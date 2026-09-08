@@ -257,4 +257,4 @@ Validation: One integrated readiness report referencing local story evidence, ex
 
 All 13 stories are recorded under the PhotoCatalog team in the Standard workflow, initially To Do, with three local acceptance criteria each. The 25 prerequisite relations have been read back and verified in the correct direction. Shortcut is the operational source of truth; this document is a local snapshot. Revalidate each live story and repository state before execution, and keep findings reflected in Shortcut. The first executable slice is sc-22836.
 
-When beginning implementation, the repository must have a configured remote and CI destination before claiming cross-platform CI evidence. It is currently a new local repository on planning/foundation with no application code or remote. Do not claim local validation as merged delivery.
+The private repository is https://github.com/michaeltrefry/PhotoCatalog, with main as its default branch. Three-platform Rust CI is part of sc-22836. Actual terminal checks and remote merge must be verified before claiming delivery; local validation is not merged delivery.

@@ -1,0 +1,8 @@
+/target/
+*.sqlite*
+*.lrcat*
+*.CR2
+*.cr2
+*.DNG
+*.dng
+/private-fixtures/
