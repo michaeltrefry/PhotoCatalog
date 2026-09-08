@@ -2,7 +2,7 @@
 """Validate a private image corpus without placing images or receipts in Git.
 
 The manifest supplies fixture/source paths, SHA-256, byte size, source mtime,
-and optional independently measured `reference` fields from render_probe JSON.
+and mandatory independent dimensions, precision, format and camera references.
 The probe runs in a fresh process twice per file; previews go to a new folder.
 """
 import argparse
@@ -10,6 +10,48 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+
+
+def validate_reference(row):
+    if not row.get("reference_source"):
+        raise ValueError("independent reference source is required")
+    if not row.get("expected_format") or row["expected_format"] == "RAW":
+        raise ValueError("explicit independently identified format is required")
+    reference = row.get("reference", {})
+    for key in ("width", "height"):
+        if not isinstance(reference.get(key), int) or reference[key] <= 0:
+            raise ValueError(f"independent {key} is required")
+    bits = row.get("expected_source_bits")
+    if not isinstance(bits, int) or not 1 <= bits <= 64:
+        raise ValueError("independent source precision is required")
+    for key in ("expected_camera_make", "expected_camera_model"):
+        if key not in row:
+            raise ValueError(f"independent {key} is required (null if absent)")
+        if row[key] is None and not row.get("camera_reference_note"):
+            raise ValueError("absent camera metadata requires a reference explanation")
+
+
+def validate_render(row, value):
+    if value.get("status") != "decoded":
+        raise ValueError(f"decode failed: {value}")
+    metadata = value["metadata"]
+    if metadata["format"] != row["expected_format"]:
+        raise ValueError("decoded format differs from independent reference")
+    if metadata.get("preview_source") != "full-quality original rendering":
+        raise ValueError("full-quality original provenance is required")
+    if value["provenance"]["source_bits_per_channel"] != row["expected_source_bits"]:
+        raise ValueError("decoded source precision differs from independent reference")
+    for key in ("camera_make", "camera_model"):
+        if metadata.get(key) != row[f"expected_{key}"]:
+            raise ValueError(f"decoded {key} differs from independent reference")
+    if value.get("nonfinite_components") != 0:
+        raise ValueError("nonfinite pixel values or missing finiteness evidence")
+    alpha_pixels = sum(value[key] for key in ("alpha_zero", "alpha_partial", "alpha_opaque"))
+    if alpha_pixels != value["width"] * value["height"]:
+        raise ValueError("alpha coverage does not match image dimensions")
+    for key, expected in row["reference"].items():
+        if value.get(key) != expected:
+            raise ValueError(f"independent reference mismatch: {key}, expected {expected}, got {value.get(key)}")
 
 
 def verify_source(row):
@@ -34,6 +76,7 @@ def main():
         raise ValueError("empty corpus")
     output = args.output.resolve()
     for row in rows:
+        validate_reference(row)
         for field in ("source", "fixture"):
             if output.is_relative_to(Path(row[field]).resolve().parent):
                 raise ValueError("receipt directory must be separate from source folders")
@@ -43,7 +86,10 @@ def main():
     receipts = []
     for index, row in enumerate(rows):
         receipt = {"camera": row["camera"], "format": row["format"],
-                   "source_sha256": row["sha256"], "passed": False}
+                   "source_sha256": row["sha256"], "passed": False,
+                   "independent_reference": {key: row[key] for key in row
+                                             if key.startswith("expected_") or key in
+                                             ("reference", "reference_source", "camera_reference_note")}}
         try:
             runs = []
             for repeat in range(2):
@@ -53,18 +99,9 @@ def main():
                 result = subprocess.run(command, capture_output=True, text=True, timeout=180)
                 value = json.loads(result.stdout)
                 runs.append(value)
-                if result.returncode or value.get("status") != "decoded":
+                if result.returncode:
                     raise ValueError(f"decode failed: {value}")
-                if value.get("nonfinite_components") != 0:
-                    raise ValueError("nonfinite pixel values or missing finiteness evidence")
-                if value["width"] <= 0 or value["height"] <= 0:
-                    raise ValueError("empty decoded image")
-                alpha_pixels = sum(value[key] for key in ("alpha_zero", "alpha_partial", "alpha_opaque"))
-                if alpha_pixels != value["width"] * value["height"]:
-                    raise ValueError("alpha coverage does not match image dimensions")
-                for key, expected in row.get("reference", {}).items():
-                    if value.get(key) != expected:
-                        raise ValueError(f"independent reference mismatch: {key}, expected {expected}, got {value.get(key)}")
+                validate_render(row, value)
             if runs[0]["pixel_blake3"] != runs[1]["pixel_blake3"]:
                 raise ValueError("pixels differ between fresh-process renders")
             receipt["runs"] = runs
