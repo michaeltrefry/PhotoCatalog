@@ -8,3 +8,4 @@
 *.DNG
 *.dng
 /private-fixtures/
+__pycache__/
