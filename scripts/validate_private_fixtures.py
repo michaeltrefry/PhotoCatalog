@@ -36,8 +36,10 @@ def main():
         def run(*command, parse=True):
             result = subprocess.run(
                 [str(binary), "--catalog", str(catalog), *map(str, command)],
-                check=True, capture_output=True, text=True, timeout=180,
+                check=False, capture_output=True, text=True, timeout=180,
             )
+            if result.returncode:
+                raise RuntimeError(f"CLI {command[0]} failed ({result.returncode}): {result.stderr}")
             return json.loads(result.stdout) if parse else result
 
         imported = run("import", fixtures)
