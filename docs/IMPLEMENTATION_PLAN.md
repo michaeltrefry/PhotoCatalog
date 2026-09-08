@@ -212,7 +212,7 @@ Type: `feature`
 Depends on: sc-22840, sc-22841, sc-22842, sc-22843, sc-22845, sc-22846  
 Inherits epic requirements: E1, E2, E3, E5, E6, E7, E8, E9, E10, E11, E12
 
-Package the desktop app with Tauri, as explicitly selected by the user. Validate a small measured grid/editor integration, then expose the full agreed foundation through the supplied Fieldbook design. Keep catalog and image-processing logic in the UI-independent Rust core, with a bounded command/data boundary to the frontend. Refine UI choices with the user; frontend component framework and final styling remain open, and SceneWorks integration remains outside this foundation.
+Package the desktop app with Tauri, as explicitly selected by the user. Validate a small measured grid/editor integration, then expose the full agreed foundation through the supplied Fieldbook design. Fieldbook is only the design-reference label and will not be the product name. Keep PhotoCatalog as the working name until the user selects the product name; do not adopt Fieldbook branding or its .fbcat extension from the prototype. Keep catalog and image-processing logic in the UI-independent Rust core, with a bounded command/data boundary to the frontend. Refine UI choices with the user; frontend component framework and final styling remain open, and SceneWorks integration remains outside this foundation.
 
 Acceptance (story-local):
 - Installable Tauri desktop packages on macOS, Windows, and Linux expose catalog/import, virtualized browsing, search/organization, offline status, relink review/undo, editing/export, Lightroom dry-run/import, metadata conflicts, and backup/restore.
