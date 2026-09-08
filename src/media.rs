@@ -167,7 +167,7 @@ fn cr2_preview(file: &mut File) -> Result<(Vec<u8>, RawTags)> {
         let mut strip_len = None;
         let mut jpeg_offset = None;
         let mut jpeg_len = None;
-        for entry in entries[..count * 12].chunks_exact(12) {
+        for entry in entries[..count * 12].as_chunks::<12>().0 {
             let tag = u16_at(entry);
             let kind = u16_at(&entry[2..]);
             let count = u32_at(&entry[4..]);

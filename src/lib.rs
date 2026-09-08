@@ -39,6 +39,18 @@ pub struct Catalog {
     root: PathBuf,
 }
 impl Catalog {
+    /// Resolve source and prospective catalog locations before creating any files.
+    /// Use this entry point when opening a catalog for an import operation.
+    pub fn open_for_import(root: impl AsRef<Path>, source: impl AsRef<Path>) -> Result<Self> {
+        let source = fs::canonicalize(source).context("resolve import source")?;
+        ensure!(source.is_dir(), "import source must be a folder");
+        let root = prospective_directory(root.as_ref())?;
+        ensure!(
+            !root.starts_with(&source) && !source.starts_with(&root),
+            "catalog and originals must be separate directories"
+        );
+        Self::open(root)
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
@@ -346,4 +358,57 @@ fn location_bytes(path: &Path) -> Vec<u8> {
         .encode_wide()
         .flat_map(u16::to_le_bytes)
         .collect()
+}
+
+// Canonicalize the existing ancestor, then normalize the missing suffix without mkdir.
+// Opening the resolved result also avoids creating incidental directories in paths
+// such as `originals/not-yet-created/../../catalog`.
+fn prospective_directory(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    let mut resolved = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(existing) => {
+                ensure!(existing.is_dir(), "catalog ancestor must be a directory");
+                break existing;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .components()
+                        .next_back()
+                        .context("catalog has no existing ancestor")?
+                        .as_os_str()
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("catalog has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("resolve catalog location"),
+        }
+    };
+    for part in suffix.into_iter().rev() {
+        if part == ".." {
+            resolved.pop();
+        } else if part != "." {
+            resolved.push(part);
+        }
+        // A parent component may return from the missing suffix into a different
+        // existing branch; resolve any symlink reached there before comparing.
+        match fs::canonicalize(&resolved) {
+            Ok(existing) => {
+                ensure!(existing.is_dir(), "catalog ancestor must be a directory");
+                resolved = existing;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("resolve catalog suffix"),
+        }
+    }
+    Ok(resolved)
 }

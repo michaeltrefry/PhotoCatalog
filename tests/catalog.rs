@@ -326,3 +326,100 @@ fn directory_and_file_symlinks_are_not_imported() -> Result<()> {
     assert_eq!(catalog.import(src, None, |_| Ok(()))?.imported, 0);
     Ok(())
 }
+
+// Include file contents, symlink targets, and directory entries so rejected imports
+// cannot hide catalog artifacts or incidental directory creation in the originals.
+fn tree_snapshot(root: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    let mut snapshot = Vec::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        let data = if entry.file_type().is_file() {
+            fs::read(entry.path())?
+        } else if entry.file_type().is_symlink() {
+            fs::read_link(entry.path())?
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        snapshot.push((entry.path().strip_prefix(root)?.to_path_buf(), data));
+    }
+    snapshot.sort();
+    Ok(snapshot)
+}
+fn assert_import_rejected_without_mutation(
+    root: &Path,
+    catalog: &Path,
+    source: &Path,
+) -> Result<()> {
+    let before = tree_snapshot(root)?;
+    assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("photocatalog"))
+        .arg("--catalog")
+        .arg(catalog)
+        .arg("import")
+        .arg(source)
+        .assert()
+        .failure();
+    assert_eq!(tree_snapshot(root)?, before);
+    Ok(())
+}
+#[test]
+fn cli_rejects_overlapping_catalogs_before_any_mutation() -> Result<()> {
+    let (tmp, src, _db) = setup();
+    jpeg(&src.join("a.jpg"), 1);
+    let existing = src.join("existing");
+    fs::create_dir(&existing)?;
+    for catalog in [
+        src.clone(),
+        tmp.path().to_path_buf(),
+        existing,
+        src.join("new/nested/catalog"),
+        src.join("new/../catalog"),
+    ] {
+        assert_import_rejected_without_mutation(tmp.path(), &catalog, &src)?;
+    }
+    Ok(())
+}
+#[cfg(unix)]
+#[test]
+fn cli_resolves_symlink_overlap_before_any_mutation() -> Result<()> {
+    let (tmp, src, _db) = setup();
+    jpeg(&src.join("a.jpg"), 1);
+    let alias = tmp.path().join("alias");
+    std::os::unix::fs::symlink(&src, &alias)?;
+    for catalog in [
+        alias.clone(),
+        alias.join("new/nested"),
+        src.join("missing/../../alias"),
+        src.join("missing/../../alias/new"),
+    ] {
+        assert_import_rejected_without_mutation(tmp.path(), &catalog, &src)?;
+    }
+    assert_import_rejected_without_mutation(tmp.path(), &src, &alias)?;
+    Ok(())
+}
+#[test]
+fn cli_normalizes_nonexistent_parent_components_without_incidental_source_writes() -> Result<()> {
+    let (tmp, src, db) = setup();
+    jpeg(&src.join("a.jpg"), 1);
+    let before = tree_snapshot(&src)?;
+    let catalog = src.join("not-created/../../catalog");
+    assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("photocatalog"))
+        .arg("--catalog")
+        .arg(catalog)
+        .arg("import")
+        .arg(&src)
+        .assert()
+        .success();
+    assert_eq!(tree_snapshot(&src)?, before);
+    assert_eq!(Catalog::open(&db)?.browse(0, 10)?.len(), 1);
+    assert_eq!(
+        tree_snapshot(tmp.path())?
+            .iter()
+            .filter(|(p, _)| p.ends_with("catalog.sqlite3"))
+            .count(),
+        1
+    );
+    Ok(())
+}

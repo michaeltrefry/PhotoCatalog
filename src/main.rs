@@ -39,7 +39,10 @@ enum Command {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut catalog = Catalog::open(cli.catalog)?;
+    let mut catalog = match &cli.command {
+        Command::Import { folder, .. } => Catalog::open_for_import(&cli.catalog, folder)?,
+        _ => Catalog::open(&cli.catalog)?,
+    };
     match cli.command {
         Command::Import { folder, max_files } => {
             let report = catalog.import(folder, max_files, |_| Ok(()))?;
