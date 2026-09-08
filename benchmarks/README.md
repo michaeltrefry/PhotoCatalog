@@ -57,3 +57,37 @@ Version 2 moves ratings into the standard dependent annotation relation **in bot
 **Fresh processes are not cold OS-cache measurements.** The harness never purges the user's machine cache or silently labels a reopened database cold. Cold filesystem cache remains separately unmeasured; the approved numeric target is explicitly fresh-process. No image, preview, or UI requirement is concluded by this database story.
 
 The database decision must be written only after the full fixed campaign and independent review. Preserve raw receipts externally and commit the compact reviewed decision/evidence summary. No completed decision is asserted by a smoke test.
+
+## Auxiliary host observation
+
+Run the passive observer alongside the reserved measurement window, with a new
+private output file whose parent directory already exists:
+
+```sh
+python benchmarks/observe_host.py --output /absolute/private/host-observation.jsonl \
+  --duration-seconds 3600 --interval-seconds 1
+```
+
+This records UTC and monotonic timestamps, acquisition duration, host CPU/RAM/swap,
+aggregate disk counters and interval deltas, and process PID/basename/CPU/RSS.
+Process CPU uses one logical core as 100% and can exceed 100%; host CPU is the
+system-wide percentage. PID reuse starts a new baseline. No process arguments,
+environment, executable paths, usernames or open-file paths are collected.
+The JSONL file is exclusively created with mode 0600, flushed after each record,
+and ends with a final record on duration expiry, SIGINT or SIGTERM. Abrupt process
+termination or power loss can still leave no final record. Receipts remain private.
+
+On macOS, a bounded read-only `ioreg` request records AGX driver device/renderer/
+tiler utilization and allocated/in-use system memory. Missing AGX devices,
+missing fields, command failures, counter resets and initial delta baselines
+remain explicit; they are never represented as idle or invented zero usage.
+Other platforms retain CPU/process/memory/disk telemetry and report GPU telemetry
+unavailable. The AGX counters are driver observations with their own sampling
+semantics, not per-process GPU attribution or a complete detector of interference.
+
+This observer neither launches/stops workloads nor decides quiet-host status,
+benchmark validity, profile eligibility, or budget pass/fail. Its own work adds
+some load, recorded under its PID, and sample acquisition can exceed the requested
+interval. Retain the JSONL with the campaign receipts for independent review.
+No frozen harness, dataset, workload, cache-profile selection, or budget changes
+are implied by this auxiliary telemetry.

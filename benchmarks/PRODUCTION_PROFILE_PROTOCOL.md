@@ -49,3 +49,13 @@ The output must be new. The driver verifies its own and the frozen harness's has
 The driver invokes the **existing frozen CLI** for plans, warm queries, fresh-process queries, mixed writes, and forced process-crash recovery using the profile's explicit `--memory-mb` argument. It retains p50/p95/p99, raw samples, measured settings, correctness digests, RSS, background errors, and disk growth from those original commands. `production_profiles.json` records every attempted profile and chooses only one profile per engine that passes at every scale. No numerical threshold changes, per-query best-result selection, blanket retries, or suppressed operation failures are permitted.
 
 A production decision still needs the full 1M/5M/10M scale set, quiet-host evidence, reviewed raw results, and native Rust validation. Small fixtures can test this driver's rejection logic but do not establish performance suitability.
+
+## Auxiliary competing-load evidence
+
+`benchmarks/observe_host.py` can record passive host telemetry during the reserved
+window, as described in the benchmark README. Preserve its private JSONL with the
+measurement receipts. This supplies CPU/process/RAM/swap/disk observations and,
+when available, macOS AGX utilization/memory counters; unavailable data is not
+proof of an idle host. The observer never controls workloads or decides whether
+host conditions or benchmark budgets pass. This auxiliary evidence does not alter
+the frozen comparison, predeclared profile order, numeric thresholds, or datasets.
