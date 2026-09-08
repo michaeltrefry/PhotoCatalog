@@ -1,4 +1,6 @@
 /target/
+/.deps/
+/vcpkg_installed/
 *.sqlite*
 *.lrcat*
 *.CR2
@@ -6,3 +8,4 @@
 *.DNG
 *.dng
 /private-fixtures/
+__pycache__/
