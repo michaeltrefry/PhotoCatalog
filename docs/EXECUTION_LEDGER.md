@@ -4,13 +4,13 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836 only. Complete its local acceptance, independent review, exact-head cross-platform CI, merge, and tracker read-back before admitting dependent stories. sc-22837 and sc-22838 become the next frontier after that merge.
+sc-22837 and sc-22838 execute in isolated worktrees after verified completion of sc-22836. Reserve the reference Mac for timed scale measurements after other heavy builds finish.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
-| sc-22836 | In Progress | Rust core, CLI, portable fixtures, CI | Requirements and live workflow reconciled; private CR2/JPEG fixture copies hash-verified | Implement, independently review, validate and merge |
-| sc-22837 | To Do | Backend benchmark and selection | Prerequisite sc-22836 | Wait for foundation |
-| sc-22838 | To Do | Decoding and color pipeline | Prerequisite sc-22836 | Wait for foundation |
+| sc-22836 | Done | [PR #1](https://github.com/michaeltrefry/PhotoCatalog/pull/1), merged 56f0b37 | Independent review PASS; 18 local tests; real CR2/JPEG source-invariance receipt; PR and merged-main three-platform CI 34227667817 SUCCESS; Shortcut read-back | Complete |
+| sc-22837 | In Progress | Isolated backend benchmark and storage worktree | Prerequisite Done; local AC and quiet-lane controls recorded | Build comparison harness, measure, integrate decision |
+| sc-22838 | In Progress | Isolated decoding and color pipeline worktree | Prerequisite Done; real-camera validation and scope controls recorded | Integrate full-quality pipeline and validate matrix |
 | sc-22839 | To Do | XMP fidelity | Prerequisites sc-22837/sc-22838 | Dependency-bound |
 | sc-22840 | To Do | Offline storage and relinking | Prerequisite sc-22837 | Dependency-bound |
 | sc-22841 | To Do | Preview storage and scheduling | Prerequisites sc-22837/sc-22838 | Dependency-bound |
@@ -26,10 +26,10 @@ sc-22836 only. Complete its local acceptance, independent review, exact-head cro
 
 - User authorized epic delivery, including ordinary PR/CI/merge, and selected michaeltrefry for the private PhotoCatalog repository.
 - Originals and Lightroom sources on the RAID remain read-only. Private source fixtures are outside Git. No live migration or original mutation has occurred.
-- One implementation Cargo lane, jobs capped at four, in an isolated sc-22836 worktree. No GPU or scale-benchmark lane started.
+- Two isolated implementation lanes, Cargo jobs capped at four each. Final scale timing requires a quiet lane; no GPU work started.
 - Initial repository contained only planning documents, now recorded as baseline commit 09f8e9a. No CodeGraph tools/index or root CODEGRAPH.md were available.
 - Native Windows/Linux behavior requires actual remote CI evidence; local Mac tests are not equivalent.
-- Independent review is pending implementation; no story has been marked Done.
+- sc-22836 independent review passed exact head 8c56058; merged tree is identical. Future material stories require fresh independent review before merge and Done.
 
 ## Foundation risk register
 
