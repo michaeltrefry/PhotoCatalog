@@ -1,0 +1,128 @@
+#include <libraw/libraw.h>
+#include <avif/avif.h>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <exception>
+#include <cmath>
+#include <algorithm>
+#include "decode.h"
+
+// This ABI contains no vendor structs. Compile against the linked library's headers.
+extern "C" {
+void pc_free(PcImage *out) { free(out->pixels); free(out->icc); out->pixels = nullptr; out->icc = nullptr; }
+const char *pc_raw_version() { return libraw_version(); }
+const char *pc_avif_version() { return avifVersion(); }
+}
+int fail(PcImage *out, const char *message) {
+    pc_free(out); snprintf(out->error, sizeof(out->error), "%s", message); return -1;
+}
+bool allocate(PcImage *out) {
+    uint64_t count = uint64_t(out->width) * out->height;
+    if (!count || out->width > 40000 || out->height > 40000 || count > 100000000) return false;
+    out->pixels = static_cast<float *>(malloc(size_t(count) * 4 * sizeof(float)));
+    return out->pixels != nullptr;
+}
+extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
+    try {
+        LibRaw raw;
+        raw.imgdata.rawparams.max_raw_memory_mb = 768;
+        raw.imgdata.rawparams.options &= ~LIBRAW_RAWOPTIONS_CONVERTFLOAT_TO_INT;
+        int status = raw.open_buffer(const_cast<unsigned char *>(bytes), len);
+        if (status) return fail(out, libraw_strerror(status));
+        out->width = raw.imgdata.sizes.width; out->height = raw.imgdata.sizes.height;
+        if (uint64_t(out->width) * out->height > 100000000) return fail(out, "resource limit: RAW exceeds 100 megapixels");
+        snprintf(out->make, sizeof(out->make), "%s", raw.imgdata.idata.make);
+        snprintf(out->model, sizeof(out->model), "%s", raw.imgdata.idata.model);
+        out->bits = raw.imgdata.color.raw_bps;
+        int flip = raw.imgdata.sizes.flip;
+        const uint32_t orientations[] = {1,2,4,3,5,8,6,7};
+        out->orientation = (flip >= 0 && flip < 8) ? orientations[flip] : 1;
+        // Stable full sensor development, not an embedded JPEG. Orientation is applied in Rust once.
+        auto &p = raw.imgdata.params;
+        float camera_wb[3]; float camera_to_rgb[3][3];
+        for (int c=0;c<3;++c) {
+            camera_wb[c]=raw.imgdata.color.cam_mul[c];
+            for(int k=0;k<3;++k) camera_to_rgb[c][k]=raw.imgdata.color.rgb_cam[c][k];
+        }
+        float minimum_wb=std::min(camera_wb[0],std::min(camera_wb[1],camera_wb[2]));
+        if (!(minimum_wb>0)) return fail(out,"unsupported RAW missing as-shot white balance");
+        p.half_size = 0; p.user_flip = 0; p.use_camera_wb = 0; p.use_auto_wb = 0;
+        for (int c=0;c<4;++c) p.user_mul[c]=1.f;
+        p.use_camera_matrix = 1; p.output_color = 0; p.output_bps = 16;
+        p.gamm[0] = 1.0; p.gamm[1] = 1.0; p.no_auto_bright = 1;
+        p.user_qual = 3; p.highlight = 0;
+        status = raw.unpack(); if (status) return fail(out, libraw_strerror(status));
+        if (raw.imgdata.rawdata.float_image || raw.imgdata.rawdata.float3_image || raw.imgdata.rawdata.float4_image)
+            return fail(out, "unsupported floating DNG: requires validated ForwardMatrix/profile and transparency-mask rendering; integer conversion is forbidden");
+        status = raw.dcraw_process(); if (status) return fail(out, libraw_strerror(status));
+        auto *processed = raw.dcraw_make_mem_image(&status);
+        if (!processed) return fail(out, libraw_strerror(status));
+        std::unique_ptr<libraw_processed_image_t, decltype(&LibRaw::dcraw_clear_mem)> image(processed, LibRaw::dcraw_clear_mem);
+        if (processed->type != LIBRAW_IMAGE_BITMAP || processed->colors != 3 || processed->bits != 16)
+            return fail(out, "unsupported RAW development output");
+        out->width = processed->width; out->height = processed->height;
+        if (!allocate(out)) return fail(out, "resource limit: RAW output allocation");
+        const auto *samples = reinterpret_cast<const uint16_t *>(processed->data);
+        for (size_t i = 0; i < size_t(out->width) * out->height; ++i) {
+            for (size_t c = 0; c < 3; ++c) {
+                float value=0;
+                for(size_t k=0;k<3;++k) value+=camera_to_rgb[c][k]*(samples[3*i+k]/65535.0f)*(camera_wb[k]/minimum_wb);
+                out->pixels[4*i+c]=value;
+            }
+            out->pixels[4*i+3] = 1;
+        }
+        out->primaries = 1; out->transfer = 8; // linear sRGB primaries
+        return 0;
+    } catch (const std::exception &error) { return fail(out, error.what()); }
+    catch (...) { return fail(out, "RAW decoder exception"); }
+}
+extern "C" int pc_avif(const unsigned char *bytes, size_t len, PcImage *out) {
+    std::unique_ptr<avifDecoder, decltype(&avifDecoderDestroy)> decoder(avifDecoderCreate(), avifDecoderDestroy);
+    if (!decoder) return fail(out, "AVIF allocation failed");
+    decoder->maxThreads = 1; decoder->imageSizeLimit = 100000000; decoder->imageDimensionLimit = 40000;
+    decoder->imageCountLimit = 1;
+    auto result = avifDecoderSetIOMemory(decoder.get(), bytes, len);
+    if (result == AVIF_RESULT_OK) result = avifDecoderParse(decoder.get());
+    if (result == AVIF_RESULT_OK) result = avifDecoderNextImage(decoder.get());
+    if (result != AVIF_RESULT_OK) return fail(out, avifResultToString(result));
+    const avifImage *img = decoder->image;
+    avifCropRect crop{0,0,img->width,img->height};
+    if ((img->transformFlags & AVIF_TRANSFORM_CLAP) && !avifCropRectConvertCleanApertureBox(&crop,&img->clap,img->width,img->height,img->yuvFormat,&decoder->diag))
+        return fail(out,"unsupported AVIF fractional or invalid clean aperture");
+    if ((img->transformFlags & AVIF_TRANSFORM_PASP) && img->pasp.hSpacing!=img->pasp.vSpacing)
+        return fail(out,"unsupported AVIF non-square pixels");
+    out->width = crop.width; out->height = crop.height; out->bits = img->depth;
+    out->primaries = img->colorPrimaries; out->transfer = img->transferCharacteristics;
+    out->orientation = 1;
+    unsigned angle = (img->transformFlags & AVIF_TRANSFORM_IROT) ? img->irot.angle : 0;
+    // irot describes counter-clockwise quarter turns; EXIF is clockwise.
+    const uint32_t rotations[] = {1,8,3,6}; out->orientation = rotations[angle & 3];
+    if (img->transformFlags & AVIF_TRANSFORM_IMIR) {
+        const uint32_t horizontal[]={2,7,4,5},vertical[]={4,5,2,7};
+        out->orientation=(img->imir.axis==1?horizontal:vertical)[angle&3];
+    }
+    if (!allocate(out)) return fail(out, "resource limit: AVIF output allocation");
+    if (img->icc.size) {
+        if (img->icc.size > 16*1024*1024) return fail(out, "resource limit: ICC profile");
+        out->icc = static_cast<unsigned char *>(malloc(img->icc.size));
+        if (!out->icc) return fail(out, "ICC allocation failed");
+        memcpy(out->icc, img->icc.data, img->icc.size); out->icc_size = img->icc.size;
+    }
+    avifRGBImage rgb; avifRGBImageSetDefaults(&rgb, img);
+    rgb.depth = 16; rgb.format = AVIF_RGB_FORMAT_RGBA; rgb.alphaPremultiplied = AVIF_FALSE;
+    (void)avifRGBImageAllocatePixels(&rgb);
+    if (!rgb.pixels) return fail(out, "AVIF RGB allocation failed");
+    result = avifImageYUVToRGB(img, &rgb);
+    if (result == AVIF_RESULT_OK) {
+        for (size_t y = 0; y < out->height; ++y) {
+            const auto *row = reinterpret_cast<const uint16_t *>(rgb.pixels + (y+crop.y) * rgb.rowBytes)+crop.x*4;
+            for (size_t x = 0; x < size_t(out->width)*4; ++x) out->pixels[y*out->width*4+x] = row[x] / 65535.0f;
+        }
+    }
+    avifRGBImageFreePixels(&rgb);
+    if (result != AVIF_RESULT_OK) return fail(out, avifResultToString(result));
+    return 0;
+}

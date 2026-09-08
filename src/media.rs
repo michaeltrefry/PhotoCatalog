@@ -1,3 +1,9 @@
+mod full;
+mod psd;
+pub use full::{
+    DecodeError, DecodeStatus, RenderProvenance, RenderedImage, decode_full, decoder_versions,
+};
+
 use anyhow::{Context, Result, bail, ensure};
 use image::{DynamicImage, ImageReader};
 use serde::{Deserialize, Serialize};
@@ -20,7 +26,29 @@ pub struct Metadata {
     pub preview_source: String,
 }
 
+pub fn supported_extension(ext: &str) -> bool {
+    [
+        "cr2", "cr3", "dng", "raf", "rw2", "nef", "arw", "orf", "pef", "jpg", "jpeg", "png",
+        "avif", "webp", "bmp", "tif", "tiff", "psd",
+    ]
+    .contains(&ext)
+}
+
 pub fn decode(path: &Path) -> Result<(Metadata, Vec<u8>)> {
+    // An explicitly labelled embedded preview is allowed for browsing. Editing always
+    // enters decode_full, which never reads this preview or a catalog thumbnail.
+    let mut header = [0u8; 12];
+    let mut file = File::open(path)?;
+    let n = file.read(&mut header)?;
+    if n == 12 && &header[8..12] == b"CR\x02\0" {
+        return decode_embedded_cr2(path);
+    }
+    let rendered = decode_full(path)?;
+    let preview = rendered.srgb_preview(512)?;
+    Ok((rendered.metadata, preview))
+}
+
+fn decode_embedded_cr2(path: &Path) -> Result<(Metadata, Vec<u8>)> {
     let mut file = File::open(path)?;
     let mut header = [0; 16];
     let n = file.read(&mut header)?;
