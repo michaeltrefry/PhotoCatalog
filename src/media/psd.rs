@@ -84,6 +84,13 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
             rr.take(1)?;
         }
         let data = rr.block()?;
+        if id == 1057 {
+            ensure!(data.len() >= 5, "truncated PSD VersionInfo");
+            ensure!(
+                data[4] != 0,
+                "unsupported PSD without real merged composite"
+            );
+        }
         if id == 1039 {
             ensure!(data.len() <= 16 * 1024 * 1024, "ICC resource limit");
             icc = Some(data.to_vec());
@@ -93,12 +100,46 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
         }
     }
     let layers = r.block()?;
-    let merged_alpha = if layers.len() >= 6 {
-        let length = u32::from_be_bytes(layers[..4].try_into()?);
-        length >= 2 && i16::from_be_bytes(layers[4..6].try_into()?) < 0
-    } else {
-        false
-    };
+    let mut merged_alpha = false;
+    if !layers.is_empty() {
+        let mut lr = Reader {
+            bytes: layers,
+            offset: 0,
+        };
+        let layer_info = lr.block()?;
+        if !layer_info.is_empty() {
+            ensure!(layer_info.len() >= 2, "truncated PSD layer count");
+            merged_alpha = i16::from_be_bytes(layer_info[..2].try_into()?) < 0;
+        }
+        // Some writers omit the empty global mask when no additional blocks exist.
+        if lr.offset < layers.len() {
+            lr.block()?;
+        }
+        while lr.offset < layers.len() {
+            let signature = lr.take(4)?;
+            ensure!(
+                signature == b"8BIM" || signature == b"8B64",
+                "invalid PSD layer tag signature"
+            );
+            let key = lr.take(4)?;
+            let data = lr.block()?;
+            if key == b"Mtrn" || key == b"Mt16" || key == b"Mt32" {
+                ensure!(data.is_empty(), "invalid PSD merged transparency tag");
+                merged_alpha = true;
+            }
+            if key == b"Layr" || key == b"Lr16" || key == b"Lr32" {
+                ensure!(data.len() >= 2, "truncated PSD additional layer count");
+                merged_alpha |= i16::from_be_bytes(data[..2].try_into()?) < 0;
+            }
+            if data.len() % 2 != 0 {
+                lr.take(1)?;
+            }
+        }
+    }
+    ensure!(
+        !merged_alpha || channels > colors,
+        "PSD merged transparency channel missing"
+    );
     let compression = r.u16()?;
     let mut data = match compression {
         0 => r.take(total)?.to_vec(),
@@ -202,6 +243,18 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
         } else {
             1.0
         };
+        ensure!(
+            p[3].is_finite() && (0.0..=1.0).contains(&p[3]),
+            "invalid PSD alpha"
+        );
+        // Photoshop RGB merged composites are matted against white. Undo that
+        // storage convention before ICC conversion to expose straight RGB.
+        // At zero alpha the source foreground color cannot be recovered.
+        if merged_alpha && mode == 3 && p[3] > 0.0 {
+            for c in 0..3 {
+                p[c] = (p[c] + p[3] - 1.0) / p[3];
+            }
+        }
     }
     Ok(Composite {
         image: DynamicImage::ImageRgba32F(rgba),

@@ -41,6 +41,13 @@ fn error(status: DecodeStatus, message: impl ToString) -> DecodeError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorCalibration {
+    pub table: String,
+    pub applied_pixels: u64,
+    pub bypassed_pixels: u64,
+    pub domain_policy: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderProvenance {
     pub pipeline_version: String,
     pub decoder: String,
@@ -48,6 +55,7 @@ pub struct RenderProvenance {
     pub source_color: String,
     pub working_color: String,
     pub alpha: String,
+    pub calibration: Option<ColorCalibration>,
     pub notes: Vec<String>,
 }
 /// Full-resolution, oriented, scene/display-linear sRGB-primary pixels. RGB may be
@@ -107,6 +115,8 @@ struct NativeImage {
     primaries: u32,
     transfer: u32,
     flags: u32,
+    calibration_applied_pixels: u64,
+    calibration_bypassed_pixels: u64,
     make: [c_char; 128],
     model: [c_char; 128],
     profile: [c_char; 128],
@@ -187,6 +197,7 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
         && bytes
             .get(8..64.min(bytes.len()))
             .is_some_and(|b| b.windows(4).any(|x| x == b"avif" || x == b"avis"));
+    let mut calibration = None;
     let (mut image, format, bits, icc, orientation, source_color, decoder, make, model, mut notes) =
         if is_raw || is_avif {
             // Zeroed pointers and lengths form an empty native result; Drop frees all native allocations on every path.
@@ -258,7 +269,13 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
                     notes.push("Source contains a separate enhanced rendition; original RAW is selected. Enhanced/AI appearance is not reproduced.".into());
                 }
                 if out.flags & 4 != 0 {
-                    notes.push("Source profile hue/saturation calibration table is retained in original but is not applied by this matrix-only working-color transform.".into());
+                    calibration = Some(ColorCalibration {
+                        table: "embedded DNG HueSatMap, interpolated for as-shot white".into(),
+                        applied_pixels: out.calibration_applied_pixels,
+                        bypassed_pixels: out.calibration_bypassed_pixels,
+                        domain_policy: if out.flags & 16 != 0 { "SDK HDR overrange encoding; negative ProPhoto input bypasses LUT without clamping" } else { "SDR LUT domain [0,1] in linear ProPhoto; negative or over-one input bypasses LUT without clamping" }.into(),
+                    });
+                    notes.push("Embedded profile HueSatMap calibration applied through Adobe SDK; out-of-domain pixels retain their matrix-rendered color and are counted separately.".into());
                 }
                 if out.flags & 8 != 0 {
                     notes.push("Source profile LookTable is retained in original but not applied to scene-linear editor input.".into());
@@ -276,7 +293,11 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
                 },
                 out.bits,
                 icc,
-                exif_orientation.unwrap_or(out.orientation),
+                if is_avif {
+                    out.orientation
+                } else {
+                    exif_orientation.unwrap_or(out.orientation)
+                },
                 label,
                 decoder_versions(),
                 (!make.is_empty()).then_some(make),
@@ -401,12 +422,13 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
         height: out_height,
         pixels,
         provenance: RenderProvenance {
-            pipeline_version: "photocatalog-render-1".into(),
+            pipeline_version: "photocatalog-render-2".into(),
             decoder,
             source_bits_per_channel: bits,
             source_color,
             working_color: "linear sRGB primaries, D65, f32, unclamped".into(),
             alpha: "straight alpha [0,1]".into(),
+            calibration,
             notes,
         },
     })

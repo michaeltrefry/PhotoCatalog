@@ -12,6 +12,9 @@
 #include "dng_tag_types.h"
 #include "dng_exceptions.h"
 #include "dng_xy_coord.h"
+#include "dng_1d_table.h"
+#include "dng_bottlenecks.h"
+#include "dng_tag_values.h"
 #include <vector>
 #include <memory>
 #include <cmath>
@@ -68,21 +71,68 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
             if (profile.HasHueSatDeltas()) out->flags|=4;
             if (profile.HasLookTable()) out->flags|=8;
         }
+        if (negative->HasProfileGainTableMap() || profile.HasProfileGainTableMap())
+            return fail(out,"unsupported DNG spatial ProfileGainTableMap calibration");
         if (negative->HasCameraNeutral()) spec->SetWhiteXY(spec->NeutralToXY(negative->CameraNeutral()));
         else if (negative->HasCameraWhiteXY()) spec->SetWhiteXY(negative->CameraWhiteXY());
         else return fail(out,"unsupported DNG without as-shot white balance");
         const auto matrix=dng_space_sRGB_Linear::Get().MatrixFromPCS()*spec->CameraToPCS();
+        const auto camera_to_prophoto=dng_space_ProPhoto::Get().MatrixFromPCS()*spec->CameraToPCS();
+        const auto prophoto_to_srgb=dng_space_sRGB_Linear::Get().MatrixFromPCS()*dng_space_ProPhoto::Get().MatrixToPCS();
+        AutoPtr<dng_hue_sat_map> calibration;
+        AutoPtr<dng_1d_table> encode_table,decode_table;
+        bool calibration_overrange=false;
+        if (profile.HasHueSatDeltas()) {
+            calibration.Reset(profile.HueSatMapForWhite(spec->WhiteXY()));
+            if (!calibration.Get()) return fail(out,"unsupported DNG calibration table interpolation");
+            if (profile.HueSatMapEncoding()!=encoding_Linear)
+                BuildHueSatMapEncodingTable(allocator,profile.HueSatMapEncoding(),encode_table,decode_table,false);
+            uint32 hue,sat,value;calibration->GetDivisions(hue,sat,value);
+            // SDK overrange encoding is defined for HDR value-dimensional maps.
+            // Its 2.5D branch still clips value, so it must not receive HDR samples.
+            calibration_overrange=profile.IsHDR()&&value>1;
+            if (calibration_overrange) out->flags|=16;
+        }
         const dng_image *mask=negative->TransparencyMask();
         if (mask && !(mask->Bounds()==bounds)) return fail(out,"unsupported DNG mask alignment");
         std::vector<float> row(size_t(out->width)*3), alpha(out->width,1.f);
+        std::vector<float> working(size_t(out->width)*3);
+        std::vector<unsigned char> apply(out->width);
         const double black=negative->Stage3BlackLevelNormalized();
         for (uint32 y=0;y<out->height;++y) {
             dng_rect area(crop.t+y,crop.l,crop.t+y+1,crop.r);
             auto buffer=row_buffer(area,3,row.data()); image->Get(buffer);
             if (mask) {auto mask_buffer=row_buffer(area,1,alpha.data());mask->Get(mask_buffer);}
+            if (calibration.Get()) {
+                for (uint32 x=0;x<out->width;++x) {
+                    bool in_domain=true;
+                    for(uint32 c=0;c<3;++c) {
+                        double value=0;for(uint32 k=0;k<3;++k) value+=camera_to_prophoto[c][k]*(row[3*x+k]-black)/(1.0-black);
+                        if (!std::isfinite(value)) return fail(out,"corrupt DNG non-finite calibration input");
+                        working[c*out->width+x]=static_cast<float>(value);
+                        in_domain=in_domain&&value>=0&&(calibration_overrange||value<=1);
+                    }
+                    apply[x]=in_domain;
+                    if(in_domain) ++out->calibration_applied_pixels;
+                    else {
+                        ++out->calibration_bypassed_pixels;
+                        // Exclude undefined samples from SDK HSV operations, then restore
+                        // their exact matrix-rendered value below instead of clamping them.
+                        for(uint32 c=0;c<3;++c) working[c*out->width+x]=0;
+                    }
+                }
+                DoBaselineHueSatMap(working.data(),working.data()+out->width,working.data()+out->width*2,
+                    working.data(),working.data()+out->width,working.data()+out->width*2,
+                    out->width,*calibration.Get(),encode_table.Get(),decode_table.Get(),calibration_overrange);
+            }
             for (uint32 x=0;x<out->width;++x) {
                 for (uint32 c=0;c<3;++c) {
-                    double value=0; for(uint32 k=0;k<3;++k) value+=matrix[c][k]*(row[3*x+k]-black)/(1.0-black);
+                    double value=0;
+                    if(calibration.Get()&&apply[x]) {
+                        for(uint32 k=0;k<3;++k) value+=prophoto_to_srgb[c][k]*working[k*out->width+x];
+                    } else {
+                        for(uint32 k=0;k<3;++k) value+=matrix[c][k]*(row[3*x+k]-black)/(1.0-black);
+                    }
                     if (!std::isfinite(value)) return fail(out,"corrupt DNG non-finite sample");
                     out->pixels[(size_t(y)*out->width+x)*4+c]=static_cast<float>(value);
                 }

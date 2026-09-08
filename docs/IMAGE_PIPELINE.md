@@ -19,23 +19,38 @@ alter the editor's float pixels. Preview codec/cache selection belongs to sc-228
 | Input | Component and actual behavior |
 | --- | --- |
 | CR2/RAF/RW2 and recognized camera RAW | LibRaw; full-size demosaic into normalized camera RGB with unit WB, then as-shot WB and camera matrix applied in unclamped float. Sensor normalization still clips samples above sensor white. Missing WB is reported rather than guessed. |
-| DNG, including floating/linear/JPEG-XL | Adobe DNG SDK 1.7.1 build 2724: original Stage1→Stage2→Stage3, required opcodes, default crop, as-shot neutral and camera profile's camera-to-PCS matrix, then linear sRGB. Float samples and separate transparency mask are preserved. |
+| DNG, including floating/linear/JPEG-XL | Adobe DNG SDK 1.7.1 build 2724: original Stage1→Stage2→Stage3, required opcodes, default crop, as-shot neutral, camera profile's camera-to-PCS matrix and embedded HueSatMap calibration, then linear sRGB. Float samples and separate transparency mask are preserved. |
 | JPEG/PNG/WebP/BMP/TIFF | image-rs; original precision converted to float. ICC RGB profiles use LittleCMS relative-colorimetric conversion with alpha copied and negative values allowed. |
 | AVIF | libavif, single active decoder thread, 16-bit RGB conversion retaining 8/10/12-bit source precision and straight alpha; ICC preferred, otherwise declared CICP. Integer clean aperture and rotation/mirror are applied. |
-| PSD | Bounded merged-composite reader for RGB/grayscale 8/16/32-bit, raw, PackBits and ZIP/prediction. ICC resource retained for transform. A negative layer count identifies merged transparency; extra spot channels are not mistaken for alpha. |
+| PSD | Bounded merged-composite reader for RGB/grayscale 8/16/32-bit, raw, PackBits and ZIP/prediction. ICC resource retained for transform. Negative layer counts and Mtrn/Mt16/Mt32 tags identify merged transparency; extra spot channels are not mistaken for alpha. RGB merged white matting is removed before ICC conversion. Files declaring no real merged composite are Unsupported. |
 
 Untagged raster RGB assumes sRGB, explicitly recorded. PNG gAMA/cHRM generate a
 source profile; sRGB overrides these. Non-RGB ICC profiles and unsupported PNG
 CICP, PSD color modes/PSB, fractional AVIF apertures/non-square pixels and unknown
-color encodings fail explicitly. TIFF/PSD layer editing is not implemented.
+color encodings fail explicitly. DNG spatial ProfileGainTableMap calibration is
+currently Unsupported, including maps supplied by an embedded profile; it is never
+silently skipped. TIFF/PSD layer editing is not implemented.
 
 The DNG SDK profile matrix incorporates ForwardMatrix, calibration signatures,
-analog balance and illuminant interpolation. This is a **scene-linear matrix
-rendering policy**: profile HueSatMap/LookTable and display tone curves are not
-applied. When such tables or a separate enhanced rendition are present, per-file
-notes expose them; original RAW is selected rather than an AI/enhanced rendition.
-Those choices are compatibility limitations, not claims of Adobe rendering parity.
-Source packets and imported develop records are retained separately in sc-22839/45.
+analog balance and illuminant interpolation. Embedded HueSatMap calibration is
+interpolated for the as-shot white and applied by the SDK in linear ProPhoto before
+conversion to working sRGB. Its transfer-encoding tables are honored. Display
+LookTable and tone curves remain outside this scene-linear input policy; their
+presence is reported. Original RAW is selected and a separate AI/enhanced rendition
+is reported rather than silently substituted. These are explicit choices, not
+claims of Adobe rendering parity. Source packets and imported develop records
+are retained separately in sc-22839/45.
+
+SDR calibration tables have a [0,1] RGB domain. Negative or over-one ProPhoto
+samples bypass that table and retain their matrix-rendered values; no hidden
+clamp destroys these samples. For profiles explicitly marked HDR with a
+value-dimensional LUT, the SDK's overrange encoding is used; negative samples
+still bypass the LUT. SDK's 2.5D table routine clips over-one values even with its
+overrange flag, so that flag is not used to claim unsupported HDR behavior.
+The renderer records applied and bypassed pixel counts and the domain policy.
+In-domain LUT value/saturation behavior follows the profile and SDK, including
+profile-defined saturation/value bounds. Subsequent working-gamut conversion
+retains negative and above-one sRGB values.
 
 ## Native build and provenance
 
@@ -71,7 +86,8 @@ license obligations; this development build does not certify a release bundle.
 ## Validation and limits
 
 Generated CI tests cover format swatches, alpha, independent matrix math with
-negative/above-one output, 16-bit distinction, all orientations, profile conversion,
+negative/above-one output, analytic nonidentity HueSatMap calibration and explicit
+out-of-domain bypass, 16-bit distinction, all orientations, profile conversion,
 corruption and repeatability. `examples/render_probe.rs` emits dimensions, finite
 statistics, alpha counts, pixel digest and provenance; optional preview output uses
 create-new semantics. Private corpus testing stays outside Git and includes real

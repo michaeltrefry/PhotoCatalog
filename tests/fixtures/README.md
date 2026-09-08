@@ -13,6 +13,13 @@ negative green and red above one. The separate transparency SubIFD contains
 zero, partial and opaque samples. TIFF PhotometricInterpretation is patched to
 LinearRaw after writing RGB so tifffile does not invent ExtraSamples.
 
+`generated-calibration-mask.dng` adds an embedded HueSatMap with an analytic
+nonidentity transform in ProPhoto: hue is unchanged, saturation is halved and
+value is multiplied by `(1 - saturation/4)`. Independent fixed color matrices and
+NumPy float64 math provide expected pixels. Negative and over-one ProPhoto input
+must bypass the LUT unchanged and appear in the recorded bypass count. The mask
+is preserved for both calibrated and bypassed pixels.
+
 `generated-swatches.png` is a 3×2 RGBA PNG: red/green/blue and gray/white/black,
 including half and zero alpha. `generated-swatches-10bit.avif` was encoded using
 libavif 1.4.2's avifenc, AOM 3.15.0:
@@ -21,6 +28,10 @@ libavif 1.4.2's avifenc, AOM 3.15.0:
 avifenc -j 1 --lossless --depth 10 --yuv 444 --cicp 1/13/0 \
   generated-swatches.png generated-swatches-10bit.avif
 ```
+
+`generated-irot.avif` and `generated-irot-exif.avif` are independent-review
+swatch fixtures with the same container rotation and an additional EXIF identity
+orientation in the latter. They must produce identical oriented pixels.
 
 Raster TIFF/PNG/WebP/BMP, 16-bit precision, malformed images, PSD composites and
 all eight EXIF orientation cases are generated in temporary directories by tests.

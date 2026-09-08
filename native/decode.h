@@ -7,6 +7,7 @@ struct PcImage {
     unsigned char *icc;
     size_t icc_size;
     uint32_t width, height, bits, orientation, primaries, transfer, flags;
+    uint64_t calibration_applied_pixels, calibration_bypassed_pixels;
     char make[128], model[128], profile[128], error[256];
 };
 void pc_free(PcImage *out);

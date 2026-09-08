@@ -171,6 +171,49 @@ fn linear_dng_profile_matrix_matches_independent_oracle_and_retains_mask() {
 }
 
 #[test]
+fn embedded_dng_calibration_matches_analytic_lut_and_bypasses_undefined_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("calibration.dng");
+    std::fs::write(
+        &path,
+        include_bytes!("fixtures/generated-calibration-mask.dng"),
+    )
+    .unwrap();
+    let image = decode_full(&path).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/generated-calibration-mask.expected.json"
+    ))
+    .unwrap();
+    assert_eq!((image.width, image.height), (36, 16));
+    for x in 0..6 {
+        for c in 0..3 {
+            let target = expected["linear_srgb"][x][c].as_f64().unwrap() as f32;
+            assert!(
+                (image.pixels[x][c] - target).abs() < 0.001,
+                "calibration pixel{x} channel{c}: {} expected {target}",
+                image.pixels[x][c]
+            );
+        }
+        assert!((image.pixels[x][3] - expected["alpha"][x].as_f64().unwrap() as f32).abs() < 1e-6);
+    }
+    let calibration = image.provenance.calibration.as_ref().unwrap();
+    let applied = expected["calibration_applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x.as_bool() == Some(true))
+        .count() as u64
+        * 16
+        * 6;
+    assert_eq!(calibration.applied_pixels, applied);
+    assert_eq!(calibration.bypassed_pixels, 36 * 16 - applied);
+    assert!(calibration.applied_pixels > 0 && calibration.bypassed_pixels > 0);
+    assert!(image.pixels[5][0] > 1.0);
+    assert!(image.pixels[3][0] < 0.0);
+    assert_eq!(image.pixels, decode_full(&path).unwrap().pixels);
+}
+
+#[test]
 fn avif_ten_bit_color_and_alpha_match_lossless_swatches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("swatches.avif");
@@ -229,4 +272,92 @@ fn all_exif_orientations_are_applied_once_at_full_resolution() {
             assert!((pixel[0] - v.powf(2.4)).abs() < 1e-6);
         }
     }
+}
+
+#[test]
+fn psd_merged_transparency_tags_and_missing_composite_are_observable() {
+    let dir = tempfile::tempdir().unwrap();
+    for (depth, key) in [(8u16, b"Mtrn"), (16, b"Mt16"), (32, b"Mt32")] {
+        let mut bytes = b"8BPS\0\x01\0\0\0\0\0\0".to_vec();
+        bytes.extend(4u16.to_be_bytes());
+        bytes.extend(1u32.to_be_bytes());
+        bytes.extend(2u32.to_be_bytes());
+        bytes.extend(depth.to_be_bytes());
+        bytes.extend(3u16.to_be_bytes());
+        bytes.extend(0u32.to_be_bytes()); // color mode
+        bytes.extend(0u32.to_be_bytes()); // resources
+        bytes.extend(20u32.to_be_bytes()); // layer and mask section
+        bytes.extend(0u32.to_be_bytes()); // layer info
+        bytes.extend(0u32.to_be_bytes()); // global mask
+        bytes.extend(b"8BIM");
+        bytes.extend(key);
+        bytes.extend(0u32.to_be_bytes());
+        bytes.extend(0u16.to_be_bytes());
+        for value in [1.0f32, 1.0, 1.0, 0.75, 1.0, 0.75, 0.0, 0.5] {
+            match depth {
+                8 => bytes.push((value * 255.0).round() as u8),
+                16 => bytes.extend(((value * 65535.0).round() as u16).to_be_bytes()),
+                _ => bytes.extend(value.to_be_bytes()),
+            }
+        }
+        let path = dir.path().join(format!("alpha-{depth}.psd"));
+        std::fs::write(&path, bytes).unwrap();
+        let image = decode_full(&path).unwrap();
+        assert_eq!(image.pixels[0][3], 0.0);
+        assert!((image.pixels[1][3] - 0.5).abs() < 0.002);
+        // Stored green/blue .75 with half alpha unmattes to .5 before sRGB decoding.
+        assert!((image.pixels[1][1] - 0.214041).abs() < 0.004);
+        assert!((image.pixels[1][2] - 0.214041).abs() < 0.004);
+    }
+    let mut bytes = b"8BPS\0\x01\0\0\0\0\0\0".to_vec();
+    bytes.extend(3u16.to_be_bytes());
+    bytes.extend(1u32.to_be_bytes());
+    bytes.extend(1u32.to_be_bytes());
+    bytes.extend(8u16.to_be_bytes());
+    bytes.extend(3u16.to_be_bytes());
+    bytes.extend(0u32.to_be_bytes());
+    let mut resource = b"8BIM".to_vec();
+    resource.extend(1057u16.to_be_bytes());
+    resource.extend([0, 0]);
+    resource.extend(17u32.to_be_bytes());
+    resource.extend(1u32.to_be_bytes());
+    resource.push(0);
+    resource.extend(0u32.to_be_bytes());
+    resource.extend(0u32.to_be_bytes());
+    resource.extend(1u32.to_be_bytes());
+    resource.push(0);
+    bytes.extend((resource.len() as u32).to_be_bytes());
+    bytes.extend(resource);
+    bytes.extend(0u32.to_be_bytes());
+    bytes.extend(0u16.to_be_bytes());
+    bytes.extend([255, 0, 0]);
+    let path = dir.path().join("no-merged.psd");
+    std::fs::write(&path, bytes).unwrap();
+    let failure = decode_full(&path).err().unwrap();
+    assert_eq!(failure.status, DecodeStatus::Unsupported);
+    assert!(failure.message.contains("real merged"));
+}
+
+#[test]
+fn avif_container_orientation_takes_precedence_over_exif() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rendered = Vec::new();
+    for (name, bytes) in [
+        (
+            "irot.avif",
+            include_bytes!("fixtures/generated-irot.avif").as_slice(),
+        ),
+        (
+            "irot-exif.avif",
+            include_bytes!("fixtures/generated-irot-exif.avif").as_slice(),
+        ),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let image = decode_full(&path).unwrap();
+        assert_eq!((image.width, image.height), (2, 3));
+        assert_eq!(image.metadata.orientation, 8);
+        rendered.push(image.pixels);
+    }
+    assert_eq!(rendered[0], rendered[1]);
 }
