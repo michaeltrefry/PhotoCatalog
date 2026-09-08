@@ -19,7 +19,7 @@ The recorded implementation plan includes these decisions and bounded feasibilit
 - Use the performance budgets below for the backend decision and integrated acceptance.
 - Choose the final RAW/camera matrix from an inventory and representative files early in sc-22838. Decoding support cannot be inferred from an extension.
 - Preserve all Adobe/source metadata and auxiliary evidence. Native Adobe rendering parity is unproven; any unsupported translation remains visible and needs a user decision if it prevents replacement of the user's workflow.
-- Use minimal CLI access first; select and design the desktop interface with the user at sc-22847. The usable desktop foundation is in this plan, not an untracked follow-up.
+- Use minimal CLI access first; implement the desktop app with Tauri and refine the supplied Fieldbook design with the user at sc-22847. The usable desktop foundation is in this plan, not an untracked follow-up.
 
 ## Performance acceptance
 
@@ -212,14 +212,14 @@ Type: `feature`
 Depends on: sc-22840, sc-22841, sc-22842, sc-22843, sc-22845, sc-22846  
 Inherits epic requirements: E1, E2, E3, E5, E6, E7, E8, E9, E10, E11, E12
 
-Choose the desktop framework through a small measured grid/editor integration, then expose the full agreed foundation. Work with the user on UI choices at this stage; do not assume final styling or SceneWorks integration.
+Package the desktop app with Tauri, as explicitly selected by the user. Validate a small measured grid/editor integration, then expose the full agreed foundation through the supplied Fieldbook design. Keep catalog and image-processing logic in the UI-independent Rust core, with a bounded command/data boundary to the frontend. Refine UI choices with the user; frontend component framework and final styling remain open, and SceneWorks integration remains outside this foundation.
 
 Acceptance (story-local):
-- A desktop build on macOS, Windows, and Linux exposes catalog/import, virtualized browsing, search/organization, offline status, relink review/undo, editing/export, Lightroom dry-run/import, metadata conflicts, and backup/restore.
+- Installable Tauri desktop packages on macOS, Windows, and Linux expose catalog/import, virtualized browsing, search/organization, offline status, relink review/undo, editing/export, Lightroom dry-run/import, metadata conflicts, and backup/restore.
 - Visible-photo scheduling, keyboard navigation, cancellation/progress, and a color-managed image viewport keep foreground operations within the fixed interaction budgets.
 - Errors, retained-only Adobe settings, missing originals, and destructive/export choices are understandable in the relevant user flow; selected UI design and platform packaging are validated with the user.
 
-Validation: End-to-end desktop workflows on all platforms, reference-Mac frame/interaction traces, accessibility/keyboard checks and reviewed screenshots. Final visual-design refinements require explicit agreed scope.
+Validation: Build/package, install, launch, and end-to-end desktop workflows on all three platforms, reference-Mac frame/interaction traces, accessibility/keyboard checks and reviewed screenshots. Final visual-design refinements require explicit agreed scope.
 
 ### sc-22848 — Verify integrated foundation readiness and reconcile delivery
 
