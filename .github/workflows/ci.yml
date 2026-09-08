@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 4
+  OMP_NUM_THREADS: '1'
   PHOTOCATALOG_DNG_SDK: ${{ github.workspace }}/.deps/dng_sdk_1_7_1_2724/dng_sdk_1_7_1
 
 jobs:
@@ -100,5 +101,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test library and CLI, including restart and recovery
         run: cargo test --locked --all-targets
-      - name: Build CLI
-        run: cargo build --locked
+      - name: Build CLI and full-resolution validation probe
+        run: cargo build --locked --bins --examples
+      - name: Validate public CC0 Canon and Panasonic RAW originals
+        run: python scripts/validate_public_raw.py --probe "target/debug/examples/render_probe${{ runner.os == 'Windows' && '.exe' || '' }}"
