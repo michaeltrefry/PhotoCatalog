@@ -97,6 +97,8 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'build.rs', 'vcpkg.json', 'scripts/fetch_dng_sdk.py') }}
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Test corpus evidence rejection
+        run: python -m unittest discover -s scripts -p test_validate_image_corpus.py -v
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test library and CLI, including restart and recovery
