@@ -26,7 +26,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 40 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install native image libraries (Linux)
@@ -44,11 +44,12 @@ jobs:
           repository: microsoft/vcpkg
           ref: 04a9d8e5212d01ee1dd9478eadd9caade4f8b0d4
           path: .vcpkg
-      - name: Cache native image libraries (Windows)
+      - name: Restore native image libraries (Windows)
         if: runner.os == 'Windows'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: windows-native-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: vcpkg_installed
+          path: .vcpkg/installed
           key: windows-x64-static-md-vcpkg-04a9d8e-${{ hashFiles('vcpkg.json') }}
       - name: Install native image libraries (Windows)
         if: runner.os == 'Windows'
@@ -56,11 +57,17 @@ jobs:
         run: |
           & ./.vcpkg/bootstrap-vcpkg.bat -disableMetrics
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ./.vcpkg/vcpkg.exe install --triplet x64-windows-static-md --x-manifest-root="$env:GITHUB_WORKSPACE"
+          & ./.vcpkg/vcpkg.exe install --triplet x64-windows-static-md --x-manifest-root="$env:GITHUB_WORKSPACE" --x-install-root="$env:GITHUB_WORKSPACE/.vcpkg/installed"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "VCPKG_ROOT=$env:GITHUB_WORKSPACE/.vcpkg" >> $env:GITHUB_ENV
-          "VCPKG_INSTALLED_ROOT=$env:GITHUB_WORKSPACE/vcpkg_installed" >> $env:GITHUB_ENV
           "VCPKGRS_TRIPLET=x64-windows-static-md" >> $env:GITHUB_ENV
+      # Preserve a successful cold build even if a later Rust check fails.
+      - name: Save native image libraries (Windows)
+        if: runner.os == 'Windows' && steps.windows-native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .vcpkg/installed
+          key: ${{ steps.windows-native-cache.outputs.cache-primary-key }}
       - name: Install repository toolchain
         shell: bash
         run: rustup show
