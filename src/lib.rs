@@ -1,5 +1,5 @@
 //! UI-independent catalog skeleton. SQLite and JPEG thumbnails are provisional.
-mod media;
+pub mod media;
 use anyhow::{Context, Result, bail, ensure};
 pub use media::Metadata;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -137,7 +137,7 @@ impl Catalog {
                 .and_then(|v| v.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if !["cr2", "jpg", "jpeg", "png"].contains(&ext.as_str()) {
+            if !media::supported_extension(&ext) {
                 report.skipped += 1;
                 continue;
             }
