@@ -118,8 +118,12 @@ fn native_mixed(path: &std::path::Path, repetitions: usize) -> Result<serde_json
             for offset in 0..32 {
                 let sequence = original_count + (iteration * 32 + offset) as i64 + 1;
                 let template = offset as i64 + 1;
-                tx.execute("INSERT INTO assets SELECT ?1,?2,?3,?3,fingerprint,state,metadata,preview_hash,error,folder_id,captured_at,rating,camera_id,file_bytes FROM assets WHERE sequence=?4",
+                tx.execute("INSERT INTO assets SELECT ?1,?2,?3,?3,fingerprint,state,metadata,preview_hash,error,folder_id,captured_at,camera_id,file_bytes FROM assets WHERE sequence=?4",
                     rusqlite::params![sequence,format!("00000000-0000-4000-8000-{sequence:012x}"),format!("/synthetic/native/IMG_{sequence:012}.CR2"),template])?;
+                tx.execute(
+                    "INSERT INTO annotations SELECT ?1,rating FROM annotations WHERE asset_id=?2",
+                    rusqlite::params![sequence, template],
+                )?;
                 tx.execute("INSERT INTO asset_keywords SELECT ?1,keyword_id FROM asset_keywords WHERE asset_id=?2", rusqlite::params![sequence,template])?;
                 if sequence % 5 == 0 {
                     tx.execute(
@@ -145,7 +149,7 @@ fn native_mixed(path: &std::path::Path, repetitions: usize) -> Result<serde_json
                 foreground.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if iteration % 2 == 0 {
                 tx.execute(
-                    "UPDATE assets SET rating=?1 WHERE sequence=?2",
+                    "UPDATE annotations SET rating=?1 WHERE asset_id=?2",
                     rusqlite::params![(iteration % 6) as i64, sequence],
                 )?;
             } else {
@@ -157,7 +161,7 @@ fn native_mixed(path: &std::path::Path, repetitions: usize) -> Result<serde_json
                 ratings.push(elapsed);
                 ensure!(
                     foreground.query_row(
-                        "SELECT rating FROM assets WHERE sequence=?1",
+                        "SELECT rating FROM annotations WHERE asset_id=?1",
                         [sequence],
                         |r| r.get::<_, i64>(0)
                     )? == (iteration % 6) as i64,

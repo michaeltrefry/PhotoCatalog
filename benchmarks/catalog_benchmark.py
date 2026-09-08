@@ -22,7 +22,7 @@ import time
 import duckdb
 import psutil
 
-VERSION = 1
+VERSION = 2
 SEED = 22837
 PAGE_SIZE = 200
 BASE_DATE = 1262304000
@@ -43,25 +43,14 @@ COLUMNS = [
     "camera_id",
     "file_bytes",
 ]
-METADATA = json.dumps(
-    dict(
-        format="CR2",
-        width=6000,
-        height=4000,
-        orientation=1,
-        camera_make="Synthetic",
-        camera_model="Fixture",
-        captured_at=None,
-        preview_source="synthetic metadata; no image decoding",
-    ),
-    separators=(",", ":"),
-)
 SCHEMA = [
     """CREATE TABLE assets (sequence BIGINT PRIMARY KEY, id VARCHAR NOT NULL UNIQUE,
        location VARCHAR NOT NULL UNIQUE, path_display VARCHAR NOT NULL, fingerprint VARCHAR,
        state VARCHAR NOT NULL, metadata VARCHAR, preview_hash VARCHAR, error VARCHAR,
-       folder_id BIGINT NOT NULL, captured_at BIGINT NOT NULL, rating INTEGER NOT NULL,
+       folder_id BIGINT NOT NULL, captured_at BIGINT NOT NULL,
        camera_id INTEGER NOT NULL, file_bytes BIGINT NOT NULL)""",
+    """CREATE TABLE annotations(asset_id BIGINT PRIMARY KEY REFERENCES assets(sequence),
+       rating INTEGER NOT NULL)""",
     """CREATE TABLE asset_keywords(asset_id BIGINT NOT NULL REFERENCES assets(sequence),
        keyword_id INTEGER NOT NULL, PRIMARY KEY(keyword_id,asset_id))""",
     """CREATE TABLE collection_assets(collection_id INTEGER NOT NULL, asset_id BIGINT NOT NULL
@@ -73,22 +62,21 @@ SCHEMA = [
 INDEXES = [
     "CREATE INDEX asset_folder_page ON assets(folder_id,sequence)",
     "CREATE INDEX asset_date_page ON assets(captured_at,sequence)",
-    "CREATE INDEX asset_rating_page ON assets(rating,sequence)",
-    "CREATE INDEX asset_combined_page ON assets(folder_id,rating,sequence)",
+    "CREATE INDEX annotation_rating_page ON annotations(rating,asset_id)",
 ]
-SELECT = "a.sequence,a.id,a.folder_id,a.captured_at,a.rating,a.preview_hash"
+SELECT = "a.sequence,a.id,a.folder_id,a.captured_at,r.rating,a.preview_hash"
 QUERY_SQL = {
-    "page_deep": f"SELECT {SELECT} FROM assets a WHERE a.sequence>? ORDER BY a.sequence LIMIT 200",
-    "folder": f"SELECT {SELECT} FROM assets a WHERE a.folder_id=? AND a.sequence>? ORDER BY a.sequence LIMIT 200",
-    "date": f"SELECT {SELECT} FROM assets a WHERE a.captured_at>=? AND a.captured_at<? ORDER BY a.captured_at,a.sequence LIMIT 200",
-    "rating": f"SELECT {SELECT} FROM assets a WHERE a.rating=? AND a.sequence>? ORDER BY a.sequence LIMIT 200",
-    "keyword": f"""SELECT {SELECT} FROM asset_keywords k JOIN assets a ON a.sequence=k.asset_id
+    "page_deep": f"SELECT {SELECT} FROM assets a JOIN annotations r ON r.asset_id=a.sequence WHERE a.sequence>? ORDER BY a.sequence LIMIT 200",
+    "folder": f"SELECT {SELECT} FROM assets a JOIN annotations r ON r.asset_id=a.sequence WHERE a.folder_id=? AND a.sequence>? ORDER BY a.sequence LIMIT 200",
+    "date": f"SELECT {SELECT} FROM assets a JOIN annotations r ON r.asset_id=a.sequence WHERE a.captured_at>=? AND a.captured_at<? ORDER BY a.captured_at,a.sequence LIMIT 200",
+    "rating": f"SELECT {SELECT} FROM assets a JOIN annotations r ON r.asset_id=a.sequence WHERE r.rating=? AND a.sequence>? ORDER BY a.sequence LIMIT 200",
+    "keyword": f"""SELECT {SELECT} FROM asset_keywords k JOIN assets a ON a.sequence=k.asset_id JOIN annotations r ON r.asset_id=a.sequence
         WHERE k.keyword_id=? AND k.asset_id>? ORDER BY k.asset_id LIMIT 200""",
-    "combined": f"""SELECT {SELECT} FROM assets a WHERE a.folder_id=? AND a.rating=?
+    "combined": f"""SELECT {SELECT} FROM assets a JOIN annotations r ON r.asset_id=a.sequence WHERE a.folder_id=? AND r.rating=?
         AND a.captured_at>=? AND a.captured_at<? AND a.sequence>? ORDER BY a.sequence LIMIT 200""",
-    "collection": f"""SELECT {SELECT} FROM collection_assets c JOIN assets a ON a.sequence=c.asset_id
+    "collection": f"""SELECT {SELECT} FROM collection_assets c JOIN assets a ON a.sequence=c.asset_id JOIN annotations r ON r.asset_id=a.sequence
         WHERE c.collection_id=? AND c.asset_id>? ORDER BY c.asset_id LIMIT 200""",
-    "aggregate": "SELECT camera_id,rating,count(*),sum(file_bytes) FROM assets GROUP BY camera_id,rating ORDER BY camera_id,rating",
+    "aggregate": "SELECT camera_id,rating,count(*),sum(file_bytes) FROM assets a JOIN annotations r ON r.asset_id=a.sequence GROUP BY camera_id,rating ORDER BY camera_id,rating",
 }
 
 
@@ -256,7 +244,8 @@ def bulk_insert(db, table, rows):
 
 def insert_batch(db, rows, bulk=False):
     if bulk:
-        bulk_insert(db, "assets", rows)
+        bulk_insert(db, "assets", [row[:11] + row[12:] for row in rows])
+        bulk_insert(db, "annotations", [(row[0], row[11]) for row in rows])
         bulk_insert(
             db, "asset_keywords", [pair for row in rows for pair in keywords(row[0])]
         )
@@ -266,16 +255,9 @@ def insert_batch(db, rows, bulk=False):
             [pair for row in rows for pair in collections(row[0])],
         )
         return
-    db.executemany(
-        "INSERT INTO assets VALUES(" + ",".join(["?"] * len(COLUMNS)) + ")", rows
+    raise ValueError(
+        "runtime batches require bulk inserts; CSV loader has its own bounded batches"
     )
-    db.executemany(
-        "INSERT INTO asset_keywords VALUES(?,?)",
-        [pair for row in rows for pair in keywords(row[0])],
-    )
-    relation_rows = [pair for row in rows for pair in collections(row[0])]
-    if relation_rows:
-        db.executemany("INSERT INTO collection_assets VALUES(?,?)", relation_rows)
 
 
 def checkpoint(db, engine):
@@ -329,14 +311,18 @@ def generate(folder, count):
         (folder / "assets.csv").open("w", newline="") as a,
         (folder / "keywords.csv").open("w", newline="") as k,
         (folder / "collections.csv").open("w", newline="") as c,
+        (folder / "annotations.csv").open("w", newline="") as r,
     ):
         aw, kw, cw = csv.writer(a), csv.writer(k), csv.writer(c)
-        aw.writerow(COLUMNS)
+        rw = csv.writer(r)
+        rw.writerow(["asset_id", "rating"])
+        aw.writerow([column for column in COLUMNS if column != "rating"])
         kw.writerow(["asset_id", "keyword_id"])
         cw.writerow(["collection_id", "asset_id"])
         for sequence in range(1, count + 1):
             row = asset_row(sequence)
-            aw.writerow(row)
+            aw.writerow(row[:11] + row[12:])
+            rw.writerow((row[0], row[11]))
             kw.writerows(keywords(sequence))
             cw.writerows(collections(sequence))
             sums["rating_sum"] += row[11]
@@ -361,7 +347,7 @@ def generate(folder, count):
 
 def verify(db, manifest):
     count, sequence_sum, rating_sum, captured_sum, bytes_sum = db.execute(
-        "SELECT count(*),sum(sequence),sum(rating),sum(captured_at),sum(file_bytes) FROM assets"
+        "SELECT count(*),sum(sequence),sum(rating),sum(captured_at),sum(file_bytes) FROM assets a JOIN annotations r ON r.asset_id=a.sequence"
     ).fetchone()
     actual = dict(
         count=count,
@@ -374,7 +360,12 @@ def verify(db, manifest):
     )
     assert actual == manifest["expected"], (actual, manifest["expected"])
     for sequence in [1, max(1, count // 2), count]:
-        row = db.execute("SELECT * FROM assets WHERE sequence=?", [sequence]).fetchone()
+        row = db.execute(
+            "SELECT "
+            + ",".join("r.rating" if c == "rating" else "a." + c for c in COLUMNS)
+            + " FROM assets a JOIN annotations r ON r.asset_id=a.sequence WHERE sequence=?",
+            [sequence],
+        ).fetchone()
         assert tuple(row) == asset_row(sequence), (sequence, row)
     return actual
 
@@ -391,6 +382,7 @@ def load(engine, path, source, memory_mb):
         if engine == "duckdb":
             for table, filename in [
                 ("assets", "assets.csv"),
+                ("annotations", "annotations.csv"),
                 ("asset_keywords", "keywords.csv"),
                 ("collection_assets", "collections.csv"),
             ]:
@@ -401,29 +393,40 @@ def load(engine, path, source, memory_mb):
                 )
                 db.execute("COMMIT")
         else:
-            with (source / "assets.csv").open(newline="") as file:
-                reader = csv.reader(file)
-                next(reader)
-                batch = []
-                for raw in reader:
-                    row = [
-                        int(value)
-                        if i in [0, 9, 10, 11, 12, 13]
-                        else None
-                        if i == 8
-                        else value
-                        for i, value in enumerate(raw)
-                    ]
-                    batch.append(row)
-                    if len(batch) == 10000:
+            for table, filename in [
+                ("assets", "assets.csv"),
+                ("annotations", "annotations.csv"),
+                ("asset_keywords", "keywords.csv"),
+                ("collection_assets", "collections.csv"),
+            ]:
+                with (source / filename).open(newline="") as file:
+                    reader = csv.reader(file)
+                    header = next(reader)
+                    batch = []
+                    sql = (
+                        f"INSERT INTO {table} VALUES("
+                        + ",".join("?" for _ in header)
+                        + ")"
+                    )
+                    for raw in reader:
+                        row = [
+                            int(value)
+                            if table != "assets" or i in [0, 9, 10, 11, 12]
+                            else None
+                            if i == 8
+                            else value
+                            for i, value in enumerate(raw)
+                        ]
+                        batch.append(row)
+                        if len(batch) == 10000:
+                            db.execute("BEGIN")
+                            db.executemany(sql, batch)
+                            db.execute("COMMIT")
+                            batch = []
+                    if batch:
                         db.execute("BEGIN")
-                        insert_batch(db, batch)
+                        db.executemany(sql, batch)
                         db.execute("COMMIT")
-                        batch = []
-                if batch:
-                    db.execute("BEGIN")
-                    insert_batch(db, batch)
-                    db.execute("COMMIT")
         add_indexes(db)
         proof = verify(db, manifest)
         checkpoint(db, engine)
@@ -646,7 +649,7 @@ def mixed(engine, path, count, memory_mb, repetitions):
                 db.execute("BEGIN")
                 if operation == "rating":
                     db.execute(
-                        "UPDATE assets SET rating=? WHERE sequence=?",
+                        "UPDATE annotations SET rating=? WHERE asset_id=?",
                         [1 + i % 5, sequence],
                     )
                 else:
@@ -663,7 +666,8 @@ def mixed(engine, path, count, memory_mb, repetitions):
                 if operation == "rating":
                     assert (
                         db.execute(
-                            "SELECT rating FROM assets WHERE sequence=?", [sequence]
+                            "SELECT rating FROM annotations WHERE asset_id=?",
+                            [sequence],
                         ).fetchone()[0]
                         == 1 + i % 5
                     )
@@ -994,8 +998,11 @@ def summarize(root):
             pages = {}
             for memory in [256, 64]:
                 warm = result.get(f"warm_{memory}mb", {})
-                checks[f"warm_{memory}mb"] = bool(warm.get("workloads")) and all(
+                checks[f"warm_{memory}mb"] = set(warm.get("workloads", {})) == set(
+                    QUERY_SQL
+                ) and all(
                     v["distribution"]["p95_ms"] <= 100
+                    and v["distribution"].get("n") == manifest["repetitions"]
                     for k, v in warm.get("workloads", {}).items()
                     if k != "aggregate"
                 )
@@ -1007,10 +1014,23 @@ def summarize(root):
                     for name, value in warm.get("workloads", {}).items()
                 }
             fresh = result.get("fresh_process", {})
-            checks["fresh_process"] = len(fresh) == len(QUERY_SQL) - 1 and all(
+            checks["fresh_process"] = set(fresh) == set(QUERY_SQL) - {
+                "aggregate"
+            } and all(
                 not value["errors"]
+                and value.get("open_plus_query", {}).get("n")
+                == manifest["fresh_repetitions"]
                 and value.get("open_plus_query", {}).get("p95_ms", float("inf")) <= 500
                 for value in fresh.values()
+            )
+            checks["fresh_rss"] = set(fresh) == set(QUERY_SQL) - {"aggregate"} and all(
+                value.get("peak_rss_bytes", float("inf")) <= 4 * 1024**3
+                for value in fresh.values()
+            )
+            query_plans = result.get("plans", {})
+            checks["query_plans"] = set(query_plans) == set(QUERY_SQL) and all(
+                isinstance(query_plans[name], list) and bool(query_plans[name])
+                for name in QUERY_SQL
             )
             mixed = result.get("mixed", {})
             checks["mixed_writes"] = (
@@ -1020,6 +1040,8 @@ def summarize(root):
                 and all(
                     mixed.get("workloads", {}).get(name, {}).get("p95_ms", float("inf"))
                     <= 100
+                    and mixed.get("workloads", {}).get(name, {}).get("n")
+                    == manifest["repetitions"]
                     for name in ["rating", "edit"]
                 )
             )

@@ -72,6 +72,61 @@ class BenchmarkContract(unittest.TestCase):
                 ) if engine == "sqlite" else None
                 db.close()
 
+    def test_summary_fails_closed_for_plan_and_fresh_memory_proof(self):
+        import copy
+
+        samples = bench.distribution([1, 1, 1, 1])
+        warm = {
+            "peak_rss_bytes": 1024,
+            "workloads": {name: {"distribution": samples} for name in bench.QUERY_SQL},
+        }
+        fresh = {
+            name: {"errors": [], "open_plus_query": samples, "peak_rss_bytes": 1024}
+            for name in bench.QUERY_SQL
+            if name != "aggregate"
+        }
+        good = {
+            "load": {},
+            "plans": {name: [[0, "plan"]] for name in bench.QUERY_SQL},
+            "warm_256mb": warm,
+            "warm_64mb": warm,
+            "fresh_process": fresh,
+            "mixed": {
+                "errors": [],
+                "background": {"errors": []},
+                "workloads": {"rating": samples, "edit": samples},
+            },
+            "recovery": {"before": {"actual": 1}, "after": {"actual": 2}},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bench.dump(
+                root / "campaign.json",
+                {"counts": [10000], "repetitions": 4, "fresh_repetitions": 4},
+            )
+
+            def evaluate(receipt):
+                for engine in ["sqlite", "duckdb"]:
+                    bench.dump(root / "10000" / f"{engine}.json", receipt)
+                return bench.summarize(root)["scale_results"]["10000"]["sqlite"]
+
+            self.assertTrue(evaluate(good)["all_pass"])
+            broken = copy.deepcopy(good)
+            broken["plans"] = {"error": "EXPLAIN failed", "returncode": 1}
+            self.assertFalse(evaluate(broken)["checks"]["query_plans"])
+            broken = copy.deepcopy(good)
+            del broken["plans"]["page_deep"]
+            self.assertFalse(evaluate(broken)["all_pass"])
+            broken = copy.deepcopy(good)
+            broken["fresh_process"]["page_deep"]["peak_rss_bytes"] = 8 * 1024**3
+            self.assertFalse(evaluate(broken)["checks"]["fresh_rss"])
+            broken = copy.deepcopy(good)
+            del broken["fresh_process"]["page_deep"]["peak_rss_bytes"]
+            self.assertFalse(evaluate(broken)["all_pass"])
+            broken = copy.deepcopy(good)
+            broken["mixed"]["workloads"]["rating"]["n"] = 1
+            self.assertFalse(evaluate(broken)["checks"]["mixed_writes"])
+
     def test_generator_is_reproducible_and_metadata_agrees(self):
         a = bench.asset_row(17)
         b = bench.asset_row(18)
