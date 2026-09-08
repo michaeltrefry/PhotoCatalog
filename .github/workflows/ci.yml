@@ -24,9 +24,41 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native image libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libraw-dev libavif-dev pkg-config
+      - name: Install native image libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libraw libavif pkgconf
+      - name: Check out pinned vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: microsoft/vcpkg
+          ref: 04a9d8e5212d01ee1dd9478eadd9caade4f8b0d4
+          path: .vcpkg
+      - name: Cache native image libraries (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: vcpkg_installed
+          key: windows-x64-static-md-vcpkg-04a9d8e-${{ hashFiles('vcpkg.json') }}
+      - name: Install native image libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./.vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./.vcpkg/vcpkg.exe install --triplet x64-windows-static-md --x-manifest-root="$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "VCPKG_ROOT=$env:GITHUB_WORKSPACE/.vcpkg" >> $env:GITHUB_ENV
+          "VCPKG_INSTALLED_ROOT=$env:GITHUB_WORKSPACE/vcpkg_installed" >> $env:GITHUB_ENV
+          "VCPKGRS_TRIPLET=x64-windows-static-md" >> $env:GITHUB_ENV
       - name: Install repository toolchain
         shell: bash
         run: rustup show
