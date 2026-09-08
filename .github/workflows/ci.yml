@@ -32,7 +32,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libraw-dev libavif-dev libjxl-dev libjpeg-dev zlib1g-dev pkg-config
+          sudo apt-get install -y libraw-dev libavif-dev libjpeg-dev zlib1g-dev pkg-config
       - name: Install native image libraries (macOS)
         if: runner.os == 'macOS'
         run: brew install libraw libavif jpeg-xl pkgconf
@@ -67,9 +67,25 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .deps
-          key: ${{ runner.os }}-dng-sdk-1.7.1-2724-740fbe95c69e09e9
+          key: ${{ runner.os }}-${{ runner.arch }}-dng-sdk-2724-740fbe95-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Fetch and verify pinned DNG SDK
         run: python scripts/fetch_dng_sdk.py --destination .deps
+      - name: Build bundled JPEG XL for DNG compatibility (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cmake -S "$PHOTOCATALOG_DNG_SDK/libjxl/libjxl" -B .deps/jxl-build \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.deps/jxl" \
+            -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF \
+            -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_DEVTOOLS=OFF \
+            -DJPEGXL_ENABLE_JPEGLI=OFF -DJPEGXL_ENABLE_JPEGLI_LIBJPEG=OFF \
+            -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
+            -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_EXAMPLES=OFF \
+            -DJPEGXL_ENABLE_JNI=OFF -DJPEGXL_ENABLE_SJPEG=OFF -DJPEGXL_ENABLE_OPENEXR=OFF
+          cmake --build .deps/jxl-build --parallel 4
+          cmake --install .deps/jxl-build
+          echo "PKG_CONFIG_PATH=$GITHUB_WORKSPACE/.deps/jxl/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/.deps/jxl/lib" >> "$GITHUB_ENV"
       - name: Cache Rust dependencies
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
