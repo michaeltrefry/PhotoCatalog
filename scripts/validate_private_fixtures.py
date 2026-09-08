@@ -28,6 +28,19 @@ def main():
         raise RuntimeError("A real CR2 fixture is required")
     if not any(p.suffix.lower() in {".jpg", ".jpeg"} for p in originals):
         raise RuntimeError("A real JPEG fixture is required")
+    expected_formats = {}
+    for path in originals:
+        suffix = path.suffix.lower()
+        with path.open("rb") as source:
+            header = source.read(16)
+        if suffix == ".cr2":
+            if not (header[:4] in {b"II*\0", b"MM\0*"} and header[8:12] == b"CR\x02\0"):
+                raise RuntimeError("CR2 fixture does not contain a CR2 header")
+            expected_formats[path.resolve()] = "CR2"
+        elif suffix in {".jpg", ".jpeg"}:
+            if not header.startswith(b"\xff\xd8"):
+                raise RuntimeError("JPEG fixture does not contain a JPEG header")
+            expected_formats[path.resolve()] = "JPEG"
     before = {p: (p.stat().st_size, p.stat().st_mtime_ns, digest(p)) for p in originals}
     with tempfile.TemporaryDirectory(prefix="photocatalog-private-validation-") as directory:
         root = Path(directory)
@@ -58,6 +71,11 @@ def main():
             if fetched != asset or asset["state"] != "ready":
                 raise RuntimeError("Asset did not survive process restart as ready")
             metadata = asset["metadata"]
+            expected = expected_formats.get(Path(asset["original_path"]).resolve())
+            if expected is not None and metadata["format"] != expected:
+                raise RuntimeError("Decoded fixture format differs from expected content")
+            if expected == "CR2" and metadata["preview_source"] != "embedded JPEG (not RAW development)":
+                raise RuntimeError("CR2 fixture did not exercise embedded-preview extraction")
             if metadata["width"] <= 0 or metadata["height"] <= 0:
                 raise RuntimeError("Invalid image dimensions")
             output = root / f"preview-{index}.jpg"
@@ -67,6 +85,8 @@ def main():
                 raise RuntimeError("Preview is not a complete JPEG stream")
             evidence.append({"format": metadata["format"], "width": metadata["width"],
                              "height": metadata["height"], "preview_bytes": len(encoded)})
+        if not {"CR2", "JPEG"}.issubset({item["format"] for item in evidence}):
+            raise RuntimeError("Receipt must include both decoded CR2 and JPEG evidence")
         retry = run("import", fixtures)
         if retry["imported"] != 0 or retry["unchanged"] != len(assets):
             raise RuntimeError("Repeated import did not retain existing records")
