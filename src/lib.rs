@@ -114,13 +114,7 @@ impl Catalog {
             !self.root.starts_with(&folder) && !folder.starts_with(&self.root),
             "catalog and originals must be separate directories"
         );
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join("import.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock).context("another catalog import is running")?;
+        let _lock = ImportLock::acquire(&self.root.join("import.lock"))?;
         let mut report = ImportReport::default();
         let mut processed = 0;
         for entry in walkdir::WalkDir::new(&folder)
@@ -411,4 +405,76 @@ fn prospective_directory(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(resolved)
+}
+
+struct ImportLock(File);
+impl ImportLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        fs2::FileExt::try_lock_exclusive(&file).context("another catalog import is running")?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for ImportLock {
+    fn drop(&mut self) {
+        // Closing only our descriptor can leave flock held by a fork's inherited
+        // open-file description until exec. Release at the operation boundary,
+        // including early errors and unwinding, before closing this descriptor.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+    #[test]
+    fn finishing_import_releases_lock_even_if_a_descriptor_was_duplicated() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("import.lock");
+        let lock = ImportLock::acquire(&path)?;
+        assert!(ImportLock::acquire(&path).is_err());
+        // A fork can retain the same open-file description until the child's exec.
+        // try_clone reproduces that descriptor lifetime deterministically.
+        let inherited = lock.0.try_clone()?;
+        drop(lock);
+        let next_import = ImportLock::acquire(&path)?;
+        drop(inherited);
+        drop(next_import);
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn failed_or_unwinding_import_releases_duplicated_lock() -> Result<()> {
+    for unwind in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("import.lock");
+        let mut inherited = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            let lock = ImportLock::acquire(&path)?;
+            inherited = Some(lock.0.try_clone()?);
+            if unwind {
+                panic!("controlled importer unwind");
+            }
+            bail!("controlled importer failure")
+        }));
+        if unwind {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().is_err());
+        }
+        let next_import = ImportLock::acquire(&path)?;
+        drop(inherited);
+        // Closing the old duplicate must not release the new operation's lock.
+        assert!(ImportLock::acquire(&path).is_err());
+        drop(next_import);
+    }
+    Ok(())
 }
