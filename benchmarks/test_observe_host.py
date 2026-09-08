@@ -1,3 +1,4 @@
+import contextlib
 import json
 import plistlib
 import signal
@@ -8,10 +9,47 @@ import subprocess
 import types
 import unittest
 
-from observe_host import counter_delta, gpu_snapshot, main, stamp
+from observe_host import HostSampler, counter_delta, gpu_snapshot, main, stamp
 
 
 class ObserverTests(unittest.TestCase):
+    def test_reused_pid_does_not_mix_cached_creation_time_with_replacement_cpu(self):
+        state = {"created": 1000, "cpu": 5.0, "cached": None}
+
+        def process_iter():
+            if state["cached"] is None:
+                process = mock.Mock(pid=424242)
+                process.name.return_value = "worker"
+                process.create_time.return_value = state["created"]
+                process.cpu_times.side_effect = lambda: types.SimpleNamespace(user=state["cpu"], system=0)
+                process.memory_info.return_value = types.SimpleNamespace(rss=4096)
+                process.oneshot.side_effect = contextlib.nullcontext
+                state["cached"] = process
+            return [state["cached"]]
+
+        def clear_cache():
+            state["cached"] = None
+
+        iterator = mock.Mock(side_effect=process_iter)
+        iterator.cache_clear.side_effect = clear_cache
+        timestamps = [{"utc": "test", "monotonic_seconds": t} for t in (10.0, 11.0, 12.0)]
+        with mock.patch("observe_host.psutil.process_iter", iterator), \
+             mock.patch("observe_host.gpu_snapshot", return_value={"status": "unavailable"}), \
+             mock.patch("observe_host.stamp", side_effect=timestamps):
+            sampler = HostSampler()
+            first = sampler.sample()["processes"]["items"][0]
+            self.assertEqual(first["cpu_status"], "baseline")
+            # The replacement's counters would yield a false 100% if the old
+            # cached create_time (1000) were combined with its live CPU value6.
+            state.update(created=2000, cpu=6.0)
+            replacement = sampler.sample()["processes"]["items"][0]
+            self.assertEqual(replacement["cpu_status"], "baseline")
+            self.assertIsNone(replacement["cpu_percent"])
+            state["cpu"] = 6.5
+            continued = sampler.sample()["processes"]["items"][0]
+            self.assertEqual(continued["cpu_status"], "available")
+            self.assertEqual(continued["cpu_percent"], 50.0)
+
     def test_existing_output_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "existing.jsonl"

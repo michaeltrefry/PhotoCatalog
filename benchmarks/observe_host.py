@@ -129,6 +129,9 @@ class HostSampler:
         current_processes = {}
         disappeared = 0
         try:
+            # psutil caches Process objects and create_time across process_iter
+            # calls; discard them so a reused PID gets its current identity.
+            psutil.process_iter.cache_clear()
             for process in psutil.process_iter():
                 try:
                     # Do not request argv, executable path, environment, username or open files.
