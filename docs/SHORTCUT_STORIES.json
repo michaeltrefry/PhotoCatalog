@@ -1,0 +1,188 @@
+{
+  "epic": 22835,
+  "team": "6a9ff222-1702-437c-be8b-9e6547440079",
+  "workflow": 500000005,
+  "state": 500000007,
+  "stories": [
+    {
+      "slice": "S1",
+      "name": "Catalog a real external folder through a usable Rust skeleton",
+      "type": "feature",
+      "deps": [],
+      "inherited": "E1, E2, E3, E4, E8, E11",
+      "body": "Create a UI-independent Rust core and minimal CLI that imports an explicitly selected fixture folder, stores stable records and previews, and supports paged browsing after restart. A provisional SQLite implementation is an experiment, not the backend decision.\n\nAcceptance (story-local):\n- Import representative CR2 and JPEG fixtures, retrieve their metadata and preview by stable identity, and paginate results after restarting the process.\n- Repeated or interrupted import resumes without duplicate records or incomplete previews being presented as valid.\n- The same fixture workflow builds and runs on macOS, Windows, and Linux; private library fixtures remain outside Git.\n\nValidation: CLI end-to-end fixtures, injected interruption/restart, source hashes, three-platform CI.",
+      "acCount": 3,
+      "id": 22836,
+      "description": "Create a UI-independent Rust core and minimal CLI that imports an explicitly selected fixture folder, stores stable records and previews, and supports paged browsing after restart. A provisional SQLite implementation is an experiment, not the backend decision.\n\nAcceptance (story-local):\n- Import representative CR2 and JPEG fixtures, retrieve their metadata and preview by stable identity, and paginate results after restarting the process.\n- Repeated or interrupted import resumes without duplicate records or incomplete previews being presented as valid.\n- The same fixture workflow builds and runs on macOS, Windows, and Linux; private library fixtures remain outside Git.\n\nValidation: CLI end-to-end fixtures, injected interruption/restart, source hashes, three-platform CI.\n\nInherits epic requirements: E1, E2, E3, E4, E8, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: none\nPlan slice: S1\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S2",
+      "name": "Select and integrate the catalog backend using representative scale benchmarks",
+      "type": "chore",
+      "deps": [
+        "S1"
+      ],
+      "inherited": "E1, E2, E11",
+      "body": "Compare SQLite and DuckDB with the same logical catalog, realistic skew and relationships, durable write policy, and foreground workload. Integrate the selected backend into the skeleton; retain the comparison harness without imposing a speculative permanent multi-database abstraction.\n\nAcceptance (story-local):\n- Reproducible results at 1M, 5M, and 10M asset records cover cold/warm paging, combined filters, aggregates, rating/edit writes during import, memory, disk growth, and interrupted transactions.\n- An evidence-backed database decision meets the fixed interaction budgets, or an explicit requirement/architecture decision is escalated before dependent delivery.\n- The selected backend persists the skeleton's identities and data without loss, and its query plans avoid unbounded work on ordinary deep-page navigation.\n\nValidation: Versioned generator seed/schema/workload, named hardware and storage, query plans, p50/p95/p99 distributions, exact durability settings and memory limits.",
+      "acCount": 3,
+      "id": 22837,
+      "description": "Compare SQLite and DuckDB with the same logical catalog, realistic skew and relationships, durable write policy, and foreground workload. Integrate the selected backend into the skeleton; retain the comparison harness without imposing a speculative permanent multi-database abstraction.\n\nAcceptance (story-local):\n- Reproducible results at 1M, 5M, and 10M asset records cover cold/warm paging, combined filters, aggregates, rating/edit writes during import, memory, disk growth, and interrupted transactions.\n- An evidence-backed database decision meets the fixed interaction budgets, or an explicit requirement/architecture decision is escalated before dependent delivery.\n- The selected backend persists the skeleton's identities and data without loss, and its query plans avoid unbounded work on ordinary deep-page navigation.\n\nValidation: Versioned generator seed/schema/workload, named hardware and storage, query plans, p50/p95/p99 distributions, exact durability settings and memory limits.\n\nInherits epic requirements: E1, E2, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22836\nPlan slice: S2\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S3",
+      "name": "Provide broad photo decoding and a validated RAW/color pipeline",
+      "type": "chore",
+      "deps": [
+        "S1"
+      ],
+      "inherited": "E1, E3, E9",
+      "body": "Select and integrate mature decoding, metadata access, camera profiling, and color-management components behind Rust interfaces. Freeze a capability matrix using cameras found in the catalog plus standard format fixtures; include TIFF and PSD composite rendering as the library-driven addition.\n\nAcceptance (story-local):\n- CR2, DNG, JPEG, PNG, AVIF, WebP, BMP, TIFF, and PSD composites decode to correctly oriented color-managed images on all three platforms, with explicit statuses for unsupported variants and corrupt inputs.\n- The RAW matrix covers representative Canon, Fujifilm, Panasonic, and DJI files identified during discovery, including supported HDR/linear DNG, camera profiles, and higher bit depths; any unavailable capability is brought back for decision.\n- Full-quality rendering preserves declared color/alpha/bit-depth behavior and supplies a deterministic input to the editor without depending on a lossy browse thumbnail.\n\nValidation: Private real-camera corpus plus redistributable format fixtures, numerical/reference-image comparisons and visual inspection; dependency/build/license compatibility audit.",
+      "acCount": 3,
+      "id": 22838,
+      "description": "Select and integrate mature decoding, metadata access, camera profiling, and color-management components behind Rust interfaces. Freeze a capability matrix using cameras found in the catalog plus standard format fixtures; include TIFF and PSD composite rendering as the library-driven addition.\n\nAcceptance (story-local):\n- CR2, DNG, JPEG, PNG, AVIF, WebP, BMP, TIFF, and PSD composites decode to correctly oriented color-managed images on all three platforms, with explicit statuses for unsupported variants and corrupt inputs.\n- The RAW matrix covers representative Canon, Fujifilm, Panasonic, and DJI files identified during discovery, including supported HDR/linear DNG, camera profiles, and higher bit depths; any unavailable capability is brought back for decision.\n- Full-quality rendering preserves declared color/alpha/bit-depth behavior and supplies a deterministic input to the editor without depending on a lossy browse thumbnail.\n\nValidation: Private real-camera corpus plus redistributable format fixtures, numerical/reference-image comparisons and visual inspection; dependency/build/license compatibility audit.\n\nInherits epic requirements: E1, E3, E9\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22836\nPlan slice: S3\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S4",
+      "name": "Retain complete XMP and reconcile metadata sources",
+      "type": "feature",
+      "deps": [
+        "S2",
+        "S3"
+      ],
+      "inherited": "E4, E6, E7, E11",
+      "body": "Store original embedded and sidecar XMP packets with source identity, digest, and provenance while indexing useful fields. Represent conflicting source values without losing their originals. Controlled export merges only selected changes.\n\nAcceptance (story-local):\n- Import retains original packet bytes and all unknown namespaces, arrays, nested structures, and qualifiers; indexed common metadata remains queryable.\n- Conflicting catalog/sidecar/embedded values are visible with source provenance and can be resolved without erasing the retained source versions.\n- Explicit metadata export round-trips unrelated XMP semantics unchanged, detects externally changed destinations, and leaves originals/sidecars untouched during ordinary import and editing.\n\nValidation: Adversarial XMP fixtures, original-byte digests, parse/serialize semantic comparisons, cross-source conflict and concurrent-file-change cases.",
+      "acCount": 3,
+      "id": 22839,
+      "description": "Store original embedded and sidecar XMP packets with source identity, digest, and provenance while indexing useful fields. Represent conflicting source values without losing their originals. Controlled export merges only selected changes.\n\nAcceptance (story-local):\n- Import retains original packet bytes and all unknown namespaces, arrays, nested structures, and qualifiers; indexed common metadata remains queryable.\n- Conflicting catalog/sidecar/embedded values are visible with source provenance and can be resolved without erasing the retained source versions.\n- Explicit metadata export round-trips unrelated XMP semantics unchanged, detects externally changed destinations, and leaves originals/sidecars untouched during ordinary import and editing.\n\nValidation: Adversarial XMP fixtures, original-byte digests, parse/serialize semantic comparisons, cross-source conflict and concurrent-file-change cases.\n\nInherits epic requirements: E4, E6, E7, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22837, sc-22838\nPlan slice: S4\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S5",
+      "name": "Reconnect external storage and relink folders or individual originals",
+      "type": "feature",
+      "deps": [
+        "S2"
+      ],
+      "inherited": "E4, E5, E11",
+      "body": "Represent unavailable storage and support previewable, atomic, undoable path remapping for root folders, subfolders, and files, including old macOS and Windows path references.\n\nAcceptance (story-local):\n- Disconnect/reconnect preserves browsing and organization; return of a known volume reconnects matching originals without creating new identities.\n- Proactive and missing-folder relinks show matched, missing, and ambiguous candidates, update descendants by relative path, and support individual exceptions without silently matching same-name different files.\n- Interrupted relinks and undo preserve a consistent set of paths, asset identities, variants, and edit associations.\n\nValidation: Fixture volume removal/remount, changed mount names, relocated/reorganized trees, Unicode/case differences, filename collisions, transaction fault injection, real legacy path mappings.",
+      "acCount": 3,
+      "id": 22840,
+      "description": "Represent unavailable storage and support previewable, atomic, undoable path remapping for root folders, subfolders, and files, including old macOS and Windows path references.\n\nAcceptance (story-local):\n- Disconnect/reconnect preserves browsing and organization; return of a known volume reconnects matching originals without creating new identities.\n- Proactive and missing-folder relinks show matched, missing, and ambiguous candidates, update descendants by relative path, and support individual exceptions without silently matching same-name different files.\n- Interrupted relinks and undo preserve a consistent set of paths, asset identities, variants, and edit associations.\n\nValidation: Fixture volume removal/remount, changed mount names, relocated/reorganized trees, Unicode/case differences, filename collisions, transaction fault injection, real legacy path mappings.\n\nInherits epic requirements: E4, E5, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22837\nPlan slice: S5\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S6",
+      "name": "Deliver compressed previews with bounded storage and responsive scheduling",
+      "type": "feature",
+      "deps": [
+        "S2",
+        "S3"
+      ],
+      "inherited": "E2, E5, E8, E9, E11",
+      "body": "Select preview codec/layout by measured decode latency, quality, and total footprint. Retain an offline thumbnail tier and budget larger previews separately; schedule visible photos ahead of bulk work.\n\nAcceptance (story-local):\n- Codec/layout evidence covers JPEG, WebP, and AVIF, with selected thumbnail/preview sizes, quality samples, and measured storage and scrolling costs.\n- Configurable cache budgets, cancellable requests, and foreground priority hold resource limits during imports; unavailable-original thumbnails remain usable and disk exhaustion is reported without corrupting catalog state.\n- Preview keys include asset revision, edit revision, and rendering version, preventing stale results from overwriting newer edits; interrupted writes are recoverable.\n\nValidation: Real RAW/raster preview set, codec comparison, rapid-navigation race tests, memory/queue bounds, low-disk and source-disconnection cases.",
+      "acCount": 3,
+      "id": 22841,
+      "description": "Select preview codec/layout by measured decode latency, quality, and total footprint. Retain an offline thumbnail tier and budget larger previews separately; schedule visible photos ahead of bulk work.\n\nAcceptance (story-local):\n- Codec/layout evidence covers JPEG, WebP, and AVIF, with selected thumbnail/preview sizes, quality samples, and measured storage and scrolling costs.\n- Configurable cache budgets, cancellable requests, and foreground priority hold resource limits during imports; unavailable-original thumbnails remain usable and disk exhaustion is reported without corrupting catalog state.\n- Preview keys include asset revision, edit revision, and rendering version, preventing stale results from overwriting newer edits; interrupted writes are recoverable.\n\nValidation: Real RAW/raster preview set, codec comparison, rapid-navigation race tests, memory/queue bounds, low-disk and source-disconnection cases.\n\nInherits epic requirements: E2, E5, E8, E9, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22837, sc-22838\nPlan slice: S6\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S7",
+      "name": "Organize and search the library without loading the whole catalog",
+      "type": "feature",
+      "deps": [
+        "S4"
+      ],
+      "inherited": "E2, E4, E7",
+      "body": "Provide durable folder views, hierarchical keywords, ratings, pick/reject flags, color labels, collections, and combined photographic-metadata filters through paged APIs.\n\nAcceptance (story-local):\n- All agreed organization operations persist after restart and maintain keyword hierarchy and collection membership through asset relinks.\n- Combined text/keyword, date, camera/lens, format, rating, flag, and label queries support stable sorting/pagination under concurrent imports and edits.\n- Batch organization changes are atomic or expose a resumable job with an exact completion state, and remain within the interaction budgets.\n\nValidation: Mixed-filter correctness fixtures, tie/cursor-boundary changes, high-cardinality keywords/collections, durable batch-operation tests.",
+      "acCount": 3,
+      "id": 22842,
+      "description": "Provide durable folder views, hierarchical keywords, ratings, pick/reject flags, color labels, collections, and combined photographic-metadata filters through paged APIs.\n\nAcceptance (story-local):\n- All agreed organization operations persist after restart and maintain keyword hierarchy and collection membership through asset relinks.\n- Combined text/keyword, date, camera/lens, format, rating, flag, and label queries support stable sorting/pagination under concurrent imports and edits.\n- Batch organization changes are atomic or expose a resumable job with an exact completion state, and remain within the interaction budgets.\n\nValidation: Mixed-filter correctness fixtures, tie/cursor-boundary changes, high-cardinality keywords/collections, durable batch-operation tests.\n\nInherits epic requirements: E2, E4, E7\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22839\nPlan slice: S7\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S8",
+      "name": "Edit non-destructively and export full-quality batches",
+      "type": "feature",
+      "deps": [
+        "S3",
+        "S4",
+        "S6"
+      ],
+      "inherited": "E4, E6, E8, E9, E11",
+      "body": "Implement the complete agreed basic editing surface as versioned recipes, with variants, persistent undo, adjustment transfer, responsive previews, and full-resolution export. Initial export formats are JPEG, PNG, and TIFF.\n\nAcceptance (story-local):\n- Crop/straighten, exposure, white balance, contrast, highlights/shadows, color adjustments, sharpening, and noise reduction work on supported RAW/raster sources; undo and independent variants survive restart.\n- Copy/paste adjustments and batch export apply the intended recipe deterministically, preserve selected metadata, and report missing originals or incompatible operations rather than substituting browse previews.\n- Exports honor selected output size, format, bit depth, and color profile with cancellation, explicit overwrite handling, and no changes to originals.\n\nValidation: Per-operation and combined recipe fixtures, color/precision reference checks, original hashes, cross-platform export comparisons, cancellation/restart and missing-source cases.",
+      "acCount": 3,
+      "id": 22843,
+      "description": "Implement the complete agreed basic editing surface as versioned recipes, with variants, persistent undo, adjustment transfer, responsive previews, and full-resolution export. Initial export formats are JPEG, PNG, and TIFF.\n\nAcceptance (story-local):\n- Crop/straighten, exposure, white balance, contrast, highlights/shadows, color adjustments, sharpening, and noise reduction work on supported RAW/raster sources; undo and independent variants survive restart.\n- Copy/paste adjustments and batch export apply the intended recipe deterministically, preserve selected metadata, and report missing originals or incompatible operations rather than substituting browse previews.\n- Exports honor selected output size, format, bit depth, and color profile with cancellation, explicit overwrite handling, and no changes to originals.\n\nValidation: Per-operation and combined recipe fixtures, color/precision reference checks, original hashes, cross-platform export comparisons, cancellation/restart and missing-source cases.\n\nInherits epic requirements: E4, E6, E8, E9, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22838, sc-22839, sc-22841\nPlan slice: S8\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S9",
+      "name": "Inspect Lightroom catalogs and produce a preservation and migration dry run",
+      "type": "feature",
+      "deps": [
+        "S4"
+      ],
+      "inherited": "E3, E4, E6, E10, E11",
+      "body": "Group candidate files by logical year/named catalog family and suggest one most recent/current member per family for user review, leaving backups and older variants unselected. Read consistent snapshots and relevant companion data from the selected members, detect schema versions, and generate a complete migration plan with source identifiers and preserved opaque data.\n\nAcceptance (story-local):\n- Snapshot handling accounts for active writers, WAL/SHM, and .lrcat-data or .acr companions; unsafe/incomplete sources are reported and never silently read as complete.\n- Dry runs show the selected current member and excluded older copies for each family, expose ambiguous recency evidence, and enumerate selected files, virtual copies, organization, edits/history/snapshots, missing paths, conflicts, and unsupported constructs with source IDs and reconciled counts.\n- Original XMP and source catalog/auxiliary evidence are preserved with digests; the report distinguishes supported semantic imports from retained-only data and unverified Adobe rendering equivalence.\n\nValidation: Synthetic schema/version/WAL and catalog-family fixtures, including misleading suffixes, copied-file timestamps, renamed families, ambiguous candidates, and the observed 2018 case where the suffixed member is newer; read-only snapshots of selected current catalogs. Earlier 2013/2019 samples may be compatibility fixtures without being real migration selections. Verify unchanged sources and count/relation reconciliation. Never execute stored catalog text as code.",
+      "acCount": 3,
+      "id": 22844,
+      "description": "Group candidate files by logical year/named catalog family and suggest one most recent/current member per family for user review, leaving backups and older variants unselected. Read consistent snapshots and relevant companion data from the selected members, detect schema versions, and generate a complete migration plan with source identifiers and preserved opaque data.\n\nAcceptance (story-local):\n- Snapshot handling accounts for active writers, WAL/SHM, and .lrcat-data or .acr companions; unsafe/incomplete sources are reported and never silently read as complete.\n- Dry runs show the selected current member and excluded older copies for each family, expose ambiguous recency evidence, and enumerate selected files, virtual copies, organization, edits/history/snapshots, missing paths, conflicts, and unsupported constructs with source IDs and reconciled counts.\n- Original XMP and source catalog/auxiliary evidence are preserved with digests; the report distinguishes supported semantic imports from retained-only data and unverified Adobe rendering equivalence.\n\nValidation: Synthetic schema/version/WAL and catalog-family fixtures, including misleading suffixes, copied-file timestamps, renamed families, ambiguous candidates, and the observed 2018 case where the suffixed member is newer; read-only snapshots of selected current catalogs. Earlier 2013/2019 samples may be compatibility fixtures without being real migration selections. Verify unchanged sources and count/relation reconciliation. Never execute stored catalog text as code.\n\nInherits epic requirements: E3, E4, E6, E10, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22839\nPlan slice: S9\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S10",
+      "name": "Import Lightroom organization and independent edit variants with reconciliation",
+      "type": "feature",
+      "deps": [
+        "S5",
+        "S7",
+        "S8",
+        "S9"
+      ],
+      "inherited": "E4, E5, E6, E7, E9, E10, E11",
+      "body": "Execute the approved dry-run selection of one current catalog per family into PhotoCatalog, retaining distinct source records and virtual copies while resolving shared originals and path mappings. Older catalog backups are not merged into the imported history. Translate only settings whose semantics are validated; preserve every remaining selected-source payload and expose the compatibility result.\n\nAcceptance (story-local):\n- Selected source counts and relationships reconcile after import: files, metadata, keywords, collections and virtual copies remain accounted for; preserved smart-collection/stack/history constructs are explicitly classified where native behavior differs.\n- Reimport or resume is idempotent; excluded backups produce no imported records, and overlap or conflicting variants among the selected current catalogs are handled by stable source identities and explicit decisions.\n- Each imported variant exposes original Adobe settings/history and a compatibility status; validated settings are rendered through native recipes, with unsupported settings and appearance differences clearly reported.\n\nValidation: Selected-current-catalog snapshot imports with fresh count/relation reconciliation, excluded-backup assertions, overlap/conflict fixtures, source and XMP hashes, interrupted migration and translated-render checks. The previously observed 40/2,154 virtual-copy counts apply only if those exact 2013/2019 snapshots are used as compatibility fixtures; do not use them as acceptance totals for a different current catalog.",
+      "acCount": 3,
+      "id": 22845,
+      "description": "Execute the approved dry-run selection of one current catalog per family into PhotoCatalog, retaining distinct source records and virtual copies while resolving shared originals and path mappings. Older catalog backups are not merged into the imported history. Translate only settings whose semantics are validated; preserve every remaining selected-source payload and expose the compatibility result.\n\nAcceptance (story-local):\n- Selected source counts and relationships reconcile after import: files, metadata, keywords, collections and virtual copies remain accounted for; preserved smart-collection/stack/history constructs are explicitly classified where native behavior differs.\n- Reimport or resume is idempotent; excluded backups produce no imported records, and overlap or conflicting variants among the selected current catalogs are handled by stable source identities and explicit decisions.\n- Each imported variant exposes original Adobe settings/history and a compatibility status; validated settings are rendered through native recipes, with unsupported settings and appearance differences clearly reported.\n\nValidation: Selected-current-catalog snapshot imports with fresh count/relation reconciliation, excluded-backup assertions, overlap/conflict fixtures, source and XMP hashes, interrupted migration and translated-render checks. The previously observed 40/2,154 virtual-copy counts apply only if those exact 2013/2019 snapshots are used as compatibility fixtures; do not use them as acceptance totals for a different current catalog.\n\nInherits epic requirements: E4, E5, E6, E7, E9, E10, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22840, sc-22842, sc-22843, sc-22844\nPlan slice: S10\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S11",
+      "name": "Back up and restore catalog state and migration evidence",
+      "type": "feature",
+      "deps": [
+        "S8",
+        "S10"
+      ],
+      "inherited": "E4, E6, E10, E11",
+      "body": "Provide consistent backups of irreplaceable state with verified restoration and safe schema upgrades, separately from regenerable previews. A catalog backup does not pretend to back up external originals.\n\nAcceptance (story-local):\n- Backup captures identities, metadata, edit/undo/variant state, original XMP packets, provenance, and retained migration evidence consistently while jobs run.\n- Restore into a new destination reproduces the preserved state and supports relinking external originals; preview absence triggers safe regeneration.\n- Interrupted backup/restore or failed schema upgrades preserve a usable prior state and report actionable failure without promoting incomplete backups.\n\nValidation: Clean-destination restore with logical and blob digest comparisons, concurrent jobs, low-disk faults, partial archives, and upgrade failure fixtures.",
+      "acCount": 3,
+      "id": 22846,
+      "description": "Provide consistent backups of irreplaceable state with verified restoration and safe schema upgrades, separately from regenerable previews. A catalog backup does not pretend to back up external originals.\n\nAcceptance (story-local):\n- Backup captures identities, metadata, edit/undo/variant state, original XMP packets, provenance, and retained migration evidence consistently while jobs run.\n- Restore into a new destination reproduces the preserved state and supports relinking external originals; preview absence triggers safe regeneration.\n- Interrupted backup/restore or failed schema upgrades preserve a usable prior state and report actionable failure without promoting incomplete backups.\n\nValidation: Clean-destination restore with logical and blob digest comparisons, concurrent jobs, low-disk faults, partial archives, and upgrade failure fixtures.\n\nInherits epic requirements: E4, E6, E10, E11\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22843, sc-22845\nPlan slice: S11\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S12",
+      "name": "Expose the foundation through a functional desktop interface on all three platforms",
+      "type": "feature",
+      "deps": [
+        "S5",
+        "S6",
+        "S7",
+        "S8",
+        "S10",
+        "S11"
+      ],
+      "inherited": "E1, E2, E3, E5, E6, E7, E8, E9, E10, E11, E12",
+      "body": "Choose the desktop framework through a small measured grid/editor integration, then expose the full agreed foundation. Work with the user on UI choices at this stage; do not assume final styling or SceneWorks integration.\n\nAcceptance (story-local):\n- A desktop build on macOS, Windows, and Linux exposes catalog/import, virtualized browsing, search/organization, offline status, relink review/undo, editing/export, Lightroom dry-run/import, metadata conflicts, and backup/restore.\n- Visible-photo scheduling, keyboard navigation, cancellation/progress, and a color-managed image viewport keep foreground operations within the fixed interaction budgets.\n- Errors, retained-only Adobe settings, missing originals, and destructive/export choices are understandable in the relevant user flow; selected UI design and platform packaging are validated with the user.\n\nValidation: End-to-end desktop workflows on all platforms, reference-Mac frame/interaction traces, accessibility/keyboard checks and reviewed screenshots. Final visual-design refinements require explicit agreed scope.",
+      "acCount": 3,
+      "id": 22847,
+      "description": "Choose the desktop framework through a small measured grid/editor integration, then expose the full agreed foundation. Work with the user on UI choices at this stage; do not assume final styling or SceneWorks integration.\n\nAcceptance (story-local):\n- A desktop build on macOS, Windows, and Linux exposes catalog/import, virtualized browsing, search/organization, offline status, relink review/undo, editing/export, Lightroom dry-run/import, metadata conflicts, and backup/restore.\n- Visible-photo scheduling, keyboard navigation, cancellation/progress, and a color-managed image viewport keep foreground operations within the fixed interaction budgets.\n- Errors, retained-only Adobe settings, missing originals, and destructive/export choices are understandable in the relevant user flow; selected UI design and platform packaging are validated with the user.\n\nValidation: End-to-end desktop workflows on all platforms, reference-Mac frame/interaction traces, accessibility/keyboard checks and reviewed screenshots. Final visual-design refinements require explicit agreed scope.\n\nInherits epic requirements: E1, E2, E3, E5, E6, E7, E8, E9, E10, E11, E12\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22840, sc-22841, sc-22842, sc-22843, sc-22845, sc-22846\nPlan slice: S12\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    },
+    {
+      "slice": "S13",
+      "name": "Verify integrated foundation readiness and reconcile delivery",
+      "type": "chore",
+      "deps": [
+        "S12"
+      ],
+      "inherited": "E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12",
+      "body": "Own the one terminal integrated acceptance run after the backend, rendering contract, and desktop interface are stationary. Reconcile the epic and every delivered slice with merged code and evidence.\n\nAcceptance (story-local):\n- The epic's complete external-storage import/browse/edit/export/offline/relink/restart/restore scenario passes on the reference Mac, with platform-specific integrated checks on Windows and Linux.\n- Terminal scale and real-image measurements satisfy the fixed budgets, and Lightroom/XMP reconciliation proves retained source information and reports every approved compatibility limitation.\n- Merged revisions, terminal CI, reproducible artifacts, and live Shortcut read-back agree; unresolved agreed requirements keep the affected story and epic open.\n\nValidation: One integrated readiness report referencing local story evidence, exact merged revisions, hardware/configuration, performance distributions, migration reconciliation, restore digests, and tracker read-back.",
+      "acCount": 3,
+      "id": 22848,
+      "description": "Own the one terminal integrated acceptance run after the backend, rendering contract, and desktop interface are stationary. Reconcile the epic and every delivered slice with merged code and evidence.\n\nAcceptance (story-local):\n- The epic's complete external-storage import/browse/edit/export/offline/relink/restart/restore scenario passes on the reference Mac, with platform-specific integrated checks on Windows and Linux.\n- Terminal scale and real-image measurements satisfy the fixed budgets, and Lightroom/XMP reconciliation proves retained source information and reports every approved compatibility limitation.\n- Merged revisions, terminal CI, reproducible artifacts, and live Shortcut read-back agree; unresolved agreed requirements keep the affected story and epic open.\n\nValidation: One integrated readiness report referencing local story evidence, exact merged revisions, hardware/configuration, performance distributions, migration reconciliation, restore digests, and tracker read-back.\n\nInherits epic requirements: E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12\nRequirements and performance contract: https://app.shortcut.com/trefry/epic/22835\nDepends on: sc-22847\nPlan slice: S13\n\nDelivery: Revalidate current source and this story before starting. Keep implementation on a feature branch; merge and validate before Done. Preserve the epic's source-data and scope constraints."
+    }
+  ]
+}
