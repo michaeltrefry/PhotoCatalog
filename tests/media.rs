@@ -286,12 +286,13 @@ fn psd_merged_transparency_tags_and_missing_composite_are_observable() {
         bytes.extend(3u16.to_be_bytes());
         bytes.extend(0u32.to_be_bytes()); // color mode
         bytes.extend(0u32.to_be_bytes()); // resources
-        bytes.extend(20u32.to_be_bytes()); // layer and mask section
+        bytes.extend(22u32.to_be_bytes()); // layer and mask section with zero padding
         bytes.extend(0u32.to_be_bytes()); // layer info
         bytes.extend(0u32.to_be_bytes()); // global mask
         bytes.extend(b"8BIM");
         bytes.extend(key);
         bytes.extend(0u32.to_be_bytes());
+        bytes.extend([0, 0]); // trailing layer/mask section padding
         bytes.extend(0u16.to_be_bytes());
         for value in [1.0f32, 1.0, 1.0, 0.75, 1.0, 0.75, 0.0, 0.5] {
             match depth {
@@ -360,4 +361,98 @@ fn avif_container_orientation_takes_precedence_over_exif() {
         rendered.push(image.pixels);
     }
     assert_eq!(rendered[0], rendered[1]);
+}
+
+#[test]
+fn dng_spatial_gain_matches_independent_position_intensity_gamma_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    for (index, bytes, oracle) in [
+        (
+            1,
+            include_bytes!("fixtures/generated-spatial1-mask.dng").as_slice(),
+            include_str!("fixtures/generated-spatial1-mask.expected.json"),
+        ),
+        (
+            2,
+            include_bytes!("fixtures/generated-spatial2-mask.dng").as_slice(),
+            include_str!("fixtures/generated-spatial2-mask.expected.json"),
+        ),
+    ] {
+        let path = dir.path().join(format!("spatial{index}.dng"));
+        std::fs::write(&path, bytes).unwrap();
+        let image = decode_full(&path).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(oracle).unwrap();
+        for y in 0..16 {
+            for x in 0..36 {
+                for c in 0..3 {
+                    let target = expected["spatial_linear_srgb"][y][x][c].as_f64().unwrap() as f32;
+                    assert!(
+                        (image.pixels[y * 36 + x][c] - target).abs() < 0.002,
+                        "PGTM{index} at{x},{y} c{c}: {} expected{target}",
+                        image.pixels[y * 36 + x][c]
+                    );
+                }
+                assert!(
+                    (image.pixels[y * 36 + x][3]
+                        - expected["alpha"][x % 6].as_f64().unwrap() as f32)
+                        .abs()
+                        < 1e-6
+                );
+            }
+        }
+        let applied = image.provenance.spatial_calibration.as_ref().unwrap();
+        assert_eq!(applied.applied_pixels, 576);
+        assert_eq!(applied.bypassed_pixels, 0);
+        assert!(image.pixels.iter().any(|p| p[0] > 1.0));
+        assert!(image.pixels.iter().any(|p| p[..3].iter().any(|c| *c < 0.0)));
+        assert_eq!(image.pixels, decode_full(&path).unwrap().pixels);
+    }
+}
+
+#[test]
+fn psd_source_exif_strings_and_orientation_are_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    // TIFF IFD with model ASCII and orientation, all generated metadata.
+    let model = b"Camera verbatim model\0";
+    let mut exif = b"II*\0\x08\0\0\0".to_vec();
+    exif.extend(2u16.to_le_bytes());
+    exif.extend(272u16.to_le_bytes());
+    exif.extend(2u16.to_le_bytes());
+    exif.extend((model.len() as u32).to_le_bytes());
+    exif.extend(38u32.to_le_bytes());
+    exif.extend(274u16.to_le_bytes());
+    exif.extend(3u16.to_le_bytes());
+    exif.extend(1u32.to_le_bytes());
+    exif.extend(6u32.to_le_bytes());
+    exif.extend(0u32.to_le_bytes());
+    exif.extend(model);
+    let mut resource = b"8BIM".to_vec();
+    resource.extend(1058u16.to_be_bytes());
+    resource.extend([0, 0]);
+    resource.extend((exif.len() as u32).to_be_bytes());
+    resource.extend(&exif);
+    if !exif.len().is_multiple_of(2) {
+        resource.push(0);
+    }
+    let mut bytes = b"8BPS\0\x01\0\0\0\0\0\0".to_vec();
+    bytes.extend(3u16.to_be_bytes());
+    bytes.extend(1u32.to_be_bytes());
+    bytes.extend(2u32.to_be_bytes());
+    bytes.extend(8u16.to_be_bytes());
+    bytes.extend(3u16.to_be_bytes());
+    bytes.extend(0u32.to_be_bytes());
+    bytes.extend((resource.len() as u32).to_be_bytes());
+    bytes.extend(resource);
+    bytes.extend(0u32.to_be_bytes());
+    bytes.extend(0u16.to_be_bytes());
+    bytes.extend([255, 0, 0, 255, 0, 0]);
+    let path = dir.path().join("source-exif.psd");
+    std::fs::write(&path, bytes).unwrap();
+    let image = decode_full(&path).unwrap();
+    assert_eq!(
+        image.metadata.camera_model.as_deref(),
+        Some("Camera verbatim model")
+    );
+    assert_eq!((image.width, image.height), (1, 2));
+    assert_eq!(image.metadata.orientation, 6);
 }

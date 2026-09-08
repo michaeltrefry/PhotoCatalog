@@ -37,3 +37,8 @@ Raster TIFF/PNG/WebP/BMP, 16-bit precision, malformed images, PSD composites and
 all eight EXIF orientation cases are generated in temporary directories by tests.
 Official DNG SDK sample files are available through the verified SDK download;
 they are governed by the SDK's license and are not copied into this fixture set.
+
+`generated-spatial1-mask.dng` and `generated-spatial2-mask.dng` add spatial
+ProfileGainTableMap/2 after HueSatMap. The independent oracle varies gain by
+pixel position and intensity, includes nonzero baseline exposure, and tests
+version2 gamma. Signed/HDR pixels and zero/partial alpha remain observable.

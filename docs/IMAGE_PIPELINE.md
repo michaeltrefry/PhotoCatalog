@@ -18,18 +18,29 @@ alter the editor's float pixels. Preview codec/cache selection belongs to sc-228
 
 | Input | Component and actual behavior |
 | --- | --- |
-| CR2/RAF/RW2 and recognized camera RAW | LibRaw; full-size demosaic into normalized camera RGB with unit WB, then as-shot WB and camera matrix applied in unclamped float. Sensor normalization still clips samples above sensor white. Missing WB is reported rather than guessed. |
+| CR2/RAF/RW2 and recognized camera RAW | LibRaw; full-size demosaic into normalized camera RGB with unit WB, then as-shot WB and camera matrix applied in unclamped float. Sensor normalization still clips samples above sensor white. Exact source/vendor crop is applied after full-area demosaic, before orientation. Missing WB is reported rather than guessed. |
 | DNG, including floating/linear/JPEG-XL | Adobe DNG SDK 1.7.1 build 2724: original Stage1→Stage2→Stage3, required opcodes, default crop, as-shot neutral, camera profile's camera-to-PCS matrix and embedded HueSatMap calibration, then linear sRGB. Float samples and separate transparency mask are preserved. |
 | JPEG/PNG/WebP/BMP/TIFF | image-rs; original precision converted to float. ICC RGB profiles use LittleCMS relative-colorimetric conversion with alpha copied and negative values allowed. |
 | AVIF | libavif, single active decoder thread, 16-bit RGB conversion retaining 8/10/12-bit source precision and straight alpha; ICC preferred, otherwise declared CICP. Integer clean aperture and rotation/mirror are applied. |
 | PSD | Bounded merged-composite reader for RGB/grayscale 8/16/32-bit, raw, PackBits and ZIP/prediction. ICC resource retained for transform. Negative layer counts and Mtrn/Mt16/Mt32 tags identify merged transparency; extra spot channels are not mistaken for alpha. RGB merged white matting is removed before ICC conversion. Files declaring no real merged composite are Unsupported. |
 
+Camera make/model and capture time use source EXIF ASCII strings without display
+quoting; decoder-normalized names are fallbacks. PSD EXIF resources, RAF's source
+EXIF metadata segment and RW2 TIFF-dialect metadata are read independently of pixels.
+LibRaw CFA-aligned insets are not used as the final crop: the original vendor
+rectangle is captured before alignment and applied to the developed RGB. Crop
+containment failures are explicit, with no padding or resizing. Default scene-linear
+input excludes automatic brightness, display tone curves and baseline exposure;
+PGTM lookup weights still account for the source's baseline exposure as required.
+
 Untagged raster RGB assumes sRGB, explicitly recorded. PNG gAMA/cHRM generate a
 source profile; sRGB overrides these. Non-RGB ICC profiles and unsupported PNG
 CICP, PSD color modes/PSB, fractional AVIF apertures/non-square pixels and unknown
-color encodings fail explicitly. DNG spatial ProfileGainTableMap calibration is
-currently Unsupported, including maps supplied by an embedded profile; it is never
-silently skipped. TIFF/PSD layer editing is not implemented.
+color encodings fail explicitly. DNG spatial ProfileGainTableMap/2 calibration uses the SDK after HueSatMap: profile
+maps take precedence over source maps, baseline exposure adjusts the lookup weight,
+and map interpolation/gamma are honored. The SDK overrange mode retains signed
+and above-one RGB while clamping the lookup weight to its defined domain. Applied
+pixel counts are recorded separately from HueSatMap; alpha is untouched. TIFF/PSD layer editing is not implemented.
 
 The DNG SDK profile matrix incorporates ForwardMatrix, calibration signatures,
 analog balance and illuminant interpolation. Embedded HueSatMap calibration is

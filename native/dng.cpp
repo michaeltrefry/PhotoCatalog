@@ -13,6 +13,7 @@
 #include "dng_exceptions.h"
 #include "dng_xy_coord.h"
 #include "dng_1d_table.h"
+#include "dng_gain_map.h"
 #include "dng_bottlenecks.h"
 #include "dng_tag_values.h"
 #include <vector>
@@ -71,8 +72,17 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
             if (profile.HasHueSatDeltas()) out->flags|=4;
             if (profile.HasLookTable()) out->flags|=8;
         }
-        if (negative->HasProfileGainTableMap() || profile.HasProfileGainTableMap())
-            return fail(out,"unsupported DNG spatial ProfileGainTableMap calibration");
+        std::shared_ptr<const dng_gain_table_map> spatial;
+        if (profile.HasProfileGainTableMap()) {
+            spatial=profile.ShareProfileGainTableMap(); out->flags|=64;
+        } else if (negative->HasProfileGainTableMap()) spatial=negative->ShareProfileGainTableMap();
+        const double stage_gain=negative->Stage3Gain();
+        const double exposure_weight=std::exp2(negative->TotalBaselineExposure(dng_camera_profile_id()))/stage_gain;
+        if(spatial) {
+            if(!std::isfinite(exposure_weight)||exposure_weight<=0||exposure_weight>1e12)
+                return fail(out,"corrupt DNG spatial calibration exposure weight");
+            out->flags|=32;
+        }
         if (negative->HasCameraNeutral()) spec->SetWhiteXY(spec->NeutralToXY(negative->CameraNeutral()));
         else if (negative->HasCameraWhiteXY()) spec->SetWhiteXY(negative->CameraWhiteXY());
         else return fail(out,"unsupported DNG without as-shot white balance");
@@ -103,7 +113,7 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
             dng_rect area(crop.t+y,crop.l,crop.t+y+1,crop.r);
             auto buffer=row_buffer(area,3,row.data()); image->Get(buffer);
             if (mask) {auto mask_buffer=row_buffer(area,1,alpha.data());mask->Get(mask_buffer);}
-            if (calibration.Get()) {
+            if (calibration.Get() || spatial) {
                 for (uint32 x=0;x<out->width;++x) {
                     bool in_domain=true;
                     for(uint32 c=0;c<3;++c) {
@@ -113,6 +123,7 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
                         in_domain=in_domain&&value>=0&&(calibration_overrange||value<=1);
                     }
                     apply[x]=in_domain;
+                    if(!calibration.Get()) continue;
                     if(in_domain) ++out->calibration_applied_pixels;
                     else {
                         ++out->calibration_bypassed_pixels;
@@ -121,14 +132,28 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
                         for(uint32 c=0;c<3;++c) working[c*out->width+x]=0;
                     }
                 }
-                DoBaselineHueSatMap(working.data(),working.data()+out->width,working.data()+out->width*2,
+                if(calibration.Get()) DoBaselineHueSatMap(working.data(),working.data()+out->width,working.data()+out->width*2,
                     working.data(),working.data()+out->width,working.data()+out->width*2,
                     out->width,*calibration.Get(),encode_table.Get(),decode_table.Get(),calibration_overrange);
+                if(spatial) {
+                    // HueSatMap bypassed samples still receive defined spatial gain.
+                    if(calibration.Get()) for(uint32 x=0;x<out->width;++x) if(!apply[x]) {
+                        for(uint32 c=0;c<3;++c) {
+                            double value=0;for(uint32 k=0;k<3;++k) value+=camera_to_prophoto[c][k]*(row[3*x+k]-black)/(1.0-black);
+                            working[c*out->width+x]=static_cast<float>(value);
+                        }
+                    }
+                    // SDK clamps only the table's lookup weight; true preserves signed
+                    // and over-one RGB output while applying the interpolated gain.
+                    DoBaselineProfileGainTableMap(working.data(),working.data()+out->width,working.data()+out->width*2,
+                        working.data(),working.data()+out->width,working.data()+out->width*2,
+                        out->width,area.t,area.l,bounds,static_cast<float>(exposure_weight),*spatial,true);
+                }
             }
             for (uint32 x=0;x<out->width;++x) {
                 for (uint32 c=0;c<3;++c) {
                     double value=0;
-                    if(calibration.Get()&&apply[x]) {
+                    if(spatial||(calibration.Get()&&apply[x])) {
                         for(uint32 k=0;k<3;++k) value+=prophoto_to_srgb[c][k]*working[k*out->width+x];
                     } else {
                         for(uint32 k=0;k<3;++k) value+=matrix[c][k]*(row[3*x+k]-black)/(1.0-black);

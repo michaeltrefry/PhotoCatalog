@@ -56,6 +56,7 @@ pub struct RenderProvenance {
     pub working_color: String,
     pub alpha: String,
     pub calibration: Option<ColorCalibration>,
+    pub spatial_calibration: Option<ColorCalibration>,
     pub notes: Vec<String>,
 }
 /// Full-resolution, oriented, scene/display-linear sRGB-primary pixels. RGB may be
@@ -177,11 +178,44 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
         .to_ascii_lowercase();
     let exif = exif::Reader::new()
         .read_from_container(&mut BufReader::new(Cursor::new(&bytes)))
-        .ok();
+        .ok()
+        .or_else(|| {
+            if bytes.starts_with(b"FUJIFILMCCD-RAW") && bytes.len() >= 92 {
+                // RAF stores source EXIF in its JPEG metadata segment. Only EXIF
+                // is read here; editor pixels still come from the RAW mosaic.
+                let start = u32::from_be_bytes(bytes[84..88].try_into().ok()?) as usize;
+                let length = u32::from_be_bytes(bytes[88..92].try_into().ok()?) as usize;
+                let segment = bytes.get(start..start.checked_add(length)?)?;
+                exif::Reader::new()
+                    .read_from_container(&mut Cursor::new(segment))
+                    .ok()
+            } else if bytes.starts_with(b"IIU\0") {
+                // RW2's TIFF dialect has magic85, while its EXIF IFD layout is TIFF.
+                let mut metadata_bytes = bytes.clone();
+                metadata_bytes[2] = 42;
+                exif::Reader::new().read_raw(metadata_bytes).ok()
+            } else if bytes.starts_with(b"8BPS") {
+                super::psd::source_exif(&bytes)
+                    .ok()
+                    .flatten()
+                    .and_then(|data| exif::Reader::new().read_raw(data).ok())
+            } else {
+                None
+            }
+        });
     let text = |tag| {
         exif.as_ref()
             .and_then(|x| x.get_field(tag, exif::In::PRIMARY))
-            .map(|f| f.display_value().to_string())
+            .and_then(|f| match &f.value {
+                exif::Value::Ascii(values) => values.first().map(|v| {
+                    String::from_utf8_lossy(v)
+                        .trim_end_matches('\0')
+                        .trim()
+                        .to_owned()
+                }),
+                _ => None,
+            })
+            .filter(|s| !s.is_empty())
     };
     let exif_orientation = exif
         .as_ref()
@@ -198,6 +232,7 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
             .get(8..64.min(bytes.len()))
             .is_some_and(|b| b.windows(4).any(|x| x == b"avif" || x == b"avis"));
     let mut calibration = None;
+    let mut spatial_calibration = None;
     let (mut image, format, bits, icc, orientation, source_color, decoder, make, model, mut notes) =
         if is_raw || is_avif {
             // Zeroed pointers and lengths form an empty native result; Drop frees all native allocations on every path.
@@ -277,11 +312,20 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
                     });
                     notes.push("Embedded profile HueSatMap calibration applied through Adobe SDK; out-of-domain pixels retain their matrix-rendered color and are counted separately.".into());
                 }
+                if out.flags & 32 != 0 {
+                    spatial_calibration = Some(ColorCalibration {
+                        table: if out.flags & 64 != 0 { "embedded profile ProfileGainTableMap" } else { "source ProfileGainTableMap/ProfileGainTableMap2" }.into(),
+                        applied_pixels: u64::from(out.width)*u64::from(out.height),
+                        bypassed_pixels: 0,
+                        domain_policy: "SDK spatial/table interpolation after HueSatMap; baseline exposure affects lookup weight only; signed and over-one RGB retained".into(),
+                    });
+                    notes.push("Spatial ProfileGainTableMap calibration applied through Adobe SDK, including table gamma and source/profile precedence. No display exposure or tone curve is baked into the working surface.".into());
+                }
                 if out.flags & 8 != 0 {
                     notes.push("Source profile LookTable is retained in original but not applied to scene-linear editor input.".into());
                 }
             } else if is_raw {
-                notes.push("Camera matrix and as-shot white balance; Adobe DCP looks, local instructions and DNG opcode rendering are not reproduced.".into());
+                notes.push("Camera matrix and as-shot white balance; exact vendor crop applied after full-area demosaic. Baseline exposure, automatic brightness, display tone curves and Adobe DCP looks are excluded from scene-linear editor input.".into());
                 notes.push(if out.bits==32 {"Floating linear DNG: no integer clipping; matrix/WB interpretation requires camera reference validation."} else {"LibRaw full-size camera RGB demosaic with unit WB, linear 16-bit sensor normalization; as-shot WB and camera-to-sRGB matrix applied afterwards in unclamped float. Sensor samples above white are clipped before demosaic."}.into());
             }
             (
@@ -413,8 +457,8 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
             width,
             height,
             orientation,
-            camera_make: make.or_else(|| text(exif::Tag::Make)),
-            camera_model: model.or_else(|| text(exif::Tag::Model)),
+            camera_make: text(exif::Tag::Make).or(make),
+            camera_model: text(exif::Tag::Model).or(model),
             captured_at: text(exif::Tag::DateTimeOriginal),
             preview_source: "full-quality original rendering".into(),
         },
@@ -422,13 +466,14 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
         height: out_height,
         pixels,
         provenance: RenderProvenance {
-            pipeline_version: "photocatalog-render-2".into(),
+            pipeline_version: "photocatalog-render-3".into(),
             decoder,
             source_bits_per_channel: bits,
             source_color,
             working_color: "linear sRGB primaries, D65, f32, unclamped".into(),
             alpha: "straight alpha [0,1]".into(),
             calibration,
+            spatial_calibration,
             notes,
         },
     })

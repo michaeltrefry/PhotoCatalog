@@ -36,6 +36,33 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 }
+/// Read source EXIF metadata without decoding the merged pixels.
+pub(super) fn source_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut r = Reader { bytes, offset: 26 };
+    r.block()?;
+    let resources = r.block()?;
+    let mut rr = Reader {
+        bytes: resources,
+        offset: 0,
+    };
+    while rr.offset < resources.len() {
+        ensure!(rr.take(4)? == b"8BIM", "invalid PSD resource signature");
+        let id = rr.u16()?;
+        let n = rr.take(1)?[0] as usize;
+        rr.take(n)?;
+        if !(n + 1).is_multiple_of(2) {
+            rr.take(1)?;
+        }
+        let data = rr.block()?;
+        if id == 1058 || id == 1059 {
+            return Ok(Some(data.to_vec()));
+        }
+        if data.len() % 2 != 0 {
+            rr.take(1)?;
+        }
+    }
+    Ok(None)
+}
 pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
     let mut r = Reader { bytes, offset: 0 };
     ensure!(r.take(4)? == b"8BPS", "invalid PSD signature");
@@ -116,6 +143,11 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
             lr.block()?;
         }
         while lr.offset < layers.len() {
+            // The whole layer/mask section may be padded to a four-byte boundary.
+            let remaining = &layers[lr.offset..];
+            if remaining.len() <= 3 && remaining.iter().all(|b| *b == 0) {
+                break;
+            }
             let signature = lr.take(4)?;
             ensure!(
                 signature == b"8BIM" || signature == b"8B64",

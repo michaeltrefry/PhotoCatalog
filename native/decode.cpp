@@ -25,9 +25,31 @@ bool allocate(PcImage *out) {
     out->pixels = static_cast<float *>(malloc(size_t(count) * 4 * sizeof(float)));
     return out->pixels != nullptr;
 }
+// Preserve metadata crop before LibRaw rounds CFA origins for demosaicing.
+// Crop the developed RGB afterwards, where arbitrary pixel origins are valid.
+class OriginalCropRaw : public LibRaw {
+public:
+    libraw_raw_inset_crop_t vendor_crop{};
+    OriginalCropRaw() {
+        callbacks.post_identify_cb=[](void *ctx) {
+            auto *self=static_cast<OriginalCropRaw *>(static_cast<LibRaw *>(ctx));
+            self->vendor_crop=self->imgdata.sizes.raw_inset_crops[0];
+            const auto &rect=self->imgdata.makernotes.canon.DefaultCropAbsolute;
+            if(self->imgdata.idata.maker_index==LIBRAW_CAMERAMAKER_Canon && rect.l>=0 && rect.t>=0 && rect.r>=rect.l && rect.b>=rect.t) {
+                auto &crop=self->vendor_crop;
+                if(self->imgdata.sizes.raw_aspect!=LIBRAW_IMAGE_ASPECT_UNKNOWN && crop.cwidth && crop.cheight) {
+                    crop.cleft+=rect.l;crop.ctop+=rect.t;
+                } else {
+                    crop.cleft=rect.l;crop.ctop=rect.t;
+                    crop.cwidth=rect.r-rect.l+1;crop.cheight=rect.b-rect.t+1;
+                }
+            }
+        };
+    }
+};
 extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
     try {
-        LibRaw raw;
+        OriginalCropRaw raw;
         raw.imgdata.rawparams.max_raw_memory_mb = 768;
         raw.imgdata.rawparams.options &= ~LIBRAW_RAWOPTIONS_CONVERTFLOAT_TO_INT;
         int status = raw.open_buffer(const_cast<unsigned char *>(bytes), len);
@@ -64,12 +86,26 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
         if (processed->type != LIBRAW_IMAGE_BITMAP || processed->colors != 3 || processed->bits != 16)
             return fail(out, "unsupported RAW development output");
         out->width = processed->width; out->height = processed->height;
+        uint32_t crop_left=0,crop_top=0;
+        const auto &crop=raw.vendor_crop;
+        if(crop.cwidth && crop.cheight && crop.cleft<0xffff && crop.ctop<0xffff) {
+            const auto &sizes=raw.imgdata.sizes;
+            if(processed->width!=sizes.width || processed->height!=sizes.height)
+                return fail(out,"unsupported RAW vendor crop with scaled or diagonal development");
+            if(crop.cleft<sizes.left_margin||crop.ctop<sizes.top_margin)
+                return fail(out,"unsupported RAW vendor crop outside developed area");
+            crop_left=crop.cleft-sizes.left_margin;crop_top=crop.ctop-sizes.top_margin;
+            if(uint64_t(crop_left)+crop.cwidth>processed->width || uint64_t(crop_top)+crop.cheight>processed->height)
+                return fail(out,"unsupported RAW vendor crop outside developed area");
+            out->width=crop.cwidth;out->height=crop.cheight;
+        }
         if (!allocate(out)) return fail(out, "resource limit: RAW output allocation");
         const auto *samples = reinterpret_cast<const uint16_t *>(processed->data);
         for (size_t i = 0; i < size_t(out->width) * out->height; ++i) {
+            size_t source=(i/out->width+crop_top)*processed->width+(i%out->width+crop_left);
             for (size_t c = 0; c < 3; ++c) {
                 float value=0;
-                for(size_t k=0;k<3;++k) value+=camera_to_rgb[c][k]*(samples[3*i+k]/65535.0f)*(camera_wb[k]/minimum_wb);
+                for(size_t k=0;k<3;++k) value+=camera_to_rgb[c][k]*(samples[3*source+k]/65535.0f)*(camera_wb[k]/minimum_wb);
                 out->pixels[4*i+c]=value;
             }
             out->pixels[4*i+3] = 1;
