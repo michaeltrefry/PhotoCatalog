@@ -20,6 +20,16 @@ FIXTURES = [
      "6109abdf7cc633c1e0c9e7ec1a005a396313fe564998c3e2eeca48c8436fed11", "RW2"),
 ]
 
+# Independently read from these checksum-pinned files: Canon SensorInfo inclusive
+# borders and RAW lossless-JPEG SOF3; Panasonic IFD0 exclusive crop and bit depth.
+# Camera strings are source IFD0 ASCII, not normalized decoder aliases.
+REFERENCES = {
+    "canon-6d.cr2": {"width": 5472, "height": 3648, "bits": 14,
+                     "make": "Canon", "model": "Canon EOS 6D"},
+    "panasonic-gx7mk2.rw2": {"width": 4592, "height": 3448, "bits": 12,
+                           "make": "Panasonic", "model": "DMC-GX7MK2"},
+}
+
 
 def digest(path):
     result = hashlib.sha256()
@@ -55,16 +65,21 @@ def main():
                 finally:
                     temporary.close()
                     temporary_path.unlink(missing_ok=True)
-        receipt = {"fixture": name, "sha256": expected, "license": "CC0-1.0", "source": url}
+        reference = REFERENCES[name]
+        receipt = {"fixture": name, "sha256": expected, "license": "CC0-1.0",
+                   "source": url, "independent_header_reference": reference}
         if args.probe:
             result = subprocess.run([str(args.probe.resolve()), str(path.resolve())],
                                     capture_output=True, text=True, timeout=180, check=True)
             decoded = json.loads(result.stdout)
             if (decoded.get("status") != "decoded" or decoded.get("nonfinite_components") != 0
-                    or decoded["width"] * decoded["height"] < 10_000_000
+                    or decoded["width"] != reference["width"]
+                    or decoded["height"] != reference["height"]
                     or decoded["metadata"]["format"] != image_format
                     or decoded["metadata"]["preview_source"] != "full-quality original rendering"
-                    or decoded["provenance"]["source_bits_per_channel"] < 12):
+                    or decoded["metadata"]["camera_make"] != reference["make"]
+                    or decoded["metadata"]["camera_model"] != reference["model"]
+                    or decoded["provenance"]["source_bits_per_channel"] != reference["bits"]):
                 raise ValueError(f"full RAW decode contract failed: {decoded}")
             if digest(path) != expected:
                 raise ValueError("RAW decoder changed its input")
