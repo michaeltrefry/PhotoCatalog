@@ -6,3 +6,5 @@
 *.DNG
 *.dng
 /private-fixtures/
+/benchmarks/__pycache__/
+*.duckdb*

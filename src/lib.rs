@@ -81,6 +81,8 @@ impl Catalog {
         }
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
+        // Match macOS durable WAL commits to storage flush semantics (ignored elsewhere).
+        db.pragma_update(None, "fullfsync", true)?;
         db.pragma_update(None, "foreign_keys", true)?;
         db.execute_batch("BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS assets (
@@ -476,5 +478,31 @@ fn failed_or_unwinding_import_releases_duplicated_lock() -> Result<()> {
         assert!(ImportLock::acquire(&path).is_err());
         drop(next_import);
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn catalog_connections_use_full_durable_wal_commits() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let catalog = Catalog::open(temporary.path())?;
+    assert_eq!(
+        catalog
+            .db
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
+        "wal"
+    );
+    assert_eq!(
+        catalog
+            .db
+            .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?,
+        2
+    );
+    assert_eq!(
+        catalog
+            .db
+            .query_row("PRAGMA fullfsync", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
     Ok(())
 }
