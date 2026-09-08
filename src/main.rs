@@ -15,7 +15,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Import CR2/JPEG/PNG recursively; originals are read only. Repeat to resume.
+    /// Import supported photos recursively; originals are read only. Repeat to resume.
     Import {
         folder: PathBuf,
         #[arg(long)]
