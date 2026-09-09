@@ -142,11 +142,18 @@ infinite foreground stream, or provide fairness across separate CLI processes.
 | v3, source `9713f3a` | Query gates passed. The original full-population mixed summary was rejected: only 19/13/17 saves overlapped background work, with p95 292.180/413.699/280.726 ms. The original false-green audit and superseding rejection both remain retained. | Shared in-process foreground/background writer admission; apply the unchanged 100 ms target to actual overlapping populations as well as complete populations, with zero overlap rejected. |
 | v4, source `0cfc1fd` | Complete query and transition audit PASS with no errors. | Current measured candidate; final delivery CI/review remains separate. |
 
-The CLI import dispatch was also separated from the large command match after a
-Windows debug import stack overflow on the earlier PR head. Both old and new
-bounded 1 MiB child tests passed locally on macOS, so they did not reproduce the
-Windows failure. The Windows cause/fix remains provisional until the final
-Windows CI executes the actual import regressions; local success is not that proof.
+The earlier CLI dispatch split did not fix Windows: CI `34415358815` again
+failed actual executable imports with stack overflow, while the helper test
+passed. That test had constructed `Cli` directly and bypassed `Cli::parse()`.
+Adding real argument parsing reproduces the old failure in a 1 MiB child on
+macOS. Splitting Clap's derived command builders into flattened families makes
+the same parser/import regression pass, without enlarging the stack or changing
+the library, query probe or benchmark. All 57 help outputs (top level and 56
+application commands) are byte-identical with controlled identical `argv[0]`;
+actual executable import/restart/browse regressions also pass locally. Final
+Windows CI must still verify the corrected executable. The v4 performance source
+and results remain valid because this subsequent repair changes only the CLI
+parser boundary and its regression test.
 
 ## Identity, preservation and reproducibility
 
