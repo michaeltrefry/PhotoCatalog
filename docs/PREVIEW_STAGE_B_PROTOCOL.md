@@ -225,3 +225,60 @@ preview_navigation_probe run --fixture ABS_FIXTURE_JSON --worker ABS_APP \
 The new shared fixture module and navigation probe have been formatted only.
 Compilation, correctness tests, coordinator validation and independent review
 remain required before any timed service child is admitted.
+
+The complete 30-worker memory gate has since established a frozen **Stage B
+experiment allowance of 2,269,118,464 bytes (2164 MiB) per original worker**,
+with the existing 3 GiB total working allowance. Both headless probe profiles
+record that allowance even though they do not launch original workers. This
+cohort-derived setting is not a production default or a guarantee for all future
+camera inputs. Two such workers do not fit simultaneously: the actual-child
+correctness test configures two worker slots and requires one active/one queued,
+then successful progress when the first reservation is released. It does not
+launch two simultaneous full renderers to manufacture a peak measurement.
+
+The source-ready `preview_navigation_campaign.py` fixes **44 measured children**:
+for standard, then constrained, one warm child, 20 fresh children and one ten-trace
+navigation child. Each has one untimed `preview_navigation_probe verify` child,
+for **44 receipt verifiers**. The verifier reconciles exact fixed trial filenames,
+compiled source identity and trial-file BLAKE3 before the Python coordinator
+performs independent count, consumer-conservation and finite-value checks.
+The coordinator also records actual SHA-256 for all accepted trial files. Every
+child has UTC/monotonic anchors, exclusive stdout/stderr/results and a 900-second
+safety deadline; timeout terminates and joins only that owned retained-work child.
+There are no native grandchildren in this campaign, retries or replacement trials.
+
+Before admitting a measured child, the coordinator requires the six-pass 10k
+layout prerequisite with 10k independently verified distinct payloads per pass,
+bound to the exact dataset digest. It also requires an externally prepared,
+reviewed JSON binding with `version: 1`, `clean: true`, a 40-character
+`source_revision`, `planned_measured_children: 44`, `planned_verifiers: 44`, and
+SHA-256 fields named `binary_sha256`, `worker_sha256`, `archive_sha256`,
+`storage_sha256`, `fixture_sha256`, `dataset_sha256`, `layout_receipt_sha256`,
+`protocol_sha256`, and `coordinator_sha256`. The archive is the complete clean
+build source; the storage artifact preserves actual APFS Data/path attribution.
+All bound files are rechecked at campaign end. Neither this mechanical binding
+nor its lane token substitutes for independent review and the parent's explicit
+quiet-lane grant. Passive host observation must start before the first child and
+complete successfully; it does not judge quietness automatically.
+
+Aggregate reporting uses fixed nearest-rank p50/p95/p99/max with all samples and
+no outlier deletion. Warmup, warm, fresh, hot-LRU and navigation remain separate.
+It reports warm headless p95 against 1000 ms and component process high-water
+against 4 GiB. **The original memory acceptance names 10 million metadata records;
+this fixed 10k catalog component cannot award that integrated 10M gate.** A final
+integrated catalog-plus-preview RSS observation is still required. UI timing is
+also unavailable here. A successful campaign flag means the fixed work and
+identity/oracle checks completed, not that every budget or full S6 requirement
+passed. Failures retain original per-read resource/error classification and all
+preceding observations.
+
+```
+python3 scripts/preview_navigation_campaign.py --binary ABS_NAVIGATION_PROBE \
+  --worker ABS_APP --archive CLEAN_SOURCE_ARCHIVE --storage STORAGE_EVIDENCE \
+  --fixture ABS_FIXTURE_JSON --layout-receipt ABS_SUCCESSFUL_10K_LOOKUP_JSON \
+  --binding REVIEWED_BINDING_JSON --output NEW_PRIVATE_DIRECTORY \
+  --lane-token coordinator-authorized
+```
+
+The coordinator, verifier, ownership-contract tests and two-child reservation
+regression are source-ready and UNRUN pending the native correctness lane.

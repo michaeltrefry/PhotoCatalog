@@ -29,6 +29,59 @@ fn image(path: &Path, color: [u8; 3]) {
         .unwrap();
 }
 #[test]
+fn frozen_worker_allowance_queues_second_actual_child_until_first_releases() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("a.png"), [41, 87, 149]);
+    image(&originals.join("b.png"), [91, 45, 63]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    let mut previews = service(
+        &root.path().join("cache"),
+        &originals,
+        ServiceLimits {
+            workers: 2,
+            per_worker_bytes: 2_269_118_464,
+            working_bytes: 3 * 1024 * 1024 * 1024,
+            ..ServiceLimits::default()
+        },
+    );
+    catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap();
+    let assets = catalog.browse(0, 10).unwrap();
+    let first = previews
+        .request(
+            &mut catalog,
+            &assets[0].id,
+            Tier::Large,
+            Priority::Foreground,
+        )
+        .unwrap();
+    let second = previews
+        .request(
+            &mut catalog,
+            &assets[1].id,
+            Tier::Large,
+            Priority::Foreground,
+        )
+        .unwrap();
+    previews.tick(&mut catalog).unwrap();
+    assert_eq!(previews.scheduler_usage().active, 1);
+    assert_eq!(previews.scheduler_usage().queued, 1);
+    assert_eq!(previews.scheduler_usage().reserved_bytes, 2_269_118_464);
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, first),
+        ServiceCompletion::Ready
+    ));
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, second),
+        ServiceCompletion::Ready
+    ));
+    assert_eq!(previews.scheduler_usage().reserved_bytes, 0);
+    assert!(previews.is_drained());
+}
+#[test]
 fn held_export_with_maximum_staging_limit_blocks_worker_without_overflow_then_recovers() {
     let root = tempfile::tempdir().unwrap();
     let originals = root.path().join("originals");

@@ -25,6 +25,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Untimed receipt-chain validation; never opens images or originals.
+    Verify { folder: PathBuf },
     /// Seed only a new disposable catalog; the cache dataset must already exist.
     Prepare {
         #[arg(long)]
@@ -103,8 +105,12 @@ fn peak_rss() -> Option<u64> {
 }
 fn limits(profile: Profile) -> ServiceLimits {
     match profile {
-        Profile::Standard => ServiceLimits::default(),
+        Profile::Standard => ServiceLimits {
+            per_worker_bytes: 2_269_118_464, // Frozen Stage B cohort allowance, not a production default.
+            ..ServiceLimits::default()
+        },
         Profile::Constrained => ServiceLimits {
+            per_worker_bytes: 2_269_118_464,
             requests: 200,
             decoded_cache_bytes: 32 * 1024 * 1024,
             encoded_staging_bytes: 8 * 1024 * 1024,
@@ -520,8 +526,58 @@ fn run(
     println!("{receipt}");
     result
 }
+fn verify(folder: &Path) -> Result<()> {
+    let receipt: Value =
+        serde_json::from_slice(&read_bounded(&folder.join("receipt.json"), 1024 * 1024)?)?;
+    ensure!(
+        receipt["complete"] == true && receipt["version"] == 1,
+        "incomplete run"
+    );
+    ensure!(
+        receipt["source_blake3"]
+            == blake3::hash(include_bytes!("preview_navigation_probe.rs"))
+                .to_hex()
+                .to_string(),
+        "probe source mismatch"
+    );
+    let expected: Vec<(String, u32)> = match receipt["workload"].as_str() {
+        Some("warm") => (0..3)
+            .map(|i| ("warmup".into(), i))
+            .chain((0..100).map(|i| ("warm".into(), i)))
+            .chain(std::iter::once(("hot_lru".into(), 0)))
+            .collect(),
+        Some("fresh") => vec![("fresh".into(), 0)],
+        Some("navigation") => (0..10).map(|i| ("navigation".into(), i)).collect(),
+        _ => anyhow::bail!("unknown workload"),
+    };
+    let trials = receipt["trials"].as_array().context("trial list missing")?;
+    ensure!(trials.len() == expected.len(), "wrong fixed trial count");
+    for (entry, (kind, index)) in trials.iter().zip(expected) {
+        let name = format!("{kind}-{index:03}.json");
+        ensure!(
+            entry["path"] == name && entry["complete"] == true,
+            "wrong/failed trial identity"
+        );
+        let bytes = read_bounded(&folder.join(name), 64 * 1024 * 1024)?;
+        ensure!(
+            entry["blake3"] == blake3::hash(&bytes).to_hex().to_string(),
+            "trial bytes changed"
+        );
+        let row: Value = serde_json::from_slice(&bytes)?;
+        ensure!(
+            row["complete"] == true && row["kind"] == kind && row["index"] == index,
+            "trial result mismatch"
+        );
+    }
+    println!(
+        "{}",
+        json!({"complete":true,"trials":trials.len(),"receipt_blake3":blake3::hash(&read_bounded(&folder.join("receipt.json"),1024*1024)?).to_hex().to_string()})
+    );
+    Ok(())
+}
 fn main() -> Result<()> {
     match Args::parse().command {
+        Command::Verify { folder } => verify(&folder),
         Command::Prepare { dataset, output } => prepare(&dataset, &output),
         Command::Run {
             fixture,

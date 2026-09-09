@@ -350,6 +350,11 @@ fn lookup(dataset_path: &Path, output: &Path) -> Result<()> {
         "measurement":"full production manifest lookup, file read and checksum; no pixel decode in layout-only measurements"});
     let result = (|| -> Result<()> {
         let data = dataset(dataset_path)?;
+        receipt["dataset_blake3"] = json!(
+            blake3::hash(&read_bounded(dataset_path, 1024 * 1024)?)
+                .to_hex()
+                .to_string()
+        );
         let store = PreviewStore::open(data.store.clone(), &[])?;
         ensure!(
             store.usage()?.objects == u64::from(data.count),
