@@ -4,6 +4,7 @@ pub mod media;
 pub mod metadata_export;
 pub mod xmp;
 pub mod xmp_packets;
+mod xmp_rdf;
 use anyhow::{Context, Result, bail, ensure};
 pub use media::Metadata;
 use rusqlite::{Connection, OptionalExtension, params};

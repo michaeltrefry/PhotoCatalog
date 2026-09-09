@@ -12,7 +12,7 @@ Install the native dependencies documented in the image pipeline, fetch the veri
 python3 scripts/fetch_dng_sdk.py --destination .deps
 export PHOTOCATALOG_DNG_SDK="$PWD/.deps/dng_sdk_1_7_1_2724/dng_sdk_1_7_1"
 cargo build --locked
-cargo fmt --all --check
+cargo fmt --package photocatalog --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```

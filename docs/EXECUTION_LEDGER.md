@@ -4,16 +4,16 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836 and sc-22838 are verified Done. sc-22837 has selected and integrated SQLite at the measured 256 MiB per-connection settings. Original/supplemental comparisons, corrective timing, bundled query-work validation, current native timing, and independent evidence reviews are complete. Local checks pass. The remaining closeout work is final documentation review, exact-head hosted CI, normal PR merge, merged-main validation, and Shortcut read-back. Dependent stories remain To Do until that closeout.
+sc-22836–sc-22838 are verified Done. S4 metadata integration is in review; independent private RDF comparison found destructive SDK normalization and the repair remains required. S5 volume/path work is in progress on isolated stacked branches. S6 is running its frozen preview-codec experiment; local builds and heavy I/O are paused until it releases the reference Mac.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
 | sc-22836 | Done | [PR #1](https://github.com/michaeltrefry/PhotoCatalog/pull/1), merged 56f0b37 | Independent review PASS; 18 local tests; real CR2/JPEG source invariance; merged-main three-platform CI 34227667817 SUCCESS; Shortcut read-back | Complete |
 | sc-22837 | Done | [PR #3](https://github.com/michaeltrefry/PhotoCatalog/pull/3), merged f353f3d; [decision](BACKEND_DECISION.md) | Reviewed head 7bb3930 and merge have identical trees; PR CI 34362927300 and main CI 34366395501 all four jobs SUCCESS; Shortcut Done read-back, comment 22896 | Complete |
 | sc-22838 | Done | [PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2), merged a0bf374 | Independent review PASS; 31 release tests; 22 private samples/44 renders; public RAW checks; PR CI 34237848026 and merged-main CI 34242815786 three-platform SUCCESS; Shortcut read-back | Complete |
-| sc-22839 | In Progress | XMP fidelity; codex/sc-22839-xmp | S2/S3 Done; exact-byte extraction, semantic model and guarded export under implementation; comment 22898 | Integrate schema/projections/conflicts/export; independent review and cross-platform CI |
-| sc-22840 | To Do | Offline storage and relinking | S2 Done; volume identity/path preflight complete | Sequence shared catalog schema work after S4 |
-| sc-22841 | In Progress | Preview storage and scheduling; codex/sc-22841-previews | S2/S3 Done; protocol/adapters/harness under implementation; comment 22899 | Review protocol before timed runs; implement full cache/scheduling/recovery scope |
+| sc-22839 | In Review | [Draft PR #4](https://github.com/michaeltrefry/PhotoCatalog/pull/4); codex/sc-22839-xmp | Private byte/count/source-invariance checks reconcile, but RDF preservation review found identifier loss; comment 22904 | Repair SDK normalization boundary; corrected semantic evidence, review and final CI |
+| sc-22840 | In Progress | Offline storage and relinking; codex/sc-22840-relink and codex/sc-22840-volume | Live acceptance revalidated; source-only volume adapter work during S6 measurements; comment 22903 | Implement volume binding, atomic relink/undo and controlled removable-volume proof |
+| sc-22841 | In Progress | Preview storage and scheduling; codex/sc-22841-previews | Phase A reviewed at 157347f; frozen campaign sc-22841-codec-v1 running without retries | Review full quality/measurement evidence; complete cache/scheduling/recovery and Stage B |
 | sc-22842 | To Do | Organization and search | Prerequisite sc-22839 | Dependency-bound |
 | sc-22843 | To Do | Editing and export | Prerequisites sc-22838/sc-22839/sc-22841 | Dependency-bound |
 | sc-22844 | To Do | Lightroom dry run | Prerequisite sc-22839 | Dependency-bound |

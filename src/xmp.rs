@@ -156,8 +156,15 @@ pub fn parse(bytes: &[u8]) -> Result<XmpMeta> {
     } else {
         &text
     };
-    XmpMeta::from_str_with_options(sdk_text, FromStrOptions::default().strict_aliasing())
-        .context("parse XMP model")
+    let model =
+        XmpMeta::from_str_with_options(sdk_text, FromStrOptions::default().strict_aliasing())
+            .context("parse XMP model")?;
+    // Compare original RDF before trusting any native projection. The pinned
+    // preservation feature prevents known migrations; this independent boundary
+    // also detects unsupported graph semantics or future native normalization.
+    let serialized = serialize(&model)?;
+    crate::xmp_rdf::assert_equivalent(&text, std::str::from_utf8(&serialized)?)?;
+    Ok(model)
 }
 fn serialize(meta: &XmpMeta) -> Result<Vec<u8>> {
     let bytes = meta

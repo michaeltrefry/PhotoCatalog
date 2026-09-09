@@ -166,7 +166,7 @@ impl Prepared {
             status: format!("{:?}", inspection.status),
             issues: serde_json::to_string(&inspection.issues)?,
             provenance: serde_json::to_string(
-                &serde_json::json!({"source":source.provenance,"file_revision":inspection.revision}),
+                &serde_json::json!({"source":source.provenance,"source_location":{"kind":source.kind,"locator":source.locator,"display":source.display},"file_revision":inspection.revision}),
             )?,
             blobs: BTreeMap::new(),
             packets: Vec::new(),

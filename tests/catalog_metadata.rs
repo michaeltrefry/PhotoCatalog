@@ -89,6 +89,17 @@ fn automatic_sidecars_history_conflicts_edits_and_source_invariance() -> Result<
         .iter()
         .find(|o| o.models.iter().any(|m| m.id == model))
         .unwrap();
+    ensure!(old.provenance["source_location"]["kind"] == "sidecar");
+    ensure!(
+        old.provenance["source_location"]["display"]
+            == fs::canonicalize(&sidecar)?.to_string_lossy().as_ref()
+    );
+    ensure!(
+        !old.provenance["source_location"]["locator"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     ensure!(cat.metadata_packets(&asset.id, old.id)?[0].bytes == packet(2).as_bytes());
     ensure!(fs::read(&path)? == before);
     let stable = cat.metadata(&asset.id)?.revision;

@@ -4,6 +4,127 @@ use xmp_toolkit::{FromStrOptions, ToStringOptions, XmpMeta, XmpValue};
 const XMP: &str = "http://ns.adobe.com/xap/1.0/";
 const UNKNOWN: &str = "https://example.invalid/photocatalog/unknown/";
 
+#[test]
+fn editing_preserves_original_rdf_before_adobe_legacy_repairs() -> Result<()> {
+    use photocatalog::xmp::{self, Edit};
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    const MM: &str = "http://ns.adobe.com/xap/1.0/mm/";
+    let original = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="uuid:11111111-2222-3333-4444-555555555555" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:u="https://example.invalid/photocatalog/unknown/" xmlns:xmpDM="http://ns.adobe.com/xmp/1.0/DynamicMedia/">
+    <xmp:Rating>2</xmp:Rating>
+    <xmpMM:InstanceID rdf:parseType="Resource"><rdf:value>xmp.iid:existing</rdf:value><u:proof>retained</u:proof></xmpMM:InstanceID>
+    <dc:title><rdf:Alt><rdf:li xml:lang="x-default">Default</rdf:li><rdf:li xml:lang="fr">Bonjour</rdf:li></rdf:Alt></dc:title>
+    <dc:creator>scalar creator</dc:creator>
+    <dc:subject><rdf:Seq><rdf:li>second</rdf:li><rdf:li>first</rdf:li></rdf:Seq></dc:subject>
+    <dc:description><rdf:Alt><rdf:li rdf:parseType="Resource"><u:opaque>structured alternative</u:opaque></rdf:li></rdf:Alt></dc:description>
+    <xmpDM:copyright>audio rights</xmpDM:copyright>
+    </rdf:Description></rdf:RDF></x:xmpmeta>"#;
+    let output = xmp::apply_edits(
+        original,
+        &[Edit::Set {
+            namespace: XMP.into(),
+            path: "Rating".into(),
+            value: "4".into(),
+        }],
+    )?;
+    // These assertions read serialized RDF directly. An SDK-normalized baseline
+    // would hide destructive migrations that happened before the edit began.
+    let text = std::str::from_utf8(&output)?;
+    let document = roxmltree::Document::parse(text)?;
+    let description = document
+        .descendants()
+        .find(|n| n.has_tag_name((RDF, "Description")))
+        .unwrap();
+    ensure!(
+        description.attribute((RDF, "about")) == Some("uuid:11111111-2222-3333-4444-555555555555")
+    );
+    let instance = document
+        .descendants()
+        .find(|n| n.has_tag_name((MM, "InstanceID")))
+        .unwrap();
+    ensure!(
+        instance
+            .descendants()
+            .any(|n| n.has_tag_name((RDF, "value")) && n.text() == Some("xmp.iid:existing"))
+    );
+    ensure!(
+        instance
+            .descendants()
+            .any(|n| n.has_tag_name((UNKNOWN, "proof")) && n.text() == Some("retained"))
+    );
+    let title = document
+        .descendants()
+        .find(|n| n.has_tag_name((xmp::DC, "title")))
+        .unwrap();
+    ensure!(
+        title
+            .descendants()
+            .any(|n| n.attribute((xmp::XML, "lang")) == Some("fr") && n.text() == Some("Bonjour"))
+    );
+    let meta = xmp::parse(&output)?;
+    ensure!(meta.property(xmp::DC, "creator").unwrap().value == "scalar creator");
+    ensure!(!meta.property(xmp::DC, "creator").unwrap().is_array());
+    ensure!(meta.property(xmp::DC, "subject").unwrap().is_ordered());
+    ensure!(
+        document
+            .descendants()
+            .any(|n| (n.has_tag_name((UNKNOWN, "opaque"))
+                && n.text() == Some("structured alternative"))
+                || n.attribute((UNKNOWN, "opaque")) == Some("structured alternative"))
+    );
+    ensure!(
+        meta.property("http://ns.adobe.com/xmp/1.0/DynamicMedia/", "copyright")
+            .unwrap()
+            .value
+            == "audio rights"
+    );
+    let localized = xmp::apply_edits(
+        &output,
+        &[Edit::Localized {
+            namespace: xmp::DC.into(),
+            path: "title".into(),
+            language: "fr".into(),
+            value: "Bonsoir".into(),
+        }],
+    )?;
+    let model = xmp::parse(&localized)?;
+    ensure!(
+        model
+            .property(xmp::DC, "title[?xml:lang='x-default']")
+            .unwrap()
+            .value
+            == "Default"
+    );
+    ensure!(
+        model
+            .property(xmp::DC, "title[?xml:lang='fr']")
+            .unwrap()
+            .value
+            == "Bonsoir"
+    );
+    Ok(())
+}
+
+#[test]
+fn aliases_and_historical_properties_are_literal_independent_data() -> Result<()> {
+    use photocatalog::xmp::{self, Edit};
+    const PDF: &str = "http://ns.adobe.com/pdf/1.3/";
+    const IX: &str = "http://ns.adobe.com/iX/1.0/";
+    let original = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:pdf="http://ns.adobe.com/pdf/1.3/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:iX="http://ns.adobe.com/iX/1.0/"><pdf:Author>PDF author</pdf:Author><dc:creator><rdf:Seq><rdf:li>DC author</rdf:li></rdf:Seq></dc:creator><iX:changes><rdf:Seq><rdf:li>historical value</rdf:li></rdf:Seq></iX:changes></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+    let output = xmp::apply_edits(
+        original,
+        &[Edit::Set {
+            namespace: PDF.into(),
+            path: "Author".into(),
+            value: "edited PDF author".into(),
+        }],
+    )?;
+    let meta = xmp::parse(&output)?;
+    ensure!(meta.property(PDF, "Author").unwrap().value == "edited PDF author");
+    ensure!(meta.property(xmp::DC, "creator[1]").unwrap().value == "DC author");
+    ensure!(meta.property(IX, "changes[1]").unwrap().value == "historical value");
+    Ok(())
+}
+
 const QUALIFIED_PACKET: &str = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
 <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
