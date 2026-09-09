@@ -41,13 +41,15 @@ Sources: [DuckDB metrics](https://duckdb.org/docs/current/dev/metrics), [DuckDB 
 
 ## Preservation and output
 
+The reference run uses standalone copies at `/Users/michael/PhotoCatalog-private-results/sc-22837-query-work-pristine-v3`. Read-only connections used by the earlier copy helpers left empty SQLite WAL and 32 KiB SHM files at the original pristine location. The diagnostic correctly rejected those sources; its failed receipt is retained. No companions were removed. With no open database handles and no WAL/journal content, APFS clones of each manifest-verified main file were created, their full hashes checked, and original main/companion metadata checked unchanged. `derivation.json` records this operation and the snapshot manifest is byte-identical to the original. These copies isolate immutable query-work access from the original copy helpers.
+
 Only the previously verified production-pristine snapshot is accepted. The snapshot manifest must be complete and match the frozen harness. Each selected database is checked against its recorded size and SHA-256 before opening. Connections are read-only. SQLite additionally uses `immutable=1` and rejects all WAL, SHM, journal, and temporary sidecars before opening; this requires an isolated, checkpointed source with no concurrent writer. It sets only connection-local pragmas and never sets journal mode. DuckDB's profile and spill output stay in the newly created exclusive output directory. Neither engine checkpoints, changes schema, nor writes source records.
 
 The full database hash, size, modification time and inode are compared again after closing, including error paths. These are full sequential hash reads and must also wait for the timing-lane release. Source sidecar appearance fails preservation. Output paths cannot overlap the snapshot tree. Existing output directories are refused. Exceptions leave `receipt.json` with `complete: false`, the error, available query evidence, and preservation evidence where obtainable. A failed run must use a new output path when rerun; failed evidence is retained.
 
 ## Deferred verification and run plan
 
-Protocol 1's six diagnostic tests and all 21 benchmark contract tests passed in the existing Python environment after the coordinator released the small-test lane. Protocol 2 adds two case-generation tests. All 23 tests passed in hosted Linux CI [34353915562](https://github.com/michaeltrefry/PhotoCatalog/actions/runs/34353915562) at `8bb8889dd3694b486259974afdd19a589f688c04`; the extension's reference-Mac run remains pending while supplemental timing owns the lane. The protocol-1 local runs verified native SQLite access, real DuckDB JSON metrics, settings readback, source preservation, and rejected evidence. A real DuckDB setup failure was repaired by enabling JSON profiling before assigning a `.json` output path. `operator_type` is emitted automatically and was checked on every operator by the strict validator. No scale query-work result is claimed. Protocol 3 adds variant-selection, identity, isolation and rejection checks; these new checks remain **UNRUN while supplemental timing owns the reference lane**. The earlier hosted pass does not validate protocol 3. After the coordinator authorizes diagnostic execution:
+Protocol 1's six diagnostic tests and all 21 benchmark contract tests passed in the reference Python environment. Protocol 2's 23 combined tests then passed hosted CI at `8bb8889dd3694b486259974afdd19a589f688c04`. Protocol 3 and the conditional candidate runner passed all 38 hosted evidence tests in [CI 34356352572](https://github.com/michaeltrefry/PhotoCatalog/actions/runs/34356352572) at `5a1f13dcb7d0eee17dd7156108a8229b26d20b24`, including actual child SQL execution and recovery dispatch. The latest reference-Mac run remains pending while supplemental timing owns the lane. The earlier local runs verified native SQLite access, real DuckDB JSON metrics, settings readback, source preservation, and rejected evidence. A real DuckDB setup failure was repaired by enabling JSON profiling before assigning a `.json` output path. `operator_type` is emitted automatically and was checked on every operator by the strict validator. No scale query-work result is claimed. After the coordinator authorizes diagnostic execution:
 
 1. Run the small diagnostic tests first in the existing Python environment:
 
@@ -56,11 +58,11 @@ Protocol 1's six diagnostic tests and all 21 benchmark contract tests passed in 
    ```
 
 2. Review their actual results, including native API loading, emitted DuckDB JSON schema, strict settings readback, source preservation and rejected metrics. Repair any verified failure and independently review the final diagnostic before scale execution.
-3. Run one process at a time for each engine at 1M, 5M and 10M, using that engine's single candidate memory setting from the production-profile campaign. The command requires memory explicitly and does not infer or choose a candidate. For example, **only if the candidate is 256 MiB**:
+3. Run one process at a time for each engine at 1M, 5M and 10M, using that engine's single candidate memory setting from the production-profile campaign. If no profile qualifies, use the original 256 MiB default consistently across all three scales to diagnose its failures; record that this is a failed configuration, not a production candidate. The command requires memory explicitly and does not infer or choose a candidate. For example, **for a selected 256 MiB profile or the explicitly labeled failed-default diagnostic**:
 
    ```sh
    /Users/michael/PhotoCatalog-private-results/sc-22837-env/bin/python benchmarks/query_work.py \
-     --snapshot /Users/michael/PhotoCatalog-private-results/sc-22837-production-pristine \
+     --snapshot /Users/michael/PhotoCatalog-private-results/sc-22837-query-work-pristine-v3 \
      --engine sqlite --variant baseline --count 1000000 --memory-mb 256 \
      --output /Users/michael/PhotoCatalog-private-results/sc-22837-query-work/baseline-sqlite-1000000-256mib
    ```
