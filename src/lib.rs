@@ -130,6 +130,7 @@ impl Catalog {
         }
         if version < 3 {
             tx.execute_batch(catalog_storage::SCHEMA)?;
+            tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
             tx.pragma_update(None, "user_version", 3)?;
         }
         tx.commit()?;

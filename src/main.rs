@@ -65,12 +65,13 @@ enum Command {
     },
     RelinkSources {
         plan: String,
+        sequence: i64,
         #[arg(long, default_value_t = 0)]
         after: i64,
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
-    /// Set per-original destinations before preparing that item.
+    /// Set per-original destinations before starting plan preparation.
     RelinkCandidates {
         plan: String,
         id: String,
@@ -126,6 +127,14 @@ enum Command {
     },
     /// Browse retained source observations and packet/model descriptors.
     MetadataHistory {
+        id: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Browse retained copy/relocation file-instance provenance for unchanged XMP.
+    MetadataFileInstances {
         id: String,
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -223,9 +232,12 @@ fn main() -> Result<()> {
         Command::RelinkItems { plan, after, limit } => {
             print_json(&catalog.relink_items(&plan, after, limit)?)?
         }
-        Command::RelinkSources { plan, after, limit } => {
-            print_json(&catalog.relink_sources(&plan, after, limit)?)?
-        }
+        Command::RelinkSources {
+            plan,
+            sequence,
+            after,
+            limit,
+        } => print_json(&catalog.relink_sources(&plan, sequence, after, limit)?)?,
         Command::RelinkCandidates {
             plan,
             id,
@@ -278,6 +290,9 @@ fn main() -> Result<()> {
         Command::Metadata { id } => print_json(&catalog.metadata(&id)?)?,
         Command::MetadataHistory { id, after, limit } => {
             print_json(&catalog.metadata_history(&id, after, limit)?)?
+        }
+        Command::MetadataFileInstances { id, after, limit } => {
+            print_json(&catalog.metadata_file_instances(&id, after, limit)?)?
         }
         Command::MetadataDecisions { id, after, limit } => {
             print_json(&catalog.metadata_decisions(&id, after, limit)?)?

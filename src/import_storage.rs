@@ -10,11 +10,13 @@ use std::{
 pub(crate) struct ImportVolumes {
     directory: Option<(PathBuf, (u64, u128), Instant, VolumeLocation)>,
     snapshot: MountSnapshot,
+    parent_mount: Option<u64>,
 }
 impl ImportVolumes {
     pub(crate) fn new() -> Self {
         Self {
             directory: None,
+            parent_mount: None,
             snapshot: MountSnapshot {
                 mounts: vec![],
                 complete: false,
@@ -28,11 +30,15 @@ impl ImportVolumes {
     pub(crate) fn observe(&mut self, path: &Path) -> Result<VolumeLocation> {
         let parent = path.parent().context("original has no parent")?;
         let key = storage_volume::object_key(parent, &fs::metadata(parent)?)?;
+        let parent_mount = mount_instance(parent);
         if !self
             .directory
             .as_ref()
             .is_some_and(|(cached, previous, at, _)| {
-                cached == parent && *previous == key && at.elapsed() < Duration::from_secs(1)
+                cached == parent
+                    && *previous == key
+                    && self.parent_mount == parent_mount
+                    && at.elapsed() < Duration::from_secs(1)
             })
         {
             let observation = storage_volume::locate(parent);
@@ -52,6 +58,7 @@ impl ImportVolumes {
                 "original directory changed during volume inspection"
             );
             self.directory = Some((parent.to_path_buf(), key, Instant::now(), observation));
+            self.parent_mount = parent_mount;
         }
         let (_, _, _, directory) = self.directory.as_ref().context("volume cache missing")?;
         if directory.state != LocationState::Available {
@@ -61,7 +68,12 @@ impl ImportVolumes {
         ensure!(metadata.is_file(), "original is not a regular file");
         let file_key = storage_volume::object_key(path, &metadata)?;
         // A mount at the file or a concurrent directory change requires a fresh native query.
-        if file_key.0 != key.0 || key != storage_volume::object_key(parent, &fs::metadata(parent)?)?
+        if file_key.0 != key.0
+            || key != storage_volume::object_key(parent, &fs::metadata(parent)?)?
+            || (cfg!(target_os = "linux")
+                && (parent_mount.is_none()
+                    || mount_instance(path) != parent_mount
+                    || mount_instance(parent) != parent_mount))
         {
             self.directory = None;
             return Ok(storage_volume::locate(path));
@@ -81,6 +93,34 @@ impl ImportVolumes {
             .transpose()?;
         Ok(observation)
     }
+}
+
+/// A mount instance is transient evidence for a cache observation, never a volume ID.
+#[cfg(target_os = "linux")]
+fn mount_instance(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: path is NUL-terminated and stat points to writable storage.
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            stat.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: successful statx initialized the structure; check the returned mask.
+    let stat = unsafe { stat.assume_init() };
+    (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id)
+}
+#[cfg(not(target_os = "linux"))]
+fn mount_instance(_: &Path) -> Option<u64> {
+    None
 }
 
 #[cfg(test)]

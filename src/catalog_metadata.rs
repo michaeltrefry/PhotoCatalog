@@ -124,6 +124,21 @@ pub struct Change {
     pub changed: bool,
 }
 
+pub(crate) const FILE_INSTANCE_SCHEMA: &str = "
+CREATE TABLE metadata_file_instances(id INTEGER PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id), source_id INTEGER NOT NULL REFERENCES metadata_sources(id), evidence_hash TEXT NOT NULL, provenance TEXT NOT NULL, observed_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(source_id,evidence_hash));
+CREATE INDEX metadata_file_instances_asset ON metadata_file_instances(asset_id,id);
+";
+
+/// File-instance observations preserve relocation/copy timing without replacing an
+/// unchanged immutable XMP observation or invalidating selected model identities.
+#[derive(Debug, Serialize)]
+pub struct FileInstance {
+    pub id: i64,
+    pub source_id: i64,
+    pub provenance: serde_json::Value,
+    pub observed_at: String,
+}
+
 struct PreparedModel {
     hash: String,
     semantics: BTreeMap<String, String>,
@@ -270,7 +285,9 @@ impl Prepared {
     }
     /// A verified relink changes the current locator, not the historical observation.
     /// Compare only the current observation, with its original location reinstated.
-    /// File revision, source provenance, packet layout and parser results must all match.
+    /// File bytes, source provenance, packet layout and parser results must all match.
+    /// A copy's timestamp may differ only across a source locator change; its new
+    /// file-instance provenance is retained separately from the immutable model.
     fn matches_relocated_observation(&self, db: &Connection, id: i64) -> Result<bool> {
         let (revision, provenance): (String, String) = db.query_row(
             "SELECT revision,provenance FROM metadata_observations WHERE id=?1",
@@ -279,6 +296,7 @@ impl Prepared {
         )?;
         let mut previous: serde_json::Value = serde_json::from_str(&provenance)?;
         let mut current: serde_json::Value = serde_json::from_str(&self.provenance)?;
+        let relocated = previous.get("source_location") != current.get("source_location");
         previous
             .as_object_mut()
             .context("invalid previous provenance")?
@@ -287,6 +305,15 @@ impl Prepared {
             .as_object_mut()
             .context("invalid current provenance")?
             .remove("source_location");
+        if relocated {
+            for value in [&mut previous, &mut current] {
+                value
+                    .get_mut("file_revision")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("invalid file revision")?
+                    .remove("modified_unix_ns");
+            }
+        }
         Ok(previous == current && self.revision_with_provenance(&provenance)? == revision)
     }
     fn blob(&mut self, bytes: &[u8]) -> Result<String> {
@@ -352,6 +379,11 @@ fn store(
         && prepared.matches_relocated_observation(db, *current)?
     {
         observed = Some(*current);
+        let hash = blake3::hash(prepared.provenance.as_bytes())
+            .to_hex()
+            .to_string();
+        db.execute("INSERT OR IGNORE INTO metadata_file_instances(asset_id,source_id,evidence_hash,provenance) VALUES(?1,?2,?3,?4)",
+            params![asset, sid, hash, prepared.provenance])?;
     }
     let oid = if let Some(id) = observed {
         id
@@ -511,6 +543,29 @@ fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 impl Catalog {
+    pub fn metadata_file_instances(
+        &self,
+        asset: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<FileInstance>> {
+        ensure!((1..=1000).contains(&limit), "page limit must be 1..1000");
+        revision(&self.db, asset)?;
+        let mut stmt = self.db.prepare("SELECT id,source_id,provenance,observed_at FROM metadata_file_instances WHERE asset_id=?1 AND id>?2 ORDER BY id LIMIT ?3")?;
+        let mut result = Vec::new();
+        for row in stmt.query_map(params![asset, after, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?, r.get(3)?))
+        })? {
+            let (id, source_id, provenance, observed_at) = row?;
+            result.push(FileInstance {
+                id,
+                source_id,
+                provenance: serde_json::from_str(&provenance)?,
+                observed_at,
+            });
+        }
+        Ok(result)
+    }
     /// Hold catalog generation authority only for the final preview-manifest CAS.
     /// Stage and flush image bytes before entering this guard; callbacks must not
     /// acquire catalog locks in reverse order. Visible reads still check current keys.
