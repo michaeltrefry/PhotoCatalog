@@ -49,6 +49,7 @@ The reference computer is a MacBook Pro with Apple M5 Max, 18 logical CPUs and 1
 Preparation, copy validation, and full database hashing occur outside timed query intervals and warm OS caches. “Fresh” means a newly opened process/database connection; it does not establish cold filesystem-cache performance. All timing runs were serialized, with local build/render lanes paused. The passive observer retained ordinary desktop CPU/RAM/GPU/I/O observations; it was stopped after the last native run, with a final SIGTERM receipt (6,472 samples). This was a controlled development-host run, not an otherwise empty operating system.
 
 - [Original comparison](BASELINE_BENCHMARK_RESULTS.md): all p50/p95/p99 distributions, constrained 64 MiB failures, loading/storage/growth, plans, recovery, and original native evidence.
+- [Native runtime results](NATIVE_RUNTIME_RESULTS.md): all 15 native distributions, separate RSS, artifact identities, and tail samples.
 - [Production profiles and correction](PRODUCTION_PROFILE_RESULTS.md): all 15 profile outcomes, complete corrected page/write tables, memory distinctions, query-work counters, and receipt hashes.
 - [Frozen protocol](../benchmarks/README.md), [profile protocol](../benchmarks/PRODUCTION_PROFILE_PROTOCOL.md), [correction protocol](../benchmarks/CANDIDATE_VALIDATION_PROTOCOL.md), [work diagnostics](../benchmarks/QUERY_WORK_PROTOCOL.md), and [native runtime protocol](../benchmarks/NATIVE_RUNTIME_VALIDATION.md).
 
