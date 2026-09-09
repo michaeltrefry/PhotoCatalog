@@ -97,6 +97,35 @@ fn distinct_jpeg(base: &[u8], index: u32) -> Result<Vec<u8>> {
     result.extend_from_slice(&base[2..]);
     Ok(result)
 }
+fn verify_object(bytes: &[u8], index: u32, base_hash: &str) -> Result<[u8; 32]> {
+    ensure!(
+        bytes.len() > 39 && bytes[..6] == [0xff, 0xd8, 0xff, 0xfe, 0, 35],
+        "generated COM header mismatch"
+    );
+    ensure!(
+        &bytes[6..39] == format!("photocatalog-layout-v1:{index:010}").as_bytes(),
+        "generated object index mismatch"
+    );
+    let mut original = blake3::Hasher::new();
+    original.update(&bytes[..2]);
+    original.update(&bytes[39..]);
+    ensure!(
+        original.finalize().to_hex().as_str() == base_hash,
+        "generated object source payload mismatch"
+    );
+    Ok(*blake3::hash(bytes).as_bytes())
+}
+fn admit_seed_id(ids: &mut HashSet<String>, id: &str) -> Result<()> {
+    ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+        "unsafe fixture id"
+    );
+    ensure!(ids.insert(id.into()), "duplicate fixture input");
+    Ok(())
+}
 fn key(dataset: &Dataset, index: u32) -> PreviewKey {
     let mut key = dataset.seeds[index as usize % dataset.seeds.len()]
         .key
@@ -159,15 +188,14 @@ fn prepare(campaign: &Path, output: &Path, count: u32, layout: LayoutArg) -> Res
         let mut payloads = Vec::new();
         let mut retained_bytes = 0u64;
         let mut base_hashes = HashSet::new();
+        let mut fixture_ids = HashSet::new();
         for child in children {
             ensure!(child["complete"] == true, "incomplete worker child");
             let id = child["id"].as_str().context("fixture id")?;
+            admit_seed_id(&mut fixture_ids, id)?;
             ensure!(
-                !id.is_empty()
-                    && id
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
-                "unsafe fixture id"
+                child["result"]["fixture_id"] == id,
+                "worker fixture identity mismatch"
             );
             let artifact = child["result"]["artifacts"]
                 .as_array()
@@ -177,7 +205,8 @@ fn prepare(campaign: &Path, output: &Path, count: u32, layout: LayoutArg) -> Res
                 .context("missing retained tier")?;
             let key: PreviewKey = serde_json::from_value(artifact["key"].clone())?;
             ensure!(
-                key.renderer_version == renderer_identity()
+                key.asset_id == id
+                    && key.renderer_version == renderer_identity()
                     && key.tier == Tier::Thumbnail
                     && key.encoding
                         == CodecSettings {
@@ -393,6 +422,8 @@ fn lookup(dataset_path: &Path, output: &Path) -> Result<()> {
             };
             let mut samples = Vec::with_capacity(data.count as usize);
             let mut bytes = 0u64;
+            let mut verified_hashes = HashSet::new();
+            let mut verification_ms = 0.0;
             let mut row = json!({"pass":pass,"order":if pass<3{"sequential"}else{"seeded_random"},"seed":if pass<3{None}else{Some(22841+pass-3)},"started":stamp(start),"complete":false});
             let pass_start = Instant::now();
             let measured = (|| -> Result<()> {
@@ -407,14 +438,34 @@ fn lookup(dataset_path: &Path, output: &Path) -> Result<()> {
                         !cached.stale && cached.key == expected,
                         "stale/wrong layout object"
                     );
+                    let verification_start = Instant::now();
+                    let digest = verify_object(
+                        &cached.bytes,
+                        index,
+                        &data.seeds[index as usize % 30].encoded_blake3,
+                    )?;
+                    ensure!(
+                        verified_hashes.insert(digest),
+                        "duplicate actual read content hash"
+                    );
+                    verification_ms += verification_start.elapsed().as_secs_f64() * 1000.0;
                     bytes += cached.bytes.len() as u64;
                 }
+                ensure!(
+                    verified_hashes.len() == data.count as usize,
+                    "actual read content cardinality mismatch"
+                );
                 Ok(())
             })();
             row["wall_ms"] = json!(pass_start.elapsed().as_secs_f64() * 1000.0);
             row["finished"] = stamp(start);
             row["lookup_count"] = json!(samples.len());
             row["bytes_read_verified"] = json!(bytes);
+            row["distinct_actual_read_content_hashes"] = json!(verified_hashes.len());
+            row["independent_verification_ms"] = json!(verification_ms);
+            row["verification_scope"] = json!(
+                "COM entry identity and original seed bytes digest; excluded from per-lookup samples, included in pass wall"
+            );
             if let Err(error) = &measured {
                 row["error"] = json!(format!("{error:#}"));
             }
@@ -498,5 +549,32 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(sorted, (0..100).collect::<Vec<_>>());
         assert_ne!(values, shuffled(100, 22842));
+    }
+    #[test]
+    fn correct_key_cannot_hide_wrong_payload_or_duplicate_fixture_input() {
+        let settings = CodecSettings {
+            codec: Codec::Jpeg,
+            quality: 80,
+        };
+        let a = encode(
+            &PreparedRgb::new(2, 2, vec![10; 12]).unwrap(),
+            settings,
+            None,
+        )
+        .unwrap();
+        let b = encode(
+            &PreparedRgb::new(2, 2, vec![200; 12]).unwrap(),
+            settings,
+            None,
+        )
+        .unwrap();
+        let expected = blake3::hash(&a).to_hex().to_string();
+        assert!(verify_object(&distinct_jpeg(&a, 4).unwrap(), 4, &expected).is_ok());
+        assert!(verify_object(&distinct_jpeg(&a, 5).unwrap(), 4, &expected).is_err());
+        assert!(verify_object(&distinct_jpeg(&b, 4).unwrap(), 4, &expected).is_err());
+        let mut ids = HashSet::new();
+        admit_seed_id(&mut ids, "fixture").unwrap();
+        assert!(admit_seed_id(&mut ids, "fixture").is_err());
+        assert!(admit_seed_id(&mut ids, "../other").is_err());
     }
 }

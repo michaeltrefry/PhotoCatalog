@@ -118,6 +118,13 @@ performs three sequential passes followed by random passes with seeds
 22841/22842/22843. It uses actual `PreviewStore::publish_record` (including complete
 render records) and `read_limited` with 8 MiB encoded admission, production
 deferred access touches, one manifest connection and no decoded image cache.
+Every returned object is independently checked outside its per-lookup timer:
+the COM segment must carry the expected entry number, and hashing the remaining
+original JPEG bytes must match the selected seed digest. Each pass requires
+exactly N distinct actual returned-content hashes. This verification is included
+in pass wall time and reported separately; manifest checksums alone are not the
+experiment's payload oracle. Duplicate fixture identities are rejected before
+preparation, while legitimately identical base pixels remain disclosed.
 Raw per-lookup samples are written after each pass; each pass also records wall
 time, boundaries, verified bytes and failures. Footprints are captured after
 preparation and before/after lookup, including actual lock/marker/index/WAL files.
