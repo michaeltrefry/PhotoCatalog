@@ -278,6 +278,10 @@ impl Catalog {
         observer: impl FnMut(ImportEvent) -> Result<()>,
         service: &mut preview::PreviewService,
     ) -> Result<ImportReport> {
+        ensure!(
+            service.is_drained(),
+            "synchronous preview import requires a drained service; drain existing consumers or use begin_import/ImportSession::advance"
+        );
         self.import_impl(folder, max_files, observer, Some(service))
     }
     pub fn begin_import(

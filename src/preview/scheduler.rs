@@ -47,6 +47,9 @@ pub struct Completion {
     pub consumers: Vec<Consumer>,
     pub outcome: WorkerOutcome,
     pub requeued: bool,
+    /// Another scheduler job now owns the same durable key. Reaping this lease
+    /// must not remove that replacement's descriptor or recovery journal.
+    pub superseded: bool,
 }
 struct Job {
     key: String,
@@ -251,8 +254,10 @@ impl PreviewScheduler {
                 consumers: Vec::new(),
                 outcome: WorkerOutcome::Stopped,
                 requeued: true,
+                superseded: false,
             });
         }
+        let superseded = self.keys.get(&job.key).is_some_and(|owner| *owner != id);
         let job = self.remove(id);
         let outcome = if job.canceled.load(Ordering::Acquire) {
             WorkerOutcome::Stopped
@@ -263,6 +268,7 @@ impl PreviewScheduler {
             consumers: job.consumers.keys().copied().collect(),
             outcome,
             requeued: false,
+            superseded,
         })
     }
     pub fn usage(&self) -> SchedulerUsage {
@@ -279,6 +285,25 @@ impl PreviewScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn canceled_lease_reports_replacement_key_ownership() {
+        let mut queue = scheduler();
+        let first = queue.request(key(1), 80, Priority::Foreground).unwrap();
+        let old = queue.next_ready().unwrap().unwrap();
+        queue.cancel(first);
+        let next = queue.request(key(1), 80, Priority::Foreground).unwrap();
+        let completion = queue.finished(old.id, WorkerOutcome::Stopped).unwrap();
+        assert!(completion.superseded);
+        assert!(completion.consumers.is_empty());
+        assert_eq!(queue.usage().queued, 1);
+        let replacement = queue.next_ready().unwrap().unwrap();
+        let completion = queue
+            .finished(replacement.id, WorkerOutcome::Succeeded)
+            .unwrap();
+        assert!(!completion.superseded);
+        assert_eq!(completion.consumers, vec![next]);
+        assert_eq!(queue.usage().reserved_bytes, 0);
+    }
     fn key(n: u8) -> String {
         format!("{n:064x}")
     }

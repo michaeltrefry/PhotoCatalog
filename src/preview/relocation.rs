@@ -158,6 +158,15 @@ impl PreviewStore {
         destination: &Path,
         original_roots: &[PathBuf],
     ) -> Result<()> {
+        self.begin_relocation_inner(tier, destination, original_roots, || Ok(()))
+    }
+    fn begin_relocation_inner(
+        &mut self,
+        tier: Tier,
+        destination: &Path,
+        original_roots: &[PathBuf],
+        after_markers: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         ensure!(
             !self.relocation_pending()?,
             "another cache relocation is in progress"
@@ -191,20 +200,58 @@ impl PreviewStore {
             );
         }
         fs::create_dir_all(&destination)?;
+        // A crash after durable ownership markers but before the journal insert
+        // can be retried only by this same manifest/tier/layout. No data objects
+        // or foreign entries may be adopted. The marker lock below authenticates
+        // ownership before an incomplete relocation marker is rewritten.
+        for entry in fs::read_dir(&destination)? {
+            let entry = entry?;
+            ensure!(
+                entry.file_type()?.is_file()
+                    && matches!(
+                        entry.file_name().to_str(),
+                        Some(".photocatalog-preview-owner" | ".photocatalog-relocation")
+                    ),
+                "relocation destination contains non-admission files"
+            );
+        }
+        let relocation_marker = destination.join(".photocatalog-relocation");
         ensure!(
-            fs::read_dir(&destination)?.next().is_none(),
-            "relocation destination must be empty"
+            !relocation_marker.exists() || destination.join(".photocatalog-preview-owner").exists(),
+            "relocation marker has no owning manifest"
         );
+        if relocation_marker.exists() {
+            ensure!(
+                fs::metadata(destination.join(".photocatalog-preview-owner"))?.len() > 0,
+                "relocation admission has no recorded owner identity"
+            );
+        }
         let target_lock = lock_root(&destination, &self.identity, tier, self.config.layout)?;
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = if relocation_marker.exists() {
+            ensure!(
+                fs::metadata(&relocation_marker)?.len() <= 36,
+                "invalid relocation admission marker"
+            );
+            let mut bytes = [0; 37];
+            let count = File::open(&relocation_marker)?.read(&mut bytes)?;
+            std::str::from_utf8(&bytes[..count])
+                .ok()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .unwrap_or_else(uuid::Uuid::new_v4)
+                .to_string()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
         let mut marker = std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
-            .open(destination.join(".photocatalog-relocation"))?;
+            .create(true)
+            .truncate(true)
+            .open(relocation_marker)?;
         marker.write_all(id.as_bytes())?;
         marker.sync_all()?;
         #[cfg(unix)]
         File::open(&destination)?.sync_all()?;
+        after_markers()?;
         self.db.execute(
             "INSERT INTO relocations VALUES(?1,?2,?3,?4,'copy','')",
             params![
@@ -417,5 +464,97 @@ impl PreviewStore {
                 })?;
         }
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn interrupted_marker_admission_can_retry_only_owned_empty_target() {
+        let root = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            manifest_root: root.path().join("manifest"),
+            thumbnail_root: root.path().join("thumb"),
+            large_root: root.path().join("large"),
+            layout: Layout::HashPrefix,
+            thumbnail_bytes: 1000,
+            large_bytes: 1000,
+        };
+        let destination = root.path().join("destination");
+        let mut store = PreviewStore::open(config.clone(), &[]).unwrap();
+        let source_identity =
+            fs::read(config.thumbnail_root.join(".photocatalog-preview-owner")).unwrap();
+        assert!(
+            store
+                .begin_relocation_inner(Tier::Thumbnail, &destination, &[], || {
+                    anyhow::bail!("injected interruption after markers before journal")
+                })
+                .is_err()
+        );
+        assert!(!store.relocation_pending().unwrap());
+        assert!(destination.join(".photocatalog-relocation").is_file());
+        drop(store);
+        let mut store = PreviewStore::open(config.clone(), &[]).unwrap();
+        let foreign = destination.join("foreign.txt");
+        fs::write(&foreign, b"preserve").unwrap();
+        assert!(
+            store
+                .begin_relocation(Tier::Thumbnail, &destination, &[])
+                .is_err()
+        );
+        assert_eq!(fs::read(&foreign).unwrap(), b"preserve");
+        fs::remove_file(&foreign).unwrap(); // remove only the test-owned fixture
+        store
+            .begin_relocation(Tier::Thumbnail, &destination, &[])
+            .unwrap();
+        assert!(store.relocation_pending().unwrap());
+        assert_eq!(
+            fs::read(config.thumbnail_root.join(".photocatalog-preview-owner")).unwrap(),
+            source_identity
+        );
+        drop(store);
+        let mut store = PreviewStore::open(config.clone(), &[]).unwrap();
+        while !store
+            .relocation_step(Tier::Thumbnail, 10, 1000)
+            .unwrap()
+            .complete
+        {}
+        assert_eq!(store.config.thumbnail_root, destination);
+        assert!(config.thumbnail_root.exists());
+    }
+    #[test]
+    fn another_manifests_admission_markers_are_never_adopted() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("foreign");
+        fs::create_dir(&destination).unwrap();
+        let lock = lock_root(
+            &destination,
+            "foreign-manifest",
+            Tier::Thumbnail,
+            Layout::Flat,
+        )
+        .unwrap();
+        drop(lock);
+        let before = fs::read(destination.join(".photocatalog-preview-owner")).unwrap();
+        let config = StoreConfig {
+            manifest_root: root.path().join("manifest"),
+            thumbnail_root: root.path().join("thumb"),
+            large_root: root.path().join("large"),
+            layout: Layout::Flat,
+            thumbnail_bytes: 100,
+            large_bytes: 100,
+        };
+        let mut store = PreviewStore::open(config, &[]).unwrap();
+        assert!(
+            store
+                .begin_relocation(Tier::Thumbnail, &destination, &[])
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(destination.join(".photocatalog-preview-owner")).unwrap(),
+            before
+        );
+        assert!(!destination.join(".photocatalog-relocation").exists());
     }
 }

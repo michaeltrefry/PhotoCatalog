@@ -12,8 +12,10 @@ memory profile; Stage B freezes worker reservation and its accounting margin.
 and `ImportSession::advance` expose the same discovery/metadata/reservation path
 one directory entry at a time, queuing full-image rendering instead of waiting
 for it. An application actor interleaves advances with foreground requests and
-service ticks. The synchronous wrapper drains required jobs before reporting
-completion. `Catalog::import` retains the explicitly documented compatibility
+service ticks. The synchronous wrapper requires a drained service before it
+starts, then drains its own required jobs before reporting completion. It rejects
+caller-owned outstanding work with an actionable error; the incremental actor
+API retains foreground/import interleaving. `Catalog::import` retains the explicitly documented compatibility
 thumbnail path for existing library callers. CLI import and preview commands use
 the configured service, including complete-original rendering for RAW.
 
@@ -26,6 +28,10 @@ configurable. `cache-jobs` exposes queued, resource-limited, unavailable and fai
 jobs; `cache-resume` performs bounded restart, with `--retry-blocked` for deliberate
 retry after admission/storage changes. `cache-budgets` persists quota changes in
 the preview manifest. It never evicts the last retained thumbnail to shrink a quota.
+If a resume batch fails after admitting earlier jobs, it cancels only those new
+in-memory admissions and retains their durable journals for retry. No unreturned
+consumer continues running. A canceled worker's lease cannot delete a newer
+same-key request or its journal when the old process is reaped.
 
 A job key binds asset/variant, authoritative source generation and fingerprint,
 pixel-recipe revision, actual renderer/preparation identity, tier, dimensions and
@@ -55,7 +61,10 @@ are dropped. Native working reservations are accounting admissions; they do not
 claim an aggregate native allocator or OS RSS enforcement.
 
 `cache-relocate-begin` requires drained active/queued rendering and a separate,
-empty destination. Original roots, tier roots and the manifest cannot overlap.
+empty destination. An interrupted marker-before-journal admission can be retried
+only when the target carries this manifest/tier/layout identity and contains
+solely its admission markers. Foreign files or another manifest's marker are
+preserved and rejected. Original roots, tier roots and the manifest cannot overlap.
 Both tier directories have process locks with a manifest UUID/tier/layout marker;
 the destination is additionally bound to the durable relocation job. Bounded
 `cache-relocate-step` calls copy using fixed-size streaming buffers and verify
@@ -75,3 +84,7 @@ restart before/after the location switch, and actual owner-process exits at four
 cross-database boundaries. Named short observer callbacks expose manifest attach,
 before catalog commit, after catalog commit and before journal removal; default
 execution installs no callback. This is an evidence plan until those tests run.
+The six-finding review repair also adds canceled/same-key resubmission, occupied
+synchronous import, mixed valid/foreign-path resume, interrupted relocation
+admission, all root-overlap pairs, and deferred-constraint COMMIT failure/reuse
+regressions. These additions are source-ready and unrun while S7 owns timing.

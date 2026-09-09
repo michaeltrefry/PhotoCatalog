@@ -28,6 +28,131 @@ fn image(path: &Path, color: [u8; 3]) {
         .save(path)
         .unwrap();
 }
+#[test]
+fn canceled_active_key_cannot_remove_replacement_before_reap() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("a.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    catalog.import(&originals, None, |_| Ok(())).unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let mut previews = service(
+        &root.path().join("cache"),
+        &originals,
+        ServiceLimits::default(),
+    );
+    let first = previews
+        .request(&mut catalog, &asset.id, Tier::Large, Priority::Foreground)
+        .unwrap();
+    previews.tick(&mut catalog).unwrap();
+    assert_eq!(previews.scheduler_usage().active, 1);
+    previews.cancel(first).unwrap();
+    let replacement = previews
+        .request(&mut catalog, &asset.id, Tier::Large, Priority::Foreground)
+        .unwrap();
+    assert_ne!(first, replacement);
+    assert_eq!(previews.jobs(0, 10).unwrap().len(), 1);
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, replacement),
+        ServiceCompletion::Ready
+    ));
+    assert!(previews.take_completion(first).is_none());
+    assert!(previews.jobs(0, 10).unwrap().is_empty());
+    assert_eq!(previews.scheduler_usage().reserved_bytes, 0);
+    assert!(previews.is_drained());
+}
+
+#[test]
+fn synchronous_import_rejects_caller_owned_request_without_consuming_it() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("a.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    catalog.import(&originals, None, |_| Ok(())).unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let limits = ServiceLimits {
+        requests: 1,
+        ..ServiceLimits::default()
+    };
+    let mut previews = service(&root.path().join("cache"), &originals, limits);
+    let caller = previews
+        .request(&mut catalog, &asset.id, Tier::Large, Priority::Foreground)
+        .unwrap();
+    let error = catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap_err();
+    assert!(error.to_string().contains("drained service"));
+    assert_eq!(previews.scheduler_usage().queued, 1);
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, caller),
+        ServiceCompletion::Ready
+    ));
+    catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap();
+}
+
+#[test]
+fn resume_error_rolls_back_new_handles_but_preserves_durable_jobs() {
+    use photocatalog::storage_volume::NativePath;
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    for n in 0..2 {
+        image(&originals.join(format!("{n}.png")), [41 + n, 87, 149]);
+    }
+    let catalog_path = root.path().join("catalog");
+    let cache = root.path().join("cache");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog.import(&originals, None, |_| Ok(())).unwrap();
+    let assets = catalog.browse(0, 10).unwrap();
+    let mut previews = service(&cache, &originals, ServiceLimits::default());
+    for asset in &assets {
+        previews
+            .request(&mut catalog, &asset.id, Tier::Large, Priority::Background)
+            .unwrap();
+    }
+    drop(previews); // queued journals survive owner shutdown
+    let db = rusqlite::Connection::open(catalog_path.join("catalog.sqlite3")).unwrap();
+    let original: String = db
+        .query_row(
+            "SELECT native_path FROM storage_bindings WHERE asset_id=?1",
+            [&assets[1].id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    #[cfg(unix)]
+    let foreign = NativePath::WindowsWide("C:\\unmapped\\photo.png".encode_utf16().collect());
+    #[cfg(windows)]
+    let foreign = NativePath::UnixBytes(b"/unmapped/photo.png".to_vec());
+    db.execute(
+        "UPDATE storage_bindings SET native_path=?1 WHERE asset_id=?2",
+        rusqlite::params![serde_json::to_string(&foreign).unwrap(), assets[1].id],
+    )
+    .unwrap();
+    let mut previews = service(&cache, &originals, ServiceLimits::default());
+    assert!(previews.resume(&mut catalog, 0, 10, false).is_err());
+    assert!(previews.is_drained());
+    assert_eq!(previews.scheduler_usage().consumers, 0);
+    assert_eq!(previews.jobs(0, 10).unwrap().len(), 2);
+    db.execute(
+        "UPDATE storage_bindings SET native_path=?1 WHERE asset_id=?2",
+        rusqlite::params![original, assets[1].id],
+    )
+    .unwrap();
+    let (_, consumers) = previews.resume(&mut catalog, 0, 10, false).unwrap();
+    assert_eq!(consumers.len(), 2);
+    for consumer in consumers {
+        assert!(matches!(
+            await_result(&mut previews, &mut catalog, consumer),
+            ServiceCompletion::Ready
+        ));
+    }
+    assert!(previews.is_drained());
+    assert!(previews.jobs(0, 10).unwrap().is_empty());
+}
 fn await_result(
     service: &mut PreviewService,
     catalog: &mut Catalog,

@@ -173,12 +173,14 @@ impl PreviewStore {
                 );
             }
         }
-        ensure!(
-            roots[1] != roots[2]
-                && !roots[1].starts_with(&roots[2])
-                && !roots[2].starts_with(&roots[1]),
-            "thumbnail and large storage must be separate"
-        );
+        for (index, left) in roots.iter().enumerate() {
+            for right in &roots[index + 1..] {
+                ensure!(
+                    !left.starts_with(right) && !right.starts_with(left),
+                    "manifest, thumbnail and large storage must be separate"
+                );
+            }
+        }
         for root in &roots {
             fs::create_dir_all(root)?;
         }
@@ -911,7 +913,17 @@ fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
 
 fn finish(db: &Connection, result: Result<()>) -> Result<()> {
     match result {
-        Ok(()) => db.execute_batch("COMMIT").map_err(Into::into),
+        Ok(()) => match db.execute_batch("COMMIT") {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Deferred constraints and some I/O failures leave the
+                // transaction open. Never leak provisional state into reuse.
+                if !db.is_autocommit() {
+                    let _ = db.execute_batch("ROLLBACK");
+                }
+                Err(error.into())
+            }
+        },
         Err(e) => {
             let _ = db.execute_batch("ROLLBACK");
             Err(e)
@@ -944,6 +956,74 @@ fn prospective(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_commit_rolls_back_provisional_state_and_allows_reuse() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE publication(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED,state TEXT);
+            CREATE TABLE job(id INTEGER PRIMARY KEY);
+            INSERT INTO job VALUES(1);
+            BEGIN IMMEDIATE;
+            INSERT INTO publication VALUES(42,'ready');
+            DELETE FROM job;").unwrap();
+        let error = finish(&db, Ok(())).unwrap_err();
+        assert!(error.to_string().contains("FOREIGN KEY"));
+        assert!(db.is_autocommit());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM publication", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM job", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        db.execute_batch("BEGIN IMMEDIATE; INSERT INTO parent VALUES(42); INSERT INTO publication VALUES(42,'ready'); DELETE FROM job;").unwrap();
+        finish(&db, Ok(())).unwrap();
+        assert!(db.is_autocommit());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM publication", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn every_pair_of_cache_roots_must_be_disjoint_before_creation() {
+        for left in 0..3 {
+            for right in 0..3 {
+                if left == right {
+                    continue;
+                }
+                for nested in [false, true] {
+                    let root = tempfile::tempdir().unwrap();
+                    let mut roots = [
+                        root.path().join("manifest"),
+                        root.path().join("thumb"),
+                        root.path().join("large"),
+                    ];
+                    roots[right] = if nested {
+                        roots[left].join("nested")
+                    } else {
+                        roots[left].clone()
+                    };
+                    let cfg = StoreConfig {
+                        manifest_root: roots[0].clone(),
+                        thumbnail_root: roots[1].clone(),
+                        large_root: roots[2].clone(),
+                        layout: Layout::HashPrefix,
+                        thumbnail_bytes: 100,
+                        large_bytes: 100,
+                    };
+                    assert!(PreviewStore::open(cfg, &[]).is_err());
+                    assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+                }
+            }
+        }
+    }
     fn config(root: &Path, thumb: u64, large: u64) -> StoreConfig {
         StoreConfig {
             manifest_root: root.join("manifest"),

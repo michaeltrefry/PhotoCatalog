@@ -515,7 +515,7 @@ impl PreviewService {
                 WorkerOutcome::Failed
             };
             let completion = self.scheduler.finished(lease_id, outcome)?;
-            if completion.requeued {
+            if completion.requeued || completion.superseded {
                 continue;
             }
             let status = match publication {
@@ -714,72 +714,96 @@ impl PreviewService {
     ) -> Result<(i64, Vec<Consumer>)> {
         let mut cursor = after;
         let mut consumers = Vec::new();
-        for (position, id, descriptor) in self.store.saved_jobs(after, limit)? {
-            if self.consumers.len() >= self.limits.requests {
-                break;
+        let result = (|| -> Result<()> {
+            for (position, id, descriptor) in self.store.saved_jobs(after, limit)? {
+                if self.consumers.len() >= self.limits.requests {
+                    break;
+                }
+                cursor = position;
+                if self.jobs.contains_key(&id) {
+                    continue;
+                }
+                let mut job: SavedJob = serde_json::from_str(&descriptor)?;
+                let current = catalog.render_identity(&job.expected.asset_id)?;
+                let key = &job.request.keys[0];
+                // Crash after catalog commit but before journal deletion.
+                if job.import
+                    && current.state == "ready"
+                    && current.generation == job.expected.generation
+                    && current.fingerprint.as_deref() == Some(&key.fingerprint)
+                {
+                    self.store.finish_job(&id)?;
+                    continue;
+                }
+                if !same_pixels(&current, &job.expected) {
+                    self.store.finish_job(&id)?;
+                    continue;
+                }
+                // Crash after manifest attachment but before catalog ready commit.
+                if job.import && self.store.current_is_intact(key)? {
+                    if let Some(record) = self.store.render_record(key)? {
+                        if catalog
+                            .commit_preview_import(
+                                &job.expected,
+                                &key.fingerprint,
+                                &record.metadata,
+                                &key.digest()?,
+                                || Ok(()),
+                                || Ok(()),
+                            )?
+                            .is_some()
+                        {
+                            self.store.finish_job(&id)?;
+                            continue;
+                        }
+                    }
+                }
+                if !retry_blocked && !matches!(job.state, JobState::Queued) {
+                    continue;
+                }
+                let fingerprint = job.request.keys[0].fingerprint.clone();
+                job.request.keys = job
+                    .request
+                    .keys
+                    .iter()
+                    .map(|key| self.key(&current, key.tier, &fingerprint))
+                    .collect::<Result<Vec<_>>>()?;
+                job.request.source = catalog.preview_original_path(&job.expected.asset_id)?;
+                job.request.decode_limits = self.limits.decode_limits;
+                job.request.encoded_limit = self.limits.per_worker_encoded_bytes;
+                job.state = JobState::Queued;
+                let new_id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
+                    .to_hex()
+                    .to_string();
+                consumers.push(self.submit(catalog, job, Priority::Background)?);
+                if new_id != id {
+                    self.store.finish_job(&id)?;
+                }
             }
-            cursor = position;
-            if self.jobs.contains_key(&id) {
-                continue;
-            }
-            let mut job: SavedJob = serde_json::from_str(&descriptor)?;
-            let current = catalog.render_identity(&job.expected.asset_id)?;
-            let key = &job.request.keys[0];
-            // Crash after catalog commit but before journal deletion.
-            if job.import
-                && current.state == "ready"
-                && current.generation == job.expected.generation
-                && current.fingerprint.as_deref() == Some(&key.fingerprint)
-            {
-                self.store.finish_job(&id)?;
-                continue;
-            }
-            if !same_pixels(&current, &job.expected) {
-                self.store.finish_job(&id)?;
-                continue;
-            }
-            // Crash after manifest attachment but before catalog ready commit.
-            if job.import && self.store.current_is_intact(key)? {
-                if let Some(record) = self.store.render_record(key)? {
-                    if catalog
-                        .commit_preview_import(
-                            &job.expected,
-                            &key.fingerprint,
-                            &record.metadata,
-                            &key.digest()?,
-                            || Ok(()),
-                            || Ok(()),
-                        )?
-                        .is_some()
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // resume does not launch children. Roll back only this call's
+            // in-memory admissions while preserving every durable retry job.
+            // The caller never loses an inaccessible live consumer on Err.
+            for consumer in consumers {
+                self.scheduler.cancel(consumer);
+                if let Some(id) = self.consumers.remove(&consumer) {
+                    if !self.consumers.values().any(|other| other == &id)
+                        && !self.active.values().any(|active| active.lease.key == id)
                     {
-                        self.store.finish_job(&id)?;
-                        continue;
+                        self.jobs.remove(&id);
                     }
                 }
             }
-            if !retry_blocked && !matches!(job.state, JobState::Queued) {
-                continue;
-            }
-            let fingerprint = job.request.keys[0].fingerprint.clone();
-            job.request.keys = job
-                .request
-                .keys
-                .iter()
-                .map(|key| self.key(&current, key.tier, &fingerprint))
-                .collect::<Result<Vec<_>>>()?;
-            job.request.source = catalog.preview_original_path(&job.expected.asset_id)?;
-            job.request.decode_limits = self.limits.decode_limits;
-            job.request.encoded_limit = self.limits.per_worker_encoded_bytes;
-            job.state = JobState::Queued;
-            let new_id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
-                .to_hex()
-                .to_string();
-            consumers.push(self.submit(catalog, job, Priority::Background)?);
-            if new_id != id {
-                self.store.finish_job(&id)?;
-            }
+            return Err(error);
         }
         Ok((cursor, consumers))
+    }
+    /// Synchronous import owns all handles it creates. Applications sharing the
+    /// service with foreground work use ImportSession::advance instead.
+    pub fn is_drained(&self) -> bool {
+        self.consumers.is_empty() && self.active.is_empty() && self.scheduler.usage().queued == 0
     }
     pub fn take_completion(&mut self, consumer: Consumer) -> Option<ServiceCompletion> {
         let result = self.completed.remove(&consumer);
