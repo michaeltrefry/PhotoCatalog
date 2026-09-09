@@ -245,6 +245,41 @@ class ReadOnlyEngines(unittest.TestCase):
                 db.close()
             self.assertEqual(before, diagnostic.source_state(path))
 
+    def test_full_duckdb_run_applies_session_settings_after_readonly_connect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "snapshot"
+            relative = "1000/duckdb/catalog.duckdb"
+            path = source / relative
+            path.parent.mkdir(parents=True)
+            self.fixture(path, "duckdb")
+            before = diagnostic.source_state(path)
+            manifest = {"complete": True, "counts": [1000],
+                        "frozen_harness_sha256": diagnostic.FROZEN_SHA256,
+                        "snapshots": {relative: {"sha256": before["sha256"], "bytes": before["bytes"]}}}
+            (source / "snapshot.json").write_text(json.dumps(manifest))
+            output = root / "receipt"
+            # This setup regression needs one valid page from the tiny fixture;
+            # production case generation and its six cases are tested separately.
+            cases = [{"workload": "page_deep", "case_label": "setup_fixture",
+                      "iteration": None, "cursor_percent": 50, "parameters": [500]}]
+            with patch.object(diagnostic, "query_cases", return_value=cases), \
+                 patch.object(diagnostic.duckdb, "connect", wraps=duckdb.connect) as connect:
+                result = diagnostic.run(source, "duckdb", 1000, 64, output)
+            connect.assert_called_once()
+            arguments = connect.call_args.kwargs
+            self.assertTrue(arguments["read_only"])
+            self.assertNotIn("enable_progress_bar", arguments["config"])
+            self.assertEqual(arguments["config"]["temp_directory"], str((output / "spill").resolve()))
+            self.assertEqual(result["settings"]["enable_progress_bar"], "false")
+            self.assertIs(result["requested_settings"]["enable_progress_bar"], False)
+            self.assertTrue(result["complete"])
+            self.assertTrue(result["source_preserved"])
+            self.assertEqual(result["queries"][0]["correctness"]["rows"], 200)
+            self.assertEqual(result["queries"][0]["profile"]["rows_returned"], 200)
+            self.assertEqual(json.loads((output / "receipt.json").read_text()), json.loads(json.dumps(result)))
+            self.assertEqual(before, diagnostic.source_state(path))
+
     def test_exclusive_output_and_failed_source_proof_leave_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

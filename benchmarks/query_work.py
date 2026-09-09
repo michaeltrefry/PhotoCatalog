@@ -322,7 +322,10 @@ def run(snapshot, engine, count, memory_mb, output, variant="baseline"):
         else:
             options = bench.settings(engine, memory_mb)
             options["temp_directory"] = str(output / "spill")
-            db = duckdb.connect(str(path), read_only=True, config=options)
+            connection_options = options.copy()
+            connection_options.pop("enable_progress_bar")
+            db = duckdb.connect(str(path), read_only=True, config=connection_options)
+            db.execute("SET enable_progress_bar=false")
             receipt.update(engine_version=duckdb.__version__, settings=bench.measured_settings(db, engine), requested_settings=options, open_mode="read_only=True")
         for case in query_cases(count):
             name, parameters = case["workload"], case["parameters"]
