@@ -19,3 +19,9 @@ pub use scheduler::{
 pub use store::{
     CachedPreview, Layout, PreviewKey, PreviewStore, Publication, StoreConfig, StoreUsage, Tier,
 };
+
+mod worker;
+pub use worker::{
+    ProducedPreview, RenderWork, RenderedPreviewBatch, WorkerProcess, recover_worker_staging,
+    worker_main,
+};

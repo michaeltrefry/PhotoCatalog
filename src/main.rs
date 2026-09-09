@@ -207,6 +207,12 @@ enum Command {
     },
 }
 fn main() -> Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--preview-worker")
+    {
+        return photocatalog::preview::worker_main();
+    }
     let cli = Cli::parse();
     let mut catalog = match &cli.command {
         Command::Import { folder, .. } => Catalog::open_for_import(&cli.catalog, folder)?,
