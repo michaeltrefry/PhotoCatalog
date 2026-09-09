@@ -9,3 +9,4 @@
 *.dng
 /private-fixtures/
 __pycache__/
+*.duckdb*

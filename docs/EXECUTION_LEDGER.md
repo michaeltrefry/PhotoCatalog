@@ -4,13 +4,13 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22837 and sc-22838 execute in isolated worktrees after verified completion of sc-22836. Reserve the reference Mac for timed scale measurements after other heavy builds finish.
+sc-22836 and sc-22838 are verified Done. sc-22837 has selected and integrated SQLite at the measured 256 MiB per-connection settings. Original/supplemental comparisons, corrective timing, bundled query-work validation, current native timing, and independent evidence reviews are complete. Local checks pass. The remaining closeout work is final documentation review, exact-head hosted CI, normal PR merge, merged-main validation, and Shortcut read-back. Dependent stories remain To Do until that closeout.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
-| sc-22836 | Done | [PR #1](https://github.com/michaeltrefry/PhotoCatalog/pull/1), merged 56f0b37 | Independent review PASS; 18 local tests; real CR2/JPEG source-invariance receipt; PR and merged-main three-platform CI 34227667817 SUCCESS; Shortcut read-back | Complete |
-| sc-22837 | In Progress | Benchmark worktree at 3baba21; frozen harness 625d677 | Reviewed harness and supplemental profile driver; six verified 1M/5M/10M preparations and pristine snapshots | Await quiet host, run comparisons, integrate decision |
-| sc-22838 | In Progress | [Draft PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2) | 29 release Rust tests; independent validator rejection review; public Canon/Panasonic RAW pass on Mac; 22 private header references | Finish spatial DNG calibration/crop/metadata repairs, corpus validation, exact-head review and three-platform CI |
+| sc-22836 | Done | [PR #1](https://github.com/michaeltrefry/PhotoCatalog/pull/1), merged 56f0b37 | Independent review PASS; 18 local tests; real CR2/JPEG source invariance; merged-main three-platform CI 34227667817 SUCCESS; Shortcut read-back | Complete |
+| sc-22837 | In Review | [PR #3](https://github.com/michaeltrefry/PhotoCatalog/pull/3); [decision](BACKEND_DECISION.md) | Original/profile/correction/native evidence reviews PASS; 40 Rust and 39 Python tests, clippy and formatting pass; CI 34360150692 at 1367118 running (macOS/Linux/contracts PASS, Windows pending) | Final documentation review, exact-head CI, merge/main CI, tracker read-back |
+| sc-22838 | Done | [PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2), merged a0bf374 | Independent review PASS; 31 release tests; 22 private samples/44 renders; public RAW checks; PR CI 34237848026 and merged-main CI 34242815786 three-platform SUCCESS; Shortcut read-back | Complete |
 | sc-22839 | To Do | XMP fidelity | Prerequisites sc-22837/sc-22838 | Dependency-bound |
 | sc-22840 | To Do | Offline storage and relinking | Prerequisite sc-22837 | Dependency-bound |
 | sc-22841 | To Do | Preview storage and scheduling | Prerequisites sc-22837/sc-22838 | Dependency-bound |
@@ -24,20 +24,36 @@ sc-22837 and sc-22838 execute in isolated worktrees after verified completion of
 
 ## Resource and authorization ledger
 
-- User authorized epic delivery, including ordinary PR/CI/merge, and selected michaeltrefry for the private PhotoCatalog repository.
-- Originals and Lightroom sources on the RAID remain read-only. Private source fixtures are outside Git. No live migration or original mutation has occurred.
-- Two isolated implementation lanes, Cargo jobs capped at four each. Final scale timing requires a quiet lane; no GPU work started.
-- Initial repository contained only planning documents, now recorded as baseline commit 09f8e9a. No CodeGraph tools/index or root CODEGRAPH.md were available.
-- Native Windows/Linux behavior requires actual remote CI evidence; local Mac tests are not equivalent.
-- sc-22836 independent review passed exact head 8c56058; merged tree is identical. Future material stories require fresh independent review before merge and Done.
+- User authorized epic delivery, ordinary PR/CI/merge, and the private michaeltrefry/PhotoCatalog repository. The user released the reference Mac on 2026-09-09.
+- Originals and Lightroom sources on the RAID remain read-only. Private fixtures and evidence remain outside Git. No live migration or original mutation has occurred.
+- All S2 measurement sessions are complete. Local builds/renders were paused during timing. The owned passive observer PID 30547/session 93348 was stopped afterward and exited successfully; its final receipt at 2026-09-09T14:00:27Z records SIGTERM and 6,472 samples. No outstanding S2 process needs resuming.
+- Bound Cargo builds to four jobs and serialize heavy measurement/render lanes. Native Windows/Linux behavior requires hosted CI; local Mac tests alone do not establish it.
+- Preserve user ZIPs and unrelated root-worktree files. No CodeGraph tools/index or root CODEGRAPH.md was available.
 
-## Current evidence boundaries
+## S2 evidence and closeout
 
-- Database preparation is complete, but foreground timing has not started. The separate SceneWorks workload is not owned by this epic and has not been stopped. Preserve the pristine snapshots before any mixed writes.
-- The original benchmark's all-cache-profile summary is diagnostic. Production eligibility uses one declared configuration across all scales, with the unchanged latency, durability and actual RSS budgets; see the sc-22837 supplemental protocol.
-- S3 preflight reproduced and repaired AVIF orientation precedence, PSD transparency and missing-composite semantics, and private-validator format mislabeling. Subsequent crop and source-metadata differences remain under repair.
-- Private source headers independently identify precision, intended dimensions and camera metadata. Two DNG fixtures derive from JPEG/TIFF and do not establish native camera RAW coverage. Private images and evidence remain outside Git.
-- PR #2 CI at 4192217 passed macOS tests and public RAW validation; Linux/Windows and the final corrected head remain unverified at this checkpoint. No S3 completion claim.
+The frozen original harness SHA-256 is `167b13d524c0f21a18426bb8b21acc6792f275de7884edca1cf995c6ff874c89`; supplemental driver is `1c509cf8a06ce2dba734ef71ca4aecd6b4a50d1b9eac513ab9cc9ee2a8e6f5eb`. Both files remain unchanged. The frozen original native binary remains separately retained at `sc-22837-frozen-v2-native/catalog_probe`, SHA-256 `cfbe4dcce0f3f176af369e1c685f40bce45d5ae77c259603ab6d78948b6084a6`.
+
+All private paths below are under `/Users/michael/PhotoCatalog-private-results/`:
+
+| Evidence | Status / review |
+| --- | --- |
+| `sc-22837-final-v2` | Complete original campaign; 1,026 distributions, all load proofs, paired hashes, 48 plans and recovery independently reconciled. Default 256 MiB failures retained. |
+| `sc-22837-production-profiles` | Complete predeclared profiles; 2,475 distributions reviewed. DuckDB 1024 MiB numerical PASS; no original SQLite profile qualifies. |
+| `sc-22837-query-work-v3` | Independent full-record/counter/provenance review PASS. SQLite correction constant 2,410/2,413 VM steps; DuckDB scans grow. Failed diagnostics retained. |
+| `sc-22837-query-work-pristine-v3/derivation.json` | Six verified APFS standalone clones; main-file hashes and original main/companion state retained unchanged. No WAL/SHM removal. |
+| `sc-22837-sqlite-page-correction-v1` | Complete once, all scales PASS. Review reconciles 432 children and 495 distributions. 10M worst warm/fresh/write p95 0.695/1.587/20.813 ms; warm RSS 325 MiB. |
+| `sc-22837-native-query-work-v1` | Review PASS: bundled SQLite 3.51.1, 36 queries/7,200 full records; same constant candidate VM work, hashes and source preservation. |
+| `sc-22837-native-runtime-v1` | Complete once, all scales PASS; reviewed 6 children, 15 distributions/2,400 samples. 10M browse/rating/edit p95 0.129/86.948/87.238 ms. Two edit samples exceed 100 ms; p99 105.234/max 116.937 ms retained. |
+| `sc-22837-measurement-20260909-host.jsonl` | Complete ordinary desktop CPU/RAM/GPU/I/O observation stream, with explicit final shutdown. |
+
+Native runtime source is 1ac4737 (code introduced at ef53d25), binary SHA-256 `ab76f6d00358f4ad45e4f833bfd2e124b73cd74b9733d6fece6d02d101f3c8f8`. Its build reference binds Rust 1.98.0, lockfile, source and binary. Later documentation/comment changes do not change the measured execution path. Five native query-work tests plus new configuration/preservation/browse-only tests are included in the 40-test Rust suite. The 39 Python tests include real candidate child/recovery dispatch and full DuckDB diagnostic setup.
+
+Full original/profile/corrected tables are in [baseline results](BASELINE_BENCHMARK_RESULTS.md) and [profile results](PRODUCTION_PROFILE_RESULTS.md). The [decision](BACKEND_DECISION.md) records the selected configuration, original adverse evidence, native contention differences, cold-cache limitations, and integration scope. No S2 result is evidence for RAW/preview/UI performance. Do not repeat a completed campaign to improve a result.
+
+## S3 retained evidence
+
+PR #2 reviewed head 2d30647 and merged a0bf374 have identical trees. Private corpus `sc-22838-e6a4545-corpus/receipt.json` and `verification.json` retain 22 fixtures/44 deterministic renders, numeric and visual color/HDR checks, and camera/format provenance. Two DNG fixtures derive from JPEG/TIFF and are explicitly not native-camera evidence. AVIF orientation, PSD transparency/missing-composite, and DNG crop/profile/spatial calibration repairs passed review and the corpus. This backend integration does not change the renderer; do not repeat the private corpus without a relevant change or unresolved concern.
 
 ## Foundation risk register
 

@@ -4,7 +4,7 @@ A Rust photo catalog and non-destructive editor in development for macOS, Window
 
 ## Foundation CLI
 
-The foundation provides a UI-independent library and CLI with provisional SQLite metadata storage and JPEG thumbnails. The database and preview formats are selected through the epic's benchmarks. The image pipeline adds full-resolution RAW/DNG development and common raster/PSD composite decoding, with explicit color/precision provenance and compatibility limits. See [image pipeline](docs/IMAGE_PIPELINE.md) for the supported variants and native build requirements. Editing recipes and the desktop interface remain tracked work.
+The foundation provides a UI-independent library and CLI with SQLite metadata storage and provisional JPEG thumbnails. The [database decision](docs/BACKEND_DECISION.md) records the measured configuration and its limits; preview formats retain their own benchmark story. The image pipeline adds full-resolution RAW/DNG development and common raster/PSD composite decoding, with explicit color/precision provenance and compatibility limits. See [image pipeline](docs/IMAGE_PIPELINE.md) for the supported variants and native build requirements. Editing recipes and the desktop interface remain tracked work.
 
 Install the native dependencies documented in the image pipeline, fetch the verified SDK, then build and check:
 
