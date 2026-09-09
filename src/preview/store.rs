@@ -1178,7 +1178,11 @@ mod tests {
         store.desire(&key, || Ok(true)).unwrap();
         store.publish(&key, b"eightbit", authority).unwrap();
         let error = store.read_limited(&key, false, 7).err().unwrap();
-        assert!(error.to_string().contains("before allocation"));
+        assert!(
+            error
+                .downcast_ref::<super::super::EncodedBudgetExceeded>()
+                .is_some()
+        );
         assert_eq!(store.usage().unwrap().thumbnail_bytes, 8);
         assert_eq!(
             store.read_limited(&key, false, 8).unwrap().unwrap().bytes,
