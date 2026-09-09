@@ -4,6 +4,8 @@ pub mod catalog_storage;
 mod import_storage;
 pub mod media;
 pub mod metadata_export;
+pub mod organization;
+pub mod organization_search;
 pub mod preview;
 pub mod storage_volume;
 pub mod xmp;
@@ -88,7 +90,7 @@ impl Catalog {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 3,
+            version <= 4,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -133,6 +135,10 @@ impl Catalog {
             tx.execute_batch(catalog_storage::SCHEMA)?;
             tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
             tx.pragma_update(None, "user_version", 3)?;
+        }
+        if version < 4 {
+            tx.execute_batch(organization::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 4)?;
         }
         tx.commit()?;
         Ok(Self { db, root })
@@ -256,7 +262,14 @@ impl Catalog {
             let hash = blake3::hash(&preview).to_hex().to_string();
             self.publish_preview(&hash, &preview)?;
             observer(ImportEvent::PreviewPublished)?;
-            self.db.execute("UPDATE assets SET fingerprint=?1,state='ready',metadata=?2,preview_hash=?3,error=NULL WHERE location=?4", params![fingerprint,serde_json::to_string(&metadata)?,hash,location])?;
+            let tx = self.db.transaction()?;
+            tx.execute("UPDATE assets SET fingerprint=?1,state='ready',metadata=?2,preview_hash=?3,error=NULL WHERE location=?4", params![fingerprint,serde_json::to_string(&metadata)?,hash,location])?;
+            let asset: String =
+                tx.query_row("SELECT id FROM assets WHERE location=?", [&location], |r| {
+                    r.get(0)
+                })?;
+            organization::refresh(&tx, &asset)?;
+            tx.commit()?;
             observer(ImportEvent::Committed)?;
             report.imported += 1;
         }
@@ -282,15 +295,29 @@ impl Catalog {
         self.record_storage_path(&asset, &storage_volume::NativePath::from_path(path))?;
         Ok(asset)
     }
-    fn reserve(&self, path: &Path, location: &[u8]) -> Result<()> {
-        self.db.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
+    fn reserve(&mut self, path: &Path, location: &[u8]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
+        let asset: String =
+            tx.query_row("SELECT id FROM assets WHERE location=?", [location], |r| {
+                r.get(0)
+            })?;
+        organization::refresh(&tx, &asset)?;
+        tx.commit()?;
         Ok(())
     }
-    fn fail(&self, location: &[u8], error: &anyhow::Error) -> Result<()> {
-        self.db.execute(
+    fn fail(&mut self, location: &[u8], error: &anyhow::Error) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute(
             "UPDATE assets SET state='failed',preview_hash=NULL,error=?1 WHERE location=?2",
             params![format!("{error:#}"), location],
         )?;
+        let asset: String =
+            tx.query_row("SELECT id FROM assets WHERE location=?", [location], |r| {
+                r.get(0)
+            })?;
+        organization::refresh(&tx, &asset)?;
+        tx.commit()?;
         Ok(())
     }
     fn publish_preview(&self, hash: &str, bytes: &[u8]) -> Result<()> {
@@ -646,7 +673,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            3
+            4
         );
         assert_eq!(
             catalog

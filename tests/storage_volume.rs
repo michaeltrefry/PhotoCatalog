@@ -253,7 +253,27 @@ fn inspect_explicit_volume_fixture() {
         std::env::var_os("PHOTOCATALOG_VOLUME_FIXTURE").expect("explicit disposable fixture path");
     let observed = locate(Path::new(&root));
     assert_eq!(observed.state, LocationState::Available, "{observed:?}");
-    assert!(observed.relative_in_volume.is_some(), "{observed:?}");
+    let relative = observed
+        .relative_in_volume
+        .as_ref()
+        .expect("verified relative path");
+    if let Some(expected) = std::env::var_os("PHOTOCATALOG_EXPECT_VOLUME_RELATIVE") {
+        assert_eq!(relative.to_path().unwrap(), PathBuf::from(expected));
+    }
+    let reconstructed = candidate_path(observed.volume.as_ref().unwrap(), relative).unwrap();
+    let original = Path::new(&root);
+    assert_eq!(
+        object_key(original, &std::fs::metadata(original).unwrap()).unwrap(),
+        object_key(&reconstructed, &std::fs::metadata(&reconstructed).unwrap()).unwrap(),
+        "relative mapping must reconstruct the same native filesystem object"
+    );
+    if let Some(expected) = std::env::var_os("PHOTOCATALOG_EXPECT_CANONICAL_SOURCE") {
+        assert_eq!(
+            observed.canonical_path.as_ref().unwrap().to_path().unwrap(),
+            std::fs::canonicalize(expected).unwrap(),
+            "junction observation must resolve to the independently selected source"
+        );
+    }
     let id = observed
         .volume
         .as_ref()
@@ -261,6 +281,8 @@ fn inspect_explicit_volume_fixture() {
         .persistent_identity
         .as_ref()
         .expect("fixture must provide a persistent UUID");
+    #[cfg(windows)]
+    assert_eq!(id.scheme, IdentityScheme::WindowsVolumeGuid);
     if let Ok(expected) = std::env::var("PHOTOCATALOG_EXPECT_VOLUME_ID") {
         assert_eq!(id.value, expected);
     }

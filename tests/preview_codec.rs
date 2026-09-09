@@ -16,6 +16,7 @@ fn rendered(w: u32, h: u32, pixels: Vec<[f32; 4]>) -> RenderedImage {
             camera_make: None,
             camera_model: None,
             captured_at: None,
+            lens: None,
             preview_source: "independent fixture".into(),
         },
         provenance: RenderProvenance {

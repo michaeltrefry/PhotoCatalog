@@ -228,6 +228,7 @@ fn put_binding(db: &Connection, asset: &str, b: &Binding) -> Result<()> {
         return Ok(());
     }
     db.execute("INSERT INTO storage_bindings(asset_id,reference,native_path,volume_id,relative,file_key) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(asset_id) DO UPDATE SET reference=excluded.reference,native_path=excluded.native_path,volume_id=excluded.volume_id,relative=excluded.relative,file_key=excluded.file_key",params![asset,json(&b.reference)?,json(&b.native_path)?,b.volume_id,b.relative.as_ref().map(json).transpose()?,b.file_key])?;
+    crate::organization::refresh(db, asset)?;
     Ok(())
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1205,6 +1206,7 @@ impl Catalog {
             if changed || sources_changed(&tx, plan, sequence)? {
                 advance_metadata(&tx, asset, "storage_relink", plan)?;
             }
+            crate::organization::refresh(&tx, asset)?;
             record_applied(&tx, plan, asset)?;
             boundary(RelinkBoundary::Updated(sequence))?;
             Ok(())
@@ -1339,6 +1341,7 @@ impl Catalog {
             if changed || sources_changed(&tx, plan, sequence)? {
                 advance_metadata(&tx, asset, "storage_undo", plan)?;
             }
+            crate::organization::refresh(&tx, asset)?;
             restore_predecessor(&tx, plan, asset)?;
             boundary(RelinkBoundary::Updated(sequence))?;
             Ok(())
@@ -1708,6 +1711,38 @@ fn components(reference: &PathReference) -> Result<Parts> {
         root,
         names,
     })
+}
+/// Origin-aware folder prefixes for indexed browsing; display strings never form identity.
+pub(crate) fn native_folder_chain(path: &NativePath) -> Result<Vec<(NativePath, String)>> {
+    let parts = components(&PathReference::Native(path.clone()))?;
+    let native = |v: &[u16]| {
+        if parts.windows {
+            NativePath::WindowsWide(v.to_vec())
+        } else {
+            NativePath::UnixBytes(v.iter().map(|u| *u as u8).collect())
+        }
+    };
+    let display = |v: &[u16]| {
+        if parts.windows {
+            String::from_utf16_lossy(v)
+        } else {
+            String::from_utf8_lossy(&v.iter().map(|u| *u as u8).collect::<Vec<_>>()).into_owned()
+        }
+    };
+    let mut prefix = parts.root.clone();
+    if parts.windows {
+        prefix.push(92);
+    }
+    let mut result = vec![(native(&prefix), display(&prefix))];
+    for name in parts.names.iter().take(parts.names.len().saturating_sub(1)) {
+        let separator = if parts.windows { 92 } else { 47 };
+        if prefix.last() != Some(&separator) {
+            prefix.push(separator);
+        }
+        prefix.extend_from_slice(name);
+        result.push((native(&prefix), display(name)));
+    }
+    Ok(result)
 }
 fn native_component(windows: bool, component: &[u16]) -> Result<std::ffi::OsString> {
     #[cfg(unix)]
