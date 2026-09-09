@@ -79,6 +79,9 @@ fn actual_worker_renders_both_tiers_and_validates_full_outputs() {
         std::thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(result.objects.len(), 2);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert!(result.peak_resident_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(!result.peak_method.is_empty());
     for (object, key) in result.objects.iter().zip(&request.keys) {
         assert_eq!(&object.key, key);
         assert_eq!((object.pixels.width(), object.pixels.height()), (17, 11));

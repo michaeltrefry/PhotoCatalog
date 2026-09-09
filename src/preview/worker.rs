@@ -93,6 +93,8 @@ struct ObjectReceipt {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct RenderReceipt {
+    peak_resident_bytes: Option<u64>,
+    peak_method: String,
     metadata: Metadata,
     provenance: RenderProvenance,
     objects: Vec<ObjectReceipt>,
@@ -103,6 +105,8 @@ pub struct ProducedPreview {
     pub encoded: Vec<u8>,
 }
 pub struct RenderedPreviewBatch {
+    pub peak_resident_bytes: Option<u64>,
+    pub peak_method: String,
     pub metadata: Metadata,
     pub provenance: RenderProvenance,
     pub objects: Vec<ProducedPreview>,
@@ -245,6 +249,8 @@ impl WorkerProcess {
             });
         }
         Ok(Some(RenderedPreviewBatch {
+            peak_resident_bytes: receipt.peak_resident_bytes,
+            peak_method: receipt.peak_method,
             metadata: receipt.metadata,
             provenance: receipt.provenance,
             objects,
@@ -480,6 +486,32 @@ pub fn worker_main() -> Result<()> {
     }
     result
 }
+fn peak_resident_memory() -> (Option<u64>, String) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+            if let Ok(value) = u64::try_from(usage.ru_maxrss) {
+                #[cfg(target_os = "macos")]
+                let bytes = value;
+                #[cfg(target_os = "linux")]
+                let bytes = value.saturating_mul(1024);
+                return (
+                    Some(bytes),
+                    "getrusage process high-water RSS; macOS bytes/Linux KiB normalized".into(),
+                );
+            }
+        }
+        (None, "getrusage unavailable".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (
+            None,
+            "process high-water RSS unavailable on this platform".into(),
+        )
+    }
+}
 fn run_worker() -> Result<()> {
     let mut input = BufReader::new(std::io::stdin());
     let mut line = Vec::new();
@@ -543,7 +575,12 @@ fn run_worker() -> Result<()> {
         crate::fingerprint(&source)? == request.keys[0].fingerprint,
         "original changed during rendering"
     );
+    // This covers source decode, both tier preparations/encodes and final
+    // source verification. Only the bounded 64 KiB receipt write follows.
+    let (peak_resident_bytes, peak_method) = peak_resident_memory();
     let receipt = serde_json::to_vec(&RenderReceipt {
+        peak_resident_bytes,
+        peak_method,
         metadata: rendered.metadata,
         provenance: rendered.provenance,
         objects,
