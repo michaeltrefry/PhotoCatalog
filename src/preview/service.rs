@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +133,40 @@ pub struct PreviewView {
     pub record: Option<RenderRecord>,
     pub stale: bool,
 }
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct CacheReadMetrics {
+    pub catalog_identity_ms: f64,
+    /// Includes manifest SQL, record parsing, filesystem read and checksum.
+    pub store_read_checksum_ms: f64,
+    /// Header parsing plus full RGB8 decode, or an existing decoded-cache hit.
+    pub header_decode_ms: f64,
+    pub total_ms: f64,
+    pub decoded_hits: u64,
+    pub decoded_misses: u64,
+    pub returned_pixels: bool,
+}
+enum ReadPhase {
+    Identity,
+    Store,
+    Decode,
+}
+fn measured<T>(
+    metrics: &mut Option<&mut CacheReadMetrics>,
+    phase: ReadPhase,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let start = metrics.as_ref().map(|_| Instant::now());
+    let result = operation();
+    if let (Some(metrics), Some(start)) = (metrics.as_deref_mut(), start) {
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        match phase {
+            ReadPhase::Identity => metrics.catalog_identity_ms += elapsed,
+            ReadPhase::Store => metrics.store_read_checksum_ms += elapsed,
+            ReadPhase::Decode => metrics.header_decode_ms += elapsed,
+        }
+    }
+    result
+}
 type ServiceObserver = Box<dyn FnMut(ServiceEvent) -> Result<()> + Send>;
 pub struct PreviewService {
     observer: std::cell::RefCell<Option<ServiceObserver>>,
@@ -254,7 +289,40 @@ impl PreviewService {
         tier: Tier,
         allow_stale: bool,
     ) -> Result<Option<PreviewView>> {
-        let identity = catalog.render_identity(asset)?;
+        self.cached_inner(catalog, asset, tier, allow_stale, None)
+    }
+    /// Same production path with opt-in phase clocks. Timings remain available
+    /// on errors/misses; instrumentation overhead is included, never subtracted.
+    pub fn cached_with_metrics(
+        &mut self,
+        catalog: &Catalog,
+        asset: &str,
+        tier: Tier,
+        allow_stale: bool,
+        metrics: &mut CacheReadMetrics,
+    ) -> Result<Option<PreviewView>> {
+        *metrics = CacheReadMetrics::default();
+        let before = self.decoded.access_counts();
+        let start = Instant::now();
+        let result = self.cached_inner(catalog, asset, tier, allow_stale, Some(&mut *metrics));
+        metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let after = self.decoded.access_counts();
+        metrics.decoded_hits = after.0.saturating_sub(before.0);
+        metrics.decoded_misses = after.1.saturating_sub(before.1);
+        metrics.returned_pixels = matches!(&result, Ok(Some(_)));
+        result
+    }
+    fn cached_inner(
+        &mut self,
+        catalog: &Catalog,
+        asset: &str,
+        tier: Tier,
+        allow_stale: bool,
+        mut metrics: Option<&mut CacheReadMetrics>,
+    ) -> Result<Option<PreviewView>> {
+        let identity = measured(&mut metrics, ReadPhase::Identity, || {
+            catalog.render_identity(asset)
+        })?;
         let key = self.key(
             &identity,
             tier,
@@ -265,21 +333,28 @@ impl PreviewService {
             .encoded
             .try_reserve(allowance)
             .context("encoded staging unavailable")?;
-        let Some(cached) = self.store.read_limited(&key, allow_stale, allowance)? else {
+        let Some(cached) = measured(&mut metrics, ReadPhase::Store, || {
+            self.store.read_limited(&key, allow_stale, allowance)
+        })?
+        else {
             if allow_stale
                 && tier == Tier::Thumbnail
-                && let Some((hash, bytes)) = catalog.retained_legacy_preview(asset, allowance)?
+                && let Some((hash, bytes)) = measured(&mut metrics, ReadPhase::Store, || {
+                    catalog.retained_legacy_preview(asset, allowance)
+                })?
             {
-                let (width, height) = encoded_dimensions(&bytes, Codec::Jpeg)?;
-                let pixels = self.decoded.decode(
-                    blake3::hash(format!("legacy:{hash}").as_bytes())
-                        .to_hex()
-                        .to_string(),
-                    &bytes,
-                    Codec::Jpeg,
-                    width,
-                    height,
-                )?;
+                let pixels = measured(&mut metrics, ReadPhase::Decode, || {
+                    let (width, height) = encoded_dimensions(&bytes, Codec::Jpeg)?;
+                    self.decoded.decode(
+                        blake3::hash(format!("legacy:{hash}").as_bytes())
+                            .to_hex()
+                            .to_string(),
+                        &bytes,
+                        Codec::Jpeg,
+                        width,
+                        height,
+                    )
+                })?;
                 return Ok(Some(PreviewView {
                     key: None,
                     legacy_hash: Some(hash),
@@ -290,9 +365,8 @@ impl PreviewService {
             }
             return Ok(None);
         };
-        let dimensions = encoded_dimensions(&cached.bytes, cached.key.encoding.codec);
-        let pixels = (|| -> Result<_> {
-            let (width, height) = dimensions?;
+        let pixels = measured(&mut metrics, ReadPhase::Decode, || -> Result<_> {
+            let (width, height) = encoded_dimensions(&cached.bytes, cached.key.encoding.codec)?;
             ensure!(
                 width <= cached.key.edge && height <= cached.key.edge,
                 "cached image exceeds tier"
@@ -310,7 +384,7 @@ impl PreviewService {
                 width,
                 height,
             )
-        })();
+        });
         let pixels = match pixels {
             Ok(pixels) => pixels,
             Err(error) => {
@@ -320,7 +394,9 @@ impl PreviewService {
                 return Err(error);
             }
         };
-        let current = catalog.render_identity(asset)?;
+        let current = measured(&mut metrics, ReadPhase::Identity, || {
+            catalog.render_identity(asset)
+        })?;
         let stale = cached.stale || !same_pixels(&identity, &current) || current.state != "ready";
         if stale && !(allow_stale && tier == Tier::Thumbnail) {
             return Ok(None);

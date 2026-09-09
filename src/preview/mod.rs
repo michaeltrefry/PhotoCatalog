@@ -31,8 +31,8 @@ pub use worker::{
 
 mod service;
 pub use service::{
-    EncodedPreview, JobState, JobView, PreviewPolicy, PreviewService, PreviewView,
-    ServiceCompletion, ServiceEvent, ServiceLimits, TierPolicy,
+    CacheReadMetrics, EncodedPreview, JobState, JobView, PreviewPolicy, PreviewService,
+    PreviewView, ServiceCompletion, ServiceEvent, ServiceLimits, TierPolicy,
 };
 
 mod config;

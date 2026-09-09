@@ -29,6 +29,55 @@ fn image(path: &Path, color: [u8; 3]) {
         .unwrap();
 }
 #[test]
+fn measured_cache_reads_use_identical_pixels_and_report_hits_misses_and_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("a.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    let mut previews = service(
+        &root.path().join("cache"),
+        &originals,
+        ServiceLimits::default(),
+    );
+    catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let mut metrics = CacheReadMetrics::default();
+    let first = previews
+        .cached_with_metrics(&catalog, &asset.id, Tier::Thumbnail, false, &mut metrics)
+        .unwrap()
+        .unwrap();
+    assert_eq!((metrics.decoded_hits, metrics.decoded_misses), (0, 1));
+    assert!(metrics.returned_pixels);
+    let next = previews
+        .cached_with_metrics(&catalog, &asset.id, Tier::Thumbnail, false, &mut metrics)
+        .unwrap()
+        .unwrap();
+    assert_eq!((metrics.decoded_hits, metrics.decoded_misses), (1, 0));
+    assert_eq!(
+        first.pixels.pixels().pixels(),
+        next.pixels.pixels().pixels()
+    );
+    let ordinary = previews
+        .cached(&catalog, &asset.id, Tier::Thumbnail, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ordinary.pixels.pixels().pixels(),
+        first.pixels.pixels().pixels()
+    );
+    assert!(
+        previews
+            .cached_with_metrics(&catalog, "missing", Tier::Thumbnail, false, &mut metrics)
+            .is_err()
+    );
+    assert!(!metrics.returned_pixels);
+    assert_eq!((metrics.decoded_hits, metrics.decoded_misses), (0, 0));
+    assert!(metrics.total_ms >= metrics.catalog_identity_ms);
+}
+#[test]
 fn canceled_active_key_cannot_remove_replacement_before_reap() {
     let root = tempfile::tempdir().unwrap();
     let originals = root.path().join("originals");

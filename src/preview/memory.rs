@@ -64,6 +64,8 @@ impl RetainedPixels {
     }
 }
 pub struct DecodedCache {
+    hits: u64,
+    misses: u64,
     budget: ByteBudget,
     cache_limit: u64,
     max_entries: usize,
@@ -84,6 +86,8 @@ impl DecodedCache {
             "LRU exceeds total decoded allowance"
         );
         Ok(Self {
+            hits: 0,
+            misses: 0,
             budget: ByteBudget::new(total_live_bytes)?,
             cache_limit: cache_bytes,
             max_entries,
@@ -97,6 +101,10 @@ impl DecodedCache {
     }
     pub fn cached_bytes(&self) -> u64 {
         self.cached_bytes
+    }
+    /// Counters cover decode requests, including misses refused by live admission.
+    pub fn access_counts(&self) -> (u64, u64) {
+        (self.hits, self.misses)
     }
     fn tick(&mut self) -> Result<u64> {
         self.clock = self
@@ -142,8 +150,10 @@ impl DecodedCache {
     ) -> Result<Arc<RetainedPixels>> {
         ensure!(!key.is_empty() && key.len() <= 64, "decoded key length");
         if let Some(pixels) = self.get(&key)? {
+            self.hits = self.hits.saturating_add(1);
             return Ok(pixels);
         }
+        self.misses = self.misses.saturating_add(1);
         ensure!(
             width > 0 && height > 0 && width <= 8192 && height <= 8192,
             "invalid decoded dimensions"

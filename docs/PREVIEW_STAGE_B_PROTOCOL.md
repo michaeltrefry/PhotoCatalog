@@ -111,6 +111,21 @@ resource defaults stay configurable and unfrozen until these gates are reviewed.
 The existing first-visible-page target applies only to the measured headless
 component here; desktop/UI/frame-time proof remains S12 work.
 
-Only the first worker-memory probe/coordinator is implemented by this protocol
-checkpoint. Layout/service/navigation coordinators and remaining fault coverage
-are still required S6 implementation, not deferred scope or completion claims.
+The worker-memory probe/coordinator passed its tiny Mac correctness gate. The
+layout probe is now source-ready and unrun: `preview_layout_probe prepare` creates
+one selected layout/count using the successful worker campaign, and `lookup`
+performs three sequential passes followed by random passes with seeds
+22841/22842/22843. It uses actual `PreviewStore::publish_record` (including complete
+render records) and `read_limited` with 8 MiB encoded admission, production
+deferred access touches, one manifest connection and no decoded image cache.
+Raw per-lookup samples are written after each pass; each pass also records wall
+time, boundaries, verified bytes and failures. Footprints are captured after
+preparation and before/after lookup, including actual lock/marker/index/WAL files.
+
+The production service has an opt-in `cached_with_metrics` wrapper around the
+same internal read/decode implementation as `cached`. It records catalog identity,
+manifest/read/checksum, header/decode, total duration and decoded-cache hits/misses;
+ordinary calls do not collect clocks. Instrumentation overhead is included in
+measured wall time and is never subtracted. Service/navigation coordinators and
+remaining fault coverage are still required S6 work; no timing or layout choice
+is implied by these source additions.
