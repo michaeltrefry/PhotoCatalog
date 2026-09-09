@@ -1,5 +1,6 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 pub mod media;
+pub mod preview;
 use anyhow::{Context, Result, bail, ensure};
 pub use media::Metadata;
 use rusqlite::{Connection, OptionalExtension, params};

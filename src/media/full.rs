@@ -71,9 +71,28 @@ pub struct RenderedImage {
 impl RenderedImage {
     /// Browse-only SDR conversion. The float editor input remains unchanged.
     pub fn srgb_preview(&self, edge: u32) -> anyhow::Result<Vec<u8>> {
+        let image = self.srgb_preview_pixels(edge)?;
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 65).encode_image(&image)?;
+        Ok(bytes)
+    }
+
+    /// Shared browse preparation: composite, transfer, quantize, then resize.
+    /// Orientation has already been applied by `decode_full`.
+    pub fn srgb_preview_pixels(&self, edge: u32) -> anyhow::Result<image::RgbImage> {
         anyhow::ensure!((1..=8192).contains(&edge), "preview edge outside 1..8192");
+        anyhow::ensure!(
+            self.width > 0
+                && self.height > 0
+                && self.pixels.len() as u64 == u64::from(self.width) * u64::from(self.height),
+            "invalid rendered dimensions"
+        );
         let mut rgba = RgbaImage::new(self.width, self.height);
         for (target, source) in rgba.pixels_mut().zip(&self.pixels) {
+            anyhow::ensure!(
+                source.iter().all(|v| v.is_finite()) && (0.0..=1.0).contains(&source[3]),
+                "invalid rendered pixel"
+            );
             for c in 0..3 {
                 // Composite straight alpha against a neutral white canvas in linear light.
                 let v = source[c] * source[3] + 1.0 - source[3];
@@ -81,12 +100,9 @@ impl RenderedImage {
             }
             target[3] = 255;
         }
-        let image = DynamicImage::ImageRgba8(rgba)
+        Ok(DynamicImage::ImageRgba8(rgba)
             .thumbnail(edge, edge)
-            .to_rgb8();
-        let mut bytes = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 65).encode_image(&image)?;
-        Ok(bytes)
+            .to_rgb8())
     }
 }
 pub fn linear_to_srgb(x: f32) -> f32 {

@@ -2,6 +2,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/decode.cpp");
     println!("cargo:rerun-if-changed=native/decode.h");
     println!("cargo:rerun-if-changed=native/dng.cpp");
+    println!("cargo:rerun-if-changed=native/preview.cpp");
+    println!("cargo:rerun-if-changed=native/preview.h");
     println!("cargo:rerun-if-env-changed=PHOTOCATALOG_DNG_SDK");
     let sdk = std::path::PathBuf::from(
         std::env::var_os("PHOTOCATALOG_DNG_SDK")
@@ -21,6 +23,7 @@ fn main() {
         .cpp(true)
         .file("native/decode.cpp")
         .file("native/dng.cpp")
+        .file("native/preview.cpp")
         .std("c++17")
         .include(&source)
         .define("qDNGUseXMP", "0")
@@ -72,7 +75,14 @@ fn main() {
     sources.sort();
     build.files(sources).warnings(false);
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        for name in ["libraw", "libavif", "libjxl", "libjpeg-turbo", "zlib"] {
+        for name in [
+            "libraw",
+            "libavif",
+            "libjxl",
+            "libjpeg-turbo",
+            "libwebp",
+            "zlib",
+        ] {
             let lib = vcpkg::Config::new()
                 .find_package(name)
                 .expect("install libraw and libavif with vcpkg (x64-windows-static-md)");
@@ -84,6 +94,7 @@ fn main() {
         for (name, version) in [
             ("libraw", "0.21"),
             ("libavif", "1.0"),
+            ("libwebp", "1.2"),
             ("libjxl", "0.11"),
             ("libjxl_threads", "0.11"),
             ("libjpeg", "2"),
