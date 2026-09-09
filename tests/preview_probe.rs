@@ -150,3 +150,60 @@ fn actual_probe_commands_validate_identity_artifacts_and_exclusive_outputs() {
         .assert()
         .failure();
 }
+
+#[test]
+fn nonuniform_quality_survives_receipt_roundtrip_and_rejects_forgery() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("noise.png");
+    image::RgbImage::from_fn(9, 11, |x, y| {
+        image::Rgb([
+            (x * 29 + y * 71) as u8,
+            (x * 89 + y * 17) as u8,
+            (x * 13 + y * 47) as u8,
+        ])
+    })
+    .save(&source)
+    .unwrap();
+    let prepared = dir.path().join("prepared");
+    cargo_bin_cmd!("preview_probe")
+        .arg("prepare")
+        .arg(&source)
+        .arg(&prepared)
+        .assert()
+        .success();
+    for (codec, q) in [("jpeg", "65"), ("webp", "65"), ("avif", "60")] {
+        let folder = dir.path().join(codec);
+        cargo_bin_cmd!("preview_probe")
+            .args(["measure", "--prepared"])
+            .arg(&prepared)
+            .args([
+                "--edge",
+                "256",
+                "--codec",
+                codec,
+                "--quality",
+                q,
+                "--output",
+            ])
+            .arg(&folder)
+            .assert()
+            .success();
+        cargo_bin_cmd!("preview_probe")
+            .arg("verify-case")
+            .arg(&prepared)
+            .arg(&folder)
+            .assert()
+            .success();
+        let path = folder.join("receipt.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["quality"]["mse_rgb8"] =
+            json!(value["quality"]["mse_rgb8"].as_f64().unwrap() + 0.001);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        cargo_bin_cmd!("preview_probe")
+            .arg("verify-case")
+            .arg(&prepared)
+            .arg(&folder)
+            .assert()
+            .failure();
+    }
+}

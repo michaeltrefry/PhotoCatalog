@@ -474,11 +474,10 @@ fn verify_case(prepared: &Path, folder: &Path) -> Result<Value> {
                     == rgb_digest(&image::open(folder.join("decoded.png"))?.to_rgb8())?,
                 "decoded PNG mismatch"
             );
-            ensure!(
-                serde_json::to_value(preview::quality_metrics(&reference, &decoded)?)?
-                    == value["quality"],
-                "quality mismatch"
-            );
+            verify_quality(
+                &serde_json::to_value(preview::quality_metrics(&reference, &decoded)?)?,
+                &value["quality"],
+            )?;
         }
         verified.push(
             json!({"bytes":bytes.len(),"blake3":sha(&bytes),"decoded_blake3":decoded.digest()}),
@@ -488,6 +487,31 @@ fn verify_case(prepared: &Path, folder: &Path) -> Result<Value> {
         json!({"complete":true,"identity":identity(),"receipt_blake3":sha(&std::fs::read(folder.join("receipt.json"))?),"prepared_blake3":reference.digest(),"decoded_blake3":value["decoded_blake3"],"artifacts":verified}),
     )
 }
+fn verify_quality(actual: &Value, reported: &Value) -> Result<()> {
+    ensure!(
+        actual["identical"] == reported["identical"]
+            && actual["maximum_channel_error"] == reported["maximum_channel_error"],
+        "quality categorical/integer mismatch"
+    );
+    for key in ["mse_rgb8", "psnr_db", "block_rgb_ssim"] {
+        if actual[key].is_null() {
+            ensure!(reported[key].is_null(), "quality nullable field mismatch");
+        } else {
+            let a = actual[key].as_f64().context("computed quality number")?;
+            let b = reported[key].as_f64().context("reported quality number")?;
+            // Default serde_json parsing can move the serialized f64 by an ULP.
+            // This allowance is only for decimal roundtrip, not codec quality.
+            ensure!(
+                a.is_finite()
+                    && b.is_finite()
+                    && (a - b).abs() <= 4.0 * f64::EPSILON * a.abs().max(b.abs()).max(1.0),
+                "quality numeric mismatch"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
