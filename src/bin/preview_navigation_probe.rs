@@ -360,7 +360,7 @@ fn navigation(
             let visible: HashSet<_> = expected.iter().copied().collect();
             let old: Vec<_> = pending
                 .iter()
-                .filter(|(_, index)| !visible.contains(index))
+                .filter(|(_, index)| !visible.contains(*index))
                 .map(|(ticket, index)| (*ticket, *index))
                 .collect();
             for (ticket, index) in old {
