@@ -1,8 +1,8 @@
 # Production profiles and query-work results
 
-Status: completed supplemental evidence, 2026-09-09; **no backend selected**.
+Status: completed supplemental evidence, 2026-09-09. The subsequent [backend decision](BACKEND_DECISION.md) integrates these results with native validation.
 
-DuckDB's 1024 MiB profile passes the supplemental numerical gates at 1M, 5M, and 10M records, but its tested deep-page queries perform increasing scan work as catalog size grows. SQLite's frozen queries have no passing profile through 2048 MiB. The separate SQLite query correction at 256 MiB passes its page, memory, write, correctness, and recovery checks at all three scales; separate work receipts show 2,410 VM steps for deep pages and 2,413 for rating pages at every tested scale and cursor. Native Rust integration and independent acceptance review remain required before selection.
+DuckDB's 1024 MiB profile passes the supplemental numerical gates at 1M, 5M, and 10M records, but its tested deep-page queries perform increasing scan work as catalog size grows. SQLite's frozen queries have no passing profile through 2048 MiB. The separate SQLite query correction at 256 MiB passes its page, memory, write, correctness, and recovery checks at all three scales; separate work receipts show 2,410 VM steps for deep pages and 2,413 for rating pages at every tested scale and cursor. Native Rust integration and independent acceptance review are recorded separately in the backend decision and execution ledger.
 
 Confidence is high in these receipt-level observations. They do not establish performance on other computers, storage, distributions, or production implementations. This report summarizes existing JSON evidence only; preparing it did not execute databases, tests, builds, or new measurements. The original failed results remain valid evidence alongside the correction.
 

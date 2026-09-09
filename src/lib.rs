@@ -1,4 +1,4 @@
-//! UI-independent catalog skeleton. SQLite and JPEG thumbnails are provisional.
+//! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 pub mod media;
 use anyhow::{Context, Result, bail, ensure};
 pub use media::Metadata;
