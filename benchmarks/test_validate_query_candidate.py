@@ -126,13 +126,22 @@ class CandidateEvidence(unittest.TestCase):
             lambda r: r["recovery"]["result"]["before"].update(forced_exit_code=0),
             lambda r: r["warm"]["result"].update(peak_rss_bytes=8 * 1024**3),
             lambda r: r["fresh"]["rating"][0]["result"].update(peak_rss_bytes=8 * 1024**3),
-            lambda r: r["mixed"]["result"].update(peak_rss_bytes=8 * 1024**3),
+            lambda r: r["mixed"]["result"].pop("peak_rss_bytes"),
+            lambda r: r["mixed"]["result"].update(peak_rss_bytes=0),
         ]
         for mutate in mutations:
             with self.subTest(mutation=mutate):
                 changed = copy.deepcopy(args)
                 mutate(changed[0])
                 self.assertFalse(runner.evaluate(*changed)["all_pass"])
+
+    def test_mixed_rss_is_recorded_without_a_browse_budget_gate(self):
+        args = self.fixture()
+        args[0]["mixed"]["result"]["peak_rss_bytes"] = 8 * 1024**3
+        evaluation = runner.evaluate(*args)
+        self.assertTrue(evaluation["checks"]["mixed_rss_recorded"])
+        self.assertTrue(evaluation["all_pass"])
+        self.assertEqual(args[0]["mixed"]["result"]["peak_rss_bytes"], 8 * 1024**3)
 
     def test_stale_child_sql_identity_cannot_pass_matching_results(self):
         args = list(copy.deepcopy(self.fixture()))

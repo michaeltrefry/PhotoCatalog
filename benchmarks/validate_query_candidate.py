@@ -235,7 +235,8 @@ def evaluate(result, baseline, expected_identity, count, repetitions=WARM_SAMPLE
         and len(background.get("samples_ms", [])) == background["batches"]
         and all(valid_distribution(mixed.get("workloads", {}).get(name), repetitions, 100) for name in ("rating", "edit")))
     checks["mixed_pages_complete"] = checks["mixed_identity"] and valid_distribution(mixed.get("workloads", {}).get("page_during_import"), repetitions * 2)
-    checks["mixed_browse_rss"] = type(mixed.get("peak_rss_bytes")) is int and 0 < mixed["peak_rss_bytes"] <= RSS_LIMIT
+    # Mixed RSS is diagnostic; the approved 4 GiB cap applies to warm/fresh browsing.
+    checks["mixed_rss_recorded"] = type(mixed.get("peak_rss_bytes")) is int and mixed["peak_rss_bytes"] > 0
     # Report page-under-import p95 separately; do not invent a new mixed-page threshold.
     recovery = result.get("recovery", {})
     checks["recovery"] = valid_envelope(recovery, expected_identity, request("recovery", count)) and all(
