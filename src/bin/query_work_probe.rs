@@ -334,6 +334,34 @@ fn main() -> Result<()> {
     execute(&Args::parse())
 }
 
+fn checked_output(database: &Path, output: &Path) -> Result<PathBuf> {
+    let database = database.canonicalize()?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let resolved = parent.join(output.file_name().context("output needs a filename")?);
+    let resolved = if resolved.exists() {
+        resolved.canonicalize()?
+    } else {
+        resolved
+    };
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut reserved = database.as_os_str().to_os_string();
+        reserved.push(suffix);
+        // Reserve ASCII case variants too, including on case-insensitive macOS/Windows.
+        ensure!(
+            !resolved
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(reserved.as_encoded_bytes()),
+            "output aliases the source database or a reserved companion"
+        );
+    }
+    Ok(resolved)
+}
+
 fn execute(args: &Args) -> Result<()> {
     ensure!(
         fs::metadata(&args.cases)?.len() <= 65_536,
@@ -342,11 +370,13 @@ fn execute(args: &Args) -> Result<()> {
     let manifest_bytes = fs::read(&args.cases)?;
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate()?;
-    // Reserve the output before any database access; never overwrite a receipt.
+    // Reject aliases before reservation itself can create a source companion.
+    let output_path = checked_output(&args.db, &args.output)?;
+    // Reserve the output before any database connection; never overwrite a receipt.
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&args.output)?;
+        .open(output_path)?;
     let mut receipt = json!({"version":VERSION,"protocol_version":PROTOCOL,"complete":false,
         "diagnostic_only":true,"sqlite_version":rusqlite::version(),"memory_mib":args.memory_mib,
         "manifest":manifest,"manifest_blake3":blake3::hash(&manifest_bytes).to_hex().to_string(),
@@ -528,6 +558,48 @@ mod tests {
         .unwrap_err();
         assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(fs::read(output)?, b"original receipt");
+        Ok(())
+    }
+
+    #[test]
+    fn output_companion_aliases_leave_source_bytes_and_directory_unchanged() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        fs::create_dir(&source)?;
+        let database = source.join("catalog.sqlite3");
+        // Rejection must precede opening SQLite, so an arbitrary source marker suffices.
+        fs::write(&database, b"source must remain exactly unchanged")?;
+        let cases = temporary.path().join("cases.json");
+        fs::write(&cases, serde_json::to_vec(&manifest())?)?;
+        let parents = vec![source.clone()];
+        #[cfg(unix)]
+        let parents = {
+            let mut parents = parents;
+            let alias = temporary.path().join("source-alias");
+            std::os::unix::fs::symlink(&source, &alias)?;
+            parents.push(alias);
+            parents
+        };
+        for parent in parents {
+            for suffix in ["", "-wal", "-shm", "-journal", "-WAL"] {
+                let error = execute(&Args {
+                    db: parent.join("catalog.sqlite3"),
+                    cases: cases.clone(),
+                    output: parent.join(format!("catalog.sqlite3{suffix}")),
+                    memory_mib: 256,
+                })
+                .unwrap_err();
+                assert!(error.to_string().contains("output aliases"), "{error}");
+                assert_eq!(
+                    fs::read(&database)?,
+                    b"source must remain exactly unchanged"
+                );
+                let names: Vec<_> = fs::read_dir(&source)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<_>>()?;
+                assert_eq!(names, [std::ffi::OsString::from("catalog.sqlite3")]);
+            }
+        }
         Ok(())
     }
 
