@@ -4,19 +4,19 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836–sc-22838 are verified Done. S4 metadata integration is in review; independent private RDF comparison found destructive SDK normalization and the repair remains required. S5 volume/path work is in progress on isolated stacked branches. S6 is running its frozen preview-codec experiment; local builds and heavy I/O are paused until it releases the reference Mac.
+sc-22836–sc-22840 are verified Done. S6 preview integration and final measurements remain in progress. S7 has passed local correctness and full scale qualification and is preparing final hosted CI. S9 is inspecting Lightroom catalogs in resumable, read-only source passes. Heavy local validation and timed measurements are coordinated separately; the live Shortcut epic remains authoritative.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
 | sc-22836 | Done | [PR #1](https://github.com/michaeltrefry/PhotoCatalog/pull/1), merged 56f0b37 | Independent review PASS; 18 local tests; real CR2/JPEG source invariance; merged-main three-platform CI 34227667817 SUCCESS; Shortcut read-back | Complete |
 | sc-22837 | Done | [PR #3](https://github.com/michaeltrefry/PhotoCatalog/pull/3), merged f353f3d; [decision](BACKEND_DECISION.md) | Reviewed head 7bb3930 and merge have identical trees; PR CI 34362927300 and main CI 34366395501 all four jobs SUCCESS; Shortcut Done read-back, comment 22896 | Complete |
-| sc-22838 | Done | [PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2), merged a0bf374 | Independent review PASS; 31 release tests; 22 private samples/44 renders; public RAW checks; PR CI 34237848026 and merged-main CI 34242815786 three-platform SUCCESS; Shortcut read-back | Complete |
-| sc-22839 | In Review | [Draft PR #4](https://github.com/michaeltrefry/PhotoCatalog/pull/4); codex/sc-22839-xmp | Private byte/count/source-invariance checks reconcile, but RDF preservation review found identifier loss; comment 22904 | Repair SDK normalization boundary; corrected semantic evidence, review and final CI |
-| sc-22840 | In Progress | Offline storage and relinking; codex/sc-22840-relink and codex/sc-22840-volume | Live acceptance revalidated; source-only volume adapter work during S6 measurements; comment 22903 | Implement volume binding, atomic relink/undo and controlled removable-volume proof |
-| sc-22841 | In Progress | Preview storage and scheduling; codex/sc-22841-previews | Phase A reviewed at 157347f; frozen campaign sc-22841-codec-v1 running without retries | Review full quality/measurement evidence; complete cache/scheduling/recovery and Stage B |
-| sc-22842 | To Do | Organization and search | Prerequisite sc-22839 | Dependency-bound |
+| sc-22838 | Done | [PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2) and corrective [PR #5](https://github.com/michaeltrefry/PhotoCatalog/pull/5), merged bef8b6c | Final renderer review; 115 tests; private camera/render comparisons; PR CI 34386168135 and main CI 34390636314 all four jobs SUCCESS; Shortcut read-back | Complete |
+| sc-22839 | Done | [PR #4](https://github.com/michaeltrefry/PhotoCatalog/pull/4), merged be85c16 | SDK normalization repaired; independent RDF/opaque XMP preservation checks; PR CI 34380874912 and main CI 34382746592 all four jobs SUCCESS; Shortcut Done read-back | Complete |
+| sc-22840 | Done | [PR #6](https://github.com/michaeltrefry/PhotoCatalog/pull/6), merged 60fc33c | Controlled APFS detach/remount/reorganization/replacement/undo; Linux bind mount and Windows volume GUID/junction proof; PR CI 34394610454 and main CI 34395883109 all four jobs SUCCESS; Shortcut Done read-back | Complete |
+| sc-22841 | In Progress | Preview storage and scheduling; codex/sc-22841-previews | Quality and full-worker memory qualification complete; a2f33b7 correctness: 242 Rust, 18 preview/39 benchmark/5 image Python checks PASS; integrated 10M probe source reviewed | Integrate S7 writer/schema changes, validate current source, execute layout/navigation/integrated 10M gates and select defaults, then final CI/merge |
+| sc-22842 | In Progress | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7); organization/search core, schema 5 and shared writer admission | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md): exact runtime 0cfc1fd, all 17 cases × 3 scales and actual-overlap saves PASS; 183 Rust/52 Python checks pass | Final report review, batched push, three-platform CI (including Windows import), merge and tracker read-back |
 | sc-22843 | To Do | Editing and export | Prerequisites sc-22838/sc-22839/sc-22841 | Dependency-bound |
-| sc-22844 | To Do | Lightroom dry run | Prerequisite sc-22839 | Dependency-bound |
+| sc-22844 | In Progress | Lightroom inspection; codex/sc-22844-lightroom-inspection | Seed byte/row preservation independently verified; current inventory of 48 candidates admitted unchanged; two outcomes complete, next member resumed; comments 22939/22945 | Complete bounded main inspection, review companion/path/packet evidence and current-family ambiguities before migration |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
 | sc-22847 | To Do | Desktop UI | Prerequisites sc-22840/sc-22841/sc-22842/sc-22843/sc-22845/sc-22846 | Dependency-bound |
@@ -24,7 +24,7 @@ sc-22836–sc-22838 are verified Done. S4 metadata integration is in review; ind
 
 ## Resource and authorization ledger
 
-- User authorized epic delivery, ordinary PR/CI/merge, and the private michaeltrefry/PhotoCatalog repository. The user released the reference Mac on 2026-09-09.
+- User authorized epic delivery and ordinary PR/CI/merge. The user changed michaeltrefry/PhotoCatalog to public because private-repository Actions consumed the monthly allowance; preserve public visibility and batch validated changes before CI. The user released the reference Mac on 2026-09-09.
 - Originals and Lightroom sources on the RAID remain read-only. Private fixtures and evidence remain outside Git. No live migration or original mutation has occurred.
 - All S2 measurement sessions are complete. Local builds/renders were paused during timing. The owned passive observer PID 30547/session 93348 was stopped afterward and exited successfully; its final receipt at 2026-09-09T14:00:27Z records SIGTERM and 6,472 samples. No outstanding S2 process needs resuming.
 - S4 and S6 use isolated worktrees. Parent owns catalog schema/model integration; packet extraction and explicit export own separate modules. S6 owns preview adapters/store/scheduler; its rebuildable manifest has separate schema ownership. Heavy Cargo and timed measurements are serialized.
@@ -59,3 +59,12 @@ PR #2 reviewed head 2d30647 and merged a0bf374 have identical trees. Private cor
 ## Foundation risk register
 
 Incomplete previews after interruption; duplicate asset creation on retry; source changes during extraction; generated fixtures falsely standing in for real CR2 compatibility; private images or metadata being committed; unbounded directory/file reads; platform differences in path and file publication semantics. Validate these within sc-22836's scope before closeout.
+
+## S7 qualification checkpoint — 2026-09-09
+
+The [organization report](ORGANIZATION_PERFORMANCE_RESULTS.md) records the final
+v4 query and actual-overlap transition PASS at runtime source `0cfc1fd`. The v1/v2
+failures and rejected v3 mixed summary remain retained. Worst warm/fresh page p95
+was 60.295/61.871 ms; browse RSS peaked at 480.781 MiB. All 200 saves overlapped
+background activity at every scale, with p95 12.788/12.161/11.543 ms. Final CI and
+PR/merged-head verification remain required; this checkpoint is not a Done claim.

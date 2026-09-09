@@ -331,13 +331,26 @@ fn revision(db: &Connection, asset: &str) -> Result<i64> {
     let found: Option<i64> = db.query_row("SELECT COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0)).optional()?;
     found.context("asset not found")
 }
-fn advance(db: &Connection, asset: &str, action: &str, detail: &serde_json::Value) -> Result<i64> {
+fn advance(
+    db: &Connection,
+    asset: &str,
+    action: &str,
+    detail: &serde_json::Value,
+    affects_pixels: bool,
+) -> Result<i64> {
     db.execute("INSERT INTO metadata_assets(asset_id,revision) VALUES(?1,1) ON CONFLICT(asset_id) DO UPDATE SET revision=revision+1",[asset])?;
     let next = revision(db, asset)?;
     db.execute(
         "INSERT INTO metadata_history(asset_id,revision,action,detail) VALUES(?1,?2,?3,?4)",
         params![asset, next, action, serde_json::to_string(detail)?],
     )?;
+    if affects_pixels {
+        db.execute(
+            "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
+            [asset],
+        )?;
+    }
+    crate::organization::refresh(db, asset)?;
     Ok(next)
 }
 fn store(
@@ -565,20 +578,32 @@ impl Catalog {
     /// Hold catalog generation authority only for the final preview-manifest CAS.
     /// Stage and flush image bytes before entering this guard; callbacks must not
     /// acquire catalog locks in reverse order. Visible reads still check current keys.
+    /// Metadata revisions also track organization; generation advances for every
+    /// potentially pixel-affecting metadata transition, so flags/ratings need not
+    /// cancel otherwise valid preview publication. Export keeps its full revision CAS.
     pub fn with_render_identity<T>(
         &mut self,
         expected: &RenderIdentity,
         attach: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current=tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[&expected.asset_id],|r|Ok(RenderIdentity{asset_id:expected.asset_id.clone(),generation:r.get(0)?,fingerprint:r.get(1)?,state:r.get(2)?,metadata_revision:r.get(3)?})).optional()?;
-        if current.as_ref() != Some(expected) {
+        if !current.as_ref().is_some_and(|current| {
+            current.asset_id == expected.asset_id
+                && current.generation == expected.generation
+                && current.fingerprint == expected.fingerprint
+                && current.state == expected.state
+        }) {
             return Ok(None);
         }
         let result = attach()?;
         tx.commit()?;
+        drop(_write);
         Ok(Some(result))
     }
     pub fn render_identity(&self, asset: &str) -> Result<RenderIdentity> {
@@ -603,7 +628,12 @@ impl Catalog {
         inspection: &Inspection,
     ) -> Result<Change> {
         let prepared = Prepared::new(inspection, source)?;
-        let tx = self.db.transaction()?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Background)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (observation_id, model_ids, changed) = store(&tx, asset, source, &prepared)?;
         let revision = if changed {
             rebuild(&tx, asset)?;
@@ -612,11 +642,13 @@ impl Catalog {
                 asset,
                 "observe",
                 &serde_json::json!({"observation_id":observation_id}),
+                true,
             )?
         } else {
             revision(&tx, asset)?
         };
         tx.commit()?;
+        drop(_write);
         Ok(Change {
             revision,
             observation_id,
@@ -689,7 +721,12 @@ impl Catalog {
         field: &str,
         model_id: i64,
     ) -> Result<i64> {
-        let tx = self.db.transaction()?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed; refresh conflict review"
@@ -706,8 +743,10 @@ impl Catalog {
             asset,
             "resolve",
             &serde_json::json!({"field":field,"model_id":model_id}),
+            true,
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(next)
     }
     pub fn metadata_model(&self, asset: &str, model_id: i64) -> Result<Vec<u8>> {
@@ -792,16 +831,80 @@ impl Catalog {
         base_model: Option<i64>,
         edits: &[Edit],
     ) -> Result<Change> {
+        self.edit_metadata_commit(asset, expected_revision, base_model, edits, &[], |_, _| {
+            Ok(())
+        })
+    }
+    pub(crate) fn organization_edit_input(
+        &self,
+        asset: &str,
+        base_model: Option<i64>,
+        organization_fields: &[String],
+    ) -> Result<Vec<u8>> {
+        let mut input = base_model
+            .map(|id| self.editable_metadata_model(asset, id))
+            .transpose()?
+            .unwrap_or(xmp::empty_packet()?);
+        if !organization_fields.is_empty() {
+            let view = self.metadata(asset)?;
+            let mut fields = Vec::new();
+            for field in view
+                .fields
+                .iter()
+                .filter(|f| organization_fields.contains(&f.name))
+            {
+                ensure!(
+                    !field.conflicted,
+                    "resolve {} metadata conflict before organization edits",
+                    field.name
+                );
+                let bytes = if field.value == Some(Value::Removed) {
+                    None
+                } else {
+                    Some(
+                        self.editable_metadata_model(
+                            asset,
+                            field
+                                .selected_model
+                                .context("field has no selected model")?,
+                        )?,
+                    )
+                };
+                fields.push((field.name.clone(), bytes));
+            }
+            input = xmp::reconcile_fields(&input, &fields)?;
+        }
+        Ok(input)
+    }
+    pub(crate) fn edit_metadata_commit(
+        &mut self,
+        asset: &str,
+        expected_revision: i64,
+        base_model: Option<i64>,
+        edits: &[Edit],
+        organization_fields: &[String],
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<Change> {
         ensure!(
             revision(&self.db, asset)? == expected_revision,
             "metadata changed; refresh before editing"
         );
-        let input = base_model
-            .map(|id| self.editable_metadata_model(asset, id))
-            .transpose()?
-            .unwrap_or(xmp::empty_packet()?);
-        let bytes = xmp::apply_edits(&input, edits)?;
-        let original = if let Some(mid) = base_model {
+        ensure!(
+            organization_fields.iter().all(|f| matches!(
+                f.as_str(),
+                "rating" | "label" | "keywords" | "hierarchical_keywords"
+            )),
+            "organization field can affect pixels"
+        );
+        let input = self.organization_edit_input(asset, base_model, organization_fields)?;
+        let bytes = if organization_fields.is_empty() {
+            xmp::apply_edits(&input, edits)?
+        } else {
+            xmp::apply_organization_edits(&input, edits)?
+        };
+        let original = if organization_fields.is_empty()
+            && let Some(mid) = base_model
+        {
             let json: String = self.db.query_row(
                 "SELECT projection FROM metadata_models WHERE id=?1",
                 [mid],
@@ -811,7 +914,9 @@ impl Catalog {
         } else {
             xmp::project(&input)?
         };
-        let original_semantics = if let Some(mid) = base_model {
+        let original_semantics = if organization_fields.is_empty()
+            && let Some(mid) = base_model
+        {
             self.db
                 .prepare("SELECT field,semantic_hash FROM metadata_values WHERE model_id=?1")?
                 .query_map([mid], |r| {
@@ -819,7 +924,7 @@ impl Catalog {
                 })?
                 .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
         } else {
-            BTreeMap::new()
+            xmp::field_semantics(&input)?
         };
         let mut updated = xmp::project(&bytes)?;
         for field in original.fields.keys() {
@@ -874,7 +979,12 @@ impl Catalog {
         prepared.revision = blake3::hash(&serde_json::to_vec(&(&prepared.revision, &updated))?)
             .to_hex()
             .to_string();
-        let tx = self.db.transaction()?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed while preparing edit"
@@ -883,7 +993,8 @@ impl Catalog {
         let (observation_id, model_ids, _) = store(&tx, asset, &source, &prepared)?;
         let mid = model_ids[0];
         for (field, value) in &updated.fields {
-            if original.fields.get(field) != Some(value)
+            if organization_fields.contains(field)
+                || original.fields.get(field) != Some(value)
                 || original_semantics.get(field) != prepared.models[0].semantics.get(field)
                 || previous_choices
                     .get(field)
@@ -898,12 +1009,11 @@ impl Catalog {
             asset,
             "edit",
             &serde_json::json!({"observation_id":observation_id,"base_model":base_model,"edits":edits}),
+            organization_fields.is_empty(),
         )?;
-        tx.execute(
-            "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
-            [asset],
-        )?;
+        after(&tx, revision)?;
         tx.commit()?;
+        drop(_write);
         Ok(Change {
             revision,
             observation_id,
@@ -984,7 +1094,12 @@ impl Catalog {
         source: &Source,
         reason: &str,
     ) -> Result<bool> {
-        let tx = self.db.transaction()?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Background)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let previous:Option<String>=tx.query_row("SELECT availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![asset,source.kind,source.locator],|r|r.get(0)).optional()?;
         if previous.as_deref() == Some(reason) {
             return Ok(false);
@@ -995,8 +1110,10 @@ impl Catalog {
             asset,
             "source_unavailable",
             &serde_json::json!({"kind":source.kind,"display":source.display,"reason":reason}),
+            true,
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(true)
     }
     fn inspect_metadata_source(
@@ -1056,7 +1173,12 @@ impl Catalog {
             changed |= c;
             warnings += usize::from(w);
         }
-        crate::catalog_storage::record_metadata_path(&self.db, &asset, "embedded", path)?;
+        {
+            let _write = self
+                .writers
+                .enter(crate::catalog_writer::Priority::Background)?;
+            crate::catalog_storage::record_metadata_path(&self.db, &asset, "embedded", path)?;
+        }
         let directory = path.parent().context("original has no parent")?;
         self.index_metadata_directory(directory)?;
         let stem = name_key(path.file_stem().context("original has no stem")?);
@@ -1080,7 +1202,14 @@ impl Catalog {
                 provenance: serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}}),
             };
             let (c, w) = self.inspect_metadata_source(&asset, &sidecar, &source, true)?;
-            crate::catalog_storage::record_metadata_path(&self.db, &asset, "sidecar", &sidecar)?;
+            {
+                let _write = self
+                    .writers
+                    .enter(crate::catalog_writer::Priority::Background)?;
+                crate::catalog_storage::record_metadata_path(
+                    &self.db, &asset, "sidecar", &sidecar,
+                )?;
+            }
             changed |= c;
             warnings += usize::from(w || source.ambiguous);
         }
@@ -1185,7 +1314,12 @@ impl Catalog {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&payload)?;
         let compressed = encoder.finish()?;
-        let tx = self.db.transaction()?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed during export planning"
@@ -1206,6 +1340,7 @@ impl Catalog {
             ],
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(MetadataExportPlan {
             asset_id: asset.into(),
             metadata_revision: expected_revision,
@@ -1222,6 +1357,9 @@ impl Catalog {
         // IMMEDIATE prevents a concurrent catalog writer from changing metadata between the
         // revision check and external publication. Filesystem recovery evidence remains durable
         // even if the catalog transaction itself fails after publication.
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1238,6 +1376,7 @@ impl Catalog {
             params![serde_json::to_string(&receipt)?, operation],
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(receipt)
     }
     pub fn metadata_decisions(
@@ -1291,6 +1430,9 @@ impl Catalog {
             return self.apply_metadata_export(operation);
         }
         let receipt = crate::metadata_export::restore_planned_export(&plan)?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         self.db.execute(
             "UPDATE metadata_export_plans SET receipt=?1 WHERE operation=?2",
             params![serde_json::to_string(&receipt)?, operation],

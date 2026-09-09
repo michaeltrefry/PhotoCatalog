@@ -1,0 +1,213 @@
+# Organization and photographic search (sc-22842)
+
+The Rust core exposes durable folders, flat and hierarchical keywords, ratings,
+pick/reject flags, color labels, collections, combined filters, and recorded batch
+operations. The CLI is the current interface; the desktop interface remains a
+separate story. This document describes behavior; the [performance report](ORGANIZATION_PERFORMANCE_RESULTS.md) records the qualified Mac workload and remaining delivery gates.
+
+## Metadata authority and identity
+
+S4 observations, source packets, selected models, and semantic conflicts remain
+authoritative. The organization tables are indexed projections. Import, metadata
+resolution/edit, and verified storage remapping refresh affected projections in
+the same transaction. Searches never open originals. Existing offline catalogs
+retain their known metadata and organization; lens data is available only when
+source EXIF or retained XMP actually supplies it. Older decoded JSON without a
+lens field remains readable.
+
+A conflicted source field is not used as an authoritative filter value. Search
+rows expose conflict names and effective model IDs; explicit catalog flag
+provenance is included separately. Resolve a conflicting keyword/rating/label
+field through S4 before changing that field. An explicit catalog choice, including
+removal, keeps S4 precedence after an external source refresh. Opaque and qualified
+properties remain in the full model. Organization edits reconcile the complete
+selected property, derive addresses from that exact input, and apply one bounded
+native edit pass before canonicalization; unordered arrays cannot reorder between
+chunks. No operation writes source images or sidecars.
+
+Typed rating, label, keyword, flag, and membership edits advance metadata/search
+revisions while preserving pixel generation. The preview-only publication guard
+compares asset identity, generation, fingerprint, and state. All other S4 metadata
+transitions conservatively advance pixel generation, retaining invalidation for
+source refresh, conflict resolution, arbitrary edits, and unavailable sources.
+Metadata export still requires its full metadata revision check. Hierarchy moves
+validate a batch of disjoint existing scalar replacements with one full-model
+restore comparison, preserving all qualifiers and unrelated properties without
+revalidating the whole packet once per item.
+
+`dc:subject` is a flat term space; `lr:hierarchicalSubject` is a distinct hierarchy
+whose components use `|` in XMP. The hierarchy API uses arrays of components.
+Assigning `Animals|Birds|Owls` adds ancestor membership for recursive searches;
+`keyword_direct` distinguishes explicitly assigned nodes. Removing a term removes
+that exact assignment. Moving a hierarchy changes that prefix and its descendants
+only in the explicitly selected assets, preserving per-item qualifiers and
+unrelated leaves. Existing empty nodes remain until explicitly deleted; deletion
+refuses nodes with children or assignments. Future imported source terms retain
+their literal names rather than silently following an old rename.
+
+Ratings are 0–5. Unknown/conflicted rating is returned as null; source XMP -1 is
+retained and implies reject unless a catalog flag explicitly overrides it. Flags
+are unflagged/pick/reject. Labels are arbitrary bounded strings, including empty
+to clear. Collections carry creation provenance, revision-checked names, and
+per-membership provenance. Membership and flags are linked to stable asset IDs,
+so relinking originals preserves them. Removing a collection requires it to be
+empty, making member removal an explicit, reviewable batch operation.
+
+Folder identity uses tagged native path components, never display names. Unix
+bytes, Windows UTF-16, drive roots, and UNC roots keep their originating semantics.
+Folder keys normalize supported Windows extended drive/UNC prefix spellings
+(`\\?\Q:\` and `\\?\UNC\server\share\`) to drive/UNC component keys; the
+asset/source locators retain their original tagged spelling. The remaining UTF-16
+code units, including unpaired surrogates, are preserved. This is a lexical folder
+index convention, not filesystem canonicalization of arbitrary paths.
+Unicode/case variants do not silently merge. Display strings may be lossy; they
+are not locators. Unbound legacy rows have no invented folder association until
+storage mapping supplies a tagged current locator.
+
+## Query and cursor contract
+
+`Query` combines text, one keyword (direct or recursive), a folder (direct or
+recursive), collection, date interval, camera make/model, lens, format, rating,
+flag, label, and conflict presence. Text is 1–16 whitespace-separated literal
+prefix terms combined with AND using SQLite FTS5 Unicode tokenization; raw query
+operators are not interpreted. Whitespace-only text is rejected. Exact scalar
+filters preserve case except format, which is normalized uppercase. Dates use
+photographic local calendar order at second precision; EXIF date spelling is
+normalized, fractional seconds and timezone suffixes do not create an inferred
+UTC timestamp. Bounds are inclusive `date_from` and exclusive `date_until`.
+Missing dates sort before known dates and do not match a date interval.
+
+Sorts are sequence, capture date, filename, and rating, in either direction. Stable
+sequence breaks ties. Queries use indexed keyset boundaries with no OFFSET.
+Membership or FTS drives sequence queries; capture/rating/filename use their sort
+indexes. Remaining predicates are checked against at most the requested number
+of candidate assets. Each request accepts 1–1,000 output rows and a candidate
+scan budget between that limit and 4,096.
+
+A result exposes `rows`, `scanned`, `page_complete`, `has_more`, `exhausted`, and
+`next`. **An empty partial result is not an empty library.** Continue from `next`
+when `page_complete` is false. The last scanned candidate forms the continuation,
+including rejected candidates. `has_more` is conservative at an exact limit;
+only SQLite end-of-stream establishes `exhausted`. VM instruction and sort counts
+are returned as diagnostics; VM steps do not fully count work inside FTS posting
+lists. Bounded candidate delivery alone is not proof that every engine operation
+is independent of catalog size. Scale measurements are a separate acceptance
+gate.
+
+A serializable cursor binds the exact query, schema protocol, initial asset
+high-water, and projection epoch. Changed projections—including concurrent
+metadata completion during import—can invalidate it. The API returns an explicit
+stale error; it never silently resumes across an incompatible result ordering.
+Clients restart the query when they choose to adopt changes.
+
+For uninterrupted traversal during edits/import, `search_session` owns a genuine
+SQLite read snapshot with an internal cursor. Up to four sessions can exist in a
+process, each with a 1–300 second lifetime, a capacity-one request queue, 256 MiB
+engine cache, mmap disabled, and file-backed temporary storage. Expiry actively
+closes the connection even if the client stops polling, limiting WAL retention.
+Closing or dropping the session releases the snapshot. Expired sessions must
+restart; there is no indefinite snapshot promise. Browse-process RSS, including
+simultaneously active sessions, still requires the epic's measured 4 GiB gate.
+
+Schema 4 creates a persistent high-water backfill checkpoint. Existing catalogs
+run `organization-index` in batches of at most 1,000 assets. Search refuses an
+incomplete or dirty index instead of presenting partial data as complete. Each
+batch commits its projection rows and checkpoint together, and reopening resumes
+from that checkpoint. Index backfill does not read original files.
+
+## Durable operations and CLI examples
+
+Use `photocatalog --help` and each command's help for exact positional arguments.
+All JSON request files are capped at 1 MiB. Typical query and operation payloads:
+
+```json
+{"text":"blue sunset","rating":4,"lens":"RF24-70mm F2.8 L IS USM","sort":"capture","direction":"ascending"}
+```
+
+```json
+{"operation":"move_keyword","from":["Travel","Old"],"to":["Travel","New"]}
+```
+
+`search` accepts a query file and optional cursor file. `search-session` emits
+bounded pages as newline-delimited JSON. `search-plan` exposes estimated SQLite
+plans without treating them as runtime proof. `folders`, `keywords`, and
+`collections` are paged by durable IDs. Keyword create/delete and collection
+create/rename/delete are explicit commands. `organize` applies one operation with
+the expected asset metadata revision in one durable transaction.
+
+For a large selection:
+
+1. `organization-begin` records the immutable operation.
+2. `organization-append` stages pages of asset IDs and expected revisions, at most
+   1,000 per request. Repeated identical staging is idempotent; conflicting revision
+   values are rejected atomically.
+3. `organization-seal` closes selection. No asset changes occur while preparing.
+4. `organization-step` processes bounded individual transactions. The change,
+   projection, audit event, and completion marker commit together.
+5. `organization-show`, `organization-items`, and `organization-events` expose
+   exact applied, pending, failed, skipped, and cancelled state after restart.
+
+A failure rolls back the affected asset, records the error, and pauses the batch.
+Previously acknowledged items are not replayed. `organization-review` explicitly
+accepts a new revision for retry or skips the failed item. Cancellation stops
+future work while retaining exact prior results and remaining selection. It is
+not represented as all-or-nothing undo. Each asset transition is atomic, while
+multi-asset progress is explicitly resumable and visible. Point edits avoid job
+staging commits. Lock contention and disk failures remain surfaced errors.
+
+## Validation status
+
+The core tests use real disposable JPEG/XMP imports for source preservation,
+conflicts, qualifiers, lens tags, relinking, restart, and batch faults. Synthetic
+metadata fixtures exercise production projection/query APIs against independent
+mathematical result oracles, ties, both directions, partial empty pages, and
+snapshot changes. They make no RAW decode claim and no million-row timing claim.
+The production-query measurement protocol must be frozen and independently
+reviewed before the 1/5/10 million campaigns. Full integrated tests, cross-platform
+CI, final performance evidence, and parent review remain acceptance gates.
+
+Current-schema catalog opening validates/configures the connection without a
+migration transaction or header write. Actual initialization/upgrades remain one
+IMMEDIATE transaction. Query startup therefore works while an independent writer
+holds authority and leaves main/WAL contents unchanged. Metadata retain, resolve,
+edit, unavailable-source, and export-plan writers acquire IMMEDIATE authority
+before revision/source reads; expensive packet preparation stays outside the lock.
+This prevents a stale deferred read snapshot from failing its later write upgrade.
+CAS and per-asset rollback checks still run under the acquired writer authority.
+
+### Candidate-local text admission
+
+Non-FTS ordering (including a keyword/folder/collection sequence driver) evaluates
+text in connection-private TEMP FTS5 batches, using the same `unicode61` tokenizer
+and quoted phrase-prefix expression as the persistent FTS index. Each batch admits
+at most 128 candidates and at most the remaining result slots. No global hit set
+is materialized. A direct sequence FTS driver applies MATCH once and does not
+repeat it as a correlated residual predicate.
+
+The existing `search` and `search_session` use `TextLimits` defaults of 1 MiB per
+indexed document and 8 MiB cumulative indexed source text per request. The
+`search_with_text_limits` and `search_session_with_text_limits` APIs, and CLI
+`--text-document-bytes`/`--text-page-bytes`, allow explicit limits up to 64 MiB per
+request. A document over its limit produces an error with its required size;
+retry with increased limits. Reaching the cumulative limit produces a partial
+page and continuation, including when no row matched. It never means exhaustion.
+The unadmitted boundary row remains after the cursor and is inspected again on
+continuation. Limits govern UTF-8 bytes admitted to local indexing, not SQLite
+allocator usage or total RSS; SQLite may read a source field before its admission.
+
+`Page.text_work` records candidate rows read (including that boundary inspection),
+indexed rows/bytes, MATCH batches, TEMP statement VM steps/sorts, and whether byte
+admission stopped the call. Total page VM steps/sorts include candidate and TEMP
+statements. Setup, reset, inserts, matching and cleanup occur inside page timing.
+Native FTS internal instructions remain outside VM-step accounting. The scan
+limit still caps consumed candidates; at most one additional candidate is read
+for byte admission. Result pages do not hide prefetched or staged rows beyond the
+cursor. `explain_search` describes the ordered main candidate SQL; for local text
+it deliberately contains no MATCH subquery and does not claim to explain the
+separate bounded TEMP indexing work.
+
+TEMP resets occur before each call and after each batch. An error may leave at
+most one bounded batch in the connection's TEMP database until the next reset
+or connection close; it never becomes catalog evidence. TEMP writes use the same
+main read snapshot, including sessions opened with read-only main access. They
+must not acquire a main writer lock or mutate the catalog/main WAL.

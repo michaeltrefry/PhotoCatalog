@@ -1,9 +1,12 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 pub mod catalog_metadata;
 pub mod catalog_storage;
+mod catalog_writer;
 mod import_storage;
 pub mod media;
 pub mod metadata_export;
+pub mod organization;
+pub mod organization_search;
 pub mod storage_volume;
 pub mod xmp;
 pub mod xmp_packets;
@@ -47,6 +50,7 @@ pub enum ImportEvent {
 pub struct Catalog {
     db: Connection,
     root: PathBuf,
+    writers: std::sync::Arc<catalog_writer::Writers>,
 }
 
 /// Apply the measured SQLite settings to an app-owned, already validated connection.
@@ -82,12 +86,13 @@ impl Catalog {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
+        let writers = catalog_writer::for_catalog(&root);
         fs::create_dir_all(root.join("previews"))?;
         let mut db = Connection::open(root.join("catalog.sqlite3"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 3,
+            version <= 5,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -108,8 +113,18 @@ impl Catalog {
             );
         }
         configure_catalog_connection(&db)?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute_batch("
+        // Opening a current catalog must not rewrite its header or acquire an
+        // unnecessary writer transaction. Only actual initialization/migration writes.
+        if version < 5 {
+            let _write = writers.enter(catalog_writer::Priority::Foreground)?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // Another admitted opener may have completed migration while we waited.
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            ensure!(
+                version <= 5,
+                "catalog schema changed while waiting for migration"
+            );
+            tx.execute_batch("
             CREATE TABLE IF NOT EXISTS assets (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
@@ -124,17 +139,26 @@ impl Catalog {
             );
             PRAGMA application_id = 1346913089;
             ")?;
-        if version < 2 {
-            tx.execute_batch(catalog_metadata::SCHEMA)?;
-            tx.pragma_update(None, "user_version", 2)?;
+            if version < 2 {
+                tx.execute_batch(catalog_metadata::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 2)?;
+            }
+            if version < 3 {
+                tx.execute_batch(catalog_storage::SCHEMA)?;
+                tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
+                tx.pragma_update(None, "user_version", 3)?;
+            }
+            if version < 4 {
+                tx.execute_batch(organization::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 4)?;
+            }
+            if version < 5 {
+                tx.execute_batch(organization::CAPTURE_LENS_SCHEMA)?;
+                tx.pragma_update(None, "user_version", 5)?;
+            }
+            tx.commit()?;
         }
-        if version < 3 {
-            tx.execute_batch(catalog_storage::SCHEMA)?;
-            tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
-            tx.pragma_update(None, "user_version", 3)?;
-        }
-        tx.commit()?;
-        Ok(Self { db, root })
+        Ok(Self { db, root, writers })
     }
     /// Imports one explicitly selected directory. Repeating a scan resumes pending/failed files.
     /// The observer runs at durability boundaries and can request a controlled interruption.
@@ -255,7 +279,16 @@ impl Catalog {
             let hash = blake3::hash(&preview).to_hex().to_string();
             self.publish_preview(&hash, &preview)?;
             observer(ImportEvent::PreviewPublished)?;
-            self.db.execute("UPDATE assets SET fingerprint=?1,state='ready',metadata=?2,preview_hash=?3,error=NULL WHERE location=?4", params![fingerprint,serde_json::to_string(&metadata)?,hash,location])?;
+            let _write = self.writers.enter(catalog_writer::Priority::Background)?;
+            let tx = self.db.transaction()?;
+            tx.execute("UPDATE assets SET fingerprint=?1,state='ready',metadata=?2,preview_hash=?3,error=NULL WHERE location=?4", params![fingerprint,serde_json::to_string(&metadata)?,hash,location])?;
+            let asset: String =
+                tx.query_row("SELECT id FROM assets WHERE location=?", [&location], |r| {
+                    r.get(0)
+                })?;
+            organization::refresh(&tx, &asset)?;
+            tx.commit()?;
+            drop(_write);
             observer(ImportEvent::Committed)?;
             report.imported += 1;
         }
@@ -281,15 +314,31 @@ impl Catalog {
         self.record_storage_path(&asset, &storage_volume::NativePath::from_path(path))?;
         Ok(asset)
     }
-    fn reserve(&self, path: &Path, location: &[u8]) -> Result<()> {
-        self.db.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
+    fn reserve(&mut self, path: &Path, location: &[u8]) -> Result<()> {
+        let _write = self.writers.enter(catalog_writer::Priority::Background)?;
+        let tx = self.db.transaction()?;
+        tx.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
+        let asset: String =
+            tx.query_row("SELECT id FROM assets WHERE location=?", [location], |r| {
+                r.get(0)
+            })?;
+        organization::refresh(&tx, &asset)?;
+        tx.commit()?;
         Ok(())
     }
-    fn fail(&self, location: &[u8], error: &anyhow::Error) -> Result<()> {
-        self.db.execute(
+    fn fail(&mut self, location: &[u8], error: &anyhow::Error) -> Result<()> {
+        let _write = self.writers.enter(catalog_writer::Priority::Background)?;
+        let tx = self.db.transaction()?;
+        tx.execute(
             "UPDATE assets SET state='failed',preview_hash=NULL,error=?1 WHERE location=?2",
             params![format!("{error:#}"), location],
         )?;
+        let asset: String =
+            tx.query_row("SELECT id FROM assets WHERE location=?", [location], |r| {
+                r.get(0)
+            })?;
+        organization::refresh(&tx, &asset)?;
+        tx.commit()?;
         Ok(())
     }
     fn publish_preview(&self, hash: &str, bytes: &[u8]) -> Result<()> {
@@ -645,7 +694,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            3
+            5
         );
         assert_eq!(
             catalog
