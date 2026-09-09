@@ -93,6 +93,21 @@ fn relative_mapping_respects_bind_roots_and_rejects_escape() {
     assert!(candidate_path(&volume, &NativePath::from_path(&native_root())).is_err());
 }
 #[test]
+fn exact_file_mount_mapping_keeps_bytes_and_reconstructs_a_regular_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("image.cr2");
+    std::fs::write(&file, b"owned file mount fixture").unwrap();
+    let mut volume = mount(&file, None);
+    volume.volume_subpath = NativePath::from_path(Path::new("source/image.cr2"));
+    let candidate = candidate_path(&volume, &volume.volume_subpath).unwrap();
+    assert_eq!(candidate.as_os_str(), file.as_os_str());
+    assert!(std::fs::metadata(&candidate).unwrap().is_file());
+    assert_eq!(
+        std::fs::read(&candidate).unwrap(),
+        b"owned file mount fixture"
+    );
+}
+#[test]
 fn native_paths_retain_non_unicode_and_reject_foreign_interpretation() {
     #[cfg(unix)]
     let (path, foreign) = {
