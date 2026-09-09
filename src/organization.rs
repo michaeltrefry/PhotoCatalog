@@ -468,6 +468,9 @@ impl Catalog {
             (1..=MAX_BATCH).contains(&limit),
             "index batch limit must be 1..1000"
         );
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Background)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -496,6 +499,7 @@ impl Catalog {
                 r.get::<_, bool>(0)
             })?;
         tx.commit()?;
+        drop(_write);
         Ok(IndexProgress {
             processed: rows.len(),
             backfill_after: after,
@@ -515,9 +519,13 @@ impl Catalog {
         Ok(result)
     }
     pub fn create_keyword(&mut self, kind: KeywordKind, path: &[String]) -> Result<i64> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self.db.transaction()?;
         let id = keyword(&tx, kind, path)?;
         tx.commit()?;
+        drop(_write);
         Ok(id)
     }
     pub fn organization_keywords(
@@ -534,6 +542,9 @@ impl Catalog {
     }
     /// Removing an in-use hierarchy requires an explicit resumable remove/move batch first.
     pub fn delete_keyword(&mut self, id: i64) -> Result<()> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -543,6 +554,7 @@ impl Catalog {
             "keyword not found"
         );
         tx.commit()?;
+        drop(_write);
         Ok(())
     }
     pub fn create_collection(
@@ -556,6 +568,9 @@ impl Catalog {
             "collection provenance exceeds 64KiB"
         );
         let id = uuid::Uuid::new_v4().to_string();
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         self.db.execute(
             "INSERT INTO organization_collections(id,name,provenance) VALUES(?1,?2,?3)",
             params![id, name, serde_json::to_string(&provenance)?],
@@ -570,10 +585,16 @@ impl Catalog {
     }
     pub fn rename_collection(&mut self, id: &str, revision: i64, name: &str) -> Result<()> {
         text_limit(name)?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         ensure!(self.db.execute("UPDATE organization_collections SET name=?3,revision=revision+1 WHERE id=?1 AND revision=?2",params![id,revision,name])?==1,"collection changed or missing");
         Ok(())
     }
     pub fn delete_collection(&mut self, id: &str, revision: i64) -> Result<()> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -593,15 +614,20 @@ impl Catalog {
             "collection changed or missing"
         );
         tx.commit()?;
+        drop(_write);
         Ok(())
     }
     pub fn begin_organization_batch(&mut self, operation: Operation) -> Result<Job> {
         validate_operation(&self.db, &operation)?;
         let id = uuid::Uuid::new_v4().to_string();
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         self.db.execute(
             "INSERT INTO organization_jobs(id,operation,state) VALUES(?1,?2,'preparing')",
             params![id, serde_json::to_string(&operation)?],
         )?;
+        drop(_write);
         self.organization_job(&id)
     }
     /// Persist exact selection pages before sealing. Duplicate IDs with different
@@ -611,6 +637,9 @@ impl Catalog {
             !items.is_empty() && items.len() <= MAX_BATCH,
             "append batch must contain 1..1000 assets"
         );
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -639,10 +668,15 @@ impl Catalog {
             params![job, added as i64],
         )?;
         tx.commit()?;
+        drop(_write);
         self.organization_job(job)
     }
     pub fn seal_organization_batch(&mut self, job: &str) -> Result<Job> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         ensure!(self.db.execute("UPDATE organization_jobs SET state=CASE WHEN total=0 THEN 'complete' ELSE 'ready' END WHERE id=? AND state='preparing'",[job])?==1,"batch is not preparing");
+        drop(_write);
         self.organization_job(job)
     }
     pub fn organization_job(&self, job: &str) -> Result<Job> {
@@ -696,10 +730,14 @@ impl Catalog {
         Ok(self.db.prepare("SELECT j.sequence,a.id,j.expected_revision,j.status,j.error,j.result_revision FROM organization_job_items j JOIN assets a ON a.sequence=j.sequence WHERE job=?1 AND j.sequence>?2 ORDER BY j.sequence LIMIT ?3")?.query_map(params![job,after,limit as i64],|r|Ok(JobItem{sequence:r.get(0)?,asset_id:r.get(1)?,expected_revision:r.get(2)?,status:r.get(3)?,error:r.get(4)?,result_revision:r.get(5)?}))?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn cancel_organization_batch(&mut self, job: &str) -> Result<Job> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         self.db.execute(
             "UPDATE organization_jobs SET state='cancelled' WHERE id=? AND state!='complete'",
             [job],
         )?;
+        drop(_write);
         self.organization_job(job)
     }
     /// One asset and its progress record commit together. A failed asset is paused
@@ -730,6 +768,9 @@ impl Catalog {
             validate_operation(&self.db, &current.operation)?;
             match &current.operation {
                 Operation::Flag { value } => {
+                    let _write = self
+                        .writers
+                        .enter(crate::catalog_writer::Priority::Foreground)?;
                     let tx = self
                         .db
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -740,9 +781,13 @@ impl Catalog {
                     complete_item(&tx, job, seq, next)?;
                     before_commit()?;
                     tx.commit()?;
+                    drop(_write);
                 }
                 Operation::AddCollection { collection }
                 | Operation::RemoveCollection { collection } => {
+                    let _write = self
+                        .writers
+                        .enter(crate::catalog_writer::Priority::Foreground)?;
                     let tx = self
                         .db
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -762,6 +807,7 @@ impl Catalog {
                     complete_item(&tx, job, seq, next)?;
                     before_commit()?;
                     tx.commit()?;
+                    drop(_write);
                 }
                 _ => {
                     let (base, fields, edits) =
@@ -783,6 +829,9 @@ impl Catalog {
             Ok(())
         })();
         if let Err(error) = result {
+            let _write = self
+                .writers
+                .enter(crate::catalog_writer::Priority::Foreground)?;
             let tx = self
                 .db
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -801,6 +850,7 @@ impl Catalog {
                 )?;
             }
             tx.commit()?;
+            drop(_write);
         }
         self.organization_job(job)
     }
@@ -812,6 +862,9 @@ impl Catalog {
         sequence: i64,
         new_revision: Option<i64>,
     ) -> Result<Job> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -839,6 +892,7 @@ impl Catalog {
             &serde_json::json!({"new_revision":new_revision,"skip":new_revision.is_none()}),
         )?;
         tx.commit()?;
+        drop(_write);
         self.organization_job(job)
     }
 }
@@ -1041,6 +1095,9 @@ impl Catalog {
             Operation::Flag { .. }
             | Operation::AddCollection { .. }
             | Operation::RemoveCollection { .. } => {
+                let _write = self
+                    .writers
+                    .enter(crate::catalog_writer::Priority::Foreground)?;
                 let tx = self
                     .db
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1078,6 +1135,7 @@ impl Catalog {
                 refresh(&tx, asset)?;
                 tx.execute("INSERT INTO organization_events(sequence,action,detail) VALUES(?1,'single_asset',?2)",params![seq,serde_json::to_string(&operation)?])?;
                 tx.commit()?;
+                drop(_write);
                 Ok(next)
             }
             _ => {

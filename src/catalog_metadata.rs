@@ -586,6 +586,9 @@ impl Catalog {
         expected: &RenderIdentity,
         attach: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -600,6 +603,7 @@ impl Catalog {
         }
         let result = attach()?;
         tx.commit()?;
+        drop(_write);
         Ok(Some(result))
     }
     pub fn render_identity(&self, asset: &str) -> Result<RenderIdentity> {
@@ -624,6 +628,9 @@ impl Catalog {
         inspection: &Inspection,
     ) -> Result<Change> {
         let prepared = Prepared::new(inspection, source)?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Background)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -641,6 +648,7 @@ impl Catalog {
             revision(&tx, asset)?
         };
         tx.commit()?;
+        drop(_write);
         Ok(Change {
             revision,
             observation_id,
@@ -713,6 +721,9 @@ impl Catalog {
         field: &str,
         model_id: i64,
     ) -> Result<i64> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -735,6 +746,7 @@ impl Catalog {
             true,
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(next)
     }
     pub fn metadata_model(&self, asset: &str, model_id: i64) -> Result<Vec<u8>> {
@@ -967,6 +979,9 @@ impl Catalog {
         prepared.revision = blake3::hash(&serde_json::to_vec(&(&prepared.revision, &updated))?)
             .to_hex()
             .to_string();
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -998,6 +1013,7 @@ impl Catalog {
         )?;
         after(&tx, revision)?;
         tx.commit()?;
+        drop(_write);
         Ok(Change {
             revision,
             observation_id,
@@ -1078,6 +1094,9 @@ impl Catalog {
         source: &Source,
         reason: &str,
     ) -> Result<bool> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Background)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1094,6 +1113,7 @@ impl Catalog {
             true,
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(true)
     }
     fn inspect_metadata_source(
@@ -1153,7 +1173,12 @@ impl Catalog {
             changed |= c;
             warnings += usize::from(w);
         }
-        crate::catalog_storage::record_metadata_path(&self.db, &asset, "embedded", path)?;
+        {
+            let _write = self
+                .writers
+                .enter(crate::catalog_writer::Priority::Background)?;
+            crate::catalog_storage::record_metadata_path(&self.db, &asset, "embedded", path)?;
+        }
         let directory = path.parent().context("original has no parent")?;
         self.index_metadata_directory(directory)?;
         let stem = name_key(path.file_stem().context("original has no stem")?);
@@ -1177,7 +1202,14 @@ impl Catalog {
                 provenance: serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}}),
             };
             let (c, w) = self.inspect_metadata_source(&asset, &sidecar, &source, true)?;
-            crate::catalog_storage::record_metadata_path(&self.db, &asset, "sidecar", &sidecar)?;
+            {
+                let _write = self
+                    .writers
+                    .enter(crate::catalog_writer::Priority::Background)?;
+                crate::catalog_storage::record_metadata_path(
+                    &self.db, &asset, "sidecar", &sidecar,
+                )?;
+            }
             changed |= c;
             warnings += usize::from(w || source.ambiguous);
         }
@@ -1282,6 +1314,9 @@ impl Catalog {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&payload)?;
         let compressed = encoder.finish()?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1305,6 +1340,7 @@ impl Catalog {
             ],
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(MetadataExportPlan {
             asset_id: asset.into(),
             metadata_revision: expected_revision,
@@ -1321,6 +1357,9 @@ impl Catalog {
         // IMMEDIATE prevents a concurrent catalog writer from changing metadata between the
         // revision check and external publication. Filesystem recovery evidence remains durable
         // even if the catalog transaction itself fails after publication.
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1337,6 +1376,7 @@ impl Catalog {
             params![serde_json::to_string(&receipt)?, operation],
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(receipt)
     }
     pub fn metadata_decisions(
@@ -1390,6 +1430,9 @@ impl Catalog {
             return self.apply_metadata_export(operation);
         }
         let receipt = crate::metadata_export::restore_planned_export(&plan)?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         self.db.execute(
             "UPDATE metadata_export_plans SET receipt=?1 WHERE operation=?2",
             params![serde_json::to_string(&receipt)?, operation],

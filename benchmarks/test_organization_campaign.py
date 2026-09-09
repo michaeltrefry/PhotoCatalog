@@ -9,6 +9,21 @@ import unittest
 import organization_campaign as campaign
 
 class CampaignTests(unittest.TestCase):
+    def test_fast_nonoverlapping_saves_cannot_hide_background_contention(self):
+        measures={name:campaign.distribution([5.0]*100) for name in ('rating','label','snapshot_browse')}
+        measures['overlap_diagnostic']={name:dict(overlapping_n=20,nonoverlapping_n=180,
+            overlapping=campaign.distribution([100.0]*20),nonoverlapping=campaign.distribution([5.0]*180))
+            for name in ('writes','snapshot_browse')}
+        self.assertTrue(all(campaign.transition_budgets(measures).values()))
+        bad=copy.deepcopy(measures)
+        bad['overlap_diagnostic']['writes']['overlapping']=campaign.distribution([101.0]*20)
+        gates=campaign.transition_budgets(bad)
+        self.assertTrue(gates['rating'] and gates['label'])
+        self.assertFalse(gates['overlapping_writes'])
+        for name in ('writes','snapshot_browse'):
+            bad=copy.deepcopy(measures);bad['overlap_diagnostic'][name].update(overlapping_n=0,overlapping=None)
+            self.assertFalse(campaign.transition_budgets(bad)[f'overlapping_{name}'])
+
     def test_full_page_budgets_include_fresh_percentile_and_separate_startup(self):
         trials = [dict(kind="warm", index=0, elapsed_samples_ms=[100.0]*100,
                        observer=dict(elapsed_ms=11000, rss_peak_bytes=4*1024**3))]

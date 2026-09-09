@@ -136,7 +136,9 @@ that the import hook invokes these same transitions. Native receipts retain
 individual errors and all attempted samples.
 
 Report save and snapshot page distributions independently. Apply the inherited
-100 ms p95 to point saves and foreground page delivery. Background source-refresh
+100 ms p95 to point saves and foreground page delivery, both across the fixed
+full populations and across the actually overlapping save/read populations.
+A zero-overlap population fails admission. Background source-refresh
 timing and whole mixed-process RSS are diagnostic; do not impose a new mixed RSS
 limit. The separate browse-only runs retain the 4 GiB gate. Source inputs and
 pristine database hashes must remain unchanged. Final bounded-work interpretation,
@@ -165,8 +167,10 @@ with the existing host-observer timeline. Native transition operations share one
 monotonic origin anchored to Unix milliseconds; each retain, save, and snapshot
 read records its begin/end interval. The coordinator reports overlapping and
 nonoverlapping subsets separately, including sample counts and distributions.
-The same full-run budgets still apply to every fixed sample; subset reports never
-select favorable timings for admission. A start barrier alone is not overlap
-proof. If no foreground read overlaps a source retain, that run lacks the intended
-concurrent-read evidence even if its numerical summary passes, and the gap must
-be resolved explicitly before story acceptance.
+The full-run budgets remain, and the existing 100 ms target also applies to
+the actually overlapping save and snapshot-read populations. This prevents fast
+operations after background completion from concealing stalls during contention.
+Both populations and all samples remain visible; no favorable subset is selected.
+A start barrier alone is not overlap proof. Zero overlapping saves or reads fails
+the driver4 gate. See CATALOG_WRITER_ADMISSION.md for the preserved v3 failure
+and production correction.

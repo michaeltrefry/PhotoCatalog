@@ -20,7 +20,7 @@ import os
 import stat
 
 PROTOCOL = 1  # Frozen fixture/native row protocol.
-DRIVER_PROTOCOL = 3
+DRIVER_PROTOCOL = 4
 TEXT_LIMITS = {"document_bytes": 1024**2, "page_bytes": 8 * 1024**2}
 LOCAL_TEXT_CASES = {"filename-reverse", "mixed", "text-capture"}
 DIAGNOSTIC_CASES = ["filename-reverse", "text", "text-capture", "date-camera"]
@@ -310,6 +310,17 @@ def validate_transitions(data, observer, count, repetitions):
     return measurements
 
 
+def transition_budgets(measurements):
+    passes = {name: measurements[name]["p95"] <= 100
+              for name in ("rating", "label", "snapshot_browse")}
+    for name in ("writes", "snapshot_browse"):
+        population = measurements["overlap_diagnostic"][name]
+        passes[f"overlapping_{name}"] = (
+            population["overlapping_n"] > 0 and population["overlapping"] is not None
+            and population["overlapping"]["p95"] <= 100)
+    return passes
+
+
 def run_transitions(args, manifest):
     read_result=json.loads((args.root/"measurement"/"campaign.json").read_text())
     assert read_result["complete"] is True, "finish terminal read workloads before mutation copies"
@@ -336,7 +347,8 @@ def run_transitions(args, manifest):
             measures=validate_transitions(data,observer,count,repetitions)
             after_work=sha(source);assert after_work==before
             result["scales"].append({"count":count,"measurements":measures,"observer":observer,"copy_proof":proof,"source_after_work":after_work,
-                                    "numerical_pass":all(measures[name]["p95"]<=100 for name in ("rating","label","snapshot_browse")),"raw":str(receipt)})
+                                    "budget_evidence":transition_budgets(measures),
+                                    "numerical_pass":all(transition_budgets(measures).values()),"raw":str(receipt)})
         except Exception as error:
             result["errors"].append({"count":count,"error":f"{type(error).__name__}: {error}"})
     result["complete"]=len(result["scales"])==len(manifest["fixtures"]) and not result["errors"]

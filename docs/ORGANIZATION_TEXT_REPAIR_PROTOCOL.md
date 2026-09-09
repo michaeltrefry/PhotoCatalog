@@ -177,3 +177,15 @@ requires <=500 ms, alongside warm p95 <=100 ms. Both include all continuation
 and temporary-text work. The separate whole-child <1 second guard remains
 visible. Save/browse transition p95 uses the same inclusive <=100 ms contract.
 No workload, fixture formula, sample count or performance target has changed.
+
+
+The v3 complete-population transition summary was subsequently rejected: the
+actually overlapping save p95 exceeded 100 ms at all three scales, while most
+saves occurred after source work ended. Those raw samples and the superseding
+parent rejection remain immutable. Driver4 gates overlapping writes and reads
+using the unchanged 100 ms target as well as the complete populations, and zero
+overlap fails. The production correction is documented in
+[CATALOG_WRITER_ADMISSION.md](CATALOG_WRITER_ADMISSION.md). Successful v3 query
+evidence remains valid for its exact source; it does not establish mixed or
+latest-source acceptance. New qualification must use new outputs and source
+identities, preserving schema5 reuse ancestry without rebuilding logical data.
