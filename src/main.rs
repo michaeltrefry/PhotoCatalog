@@ -1,8 +1,8 @@
 use anyhow::{Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use photocatalog::{
     Catalog,
-    catalog_storage::{PathReference, RelinkScope},
+    catalog_storage::{PathReference, RelinkScope, StorageEncoding},
     storage_volume::{self, NativePath},
 };
 use std::{
@@ -17,10 +17,24 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum OriginEncoding {
+    Unix,
+    Windows,
+}
 #[derive(Subcommand)]
 enum Command {
     /// Inspect mounted-volume identities and ambiguity without changing originals.
     StorageVolumes,
+    /// Explicitly tag a bounded page of legacy, untagged catalog paths by their origin OS.
+    DeclareStorageEncoding {
+        #[arg(value_enum)]
+        encoding: OriginEncoding,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     StorageLocate {
         path: PathBuf,
     },
@@ -203,6 +217,17 @@ fn main() -> Result<()> {
         Command::StorageLocate { path } => print_json(&storage_volume::locate(&path))?,
         Command::StorageStatus { id } => {
             print_json(&catalog.storage_status(&id, &storage_volume::mounted_volumes()?)?)?
+        }
+        Command::DeclareStorageEncoding {
+            encoding,
+            after,
+            limit,
+        } => {
+            let encoding = match encoding {
+                OriginEncoding::Unix => StorageEncoding::Unix,
+                OriginEncoding::Windows => StorageEncoding::Windows,
+            };
+            print_json(&catalog.declare_storage_encoding(encoding, after, limit)?)?;
         }
         Command::RelinkFolder { from, destinations } => {
             print_json(&catalog.begin_relink(RelinkScope::Prefix {

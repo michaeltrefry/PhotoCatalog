@@ -184,6 +184,7 @@ impl Catalog {
                 Ok(value) => value,
                 Err(error) => {
                     self.reserve(path, &location)?;
+                    self.record_import_path(path)?;
                     let (changed, warnings) = self.refresh_metadata(path, true)?;
                     report.metadata_updated += u64::from(changed);
                     report.metadata_warnings += warnings as u64;
@@ -265,15 +266,20 @@ impl Catalog {
         path: &Path,
         observation: &storage_volume::VolumeLocation,
     ) -> Result<()> {
+        let asset = self.record_import_path(path)?;
         if observation.state == storage_volume::LocationState::Available {
-            let asset: String = self.db.query_row(
-                "SELECT id FROM assets WHERE location=?1",
-                [location_bytes(path)],
-                |row| row.get(0),
-            )?;
             self.bind_storage(&asset, observation)?;
         }
         Ok(())
+    }
+    fn record_import_path(&mut self, path: &Path) -> Result<String> {
+        let asset: String = self.db.query_row(
+            "SELECT id FROM assets WHERE location=?1",
+            [location_bytes(path)],
+            |row| row.get(0),
+        )?;
+        self.record_storage_path(&asset, &storage_volume::NativePath::from_path(path))?;
+        Ok(asset)
     }
     fn reserve(&self, path: &Path, location: &[u8]) -> Result<()> {
         self.db.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;

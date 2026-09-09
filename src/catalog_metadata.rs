@@ -283,11 +283,10 @@ impl Prepared {
         )?;
         Ok(blake3::hash(&identity).to_hex().to_string())
     }
-    /// A verified relink changes the current locator, not the historical observation.
-    /// Compare only the current observation, with its original location reinstated.
+    /// Compare the current observation with its original file-instance provenance.
     /// File bytes, source provenance, packet layout and parser results must all match.
-    /// A copy's timestamp may differ only across a source locator change; its new
-    /// file-instance provenance is retained separately from the immutable model.
+    /// Location and timestamp describe a file instance, including same-path copies.
+    /// Their new provenance is retained separately from the immutable model.
     fn matches_relocated_observation(&self, db: &Connection, id: i64) -> Result<bool> {
         let (revision, provenance): (String, String) = db.query_row(
             "SELECT revision,provenance FROM metadata_observations WHERE id=?1",
@@ -296,7 +295,6 @@ impl Prepared {
         )?;
         let mut previous: serde_json::Value = serde_json::from_str(&provenance)?;
         let mut current: serde_json::Value = serde_json::from_str(&self.provenance)?;
-        let relocated = previous.get("source_location") != current.get("source_location");
         previous
             .as_object_mut()
             .context("invalid previous provenance")?
@@ -305,14 +303,12 @@ impl Prepared {
             .as_object_mut()
             .context("invalid current provenance")?
             .remove("source_location");
-        if relocated {
-            for value in [&mut previous, &mut current] {
-                value
-                    .get_mut("file_revision")
-                    .and_then(serde_json::Value::as_object_mut)
-                    .context("invalid file revision")?
-                    .remove("modified_unix_ns");
-            }
+        for value in [&mut previous, &mut current] {
+            value
+                .get_mut("file_revision")
+                .and_then(serde_json::Value::as_object_mut)
+                .context("invalid file revision")?
+                .remove("modified_unix_ns");
         }
         Ok(previous == current && self.revision_with_provenance(&provenance)? == revision)
     }

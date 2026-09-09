@@ -19,7 +19,7 @@ pub(crate) const SCHEMA: &str = "
 CREATE TABLE storage_epoch(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
 INSERT INTO storage_epoch VALUES(1,0);
 CREATE TABLE storage_volumes(id TEXT PRIMARY KEY, identity TEXT UNIQUE);
-CREATE TABLE storage_bindings(asset_id TEXT PRIMARY KEY REFERENCES assets(id), reference TEXT NOT NULL, volume_id TEXT REFERENCES storage_volumes(id), relative TEXT, file_key TEXT);
+CREATE TABLE storage_bindings(asset_id TEXT PRIMARY KEY REFERENCES assets(id), reference TEXT NOT NULL, native_path TEXT NOT NULL, volume_id TEXT REFERENCES storage_volumes(id), relative TEXT, file_key TEXT);
 CREATE INDEX storage_binding_relative ON storage_bindings(volume_id,relative);
 CREATE INDEX storage_binding_object ON storage_bindings(file_key);
 CREATE TABLE storage_plans(id TEXT PRIMARY KEY, request TEXT NOT NULL, epoch INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, high_water INTEGER NOT NULL, state TEXT NOT NULL, applied_epoch INTEGER);
@@ -47,6 +47,8 @@ CREATE TRIGGER storage_source_delete AFTER DELETE ON metadata_sources BEGIN UPDA
 /// are compared exactly: no Unicode normalization or case folding guesses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathReference {
+    /// Older catalogs did not retain an encoding; explicit declaration is required.
+    Unspecified(Vec<u8>),
     Native(NativePath),
     LegacyUnix(Vec<u8>),
     LegacyWindows(Vec<u16>),
@@ -113,7 +115,7 @@ pub struct RelinkSource {
     pub source_id: i64,
     pub status: String,
     pub detail: String,
-    pub original: NativePath,
+    pub original: PathReference,
     pub candidates: Vec<Candidate>,
     pub destination: Option<NativePath>,
 }
@@ -141,6 +143,7 @@ pub struct StorageStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Binding {
     reference: PathReference,
+    native_path: NativePath,
     volume_id: Option<String>,
     relative: Option<NativePath>,
     file_key: Option<String>,
@@ -179,6 +182,7 @@ struct ItemData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceData {
     embedded: bool,
+    old_native: Option<NativePath>,
     old_locator: Vec<u8>,
     old_display: String,
     old_availability: String,
@@ -197,40 +201,12 @@ fn epoch(db: &Connection) -> Result<i64> {
         })?,
     )
 }
-fn native_bytes(bytes: &[u8]) -> Result<NativePath> {
-    #[cfg(unix)]
-    {
-        Ok(NativePath::UnixBytes(bytes.to_vec()))
-    }
-    #[cfg(windows)]
-    {
-        ensure!(bytes.len() % 2 == 0, "invalid stored Windows path");
-        Ok(NativePath::WindowsWide(
-            bytes
-                .chunks_exact(2)
-                .map(|x| u16::from_le_bytes([x[0], x[1]]))
-                .collect(),
-        ))
-    }
-}
 fn get_binding(db: &Connection, asset: &str) -> Result<Option<Binding>> {
-    let row = db
-        .query_row(
-            "SELECT reference,volume_id,relative,file_key FROM storage_bindings WHERE asset_id=?",
-            [asset],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    row.map(|(reference, volume_id, relative, file_key)| {
+    let row=db.query_row("SELECT reference,native_path,volume_id,relative,file_key FROM storage_bindings WHERE asset_id=?",[asset],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get(2)?,r.get::<_,Option<String>>(3)?,r.get(4)?))).optional()?;
+    row.map(|(reference, native_path, volume_id, relative, file_key)| {
         Ok(Binding {
             reference: serde_json::from_str(&reference)?,
+            native_path: serde_json::from_str(&native_path)?,
             volume_id,
             relative: relative.map(|v| serde_json::from_str(&v)).transpose()?,
             file_key,
@@ -242,8 +218,57 @@ fn put_binding(db: &Connection, asset: &str, b: &Binding) -> Result<()> {
     if get_binding(db, asset)?.as_ref() == Some(b) {
         return Ok(());
     }
-    db.execute("INSERT INTO storage_bindings(asset_id,reference,volume_id,relative,file_key) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(asset_id) DO UPDATE SET reference=excluded.reference,volume_id=excluded.volume_id,relative=excluded.relative,file_key=excluded.file_key",params![asset,json(&b.reference)?,b.volume_id,b.relative.as_ref().map(json).transpose()?,b.file_key])?;
+    db.execute("INSERT INTO storage_bindings(asset_id,reference,native_path,volume_id,relative,file_key) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(asset_id) DO UPDATE SET reference=excluded.reference,native_path=excluded.native_path,volume_id=excluded.volume_id,relative=excluded.relative,file_key=excluded.file_key",params![asset,json(&b.reference)?,json(&b.native_path)?,b.volume_id,b.relative.as_ref().map(json).transpose()?,b.file_key])?;
     Ok(())
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum StorageEncoding {
+    Unix,
+    Windows,
+}
+#[derive(Debug, Serialize)]
+pub struct EncodingProgress {
+    pub declared: usize,
+    pub scanned_through: i64,
+}
+fn encoded_bytes(path: &NativePath) -> Vec<u8> {
+    match path {
+        NativePath::UnixBytes(v) => v.clone(),
+        NativePath::WindowsWide(v) => v.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    }
+}
+fn decode_bytes(bytes: &[u8], encoding: StorageEncoding) -> Result<NativePath> {
+    match encoding {
+        StorageEncoding::Unix => Ok(NativePath::UnixBytes(bytes.to_vec())),
+        StorageEncoding::Windows => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "invalid UTF-16 locator length"
+            );
+            Ok(NativePath::WindowsWide(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|v| u16::from_le_bytes([v[0], v[1]]))
+                    .collect(),
+            ))
+        }
+    }
+}
+fn source_native(item: &ItemData, bytes: &[u8]) -> Result<Option<NativePath>> {
+    item.old_binding
+        .as_ref()
+        .map(|b| {
+            decode_bytes(
+                bytes,
+                match b.native_path {
+                    NativePath::UnixBytes(_) => StorageEncoding::Unix,
+                    NativePath::WindowsWide(_) => StorageEncoding::Windows,
+                },
+            )
+        })
+        .transpose()
 }
 fn volume_id(
     db: &Connection,
@@ -282,6 +307,78 @@ fn volume_id(
     Ok(id)
 }
 impl Catalog {
+    /// Record explicit encoding without filesystem queries, including unavailable
+    /// volumes. Call after reserve for every native import. Foreign declarations
+    /// must match the stored bytes exactly and remain unavailable until relinked.
+    pub fn record_storage_path(&mut self, asset: &str, path: &NativePath) -> Result<()> {
+        components(&PathReference::Native(path.clone()))?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let location: Vec<u8> =
+            tx.query_row("SELECT location FROM assets WHERE id=?", [asset], |r| {
+                r.get(0)
+            })?;
+        ensure!(
+            location == encoded_bytes(path),
+            "declared native locator differs from stored bytes"
+        );
+        if let Some(old) = get_binding(&tx, asset)? {
+            ensure!(
+                old.native_path == *path,
+                "existing locator encoding differs; explicit review required"
+            );
+        } else {
+            put_binding(
+                &tx,
+                asset,
+                &Binding {
+                    reference: PathReference::Native(path.clone()),
+                    native_path: path.clone(),
+                    volume_id: None,
+                    relative: None,
+                    file_key: None,
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Explicit migration declaration, bounded and restartable. Existing tags are
+    /// never overwritten; malformed paths fail the batch without partial changes.
+    pub fn declare_storage_encoding(
+        &mut self,
+        encoding: StorageEncoding,
+        after: i64,
+        limit: usize,
+    ) -> Result<EncodingProgress> {
+        ensure!((1..=1000).contains(&limit), "batch limit must be 1..1000");
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows=tx.prepare("SELECT a.sequence,a.id,a.location FROM assets a LEFT JOIN storage_bindings b ON b.asset_id=a.id WHERE a.sequence>?1 AND b.asset_id IS NULL ORDER BY a.sequence LIMIT ?2")?.query_map(params![after,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (_, asset, bytes) in &rows {
+            let path = decode_bytes(bytes, encoding)?;
+            components(&PathReference::Native(path.clone()))?;
+            put_binding(
+                &tx,
+                asset,
+                &Binding {
+                    reference: PathReference::Native(path.clone()),
+                    native_path: path,
+                    volume_id: None,
+                    relative: None,
+                    file_key: None,
+                },
+            )?;
+        }
+        let progress = EncodingProgress {
+            declared: rows.len(),
+            scanned_through: rows.last().map(|v| v.0).unwrap_or(after),
+        };
+        tx.commit()?;
+        Ok(progress)
+    }
     /// Caller supplies the volume observation from the same verified import. This
     /// records provenance, not permission to match a future file by name alone.
     pub fn bind_storage(&mut self, asset: &str, observation: &VolumeLocation) -> Result<()> {
@@ -306,6 +403,19 @@ impl Catalog {
             .volume
             .as_ref()
             .and_then(|v| v.persistent_identity.clone());
+        if identity.is_none()
+            && let Some(old_id) = old.as_ref().and_then(|b| b.volume_id.as_ref())
+        {
+            let known: Option<String> = tx.query_row(
+                "SELECT identity FROM storage_volumes WHERE id=?",
+                [old_id],
+                |r| r.get(0),
+            )?;
+            if known.is_some() {
+                tx.commit()?;
+                return Ok(());
+            }
+        }
         let id = volume_id(
             &tx,
             &identity,
@@ -318,8 +428,13 @@ impl Catalog {
             asset,
             &Binding {
                 reference: PathReference::native(&path),
+                native_path: NativePath::from_path(&path),
+                relative: observation.relative_in_volume.clone().or_else(|| {
+                    old.as_ref()
+                        .filter(|b| b.volume_id.as_deref() == Some(&id))
+                        .and_then(|b| b.relative.clone())
+                }),
                 volume_id: Some(id),
-                relative: observation.relative_in_volume.clone(),
                 file_key: Some(format!("{}:{}", key.0, key.1)),
             },
         )?;
@@ -339,11 +454,15 @@ impl Catalog {
         tx.query_row("SELECT id FROM assets WHERE id=?", [asset], |r| {
             r.get::<_, String>(0)
         })?;
+        let native_path = get_binding(&tx, asset)?
+            .context("declare current locator encoding before assigning a foreign reference")?
+            .native_path;
         put_binding(
             &tx,
             asset,
             &Binding {
                 reference,
+                native_path,
                 volume_id: None,
                 relative: None,
                 file_key: None,
@@ -359,10 +478,10 @@ impl Catalog {
                     r.get(0)
                 })?;
         let b = get_binding(&self.db, asset)?;
-        let reference = b
-            .as_ref()
-            .map(|b| b.reference.clone())
-            .unwrap_or(PathReference::Native(native_bytes(&location)?));
+        let reference = match b.as_ref() {
+            Some(b) => b.reference.clone(),
+            None => PathReference::Unspecified(location.clone()),
+        };
         let mut result = StorageStatus {
             asset_id: asset.into(),
             state: "unregistered".into(),
@@ -430,6 +549,20 @@ impl Catalog {
         );
         if observation.state != LocationState::Available {
             return Ok(None);
+        }
+        let observed_identity = observation
+            .volume
+            .as_ref()
+            .and_then(|v| v.persistent_identity.as_ref())
+            .map(json)
+            .transpose()?;
+        let existing:Option<(Option<String>,Option<String>)>=self.db.query_row("SELECT a.fingerprint,v.identity FROM assets a JOIN storage_bindings b ON b.asset_id=a.id JOIN storage_volumes v ON v.id=b.volume_id WHERE a.location=?",[location_bytes(path)],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((expected, Some(known_identity))) = existing {
+            ensure!(
+                observed_identity.as_deref() == Some(&known_identity)
+                    || expected.as_deref() == Some(fingerprint),
+                "different or unidentified volume at an existing original path has different content; explicit review required"
+            );
         }
         let Some(identity) = observation
             .volume
@@ -505,8 +638,9 @@ impl Catalog {
             from: PathReference::Native(path),
             ..
         } = &mut request
+            && let Ok(native) = path.to_path()
         {
-            *path = NativePath::from_path(&crate::prospective_directory(&path.to_path()?)?);
+            *path = NativePath::from_path(&crate::prospective_directory(&native)?);
         }
         let tx = self
             .db
@@ -612,6 +746,7 @@ impl Catalog {
     }
     pub fn prepare_relink_batch(&mut self, plan: &str, limit: usize) -> Result<RelinkPlan> {
         ensure!((1..=1000).contains(&limit), "batch limit must be 1..1000");
+        let catalog_root = self.root.clone();
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -647,12 +782,13 @@ impl Catalog {
         for (sequence, asset) in &rows {
             let mut data = load_item(&tx, asset)?;
             let override_paths = exception(&tx, plan, "asset", asset)?;
-            let Some(paths) = override_paths.clone().or(mapped_candidates(
-                &request,
-                asset,
-                &data.reference,
-                data.old_binding.as_ref(),
-            )?) else {
+            let paths = match &override_paths {
+                Some(paths) => Some(paths.clone()),
+                None => {
+                    mapped_candidates(&request, asset, &data.reference, data.old_binding.as_ref())?
+                }
+            };
+            let Some(paths) = paths else {
                 continue;
             };
             let (status, detail, candidates, selected) =
@@ -664,7 +800,7 @@ impl Catalog {
                         None,
                     )
                 } else {
-                    evaluate(&paths, data.fingerprint.as_deref())
+                    evaluate(&paths, data.fingerprint.as_deref(), &catalog_root)
                 };
             data.candidates = candidates;
             if let Some((path, evidence)) = selected {
@@ -691,7 +827,7 @@ impl Catalog {
                 ],
             )?;
             if status != MatchStatus::Excluded {
-                prepare_sources(&tx, plan, *sequence, asset, &request, &data)?;
+                prepare_sources(&tx, plan, *sequence, asset, &request, &data, &catalog_root)?;
             }
         }
         let finished = rows.len() < limit
@@ -788,7 +924,10 @@ impl Catalog {
                 source_id,
                 status,
                 detail,
-                original: native_bytes(&data.old_locator)?,
+                original: data
+                    .old_native
+                    .map(PathReference::Native)
+                    .unwrap_or(PathReference::Unspecified(data.old_locator)),
                 candidates: data.candidates,
                 destination: data.destination,
             });
@@ -893,7 +1032,7 @@ impl Catalog {
         visit_items(&tx, plan, |_, asset, _| {
             record_predecessor(&tx, plan, asset)
         })?;
-        // Internal BLOB values have a NUL prefix, impossible in native paths.
+        // Internal BLOB keys cannot encode an absolute path on supported platforms.
         visit_items(&tx, plan, |_, asset, _| {
             tx.execute(
                 "UPDATE assets SET location=?2 WHERE id=?1",
@@ -925,6 +1064,7 @@ impl Catalog {
                 asset,
                 &Binding {
                     reference: PathReference::native(&path),
+                    native_path: NativePath::from_path(&path),
                     volume_id: Some(volume),
                     relative: draft.relative.clone(),
                     file_key: data.evidence.as_ref().map(Evidence::key),
@@ -1197,10 +1337,10 @@ fn restore_predecessor(db: &Connection, plan: &str, asset: &str) -> Result<()> {
 fn load_item(db: &Connection, asset: &str) -> Result<ItemData> {
     let(location,display,fingerprint,generation,metadata_revision)=db.query_row("SELECT a.location,a.path_display,a.fingerprint,a.render_generation,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?",[asset],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     let binding = get_binding(db, asset)?;
-    let reference = binding
-        .as_ref()
-        .map(|b| b.reference.clone())
-        .unwrap_or(PathReference::Native(native_bytes(&location)?));
+    let reference = match binding.as_ref() {
+        Some(b) => b.reference.clone(),
+        None => PathReference::Unspecified(location.clone()),
+    };
     Ok(ItemData {
         old_location: location,
         old_display: display,
@@ -1366,6 +1506,9 @@ struct Parts {
 }
 fn components(reference: &PathReference) -> Result<Parts> {
     let (windows, mut units) = match reference {
+        PathReference::Unspecified(_) => anyhow::bail!(
+            "locator encoding is unspecified; declare its origin before prefix mapping"
+        ),
         PathReference::Native(NativePath::UnixBytes(v)) | PathReference::LegacyUnix(v) => {
             (false, v.iter().map(|v| *v as u16).collect::<Vec<_>>())
         }
@@ -1444,11 +1587,49 @@ fn components(reference: &PathReference) -> Result<Parts> {
         names,
     })
 }
+fn native_component(windows: bool, component: &[u16]) -> Result<std::ffi::OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = if windows {
+            String::from_utf16(component)
+                .context("Windows filename cannot be represented losslessly on Unix")?
+                .into_bytes()
+        } else {
+            component.iter().map(|v| *v as u8).collect()
+        };
+        ensure!(
+            !bytes.contains(&47) && !bytes.contains(&0),
+            "foreign separator in filename"
+        );
+        Ok(std::ffi::OsString::from_vec(bytes))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let units = if windows {
+            component.to_vec()
+        } else {
+            String::from_utf8(component.iter().map(|v| *v as u8).collect())
+                .context("Unix filename cannot be represented losslessly on Windows")?
+                .encode_utf16()
+                .collect()
+        };
+        ensure!(
+            !units.iter().any(|v| matches!(*v, 0 | 47 | 92 | 58)),
+            "foreign separator or stream syntax in filename"
+        );
+        Ok(std::ffi::OsString::from_wide(&units))
+    }
+}
 fn remap(
     reference: &PathReference,
     from: &PathReference,
     destination: &NativePath,
 ) -> Result<Option<NativePath>> {
+    if matches!(reference, PathReference::Unspecified(_)) {
+        return Ok(None);
+    }
     let source = components(reference)?;
     let prefix = components(from)?;
     if source.windows != prefix.windows
@@ -1459,37 +1640,9 @@ fn remap(
     }
     let mut out = destination.to_path()?;
     for component in &source.names[prefix.names.len()..] {
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let bytes = if source.windows {
-                String::from_utf16(component)
-                    .context("Windows path cannot be represented losslessly on Unix")?
-                    .into_bytes()
-            } else {
-                component.iter().map(|v| *v as u8).collect()
-            };
-            ensure!(!bytes.contains(&47), "foreign separator in filename");
-            out.push(std::ffi::OsString::from_vec(bytes));
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStringExt;
-            let units = if source.windows {
-                component.clone()
-            } else {
-                String::from_utf8(component.iter().map(|v| *v as u8).collect())
-                    .context("Unix path cannot be represented losslessly on Windows")?
-                    .encode_utf16()
-                    .collect()
-            };
-            ensure!(
-                !units.iter().any(|v| matches!(*v, 47 | 92 | 58)),
-                "foreign separator or stream syntax in filename"
-            );
-            out.push(std::ffi::OsString::from_wide(&units));
-        }
+        out.push(native_component(source.windows, component)?);
     }
+
     Ok(Some(NativePath::from_path(&out)))
 }
 fn mapped_candidates(
@@ -1536,6 +1689,7 @@ fn mapped_candidates(
 fn evaluate(
     paths: &[NativePath],
     expected: Option<&str>,
+    catalog_root: &Path,
 ) -> (
     MatchStatus,
     String,
@@ -1552,6 +1706,10 @@ fn evaluate(
         let checked = path.to_path().map_err(anyhow::Error::from).and_then(|p| {
             let evidence = read_evidence(&p)?;
             let canonical = fs::canonicalize(&p)?;
+            ensure!(
+                !canonical.starts_with(catalog_root),
+                "catalog-managed files cannot be originals or sidecar sources"
+            );
             ensure!(
                 quick_evidence_matches(&canonical, &evidence)?,
                 "candidate alias changed during resolution"
@@ -1628,6 +1786,7 @@ fn prepare_sources(
     asset: &str,
     request: &RelinkScope,
     item: &ItemData,
+    catalog_root: &Path,
 ) -> Result<()> {
     let mut stmt=db.prepare("SELECT s.id,s.kind,s.locator,s.display,s.availability,s.current_observation,o.provenance FROM metadata_sources s LEFT JOIN metadata_observations o ON o.id=s.current_observation WHERE s.asset_id=?1 AND s.kind IN ('embedded','sidecar') ORDER BY s.id")?;
     for row in stmt.query_map([asset], |r| {
@@ -1700,13 +1859,14 @@ fn prepare_sources(
                 ),
             }
         } else {
-            evaluate(&paths, expected.as_deref())
+            evaluate(&paths, expected.as_deref(), catalog_root)
         };
         let (destination, evidence) = selected
             .map(|(p, e)| (Some(p), Some(e)))
             .unwrap_or((None, None));
         let data = SourceData {
             embedded: kind == "embedded",
+            old_native: source_native(item, &locator)?,
             old_locator: locator,
             old_display: display,
             old_availability: availability,
@@ -1738,7 +1898,9 @@ fn sidecar_paths(
     item: &ItemData,
     locator: &[u8],
 ) -> Result<Vec<NativePath>> {
-    let native = native_bytes(locator)?;
+    let Some(native) = source_native(item, locator)? else {
+        return Ok(vec![]);
+    };
     if let RelinkScope::Prefix { from, destinations } = request {
         let mut result = Vec::new();
         for destination in destinations {
@@ -1753,44 +1915,50 @@ fn sidecar_paths(
     let Some(destination) = &item.destination else {
         return Ok(vec![]);
     };
-    let old = native_bytes(&item.old_location)?.to_path()?;
-    let sidecar = native.to_path()?;
-    let new = destination.to_path()?;
-    if old.parent() != sidecar.parent() {
+    let Some(binding) = item.old_binding.as_ref() else {
+        return Ok(vec![]);
+    };
+    let old = components(&PathReference::Native(binding.native_path.clone()))?;
+    let sidecar = components(&PathReference::Native(native))?;
+    if old.windows != sidecar.windows
+        || old.root != sidecar.root
+        || old.names.is_empty()
+        || sidecar.names.is_empty()
+        || old.names[..old.names.len() - 1] != sidecar.names[..sidecar.names.len() - 1]
+    {
         return Ok(vec![]);
     }
+    let old_name = old.names.last().context("old file name missing")?;
+    let side_name = sidecar.names.last().context("sidecar name missing")?;
+    let split = |name: &[u16]| name.iter().rposition(|v| *v == 46).filter(|i| *i > 0);
+    let old_stem = &old_name[..split(old_name).unwrap_or(old_name.len())];
+    let Some(dot) = split(side_name) else {
+        return Ok(vec![]);
+    };
+    let side_stem = &side_name[..dot];
+    let extension = native_component(sidecar.windows, &side_name[dot + 1..])?;
+    let new = destination.to_path()?;
     let Some(parent) = new.parent() else {
         return Ok(vec![]);
     };
     let mut result = Vec::new();
-    // Keep the exact convention and spelling; the hash, not this name, decides.
-    if sidecar.file_stem() == old.file_stem() {
-        let mut name = new
-            .file_stem()
-            .context("new file stem missing")?
-            .to_os_string();
-        if let Some(ext) = sidecar.extension() {
-            name.push(".");
-            name.push(ext);
-        }
-        result.push(NativePath::from_path(&parent.join(name)));
-    }
-    if sidecar.file_stem() == old.file_name() {
-        let mut name = new
-            .file_name()
-            .context("new file name missing")?
-            .to_os_string();
+    let base = if side_stem == old_stem {
+        new.file_stem().map(std::ffi::OsStr::to_os_string)
+    } else if side_stem == old_name {
+        new.file_name().map(std::ffi::OsStr::to_os_string)
+    } else {
+        None
+    };
+    if let Some(mut name) = base {
         name.push(".");
-        if let Some(ext) = sidecar.extension() {
-            name.push(ext);
-        }
+        name.push(extension);
         result.push(NativePath::from_path(&parent.join(name)));
+    } else {
+        result.push(NativePath::from_path(
+            &parent.join(native_component(sidecar.windows, side_name)?),
+        ));
     }
-    if result.is_empty()
-        && let Some(name) = sidecar.file_name()
-    {
-        result.push(NativePath::from_path(&parent.join(name)));
-    }
+
     Ok(result)
 }
 const SOURCE_COLLISION: &str = "EXISTS(SELECT 1 FROM storage_source_items j JOIN metadata_sources js ON js.id=j.source_id JOIN metadata_sources ss ON ss.id=s.source_id WHERE j.plan=s.plan AND j.sequence=s.sequence AND j.source_id!=s.source_id AND j.status='matched' AND j.destination=s.destination AND js.kind=ss.kind) OR EXISTS(SELECT 1 FROM metadata_sources old JOIN metadata_sources own ON own.id=s.source_id WHERE old.asset_id=own.asset_id AND old.kind=own.kind AND old.locator=s.destination AND old.id!=own.id AND NOT EXISTS(SELECT 1 FROM storage_source_items j WHERE j.plan=s.plan AND j.source_id=old.id AND j.status='matched'))";
@@ -1806,6 +1974,14 @@ fn validate_collisions(db: &Connection, plan: &str) -> Result<()> {
     ensure!(
         count == 0,
         "selected destination collision; revise the plan"
+    );
+    let sources: i64 = db.query_row(
+        &format!("SELECT COUNT(*) FROM storage_source_items s JOIN storage_items i ON i.plan=s.plan AND i.sequence=s.sequence WHERE s.plan=?1 AND s.status='matched' AND i.status='matched' AND ({SOURCE_COLLISION})"),
+        [plan], |r| r.get(0),
+    )?;
+    ensure!(
+        sources == 0,
+        "selected metadata source collision; revise the plan"
     );
     Ok(())
 }

@@ -689,3 +689,398 @@ fn a_new_relink_and_undo_cannot_hide_intervening_metadata_edits() -> Result<()> 
     );
     Ok(())
 }
+
+#[test]
+fn catalog_owned_cache_files_cannot_become_originals() -> Result<()> {
+    let (_temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let target = root.join("previews/identical-original.jpg");
+    fs::copy(old.join("one.jpg"), &target)?;
+    let p = prepared(
+        &mut cat,
+        RelinkScope::Asset {
+            asset_id: asset.id.clone(),
+            destinations: vec![NativePath::from_path(&target)],
+        },
+    )?;
+    ensure!(cat.relink_items(&p, 0, 1)?[0].status == "unavailable");
+    ensure!(cat.apply_relink(&p).is_err());
+    ensure!(cat.get(&asset.id)?.original_path == asset.original_path);
+    Ok(())
+}
+
+#[test]
+fn same_mount_name_different_volume_content_and_transient_identity_loss_are_safe() -> Result<()> {
+    let (_temp, old, root, mut cat) = setup()?;
+    let path = old.join("one.jpg");
+    photo(&path, 20);
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let observation = observed(&path, &old, Path::new("one.jpg"));
+    cat.bind_storage(&asset.id, &observation)?;
+    let before: (String, String) = db(&root)?.query_row(
+        "SELECT volume_id,relative FROM storage_bindings WHERE asset_id=?",
+        [&asset.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut unknown = observation.clone();
+    unknown.volume.as_mut().unwrap().persistent_identity = None;
+    unknown.relative_in_volume = None;
+    cat.bind_storage(&asset.id, &unknown)?;
+    let after: (String, String) = db(&root)?.query_row(
+        "SELECT volume_id,relative FROM storage_bindings WHERE asset_id=?",
+        [&asset.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(before == after);
+    let mut different = observation.clone();
+    different.volume.as_mut().unwrap().persistent_identity = Some(PersistentVolumeId::new(
+        IdentityScheme::LinuxFilesystemUuid,
+        "different-volume",
+    )?);
+    let snapshot = MountSnapshot {
+        mounts: vec![different.volume.clone().unwrap()],
+        complete: true,
+        issues: vec![],
+    };
+    ensure!(
+        cat.reconnect_storage_asset(&path, &different, "different file", &snapshot)
+            .is_err()
+    );
+    ensure!(
+        cat.reconnect_storage_asset(&path, &unknown, "different file", &snapshot)
+            .is_err()
+    );
+    let hash = blake3::hash(&fs::read(&path)?).to_hex().to_string();
+    ensure!(
+        cat.reconnect_storage_asset(&path, &different, &hash, &snapshot)?
+            .is_none()
+    );
+    ensure!(cat.browse(0, 10)?.len() == 1);
+    Ok(())
+}
+
+#[test]
+fn copied_sidecar_with_new_mtime_preserves_explicit_source_selection() -> Result<()> {
+    let (temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    let original_xmp = old.join("one.xmp");
+    let bytes=br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="copy-origin" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="4"/></rdf:RDF>"#;
+    fs::write(&original_xmp, bytes)?;
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let view = cat.metadata(&asset.id)?;
+    let field = view.fields.iter().find(|f| f.name == "rating").unwrap();
+    let model = field.candidates[0].model_id;
+    cat.resolve_metadata(&asset.id, view.revision, "rating", model)?;
+    let prior: Vec<(i64, String)> = db(&root)?
+        .prepare("SELECT id,provenance FROM metadata_observations ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let new = temp.path().join("new");
+    fs::create_dir(&new)?;
+    fs::copy(old.join("one.jpg"), new.join("one.jpg"))?;
+    let xmp = new.join("one.xmp");
+    fs::copy(&original_xmp, &xmp)?;
+    let modified = fs::metadata(&original_xmp)?.modified()? + std::time::Duration::from_secs(60);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&xmp)?
+        .set_times(fs::FileTimes::new().set_modified(modified))?;
+    ensure!(fs::metadata(&xmp)?.modified()? != fs::metadata(&original_xmp)?.modified()?);
+    let p = prepared(&mut cat, prefix(&old, &new))?;
+    cat.apply_relink(&p)?;
+    let history_before: i64 =
+        db(&root)?.query_row("SELECT COUNT(*) FROM metadata_history", [], |r| r.get(0))?;
+    let imported = cat.import(&new, None, |_| Ok(()))?;
+    ensure!(imported.unchanged == 1 && imported.metadata_updated == 0);
+    let current = cat.metadata(&asset.id)?;
+    let rating = current.fields.iter().find(|f| f.name == "rating").unwrap();
+    ensure!(rating.selected_model == Some(model) && !rating.conflicted);
+    let after: Vec<(i64, String)> = db(&root)?
+        .prepare("SELECT id,provenance FROM metadata_observations ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure!(after == prior);
+    ensure!(
+        db(&root)?.query_row("SELECT COUNT(*) FROM metadata_history", [], |r| r
+            .get::<_, i64>(0))?
+            == history_before
+    );
+    let instances = cat.metadata_file_instances(&asset.id, 0, 10)?;
+    ensure!(instances.len() == 1);
+    ensure!(
+        instances[0].provenance["source_location"]["display"].as_str()
+            == Some(xmp.to_string_lossy().as_ref())
+    );
+    ensure!(
+        instances[0].provenance["file_revision"]["modified_unix_ns"].as_u64()
+            == Some(modified.duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64)
+    );
+    ensure!(
+        cat.metadata_file_instances(&asset.id, instances[0].id, 10)?
+            .is_empty()
+    );
+    cat.import(&new, None, |_| Ok(()))?;
+    ensure!(cat.metadata_file_instances(&asset.id, 0, 10)?.len() == 1);
+    ensure!(fs::read(&original_xmp)? == bytes);
+    Ok(())
+}
+
+#[test]
+fn foreign_catalog_locators_remain_tagged_through_folder_file_relink_and_undo() -> Result<()> {
+    let (temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    fs::write(old.join("one.xmp"),br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="foreign" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="3"/></rdf:RDF>"#)?;
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    #[cfg(unix)]
+    let (foreign_root, foreign_photo, foreign_sidecar) = (
+        NativePath::WindowsWide("R:\\Photos".encode_utf16().collect()),
+        NativePath::WindowsWide("R:\\Photos\\one.jpg".encode_utf16().collect()),
+        NativePath::WindowsWide("R:\\Photos\\one.xmp".encode_utf16().collect()),
+    );
+    #[cfg(windows)]
+    let (foreign_root, foreign_photo, foreign_sidecar) = (
+        NativePath::UnixBytes(b"/Volumes/Old/Photos".to_vec()),
+        NativePath::UnixBytes(b"/Volumes/Old/Photos/one.jpg".to_vec()),
+        NativePath::UnixBytes(b"/Volumes/Old/Photos/one.xmp".to_vec()),
+    );
+    let encoded = |path: &NativePath| match path {
+        NativePath::UnixBytes(v) => v.clone(),
+        NativePath::WindowsWide(v) => v.iter().flat_map(|u| u.to_le_bytes()).collect(),
+    };
+    // Simulate a closed catalog last used on the other OS. Raw current locators
+    // and their explicit tags move together; immutable observations stay intact.
+    let connection = db(&root)?;
+    connection.execute(
+        "UPDATE assets SET location=?2,path_display='foreign original' WHERE id=?1",
+        rusqlite::params![asset.id, encoded(&foreign_photo)],
+    )?;
+    connection.execute("UPDATE storage_bindings SET reference=?2,native_path=?3,volume_id=NULL,relative=NULL,file_key=NULL WHERE asset_id=?1",rusqlite::params![asset.id,serde_json::to_string(&PathReference::Native(foreign_photo.clone()))?,serde_json::to_string(&foreign_photo)?])?;
+    connection.execute(
+        "UPDATE metadata_sources SET locator=?2 WHERE asset_id=?1 AND kind='embedded'",
+        rusqlite::params![asset.id, encoded(&foreign_photo)],
+    )?;
+    connection.execute(
+        "UPDATE metadata_sources SET locator=?2 WHERE asset_id=?1 AND kind='sidecar'",
+        rusqlite::params![asset.id, encoded(&foreign_sidecar)],
+    )?;
+    drop(connection);
+    drop(cat);
+    let mut cat = Catalog::open(&root)?;
+    let new = temp.path().join("new");
+    fs::create_dir(&new)?;
+    fs::copy(old.join("one.jpg"), new.join("one.jpg"))?;
+    fs::copy(old.join("one.xmp"), new.join("one.xmp"))?;
+    let p = prepared(
+        &mut cat,
+        RelinkScope::Prefix {
+            from: PathReference::Native(foreign_root),
+            destinations: vec![NativePath::from_path(&new)],
+        },
+    )?;
+    let item = cat.relink_items(&p, 0, 1)?.remove(0);
+    ensure!(item.status == "matched");
+    let sources = cat.relink_sources(&p, item.sequence, 0, 10)?;
+    ensure!(sources.iter().any(
+        |s| s.original == PathReference::Native(foreign_sidecar.clone()) && s.status == "matched"
+    ));
+    cat.apply_relink(&p)?;
+    cat.undo_relink(&p)?;
+    ensure!(
+        db(&root)?.query_row("SELECT location FROM assets WHERE id=?", [&asset.id], |r| r
+            .get::<_, Vec<u8>>(0))?
+            == encoded(&foreign_photo)
+    );
+    let renamed = new.join("renamed.jpg");
+    fs::rename(new.join("one.jpg"), &renamed)?;
+    fs::rename(new.join("one.xmp"), new.join("renamed.xmp"))?;
+    let p = prepared(
+        &mut cat,
+        RelinkScope::Asset {
+            asset_id: asset.id.clone(),
+            destinations: vec![NativePath::from_path(&renamed)],
+        },
+    )?;
+    ensure!(cat.relink_plan(&p)?.unresolved_sources == 0);
+    cat.apply_relink(&p)?;
+    ensure!(cat.get(&asset.id)?.original_path == renamed.to_string_lossy());
+    Ok(())
+}
+#[test]
+fn untagged_legacy_locators_require_explicit_bounded_encoding_declaration() -> Result<()> {
+    let (_temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    db(&root)?.execute("DELETE FROM storage_bindings WHERE asset_id=?", [&asset.id])?;
+    let status = cat.storage_status(
+        &asset.id,
+        &MountSnapshot {
+            mounts: vec![],
+            complete: true,
+            issues: vec![],
+        },
+    )?;
+    ensure!(matches!(status.current, PathReference::Unspecified(_)));
+    #[cfg(unix)]
+    let encoding = photocatalog::catalog_storage::StorageEncoding::Unix;
+    #[cfg(windows)]
+    let encoding = photocatalog::catalog_storage::StorageEncoding::Windows;
+    let progress = cat.declare_storage_encoding(encoding, 0, 1)?;
+    ensure!(progress.declared == 1);
+    ensure!(
+        cat.declare_storage_encoding(encoding, progress.scanned_through, 1)?
+            .declared
+            == 0
+    );
+    cat.record_storage_path(&asset.id, &NativePath::from_path(&old.join("one.jpg")))?;
+    Ok(())
+}
+
+#[test]
+fn same_path_timestamp_and_same_byte_replacement_preserve_choice_and_record_instances() -> Result<()>
+{
+    let (_temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    let xmp = old.join("one.xmp");
+    let bytes = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="same-path" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="4"/></rdf:RDF>"#;
+    fs::write(&xmp, bytes)?;
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let view = cat.metadata(&asset.id)?;
+    let model = view
+        .fields
+        .iter()
+        .find(|f| f.name == "rating")
+        .unwrap()
+        .candidates[0]
+        .model_id;
+    cat.resolve_metadata(&asset.id, view.revision, "rating", model)?;
+    let revision = cat.metadata(&asset.id)?.revision;
+    let previous: Vec<(i64, String)> = db(&root)?
+        .prepare("SELECT id,provenance FROM metadata_observations ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let original_time = fs::metadata(&xmp)?.modified()?;
+    for step in 1..=2 {
+        if step == 2 {
+            let replacement = old.join("replacement.tmp");
+            fs::write(&replacement, bytes)?;
+            fs::remove_file(&xmp)?;
+            fs::rename(replacement, &xmp)?;
+        }
+        let modified = original_time + std::time::Duration::from_secs(60 * step);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&xmp)?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+        let report = cat.import(&old, None, |_| Ok(()))?;
+        ensure!(report.unchanged == 1 && report.metadata_updated == 0);
+        let view = cat.metadata(&asset.id)?;
+        let rating = view.fields.iter().find(|f| f.name == "rating").unwrap();
+        ensure!(
+            view.revision == revision && rating.selected_model == Some(model) && !rating.conflicted
+        );
+        let instances = cat.metadata_file_instances(&asset.id, 0, 10)?;
+        ensure!(instances.len() == step as usize);
+        let latest = &instances.last().unwrap().provenance;
+        ensure!(
+            latest["source_location"]["display"].as_str() == Some(xmp.to_string_lossy().as_ref())
+        );
+        ensure!(
+            latest["file_revision"]["modified_unix_ns"].as_u64()
+                == Some(modified.duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64)
+        );
+    }
+    let after: Vec<(i64, String)> = db(&root)?
+        .prepare("SELECT id,provenance FROM metadata_observations ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure!(after == previous);
+    // Actual bytes still create a new observation, even when only one value changes.
+    fs::write(
+        &xmp,
+        String::from_utf8(bytes.to_vec())?.replace("Rating=\"4\"", "Rating=\"3\""),
+    )?;
+    ensure!(cat.import(&old, None, |_| Ok(()))?.metadata_updated == 1);
+    ensure!(cat.metadata(&asset.id)?.revision > revision);
+    Ok(())
+}
+
+#[test]
+fn prefix_skips_unknown_rows_and_explicit_candidate_does_not_evaluate_fallback() -> Result<()> {
+    let (temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    photo(&old.join("two.jpg"), 30);
+    cat.import(&old, None, |_| Ok(()))?;
+    let assets = cat.browse(0, 10)?;
+    let unknown = assets
+        .iter()
+        .find(|a| a.original_path.ends_with("two.jpg"))
+        .unwrap();
+    db(&root)?.execute(
+        "DELETE FROM storage_bindings WHERE asset_id=?",
+        [&unknown.id],
+    )?;
+    let new = temp.path().join("new");
+    fs::create_dir(&new)?;
+    fs::copy(old.join("one.jpg"), new.join("one.jpg"))?;
+    fs::copy(old.join("two.jpg"), new.join("two.jpg"))?;
+    let p = prepared(&mut cat, prefix(&old, &new))?;
+    ensure!(cat.relink_items(&p, 0, 10)?.len() == 1);
+    let p = cat.begin_relink(prefix(&old, &new))?;
+    cat.set_relink_candidates(
+        &p.id,
+        &unknown.id,
+        vec![NativePath::from_path(&new.join("two.jpg"))],
+    )?;
+    while cat.relink_plan(&p.id)?.state == "preparing" {
+        cat.prepare_relink_batch(&p.id, 1)?;
+    }
+    ensure!(cat.relink_items(&p.id, 0, 10)?.len() == 2);
+    Ok(())
+}
+
+#[test]
+fn excluding_prepared_sidecar_swap_rechecks_retained_locator_collision() -> Result<()> {
+    let (_temp, old, root, mut cat) = setup()?;
+    let original = old.join("one.jpg");
+    photo(&original, 20);
+    let a = old.join("one.xmp");
+    let b = old.join("one.jpg.xmp");
+    let xml = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="same" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="3"/></rdf:RDF>"#;
+    fs::write(&a, xml)?;
+    fs::write(&b, xml)?;
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let sources: Vec<(i64,String)> = db(&root)?.prepare("SELECT id,display FROM metadata_sources WHERE asset_id=? AND kind='sidecar' ORDER BY id")?.query_map([&asset.id], |r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    ensure!(sources.len() == 2);
+    let p = cat.begin_relink(RelinkScope::Asset {
+        asset_id: asset.id.clone(),
+        destinations: vec![NativePath::from_path(&original)],
+    })?;
+    for (id, display) in &sources {
+        let other = if display == a.to_string_lossy().as_ref() {
+            &b
+        } else {
+            &a
+        };
+        cat.set_relink_source_candidates(&p.id, *id, vec![NativePath::from_path(other)])?;
+    }
+    cat.prepare_relink_batch(&p.id, 1)?;
+    ensure!(cat.relink_plan(&p.id)?.unresolved_sources == 0);
+    cat.exclude_relink_source(&p.id, sources[0].0)?;
+    let err = cat.apply_relink(&p.id).unwrap_err();
+    ensure!(
+        err.to_string().contains("metadata source collision"),
+        "{err:#}"
+    );
+    let after: Vec<(i64,String)> = db(&root)?.prepare("SELECT id,display FROM metadata_sources WHERE asset_id=? AND kind='sidecar' ORDER BY id")?.query_map([&asset.id], |r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    ensure!(sources == after);
+    ensure!(fs::read(a)? == xml && fs::read(b)? == xml);
+    Ok(())
+}
