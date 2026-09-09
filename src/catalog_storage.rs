@@ -2307,3 +2307,52 @@ fn object_key(file: &File) -> Result<(u64, u64)> {
         ((info.index_high as u64) << 32) | info.index_low as u64,
     ))
 }
+
+#[cfg(test)]
+mod folder_alias_tests {
+    use super::*;
+
+    #[test]
+    fn windows_folder_aliases_preserve_roots_case_and_exact_utf16() -> Result<()> {
+        // These expected folder keys are literal code-unit sequences, independent
+        // of the component parser. No Windows filesystem is needed for this test.
+        for (root, verbatim_root) in [
+            (r"Q:\", r"\\?\Q:\"),
+            (r"\\SeRvEr\ShArE\", r"\\?\UNC\SeRvEr\ShArE\"),
+        ] {
+            let root_units: Vec<u16> = root.encode_utf16().collect();
+            let first: Vec<u16> = format!("{root}MiXeD").encode_utf16().collect();
+            let mut leaf: Vec<u16> = format!("{root}MiXeD\\東京🚀").encode_utf16().collect();
+            leaf.push(0xd800); // An unpaired surrogate is identity, not display text.
+            let expected = [root_units, first, leaf.clone()]
+                .map(NativePath::WindowsWide)
+                .to_vec();
+            let mut regular = leaf.clone();
+            regular.extend("\\photo.jpg".encode_utf16());
+            let mut extended: Vec<u16> = format!("{verbatim_root}MiXeD\\東京🚀")
+                .encode_utf16()
+                .collect();
+            extended.push(0xd800);
+            extended.extend("\\photo.jpg".encode_utf16());
+            for input in [regular, extended] {
+                let tagged = NativePath::WindowsWide(input);
+                let before = tagged.clone();
+                let actual = native_folder_chain(&tagged)?;
+                assert_eq!(
+                    actual.into_iter().map(|(path, _)| path).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(tagged, before);
+            }
+            // Lossy display would collapse these two names; folder identities must not.
+            *leaf.last_mut().unwrap() = 0xd801;
+            leaf.extend("\\photo.jpg".encode_utf16());
+            let different = native_folder_chain(&NativePath::WindowsWide(leaf))?;
+            assert_ne!(&different.last().unwrap().0, expected.last().unwrap());
+            let different_case =
+                NativePath::WindowsWide(format!("{root}mixed\\photo.jpg").encode_utf16().collect());
+            assert_ne!(native_folder_chain(&different_case)?[1].0, expected[1]);
+        }
+        Ok(())
+    }
+}

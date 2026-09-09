@@ -55,6 +55,11 @@ empty, making member removal an explicit, reviewable batch operation.
 
 Folder identity uses tagged native path components, never display names. Unix
 bytes, Windows UTF-16, drive roots, and UNC roots keep their originating semantics.
+Folder keys normalize supported Windows extended drive/UNC prefix spellings
+(`\\?\Q:\` and `\\?\UNC\server\share\`) to drive/UNC component keys; the
+asset/source locators retain their original tagged spelling. The remaining UTF-16
+code units, including unpaired surrogates, are preserved. This is a lexical folder
+index convention, not filesystem canonicalization of arbitrary paths.
 Unicode/case variants do not silently merge. Display strings may be lossy; they
 are not locators. Unbound legacy rows have no invented folder association until
 storage mapping supplies a tagged current locator.

@@ -421,7 +421,22 @@ fn collection_flags_restart_relink_and_xmp_choice_refresh_stay_consistent() -> R
         [folder],
         |r| r.get(0),
     )?;
-    ensure!(serde_json::from_str::<NativePath>(&stored)? == NativePath::from_path(&new));
+    // Windows canonical temp roots can use extended spelling; folder keys use the
+    // corresponding drive/UNC spelling. Ask the filesystem whether they identify
+    // the actual relocated directory, rather than comparing alias bytes.
+    let stored_folder = serde_json::from_str::<NativePath>(&stored)?.to_path()?;
+    ensure!(stored_folder.canonicalize()? == new.canonicalize()?);
+    let stored_original: String = db(&root)?.query_row(
+        "SELECT native_path FROM storage_bindings WHERE asset_id=?",
+        [&asset.id],
+        |r| r.get(0),
+    )?;
+    let canonical_original = new.join("one.jpg").canonicalize()?;
+    ensure!(
+        serde_json::from_str::<NativePath>(&stored_original)?
+            == NativePath::from_path(&canonical_original)
+    );
+    ensure!(cat.get(&asset.id)?.original_path == canonical_original.to_string_lossy());
     cat.undo_relink(&plan.id)?;
     ensure!(cat.search(&Query::default(), None, 10, 10)?.rows[0].asset_id == asset.id);
     Ok(())
