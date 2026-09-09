@@ -20,10 +20,10 @@ import os
 import stat
 
 PROTOCOL = 1  # Frozen fixture/native row protocol.
-DRIVER_PROTOCOL = 2
+DRIVER_PROTOCOL = 3
 TEXT_LIMITS = {"document_bytes": 1024**2, "page_bytes": 8 * 1024**2}
 LOCAL_TEXT_CASES = {"filename-reverse", "mixed", "text-capture"}
-DIAGNOSTIC_CASES = ["filename-reverse", "text"]
+DIAGNOSTIC_CASES = ["filename-reverse", "text", "text-capture", "date-camera"]
 DIAGNOSTIC_SCALES = [1_000_000, 10_000_000]
 SCALES = [1_000_000, 5_000_000, 10_000_000]
 CASES = ["browse", "rating", "rating-sort", "capture-rating", "filename-reverse", "keyword",
@@ -226,8 +226,9 @@ def validate_receipt(receipt, observer, case, count, repetitions, warmups, start
         assert len(expected) == len(set(expected))
         assert all(row_valid(row) for row in rows)
         assert len(rows) <= 200
-        if count >= 1_000_000 and case != "wide-keyword":
-            assert len(rows) == 200
+        # The independent arithmetic oracle is authoritative for every case.
+        # In particular, text-capture's day-26/lens0 anchors have genuine empty
+        # tails at every scale; they still owe full exhaustion and latency gates.
         if len(rows) < 200:
             assert chunks[-1]["exhausted"] is True
         assert sum(c["returned"] for c in chunks) == len(rows)
@@ -354,7 +355,8 @@ def copied_fixture(args, old_manifest_path, fixture):
     with source.open("rb") as stream:
         header = stream.read(100)
     assert header[:16] == b"SQLite format 3\0"
-    assert int.from_bytes(header[60:64], "big") == 4, "source schema is not 4"
+    source_schema = int.from_bytes(header[60:64], "big")
+    assert source_schema in (4, 5), "source schema is not 4 or 5"
     assert int.from_bytes(header[68:72], "big") == 0x50484341, "source is not PhotoCatalog"
     before_hash = sha(source)
     assert before_hash == fixture["main_sha256"], "source main changed"
@@ -385,10 +387,38 @@ def copied_fixture(args, old_manifest_path, fixture):
     assert sha(args.root / prepare.name) == fixture["prepare_receipt_sha256"]
     proof = {"source": str(source.resolve()), "source_before": before, "source_after": after,
              "source_before_sha256": before_hash, "source_after_sha256": after_hash,
-             "copy_sha256": copy_hash, "schema": 4, "application_id": 0x50484341,
+             "copy_sha256": copy_hash, "schema": source_schema, "application_id": 0x50484341,
              "prepare_receipt_sha256": fixture["prepare_receipt_sha256"]}
     save(args.root / f"reuse-{fixture['count']}.json", proof)
     return {**fixture, "catalog": str(catalog.resolve()), "reuse_proof": str(args.root / f"reuse-{fixture['count']}.json")}
+
+
+def migrate_reused_fixture(args, fixture):
+    catalog = pathlib.Path(fixture["catalog"])
+    main = catalog / "catalog.sqlite3"
+    before = sha(main)
+    assert before == fixture["main_sha256"]
+    receipt = args.root / f"migrate-{fixture['count']}.json"
+    observer = run_child(args.binary, catalog, receipt, ["migrate-fixture"], 4 * 3600)
+    native = json.loads(receipt.read_text())
+    assert observer["exit_code"] == 0 and observer["error"] is None
+    assert native["protocol"] == PROTOCOL and native["complete"] is True and native["mode"] == "migrate_fixture"
+    assert native["count"] == fixture["count"] and native["schema_before"] in (4,5) and native["schema_after"] == 5
+    assert native["engine_version"] == "3.51.1"
+    assert native["logical_before"] == native["logical_after"] and len(native["logical_before"]) == 64
+    assert native["table_counts_before"] == native["table_counts_after"] and native["table_counts_before"]
+    assert native["index_sql"] == "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
+    after = sha(main)
+    proof = {"owned_copy_before_sha256":before,"owned_copy_after_sha256":after,
+             "schema_before":native["schema_before"],"schema_after":5,"native_receipt":str(receipt),
+             "native_receipt_sha256":sha(receipt),"observer":observer,
+             "logical_before":native["logical_before"],"logical_after":native["logical_after"],
+             "table_counts_before":native["table_counts_before"],"table_counts_after":native["table_counts_after"],
+             "index_sql":native["index_sql"]}
+    proof_path=args.root/f"migration-proof-{fixture['count']}.json"
+    save(proof_path,proof)
+    return {**fixture,"source_main_sha256":before,"main_sha256":after,"main_bytes":main.stat().st_size,
+            "schema":5,"migration_proof":str(proof_path)}
 
 
 def prepare_reuse(args, counts):
@@ -402,7 +432,7 @@ def prepare_reuse(args, counts):
               "reuse_manifest": str(old_path), "reuse_manifest_sha256": before}
     try:
         for fixture in old["fixtures"]:
-            result["fixtures"].append(copied_fixture(args, old_path, fixture))
+            result["fixtures"].append(migrate_reused_fixture(args, copied_fixture(args, old_path, fixture)))
         assert sha(old_path) == before, "preserved manifest changed"
         result["complete"] = True
     except Exception as error:

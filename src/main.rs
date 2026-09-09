@@ -370,12 +370,30 @@ enum Command {
     },
 }
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let mut catalog = match &cli.command {
-        Command::Import { folder, .. } => Catalog::open_for_import(&cli.catalog, folder)?,
-        _ => Catalog::open(&cli.catalog)?,
-    };
+    run_cli(Cli::parse())
+}
+// Keep image import out of the large administrative-command dispatch frame.
+// Windows executable main stacks are smaller than Rust's test-thread stacks.
+fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Import { folder, max_files } => {
+            let mut catalog = Catalog::open_for_import(&cli.catalog, &folder)?;
+            let report = catalog.import(folder, max_files, |_| Ok(()))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            ensure!(
+                report.failed == 0,
+                "{} imports failed; inspect browse output and retry",
+                report.failed
+            );
+            Ok(())
+        }
+        command => run_catalog_command(cli.catalog, command),
+    }
+}
+#[inline(never)]
+fn run_catalog_command(root: PathBuf, command: Command) -> Result<()> {
+    let mut catalog = Catalog::open(root)?;
+    match command {
         Command::OrganizationIndex { limit } => print_json(&catalog.organization_index(limit)?)?,
         Command::Search {
             query,
@@ -608,15 +626,7 @@ fn main() -> Result<()> {
         }
         Command::RelinkApply { plan } => print_json(&catalog.apply_relink(&plan)?)?,
         Command::RelinkUndo { plan } => print_json(&catalog.undo_relink(&plan)?)?,
-        Command::Import { folder, max_files } => {
-            let report = catalog.import(folder, max_files, |_| Ok(()))?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            ensure!(
-                report.failed == 0,
-                "{} imports failed; inspect browse output and retry",
-                report.failed
-            );
-        }
+        Command::Import { .. } => unreachable!("import uses its isolated dispatch path"),
         Command::Browse { after, limit } => println!(
             "{}",
             serde_json::to_string_pretty(&catalog.browse(after, limit)?)?
@@ -720,4 +730,57 @@ fn read_request<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Resul
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 1024 * 1024, "request exceeds 1MiB");
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod cli_stack_tests {
+    use super::*;
+    #[test]
+    fn bounded_stack_import_child() -> Result<()> {
+        if std::env::var_os("PHOTOCATALOG_CLI_STACK_CHILD").is_none() {
+            return Ok(());
+        }
+        let owned = tempfile::tempdir()?;
+        let folder = owned.path().join("originals ü 日本語");
+        std::fs::create_dir(&folder)?;
+        let photo = folder.join("source.jpg");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([30, 70, 90])).save(&photo)?;
+        let before = std::fs::read(&photo)?;
+        let catalog = owned.path().join("catalog");
+        let import_root = catalog.clone();
+        std::thread::Builder::new()
+            .name("bounded-cli-import".into())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                run_cli(Cli {
+                    catalog: import_root,
+                    command: Command::Import {
+                        folder,
+                        max_files: None,
+                    },
+                })
+            })?
+            .join()
+            .map_err(|_| anyhow::anyhow!("small-stack import panicked"))??;
+        ensure!(Catalog::open(&catalog)?.browse(0, 2)?.len() == 1);
+        ensure!(std::fs::read(photo)? == before);
+        Ok(())
+    }
+    #[test]
+    fn import_runs_on_a_one_mib_stack_in_an_actual_child() -> Result<()> {
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "cli_stack_tests::bounded_stack_import_child",
+                "--nocapture",
+            ])
+            .env("PHOTOCATALOG_CLI_STACK_CHILD", "1")
+            .output()?;
+        ensure!(
+            child.status.success(),
+            "small-stack child failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        Ok(())
+    }
 }

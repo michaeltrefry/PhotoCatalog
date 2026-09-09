@@ -297,6 +297,8 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     }
     let mut source = "organization_assets a".to_string();
     let mut driving = Vec::new();
+    let mut capture_bounds = Vec::new();
+    let mut split_cursor = None;
     let mut local_text = query.text.is_some();
     let mut sequence = "a.sequence";
     let mut key = match query.sort {
@@ -364,7 +366,10 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
             }
         }
     } else if query.sort == Sort::Capture {
-        if let Some(folder) = query.folder.filter(|_| !query.folder_recursive) {
+        if let Some(lens) = &query.lens {
+            source = "organization_assets a INDEXED BY organization_lens_capture".into();
+            driving.push(format!("a.lens={}", bind(&mut params, lens.clone())));
+        } else if let Some(folder) = query.folder.filter(|_| !query.folder_recursive) {
             source = "organization_assets a INDEXED BY organization_folder_capture".into();
             driving.push(format!("a.folder={}", bind(&mut params, folder)));
         } else if let Some(rating) = query.rating {
@@ -375,13 +380,10 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
         }
         for (operator, value) in [(">=", &query.date_from), ("<", &query.date_until)] {
             if let Some(value) = value {
-                driving.push(format!(
-                    "a.capture{operator}{}",
-                    bind(
-                        &mut params,
-                        organization::date_key(value).context("invalid date")?
-                    )
-                ));
+                let value = organization::date_key(value).context("invalid date")?;
+                let predicate = format!("a.capture{operator}{}", bind(&mut params, value.clone()));
+                driving.push(predicate.clone());
+                capture_bounds.push((operator, value, predicate));
             }
         }
     } else {
@@ -414,7 +416,10 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
             };
             let k = bind(&mut params, value);
             let s = bind(&mut params, cursor.sequence);
-            driving.push(format!("({key},{sequence}){op}({k},{s})"));
+            // SQLite can select a weaker independent date bound for a tuple
+            // comparison, rereading entire earlier buckets before LIMIT. Give
+            // each disjoint range its own equality/strict index seek instead.
+            split_cursor = Some((k, s, op, cursor.key.clone()));
         }
     }
     let direction = if query.direction == Direction::Ascending {
@@ -434,11 +439,55 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     };
     let text_column = if local_text { "a.search_text" } else { "NULL" };
     let limit = bind(&mut params, scan as i64);
+    let projection = format!(
+        "a.sequence,a.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched,{text_column}"
+    );
+    let select = |predicates: &[String]| {
+        format!(
+            "SELECT {projection} FROM {source} WHERE {}",
+            predicates.join(" AND ")
+        )
+    };
+    let text = if let Some((k, s, op, cursor_key)) = split_cursor {
+        let mut same = driving.clone();
+        same.push(format!("{key}={k} AND {sequence}{op}{s}"));
+        let mut later = driving;
+        let mut cursor_bound_needed = true;
+        if let (Sort::Capture, Key::Text(cursor)) = (query.sort, cursor_key) {
+            for (operator, value, predicate) in capture_bounds {
+                if (op == ">" && operator == ">=") || (op == "<" && operator == "<") {
+                    let cursor_stronger = if op == ">" {
+                        cursor >= value
+                    } else {
+                        cursor <= value
+                    };
+                    if cursor_stronger {
+                        later.retain(|p| p != &predicate);
+                    } else {
+                        cursor_bound_needed = false;
+                    }
+                }
+            }
+        }
+        if cursor_bound_needed {
+            later.push(format!("{key}{op}{k}"));
+        }
+        let ordinal = match query.sort {
+            Sort::Capture => 7,
+            Sort::Filename => 6,
+            Sort::Rating => 12,
+            Sort::Sequence => unreachable!(),
+        };
+        format!(
+            "{} UNION ALL {} ORDER BY {ordinal} {direction},1 {direction} LIMIT {limit}",
+            select(&same),
+            select(&later)
+        )
+    } else {
+        format!("{} ORDER BY {order} LIMIT {limit}", select(&driving))
+    };
     Ok(Sql {
-        text: format!(
-            "SELECT a.sequence,a.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched,{text_column} FROM {source} WHERE {} ORDER BY {order} LIMIT {limit}",
-            driving.join(" AND ")
-        ),
+        text,
         params,
         local_text,
     })

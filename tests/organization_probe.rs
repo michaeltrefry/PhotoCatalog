@@ -112,3 +112,58 @@ fn all_frozen_queries_prove_small_fixture_and_corrupt_rows_fail_closed() -> Resu
     ensure!(!result.status.success() && fs::read(root.join("corrupt.json"))? == retained);
     Ok(())
 }
+
+#[test]
+fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    ensure!(run(root, "prepare-migration", &["prepare", "--count", "1000"])?.0);
+    let conn = rusqlite::Connection::open(root.join("catalog/catalog.sqlite3"))?;
+    conn.execute_batch("DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    let (okay, receipt) = run(root, "migration", &["migrate-fixture"])?;
+    ensure!(
+        okay && receipt["complete"] == true
+            && receipt["schema_before"] == 4
+            && receipt["schema_after"] == 5
+    );
+    ensure!(
+        receipt["logical_before"] == receipt["logical_after"]
+            && receipt["table_counts_before"] == receipt["table_counts_after"]
+    );
+    ensure!(
+        receipt["table_counts_before"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r[0] == "organization_text_idx")
+    );
+    ensure!(
+        run(
+            root,
+            "after-migration",
+            &[
+                "query",
+                "text-capture",
+                "--repetitions",
+                "2",
+                "--warmups",
+                "0"
+            ]
+        )?
+        .0
+    );
+    let conn = rusqlite::Connection::open(root.join("catalog/catalog.sqlite3"))?;
+    conn.execute_batch("DROP INDEX organization_lens_capture; CREATE INDEX organization_lens_capture ON organization_assets(lens); PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    let (okay, receipt) = run(root, "wrong-index", &["migrate-fixture"])?;
+    ensure!(
+        !okay
+            && receipt["complete"] == false
+            && receipt["error"]
+                .as_str()
+                .unwrap()
+                .contains("unexpected capture index")
+    );
+    Ok(())
+}

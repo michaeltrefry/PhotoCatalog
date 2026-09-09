@@ -121,3 +121,48 @@ Use the existing pinned benchmark Python environment. With identical `--binary`,
 thresholds, cohort formulas and sample counts remain those of protocol 1.
 Record the host observer throughout preparation and measurement. The original
 failed v1 run and all new failed attempts remain separate permanent evidence.
+
+## Protocol-2 terminal failure and corrective schema 5 draft
+
+Protocol 2 completed every query child but failed qualification. The text+capture
+case's day-26 anchors are genuine empty tails: date residues 25–27 modulo 28
+cannot satisfy lens0's residue 0 modulo 4. The native arithmetic oracle returned
+those tails correctly; the coordinator incorrectly imposed a blanket 200-row
+requirement except for wide keywords. That assertion is corrected to use the
+unchanged independent arithmetic oracle for every case, still requiring explicit
+exhaustion. Empty and full pages retain the same latency/memory budgets.
+
+This oracle correction does not erase performance failures. Text+capture warm
+p95 at 1M/5M/10M was 81.860/1021.116/2859.928 ms; fresh maxima were
+265.261/1064.666/2881.214 ms. Date+camera at 10M had warm p95 176.417 ms.
+All failed v2 evidence remains retained. The original repeated-global-FTS repair
+worked for reverse-filename search (10M warm p95 6.352 ms), but capture ordering
+still scanned disqualified date buckets and repeatedly evaluated weaker bounds.
+
+The next source candidate splits a non-sequence cursor into disjoint exact-key
+plus sequence and strict later-key ranges, merging indexed order without a global
+sort. Redundant weaker date bounds are removed separately in the later branch.
+Schema 5 adds `organization_lens_capture(lens,capture,sequence)` so a lens-filtered
+capture query can skip incompatible date buckets. No logical fixture field,
+filter, cursor, sort, sample count or threshold changes.
+
+Driver protocol 3 reuses only new private copies. Each copy is explicitly migrated
+by the native `organization_probe migrate-fixture` command before any diagnostic
+or timing. The migration streams typed rows and identities from every catalog
+and FTS table before and after the additive index; ordered primary keys cover
+WITHOUT ROWID tables. Both logical digests and every table count must agree.
+The receipt records schema4/5 before, schema5 after and exact index definition.
+Source-copy proof retains the original main hash; a separate migration proof
+records the changed derived main hash and native receipt identity. Derived bytes
+are never described as identical to v1/v2 source mains. All originals and their
+companions remain untouched. Migration scans/index construction are preparation
+work and are excluded from query timing with explicit provenance.
+
+This schema5/driver3 correction is source-only and awaits independent review,
+local regression execution and a separately frozen expanded diagnostic before
+any new scale qualification. The full 17 cases/all three scales and transition
+acceptance remain mandatory. The corrective diagnostic is now fixed to reverse-filename, direct text,
+text+capture and date+camera at 1M and 10M: eight children, each with 3 warmups,
+5 samples and the unchanged 120-second diagnostic deadline. These remain
+nonqualifying samples. All eight outcomes must be retained and reviewed before
+the full campaign.

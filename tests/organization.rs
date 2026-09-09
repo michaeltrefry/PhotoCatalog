@@ -1267,3 +1267,134 @@ fn local_text_work_is_candidate_bounded_as_unrelated_postings_grow() -> Result<(
     // This proves bounded staging on small inputs, not a scale latency or RSS gate.
     Ok(())
 }
+
+#[test]
+fn capture_cursor_seeks_bound_ties_and_lens_dates_without_prefix_scans() -> Result<()> {
+    let (_temp, root, mut cat) = synthetic(5600)?;
+    for direction in [Direction::Ascending, Direction::Descending] {
+        for lens in [None, Some("lens0".to_string())] {
+            let query = Query {
+                sort: Sort::Capture,
+                direction,
+                lens: lens.clone(),
+                date_from: Some("2024-01-05".into()),
+                date_until: Some("2024-01-20".into()),
+                camera: Some("camera1".into()),
+                ..Query::default()
+            };
+            let mut expected: Vec<_> = (1..=5600)
+                .filter(|i| {
+                    i % 3 == 1 && (4..19).contains(&(i % 28)) && (lens.is_none() || i % 4 == 0)
+                })
+                .collect();
+            expected.sort_by_key(|i| (i % 28, *i));
+            if direction == Direction::Descending {
+                expected.reverse();
+            }
+            ensure!(all(&mut cat, &query, 13, 31)? == expected);
+            let mut cursor = cat.search(&query, None, 13, 31)?.next;
+            for _ in 0..4 {
+                let page = cat.search(&query, cursor.as_ref(), 13, 31)?;
+                ensure!(
+                    page.vm_steps < 12000 && page.sorts == 0,
+                    "prefix scan leaked: {} steps",
+                    page.vm_steps
+                );
+                cursor = page.next;
+                if page.exhausted {
+                    break;
+                }
+            }
+        }
+    }
+    // Day 26..28 have residues 25..27 modulo28, none divisible by4.
+    // A lens-leading capture index must prove this true empty tail without
+    // visiting every asset in those dates; the source data/formula is unchanged.
+    let query = Query {
+        sort: Sort::Capture,
+        text: Some("blue sunset".into()),
+        lens: Some("lens0".into()),
+        date_from: Some("2024-01-26".into()),
+        ..Query::default()
+    };
+    let page = cat.search(&query, None, 200, 4096)?;
+    ensure!(
+        page.rows.is_empty()
+            && page.exhausted
+            && page.scanned == 0
+            && page.vm_steps < 1000
+            && page.sorts == 0
+    );
+    ensure!(
+        cat.explain_search(&query, None, 4096)?
+            .iter()
+            .any(|p| p.contains("organization_lens_capture"))
+    );
+    // Keep the table shape and exact logical data; only the additive index exists.
+    ensure!(
+        db(&root)?.query_row("SELECT COUNT(*) FROM organization_assets", [], |r| r
+            .get::<_, i64>(0))?
+            == 5600
+    );
+    Ok(())
+}
+
+#[test]
+fn schema_four_to_five_adds_only_index_and_preserves_data_and_readonly_queries() -> Result<()> {
+    let (_temp, root, cat) = synthetic(113)?;
+    drop(cat);
+    let conn = db(&root)?;
+    conn.execute_batch("DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    fn contents(conn: &Connection) -> Result<Vec<(String, Vec<Vec<String>>)>> {
+        let tables=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_stat1' ORDER BY name")?
+            .query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut result = Vec::new();
+        for table in tables {
+            let quoted = table.replace('"', "\"\"");
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{quoted}\""))?;
+            let columns = stmt.column_count();
+            let mut rows = stmt
+                .query_map([], |r| {
+                    Ok((0..columns)
+                        .map(|i| r.get_ref(i).map(|v| format!("{v:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()?)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.sort();
+            result.push((table, rows));
+        }
+        Ok(result)
+    }
+    let before = contents(&conn)?;
+    drop(conn);
+    let mut cat = Catalog::open(&root)?;
+    let conn = db(&root)?;
+    ensure!(contents(&conn)? == before);
+    ensure!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? == 5);
+    let index: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE name='organization_lens_capture'",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(index.contains("(lens,capture,sequence)"));
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); BEGIN IMMEDIATE")?;
+    let main = fs::read(root.join("catalog.sqlite3"))?;
+    let wal = fs::read(root.join("catalog.sqlite3-wal"))?;
+    drop(Catalog::open(&root)?);
+    let query = Query {
+        sort: Sort::Capture,
+        lens: Some("lens0".into()),
+        text: Some("blue sunset".into()),
+        ..Query::default()
+    };
+    ensure!(!cat.search(&query, None, 3, 10)?.rows.is_empty());
+    let mut session = cat.search_session(query, 30)?;
+    ensure!(!session.next_page(3, 10)?.rows.is_empty());
+    session.close()?;
+    ensure!(
+        fs::read(root.join("catalog.sqlite3"))? == main
+            && fs::read(root.join("catalog.sqlite3-wal"))? == wal
+    );
+    conn.execute_batch("ROLLBACK")?;
+    Ok(())
+}

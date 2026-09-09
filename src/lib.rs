@@ -89,7 +89,7 @@ impl Catalog {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 4,
+            version <= 5,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -112,7 +112,7 @@ impl Catalog {
         configure_catalog_connection(&db)?;
         // Opening a current catalog must not rewrite its header or acquire an
         // unnecessary writer transaction. Only actual initialization/migration writes.
-        if version < 4 {
+        if version < 5 {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute_batch("
             CREATE TABLE IF NOT EXISTS assets (
@@ -141,6 +141,10 @@ impl Catalog {
             if version < 4 {
                 tx.execute_batch(organization::SCHEMA)?;
                 tx.pragma_update(None, "user_version", 4)?;
+            }
+            if version < 5 {
+                tx.execute_batch(organization::CAPTURE_LENS_SCHEMA)?;
+                tx.pragma_update(None, "user_version", 5)?;
             }
             tx.commit()?;
         }
@@ -676,7 +680,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            4
+            5
         );
         assert_eq!(
             catalog

@@ -81,7 +81,8 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             args,fixture,main=self.reusable(pathlib.Path(directory))
             before=campaign.source_state(main);manifest_before=args.reuse_prepared.read_bytes()
-            campaign.prepare_reuse(args,[1000])
+            with mock.patch.object(campaign,"migrate_reused_fixture",side_effect=lambda args,fixture:fixture):
+                campaign.prepare_reuse(args,[1000])
             result=json.loads((args.root/"manifest.json").read_text())
             self.assertTrue(result["complete"])
             self.assertEqual(campaign.source_state(main),before)
@@ -141,17 +142,32 @@ class CampaignTests(unittest.TestCase):
                 calls.append((int(catalog.name.split("-")[-1]),argv,timeout))
                 campaign.save(output,{"placeholder":True})
                 return dict(exit_code=0,error=None,rss_samples=1,rss_peak_bytes=1024)
-            validation=[ValueError("retained first failure"),{},{},{}]
+            validation=[ValueError("retained first failure")]+[{} for _ in range(7)]
             with mock.patch.object(campaign,"run_child",side_effect=child), mock.patch.object(campaign,"validate_receipt",side_effect=validation):
                 with self.assertRaises(SystemExit):campaign.run_diagnostic(args,{"fixtures":fixtures})
-            self.assertEqual([(n,argv[1]) for n,argv,_ in calls],[(n,c) for n in [1000000,10000000] for c in ["filename-reverse","text"]])
+            self.assertEqual([(n,argv[1]) for n,argv,_ in calls],[(n,c) for n in [1000000,10000000] for c in ["filename-reverse","text","text-capture","date-camera"]])
             self.assertTrue(all(argv[2:]==["--repetitions","5","--warmups","3","--start","0"] and timeout==120 for _,argv,timeout in calls))
             result=json.loads((root/"diagnostic/diagnostic.json").read_text())
             self.assertFalse(result["acceptance_evidence"])
             self.assertFalse(result["complete"])
             self.assertEqual(len(result["errors"]),1)
-            self.assertEqual(len(result["cases"]),3)
+            self.assertEqual(len(result["cases"]),7)
             self.assertEqual(len(result["source_proofs"]),2)
             self.assertTrue(all(p["unchanged"] for p in result["source_proofs"]))
+
+    def test_capture_lens_empty_tail_matches_oracle_without_false_200_requirement(self):
+        receipt,observer=self.receipt()
+        receipt.update(count=1_000_000,case="text_capture",start=1)
+        sample=receipt["samples"][0]
+        sample.update(iteration=1,rows=[],oracle_sequences=[])
+        sample["anchor"].update(high_water=1_000_000,sequence=545000,key={"kind":"text","value":"2024-01-26T12:00:00"})
+        sample["chunks"]=[dict(scanned=0,returned=0,sorts=0,vm_steps=100,elapsed_ms=10.,exhausted=True,has_more=False,cursor=None,text_work=dict(candidate_rows_read=0,indexed_rows=0,indexed_bytes=0,batches=0,vm_steps=10,sorts=0,admission_limited=False))]
+        self.assertEqual(campaign.validate_receipt(receipt,observer,"text-capture",1_000_000,1,0,1)["n"],1)
+        bad=copy.deepcopy(receipt);bad["samples"][0]["chunks"][0].update(exhausted=False,has_more=True)
+        with self.assertRaises(AssertionError):campaign.validate_receipt(bad,observer,"text-capture",1_000_000,1,0,1)
+        # Day15 has matching later dates: falsely returning empty must still fail.
+        bad=copy.deepcopy(receipt);bad.update(start=0);bad["samples"][0].update(iteration=0)
+        bad["samples"][0]["anchor"].update(sequence=500000,key={"kind":"text","value":"2024-01-15T12:00:00"})
+        with self.assertRaises(AssertionError):campaign.validate_receipt(bad,observer,"text-capture",1_000_000,1,0,0)
 
 if __name__=="__main__":unittest.main()

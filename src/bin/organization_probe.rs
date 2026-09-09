@@ -24,6 +24,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Explicit migration of an owned pristine fixture copy, outside timed reads.
+    MigrateFixture,
     Transitions {
         #[arg(long, default_value_t = 200)]
         repetitions: usize,
@@ -121,6 +123,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 fn run(args: &Args) -> Result<serde_json::Value> {
+    if matches!(args.command, Command::MigrateFixture) {
+        return migrate_fixture(args);
+    }
     if let Command::Prepare { count } = args.command {
         return prepare(args, count);
     }
@@ -138,7 +143,7 @@ fn run(args: &Args) -> Result<serde_json::Value> {
         "fixture protocol/count mismatch"
     );
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version == 4, "fixture schema mismatch");
+    ensure!(version == 5, "fixture schema mismatch");
     let epoch: i64 = db.query_row("SELECT epoch FROM organization_state WHERE id=1", [], |r| {
         r.get(0)
     })?;
@@ -197,6 +202,117 @@ fn run(args: &Args) -> Result<serde_json::Value> {
         json!({"protocol":PROTOCOL,"complete":errors.is_empty(),"errors":errors,"mode":"query","count":count,"case":case,"query":query,"repetitions":repetitions,"warmups":warmups,"start":start,"open_ms":open_ms,"settings":settings,"engine_version":rusqlite::version(),"text_limits":TextLimits::default(),"plans":plans,"samples":samples,"warmup_samples":warmup_samples}),
     )
 }
+fn fixture_data_identity(db: &Connection) -> Result<(String, Vec<(String, i64)>)> {
+    use rusqlite::types::ValueRef;
+    let tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut hash = blake3::Hasher::new();
+    let mut counts = Vec::new();
+    for table in tables {
+        hash.update(&(table.len() as u64).to_le_bytes());
+        hash.update(table.as_bytes());
+        let quoted = table.replace('"', "\"\"");
+        let without_rowid: bool = db.query_row(
+            "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1",
+            [&table],
+            |r| r.get(0),
+        )?;
+        let sql = if without_rowid {
+            let keys = db
+                .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+                .query_map([&table], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(!keys.is_empty(), "WITHOUT ROWID table has no primary key");
+            let order = keys
+                .iter()
+                .map(|key| format!("\"{}\"", key.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("SELECT * FROM \"{quoted}\" ORDER BY {order}")
+        } else {
+            format!("SELECT rowid,* FROM \"{quoted}\" ORDER BY rowid")
+        };
+        let mut stmt = db.prepare(&sql)?;
+        let columns = stmt.column_count();
+        hash.update(&(columns as u64).to_le_bytes());
+        let mut rows = stmt.query([])?;
+        let mut count = 0i64;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            hash.update(b"row");
+            for col in 0..columns {
+                match row.get_ref(col)? {
+                    ValueRef::Null => {
+                        hash.update(b"null");
+                    }
+                    ValueRef::Integer(v) => {
+                        hash.update(b"int");
+                        hash.update(&v.to_le_bytes());
+                    }
+                    ValueRef::Real(v) => {
+                        hash.update(b"real");
+                        hash.update(&v.to_bits().to_le_bytes());
+                    }
+                    ValueRef::Text(v) | ValueRef::Blob(v) => {
+                        hash.update(if matches!(row.get_ref(col)?, ValueRef::Text(_)) {
+                            b"text"
+                        } else {
+                            b"blob"
+                        });
+                        hash.update(&(v.len() as u64).to_le_bytes());
+                        hash.update(v);
+                    }
+                }
+            }
+        }
+        hash.update(&count.to_le_bytes());
+        counts.push((table, count));
+    }
+    Ok((hash.finalize().to_hex().to_string(), counts))
+}
+fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
+    let path = args.catalog.join("catalog.sqlite3");
+    let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let before_schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        (4..=5).contains(&before_schema),
+        "migration requires fixture schema4 or5"
+    );
+    let (count, protocol): (i64, u32) = db.query_row(
+        "SELECT count,protocol FROM organization_fixture WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        protocol == PROTOCOL && (1000..=10_000_000).contains(&count),
+        "fixture identity mismatch"
+    );
+    let before = fixture_data_identity(&db)?;
+    drop(db);
+    drop(Catalog::open(&args.catalog)?);
+    let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let after = fixture_data_identity(&db)?;
+    let after_schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let index: String = db.query_row(
+        "SELECT sql FROM sqlite_master WHERE name='organization_lens_capture'",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        before == after && after_schema == 5,
+        "fixture migration changed logical rows"
+    );
+    let expected =
+        "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)";
+    ensure!(index == expected, "unexpected capture index definition");
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(
+        json!({"protocol":PROTOCOL,"mode":"migrate_fixture","complete":true,"count":count,"schema_before":before_schema,"schema_after":after_schema,"logical_before":before.0,"logical_after":after.0,"table_counts_before":before.1,"table_counts_after":after.1,"index_sql":index,"engine_version":rusqlite::version(),"provenance":"Explicit owned-copy schema/index migration; streamed typed logical rows include every catalog table, FTS shadow table and row identity. Not timed query work."}),
+    )
+}
+
 fn measure(
     cat: &mut Catalog,
     case: Case,

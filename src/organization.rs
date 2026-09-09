@@ -50,6 +50,9 @@ CREATE TRIGGER organization_binding_insert AFTER INSERT ON storage_bindings BEGI
 CREATE TRIGGER organization_binding_update AFTER UPDATE ON storage_bindings BEGIN INSERT INTO organization_dirty SELECT sequence FROM assets WHERE id=new.asset_id AND NOT EXISTS(SELECT 1 FROM organization_dirty WHERE sequence=assets.sequence); END;
 "#;
 
+pub(crate) const CAPTURE_LENS_SCHEMA: &str =
+    "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence);";
+
 pub const MAX_BATCH: usize = 1000;
 const LR: &str = "http://ns.adobe.com/lightroom/1.0/";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
