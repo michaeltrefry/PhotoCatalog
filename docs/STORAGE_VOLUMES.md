@@ -1,6 +1,6 @@
 # Volume identity and native paths (S5)
 
-Status: source ready for independent review; platform build, runtime, and disposable-volume lifecycle checks have **not run** for this change. No production storage has been detached, mounted, scanned recursively, opened for content reads, or modified. This adapter is the OS observation portion of sc-22840; the catalog transaction, availability, relink preview, content verification, and undo are separate integration work.
+Status: macOS standalone build, focused tests, Clippy, and disposable APFS lifecycle checks passed on 2026-09-09 for adapter commit `644eb45`. Native Windows/Linux execution and integrated catalog acceptance remain pending. No production storage has been detached, mounted, scanned recursively, opened for content reads, or modified. This adapter is the OS observation portion of sc-22840; the catalog transaction, availability, relink preview, content verification, and undo are separate integration work.
 
 ## Public API and integration contract
 
@@ -32,9 +32,9 @@ Cloned filesystems may duplicate UUIDs. Visible duplicate observations are ambig
 
 Calls on unresponsive remote filesystems can block in OS metadata APIs. Run this synchronous adapter in the existing cancellable worker/process boundary, not the UI thread; it does not promise kernel-level cancellation or recursively probe mounted volumes. Unix never opens selected filesystem objects; Windows opens existing regular files/directories with requested access zero for handle metadata only.
 
-## Verification plan after the coordinator releases the lane
+## Validation and remaining platform checks
 
-Run the focused target with the repository's pinned toolchain/native SDK environment and Cargo jobs at most four:
+On the coordinator-authorized lane, a standalone crate used the exact repository direct dependency pins (`serde 1.0.229`, `uuid 1.26.0`, `libc 0.2.189`, `serde_json 1.0.151`, `tempfile 3.27.0`) and Rust 1.98.0, with this module and test source linked directly into it. Nine normal tests passed; the explicit disposable-volume test also passed. Clippy with `-D warnings` passed. No image SDK was rebuilt. For the eventual integrated repository check, use its configured native SDK environment and Cargo jobs at most four:
 
 ```
 cargo test --locked --test storage_volume
@@ -43,7 +43,11 @@ cargo clippy --locked --test storage_volume -- -D warnings
 
 The normal tests create only temporary synthetic files/directories. They cover lossless native-path JSON, logical ID persistence, ambiguous/missing identities, incomplete snapshots, malformed/bounded Linux tables, Linux bind-root mapping, Windows GUID parsing including unpaired surrogates, traversal rejection, existing/missing path separation, symlink mapping, special-node rejection, and unchanged file bytes/directory contents. The read-only live fixture hook is ignored by default.
 
-The coordinator should create a **new disposable** local APFS disk image outside Git, mount it at an explicitly owned temporary path A, and put a tiny generated file/folder there. Run the ignored hook with `PHOTOCATALOG_VOLUME_FIXTURE` pointing inside that image and save its JSON receipt outside Git. Detach only that disposable device, confirm the former selected path is missing, then attach the same image at a different owned path B. Repeat with `PHOTOCATALOG_EXPECT_VOLUME_ID` set to the first observation's UUID: the UUID and volume-relative suffix must agree while mount paths differ. Use a separate new image at A to demonstrate that the old label/path does not match. Preserve input/generated-file digests and identify the exact disposable device before every lifecycle action. Never use `/Volumes/MichaelJon` or any other pre-existing volume for detach, rename, or write operations.
+The completed local lifecycle check created two **new disposable** 128 MiB sparse APFS images under the private validation directory. It verified an unchanged source digest, stable UUID and relative path after remounting the same image from A to B, missing-path ancestor evidence while detached, and a different UUID when the replacement image occupied A. Before each detach, `hdiutil info -plist` tied the exact owned image path to the selected device and mount; both images are now detached. A home-directory probe mapped to APFS Data, reconstructed the same filesystem object, and agreed with independent `diskutil` UUID evidence. The boot-root and Data mount resource UUIDs were equal on this host; the adapter reported the two observations as ambiguous, as required.
+
+Private receipts are retained at `/Users/michael/PhotoCatalog-private-results/sc-22840-volume-j6gsgrnu/validation.json` (SHA-256 `2912866129d691dc55a8d0b571c25dd52b0779ebee4e4c183db34d2f32d6142c`) and `disposable-lifecycle.json` (SHA-256 `42167aa36da6c8ba5d321c04fd6841960487b6b02461ad0c467b583b7713f4b0`). These bind the source hashes, harness pins, lifecycle commands/checks, and fixture-test output without adding host UUIDs or private paths to application data.
+
+To reproduce, the coordinator should create a **new disposable** local APFS disk image outside Git, mount it at an explicitly owned temporary path A, and put a tiny generated file/folder there. Run the ignored hook with `PHOTOCATALOG_VOLUME_FIXTURE` pointing inside that image and save its JSON receipt outside Git. Detach only that disposable device, confirm the former selected path is missing, then attach the same image at a different owned path B. Repeat with `PHOTOCATALOG_EXPECT_VOLUME_ID` set to the first observation's UUID: the UUID and volume-relative suffix must agree while mount paths differ. Use a separate new image at A to demonstrate that the old label/path does not match. Preserve input/generated-file digests and identify the exact disposable device before every lifecycle action. Never use `/Volumes/MichaelJon` or any other pre-existing volume for detach, rename, or write operations.
 
 ```
 PHOTOCATALOG_VOLUME_FIXTURE=<existing-disposable-path> \
@@ -59,4 +63,4 @@ Separately inspect an existing disposable directory under the macOS user's home 
 - Microsoft's [mount-path enumeration](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumepathnamesforvolumenamew), [handle path lookup](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew), and [128-bit file identity](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_info) define the Windows evidence used here.
 - Linux [mountinfo](https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html) defines mount roots, device pairs, escaping, and reusable mount IDs. systemd's [persistent storage udev rules](https://github.com/systemd/systemd/blob/main/rules.d/60-persistent-storage.rules.in) establish `disk/by-uuid` links from filesystem UUID properties.
 
-Confidence: medium before platform execution. The API separation and pure fixture coverage are explicit, but native ABI/linkage and disposable remount/firmlink behavior require the pending validation above.
+Confidence: high for the tested macOS read-only identity, firmlink, and disposable remount behavior; medium for cross-platform behavior until native Windows/Linux CI and the parent catalog integration pass. Snapshot/race and missing-identity limits above remain part of the API contract.
