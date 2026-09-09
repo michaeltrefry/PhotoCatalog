@@ -379,6 +379,48 @@ def source_state(source):
     return {"main": info(source), "companions": companions}
 
 
+def preserve_schema5_ancestry(args, old_manifest_path, fixture):
+    """Copy the reviewed 4->5 proof bytes before a new 5->5 verification.
+
+    This protocol accepts the direct v3 migration lineage, not an invented new
+    migration. Original proof/native receipt paths inside those bytes stay intact.
+    """
+    def evidence(path):
+        path = pathlib.Path(path)
+        assert path.resolve().is_relative_to(old_manifest_path.parent.resolve()), "ancestry escapes prior campaign"
+        st = path.lstat()
+        assert stat.S_ISREG(st.st_mode) and st.st_size <= 1024**2, "invalid/oversized ancestry receipt"
+        payload = path.read_bytes()
+        return payload, json.loads(payload)
+    proof_bytes, proof = evidence(fixture["migration_proof"])
+    native_bytes, native = evidence(proof["native_receipt"])
+    assert hashlib.sha256(native_bytes).hexdigest() == proof["native_receipt_sha256"], "ancestor native receipt changed"
+    assert proof["schema_before"] == native["schema_before"] == 4 and proof["schema_after"] == native["schema_after"] == fixture["schema"] == 5
+    assert proof["owned_copy_before_sha256"] == fixture["source_main_sha256"]
+    assert proof["owned_copy_after_sha256"] == fixture["main_sha256"], "ancestor physical output differs from selected source"
+    assert proof["owned_copy_before_sha256"] != proof["owned_copy_after_sha256"]
+    assert native["protocol"] == PROTOCOL and native["complete"] is True and native["mode"] == "migrate_fixture" and native["count"] == fixture["count"]
+    assert native["engine_version"] == "3.51.1" and proof["observer"]["exit_code"] == 0 and proof["observer"]["error"] is None
+    assert proof["index_sql"] == native["index_sql"] == "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
+    logical = native["logical_before"]
+    assert logical == native["logical_after"] == proof["logical_before"] == proof["logical_after"]
+    assert len(logical) == 64 and all(c in "0123456789abcdef" for c in logical)
+    tables = native["table_counts_before"]
+    assert tables and tables == native["table_counts_after"] == proof["table_counts_before"] == proof["table_counts_after"]
+    assert len(dict(tables)) == len(tables) and all(isinstance(name,str) and type(n) is int and n >= 0 for name,n in tables)
+    assert dict(tables)["assets"] == dict(tables)["organization_assets"] == dict(tables)["organization_text"] == fixture["count"]
+    directory = args.root / f"ancestry-{fixture['count']}"
+    directory.mkdir()
+    for name, payload in [("migration-proof.json", proof_bytes), ("native.json", native_bytes)]:
+        with (directory/name).open("xb") as output:
+            output.write(payload); output.flush(); os.fsync(output.fileno())
+    return {"proof": str(directory/"migration-proof.json"), "proof_sha256": hashlib.sha256(proof_bytes).hexdigest(),
+            "native": str(directory/"native.json"), "native_sha256": hashlib.sha256(native_bytes).hexdigest(),
+            "source_proof": fixture["migration_proof"], "source_native": proof["native_receipt"],
+            "schema4_main_sha256": proof["owned_copy_before_sha256"], "schema5_main_sha256": proof["owned_copy_after_sha256"],
+            "logical_identity": logical, "table_counts": tables, "index_sql": native["index_sql"]}
+
+
 def copied_fixture(args, old_manifest_path, fixture):
     source = pathlib.Path(fixture["catalog"]) / "catalog.sqlite3"
     for preserved in (old_manifest_path.parent.resolve(), source.parent.resolve()):
@@ -393,6 +435,7 @@ def copied_fixture(args, old_manifest_path, fixture):
     source_schema = int.from_bytes(header[60:64], "big")
     assert source_schema in (4, 5), "source schema is not 4 or 5"
     assert int.from_bytes(header[68:72], "big") == 0x50484341, "source is not PhotoCatalog"
+    ancestry = preserve_schema5_ancestry(args, old_manifest_path, fixture) if source_schema == 5 else None
     before_hash = sha(source)
     assert before_hash == fixture["main_sha256"], "source main changed"
     prepare = old_manifest_path.parent / f"prepare-{fixture['count']}.json"
@@ -425,7 +468,8 @@ def copied_fixture(args, old_manifest_path, fixture):
              "copy_sha256": copy_hash, "schema": source_schema, "application_id": 0x50484341,
              "prepare_receipt_sha256": fixture["prepare_receipt_sha256"]}
     save(args.root / f"reuse-{fixture['count']}.json", proof)
-    return {**fixture, "catalog": str(catalog.resolve()), "reuse_proof": str(args.root / f"reuse-{fixture['count']}.json")}
+    return {**fixture, "catalog": str(catalog.resolve()), "source_schema": source_schema,
+            "prior_migration": ancestry, "reuse_proof": str(args.root / f"reuse-{fixture['count']}.json")}
 
 
 def migrate_reused_fixture(args, fixture):
@@ -438,13 +482,18 @@ def migrate_reused_fixture(args, fixture):
     native = json.loads(receipt.read_text())
     assert observer["exit_code"] == 0 and observer["error"] is None
     assert native["protocol"] == PROTOCOL and native["complete"] is True and native["mode"] == "migrate_fixture"
-    assert native["count"] == fixture["count"] and native["schema_before"] in (4,5) and native["schema_after"] == 5
+    assert native["count"] == fixture["count"] and native["schema_before"] == fixture["source_schema"] and native["schema_after"] == 5
     assert native["engine_version"] == "3.51.1"
     assert native["logical_before"] == native["logical_after"] and len(native["logical_before"]) == 64
     assert native["table_counts_before"] == native["table_counts_after"] and native["table_counts_before"]
     assert native["index_sql"] == "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
     after = sha(main)
+    if native["schema_before"] == 5:
+        ancestor = fixture["prior_migration"]
+        assert before == after == ancestor["schema5_main_sha256"], "schema5 verification changed physical bytes"
+        assert native["logical_before"] == ancestor["logical_identity"] and native["table_counts_before"] == ancestor["table_counts"], "schema5 content differs from ancestor"
     proof = {"owned_copy_before_sha256":before,"owned_copy_after_sha256":after,
+             "kind":"schema5_verification" if native["schema_before"] == 5 else "schema4_to_5_migration",
              "schema_before":native["schema_before"],"schema_after":5,"native_receipt":str(receipt),
              "native_receipt_sha256":sha(receipt),"observer":observer,
              "logical_before":native["logical_before"],"logical_after":native["logical_after"],

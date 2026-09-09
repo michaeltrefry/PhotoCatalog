@@ -140,6 +140,59 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(campaign.sha(args.root/"prepare-1000.json"),fixture["prepare_receipt_sha256"])
             with self.assertRaises(FileExistsError):campaign.prepare_reuse(args,[1000])
 
+    def schema5_reusable(self, base):
+        args,fixture,main=self.reusable(base)
+        schema4=fixture['main_sha256']
+        header=bytearray(main.read_bytes());header[60:64]=(5).to_bytes(4,'big');main.write_bytes(header)
+        fixture.update(schema=5,source_main_sha256=schema4,main_sha256=campaign.sha(main))
+        tables=[['assets',1000],['organization_assets',1000],['organization_text',1000],['organization_text_idx',12]]
+        native=dict(protocol=1,complete=True,mode='migrate_fixture',count=1000,engine_version='3.51.1',schema_before=4,schema_after=5,
+                    logical_before='a'*64,logical_after='a'*64,table_counts_before=tables,table_counts_after=tables,
+                    index_sql='CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)')
+        native_path=args.reuse_prepared.parent/'migrate-1000.json';campaign.save(native_path,native)
+        proof={k:native[k] for k in ['schema_before','schema_after','logical_before','logical_after','table_counts_before','table_counts_after','index_sql']}
+        proof.update(owned_copy_before_sha256=schema4,owned_copy_after_sha256=fixture['main_sha256'],native_receipt=str(native_path),
+                     native_receipt_sha256=campaign.sha(native_path),observer=dict(exit_code=0,error=None))
+        proof_path=args.reuse_prepared.parent/'migration-proof-1000.json';campaign.save(proof_path,proof)
+        fixture['migration_proof']=str(proof_path);args.binary=pathlib.Path('unused-binary')
+        return args,fixture,main,native
+
+    def test_schema5_reuse_retains_ancestor_bytes_and_checks_noop_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args,fixture,main,native=self.schema5_reusable(pathlib.Path(directory))
+            before=campaign.source_state(main)
+            copied=campaign.copied_fixture(args,args.reuse_prepared,fixture)
+            ancestor=copied['prior_migration']
+            self.assertEqual(pathlib.Path(ancestor['proof']).read_bytes(),pathlib.Path(fixture['migration_proof']).read_bytes())
+            self.assertEqual(campaign.sha(ancestor['native']),ancestor['native_sha256'])
+            native['schema_before']=5
+            def child(binary,catalog,output,argv,timeout):
+                self.assertEqual(argv,['migrate-fixture']);campaign.save(output,native)
+                return dict(exit_code=0,error=None)
+            with mock.patch.object(campaign,'run_child',side_effect=child):
+                result=campaign.migrate_reused_fixture(args,copied)
+            proof=json.loads(pathlib.Path(result['migration_proof']).read_text())
+            self.assertEqual(proof['kind'],'schema5_verification')
+            self.assertEqual(proof['owned_copy_before_sha256'],proof['owned_copy_after_sha256'])
+            self.assertEqual(result['prior_migration'],ancestor)
+            self.assertNotEqual(ancestor['schema4_main_sha256'],result['main_sha256'])
+            self.assertEqual(campaign.source_state(main),before)
+            with self.assertRaises(FileExistsError):campaign.preserve_schema5_ancestry(args,args.reuse_prepared,fixture)
+
+    def test_schema5_ancestry_rejects_changed_native_index_logical_or_physical_claim(self):
+        for failure in ['native_bytes','index','logical','physical','schema']:
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as directory:
+                args,fixture,main,native=self.schema5_reusable(pathlib.Path(directory))
+                proof_path=pathlib.Path(fixture['migration_proof']);proof=json.loads(proof_path.read_text())
+                if failure=='native_bytes':pathlib.Path(proof['native_receipt']).write_text('{}')
+                elif failure=='index':proof['index_sql']='CREATE INDEX wrong ON assets(id)'
+                elif failure=='logical':proof['logical_after']='b'*64
+                elif failure=='physical':proof['owned_copy_after_sha256']='b'*64
+                else:proof['schema_before']=5
+                proof_path.write_text(json.dumps(proof))
+                with self.assertRaises(AssertionError):campaign.preserve_schema5_ancestry(args,args.reuse_prepared,fixture)
+                self.assertFalse((args.root/'ancestry-1000').exists())
+
     def test_reuse_rejects_dirty_wrong_schema_changed_source_or_prepare_counts(self):
         for failure in ("wal","schema","hash","counts","overlap"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:

@@ -63,3 +63,15 @@ behind a held admission, prove FIFO/foreground ordering through committed histor
 and verify rollback, unwind, recursive rejection, distinct catalogs, current-schema
 open/read behavior, stable revisions and source-byte preservation. Native test and
 measurement results must be recorded separately after the coordinated lane opens.
+
+
+For v4 preparation, existing frozen v3 schema5 fixtures may be reused only with
+their direct verified schema4-to-5 migration ancestry. The driver copies the
+original migration proof and its digest-bound native receipt byte-for-byte into
+a separate ancestry directory; internal original paths remain intact. It checks
+prior schema, exact index, logical/table identities and the prior physical output
+against the selected source main. A fresh owned-copy verification then proves
+schema5-to-5 with unchanged physical bytes and the same logical/table identities.
+The new proof is explicitly labeled schema5 verification; it never replaces or
+relabels the original migration evidence. Source catalogs/companions stay untouched,
+and no query samples, fixture formulas or indexes are regenerated.
