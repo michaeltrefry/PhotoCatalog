@@ -223,9 +223,10 @@ def duck_query(db, sql, parameters, profile_path):
     require(not profile_path.exists(), "profile output exists")
     # The parent output directory was created exclusively. Only this query is profiled.
     quoted = str(profile_path).replace("'", "''")
+    # DuckDB validates the output suffix against the current profiling format.
+    db.execute("SET enable_profiling='json'")
     db.execute(f"SET profiling_output='{quoted}'")
     db.execute("SET custom_profiling_settings='{" + ','.join(f'"{key}":"true"' for key in ("QUERY_NAME", "ROWS_RETURNED", "CUMULATIVE_ROWS_SCANNED", "OPERATOR_NAME", "OPERATOR_ROWS_SCANNED", "OPERATOR_CARDINALITY", "EXTRA_INFO")) + "}'")
-    db.execute("SET enable_profiling='json'")
     try:
         rows = db.execute(sql, parameters).fetchall()
     finally:

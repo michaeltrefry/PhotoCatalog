@@ -18,7 +18,7 @@ The full database hash, size, modification time and inode are compared again aft
 
 ## Deferred verification and run plan
 
-Code and tests were prepared while the controlled benchmark owned the reference Mac. They have **not been executed**. No scale query-work result is claimed. After the coordinator releases the lane:
+The six diagnostic tests and all 21 benchmark contract tests passed in the existing Python environment after the coordinator released the small-test lane. This verified native SQLite access, real DuckDB JSON metrics, settings readback, source preservation, and rejected evidence. A real DuckDB setup failure was repaired by enabling JSON profiling before assigning a `.json` output path. `operator_type` is emitted automatically and was checked on every operator by the strict validator. No scale query-work result is claimed. After the coordinator authorizes scale execution:
 
 1. Run the six small diagnostic tests first in the existing Python environment:
 
