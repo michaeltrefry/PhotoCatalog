@@ -137,6 +137,9 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test library and CLI, including restart and recovery
         run: cargo test --locked --all-targets
+      - name: Validate native same-device file bind mount cache boundary (Linux)
+        if: runner.os == 'Linux'
+        run: python scripts/validate_linux_bind_mount.py
       - name: Build CLI and full-resolution validation probe
         run: cargo build --locked --bins --examples
       - name: Validate public CC0 Canon and Panasonic RAW originals
