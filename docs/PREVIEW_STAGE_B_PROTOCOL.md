@@ -85,9 +85,16 @@ No historical source, reference or blind judgment is rewritten. These additional
 quality preparations do not run inside the native memory measurement child.
 
 Flat versus two-level prefix layout uses 10,000 and 100,000 distinct logical
-asset/revision keys. Reusing the 30 selected payloads does not deduplicate distinct
-keys or files. Assert actual distinct keys, files and directory entries, and
-separately report the 30-payload diversity. Record payload bytes, file allocation,
+asset/revision keys and genuinely byte-distinct valid JPEG objects. For each
+synthetic entry, insert one JPEG COM segment immediately after SOI, carrying the
+fixed ASCII prefix `photocatalog-layout-v1:` and its zero-padded 10-digit entry
+number. The 30 selected JPEG80 payloads are used round-robin; this lossless metadata
+construction changes encoded bytes/content hashes while preserving decoded RGB8.
+Verify decoded equality against the corresponding selected source payload, and
+assert distinct content hashes, keys, actual files and directory entries. The
+same entry number and source payload produce identical bytes in both layouts.
+Report the constant 37-byte marker overhead per object separately and disclose
+the 30-image pixel diversity. No content-hash deduplication is enabled. Record payload bytes, file allocation,
 directory allocation/count, manifest/index/WAL/lock/marker overhead. The fixed
 three sequential and three seeded random passes include read/checksum and preserve
 first-pass versus later OS-cache state. This fixture construction cannot forecast
