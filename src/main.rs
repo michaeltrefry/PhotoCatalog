@@ -1,6 +1,10 @@
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
-use photocatalog::Catalog;
+use photocatalog::{
+    Catalog,
+    catalog_storage::{PathReference, RelinkScope},
+    storage_volume::{self, NativePath},
+};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -15,6 +19,86 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect mounted-volume identities and ambiguity without changing originals.
+    StorageVolumes,
+    StorageLocate {
+        path: PathBuf,
+    },
+    StorageStatus {
+        id: String,
+    },
+    /// Start a reviewed folder/root remap, even while its old location is online.
+    RelinkFolder {
+        from: PathBuf,
+        #[arg(required = true)]
+        destinations: Vec<PathBuf>,
+    },
+    RelinkOriginal {
+        id: String,
+        #[arg(required = true)]
+        destinations: Vec<PathBuf>,
+    },
+    /// Start an explicit native/legacy/volume request from a bounded JSON file.
+    RelinkPlan {
+        request: PathBuf,
+    },
+    RelinkPlans {
+        #[arg(long, default_value = "")]
+        after: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    RelinkShow {
+        plan: String,
+    },
+    RelinkPrepare {
+        plan: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    RelinkItems {
+        plan: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    RelinkSources {
+        plan: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Set per-original destinations before preparing that item.
+    RelinkCandidates {
+        plan: String,
+        id: String,
+        #[arg(required = true)]
+        destinations: Vec<PathBuf>,
+    },
+    RelinkSourceCandidates {
+        plan: String,
+        source: i64,
+        #[arg(required = true)]
+        destinations: Vec<PathBuf>,
+    },
+    RelinkExclude {
+        plan: String,
+        sequence: i64,
+    },
+    RelinkExcludeSource {
+        plan: String,
+        source: i64,
+    },
+    /// Commit only a fully prepared, resolved plan; original files are never moved.
+    RelinkApply {
+        plan: String,
+    },
+    /// Atomically restore catalog paths if no conflicting changes occurred.
+    RelinkUndo {
+        plan: String,
+    },
     /// Import supported photos recursively; originals are read only. Repeat to resume.
     Import {
         folder: PathBuf,
@@ -106,6 +190,68 @@ fn main() -> Result<()> {
         _ => Catalog::open(&cli.catalog)?,
     };
     match cli.command {
+        Command::StorageVolumes => print_json(&storage_volume::mounted_volumes()?)?,
+        Command::StorageLocate { path } => print_json(&storage_volume::locate(&path))?,
+        Command::StorageStatus { id } => {
+            print_json(&catalog.storage_status(&id, &storage_volume::mounted_volumes()?)?)?
+        }
+        Command::RelinkFolder { from, destinations } => {
+            print_json(&catalog.begin_relink(RelinkScope::Prefix {
+                from: PathReference::native(&from),
+                destinations: native_paths(destinations),
+            })?)?
+        }
+        Command::RelinkOriginal { id, destinations } => {
+            print_json(&catalog.begin_relink(RelinkScope::Asset {
+                asset_id: id,
+                destinations: native_paths(destinations),
+            })?)?
+        }
+        Command::RelinkPlan { request } => {
+            let mut bytes = Vec::new();
+            std::fs::File::open(request)?
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 1024 * 1024, "relink request exceeds 1 MiB");
+            print_json(&catalog.begin_relink(serde_json::from_slice(&bytes)?)?)?;
+        }
+        Command::RelinkPlans { after, limit } => print_json(&catalog.relink_plans(&after, limit)?)?,
+        Command::RelinkShow { plan } => print_json(&catalog.relink_plan(&plan)?)?,
+        Command::RelinkPrepare { plan, limit } => {
+            print_json(&catalog.prepare_relink_batch(&plan, limit)?)?
+        }
+        Command::RelinkItems { plan, after, limit } => {
+            print_json(&catalog.relink_items(&plan, after, limit)?)?
+        }
+        Command::RelinkSources { plan, after, limit } => {
+            print_json(&catalog.relink_sources(&plan, after, limit)?)?
+        }
+        Command::RelinkCandidates {
+            plan,
+            id,
+            destinations,
+        } => {
+            catalog.set_relink_candidates(&plan, &id, native_paths(destinations))?;
+            print_json(&catalog.relink_plan(&plan)?)?;
+        }
+        Command::RelinkSourceCandidates {
+            plan,
+            source,
+            destinations,
+        } => {
+            catalog.set_relink_source_candidates(&plan, source, native_paths(destinations))?;
+            print_json(&catalog.relink_plan(&plan)?)?;
+        }
+        Command::RelinkExclude { plan, sequence } => {
+            catalog.exclude_relink_item(&plan, sequence)?;
+            print_json(&catalog.relink_plan(&plan)?)?;
+        }
+        Command::RelinkExcludeSource { plan, source } => {
+            catalog.exclude_relink_source(&plan, source)?;
+            print_json(&catalog.relink_plan(&plan)?)?;
+        }
+        Command::RelinkApply { plan } => print_json(&catalog.apply_relink(&plan)?)?,
+        Command::RelinkUndo { plan } => print_json(&catalog.undo_relink(&plan)?)?,
         Command::Import { folder, max_files } => {
             let report = catalog.import(folder, max_files, |_| Ok(()))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -203,4 +349,7 @@ fn main() -> Result<()> {
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+fn native_paths(paths: Vec<PathBuf>) -> Vec<NativePath> {
+    paths.iter().map(|p| NativePath::from_path(p)).collect()
 }

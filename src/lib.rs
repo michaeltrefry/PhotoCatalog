@@ -1,5 +1,6 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 pub mod catalog_metadata;
+mod import_storage;
 pub mod media;
 pub mod metadata_export;
 pub mod xmp;
@@ -146,6 +147,7 @@ impl Catalog {
         self.begin_metadata_scan()?;
         let mut report = ImportReport::default();
         let mut processed = 0;
+        let mut volumes = import_storage::ImportVolumes::new();
         for entry in walkdir::WalkDir::new(&folder)
             .follow_links(false)
             .max_open(16)
@@ -183,6 +185,8 @@ impl Catalog {
                     continue;
                 }
             };
+            let observation = volumes.observe(path)?;
+            self.reconnect_storage_asset(path, &observation, &fingerprint, volumes.snapshot())?;
             let existing: Option<(String, String, Option<String>)> = self
                 .db
                 .query_row(
@@ -202,6 +206,7 @@ impl Catalog {
                 && state == "ready"
                 && self.read_preview_hash(&hash).is_ok()
             {
+                self.bind_import_storage(path, &observation)?;
                 let (changed, warnings) = self.refresh_metadata(path, false)?;
                 report.metadata_updated += u64::from(changed);
                 report.metadata_warnings += warnings as u64;
@@ -209,6 +214,7 @@ impl Catalog {
                 continue;
             }
             self.reserve(path, &location)?;
+            self.bind_import_storage(path, &observation)?;
             observer(ImportEvent::Reserved)?;
             let (changed, warnings) = self.refresh_metadata(path, true)?;
             report.metadata_updated += u64::from(changed);
@@ -246,6 +252,21 @@ impl Catalog {
             report.imported += 1;
         }
         Ok(report)
+    }
+    fn bind_import_storage(
+        &mut self,
+        path: &Path,
+        observation: &storage_volume::VolumeLocation,
+    ) -> Result<()> {
+        if observation.state == storage_volume::LocationState::Available {
+            let asset: String = self.db.query_row(
+                "SELECT id FROM assets WHERE location=?1",
+                [location_bytes(path)],
+                |row| row.get(0),
+            )?;
+            self.bind_storage(&asset, observation)?;
+        }
+        Ok(())
     }
     fn reserve(&self, path: &Path, location: &[u8]) -> Result<()> {
         self.db.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;

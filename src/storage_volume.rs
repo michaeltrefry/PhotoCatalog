@@ -405,7 +405,7 @@ fn existing_ancestor(path: &Path) -> Option<ExistingAncestor> {
     }
     None
 }
-fn object_key(_path: &Path, metadata: &fs::Metadata) -> io::Result<(u64, u128)> {
+pub(crate) fn object_key(_path: &Path, metadata: &fs::Metadata) -> io::Result<(u64, u128)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
