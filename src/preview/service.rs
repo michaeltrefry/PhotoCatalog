@@ -613,8 +613,11 @@ impl PreviewService {
         if self.store.relocation_pending()? {
             return Ok(());
         }
-        while self.encoded.used() + self.limits.per_worker_encoded_bytes
-            <= self.limits.encoded_staging_bytes / 2
+        while self
+            .encoded
+            .used()
+            .checked_add(self.limits.per_worker_encoded_bytes)
+            .is_some_and(|used| used <= self.limits.encoded_staging_bytes / 2)
         {
             let Some(lease) = self.scheduler.next_ready()? else {
                 break;

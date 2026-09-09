@@ -29,7 +29,7 @@ fn image(path: &Path, color: [u8; 3]) {
         .unwrap();
 }
 #[test]
-fn held_encoded_export_reports_resource_pressure_then_read_recovers() {
+fn held_export_with_maximum_staging_limit_blocks_worker_without_overflow_then_recovers() {
     let root = tempfile::tempdir().unwrap();
     let originals = root.path().join("originals");
     std::fs::create_dir(&originals).unwrap();
@@ -38,7 +38,10 @@ fn held_encoded_export_reports_resource_pressure_then_read_recovers() {
     let mut previews = service(
         &root.path().join("cache"),
         &originals,
-        ServiceLimits::default(),
+        ServiceLimits {
+            encoded_staging_bytes: u64::MAX,
+            ..ServiceLimits::default()
+        },
     );
     catalog
         .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
@@ -48,6 +51,13 @@ fn held_encoded_export_reports_resource_pressure_then_read_recovers() {
         .encoded_cached(&catalog, &asset.id, Tier::Thumbnail, false)
         .unwrap()
         .unwrap();
+    // The held export reserves the remaining allowance, not a giant allocation.
+    let native = previews
+        .request(&mut catalog, &asset.id, Tier::Large, Priority::Background)
+        .unwrap();
+    previews.tick(&mut catalog).unwrap();
+    assert_eq!(previews.scheduler_usage().active, 0);
+    assert_eq!(previews.scheduler_usage().queued, 1);
     let objects = previews.store_usage().unwrap().objects;
     let request = previews
         .queue_read(
@@ -85,6 +95,10 @@ fn held_encoded_export_reports_resource_pressure_then_read_recovers() {
     assert!(matches!(
         previews.take_read(retry).unwrap().outcome,
         ReadOutcome::Ready(_)
+    ));
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, native),
+        ServiceCompletion::Ready
     ));
     assert!(previews.is_drained());
 }
