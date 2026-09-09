@@ -16,8 +16,15 @@ import time
 import signal
 import datetime
 import psutil
+import os
+import stat
 
-PROTOCOL = 1
+PROTOCOL = 1  # Frozen fixture/native row protocol.
+DRIVER_PROTOCOL = 2
+TEXT_LIMITS = {"document_bytes": 1024**2, "page_bytes": 8 * 1024**2}
+LOCAL_TEXT_CASES = {"filename-reverse", "mixed", "text-capture"}
+DIAGNOSTIC_CASES = ["filename-reverse", "text"]
+DIAGNOSTIC_SCALES = [1_000_000, 10_000_000]
 SCALES = [1_000_000, 5_000_000, 10_000_000]
 CASES = ["browse", "rating", "rating-sort", "capture-rating", "filename-reverse", "keyword",
          "wide-keyword", "collection", "mixed", "text", "text-capture", "camera-lens",
@@ -159,6 +166,27 @@ def expected_sequences(case, count, anchor):
                 break
     return result
 
+def validate_text_work(chunk, local_text):
+    work = chunk["text_work"]
+    assert set(work) == {"candidate_rows_read", "indexed_rows", "indexed_bytes", "batches", "vm_steps", "sorts", "admission_limited"}
+    for name in ("candidate_rows_read", "indexed_rows", "indexed_bytes", "batches", "vm_steps", "sorts"):
+        assert type(work[name]) is int and work[name] >= 0
+    # Frozen fixture documents are 11 or 14 UTF-8 bytes. Even 4096 candidates
+    # cannot reach the default byte limit; unexpected admission is a failure.
+    assert work["admission_limited"] is False
+    assert work["candidate_rows_read"] == chunk["scanned"]
+    assert work["sorts"] == 0 and chunk["vm_steps"] >= work["vm_steps"]
+    if local_text:
+        assert work["vm_steps"] > 0
+        assert 0 <= work["indexed_rows"] <= chunk["scanned"]
+        assert work["indexed_rows"] >= chunk["returned"]
+        assert work["batches"] <= work["indexed_rows"] <= 128 * work["batches"]
+        assert 11 * work["indexed_rows"] <= work["indexed_bytes"] <= 14 * work["indexed_rows"]
+        assert work["indexed_bytes"] <= TEXT_LIMITS["page_bytes"]
+    else:
+        assert all(work[k] == 0 for k in ("indexed_rows", "indexed_bytes", "batches", "vm_steps", "sorts"))
+
+
 def validate_receipt(receipt, observer, case, count, repetitions, warmups, start):
     """Fail closed on errors, truncated workloads, missing memory, or false pages."""
     assert observer["exit_code"] == 0 and observer["error"] is None
@@ -170,6 +198,9 @@ def validate_receipt(receipt, observer, case, count, repetitions, warmups, start
     assert receipt["errors"] == [] and receipt["plans"] and all(isinstance(p, str) for p in receipt["plans"])
     assert receipt["settings"]["diagnostic_shared_helper_connection"] == SETTINGS
     assert receipt["engine_version"] == "3.51.1"
+    assert receipt["text_limits"] == TEXT_LIMITS
+    virtual_plans = [p for p in receipt["plans"] if "VIRTUAL TABLE" in p]
+    assert len(virtual_plans) == (1 if case == "text" else 0)
     assert finite(receipt["open_ms"])
     assert len(receipt["samples"]) == repetitions and len(receipt["warmup_samples"]) == warmups
     for index, sample in enumerate(receipt["samples"]):
@@ -200,9 +231,13 @@ def validate_receipt(receipt, observer, case, count, repetitions, warmups, start
         if len(rows) < 200:
             assert chunks[-1]["exhausted"] is True
         assert sum(c["returned"] for c in chunks) == len(rows)
+        assert sum(c["elapsed_ms"] for c in chunks) <= sample["elapsed_ms"] + .001
         for chunk in chunks:
             assert type(chunk["scanned"]) is int and 0 <= chunk["returned"] <= chunk["scanned"] <= 4096
             assert finite(chunk["vm_steps"]) and chunk["sorts"] == 0 and finite(chunk["elapsed_ms"])
+            validate_text_work(chunk, case in LOCAL_TEXT_CASES)
+            if case == "filename-reverse":
+                assert chunk["text_work"]["indexed_rows"] == chunk["scanned"]
             if not chunk["exhausted"]:
                 assert chunk["cursor"] is not None and chunk["has_more"] is True
     return distribution([s["elapsed_ms"] for s in receipt["samples"]])
@@ -227,6 +262,7 @@ def validate_transitions(data, observer, count, repetitions):
         assert source["revision_before"]==i//100 and source["revision_after"]==i//100+1 and source["models"]
         page=browse["page"]
         assert page["sorts"]==0 and page["scanned"]==200 and page["page_complete"] is True
+        validate_text_work(page, False)
         assert [row["sequence"] for row in page["rows"]]==list(range(i*200+1,(i+1)*200+1))
         assert all(row_valid(row) for row in page["rows"])
     assert len(data["reopened"])==min(repetitions,100)
@@ -287,15 +323,147 @@ def run_transitions(args, manifest):
         raise SystemExit("transition gates failed; evidence retained")
 
 
+def source_state(source):
+    """Filesystem-only evidence: never open the preserved source with SQLite."""
+    def info(path):
+        st = path.lstat()
+        assert stat.S_ISREG(st.st_mode), "source/companion must be a regular file"
+        return {"size": st.st_size, "device": st.st_dev, "inode": st.st_ino,
+                "mtime_ns": st.st_mtime_ns, "ctime_ns": st.st_ctime_ns}
+    companions = {}
+    for path in source.parent.glob(source.name + "-*"):
+        assert path.name in {source.name + suffix for suffix in ("-wal", "-shm", "-journal")}, "unexpected source companion"
+        item = info(path)
+        if path.name.endswith(("-wal", "-journal")):
+            assert item["size"] == 0, "uncheckpointed source"
+        else:
+            assert item["size"] <= 64 * 1024, "unexpected SHM size"
+        item["sha256"] = sha(path)
+        companions[path.name] = item
+    return {"main": info(source), "companions": companions}
+
+
+def copied_fixture(args, old_manifest_path, fixture):
+    source = pathlib.Path(fixture["catalog"]) / "catalog.sqlite3"
+    for preserved in (old_manifest_path.parent.resolve(), source.parent.resolve()):
+        target = args.root.resolve()
+        assert target != preserved and not target.is_relative_to(preserved) and not preserved.is_relative_to(target), "reuse destination overlaps preserved evidence"
+    before = source_state(source)
+    assert before["main"]["size"] == fixture["main_bytes"]
+    assert shutil.disk_usage(args.root).free >= fixture["main_bytes"] + 1024**3
+    with source.open("rb") as stream:
+        header = stream.read(100)
+    assert header[:16] == b"SQLite format 3\0"
+    assert int.from_bytes(header[60:64], "big") == 4, "source schema is not 4"
+    assert int.from_bytes(header[68:72], "big") == 0x50484341, "source is not PhotoCatalog"
+    before_hash = sha(source)
+    assert before_hash == fixture["main_sha256"], "source main changed"
+    prepare = old_manifest_path.parent / f"prepare-{fixture['count']}.json"
+    assert sha(prepare) == fixture["prepare_receipt_sha256"]
+    data = json.loads(prepare.read_text())
+    assert data["protocol"] == PROTOCOL and data["complete"] is True and data["mode"] == "prepare" and data["count"] == fixture["count"]
+    expected_counts = {name: fixture["count"] * multiplier for name, multiplier in
+                       (("assets",1),("organization_assets",1),("organization_keyword_members",4),("organization_folder_members",2),("organization_text",1))}
+    assert len(data["counts"]) == 5 and dict(data["counts"]) == expected_counts
+    assert data["engine_version"] == "3.51.1" and data["settings"]["diagnostic_shared_helper_connection"] == SETTINGS
+    catalog = args.root / f"catalog-{fixture['count']}"
+    catalog.mkdir()
+    target = catalog / "catalog.sqlite3"
+    # Exclusive output, ordinary complete copy; no source SQLite connection,
+    # checkpoint, journal deletion, or source permission change is allowed.
+    with source.open("rb") as incoming, target.open("xb") as outgoing:
+        shutil.copyfileobj(incoming, outgoing, 4 * 1024**2)
+        outgoing.flush()
+        os.fsync(outgoing.fileno())
+    copy_hash, after_hash = sha(target), sha(source)
+    after = source_state(source)
+    assert copy_hash == before_hash == after_hash and before == after, "source changed while copying"
+    # Preserve exact original receipt bytes, not a new serialization identity.
+    with (args.root / prepare.name).open("xb") as output:
+        output.write(prepare.read_bytes())
+        output.flush(); os.fsync(output.fileno())
+    assert sha(args.root / prepare.name) == fixture["prepare_receipt_sha256"]
+    proof = {"source": str(source.resolve()), "source_before": before, "source_after": after,
+             "source_before_sha256": before_hash, "source_after_sha256": after_hash,
+             "copy_sha256": copy_hash, "schema": 4, "application_id": 0x50484341,
+             "prepare_receipt_sha256": fixture["prepare_receipt_sha256"]}
+    save(args.root / f"reuse-{fixture['count']}.json", proof)
+    return {**fixture, "catalog": str(catalog.resolve()), "reuse_proof": str(args.root / f"reuse-{fixture['count']}.json")}
+
+
+def prepare_reuse(args, counts):
+    old_path = args.reuse_prepared.resolve()
+    before = sha(old_path)
+    old = json.loads(old_path.read_text())
+    assert old["protocol"] == PROTOCOL and old["complete"] is True and old["scales"] == counts and old["smoke"] == args.smoke
+    assert [f["count"] for f in old["fixtures"]] == counts
+    result = {"protocol": PROTOCOL, "driver_protocol": DRIVER_PROTOCOL, "complete": False,
+              "smoke": args.smoke, "scales": counts, "fixtures": [],
+              "reuse_manifest": str(old_path), "reuse_manifest_sha256": before}
+    try:
+        for fixture in old["fixtures"]:
+            result["fixtures"].append(copied_fixture(args, old_path, fixture))
+        assert sha(old_path) == before, "preserved manifest changed"
+        result["complete"] = True
+    except Exception as error:
+        result["error"] = f"{type(error).__name__}: {error}"
+    save(args.root / "manifest.json", result)
+    if not result["complete"]:
+        raise SystemExit("reuse preparation failed; all evidence retained")
+
+
+def run_diagnostic(args, manifest):
+    destination = args.root / "diagnostic"
+    destination.mkdir()
+    scales = [1000] if args.smoke else DIAGNOSTIC_SCALES
+    result = {"driver_protocol": DRIVER_PROTOCOL, "complete": False, "acceptance_evidence": False,
+              "cases": [], "errors": [], "source_proofs": [], "samples": 5, "warmups": 3,
+              "deadline_seconds": 120, "scales": scales, "case_names": DIAGNOSTIC_CASES}
+    for fixture in manifest["fixtures"]:
+        count = fixture["count"]
+        if count not in scales: continue
+        catalog = pathlib.Path(fixture["catalog"])
+        before = None
+        try:
+            before = sha(catalog / "catalog.sqlite3")
+            assert before == fixture["main_sha256"]
+            for case in DIAGNOSTIC_CASES:
+                output = destination / f"{count}-{case}.json"
+                observer = run_child(args.binary, catalog, output,
+                                     ["query", case, "--repetitions", "5", "--warmups", "3", "--start", "0"], 120)
+                try:
+                    receipt = json.loads(output.read_text())
+                    timings = validate_receipt(receipt, observer, case, count, 5, 3, 0)
+                    result["cases"].append({"count": count, "case": case, "distribution": timings,
+                                            "observer": observer, "raw": str(output)})
+                except Exception as error:
+                    result["errors"].append({"count": count, "case": case, "error": f"{type(error).__name__}: {error}", "observer": observer, "raw": str(output)})
+        except Exception as error:
+            result["errors"].append({"count": count, "error": f"{type(error).__name__}: {error}"})
+        try:
+            after = sha(catalog / "catalog.sqlite3")
+            result["source_proofs"].append({"count": count, "before": before, "after": after, "unchanged": before == after})
+            assert before == after, "diagnostic changed fixture"
+        except Exception as error:
+            result["errors"].append({"count": count, "error": f"{type(error).__name__}: {error}"})
+    result["complete"] = not result["errors"] and len(result["cases"]) == len(scales)*len(DIAGNOSTIC_CASES)
+    result["review_required"] = "Inspect all latency/counter/RSS outcomes before starting the full campaign. These five samples are diagnostic, not qualifying tails."
+    save(destination / "diagnostic.json", result)
+    if not result["complete"]:
+        raise SystemExit("bounded diagnostic failed; retained all outcomes")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, required=True)
     parser.add_argument("--root", type=pathlib.Path, required=True)
     parser.add_argument("--build-reference", type=pathlib.Path, required=True,
                         help="Root-owned build receipt with binary_sha256 and source_commit")
-    parser.add_argument("--phase", choices=["prepare", "measure", "transitions"], required=True)
+    parser.add_argument("--phase", choices=["prepare", "diagnostic", "measure", "transitions"], required=True)
     parser.add_argument("--smoke", action="store_true", help="1000-row functional run, never scale acceptance")
+    parser.add_argument("--reuse-prepared", type=pathlib.Path, help="Prepare only: copy an explicitly supplied protocol-1 pristine manifest into a new root")
     args = parser.parse_args()
+    assert args.reuse_prepared is None or args.phase == "prepare", "reuse is a preparation operation"
     if not __debug__:
         raise RuntimeError("Python optimization disables evidence assertions; run without -O")
     build = json.loads(args.build_reference.read_text())
@@ -306,10 +474,19 @@ def main():
         assert build["working_tree_dirty"] is False
     counts = [1000] if args.smoke else SCALES
     if args.phase == "prepare":
+        if args.reuse_prepared is not None:
+            old = json.loads(args.reuse_prepared.read_text())
+            target = args.root.resolve()
+            preserved_roots = [args.reuse_prepared.resolve().parent] + [pathlib.Path(f["catalog"]).resolve() for f in old["fixtures"]]
+            for preserved in preserved_roots:
+                assert target != preserved and not target.is_relative_to(preserved) and not preserved.is_relative_to(target), "new root overlaps preserved campaign/catalog"
         args.root.mkdir()  # Refuse an existing root, including partial/failed runs.
         save(args.root / "build-reference.json", build)
         save(args.root / "driver-source.json", {"sha256": sha(__file__), "source": pathlib.Path(__file__).read_text()})
-        manifest = {"protocol": PROTOCOL, "complete": False, "smoke": args.smoke, "scales": counts, "fixtures": []}
+        if args.reuse_prepared is not None:
+            prepare_reuse(args, counts)
+            return
+        manifest = {"protocol": PROTOCOL, "driver_protocol": DRIVER_PROTOCOL, "complete": False, "smoke": args.smoke, "scales": counts, "fixtures": []}
         try:
             for count in counts:
                 # Conservative explicit admission, not an estimate of actual usage.
@@ -334,12 +511,21 @@ def main():
     assert manifest["complete"] and manifest["scales"] == counts and manifest["smoke"] == args.smoke
     assert json.loads((args.root / "build-reference.json").read_text()) == build
     assert json.loads((args.root / "driver-source.json").read_text())["sha256"] == sha(__file__), "driver changed since preparation"
+    assert manifest["driver_protocol"] == DRIVER_PROTOCOL
+    assert [f["count"] for f in manifest["fixtures"]] == counts
+    if args.phase == "diagnostic":
+        run_diagnostic(args, manifest)
+        return
     if args.phase == "transitions":
         run_transitions(args, manifest)
         return
+    if not args.smoke:
+        diagnostic = json.loads((args.root / "diagnostic" / "diagnostic.json").read_text())
+        assert diagnostic["complete"] is True and diagnostic["driver_protocol"] == DRIVER_PROTOCOL and diagnostic["acceptance_evidence"] is False
+        assert diagnostic["scales"] == DIAGNOSTIC_SCALES and diagnostic["case_names"] == DIAGNOSTIC_CASES
     destination = args.root / "measurement"
     destination.mkdir()
-    result = {"protocol": PROTOCOL, "complete": False, "smoke": args.smoke, "cases": [], "source_proofs": [], "errors": []}
+    result = {"protocol": PROTOCOL, "driver_protocol": DRIVER_PROTOCOL, "complete": False, "smoke": args.smoke, "cases": [], "source_proofs": [], "errors": []}
     for fixture in manifest["fixtures"]:
         count, catalog = fixture["count"], pathlib.Path(fixture["catalog"])
         try:

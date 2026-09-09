@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use photocatalog::{
     Catalog, configure_catalog_connection,
     organization::Flag,
-    organization_search::{Cursor, Direction, Key, Query, SearchRow, Sort},
+    organization_search::{Cursor, Direction, Key, Query, SearchRow, Sort, TextLimits},
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -194,7 +194,7 @@ fn run(args: &Args) -> Result<serde_json::Value> {
         }
     }
     Ok(
-        json!({"protocol":PROTOCOL,"complete":errors.is_empty(),"errors":errors,"mode":"query","count":count,"case":case,"query":query,"repetitions":repetitions,"warmups":warmups,"start":start,"open_ms":open_ms,"settings":settings,"engine_version":rusqlite::version(),"plans":plans,"samples":samples,"warmup_samples":warmup_samples}),
+        json!({"protocol":PROTOCOL,"complete":errors.is_empty(),"errors":errors,"mode":"query","count":count,"case":case,"query":query,"repetitions":repetitions,"warmups":warmups,"start":start,"open_ms":open_ms,"settings":settings,"engine_version":rusqlite::version(),"text_limits":TextLimits::default(),"plans":plans,"samples":samples,"warmup_samples":warmup_samples}),
     )
 }
 fn measure(
