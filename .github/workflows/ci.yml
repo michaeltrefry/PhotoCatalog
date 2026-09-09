@@ -59,13 +59,24 @@ jobs:
           repository: microsoft/vcpkg
           ref: 04a9d8e5212d01ee1dd9478eadd9caade4f8b0d4
           path: .vcpkg
+      - name: Identify Windows runner image for native cache
+        if: runner.os == 'Windows'
+        id: windows-runner-image
+        shell: pwsh
+        run: |
+          foreach ($value in @($env:ImageOS, $env:ImageVersion)) {
+            if ([string]::IsNullOrWhiteSpace($value) -or $value -notmatch '^[A-Za-z0-9._-]+$') {
+              throw "Missing or invalid hosted runner image identity"
+            }
+          }
+          "image=$env:ImageOS-$env:ImageVersion" >> $env:GITHUB_OUTPUT
       - name: Restore native image libraries (Windows)
         if: runner.os == 'Windows'
         id: windows-native-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .vcpkg/installed
-          key: windows-x64-static-md-vcpkg-04a9d8e-${{ hashFiles('vcpkg.json') }}
+          key: windows-${{ steps.windows-runner-image.outputs.image }}-x64-static-md-vcpkg-04a9d8e-${{ hashFiles('vcpkg.json') }}
       - name: Install native image libraries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
