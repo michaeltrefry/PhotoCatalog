@@ -29,6 +29,66 @@ fn image(path: &Path, color: [u8; 3]) {
         .unwrap();
 }
 #[test]
+fn held_encoded_export_reports_resource_pressure_then_read_recovers() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("a.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    let mut previews = service(
+        &root.path().join("cache"),
+        &originals,
+        ServiceLimits::default(),
+    );
+    catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let held = previews
+        .encoded_cached(&catalog, &asset.id, Tier::Thumbnail, false)
+        .unwrap()
+        .unwrap();
+    let objects = previews.store_usage().unwrap().objects;
+    let request = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert_eq!(previews.tick_read(&catalog), Some(request));
+    assert!(matches!(
+        previews.take_read(request).unwrap().outcome,
+        ReadOutcome::Failed {
+            resource_limit: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        previews.store_usage().unwrap().objects,
+        objects,
+        "encoded pressure cannot invalidate retained state"
+    );
+    drop(held);
+    let retry = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert_eq!(previews.tick_read(&catalog), Some(retry));
+    assert!(matches!(
+        previews.take_read(retry).unwrap().outcome,
+        ReadOutcome::Ready(_)
+    ));
+    assert!(previews.is_drained());
+}
+#[test]
 fn retained_read_queue_prioritizes_and_shares_admission_with_native_jobs() {
     let root = tempfile::tempdir().unwrap();
     let originals = root.path().join("originals");

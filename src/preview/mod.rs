@@ -12,7 +12,8 @@ mod scheduler;
 mod store;
 pub use identity::renderer_identity;
 pub use memory::{
-    ByteBudget, ByteReservation, DecodedBudgetExceeded, DecodedCache, RetainedPixels,
+    ByteBudget, ByteReservation, DecodedBudgetExceeded, DecodedCache, EncodedBudgetExceeded,
+    RetainedPixels,
 };
 pub use scheduler::{
     Completion, Consumer, PreviewScheduler, Priority, SchedulerLimits, SchedulerUsage, WorkLease,

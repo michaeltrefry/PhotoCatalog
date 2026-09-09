@@ -622,9 +622,12 @@ impl Catalog {
         };
         let length = file.metadata()?.len();
         ensure!(
-            length <= allowance && length <= 4 * 1024 * 1024,
-            "legacy preview exceeds encoded admission"
+            length <= 4 * 1024 * 1024,
+            "legacy preview exceeds compatibility format limit"
         );
+        if length > allowance {
+            return Err(preview::EncodedBudgetExceeded.into());
+        }
         let mut bytes = vec![0; length as usize];
         file.read_exact(&mut bytes)?;
         let mut extra = [0];

@@ -337,7 +337,7 @@ impl PreviewService {
         let _reservation = self
             .encoded
             .try_reserve(allowance)
-            .context("encoded staging unavailable")?;
+            .ok_or(EncodedBudgetExceeded)?;
         let Some(cached) = measured(&mut metrics, ReadPhase::Store, || {
             self.store.read_limited(&key, allow_stale, allowance)
         })?
@@ -430,7 +430,7 @@ impl PreviewService {
         let reservation = self
             .encoded
             .try_reserve(allowance)
-            .context("encoded export admission")?;
+            .ok_or(EncodedBudgetExceeded)?;
         let bytes = if let Some(key) = view.key {
             self.store
                 .read_limited(&key, false, allowance)?
@@ -638,7 +638,7 @@ impl PreviewService {
             let guard = self
                 .encoded
                 .try_reserve(self.limits.per_worker_encoded_bytes)
-                .context("worker staging admission")?;
+                .ok_or(EncodedBudgetExceeded)?;
             match WorkerProcess::spawn(&self.executable, &self.staging, job.request.clone()) {
                 Ok(worker) => {
                     self.active.insert(
@@ -729,6 +729,8 @@ impl PreviewService {
             .and_then(|failure| failure.decode_status);
         let resources = kind == Some(crate::media::DecodeStatus::ResourceLimit)
             || error.downcast_ref::<CacheQuotaExceeded>().is_some()
+            || error.downcast_ref::<EncodedBudgetExceeded>().is_some()
+            || error.downcast_ref::<DecodedBudgetExceeded>().is_some()
             || error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()

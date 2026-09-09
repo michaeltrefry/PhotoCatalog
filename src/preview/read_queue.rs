@@ -124,7 +124,8 @@ impl PreviewService {
             )
         })();
         let outcome = result.unwrap_or_else(|error| ReadOutcome::Failed {
-            resource_limit: error.downcast_ref::<DecodedBudgetExceeded>().is_some(),
+            resource_limit: error.downcast_ref::<DecodedBudgetExceeded>().is_some()
+                || error.downcast_ref::<EncodedBudgetExceeded>().is_some(),
             message: format!("{error:#}"),
         });
         self.reads.completed.insert(

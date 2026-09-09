@@ -842,10 +842,9 @@ impl PreviewStore {
             self.remove(&digest, key.tier)?;
             bail!("cached preview length mismatch; entry invalidated");
         }
-        ensure!(
-            len <= max_bytes,
-            "encoded staging allowance exceeded before allocation"
-        );
+        if len > max_bytes {
+            return Err(super::EncodedBudgetExceeded.into());
+        }
         let mut bytes = vec![0; len as usize];
         let read = file.read_exact(&mut bytes);
         let mut extra = [0];

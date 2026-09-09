@@ -54,6 +54,14 @@ impl std::fmt::Display for DecodedBudgetExceeded {
     }
 }
 impl std::error::Error for DecodedBudgetExceeded {}
+#[derive(Debug)]
+pub struct EncodedBudgetExceeded;
+impl std::fmt::Display for EncodedBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("encoded staging allowance is retained or too small; release held exports or increase staging admission")
+    }
+}
+impl std::error::Error for EncodedBudgetExceeded {}
 pub struct RetainedPixels {
     pixels: PreparedRgb,
     _reservation: ByteReservation,

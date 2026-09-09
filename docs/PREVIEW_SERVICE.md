@@ -21,6 +21,12 @@ remain charged to their live memory budget. Cancellation is cooperative between
 in-process retained decodes; the existing original-render process kill/wait
 mechanism remains separate. These APIs will drive the fixed headless navigation
 trace; a harness-only queue cannot substitute for them.
+Both encoded staging refusal and decoded-live refusal have typed errors. Read
+completion classifies either as transient resource pressure; no message matching
+or cache invalidation is used for admission failures. The constrained navigation
+receipt must keep resource-refused reads separate from corrupt/I/O failures and
+missing/stale results. A held encoded export, refused read, released export and
+successful subsequent read are covered by a source-ready regression.
 
 `Catalog::import_with_previews` drives the application service. `begin_import`
 and `ImportSession::advance` expose the same discovery/metadata/reservation path
