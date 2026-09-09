@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only work diagnostics, independent of latency eligibility (protocol 1)."""
+"""Read-only work diagnostics, independent of latency eligibility (protocol 2)."""
 
 import argparse
 import ctypes as C
@@ -14,7 +14,7 @@ import duckdb
 
 import catalog_benchmark as bench
 
-VERSION = 1
+VERSION = 2
 SCALES = (1_000_000, 5_000_000, 10_000_000)
 CURSORS = (50, 90)
 WORKLOADS = ("page_deep", "rating")
@@ -81,6 +81,35 @@ def validate_duck_profile(profile, sql, returned):
     require(integer(profile.get("cumulative_rows_scanned"), "cumulative_rows_scanned") == scanned, "incomplete/inconsistent scan tree")
     require(sum(node["operator_cardinality"] for node in roots) == returned, "root operator cardinality mismatch")
     return {"operator_rows_scanned_sum": scanned, "operator_cardinality_sum": sum(node["operator_cardinality"] for node in operators), "operators": len(operators), "interpretation": "engine-reported counters; zero rows scanned alone is not a bound on index work"}
+
+
+def query_cases(count):
+    """Retain the original cursors and replay the exact measured iteration 9."""
+    cases = []
+    rating = bench.query_parameters("rating", count, 0)[0]
+    for percent in CURSORS:
+        for name in WORKLOADS:
+            cursor = count * percent // 100
+            parameters = [cursor] if name == "page_deep" else [rating, cursor]
+            cases.append({
+                "workload": name,
+                "case_label": f"cursor_{percent}_percent",
+                "iteration": None,
+                "cursor_percent": percent,
+                "parameters": parameters,
+            })
+    for name in WORKLOADS:
+        # Do not synthesize 90.5% or reuse iteration 0's rating: both values
+        # must come from the frozen parameter generator that produced the spike.
+        parameters = bench.query_parameters(name, count, 9)
+        cases.append({
+            "workload": name,
+            "case_label": "frozen_iteration_9",
+            "iteration": 9,
+            "cursor_percent": parameters[-1] * 100 / count,
+            "parameters": parameters,
+        })
+    return cases
 
 
 def expected_page(name, parameters, count):
@@ -271,23 +300,21 @@ def run(snapshot, engine, count, memory_mb, output):
             options["temp_directory"] = str(output / "spill")
             db = duckdb.connect(str(path), read_only=True, config=options)
             receipt.update(engine_version=duckdb.__version__, settings=bench.measured_settings(db, engine), requested_settings=options, open_mode="read_only=True")
-        rating = bench.query_parameters("rating", count, 0)[0]
-        for percent in CURSORS:
-            for name in WORKLOADS:
-                cursor = count * percent // 100
-                parameters = [cursor] if name == "page_deep" else [rating, cursor]
-                sql = bench.QUERY_SQL[name]
-                item = {"workload": name, "cursor_percent": percent, "sql": sql, "parameters": parameters}
-                receipt["queries"].append(item)
-                if engine == "sqlite":
-                    item["plan"] = db.query("EXPLAIN QUERY PLAN " + sql, parameters)[0]
-                    rows, item["work"] = db.query(sql, parameters, metrics=True)
-                else:
-                    item["plan"] = db.execute("EXPLAIN " + sql, parameters).fetchall()
-                    rows, item["profile"], item["work"] = duck_query(db, sql, parameters, output / f"{name}-{percent}.profile.json")
-                require(bool(item["plan"]), "missing query plan")
-                item["returned_rows"] = rows
-                item["correctness"] = validate_rows(name, parameters, rows, count)
+        for case in query_cases(count):
+            name, parameters = case["workload"], case["parameters"]
+            sql = bench.QUERY_SQL[name]
+            item = {**case, "sql": sql}
+            receipt["queries"].append(item)
+            if engine == "sqlite":
+                item["plan"] = db.query("EXPLAIN QUERY PLAN " + sql, parameters)[0]
+                rows, item["work"] = db.query(sql, parameters, metrics=True)
+            else:
+                item["plan"] = db.execute("EXPLAIN " + sql, parameters).fetchall()
+                suffix = str(case["cursor_percent"]) if case["iteration"] is None else f"iteration-{case['iteration']}"
+                rows, item["profile"], item["work"] = duck_query(db, sql, parameters, output / f"{name}-{suffix}.profile.json")
+            require(bool(item["plan"]), "missing query plan")
+            item["returned_rows"] = rows
+            item["correctness"] = validate_rows(name, parameters, rows, count)
         receipt["complete"] = True
     except BaseException as error:
         receipt["error"] = f"{type(error).__name__}: {error}"

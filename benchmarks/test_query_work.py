@@ -6,11 +6,57 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import duckdb
 
 import catalog_benchmark as bench
 import query_work as diagnostic
+
+
+class QueryCases(unittest.TestCase):
+    def test_original_cursors_are_retained_and_iteration_nine_is_distinct(self):
+        self.assertEqual(diagnostic.VERSION, 2)
+        for count in diagnostic.SCALES:
+            cases = diagnostic.query_cases(count)
+            self.assertEqual(len(cases), 6)
+            self.assertEqual(len({(case["workload"], case["case_label"]) for case in cases}), 6)
+            rating = bench.query_parameters("rating", count, 0)[0]
+            expected = []
+            for percent in (50, 90):
+                for name in ("page_deep", "rating"):
+                    cursor = count * percent // 100
+                    expected.append({
+                        "workload": name,
+                        "case_label": f"cursor_{percent}_percent",
+                        "iteration": None,
+                        "cursor_percent": percent,
+                        "parameters": [cursor] if name == "page_deep" else [rating, cursor],
+                    })
+            self.assertEqual(cases[:4], expected)
+            for case in cases[4:]:
+                self.assertEqual(case["case_label"], "frozen_iteration_9")
+                self.assertEqual(case["iteration"], 9)
+                self.assertEqual(case["parameters"], bench.query_parameters(case["workload"], count, 9))
+                self.assertEqual(case["cursor_percent"], case["parameters"][-1] * 100 / count)
+                self.assertNotEqual(case["parameters"][-1], count * 90 // 100)
+
+    def test_iteration_nine_does_not_substitute_cursor_or_rating(self):
+        # Alternate generator outputs catch implementations that hard-code a
+        # nominal 90.5% cursor or reuse the legacy cases' iteration-0 rating.
+        def parameters(name, count, iteration):
+            self.assertEqual(count, 1_000_000)
+            if iteration == 0:
+                self.assertEqual(name, "rating")
+                return [2, 500_000]
+            self.assertEqual(iteration, 9)
+            return [314_159] if name == "page_deep" else [5, 271_828]
+
+        with patch.object(bench, "query_parameters", side_effect=parameters) as frozen:
+            cases = diagnostic.query_cases(1_000_000)
+        self.assertEqual(cases[4]["parameters"], [314_159])
+        self.assertEqual(cases[5]["parameters"], [5, 271_828])
+        self.assertEqual(frozen.call_count, 3)
 
 
 class MetricValidation(unittest.TestCase):
