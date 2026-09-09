@@ -160,3 +160,12 @@ snapshot changes. They make no RAW decode claim and no million-row timing claim.
 The production-query measurement protocol must be frozen and independently
 reviewed before the 1/5/10 million campaigns. Full integrated tests, cross-platform
 CI, final performance evidence, and parent review remain acceptance gates.
+
+Current-schema catalog opening validates/configures the connection without a
+migration transaction or header write. Actual initialization/upgrades remain one
+IMMEDIATE transaction. Query startup therefore works while an independent writer
+holds authority and leaves main/WAL contents unchanged. Metadata retain, resolve,
+edit, unavailable-source, and export-plan writers acquire IMMEDIATE authority
+before revision/source reads; expensive packet preparation stays outside the lock.
+This prevents a stale deferred read snapshot from failing its later write upgrade.
+CAS and per-asset rollback checks still run under the acquired writer authority.

@@ -211,7 +211,13 @@ pub fn candidate_path(mount: &MountedVolume, relative: &NativePath) -> io::Resul
             "path is outside this mounted subdirectory",
         )
     })?;
-    Ok(root.join(suffix))
+    // Joining an empty suffix adds a trailing separator. A file bind mount is
+    // itself the requested object, and a trailing separator makes it unusable.
+    Ok(if suffix.as_os_str().is_empty() {
+        root
+    } else {
+        root.join(suffix)
+    })
 }
 fn safe_relative(path: &Path) -> bool {
     path.components().all(|c| matches!(c, Component::Normal(_)))
@@ -437,7 +443,34 @@ fn relative_path(canonical: &Path, mount: &MountedVolume) -> io::Result<PathBuf>
             "unsafe relative volume path",
         ));
     }
-    Ok(subpath.join(relative))
+    Ok(if relative.as_os_str().is_empty() {
+        subpath
+    } else {
+        subpath.join(relative)
+    })
+}
+
+#[cfg(test)]
+mod exact_mount_tests {
+    use super::*;
+
+    #[test]
+    fn file_mount_root_retains_exact_volume_relative_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("mounted.cr2");
+        let source = Path::new("original/image.cr2");
+        let mount = MountedVolume {
+            mount_path: NativePath::from_path(&file),
+            volume_subpath: NativePath::from_path(source),
+            persistent_identity: None,
+            filesystem: "synthetic".into(),
+            device_number: None,
+            issues: vec![],
+        };
+        let relative = relative_path(&file, &mount).unwrap();
+        // Path equality normalizes separators; compare the stored locator bytes.
+        assert_eq!(relative.as_os_str(), source.as_os_str());
+    }
 }
 
 #[cfg(target_os = "macos")]

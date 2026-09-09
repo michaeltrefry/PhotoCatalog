@@ -111,8 +111,11 @@ impl Catalog {
             );
         }
         configure_catalog_connection(&db)?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute_batch("
+        // Opening a current catalog must not rewrite its header or acquire an
+        // unnecessary writer transaction. Only actual initialization/migration writes.
+        if version < 4 {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch("
             CREATE TABLE IF NOT EXISTS assets (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
@@ -127,20 +130,21 @@ impl Catalog {
             );
             PRAGMA application_id = 1346913089;
             ")?;
-        if version < 2 {
-            tx.execute_batch(catalog_metadata::SCHEMA)?;
-            tx.pragma_update(None, "user_version", 2)?;
+            if version < 2 {
+                tx.execute_batch(catalog_metadata::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 2)?;
+            }
+            if version < 3 {
+                tx.execute_batch(catalog_storage::SCHEMA)?;
+                tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
+                tx.pragma_update(None, "user_version", 3)?;
+            }
+            if version < 4 {
+                tx.execute_batch(organization::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 4)?;
+            }
+            tx.commit()?;
         }
-        if version < 3 {
-            tx.execute_batch(catalog_storage::SCHEMA)?;
-            tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
-            tx.pragma_update(None, "user_version", 3)?;
-        }
-        if version < 4 {
-            tx.execute_batch(organization::SCHEMA)?;
-            tx.pragma_update(None, "user_version", 4)?;
-        }
-        tx.commit()?;
         Ok(Self { db, root })
     }
     /// Imports one explicitly selected directory. Repeating a scan resumes pending/failed files.

@@ -624,7 +624,9 @@ impl Catalog {
         inspection: &Inspection,
     ) -> Result<Change> {
         let prepared = Prepared::new(inspection, source)?;
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (observation_id, model_ids, changed) = store(&tx, asset, source, &prepared)?;
         let revision = if changed {
             rebuild(&tx, asset)?;
@@ -711,7 +713,9 @@ impl Catalog {
         field: &str,
         model_id: i64,
     ) -> Result<i64> {
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed; refresh conflict review"
@@ -963,7 +967,9 @@ impl Catalog {
         prepared.revision = blake3::hash(&serde_json::to_vec(&(&prepared.revision, &updated))?)
             .to_hex()
             .to_string();
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed while preparing edit"
@@ -1072,7 +1078,9 @@ impl Catalog {
         source: &Source,
         reason: &str,
     ) -> Result<bool> {
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let previous:Option<String>=tx.query_row("SELECT availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![asset,source.kind,source.locator],|r|r.get(0)).optional()?;
         if previous.as_deref() == Some(reason) {
             return Ok(false);
@@ -1274,7 +1282,9 @@ impl Catalog {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&payload)?;
         let compressed = encoder.finish()?;
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed during export planning"

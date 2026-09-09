@@ -851,3 +851,134 @@ fn nonpixel_edits_preserve_preview_authority_but_source_and_arbitrary_edits_inva
     ensure!(cat.with_render_identity(&prior_choice, || Ok(7))?.is_none());
     Ok(())
 }
+
+#[test]
+fn current_catalog_query_open_does_not_write_or_wait_for_an_existing_writer() -> Result<()> {
+    let (_temp, root, cat) = synthetic(5)?;
+    drop(cat);
+    let main = root.join("catalog.sqlite3");
+    let before = fs::read(&main)?;
+    for _ in 0..3 {
+        drop(Catalog::open(&root)?);
+        ensure!(fs::read(&main)? == before);
+    }
+    let writer = db(&root)?;
+    writer.execute_batch("BEGIN IMMEDIATE")?;
+    let wal = root.join("catalog.sqlite3-wal");
+    let before_wal = fs::read(&wal).unwrap_or_default();
+    // The writer stays held throughout open and query; an accidental IMMEDIATE
+    // initialization transaction would time out instead of completing this read.
+    let mut reader = Catalog::open(&root)?;
+    ensure!(reader.search(&Query::default(), None, 5, 5)?.rows.len() == 5);
+    ensure!(fs::read(&main)? == before && fs::read(&wal).unwrap_or_default() == before_wal);
+    drop(reader);
+    writer.execute_batch("ROLLBACK")?;
+    drop(writer);
+    ensure!(fs::read(&main)? == before);
+    Ok(())
+}
+
+#[test]
+fn deferred_upgrade_repro_and_real_distinct_asset_writers_serialize_without_lost_data() -> Result<()>
+{
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (_temp, root, photos, mut cat) = setup()?;
+    for name in ["one", "two"] {
+        photo(&photos.join(format!("{name}.jpg")))?;
+        fs::write(photos.join(format!("{name}.xmp")), packet(3))?;
+    }
+    cat.import(&photos, None, |_| Ok(()))?;
+    let assets = cat.browse(0, 2)?;
+    let first = assets[0].id.clone();
+    let second = assets[1].id.clone();
+    let old_revision = cat.metadata(&first)?.revision;
+    // Force the historical failure deterministically: an older read snapshot
+    // cannot become a writer after an independent asset commits in WAL mode.
+    let stale = db(&root)?;
+    stale.execute_batch("BEGIN DEFERRED")?;
+    let _: i64 = stale.query_row(
+        "SELECT revision FROM metadata_assets WHERE asset_id=?",
+        [&first],
+        |r| r.get(0),
+    )?;
+    apply(&mut cat, &second, Operation::Flag { value: Flag::Pick })?;
+    let error = stale
+        .execute(
+            "UPDATE metadata_assets SET revision=revision+1 WHERE asset_id=?",
+            [&first],
+        )
+        .unwrap_err();
+    ensure!(
+        matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if code.extended_code==517),
+        "expected SQLITE_BUSY_SNAPSHOT, got {error}"
+    );
+    stale.execute_batch("ROLLBACK")?;
+    drop(stale);
+    ensure!(cat.metadata(&first)?.revision == old_revision);
+    let expected_second = cat.metadata(&second)?.revision;
+    let mut other = Catalog::open(&root)?;
+    let (go_tx, go_rx) = mpsc::sync_channel(0);
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let other_id = second.clone();
+    let worker = std::thread::spawn(move || {
+        go_rx.recv().unwrap();
+        started_tx.send(()).unwrap();
+        let result =
+            other.organize_asset(&other_id, expected_second, Operation::Rating { value: 5 });
+        done_tx.send(result).unwrap();
+    });
+    let job = cat.begin_organization_batch(Operation::Flag {
+        value: Flag::Reject,
+    })?;
+    cat.append_organization_batch(
+        &job.id,
+        &[BatchItem {
+            asset_id: first.clone(),
+            expected_revision: old_revision,
+        }],
+    )?;
+    cat.seal_organization_batch(&job.id)?;
+    let outcome = cat.step_organization_batch_with(&job.id, || {
+        go_tx.send(())?;
+        started_rx.recv()?;
+        ensure!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(40)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "second writer did not wait for held authority"
+        );
+        Ok(())
+    })?;
+    let result = done_rx.recv_timeout(Duration::from_secs(5));
+    worker.join().unwrap();
+    ensure!(outcome.state == "complete", "first atomic writer failed");
+    ensure!(result?? == expected_second + 1);
+    ensure!(cat.metadata(&first)?.revision == old_revision + 1);
+    let second_view = cat.metadata(&second)?;
+    ensure!(
+        second_view.revision == expected_second + 1
+            && second_view.fields.iter().any(|f| f.name == "rating"
+                && f.value == Some(photocatalog::xmp::Value::Text("5".into())))
+    );
+    ensure!(
+        cat.search(
+            &Query {
+                flag: Some(Flag::Reject),
+                ..Query::default()
+            },
+            None,
+            10,
+            10
+        )?
+        .rows
+        .iter()
+        .any(|r| r.asset_id == first)
+    );
+    for name in ["one", "two"] {
+        ensure!(fs::read_to_string(photos.join(format!("{name}.xmp")))? == packet(3));
+    }
+    Ok(())
+}
