@@ -14,7 +14,7 @@ The synthetic corpus has 1M/5M/10M assets, two keyword relationships per asset a
 
 ## Host, versions and settings
 
-The host reports macOS 26.6.2, arm64, 18 logical CPUs and 128 GiB RAM. Python is 3.14.6; native Python bindings report SQLite 3.53.3 and DuckDB 1.5.5. The separate Rust probe reports bundled SQLite 3.51.1; its receipts do not embed compiler or executable digest, so binary provenance is not inferred from the Python version.
+The host reports macOS 26.6.2, arm64, 18 logical CPUs and 128 GiB RAM. A separate read-only hardware check identifies Apple M5 Max, model Mac17,6, and confirms the benchmark root is on the internal solid-state APFS Data volume (Apple Fabric; container capacity 3,996,276,899,840 bytes). This is internal SSD catalog performance; originals remain on the external RAID. The hardware receipt is `/Users/michael/PhotoCatalog-private-results/sc-22837-reference-hardware-20260909.json`. Python is 3.14.6; native Python bindings report SQLite 3.53.3 and DuckDB 1.5.5. The separate Rust probe reports bundled SQLite 3.51.1; its receipts do not embed compiler or executable digest, so binary provenance is not inferred from the Python version. The execution ledger separately binds the frozen probe binary to its reviewed source and verified SHA-256.
 
 | Host receipt phase | Available RAM (GiB) | Load average 1/5/15 min |
 | --- | --- | --- |
