@@ -35,3 +35,33 @@ persistence or arbitrary stacked/concurrently changing mount behavior.
 Primary references: Linux [bind-mount semantics](https://man7.org/linux/man-pages/man2/mount.2.html),
 [private mount namespaces](https://man7.org/linux/man-pages/man1/unshare.1.html),
 and [descriptor mount IDs](https://man7.org/linux/man-pages/man5/proc_pid_fdinfo.5.html).
+
+## Windows local GUID and junction
+
+Run `./scripts/validate_windows_volume.ps1` with PowerShell 7 on the configured
+Windows build host. The Windows job invokes the existing ignored
+`inspect_explicit_volume_fixture` hook twice: on a newly created Unicode-named
+file and on that same file through a newly created directory junction.
+`Win32_Volume` through CIM supplies the expected local volume GUID independently
+of the Rust adapter. `.NET Path.GetRelativePath` supplies the expected suffix
+from the independently known drive root and source path. The hook requires both
+values, a Windows GUID identity scheme, the expected canonical source, and a
+reconstructed candidate path with the same native object identity. Thus missing
+GUIDs, absent relative mappings, or a junction-relative suffix cannot pass.
+
+The script checks exactly one executed test per invocation, unchanged fixture
+SHA-256 and modification time, and no added fixture directory entries. It deletes
+only its junction link before removing its owned temporary tree and restores the
+prior test environment variables. All setup, expectation, and test failures
+remain failures; no successful fallback or skip is allowed. The hook still
+accepts coordinator-supplied optional expectations for other platforms, but this
+Windows script always supplies every independent expectation.
+
+This is native local-volume and same-volume junction mapping evidence after CI
+passes. It does not claim VHD detach/remount, mounted-folder cross-volume mapping,
+replacement-disk lifecycle, SMB/UNC availability, or network identity coverage.
+The ordinary missing-path and pure ambiguity tests remain separate evidence.
+
+Primary references: Microsoft's [Win32_Volume provider](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/vdswmi/win32-volume),
+[relative-path calculation](https://learn.microsoft.com/en-us/dotnet/api/system.io.path.getrelativepath?view=net-9.0),
+and [PowerShell junction creation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/new-item?view=powershell-7.5).
