@@ -10,7 +10,7 @@ The runtime campaign ran from **2026-09-09 13:57:48.127950 UTC to 13:59:48.16843
 
 The actual runtime reports **bundled SQLite 3.51.1**. The Python supervisor reports SQLite 3.53.3 for its own binding; that is not the engine measured by these Rust children. The host is macOS 26.6.2/arm64, with 18 logical CPUs and 128 GiB RAM. Host observations are retained, but snapshots alone do not establish uninterrupted absence of competing CPU, disk or GPU work; the coordinator's host-load record is separate.
 
-All runtime connections use the same declared 256 MiB cache configuration, with settings read back from the production connection helper and both native writer connections:
+All runtime connections use the same declared 256 MiB cache configuration. The top-level receipt reads a separate diagnostic connection configured by the shared helper; writer settings come from their actual live handles. The actual private Catalog connection is read back directly in its integration unit test:
 
 | Setting | Actual value |
 |---|---|
@@ -66,7 +66,7 @@ RSS values below are process peaks sampled by the supervisor, not exact allocato
 
 These are six individual open observations, not fresh-process open-plus-query distributions or cold-storage evidence. The 20-sample fresh-process distributions remain in the separate page-correction campaign. Source/copy checks can warm filesystem caches.
 
-All three pristine source hashes match before/after runtime execution. Browse and mixed copies at each scale independently record the expected physical size, logical counts/sums, relationships and source identity before measurements. Mutations occur only on disposable copies; source snapshots remain preserved. Runtime output records UUID/order and basic metadata checks, and successful get/reopen identity verification. This synthetic probe does not by itself prove arbitrary Lightroom/XMP preservation.
+All three pristine source hashes match before/after preparing the independent writable copies; runtime children receive only those disposable copies. Browse and mixed copies at each scale independently record the expected physical size, logical counts/sums, relationships and source identity before measurements. Mutations occur only on disposable copies; source snapshots remain preserved. Runtime output records UUID/order and basic metadata checks, and successful get/reopen identity verification. This synthetic probe does not by itself prove arbitrary Lightroom/XMP preservation.
 
 | Records | Source bytes | Preserved source SHA-256 |
 |---|---:|---|
