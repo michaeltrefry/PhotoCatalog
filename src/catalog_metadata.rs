@@ -586,6 +586,13 @@ impl Catalog {
         expected: &RenderIdentity,
         attach: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
+        self.with_render_transaction(expected, |_| attach())
+    }
+    pub(crate) fn with_render_transaction<T>(
+        &mut self,
+        expected: &RenderIdentity,
+        attach: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<Option<T>> {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -598,7 +605,7 @@ impl Catalog {
         }) {
             return Ok(None);
         }
-        let result = attach()?;
+        let result = attach(&tx)?;
         tx.commit()?;
         Ok(Some(result))
     }

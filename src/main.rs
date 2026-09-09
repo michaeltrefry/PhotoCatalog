@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use photocatalog::{
     Catalog,
@@ -16,6 +16,9 @@ use std::{
 struct Cli {
     #[arg(long)]
     catalog: PathBuf,
+    /// Explicit preview service locations, quotas and admission settings.
+    #[arg(long)]
+    preview_config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -37,8 +40,57 @@ impl From<KeywordType> for KeywordKind {
         }
     }
 }
+#[derive(Clone, Copy, ValueEnum)]
+enum PreviewTier {
+    Thumbnail,
+    Large,
+}
+impl From<PreviewTier> for photocatalog::preview::Tier {
+    fn from(tier: PreviewTier) -> Self {
+        match tier {
+            PreviewTier::Thumbnail => Self::Thumbnail,
+            PreviewTier::Large => Self::Large,
+        }
+    }
+}
 #[derive(Subcommand)]
 enum Command {
+    /// List durable preview jobs, including resource/availability errors.
+    CacheJobs {
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Resume queued jobs; --retry-blocked retries after resources/storage recover.
+    CacheResume {
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        retry_blocked: bool,
+    },
+    CacheBudgets {
+        #[arg(long)]
+        thumbnail_bytes: u64,
+        #[arg(long)]
+        large_bytes: u64,
+    },
+    CacheRelocateBegin {
+        #[arg(value_enum)]
+        tier: PreviewTier,
+        destination: PathBuf,
+    },
+    CacheRelocateStep {
+        #[arg(value_enum)]
+        tier: PreviewTier,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value_t = 4194304)]
+        bytes: u64,
+    },
+
     /// Resume bounded organization index construction for an upgraded catalog.
     OrganizationIndex {
         #[arg(long, default_value_t = 100)]
@@ -591,13 +643,71 @@ fn main() -> Result<()> {
         }
         Command::RelinkApply { plan } => print_json(&catalog.apply_relink(&plan)?)?,
         Command::RelinkUndo { plan } => print_json(&catalog.undo_relink(&plan)?)?,
+        Command::CacheJobs { after, limit } => {
+            let settings = load_preview_settings(&cli.preview_config)?;
+            let previews = settings.open(std::env::current_exe()?, None)?;
+            print_json(&previews.jobs(after, limit)?)?;
+        }
+        Command::CacheResume {
+            after,
+            limit,
+            retry_blocked,
+        } => {
+            let settings = load_preview_settings(&cli.preview_config)?;
+            let mut previews = settings.open(std::env::current_exe()?, None)?;
+            let (cursor, consumers) = previews.resume(&mut catalog, after, limit, retry_blocked)?;
+            let mut pending = consumers;
+            let mut results = Vec::new();
+            while !pending.is_empty() {
+                previews.tick(&mut catalog)?;
+                pending.retain(|consumer| {
+                    if let Some(result) = previews.take_completion(*consumer) {
+                        results.push(result);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if !pending.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            print_json(&serde_json::json!({"cursor":cursor,"results":results}))?;
+        }
+        Command::CacheBudgets {
+            thumbnail_bytes,
+            large_bytes,
+        } => {
+            let settings = load_preview_settings(&cli.preview_config)?;
+            let mut previews = settings.open(std::env::current_exe()?, None)?;
+            previews.set_cache_budgets(thumbnail_bytes, large_bytes)?;
+            print_json(&previews.store_usage()?)?;
+        }
+        Command::CacheRelocateBegin { tier, destination } => {
+            let settings = load_preview_settings(&cli.preview_config)?;
+            let mut previews = settings.open(std::env::current_exe()?, None)?;
+            previews.begin_relocation(tier.into(), &destination, &settings.original_roots)?;
+        }
+        Command::CacheRelocateStep { tier, limit, bytes } => {
+            let settings = load_preview_settings(&cli.preview_config)?;
+            let mut previews = settings.open(std::env::current_exe()?, None)?;
+            print_json(&previews.relocation_step(tier.into(), limit, bytes)?)?;
+        }
         Command::Import { folder, max_files } => {
-            let report = catalog.import(folder, max_files, |_| Ok(()))?;
+            let configuration = photocatalog::preview::PreviewConfiguration::read(
+                cli.preview_config
+                    .as_deref()
+                    .context("--preview-config is required for application imports")?,
+            )?;
+            let mut previews = configuration.open(std::env::current_exe()?, Some(&folder))?;
+            let report =
+                catalog.import_with_previews(folder, max_files, |_| Ok(()), &mut previews)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             ensure!(
-                report.failed == 0,
-                "{} imports failed; inspect browse output and retry",
-                report.failed
+                report.failed == 0 && report.awaiting_resources == 0,
+                "{} imports failed, {} await resources or storage; inspect cache-jobs and resume",
+                report.failed,
+                report.awaiting_resources
             );
         }
         Command::Browse { after, limit } => println!(
@@ -606,12 +716,51 @@ fn main() -> Result<()> {
         ),
         Command::Get { id } => println!("{}", serde_json::to_string_pretty(&catalog.get(&id)?)?),
         Command::Preview { id, output } => {
-            let preview = catalog.preview(&id)?;
+            let configuration = photocatalog::preview::PreviewConfiguration::read(
+                cli.preview_config
+                    .as_deref()
+                    .context("--preview-config is required for application previews")?,
+            )?;
+            let mut previews = configuration.open(std::env::current_exe()?, None)?;
+            let view = match previews.cached(
+                &catalog,
+                &id,
+                photocatalog::preview::Tier::Thumbnail,
+                true,
+            )? {
+                Some(view) => view,
+                None => {
+                    let consumer = previews.request(
+                        &mut catalog,
+                        &id,
+                        photocatalog::preview::Tier::Thumbnail,
+                        photocatalog::preview::Priority::Foreground,
+                    )?;
+                    loop {
+                        previews.tick(&mut catalog)?;
+                        if let Some(result) = previews.take_completion(consumer) {
+                            ensure!(
+                                matches!(result, photocatalog::preview::ServiceCompletion::Ready),
+                                "preview unavailable: {result:?}"
+                            );
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    previews
+                        .cached(&catalog, &id, photocatalog::preview::Tier::Thumbnail, false)?
+                        .context("completed preview missing")?
+                }
+            };
+            drop(view);
+            let preview = previews
+                .encoded_cached(&catalog, &id, photocatalog::preview::Tier::Thumbnail, true)?
+                .context("preview unavailable during export")?;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(output)?;
-            file.write_all(&preview)?;
+            file.write_all(preview.bytes())?;
             file.sync_all()?;
         }
         Command::Metadata { id } => print_json(&catalog.metadata(&id)?)?,
@@ -703,4 +852,13 @@ fn read_request<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Resul
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 1024 * 1024, "request exceeds 1MiB");
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn load_preview_settings(
+    path: &Option<PathBuf>,
+) -> Result<photocatalog::preview::PreviewConfiguration> {
+    photocatalog::preview::PreviewConfiguration::read(
+        path.as_deref()
+            .context("--preview-config is required for cache commands")?,
+    )
 }

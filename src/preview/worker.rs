@@ -464,7 +464,14 @@ pub fn worker_main() -> Result<()> {
             message.truncate(boundary);
         }
         let failure = WorkerFailure {
-            decode_status: error.downcast_ref::<DecodeError>().map(|e| e.status),
+            decode_status: error
+                .downcast_ref::<DecodeError>()
+                .map(|e| e.status)
+                .or_else(|| {
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .map(|_| DecodeStatus::Io)
+                }),
             message,
         };
         if let Ok(bytes) = serde_json::to_vec(&failure) {

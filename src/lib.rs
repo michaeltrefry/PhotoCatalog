@@ -39,6 +39,7 @@ pub struct ImportReport {
     pub skipped: u64,
     pub metadata_updated: u64,
     pub metadata_warnings: u64,
+    pub awaiting_resources: u64,
     pub stopped: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,117 @@ pub enum ImportEvent {
 pub struct Catalog {
     db: Connection,
     root: PathBuf,
+}
+
+/// Incremental import discovery for application actors. Each advance handles at
+/// most one directory entry and queues native rendering; callers interleave
+/// foreground requests/ticks rather than blocking on full-image development.
+pub struct ImportSession {
+    catalog_root: PathBuf,
+    entries: walkdir::IntoIter,
+    volumes: import_storage::ImportVolumes,
+    max_files: Option<usize>,
+    processed: usize,
+    report: ImportReport,
+    finished: bool,
+    _lock: ImportLock,
+}
+pub struct ImportAdvance {
+    pub finished: bool,
+    pub consumer: Option<preview::Consumer>,
+}
+impl ImportSession {
+    pub fn report(&self) -> &ImportReport {
+        &self.report
+    }
+    pub fn advance(
+        &mut self,
+        catalog: &mut Catalog,
+        service: &mut preview::PreviewService,
+    ) -> Result<ImportAdvance> {
+        self.advance_inner(catalog, &mut Some(service), &mut |_| Ok(()))
+    }
+    pub fn record_completion(&mut self, result: &preview::ServiceCompletion) {
+        match result {
+            preview::ServiceCompletion::Ready => self.report.imported += 1,
+            preview::ServiceCompletion::NeedsResources(_)
+            | preview::ServiceCompletion::Unavailable(_) => self.report.awaiting_resources += 1,
+            _ => self.report.failed += 1,
+        }
+    }
+    fn advance_inner(
+        &mut self,
+        catalog: &mut Catalog,
+        service: &mut Option<&mut preview::PreviewService>,
+        observer: &mut impl FnMut(ImportEvent) -> Result<()>,
+    ) -> Result<ImportAdvance> {
+        ensure!(
+            catalog.root == self.catalog_root,
+            "import session belongs to another catalog"
+        );
+        if self.finished {
+            return Ok(ImportAdvance {
+                finished: true,
+                consumer: None,
+            });
+        }
+        if service
+            .as_ref()
+            .is_some_and(|service| service.available_request_slots() == 0)
+        {
+            return Ok(ImportAdvance {
+                finished: false,
+                consumer: None,
+            });
+        }
+        if self.max_files.is_some_and(|limit| self.processed >= limit) {
+            self.report.stopped = true;
+            self.finished = true;
+            return Ok(ImportAdvance {
+                finished: true,
+                consumer: None,
+            });
+        }
+        let Some(entry) = self.entries.next() else {
+            self.finished = true;
+            return Ok(ImportAdvance {
+                finished: true,
+                consumer: None,
+            });
+        };
+        let entry = entry.context("discover source folder")?;
+        if !entry.file_type().is_file() {
+            return Ok(ImportAdvance {
+                finished: false,
+                consumer: None,
+            });
+        }
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !media::supported_extension(&extension) {
+            self.report.skipped += 1;
+            return Ok(ImportAdvance {
+                finished: false,
+                consumer: None,
+            });
+        }
+        self.processed += 1;
+        let consumer = catalog.import_file(
+            entry.path(),
+            &mut self.volumes,
+            &mut self.report,
+            observer,
+            service,
+        )?;
+        Ok(ImportAdvance {
+            finished: false,
+            consumer,
+        })
+    }
 }
 
 /// Apply the measured SQLite settings to an app-owned, already validated connection.
@@ -149,135 +261,201 @@ impl Catalog {
     }
     /// Imports one explicitly selected directory. Repeating a scan resumes pending/failed files.
     /// The observer runs at durability boundaries and can request a controlled interruption.
+    /// Synchronous compatibility importer using the original provisional thumbnail
+    /// path. Application import commands use `import_with_previews`.
     pub fn import(
         &mut self,
         folder: impl AsRef<Path>,
         max_files: Option<usize>,
-        mut observer: impl FnMut(ImportEvent) -> Result<()>,
+        observer: impl FnMut(ImportEvent) -> Result<()>,
     ) -> Result<ImportReport> {
+        self.import_impl(folder, max_files, observer, None)
+    }
+    pub fn import_with_previews(
+        &mut self,
+        folder: impl AsRef<Path>,
+        max_files: Option<usize>,
+        observer: impl FnMut(ImportEvent) -> Result<()>,
+        service: &mut preview::PreviewService,
+    ) -> Result<ImportReport> {
+        self.import_impl(folder, max_files, observer, Some(service))
+    }
+    pub fn begin_import(
+        &mut self,
+        folder: impl AsRef<Path>,
+        max_files: Option<usize>,
+    ) -> Result<ImportSession> {
         let folder = fs::canonicalize(folder)?;
         ensure!(folder.is_dir(), "import source must be a folder");
         ensure!(
             !self.root.starts_with(&folder) && !folder.starts_with(&self.root),
             "catalog and originals must be separate directories"
         );
-        let _lock = ImportLock::acquire(&self.root.join("import.lock"))?;
+        let lock = ImportLock::acquire(&self.root.join("import.lock"))?;
         self.begin_metadata_scan()?;
-        let mut report = ImportReport::default();
-        let mut processed = 0;
-        let mut volumes = import_storage::ImportVolumes::new();
-        for entry in walkdir::WalkDir::new(&folder)
-            .follow_links(false)
-            .max_open(16)
-        {
-            if max_files.is_some_and(|limit| processed >= limit) {
-                report.stopped = true;
+        Ok(ImportSession {
+            catalog_root: self.root.clone(),
+            entries: walkdir::WalkDir::new(folder)
+                .follow_links(false)
+                .max_open(16)
+                .into_iter(),
+            volumes: import_storage::ImportVolumes::new(),
+            max_files,
+            processed: 0,
+            report: ImportReport::default(),
+            finished: false,
+            _lock: lock,
+        })
+    }
+    fn import_impl(
+        &mut self,
+        folder: impl AsRef<Path>,
+        max_files: Option<usize>,
+        mut observer: impl FnMut(ImportEvent) -> Result<()>,
+        mut service: Option<&mut preview::PreviewService>,
+    ) -> Result<ImportReport> {
+        let mut session = self.begin_import(folder, max_files)?;
+        loop {
+            let advance = session.advance_inner(self, &mut service, &mut observer)?;
+            if let Some(consumer) = advance.consumer {
+                let service = service
+                    .as_deref_mut()
+                    .context("queued import without preview service")?;
+                loop {
+                    service.tick(self)?;
+                    if let Some(result) = service.take_completion(consumer) {
+                        session.record_completion(&result);
+                        if matches!(result, preview::ServiceCompletion::Ready) {
+                            observer(ImportEvent::PreviewPublished)?;
+                            observer(ImportEvent::Committed)?;
+                        }
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            if advance.finished {
                 break;
             }
-            let entry = entry.context("discover source folder")?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let ext = entry
-                .path()
-                .extension()
-                .and_then(|v| v.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !media::supported_extension(&ext) {
-                report.skipped += 1;
-                continue;
-            }
-            processed += 1;
-            let path = entry.path();
-            let location = location_bytes(path);
-            let fingerprint = match fingerprint(path) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.reserve(path, &location)?;
-                    self.record_import_path(path)?;
-                    let (changed, warnings) = self.refresh_metadata(path, true)?;
-                    report.metadata_updated += u64::from(changed);
-                    report.metadata_warnings += warnings as u64;
-                    self.fail(&location, &error)?;
-                    report.failed += 1;
-                    continue;
-                }
-            };
-            let observation = volumes.observe(path)?;
-            self.reconnect_storage_asset(path, &observation, &fingerprint, volumes.snapshot())?;
-            let existing: Option<(String, String, Option<String>)> = self
-                .db
-                .query_row(
-                    "SELECT fingerprint,state,preview_hash FROM assets WHERE location=?1",
-                    [&location],
-                    |r| {
-                        Ok((
-                            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                            r.get(1)?,
-                            r.get(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            if let Some((previous, state, Some(hash))) = existing
-                && previous == fingerprint
-                && state == "ready"
-                && self.read_preview_hash(&hash).is_ok()
-            {
-                self.bind_import_storage(path, &observation)?;
-                let (changed, warnings) = self.refresh_metadata(path, false)?;
+        }
+        Ok(session.report)
+    }
+    fn import_file(
+        &mut self,
+        path: &Path,
+        volumes: &mut import_storage::ImportVolumes,
+        report: &mut ImportReport,
+        observer: &mut impl FnMut(ImportEvent) -> Result<()>,
+        service: &mut Option<&mut preview::PreviewService>,
+    ) -> Result<Option<preview::Consumer>> {
+        let location = location_bytes(path);
+        let fingerprint = match fingerprint(path) {
+            Ok(value) => value,
+            Err(error) => {
+                self.reserve(path, &location)?;
+                self.record_import_path(path)?;
+                let (changed, warnings) = self.refresh_metadata(path, true)?;
                 report.metadata_updated += u64::from(changed);
                 report.metadata_warnings += warnings as u64;
-                report.unchanged += 1;
-                continue;
+                self.fail(&location, &error)?;
+                report.failed += 1;
+                return Ok(None);
             }
-            self.reserve(path, &location)?;
+        };
+        let observation = volumes.observe(path)?;
+        self.reconnect_storage_asset(path, &observation, &fingerprint, volumes.snapshot())?;
+        let existing: Option<(String, String, Option<String>)> = self
+            .db
+            .query_row(
+                "SELECT fingerprint,state,preview_hash FROM assets WHERE location=?1",
+                [&location],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get(1)?,
+                        r.get(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((previous, state, Some(hash))) = existing
+            && previous == fingerprint
+            && state == "ready"
+            && match service.as_deref_mut() {
+                Some(service) => {
+                    let asset: String = self.db.query_row(
+                        "SELECT id FROM assets WHERE location=?1",
+                        [&location],
+                        |r| r.get(0),
+                    )?;
+                    service
+                        .cached(self, &asset, preview::Tier::Thumbnail, false)?
+                        .is_some()
+                }
+                None => self.read_preview_hash(&hash).is_ok(),
+            }
+        {
             self.bind_import_storage(path, &observation)?;
-            observer(ImportEvent::Reserved)?;
-            let (changed, warnings) = self.refresh_metadata(path, true)?;
+            let (changed, warnings) = self.refresh_metadata(path, false)?;
             report.metadata_updated += u64::from(changed);
             report.metadata_warnings += warnings as u64;
-            let (metadata, preview) = match media::decode(path) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.fail(&location, &error)?;
-                    report.failed += 1;
-                    continue;
-                }
-            };
-            // Hash again after decoding: changed or replaced originals must not publish mismatched metadata.
-            let after = match fingerprint_file(path) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.fail(&location, &error)?;
-                    report.failed += 1;
-                    continue;
-                }
-            };
-            if after != fingerprint {
-                self.fail(
-                    &location,
-                    &anyhow::anyhow!("source changed during import; retry required"),
-                )?;
-                report.failed += 1;
-                continue;
-            }
-            let hash = blake3::hash(&preview).to_hex().to_string();
-            self.publish_preview(&hash, &preview)?;
-            observer(ImportEvent::PreviewPublished)?;
-            let tx = self.db.transaction()?;
-            tx.execute("UPDATE assets SET fingerprint=?1,state='ready',metadata=?2,preview_hash=?3,error=NULL WHERE location=?4", params![fingerprint,serde_json::to_string(&metadata)?,hash,location])?;
-            let asset: String =
-                tx.query_row("SELECT id FROM assets WHERE location=?", [&location], |r| {
-                    r.get(0)
-                })?;
-            organization::refresh(&tx, &asset)?;
-            tx.commit()?;
-            observer(ImportEvent::Committed)?;
-            report.imported += 1;
+            report.unchanged += 1;
+            return Ok(None);
         }
-        Ok(report)
+        self.reserve(path, &location)?;
+        self.bind_import_storage(path, &observation)?;
+        observer(ImportEvent::Reserved)?;
+        let (changed, warnings) = self.refresh_metadata(path, true)?;
+        report.metadata_updated += u64::from(changed);
+        report.metadata_warnings += warnings as u64;
+        if let Some(service) = service.as_deref_mut() {
+            let asset: String = self.db.query_row(
+                "SELECT id FROM assets WHERE location=?1",
+                [&location],
+                |r| r.get(0),
+            )?;
+            let consumer = service.submit_import(self, &asset, path, &fingerprint)?;
+            return Ok(Some(consumer));
+        }
+        let (metadata, preview) = match media::decode(path) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail(&location, &error)?;
+                report.failed += 1;
+                return Ok(None);
+            }
+        };
+        // Hash again after decoding: changed or replaced originals must not publish mismatched metadata.
+        let after = match fingerprint_file(path) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail(&location, &error)?;
+                report.failed += 1;
+                return Ok(None);
+            }
+        };
+        if after != fingerprint {
+            self.fail(
+                &location,
+                &anyhow::anyhow!("source changed during import; retry required"),
+            )?;
+            report.failed += 1;
+            return Ok(None);
+        }
+        let hash = blake3::hash(&preview).to_hex().to_string();
+        self.publish_preview(&hash, &preview)?;
+        observer(ImportEvent::PreviewPublished)?;
+        let tx = self.db.transaction()?;
+        tx.execute("UPDATE assets SET fingerprint=?1,state='ready',metadata=?2,preview_hash=?3,error=NULL WHERE location=?4", params![fingerprint,serde_json::to_string(&metadata)?,hash,location])?;
+        let asset: String =
+            tx.query_row("SELECT id FROM assets WHERE location=?", [&location], |r| {
+                r.get(0)
+            })?;
+        organization::refresh(&tx, &asset)?;
+        tx.commit()?;
+        observer(ImportEvent::Committed)?;
+        report.imported += 1;
+        Ok(None)
     }
     fn bind_import_storage(
         &mut self,
@@ -301,7 +479,7 @@ impl Catalog {
     }
     fn reserve(&mut self, path: &Path, location: &[u8]) -> Result<()> {
         let tx = self.db.transaction()?;
-        tx.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
+        tx.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
         let asset: String =
             tx.query_row("SELECT id FROM assets WHERE location=?", [location], |r| {
                 r.get(0)
@@ -313,7 +491,7 @@ impl Catalog {
     fn fail(&mut self, location: &[u8], error: &anyhow::Error) -> Result<()> {
         let tx = self.db.transaction()?;
         tx.execute(
-            "UPDATE assets SET state='failed',preview_hash=NULL,error=?1 WHERE location=?2",
+            "UPDATE assets SET state='failed',error=?1 WHERE location=?2",
             params![format!("{error:#}"), location],
         )?;
         let asset: String =
@@ -371,6 +549,87 @@ impl Catalog {
             .context("asset not found")?;
         ensure!(state == "ready", "asset preview is not ready ({state})");
         self.read_preview_hash(&hash.context("missing preview reference")?)
+    }
+    pub(crate) fn preview_original_path(&self, asset: &str) -> Result<storage_volume::NativePath> {
+        let encoded: String = self.db.query_row(
+            "SELECT native_path FROM storage_bindings WHERE asset_id=?1",
+            [asset],
+            |r| r.get(0),
+        )?;
+        let path: storage_volume::NativePath = serde_json::from_str(&encoded)?;
+        ensure!(
+            path.to_path()?.is_absolute(),
+            "original path is not absolute"
+        );
+        Ok(path)
+    }
+    pub(crate) fn commit_preview_import<T>(
+        &mut self,
+        expected: &catalog_metadata::RenderIdentity,
+        fingerprint: &str,
+        metadata: &Metadata,
+        key: &str,
+        attach: impl FnOnce() -> Result<T>,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<T>> {
+        ensure!(
+            expected.state == "pending",
+            "import completion requires a pending asset"
+        );
+        ensure!(
+            fingerprint.len() == 64 && fingerprint.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid import fingerprint"
+        );
+        ensure!(
+            key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid preview reference"
+        );
+        let metadata = serde_json::to_string(metadata)?;
+        self.with_render_transaction(expected,|tx|{
+            let result=attach()?;
+            tx.execute("UPDATE assets SET state='ready',fingerprint=?1,metadata=?2,preview_hash=?3,error=NULL WHERE id=?4",params![fingerprint,metadata,key,expected.asset_id])?;
+            organization::refresh(tx,&expected.asset_id)?;
+            before_commit()?;
+            Ok(result)
+        })
+    }
+    /// A failed/retried import retains its last valid legacy thumbnail until the
+    /// service replaces it. This read never assigns current-render provenance.
+    pub(crate) fn retained_legacy_preview(
+        &self,
+        asset: &str,
+        allowance: u64,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let hash: Option<String> = self.db.query_row(
+            "SELECT preview_hash FROM assets WHERE id=?1",
+            [asset],
+            |r| r.get(0),
+        )?;
+        let Some(hash) = hash else { return Ok(None) };
+        ensure!(
+            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid legacy preview reference"
+        );
+        let path = self.root.join("previews").join(format!("{hash}.jpg"));
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let length = file.metadata()?.len();
+        ensure!(
+            length <= allowance && length <= 4 * 1024 * 1024,
+            "legacy preview exceeds encoded admission"
+        );
+        let mut bytes = vec![0; length as usize];
+        file.read_exact(&mut bytes)?;
+        let mut extra = [0];
+        ensure!(file.read(&mut extra)? == 0, "legacy preview grew");
+        ensure!(
+            blake3::hash(&bytes).to_hex().as_str() == hash,
+            "legacy preview checksum mismatch"
+        );
+        Ok(Some((hash, bytes)))
     }
     pub fn get(&self, id: &str) -> Result<Asset> {
         let row = self.db.query_row(

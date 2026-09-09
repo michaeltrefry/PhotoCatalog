@@ -1,7 +1,10 @@
 //! Rebuildable preview manifest. Main-catalog generations remain authoritative.
+#[path = "relocation.rs"]
+mod relocation;
 use super::{CodecSettings, PREPARATION_VERSION};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
+pub use relocation::RelocationProgress;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -76,7 +79,7 @@ pub enum Layout {
     Flat,
     HashPrefix,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
     pub manifest_root: PathBuf,
     pub layout: Layout,
@@ -86,11 +89,32 @@ pub struct StoreConfig {
     pub thumbnail_bytes: u64,
     pub large_bytes: u64,
 }
+/// The metadata/provenance belong to these pixels, including an explicitly stale
+/// retained fallback. General catalog metadata can independently be newer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderRecord {
+    pub width: u32,
+    pub height: u32,
+    pub metadata: crate::media::Metadata,
+    pub provenance: crate::media::RenderProvenance,
+}
+impl RenderRecord {
+    fn encoded(&self, key: &PreviewKey) -> Result<String> {
+        ensure!(
+            self.width > 0 && self.height > 0 && self.width <= key.edge && self.height <= key.edge,
+            "render record dimensions exceed tier"
+        );
+        let value = serde_json::to_string(self)?;
+        ensure!(value.len() <= 64 * 1024, "render record size limit");
+        Ok(value)
+    }
+}
 #[derive(Debug)]
 pub struct CachedPreview {
     pub key: PreviewKey,
     pub bytes: Vec<u8>,
     pub stale: bool,
+    pub record: Option<RenderRecord>,
 }
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct StoreUsage {
@@ -105,12 +129,24 @@ pub enum Publication {
     AlreadyPresent,
     Stale,
 }
+#[derive(Debug)]
+pub struct CacheQuotaExceeded(pub &'static str);
+impl std::fmt::Display for CacheQuotaExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for CacheQuotaExceeded {}
+
 /// One owner serializes filesystem/manifest mutations; workers return encoded
 /// data to that owner. The process lock is released automatically on crash.
 pub struct PreviewStore {
     db: Connection,
     config: StoreConfig,
     _lock: File,
+    _tier_locks: [File; 2],
+    _relocation_lock: Option<File>,
+    identity: String,
     clock: Cell<i64>,
     touches: RefCell<HashMap<String, i64>>,
 }
@@ -169,7 +205,7 @@ impl PreviewStore {
             ensure!(count == 0 && app == 0, "unrelated preview manifest");
         } else {
             ensure!(
-                version == 1 && app == 0x50435056,
+                (1..=2).contains(&version) && app == 0x50435056,
                 "unsupported preview manifest"
             );
         }
@@ -177,6 +213,12 @@ impl PreviewStore {
             CREATE TABLE IF NOT EXISTS usage(tier TEXT PRIMARY KEY,bytes INTEGER NOT NULL CHECK(bytes>=0),objects INTEGER NOT NULL CHECK(objects>=0),pending INTEGER NOT NULL CHECK(pending>=0));
             INSERT OR IGNORE INTO usage VALUES('thumbnail',0,0,0),('large',0,0,0);
             CREATE TABLE IF NOT EXISTS objects(key TEXT PRIMARY KEY,descriptor TEXT NOT NULL,tier TEXT NOT NULL,bytes INTEGER NOT NULL CHECK(bytes>0),checksum TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','ready','orphan')),temporary TEXT NOT NULL,touched INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS render_jobs(id TEXT PRIMARY KEY,descriptor TEXT NOT NULL,created INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS render_jobs_created ON render_jobs(created,id);
+            CREATE TABLE IF NOT EXISTS store_identity(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS budgets(tier TEXT PRIMARY KEY,bytes INTEGER NOT NULL CHECK(bytes>0));
+            CREATE TABLE IF NOT EXISTS relocations(tier TEXT PRIMARY KEY,id TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,phase TEXT NOT NULL,cursor TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS render_records(key TEXT PRIMARY KEY REFERENCES objects(key) ON DELETE CASCADE,record TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS objects_eviction ON objects(tier,status,touched,key);
             CREATE INDEX IF NOT EXISTS objects_recovery ON objects(status,key);
             CREATE TABLE IF NOT EXISTS counter(id INTEGER PRIMARY KEY CHECK(id=1),value INTEGER NOT NULL);
@@ -185,16 +227,37 @@ impl PreviewStore {
             CREATE TABLE IF NOT EXISTS layout(name TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS wanted(asset TEXT NOT NULL,variant TEXT NOT NULL,tier TEXT NOT NULL,generation INTEGER NOT NULL,desired TEXT NOT NULL,current TEXT,PRIMARY KEY(asset,variant,tier));
             CREATE INDEX IF NOT EXISTS wanted_current ON wanted(current);
+            CREATE TRIGGER IF NOT EXISTS render_job_added AFTER INSERT ON render_jobs BEGIN UPDATE counter SET value=max(value,NEW.created) WHERE id=1; END;
             CREATE TRIGGER IF NOT EXISTS object_added AFTER INSERT ON objects BEGIN UPDATE usage SET bytes=bytes+NEW.bytes,objects=objects+1,pending=pending+(NEW.status='pending') WHERE tier=NEW.tier; UPDATE counter SET value=max(value,NEW.touched) WHERE id=1; END;
             CREATE TRIGGER IF NOT EXISTS object_touched AFTER UPDATE OF touched ON objects BEGIN UPDATE counter SET value=max(value,NEW.touched) WHERE id=1; END;
             CREATE TRIGGER IF NOT EXISTS object_removed AFTER DELETE ON objects BEGIN UPDATE usage SET bytes=bytes-OLD.bytes,objects=objects-1,pending=pending-(OLD.status='pending') WHERE tier=OLD.tier; END;
             CREATE TRIGGER IF NOT EXISTS object_status AFTER UPDATE OF status ON objects BEGIN UPDATE usage SET pending=pending+(NEW.status='pending')-(OLD.status='pending') WHERE tier=NEW.tier; END;
-            PRAGMA application_id=1346588758; PRAGMA user_version=1; COMMIT;")?;
+            PRAGMA application_id=1346588758; PRAGMA user_version=2; COMMIT;")?;
         let clock = db.query_row("SELECT value FROM counter WHERE id=1", [], |r| r.get(0))?;
-        let store = Self {
+        db.execute(
+            "INSERT OR IGNORE INTO store_identity VALUES(1,?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+        let identity: String =
+            db.query_row("SELECT value FROM store_identity WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        let tier_locks = [
+            relocation::lock_root(
+                &config.thumbnail_root,
+                &identity,
+                Tier::Thumbnail,
+                config.layout,
+            )?,
+            relocation::lock_root(&config.large_root, &identity, Tier::Large, config.layout)?,
+        ];
+        let mut store = Self {
             db,
             config,
             _lock: lock,
+            _tier_locks: tier_locks,
+            _relocation_lock: None,
+            identity,
             clock: Cell::new(clock),
             touches: RefCell::new(HashMap::new()),
         };
@@ -238,8 +301,20 @@ impl PreviewStore {
                 )?;
             }
         }
+        store.db.execute(
+            "INSERT OR IGNORE INTO budgets VALUES('thumbnail',?1)",
+            [store.config.thumbnail_bytes as i64],
+        )?;
+        store.db.execute(
+            "INSERT OR IGNORE INTO budgets VALUES('large',?1)",
+            [store.config.large_bytes as i64],
+        )?;
+        store.recover_relocation_lock()?;
         store.recover(128)?;
         Ok(store)
+    }
+    pub fn configuration(&self) -> &StoreConfig {
+        &self.config
     }
     fn root(&self, tier: Tier) -> &Path {
         match tier {
@@ -364,7 +439,9 @@ impl PreviewStore {
             Tier::Thumbnail => self.config.thumbnail_bytes,
             Tier::Large => self.config.large_bytes,
         };
-        ensure!(bytes <= budget, "preview exceeds tier quota");
+        if bytes > budget {
+            return Err(CacheQuotaExceeded("preview exceeds tier quota").into());
+        }
         for _ in 0..128 {
             let used: u64 = self.db.query_row(
                 "SELECT bytes FROM usage WHERE tier=?1",
@@ -374,17 +451,24 @@ impl PreviewStore {
             if used <= budget - bytes {
                 return Ok(());
             }
-            ensure!(
-                tier == Tier::Large,
-                "retained thumbnail quota exhausted; previous thumbnails preserved"
-            );
+            if tier != Tier::Large {
+                return Err(CacheQuotaExceeded(
+                    "retained thumbnail quota exhausted; previous thumbnails preserved",
+                )
+                .into());
+            }
             let oldest:Option<String>=self.db.query_row("SELECT key FROM objects WHERE tier='large' AND status='ready' ORDER BY touched,key LIMIT 1",[],|r|r.get(0)).optional()?;
             let Some(oldest) = oldest else {
-                bail!("large-preview quota reserved by pending work")
+                return Err(
+                    CacheQuotaExceeded("large-preview quota reserved by pending work").into(),
+                );
             };
             self.remove(&oldest, tier)?;
         }
-        bail!("large-cache eviction batch exhausted; retry on a later service tick")
+        Err(CacheQuotaExceeded(
+            "large-cache eviction batch exhausted; retry on a later service tick",
+        )
+        .into())
     }
     fn remove(&self, digest: &str, tier: Tier) -> Result<()> {
         self.touches.borrow_mut().remove(digest);
@@ -438,6 +522,15 @@ impl PreviewStore {
     ) -> Result<Publication> {
         self.publish_controlled(key, bytes, authorize, || Ok(()))
     }
+    pub fn publish_record(
+        &self,
+        key: &PreviewKey,
+        bytes: &[u8],
+        record: &RenderRecord,
+        authorize: impl FnOnce(&mut dyn FnMut() -> Result<Publication>) -> Result<Publication>,
+    ) -> Result<Publication> {
+        self.publish_inner(key, bytes, Some(record), authorize, || Ok(()))
+    }
     fn publish_controlled(
         &self,
         key: &PreviewKey,
@@ -445,7 +538,19 @@ impl PreviewStore {
         authorize: impl FnOnce(&mut dyn FnMut() -> Result<Publication>) -> Result<Publication>,
         before_write: impl FnOnce() -> Result<()>,
     ) -> Result<Publication> {
+        self.publish_inner(key, bytes, None, authorize, before_write)
+    }
+    fn publish_inner(
+        &self,
+        key: &PreviewKey,
+        bytes: &[u8],
+        record: Option<&RenderRecord>,
+        authorize: impl FnOnce(&mut dyn FnMut() -> Result<Publication>) -> Result<Publication>,
+        before_write: impl FnOnce() -> Result<()>,
+    ) -> Result<Publication> {
+        ensure!(!self.relocation_pending()?, "cache relocation in progress");
         let digest = key.digest()?;
+        let record = record.map(|record| record.encoded(key)).transpose()?;
         ensure!(
             !bytes.is_empty() && bytes.len() <= 256 * 1024 * 1024,
             "encoded preview size limit"
@@ -453,7 +558,8 @@ impl PreviewStore {
         if !self.desired(key, &digest)? {
             return Ok(Publication::Stale);
         }
-        if self.current_is_intact(key)? {
+        if self.current_is_intact(key)? && (record.is_none() || self.render_record(key)?.is_some())
+        {
             return authorize(&mut || {
                 if self.desired(key, &digest)? {
                     Ok(Publication::AlreadyPresent)
@@ -537,6 +643,12 @@ impl PreviewStore {
                     self.db
                         .execute("UPDATE objects SET status='orphan' WHERE key=?1", [old])?;
                 }
+                if let Some(record) = &record {
+                    self.db.execute(
+                        "INSERT INTO render_records VALUES(?1,?2)",
+                        params![digest, record],
+                    )?;
+                }
                 self.db
                     .execute("UPDATE objects SET status='ready' WHERE key=?1", [&digest])?;
                 let changed=self.db.execute("UPDATE wanted SET current=?4 WHERE asset=?1 AND variant=?2 AND tier=?3 AND desired=?4 AND generation=?5",params![key.asset_id,key.variant_id,key.tier.name(),digest,key.generation as i64])?;
@@ -572,6 +684,68 @@ impl PreviewStore {
                 other
             }
         }
+    }
+    /// Durable queue records are bounded by the service's request admission. An
+    /// import job is removed only after its catalog ready transaction commits.
+    pub(crate) fn save_job(&self, id: &str, descriptor: &str, limit: usize) -> Result<()> {
+        ensure!(
+            id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid job identity"
+        );
+        ensure!(
+            descriptor.len() <= 64 * 1024 && (1..=100_000).contains(&limit),
+            "job journal limit"
+        );
+        let exists: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM render_jobs WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            let count: usize = self
+                .db
+                .query_row("SELECT count(*) FROM render_jobs", [], |r| r.get(0))?;
+            ensure!(count < limit, "durable preview queue full");
+        }
+        self.db.execute("INSERT INTO render_jobs VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET descriptor=excluded.descriptor",params![id,descriptor,self.clock()?])?;
+        Ok(())
+    }
+    pub(crate) fn saved_jobs(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String)>> {
+        ensure!((1..=1000).contains(&limit), "job recovery page limit");
+        let mut statement=self.db.prepare("SELECT created,id,descriptor FROM render_jobs WHERE created>?1 ORDER BY created,id LIMIT ?2")?;
+        Ok(statement
+            .query_map(params![after, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub(crate) fn finish_job(&self, id: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM render_jobs WHERE id=?1", [id])?;
+        Ok(())
+    }
+    pub fn render_record(&self, key: &PreviewKey) -> Result<Option<RenderRecord>> {
+        let value: Option<String> = self.db.query_row(
+            "SELECT r.record FROM render_records r JOIN objects o ON o.key=r.key WHERE r.key=?1 AND o.status='ready'",
+            [key.digest()?], |r| r.get(0),
+        ).optional()?;
+        value
+            .map(|value| {
+                ensure!(value.len() <= 64 * 1024, "render record size limit");
+                let record: RenderRecord = serde_json::from_str(&value)?;
+                record.encoded(key)?;
+                Ok(record)
+            })
+            .transpose()
+    }
+    /// Invalid image data cannot remain a permanent cache hit. The service passes
+    /// the actual returned key, including when an old fallback failed decoding.
+    pub fn invalidate(&self, key: &PreviewKey) -> Result<()> {
+        self.remove(&key.digest()?, key.tier)
     }
     /// Check immutable current-object integrity with fixed-size scratch. Duplicate
     /// publication must not allocate a second encoded object beside the incoming one.
@@ -684,7 +858,13 @@ impl PreviewStore {
         if self.touches.borrow().len() >= 256 {
             self.flush_touches()?;
         }
-        Ok(Some(CachedPreview { key, bytes, stale }))
+        let record = self.render_record(&key)?;
+        Ok(Some(CachedPreview {
+            key,
+            bytes,
+            stale,
+            record,
+        }))
     }
     /// Bounded maintenance; startup performs one batch, subsequent service ticks
     /// can finish remaining pending/orphan cleanup without loading the catalog.
@@ -818,6 +998,98 @@ mod tests {
         assert!(store.read(&new, true).unwrap().unwrap().stale);
         assert_eq!(store.usage().unwrap().thumbnail_bytes, 8);
         assert!(store.desire(&old, || Ok(true)).is_err());
+    }
+    fn record(label: &str) -> RenderRecord {
+        RenderRecord {
+            width: 2,
+            height: 1,
+            metadata: crate::media::Metadata {
+                format: "test".into(),
+                width: 20,
+                height: 10,
+                orientation: 1,
+                camera_make: None,
+                camera_model: None,
+                captured_at: None,
+                lens: None,
+                preview_source: label.into(),
+            },
+            provenance: crate::media::RenderProvenance {
+                pipeline_version: label.into(),
+                decoder: "test".into(),
+                source_bits_per_channel: 16,
+                source_color: "linear".into(),
+                working_color: "linear sRGB".into(),
+                alpha: "straight".into(),
+                calibration: None,
+                spatial_calibration: None,
+                notes: vec![],
+            },
+        }
+    }
+    #[test]
+    fn fallback_keeps_its_own_render_record_through_interrupted_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path(), 100, 100);
+        let store = PreviewStore::open(cfg.clone(), &[]).unwrap();
+        let old = key(1, Tier::Thumbnail);
+        store.desire(&old, || Ok(true)).unwrap();
+        store
+            .publish_record(&old, b"old", &record("old renderer"), authority)
+            .unwrap();
+        let new = key(2, Tier::Thumbnail);
+        store.desire(&new, || Ok(true)).unwrap();
+        assert!(
+            store
+                .publish_record(&new, b"new", &record("new renderer"), |_| bail!(
+                    "owner interrupted"
+                ))
+                .is_err()
+        );
+        drop(store);
+        let store = PreviewStore::open(cfg, &[]).unwrap();
+        let fallback = store.read(&new, true).unwrap().unwrap();
+        assert!(fallback.stale);
+        assert_eq!(
+            fallback.record.unwrap().provenance.pipeline_version,
+            "old renderer"
+        );
+        assert!(store.render_record(&new).unwrap().is_none());
+        store
+            .publish_record(&new, b"new", &record("new renderer"), authority)
+            .unwrap();
+        assert_eq!(
+            store
+                .read(&new, false)
+                .unwrap()
+                .unwrap()
+                .record
+                .unwrap()
+                .metadata
+                .preview_source,
+            "new renderer"
+        );
+        assert!(store.render_record(&old).unwrap().is_none());
+    }
+    #[test]
+    fn manifest_record_migration_retains_old_opaque_objects_without_inventing_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path(), 100, 100);
+        let store = PreviewStore::open(cfg.clone(), &[]).unwrap();
+        let key = key(1, Tier::Thumbnail);
+        store.desire(&key, || Ok(true)).unwrap();
+        store.publish(&key, b"old", authority).unwrap();
+        store
+            .db
+            .execute_batch(
+                "DROP TABLE render_records; DROP TABLE render_jobs; PRAGMA user_version=1;",
+            )
+            .unwrap();
+        drop(store);
+        let store = PreviewStore::open(cfg, &[]).unwrap();
+        let old = store.read(&key, false).unwrap().unwrap();
+        assert_eq!(old.bytes, b"old");
+        assert!(old.record.is_none());
     }
     #[test]
     fn encoded_read_budget_rejects_without_invalidating_retained_thumbnail() {

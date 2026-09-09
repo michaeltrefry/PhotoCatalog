@@ -1,7 +1,7 @@
 //! Decoded pixels retain their memory reservation until the final consumer drops
 //! them. Evicting an LRU entry alone cannot make externally held pixels free.
 use super::{Codec, PreparedRgb, decode, encoded_dimensions};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -42,6 +42,18 @@ impl Drop for ByteReservation {
         self.budget.0.lock().unwrap_or_else(|e| e.into_inner()).used -= self.bytes;
     }
 }
+/// Admission pressure is not corrupt cache data and must never invalidate the
+/// only retained offline thumbnail.
+#[derive(Debug)]
+pub struct DecodedBudgetExceeded;
+impl std::fmt::Display for DecodedBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "decoded allowance retained by visible consumers; release an old page before decoding",
+        )
+    }
+}
+impl std::error::Error for DecodedBudgetExceeded {}
 pub struct RetainedPixels {
     pixels: PreparedRgb,
     _reservation: ByteReservation,
@@ -146,9 +158,7 @@ impl DecodedCache {
                 break reservation;
             }
             if !self.evict_one() {
-                bail!(
-                    "decoded allowance retained by visible consumers; release an old page before decoding"
-                );
+                return Err(DecodedBudgetExceeded.into());
             }
         };
         let pixels = decode(encoded, codec)?;
