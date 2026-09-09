@@ -136,3 +136,92 @@ ordinary calls do not collect clocks. Instrumentation overhead is included in
 measured wall time and is never subtracted. Service/navigation coordinators and
 remaining fault coverage are still required S6 work; no timing or layout choice
 is implied by these source additions.
+
+## Retained service probe specification (source checkpoint; unrun)
+
+`preview_navigation_probe` uses the same bounded dataset schema as the layout
+probe. Preparation requires the 10,000-object variant and creates a new, separate
+catalog containing exactly those sequence/key/source-fingerprint generations.
+This direct SQL seed is a disclosed synthetic fixture, not import evidence.
+The complete retained RenderRecord and selected JPEG objects are the layout
+fixture's actual records. Every synthetic original points into a directory that
+is never created; preparation and run admission reject an existing originals
+root. No native renderer is launched in these retained-only workloads. Layout
+is taken from the bound dataset and recorded, never implicitly selected here.
+
+The first page consists of catalog sequences 1..200, corresponding to fixed
+layout indexes 0..199. Each trial invokes the production `Catalog::browse`,
+`PreviewService::queue_read`, `tick_read`, and `take_read` path. Request admission,
+FIFO foreground scheduling, catalog identity revalidation, manifest/read/hash,
+complete RGB8 decoding and caller-held pixel reservations are included. A page
+owns all 200 returned views until its wall timer stops. Expected key, dimensions
+and decoded RGB8 BLAKE3 are checked against the corresponding independent seed
+outside the page timer; verification time is reported separately. Timer overhead,
+request bookkeeping and in-timer identity assertions are included, not subtracted.
+
+Profiles are fixed as follows. Standard uses SQLite's measured 256 MiB per
+connection setting, 256 MiB decoded LRU and live-pixel allowance, 32 MiB encoded
+staging, 400 shared request descriptors, and one retained decode per owner call.
+Constrained uses the same DB profile, 32 MiB LRU, 256 MiB live-pixel allowance,
+8 MiB staging, 200 descriptors and one decoder. Its per-native-worker encoded
+reservation is 4 MiB (half staging) to satisfy the service's foreground-headroom
+invariant; no original worker is admitted here. Standard's corresponding
+reservation is 8 MiB. All remaining limits are emitted in each receipt; native
+working-memory defaults are irrelevant to these retained-only runs and remain
+subject to the separate worker gate. The visible page can outlive LRU entries,
+but its bytes remain charged to the live allowance and process RSS.
+
+The `warm` command runs three warmups, 100 measured pages, then one separately
+labeled hot-LRU observation. Each warmup/measured page drops the prior returned
+views and clears the LRU before DB lookup. Connection and OS cache remain warm;
+encoded bytes are not retained between reads. The hot observation preserves
+whatever LRU entries the configured profile can retain; it is not assumed to be
+100 percent hits. `fresh` runs exactly one page in a new process. The external
+coordinator invokes exactly 20 fresh children per profile; it does not evict OS
+cache or call this cold-disk evidence. Output files are written after each trial.
+
+`navigation` performs ten traces, clearing LRU and dropping views between traces.
+Each trace schedules 100 viewport changes at absolute offsets 0, 50, ... 4950 ms.
+Viewport v uses indexes `(50*v + 0..199) mod 10000`. At each change the owner
+cancels out-of-view pending tickets, releases out-of-view returned pixels, retains
+the intersection, and submits missing visible identities in page order. It then
+runs at most one real retained decode before receiving the next input. If an
+owner call overruns, every scheduled viewport is delivered in order with its
+actual delay recorded; the trace clock is never moved to conceal missed input
+deadlines. Completion after a canceled/unowned ticket is an error. The final
+viewport must have all 200 current views. Each returned image is independently
+verified after its owner-call timer; that verification remains in trace wall time
+and is separately reported. This instrumentation cost is not silently removed
+from navigation responsiveness. A 60-second per-trace safety deadline preserves
+a failure, not a replacement trace.
+
+Raw receipts retain request, cancellation and completion identities/order,
+per-read outcome (`ready`, `missing`, `stale`, typed `resource_limit`, or `failed`),
+error detail, queue wait, owner read wall, instrumented read/decode components,
+cache hit/miss counts, visible ownership, queue peaks and input overruns. A
+required missing/stale/error result fails the trial and preserves its partial
+observations. No failed admission is relabeled as an idle/missing thumbnail.
+A successful retained trace has zero native jobs, so it makes no concurrent
+full-original-import latency claim. Actual service/worker import-interleaving,
+resource admission and crash/failure correctness remain separate required gates.
+
+Process high-water RSS is emitted after each page/trace (macOS bytes; Linux
+KiB normalized; Windows unavailable). Warm per-trial high-water values are
+cumulative for that process, not resettable interval peaks. The coordinator must
+also preserve host telemetry, complete clean source/archive and binary identities,
+fixture/catalog/cache manifests, physical storage attribution and child UTC plus
+monotonic boundaries. It must report the original 1-second warm first-page and
+4 GiB browse RSS gates without inventing acceptance thresholds from observations.
+Desktop frame-time/UI evidence remains unavailable until S12. The source-ready
+probe and fixed commands do not authorize execution or select a layout:
+
+```
+preview_navigation_probe prepare --dataset ABS_10K_DATASET_JSON --output NEW_PRIVATE_FIXTURE
+preview_navigation_probe run --fixture ABS_FIXTURE_JSON --worker ABS_APP \
+  --output NEW_PRIVATE_RUN --profile standard --workload warm
+# profile: standard|constrained; workload: warm|fresh|navigation
+```
+
+The new shared fixture module and navigation probe have been formatted only.
+Compilation, correctness tests, coordinator validation and independent review
+remain required before any timed service child is admitted.

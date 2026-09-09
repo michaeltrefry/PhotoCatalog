@@ -1,14 +1,15 @@
 //! Byte-distinct layout fixtures and production-store lookup measurements.
 //! No original decode or layout/default selection is performed by this tool.
+mod preview_fixture;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use photocatalog::preview::*;
-use serde::{Deserialize, Serialize};
+use preview_fixture::{Dataset, Seed, dataset, key, read_bounded};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -46,38 +47,11 @@ enum LayoutArg {
     Flat,
     HashPrefix,
 }
-#[derive(Serialize, Deserialize)]
-struct Seed {
-    key: PreviewKey,
-    encoded_path: PathBuf,
-    encoded_blake3: String,
-    decoded_blake3: String,
-    width: u32,
-    height: u32,
-    record: RenderRecord,
-}
-#[derive(Serialize, Deserialize)]
-struct Dataset {
-    version: u32,
-    count: u32,
-    store: StoreConfig,
-    seeds: Vec<Seed>,
-    marker_overhead_bytes: u32,
-}
 fn exclusive(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
-}
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let length = file.metadata()?.len();
-    ensure!(length > 0 && length <= limit, "fixture byte limit");
-    let mut bytes = vec![0; length as usize];
-    file.read_exact(&mut bytes)?;
-    ensure!(file.read(&mut [0])? == 0, "fixture grew");
-    Ok(bytes)
 }
 fn stamp(start: Instant) -> Value {
     json!({"unix_ns":SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d|d.as_nanos().to_string()),"elapsed_ns":start.elapsed().as_nanos().to_string()})
@@ -125,38 +99,6 @@ fn admit_seed_id(ids: &mut HashSet<String>, id: &str) -> Result<()> {
     );
     ensure!(ids.insert(id.into()), "duplicate fixture input");
     Ok(())
-}
-fn key(dataset: &Dataset, index: u32) -> PreviewKey {
-    let mut key = dataset.seeds[index as usize % dataset.seeds.len()]
-        .key
-        .clone();
-    key.asset_id = format!("layout-{index:010}");
-    key
-}
-fn dataset(path: &Path) -> Result<Dataset> {
-    let value: Dataset = serde_json::from_slice(&read_bounded(path, 1024 * 1024)?)?;
-    ensure!(
-        value.version == 1
-            && matches!(value.count, 10_000 | 100_000)
-            && value.seeds.len() == 30
-            && value.marker_overhead_bytes == 37,
-        "unexpected layout dataset"
-    );
-    for seed in &value.seeds {
-        seed.key.validate()?;
-        ensure!(
-            seed.key.renderer_version == renderer_identity()
-                && seed.key.tier == Tier::Thumbnail
-                && seed.key.edge == 512
-                && seed.key.encoding
-                    == CodecSettings {
-                        codec: Codec::Jpeg,
-                        quality: 80
-                    },
-            "layout renderer/selection mismatch"
-        );
-    }
-    Ok(value)
 }
 fn prepare(campaign: &Path, output: &Path, count: u32, layout: LayoutArg) -> Result<()> {
     ensure!(
