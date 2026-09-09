@@ -57,6 +57,7 @@ pub struct Catalog {
 /// most one directory entry and queues native rendering; callers interleave
 /// foreground requests/ticks rather than blocking on full-image development.
 pub struct ImportSession {
+    source_root: PathBuf,
     catalog_root: PathBuf,
     entries: walkdir::IntoIter,
     volumes: import_storage::ImportVolumes,
@@ -99,6 +100,9 @@ impl ImportSession {
             catalog.root == self.catalog_root,
             "import session belongs to another catalog"
         );
+        if let Some(service) = service.as_ref() {
+            service.ensure_original_separate(&self.source_root)?;
+        }
         if self.finished {
             return Ok(ImportAdvance {
                 finished: true,
@@ -148,6 +152,9 @@ impl ImportSession {
                 finished: false,
                 consumer: None,
             });
+        }
+        if let Some(service) = service.as_ref() {
+            service.ensure_original_separate(entry.path())?;
         }
         self.processed += 1;
         let consumer = catalog.import_file(
@@ -282,6 +289,7 @@ impl Catalog {
             service.is_drained(),
             "synchronous preview import requires a drained service; drain existing consumers or use begin_import/ImportSession::advance"
         );
+        service.ensure_original_separate(folder.as_ref())?;
         self.import_impl(folder, max_files, observer, Some(service))
     }
     pub fn begin_import(
@@ -298,6 +306,7 @@ impl Catalog {
         let lock = ImportLock::acquire(&self.root.join("import.lock"))?;
         self.begin_metadata_scan()?;
         Ok(ImportSession {
+            source_root: folder.clone(),
             catalog_root: self.root.clone(),
             entries: walkdir::WalkDir::new(folder)
                 .follow_links(false)

@@ -447,6 +447,10 @@ impl PreviewService {
             _reservation: reservation,
         }))
     }
+    /// Validate actual source admission independently of configured root hints.
+    pub(crate) fn ensure_original_separate(&self, source: &Path) -> Result<()> {
+        self.store.ensure_original_separate(source)
+    }
     /// Explicit sources are supplied by the import walker after durable reserve
     /// and metadata capture. Browse misses resolve the current tagged catalog path.
     pub fn submit_import(
@@ -518,6 +522,7 @@ impl PreviewService {
         job: SavedJob,
         priority: Priority,
     ) -> Result<Consumer> {
+        self.ensure_original_separate(&job.request.source.to_path()?)?;
         ensure!(self.available_request_slots() > 0, "preview consumer limit");
         let id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
             .to_hex()
@@ -642,7 +647,11 @@ impl PreviewService {
                 .encoded
                 .try_reserve(self.limits.per_worker_encoded_bytes)
                 .ok_or(EncodedBudgetExceeded)?;
-            match WorkerProcess::spawn(&self.executable, &self.staging, job.request.clone()) {
+            let launch = (|| {
+                self.ensure_original_separate(&job.request.source.to_path()?)?;
+                WorkerProcess::spawn(&self.executable, &self.staging, job.request.clone())
+            })();
+            match launch {
                 Ok(worker) => {
                     self.active.insert(
                         lease.id,

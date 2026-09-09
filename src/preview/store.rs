@@ -151,6 +151,43 @@ pub struct PreviewStore {
     touches: RefCell<HashMap<String, i64>>,
 }
 impl PreviewStore {
+    /// Enforce separation from authoritative and in-flight owned cache roots,
+    /// even when a library caller omitted a source from its configured root list.
+    pub(crate) fn ensure_original_separate(&self, source: &Path) -> Result<()> {
+        let source = match fs::canonicalize(source) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = source.parent().context("original has no parent")?;
+                crate::prospective_directory(parent)?
+                    .join(source.file_name().context("original has no filename")?)
+            }
+            Err(error) => {
+                return Err(error).context("resolve original location for cache separation");
+            }
+        };
+        let mut roots = vec![
+            self.config.manifest_root.clone(),
+            self.config.thumbnail_root.clone(),
+            self.config.large_root.clone(),
+        ];
+        let mut statement = self
+            .db
+            .prepare("SELECT source,target FROM relocations LIMIT 2")?;
+        let relocations = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in relocations {
+            let (old, new) = row?;
+            roots.extend([PathBuf::from(old), PathBuf::from(new)]);
+        }
+        for root in roots {
+            ensure!(
+                !source.starts_with(&root) && !root.starts_with(&source),
+                "original overlaps preview storage"
+            );
+        }
+        Ok(())
+    }
     pub fn open(mut config: StoreConfig, original_roots: &[PathBuf]) -> Result<Self> {
         ensure!(
             config.thumbnail_bytes > 0
@@ -1343,6 +1380,62 @@ mod tests {
         assert_eq!(store.usage().unwrap().thumbnail_bytes, 0);
         store.publish(&key, b"valid", authority).unwrap();
         assert_eq!(store.read(&key, false).unwrap().unwrap().bytes, b"valid");
+    }
+    #[test]
+    fn source_admission_tracks_both_relocation_roots_until_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = PreviewStore::open(config(root.path(), 100, 100), &[]).unwrap();
+        let k = key(1, Tier::Thumbnail);
+        store.desire(&k, || Ok(true)).unwrap();
+        store.publish(&k, b"original", authority).unwrap();
+        let old = store.config.thumbnail_root.clone();
+        let moved = root.path().join("moved");
+        assert!(
+            store
+                .ensure_original_separate(&root.path().join("offline/missing.png"))
+                .is_ok()
+        );
+        store
+            .begin_relocation(Tier::Thumbnail, &moved, &[])
+            .unwrap();
+        assert!(
+            store
+                .ensure_original_separate(&moved.join("missing.png"))
+                .is_err()
+        );
+        assert!(
+            store
+                .ensure_original_separate(&old.join("missing.png"))
+                .is_err()
+        );
+        let step = store.relocation_step(Tier::Thumbnail, 2, 100).unwrap();
+        assert_eq!(step.phase, "cleanup");
+        assert!(
+            store
+                .ensure_original_separate(&old.join("missing.png"))
+                .is_err()
+        );
+        assert!(
+            store
+                .ensure_original_separate(&moved.join("missing.png"))
+                .is_err()
+        );
+        assert!(
+            store
+                .relocation_step(Tier::Thumbnail, 2, 100)
+                .unwrap()
+                .complete
+        );
+        assert!(
+            store
+                .ensure_original_separate(&old.join("missing.png"))
+                .is_ok()
+        );
+        assert!(
+            store
+                .ensure_original_separate(&moved.join("missing.png"))
+                .is_err()
+        );
     }
     #[test]
     fn original_overlap_and_conflicting_process_owner_are_rejected() {

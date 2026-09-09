@@ -123,3 +123,14 @@ filesystem was filled. The import-interleaving regression also consumes a real
 retained foreground read while the native import reservation remains active and
 keeps that caller-owned view alive across native foreground preemption/recovery.
 These new tests remain UNRUN pending the next bounded native gate.
+
+Source admission no longer relies only on configured original-root hints. Direct
+render requests and import submissions resolve each actual source and reject
+intersections with current manifest/tier roots before saving a job or changing a
+desired preview key. Import wrappers reject an overlapping root before beginning
+their scan; incremental advances recheck their root and each file before reserve.
+The guard also covers both sides of an unfinished relocation, and launch rechecks
+protect jobs whose filesystem mapping changed while queued. Missing legitimate
+originals remain admissible for the existing explicit unavailable/retry flow.
+Source-ready tests cover omitted root configuration, all three cache roots,
+real catalog relinking into a relocated tier, and copy/cleanup root ownership.

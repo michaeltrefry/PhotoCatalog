@@ -28,6 +28,133 @@ fn image(path: &Path, color: [u8; 3]) {
         .save(path)
         .unwrap();
 }
+fn omitted_roots_service(root: &Path) -> PreviewService {
+    PreviewService::open(
+        configuration(root),
+        &[],
+        PathBuf::from(env!("CARGO_BIN_EXE_photocatalog")),
+        PreviewPolicy::default(),
+        ServiceLimits::default(),
+    )
+    .unwrap()
+}
+fn wanted_rows(previews: &PreviewService) -> Vec<(String, String, Option<String>)> {
+    let db = rusqlite::Connection::open(
+        previews
+            .cache_configuration()
+            .manifest_root
+            .join("previews.sqlite3"),
+    )
+    .unwrap();
+    let mut statement = db
+        .prepare("SELECT asset,desired,current FROM wanted ORDER BY asset,variant,tier")
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn omitted_original_roots_cannot_admit_direct_import_or_scan_of_any_cache_root() {
+    for tier in 0..3 {
+        let root = tempfile::tempdir().unwrap();
+        let mut previews = omitted_roots_service(&root.path().join("cache"));
+        let config = previews.cache_configuration().clone();
+        let source_root = [
+            config.manifest_root,
+            config.thumbnail_root,
+            config.large_root,
+        ][tier]
+            .clone();
+        let source = source_root.join("original.png");
+        image(&source, [41, 87, 149]);
+        let bytes = std::fs::read(&source).unwrap();
+        let catalog_root = root.path().join("catalog");
+        let mut catalog = Catalog::open(&catalog_root).unwrap();
+        assert!(
+            catalog
+                .import_with_previews(&source_root, None, |_| Ok(()), &mut previews)
+                .is_err()
+        );
+        assert!(catalog.browse(0, 10).unwrap().is_empty());
+        let mut scan = catalog.begin_import(&source_root, None).unwrap();
+        assert!(scan.advance(&mut catalog, &mut previews).is_err());
+        assert!(catalog.browse(0, 10).unwrap().is_empty());
+        drop(scan);
+        // Compatibility import seeds an existing catalog reference; direct S6
+        // requests still must reject it when configured original roots are empty.
+        catalog.import(&source_root, None, |_| Ok(())).unwrap();
+        let asset = catalog.browse(0, 10).unwrap().remove(0);
+        assert!(
+            previews
+                .request(&mut catalog, &asset.id, Tier::Large, Priority::Foreground)
+                .is_err()
+        );
+        let db = rusqlite::Connection::open(catalog_root.join("catalog.sqlite3")).unwrap();
+        db.execute("UPDATE assets SET state='pending' WHERE id=?1", [&asset.id])
+            .unwrap();
+        assert!(
+            previews
+                .submit_import(&mut catalog, &asset.id, &source, &"a".repeat(64))
+                .is_err()
+        );
+        assert!(previews.jobs(0, 10).unwrap().is_empty());
+        assert!(wanted_rows(&previews).is_empty());
+        assert!(previews.is_drained());
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+}
+#[test]
+fn relink_into_relocated_cache_is_rejected_without_changing_desired_preview() {
+    use photocatalog::{catalog_storage::RelinkScope, storage_volume::NativePath};
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    let source = originals.join("original.png");
+    image(&source, [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    catalog.import(&originals, None, |_| Ok(())).unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let mut previews = omitted_roots_service(&root.path().join("cache"));
+    let legitimate = previews
+        .request(&mut catalog, &asset.id, Tier::Large, Priority::Foreground)
+        .unwrap();
+    previews.cancel(legitimate).unwrap();
+    let moved = root.path().join("relocated-large");
+    previews.begin_relocation(Tier::Large, &moved, &[]).unwrap();
+    while !previews
+        .relocation_step(Tier::Large, 1, 1024 * 1024)
+        .unwrap()
+        .complete
+    {}
+    let destination = moved.join("original.png");
+    std::fs::copy(&source, &destination).unwrap();
+    let plan = catalog
+        .begin_relink(RelinkScope::Asset {
+            asset_id: asset.id.clone(),
+            destinations: vec![NativePath::from_path(&destination)],
+        })
+        .unwrap();
+    while catalog.relink_plan(&plan.id).unwrap().state == "preparing" {
+        catalog.prepare_relink_batch(&plan.id, 1).unwrap();
+    }
+    catalog.apply_relink(&plan.id).unwrap();
+    let before = wanted_rows(&previews);
+    assert!(
+        previews
+            .request(&mut catalog, &asset.id, Tier::Large, Priority::Foreground)
+            .is_err()
+    );
+    assert_eq!(wanted_rows(&previews), before);
+    assert!(previews.jobs(0, 10).unwrap().is_empty());
+    assert!(previews.is_drained());
+    assert_eq!(
+        std::fs::read(source).unwrap(),
+        std::fs::read(destination).unwrap()
+    );
+}
 #[test]
 fn frozen_worker_allowance_queues_second_actual_child_until_first_releases() {
     let root = tempfile::tempdir().unwrap();
