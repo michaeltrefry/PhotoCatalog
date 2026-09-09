@@ -1,6 +1,6 @@
 # Volume identity and native paths (S5)
 
-Status: macOS standalone build, focused tests, Clippy, and disposable APFS lifecycle checks passed on 2026-09-09 for adapter commit `644eb45`. Native Windows/Linux execution and integrated catalog acceptance remain pending. No production storage has been detached, mounted, scanned recursively, opened for content reads, or modified. This adapter is the OS observation portion of sc-22840; the catalog transaction, availability, relink preview, content verification, and undo are separate integration work.
+Status: macOS standalone build, focused tests, Clippy, and disposable APFS lifecycle checks passed on 2026-09-09 for adapter commit `644eb45`. The integrated macOS catalog lifecycle subsequently passed on final S5 source; see STORAGE_RELINKING.md for the reproducible CLI harness and receipt. Native Windows/Linux execution remains subject to final CI. No production storage has been detached, mounted, scanned recursively, opened for content reads, or modified. This adapter is the OS observation portion of sc-22840; the catalog transaction, availability, relink preview, content verification, and undo are separate integration work.
 
 ## Public API and integration contract
 
