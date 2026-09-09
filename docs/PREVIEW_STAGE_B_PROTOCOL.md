@@ -1,6 +1,6 @@
 # Preview Stage B execution protocol 1
 
-Status: source candidate, unbuilt and unrun. Independent review and the parent's
+Status: Mac correctness gate passed; the campaign is unrun. Independent review and the parent's
 explicit hardware-lane grant are required before execution. This supplements
 PREVIEW_EXPERIMENT_PROTOCOL.md; it does not replace its workloads or acceptance
 budgets. The sealed 512/1600 JPEG80 selection and historical Stage A artifacts

@@ -1,8 +1,9 @@
 # Preview service and retained storage
 
 This source checkpoint joins the selected 512/1600 JPEG80 pair to actual isolated
-workers, catalog revision guards, durable jobs and cache relocation. Its service
-integration tests are not yet run. Stage B layout/timing, full-worker peak-memory
+workers, catalog revision guards, durable jobs and cache relocation. The Mac gate
+passes 228 Rust tests and 11 Python preview-contract tests, with package formatting
+and all-target Clippy clean. Stage B layout/timing, full-worker peak-memory
 qualification, current-renderer visual qualification and cross-platform native
 CI remain required before S6 is complete. The `ServiceLimits::default()` values
 are provisional admission settings for fixture execution, not a measured product
@@ -77,14 +78,18 @@ readable copies for explicit retry; cleanup does not recursively remove foreign
 files or directories. Duplicate copies and filesystem/marker overhead are
 separate from the encoded-object quota and must be included in disk reporting.
 
-Source-ready validation covers actual worker imports/offline reads, durable
+Local validation covers actual worker imports/offline reads, durable
 resource refusal and retry with a legacy fallback, pixel-generation rejection,
 nonpixel rating edits, foreground preemption during incremental import, relocation
 restart before/after the location switch, and actual owner-process exits at four
 cross-database boundaries. Named short observer callbacks expose manifest attach,
 before catalog commit, after catalog commit and before journal removal; default
-execution installs no callback. This is an evidence plan until those tests run.
+execution installs no callback. These correctness results do not award measured
+performance or cross-platform native acceptance.
 The six-finding review repair also adds canceled/same-key resubmission, occupied
 synchronous import, mixed valid/foreign-path resume, interrupted relocation
 admission, all root-overlap pairs, and deferred-constraint COMMIT failure/reuse
-regressions. These additions are source-ready and unrun while S7 owns timing.
+regressions. All passed in the same local gate; logs and initial compile/fixture
+failures are retained privately in `sc-22841-service-repair-v1`. The runtime probe
+was also exercised through a tiny generated DNG and its saved JPEG verifier,
+including same-size byte corruption rejection. No Stage B campaign has run.

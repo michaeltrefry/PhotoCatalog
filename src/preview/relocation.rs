@@ -520,7 +520,10 @@ mod tests {
             .unwrap()
             .complete
         {}
-        assert_eq!(store.config.thumbnail_root, destination);
+        assert_eq!(
+            store.config.thumbnail_root,
+            fs::canonicalize(destination).unwrap()
+        );
         assert!(config.thumbnail_root.exists());
     }
     #[test]

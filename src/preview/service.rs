@@ -132,8 +132,9 @@ pub struct PreviewView {
     pub record: Option<RenderRecord>,
     pub stale: bool,
 }
+type ServiceObserver = Box<dyn FnMut(ServiceEvent) -> Result<()> + Send>;
 pub struct PreviewService {
-    observer: std::cell::RefCell<Option<Box<dyn FnMut(ServiceEvent) -> Result<()> + Send>>>,
+    observer: std::cell::RefCell<Option<ServiceObserver>>,
     store: PreviewStore,
     decoded: DecodedCache,
     scheduler: PreviewScheduler,
@@ -265,26 +266,27 @@ impl PreviewService {
             .try_reserve(allowance)
             .context("encoded staging unavailable")?;
         let Some(cached) = self.store.read_limited(&key, allow_stale, allowance)? else {
-            if allow_stale && tier == Tier::Thumbnail {
-                if let Some((hash, bytes)) = catalog.retained_legacy_preview(asset, allowance)? {
-                    let (width, height) = encoded_dimensions(&bytes, Codec::Jpeg)?;
-                    let pixels = self.decoded.decode(
-                        blake3::hash(format!("legacy:{hash}").as_bytes())
-                            .to_hex()
-                            .to_string(),
-                        &bytes,
-                        Codec::Jpeg,
-                        width,
-                        height,
-                    )?;
-                    return Ok(Some(PreviewView {
-                        key: None,
-                        legacy_hash: Some(hash),
-                        pixels,
-                        record: None,
-                        stale: true,
-                    }));
-                }
+            if allow_stale
+                && tier == Tier::Thumbnail
+                && let Some((hash, bytes)) = catalog.retained_legacy_preview(asset, allowance)?
+            {
+                let (width, height) = encoded_dimensions(&bytes, Codec::Jpeg)?;
+                let pixels = self.decoded.decode(
+                    blake3::hash(format!("legacy:{hash}").as_bytes())
+                        .to_hex()
+                        .to_string(),
+                    &bytes,
+                    Codec::Jpeg,
+                    width,
+                    height,
+                )?;
+                return Ok(Some(PreviewView {
+                    key: None,
+                    legacy_hash: Some(hash),
+                    pixels,
+                    record: None,
+                    stale: true,
+                }));
             }
             return Ok(None);
         };
@@ -461,16 +463,13 @@ impl PreviewService {
     pub fn cancel(&mut self, consumer: Consumer) -> Result<()> {
         self.scheduler.cancel(consumer);
         self.completed.remove(&consumer);
-        if let Some(id) = self.consumers.remove(&consumer) {
-            if !self.consumers.values().any(|key| key == &id)
-                && !self.active.values().any(|active| active.lease.key == id)
-            {
-                if let Some(job) = self.jobs.remove(&id) {
-                    if !job.import {
-                        self.store.finish_job(&id)?;
-                    }
-                }
-            }
+        if let Some(id) = self.consumers.remove(&consumer)
+            && !self.consumers.values().any(|key| key == &id)
+            && !self.active.values().any(|active| active.lease.key == id)
+            && let Some(job) = self.jobs.remove(&id)
+            && !job.import
+        {
+            self.store.finish_job(&id)?;
         }
         Ok(())
     }
@@ -740,23 +739,22 @@ impl PreviewService {
                     continue;
                 }
                 // Crash after manifest attachment but before catalog ready commit.
-                if job.import && self.store.current_is_intact(key)? {
-                    if let Some(record) = self.store.render_record(key)? {
-                        if catalog
-                            .commit_preview_import(
-                                &job.expected,
-                                &key.fingerprint,
-                                &record.metadata,
-                                &key.digest()?,
-                                || Ok(()),
-                                || Ok(()),
-                            )?
-                            .is_some()
-                        {
-                            self.store.finish_job(&id)?;
-                            continue;
-                        }
-                    }
+                if job.import
+                    && self.store.current_is_intact(key)?
+                    && let Some(record) = self.store.render_record(key)?
+                    && catalog
+                        .commit_preview_import(
+                            &job.expected,
+                            &key.fingerprint,
+                            &record.metadata,
+                            &key.digest()?,
+                            || Ok(()),
+                            || Ok(()),
+                        )?
+                        .is_some()
+                {
+                    self.store.finish_job(&id)?;
+                    continue;
                 }
                 if !retry_blocked && !matches!(job.state, JobState::Queued) {
                     continue;
@@ -788,12 +786,11 @@ impl PreviewService {
             // The caller never loses an inaccessible live consumer on Err.
             for consumer in consumers {
                 self.scheduler.cancel(consumer);
-                if let Some(id) = self.consumers.remove(&consumer) {
-                    if !self.consumers.values().any(|other| other == &id)
-                        && !self.active.values().any(|active| active.lease.key == id)
-                    {
-                        self.jobs.remove(&id);
-                    }
+                if let Some(id) = self.consumers.remove(&consumer)
+                    && !self.consumers.values().any(|other| other == &id)
+                    && !self.active.values().any(|active| active.lease.key == id)
+                {
+                    self.jobs.remove(&id);
                 }
             }
             return Err(error);

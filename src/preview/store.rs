@@ -704,10 +704,10 @@ impl PreviewStore {
             |r| r.get(0),
         )?;
         if !exists {
-            let count: usize = self
+            let count: u64 = self
                 .db
-                .query_row("SELECT count(*) FROM render_jobs", [], |r| r.get(0))?;
-            ensure!(count < limit, "durable preview queue full");
+                .query_row("SELECT count(*) FROM render_jobs", [], |r| unsigned(r, 0))?;
+            ensure!(count < limit as u64, "durable preview queue full");
         }
         self.db.execute("INSERT INTO render_jobs VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET descriptor=excluded.descriptor",params![id,descriptor,self.clock()?])?;
         Ok(())

@@ -490,17 +490,17 @@ fn peak_resident_memory() -> (Option<u64>, String) {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
-            if let Ok(value) = u64::try_from(usage.ru_maxrss) {
-                #[cfg(target_os = "macos")]
-                let bytes = value;
-                #[cfg(target_os = "linux")]
-                let bytes = value.saturating_mul(1024);
-                return (
-                    Some(bytes),
-                    "getrusage process high-water RSS; macOS bytes/Linux KiB normalized".into(),
-                );
-            }
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0
+            && let Ok(value) = u64::try_from(usage.ru_maxrss)
+        {
+            #[cfg(target_os = "macos")]
+            let bytes = value;
+            #[cfg(target_os = "linux")]
+            let bytes = value.saturating_mul(1024);
+            return (
+                Some(bytes),
+                "getrusage process high-water RSS; macOS bytes/Linux KiB normalized".into(),
+            );
         }
         (None, "getrusage unavailable".into())
     }
