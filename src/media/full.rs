@@ -342,7 +342,7 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
                 }
             } else if is_raw {
                 notes.push("Camera matrix and as-shot white balance; exact vendor crop applied after full-area demosaic. Baseline exposure, automatic brightness, display tone curves and Adobe DCP looks are excluded from scene-linear editor input.".into());
-                notes.push(if out.bits==32 {"Floating linear DNG: no integer clipping; matrix/WB interpretation requires camera reference validation."} else {"LibRaw full-size camera RGB demosaic with unit WB, linear 16-bit sensor normalization; as-shot WB and camera-to-sRGB matrix applied afterwards in unclamped float. Sensor samples above white are clipped before demosaic."}.into());
+                notes.push("LibRaw full-size camera RGB demosaic with camera white balance and documented highlight=2 clipped-chroma blending before the camera-to-sRGB matrix. The actual WB headroom normalization is restored in unclamped float, retaining signed and over-one RGB. This highlight treatment cannot recover clipped sensor detail; no display tone curve is applied.".into());
             }
             (
                 dynamic,
@@ -482,7 +482,7 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
         height: out_height,
         pixels,
         provenance: RenderProvenance {
-            pipeline_version: "photocatalog-render-3".into(),
+            pipeline_version: "photocatalog-render-4".into(),
             decoder,
             source_bits_per_channel: bits,
             source_color,
@@ -703,3 +703,7 @@ fn png_profile(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     .map(Some)
     .map_err(|e| error(DecodeStatus::Corrupt, e))
 }
+
+#[cfg(test)]
+#[path = "raw_highlight_tests.rs"]
+mod raw_highlight_tests;

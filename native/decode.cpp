@@ -64,22 +64,37 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
         out->orientation = (flip >= 0 && flip < 8) ? orientations[flip] : 1;
         // Stable full sensor development, not an embedded JPEG. Orientation is applied in Rust once.
         auto &p = raw.imgdata.params;
-        float camera_wb[3]; float camera_to_rgb[3][3];
+        float camera_to_rgb[3][3];
         for (int c=0;c<3;++c) {
-            camera_wb[c]=raw.imgdata.color.cam_mul[c];
+            if (!(raw.imgdata.color.cam_mul[c]>0) || !std::isfinite(raw.imgdata.color.cam_mul[c]))
+                return fail(out,"unsupported RAW missing as-shot white balance");
             for(int k=0;k<3;++k) camera_to_rgb[c][k]=raw.imgdata.color.rgb_cam[c][k];
         }
-        float minimum_wb=std::min(camera_wb[0],std::min(camera_wb[1],camera_wb[2]));
-        if (!(minimum_wb>0)) return fail(out,"unsupported RAW missing as-shot white balance");
-        p.half_size = 0; p.user_flip = 0; p.use_camera_wb = 0; p.use_auto_wb = 0;
-        for (int c=0;c<4;++c) p.user_mul[c]=1.f;
+        // WB belongs before demosaic and highlight handling. With highlight=2,
+        // LibRaw scales by the largest WB multiplier to retain sensor headroom,
+        // then blends clipped chroma in camera space (dcraw's documented -H 2).
+        // Applying WB after clipping instead creates false magenta/green highlights.
+        p.half_size = 0; p.user_flip = 0; p.use_camera_wb = 1; p.use_auto_wb = 0;
         p.use_camera_matrix = 1; p.output_color = 0; p.output_bps = 16;
         p.gamm[0] = 1.0; p.gamm[1] = 1.0; p.no_auto_bright = 1;
-        p.user_qual = 3; p.highlight = 0;
+        p.user_qual = 3; p.highlight = 2;
         status = raw.unpack(); if (status) return fail(out, libraw_strerror(status));
         if (raw.imgdata.rawdata.float_image || raw.imgdata.rawdata.float3_image || raw.imgdata.rawdata.float4_image)
             return fail(out, "unsupported floating DNG: requires validated ForwardMatrix/profile and transparency-mask rendering; integer conversion is forbidden");
         status = raw.dcraw_process(); if (status) return fail(out, libraw_strerror(status));
+        // scale_colors normalizes the actual WB (including camera white-patch or
+        // already-balanced RAW handling) into pre_mul. Undo only its common
+        // headroom scale in float; never apply the channel WB twice. The 3-channel
+        // output uses merged green, so the fourth CFA multiplier is not a channel.
+        float minimum_wb=1.f;
+        for(int c=0;c<3;++c) {
+            float wb=raw.imgdata.color.pre_mul[c];
+            if (!(wb>0) || !std::isfinite(wb))
+                return fail(out,"unsupported RAW invalid developed white balance");
+            minimum_wb=std::min(minimum_wb,wb);
+        }
+        const float headroom=1.f/minimum_wb;
+        if (!std::isfinite(headroom)) return fail(out,"unsupported RAW white balance range");
         auto *processed = raw.dcraw_make_mem_image(&status);
         if (!processed) return fail(out, libraw_strerror(status));
         std::unique_ptr<libraw_processed_image_t, decltype(&LibRaw::dcraw_clear_mem)> image(processed, LibRaw::dcraw_clear_mem);
@@ -105,7 +120,7 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
             size_t source=(i/out->width+crop_top)*processed->width+(i%out->width+crop_left);
             for (size_t c = 0; c < 3; ++c) {
                 float value=0;
-                for(size_t k=0;k<3;++k) value+=camera_to_rgb[c][k]*(samples[3*source+k]/65535.0f)*(camera_wb[k]/minimum_wb);
+                for(size_t k=0;k<3;++k) value+=camera_to_rgb[c][k]*(samples[3*source+k]/65535.0f)*headroom;
                 out->pixels[4*i+c]=value;
             }
             out->pixels[4*i+3] = 1;
