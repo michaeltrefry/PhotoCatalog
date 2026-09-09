@@ -331,13 +331,25 @@ fn revision(db: &Connection, asset: &str) -> Result<i64> {
     let found: Option<i64> = db.query_row("SELECT COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0)).optional()?;
     found.context("asset not found")
 }
-fn advance(db: &Connection, asset: &str, action: &str, detail: &serde_json::Value) -> Result<i64> {
+fn advance(
+    db: &Connection,
+    asset: &str,
+    action: &str,
+    detail: &serde_json::Value,
+    affects_pixels: bool,
+) -> Result<i64> {
     db.execute("INSERT INTO metadata_assets(asset_id,revision) VALUES(?1,1) ON CONFLICT(asset_id) DO UPDATE SET revision=revision+1",[asset])?;
     let next = revision(db, asset)?;
     db.execute(
         "INSERT INTO metadata_history(asset_id,revision,action,detail) VALUES(?1,?2,?3,?4)",
         params![asset, next, action, serde_json::to_string(detail)?],
     )?;
+    if affects_pixels {
+        db.execute(
+            "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
+            [asset],
+        )?;
+    }
     crate::organization::refresh(db, asset)?;
     Ok(next)
 }
@@ -566,6 +578,9 @@ impl Catalog {
     /// Hold catalog generation authority only for the final preview-manifest CAS.
     /// Stage and flush image bytes before entering this guard; callbacks must not
     /// acquire catalog locks in reverse order. Visible reads still check current keys.
+    /// Metadata revisions also track organization; generation advances for every
+    /// potentially pixel-affecting metadata transition, so flags/ratings need not
+    /// cancel otherwise valid preview publication. Export keeps its full revision CAS.
     pub fn with_render_identity<T>(
         &mut self,
         expected: &RenderIdentity,
@@ -575,7 +590,12 @@ impl Catalog {
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current=tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[&expected.asset_id],|r|Ok(RenderIdentity{asset_id:expected.asset_id.clone(),generation:r.get(0)?,fingerprint:r.get(1)?,state:r.get(2)?,metadata_revision:r.get(3)?})).optional()?;
-        if current.as_ref() != Some(expected) {
+        if !current.as_ref().is_some_and(|current| {
+            current.asset_id == expected.asset_id
+                && current.generation == expected.generation
+                && current.fingerprint == expected.fingerprint
+                && current.state == expected.state
+        }) {
             return Ok(None);
         }
         let result = attach()?;
@@ -613,6 +633,7 @@ impl Catalog {
                 asset,
                 "observe",
                 &serde_json::json!({"observation_id":observation_id}),
+                true,
             )?
         } else {
             revision(&tx, asset)?
@@ -707,6 +728,7 @@ impl Catalog {
             asset,
             "resolve",
             &serde_json::json!({"field":field,"model_id":model_id}),
+            true,
         )?;
         tx.commit()?;
         Ok(next)
@@ -851,6 +873,13 @@ impl Catalog {
             revision(&self.db, asset)? == expected_revision,
             "metadata changed; refresh before editing"
         );
+        ensure!(
+            organization_fields.iter().all(|f| matches!(
+                f.as_str(),
+                "rating" | "label" | "keywords" | "hierarchical_keywords"
+            )),
+            "organization field can affect pixels"
+        );
         let input = self.organization_edit_input(asset, base_model, organization_fields)?;
         let bytes = if organization_fields.is_empty() {
             xmp::apply_edits(&input, edits)?
@@ -959,10 +988,7 @@ impl Catalog {
             asset,
             "edit",
             &serde_json::json!({"observation_id":observation_id,"base_model":base_model,"edits":edits}),
-        )?;
-        tx.execute(
-            "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
-            [asset],
+            organization_fields.is_empty(),
         )?;
         after(&tx, revision)?;
         tx.commit()?;
@@ -1057,6 +1083,7 @@ impl Catalog {
             asset,
             "source_unavailable",
             &serde_json::json!({"kind":source.kind,"display":source.display,"reason":reason}),
+            true,
         )?;
         tx.commit()?;
         Ok(true)

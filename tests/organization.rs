@@ -785,3 +785,69 @@ fn unix_backslash_components_remain_literal_folder_and_filename_data() -> Result
     ensure!(serde_json::from_str::<NativePath>(&locator)? == NativePath::from_path(&folder));
     Ok(())
 }
+
+#[test]
+fn nonpixel_edits_preserve_preview_authority_but_source_and_arbitrary_edits_invalidate()
+-> Result<()> {
+    let (_temp, _root, photos, mut cat) = setup()?;
+    photo(&photos.join("one.jpg"))?;
+    fs::write(photos.join("one.xmp"), packet(3))?;
+    cat.import(&photos, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let queued = cat.render_identity(&asset.id)?;
+    for operation in [
+        Operation::Rating { value: 5 },
+        Operation::Label {
+            value: "red".into(),
+        },
+        Operation::Flag { value: Flag::Pick },
+        Operation::AddKeyword {
+            kind: KeywordKind::Flat,
+            path: vec!["term".into()],
+        },
+        Operation::MoveKeyword {
+            from: vec!["A".into()],
+            to: vec!["B".into()],
+        },
+    ] {
+        apply(&mut cat, &asset.id, operation)?;
+        ensure!(cat.render_identity(&asset.id)?.generation == queued.generation);
+        ensure!(cat.with_render_identity(&queued, || Ok(7))? == Some(7));
+    }
+    ensure!(cat.render_identity(&asset.id)?.metadata_revision > queued.metadata_revision);
+    let view = cat.metadata(&asset.id)?;
+    let mid = view
+        .fields
+        .iter()
+        .find(|f| f.name == "rating")
+        .unwrap()
+        .selected_model
+        .unwrap();
+    cat.edit_metadata(
+        &asset.id,
+        view.revision,
+        Some(mid),
+        &[photocatalog::xmp::Edit::Set {
+            namespace: "http://ns.adobe.com/tiff/1.0/".into(),
+            path: "Orientation".into(),
+            value: "6".into(),
+        }],
+    )?;
+    ensure!(cat.with_render_identity(&queued, || Ok(7))?.is_none());
+    let prior_source = cat.render_identity(&asset.id)?;
+    fs::write(photos.join("one.xmp"), packet(1))?;
+    cat.import(&photos, None, |_| Ok(()))?;
+    ensure!(cat.with_render_identity(&prior_source, || Ok(7))?.is_none());
+    let prior_choice = cat.render_identity(&asset.id)?;
+    let view = cat.metadata(&asset.id)?;
+    let rating = view.fields.iter().find(|f| f.name == "rating").unwrap();
+    let source = rating
+        .candidates
+        .iter()
+        .find(|c| c.source_kind == "sidecar")
+        .unwrap()
+        .model_id;
+    cat.resolve_metadata(&asset.id, view.revision, "rating", source)?;
+    ensure!(cat.with_render_identity(&prior_choice, || Ok(7))?.is_none());
+    Ok(())
+}

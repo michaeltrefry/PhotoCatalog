@@ -363,7 +363,7 @@ fn set_scalar(meta: &mut XmpMeta, ns: &str, path: &str, value: &str) -> Result<(
 
 pub fn apply_edits(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
     ensure!(edits.len() <= 1000, "too many metadata edits");
-    apply_organization_edits(bytes, edits)
+    apply_edits_inner(bytes, edits)
 }
 /// Organization may update each of the already bounded 10,000 array items. Keep
 /// one native mutation pass: sorting between chunks would change item addresses.
@@ -372,6 +372,83 @@ pub(crate) fn apply_organization_edits(bytes: &[u8], edits: &[Edit]) -> Result<V
         edits.len() <= MAX_ITEMS,
         "too many organization array edits"
     );
+    if !edits.is_empty()
+        && edits.iter().all(|edit| match edit {
+            Edit::Set {
+                namespace, path, ..
+            } => {
+                namespace == "http://ns.adobe.com/lightroom/1.0/"
+                    && path
+                        .strip_prefix("hierarchicalSubject[")
+                        .and_then(|p| p.strip_suffix(']'))
+                        .is_some_and(|p| p.parse::<usize>().is_ok_and(|i| i > 0))
+            }
+            _ => false,
+        })
+    {
+        return replace_hierarchy_items(bytes, edits);
+    }
+    apply_edits_inner(bytes, edits)
+}
+// One full-model undo comparison proves all untouched properties and qualifiers
+// survive a batch of disjoint existing scalar replacements. Do not canonicalize
+// between writes: that would reorder RDF Bags and invalidate the item addresses.
+fn replace_hierarchy_items(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
+    let mut meta = parse(bytes)?;
+    let before = canonical(&meta)?;
+    let mut originals = Vec::with_capacity(edits.len());
+    let mut paths = std::collections::BTreeSet::new();
+    for edit in edits {
+        let Edit::Set {
+            namespace,
+            path,
+            value,
+        } = edit
+        else {
+            unreachable!()
+        };
+        address(namespace, path)?;
+        ensure!(
+            paths.insert(path),
+            "duplicate hierarchy replacement address"
+        );
+        ensure!(!value.contains('\0'), "NUL in metadata value");
+        let old = meta
+            .property(namespace, path)
+            .context("hierarchy replacement item absent")?;
+        ensure!(
+            !old.is_array() && !old.is_struct(),
+            "hierarchy replacement item is structured"
+        );
+        meta.set_property(
+            namespace,
+            path,
+            &XmpValue::new(value.clone()).set_is_uri(old.is_uri()),
+        )?;
+        originals.push((namespace, path, value, old));
+    }
+    let output = serialize(&meta)?;
+    let mut check = parse(&output)?;
+    for (ns, path, value, _) in &originals {
+        ensure!(
+            check.property(ns, path).is_some_and(|p| p.value == **value),
+            "hierarchy replacement did not round-trip"
+        );
+    }
+    for (ns, path, _, old) in originals {
+        check.set_property(
+            ns,
+            path,
+            &XmpValue::new(old.value.clone()).set_is_uri(old.is_uri()),
+        )?;
+    }
+    ensure!(
+        canonical(&check)? == before,
+        "hierarchy replacement changed unrelated XMP semantics"
+    );
+    Ok(output)
+}
+fn apply_edits_inner(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
     let mut meta = parse(bytes)?;
     for edit in edits {
         match edit {

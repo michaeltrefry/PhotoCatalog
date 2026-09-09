@@ -25,6 +25,16 @@ selected property, derive addresses from that exact input, and apply one bounded
 native edit pass before canonicalization; unordered arrays cannot reorder between
 chunks. No operation writes source images or sidecars.
 
+Typed rating, label, keyword, flag, and membership edits advance metadata/search
+revisions while preserving pixel generation. The preview-only publication guard
+compares asset identity, generation, fingerprint, and state. All other S4 metadata
+transitions conservatively advance pixel generation, retaining invalidation for
+source refresh, conflict resolution, arbitrary edits, and unavailable sources.
+Metadata export still requires its full metadata revision check. Hierarchy moves
+validate a batch of disjoint existing scalar replacements with one full-model
+restore comparison, preserving all qualifiers and unrelated properties without
+revalidating the whole packet once per item.
+
 `dc:subject` is a flat term space; `lr:hierarchicalSubject` is a distinct hierarchy
 whose components use `|` in XMP. The hierarchy API uses arrays of components.
 Assigning `Animals|Birds|Owls` adds ancestor membership for recursive searches;
