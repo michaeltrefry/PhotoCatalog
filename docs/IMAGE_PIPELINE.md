@@ -18,7 +18,7 @@ alter the editor's float pixels. Preview codec/cache selection belongs to sc-228
 
 | Input | Component and actual behavior |
 | --- | --- |
-| CR2/RAF/RW2 and recognized camera RAW | LibRaw; full-size demosaic into normalized camera RGB with unit WB, then as-shot WB and camera matrix applied in unclamped float. Sensor normalization still clips samples above sensor white. Exact source/vendor crop is applied after full-area demosaic, before orientation. Missing WB is reported rather than guessed. |
+| CR2/RAF/RW2 and recognized camera RAW | LibRaw; full-size camera-WB demosaic with documented highlight=2 chroma blending before the camera matrix. The actual WB headroom normalization is restored in float, preserving signed and over-one RGB. Sensor clipping cannot recover lost detail. Exact source/vendor crop is applied after full-area demosaic, before orientation. Missing WB is reported rather than guessed. |
 | DNG, including floating/linear/JPEG-XL | Adobe DNG SDK 1.7.1 build 2724: original Stage1→Stage2→Stage3, required opcodes, default crop, as-shot neutral, camera profile's camera-to-PCS matrix and embedded HueSatMap calibration, then linear sRGB. Float samples and separate transparency mask are preserved. |
 | JPEG/PNG/WebP/BMP/TIFF | image-rs; original precision converted to float. ICC RGB profiles use LittleCMS relative-colorimetric conversion with alpha copied and negative values allowed. |
 | AVIF | libavif, single active decoder thread, 16-bit RGB conversion retaining 8/10/12-bit source precision and straight alpha; ICC preferred, otherwise declared CICP. Integer clean aperture and rotation/mirror are applied. |
@@ -32,6 +32,24 @@ rectangle is captured before alignment and applied to the developed RGB. Crop
 containment failures are explicit, with no padding or resizing. Default scene-linear
 input excludes automatic brightness, display tone curves and baseline exposure;
 PGTM lookup weights still account for the source's baseline exposure as required.
+
+`photocatalog-render-4` corrects RAW highlight processing order. Unit-WB clipping
+followed by unequal float WB created false highlight chroma (including magenta
+sky). LibRaw now balances before demosaic and uses its documented `highlight=2`
+blend in camera space. Its maximum-WB normalization protects 16-bit headroom;
+the adapter divides balanced samples by the minimum actual normalized `pre_mul`
+of the three output channels before the float camera matrix. It does not apply
+WB twice or infer that scale from nominal `cam_mul`, which can differ from camera
+white-patch/already-balanced processing. No automatic exposure or intensity tone
+curve is introduced. DNG continues through the separate Adobe SDK path.
+
+The blend preserves brightness and reduces chroma above the weakest balanced
+channel's ceiling; below that ceiling it is inactive. It is conservative and can
+reduce chroma in bright colors even when all physical sensor samples are still
+unclipped. It does not reconstruct lost sensor detail or promise camera-JPEG
+appearance. This explicit development policy, its synthetic independent color
+oracles, and the real-file repair evidence are recorded in
+[RAW_HIGHLIGHT_REPAIR.md](RAW_HIGHLIGHT_REPAIR.md).
 
 Untagged raster RGB assumes sRGB, explicitly recorded. PNG gAMA/cHRM generate a
 source profile; sRGB overrides these. Non-RGB ICC profiles and unsupported PNG
