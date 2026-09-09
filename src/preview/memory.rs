@@ -1,6 +1,6 @@
 //! Decoded pixels retain their memory reservation until the final consumer drops
 //! them. Evicting an LRU entry alone cannot make externally held pixels free.
-use super::{Codec, PreparedRgb, decode};
+use super::{Codec, PreparedRgb, decode, encoded_dimensions};
 use anyhow::{Result, bail, ensure};
 use std::{
     collections::HashMap,
@@ -136,6 +136,10 @@ impl DecodedCache {
             width > 0 && height > 0 && width <= 8192 && height <= 8192,
             "invalid decoded dimensions"
         );
+        ensure!(
+            encoded_dimensions(encoded, codec)? == (width, height),
+            "cached header dimensions mismatch before pixel allocation"
+        );
         let bytes = u64::from(width) * u64::from(height) * 3;
         let reservation = loop {
             if let Some(reservation) = self.budget.try_reserve(bytes) {
@@ -211,6 +215,21 @@ mod tests {
         drop(second);
         drop(third);
         assert_eq!(cache.live_bytes(), 0);
+    }
+    #[test]
+    fn mismatched_header_is_rejected_before_pixel_reservation_for_every_codec() {
+        let rgb = PreparedRgb::new(64, 32, vec![128; 64 * 32 * 3]).unwrap();
+        for codec in [Codec::Jpeg, Codec::Webp, Codec::Avif] {
+            let encoded = encode(&rgb, CodecSettings { codec, quality: 80 }, None).unwrap();
+            let mut cache = DecodedCache::new(3, 3, 1).unwrap();
+            let error = cache
+                .decode("mismatch".into(), &encoded, codec, 1, 1)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("before pixel allocation"));
+            assert_eq!(cache.live_bytes(), 0);
+            assert_eq!(cache.cached_bytes(), 0);
+        }
     }
     #[test]
     fn failed_decode_releases_reserved_memory() {

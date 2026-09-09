@@ -453,7 +453,7 @@ impl PreviewStore {
         if !self.desired(key, &digest)? {
             return Ok(Publication::Stale);
         }
-        if self.read(key, false)?.is_some() {
+        if self.current_is_intact(key)? {
             return authorize(&mut || {
                 if self.desired(key, &digest)? {
                     Ok(Publication::AlreadyPresent)
@@ -573,9 +573,69 @@ impl PreviewStore {
             }
         }
     }
+    /// Check immutable current-object integrity with fixed-size scratch. Duplicate
+    /// publication must not allocate a second encoded object beside the incoming one.
+    pub fn current_is_intact(&self, expected: &PreviewKey) -> Result<bool> {
+        let digest = expected.digest()?;
+        let row: Option<(u64, String)> = self.db.query_row(
+            "SELECT o.bytes,o.checksum FROM wanted w JOIN objects o ON o.key=w.current WHERE w.asset=?1 AND w.variant=?2 AND w.tier=?3 AND o.key=?4 AND o.status='ready'",
+            params![expected.asset_id, expected.variant_id, expected.tier.name(), digest],
+            |r| Ok((unsigned(r, 0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((len, checksum)) = row else {
+            return Ok(false);
+        };
+        let valid = (|| -> Result<bool> {
+            let mut file = File::open(self.path(&digest, expected.tier)?)?;
+            if len > 256 * 1024 * 1024 || file.metadata()?.len() != len {
+                return Ok(false);
+            }
+            let mut hash = blake3::Hasher::new();
+            let mut scratch = [0; 16384];
+            let mut total = 0u64;
+            loop {
+                let count = file.read(&mut scratch)?;
+                if count == 0 {
+                    break;
+                }
+                total += count as u64;
+                if total > len {
+                    return Ok(false);
+                }
+                hash.update(&scratch[..count]);
+            }
+            Ok(total == len && hash.finalize().to_hex().as_str() == checksum)
+        })();
+        match valid {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.remove(&digest, expected.tier)?;
+                Ok(false)
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                self.remove(&digest, expected.tier)?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
     /// Only a thumbnail may be returned as an explicitly stale offline fallback.
     /// The caller provides a fresh catalog identity on each visible request.
     pub fn read(&self, expected: &PreviewKey, allow_stale: bool) -> Result<Option<CachedPreview>> {
+        self.read_limited(expected, allow_stale, 256 * 1024 * 1024)
+    }
+    /// Reject over-budget objects before allocating their bytes. A serial service
+    /// reader passes its remaining encoded staging allowance here.
+    pub fn read_limited(
+        &self,
+        expected: &PreviewKey,
+        allow_stale: bool,
+        max_bytes: u64,
+    ) -> Result<Option<CachedPreview>> {
         expected.validate()?;
         let row:Option<(String,String,u64,String)>=self.db.query_row("SELECT o.key,o.descriptor,o.bytes,o.checksum FROM wanted w JOIN objects o ON o.key=w.current WHERE w.asset=?1 AND w.variant=?2 AND w.tier=?3 AND o.status='ready'",params![expected.asset_id,expected.variant_id,expected.tier.name()],|r|Ok((r.get(0)?,r.get(1)?,unsigned(r,2)?,r.get(3)?))).optional()?;
         let Some((digest, descriptor, len, checksum)) = row else {
@@ -593,7 +653,7 @@ impl PreviewStore {
                 && key.tier == expected.tier,
             "manifest descriptor identity mismatch"
         );
-        let file = match File::open(self.path(&digest, key.tier)?) {
+        let mut file = match File::open(self.path(&digest, key.tier)?) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.remove(&digest, key.tier)?;
@@ -606,9 +666,17 @@ impl PreviewStore {
             self.remove(&digest, key.tier)?;
             bail!("cached preview length mismatch; entry invalidated");
         }
-        let mut bytes = Vec::new();
-        file.take(len + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != len || blake3::hash(&bytes).to_hex().as_str() != checksum {
+        ensure!(
+            len <= max_bytes,
+            "encoded staging allowance exceeded before allocation"
+        );
+        let mut bytes = vec![0; len as usize];
+        let read = file.read_exact(&mut bytes);
+        let mut extra = [0];
+        if read.is_err()
+            || file.read(&mut extra)? != 0
+            || blake3::hash(&bytes).to_hex().as_str() != checksum
+        {
             self.remove(&digest, key.tier)?;
             bail!("cached preview checksum mismatch; entry invalidated");
         }
@@ -750,6 +818,21 @@ mod tests {
         assert!(store.read(&new, true).unwrap().unwrap().stale);
         assert_eq!(store.usage().unwrap().thumbnail_bytes, 8);
         assert!(store.desire(&old, || Ok(true)).is_err());
+    }
+    #[test]
+    fn encoded_read_budget_rejects_without_invalidating_retained_thumbnail() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PreviewStore::open(config(root.path(), 100, 100), &[]).unwrap();
+        let key = key(1, Tier::Thumbnail);
+        store.desire(&key, || Ok(true)).unwrap();
+        store.publish(&key, b"eightbit", authority).unwrap();
+        let error = store.read_limited(&key, false, 7).err().unwrap();
+        assert!(error.to_string().contains("before allocation"));
+        assert_eq!(store.usage().unwrap().thumbnail_bytes, 8);
+        assert_eq!(
+            store.read_limited(&key, false, 8).unwrap().unwrap().bytes,
+            b"eightbit"
+        );
     }
     #[test]
     fn failed_write_and_stale_catalog_authority_do_not_attach() {

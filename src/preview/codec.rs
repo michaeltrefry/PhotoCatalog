@@ -141,6 +141,7 @@ unsafe extern "C" {
     ) -> i32;
     fn pc_preview_avif(rgb: *const u8, w: u32, h: u32, quality: i32, out: *mut NativeBuffer)
     -> i32;
+    fn pc_preview_avif_dimensions(data: *const u8, len: usize, out: *mut NativeBuffer) -> i32;
     fn pc_preview_avif_decode(data: *const u8, len: usize, out: *mut NativeBuffer) -> i32;
     fn pc_preview_free(out: *mut NativeBuffer);
     fn pc_preview_versions(out: *mut c_char, len: usize);
@@ -226,6 +227,40 @@ pub fn encode(
     check_cancel(cancel)?;
     ensure!(bytes.len() <= MAX_ENCODED, "encoded preview limit");
     Ok(bytes)
+}
+/// Parse dimensions without allocating decoded pixel planes. Callers use this
+/// before reserving output memory; codec scratch is a separate worker allowance.
+pub fn encoded_dimensions(bytes: &[u8], codec: Codec) -> Result<(u32, u32)> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_ENCODED,
+        "encoded preview limit"
+    );
+    let (width, height) = if codec == Codec::Avif {
+        let mut out = NativeBuffer::default();
+        let status = unsafe { pc_preview_avif_dimensions(bytes.as_ptr(), bytes.len(), &mut out) };
+        ensure!(
+            status == 0,
+            "AVIF header: {}",
+            unsafe { CStr::from_ptr(out.error.as_ptr()) }.to_string_lossy()
+        );
+        (out.width, out.height)
+    } else {
+        let format = match codec {
+            Codec::Jpeg => ImageFormat::Jpeg,
+            Codec::Webp => ImageFormat::WebP,
+            _ => unreachable!(),
+        };
+        ensure!(
+            image::guess_format(bytes)? == format,
+            "preview codec mismatch"
+        );
+        ImageReader::with_format(Cursor::new(bytes), format).into_dimensions()?
+    };
+    ensure!(
+        width > 0 && height > 0 && width <= MAX_EDGE && height <= MAX_EDGE,
+        "preview dimension limit"
+    );
+    Ok((width, height))
 }
 /// Complete production cache decoder: allocation and conversion to owned RGB8 are included.
 /// Input is an internally generated cache object, not an arbitrary original/photo decoder.

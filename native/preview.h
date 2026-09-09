@@ -13,6 +13,7 @@ typedef struct PcPreviewBuffer {
 } PcPreviewBuffer;
 int pc_preview_webp(const unsigned char *, uint32_t, uint32_t, int, PcPreviewCanceled, const void *, PcPreviewBuffer *);
 int pc_preview_avif(const unsigned char *, uint32_t, uint32_t, int, PcPreviewBuffer *);
+int pc_preview_avif_dimensions(const unsigned char *, size_t, PcPreviewBuffer *);
 int pc_preview_avif_decode(const unsigned char *, size_t, PcPreviewBuffer *);
 void pc_preview_free(PcPreviewBuffer *);
 void pc_preview_versions(char *, size_t);

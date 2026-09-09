@@ -1,0 +1,22 @@
+# Preview configuration selection
+
+The Stage A blind judgments were sealed before inspecting codec mappings on 2026-09-09. All 120 groups and 1,080 candidates have retained judgments: 597 acceptable, 339 unacceptable, and 144 needing review. The combined receipt SHA-256 is `19e6343fd245b57aefef396a893a6c0e4ada2433336c2f20bc6dd21ef69d744f`; the unblinded matrix is `34bc66482caa561755c88c187a44ab6221e58870c7193f3db88caaec132b4200`. These private artifacts preserve every group, label, verdict and reason.
+
+## Applicability decision
+
+The alpha (3×1), orientation (3×2), and transfer (6×1) preparation fixtures cannot demonstrate perceptual texture quality. Their independent exact preparation oracles remain mandatory; their visual judgments remain `needs_review`. An independently inspected, nearly black source JPEG is likewise visually uninformative. These four inputs remain in all integrity, encoded-byte and cost evidence. This explicit applicability decision does not convert their judgments into passes or remove recorded failures. Each selected configuration passed the other 26 informative inputs with zero visual rejections. No all-30 visual-pass claim is made.
+
+The frozen G15 RAW reference contains the subsequently repaired S3 highlight-color defect. Its judgments describe additional compression loss relative to those frozen pixels, not production color accuracy. The repaired production renderer needs separate qualification; frozen Stage A artifacts must remain unchanged.
+
+## Pair frozen for Stage B
+
+| Role | Configuration | Corpus encoded bytes | Median file bytes | Median of per-file decode medians |
+| --- | --- | ---: | ---: | ---: |
+| Retained thumbnail | JPEG, quality 80, longest edge 512 | 1,332,031 | 30,409 | 0.406 ms |
+| Evictable larger preview | JPEG, quality 80, longest edge 1600 | 6,559,455 | 184,050 | 2.956 ms |
+
+Preparation, no-upscaling behavior, JPEG YUV444 settings and production decode remain exactly as frozen in PREVIEW_EXPERIMENT_PROTOCOL.md. There are no camera-specific settings. JPEG 512/80 was the sole thumbnail configuration without an observed visual rejection. JPEG 2560/65 also passed the 26 informative inputs, but its corpus bytes were 10,313,953 and its median of per-file decode medians was 5.849 ms. The smaller 1600/80 configuration therefore provides the lower measured footprint and decode cost among eligible larger previews. A full-resolution editing view remains a separate renderer requirement.
+
+Equal weighting of the compatibility corpus gives about 44.4 GB of encoded thumbnails per million assets, excluding allocation and catalog overhead. This is a corpus projection, not a prediction of the user's image distribution. The larger preview cache is evictable rather than multiplied by library size.
+
+Confidence is medium for comparative visual quality and exploratory codec cost. Stage A recorded concurrent background activity, so those timings do not establish a quiet-host performance budget. Stage B must measure actual retained-storage overhead, bounded page decode/cache behavior, cancellation/recovery and the frozen interaction limits. Tauri frame-path validation remains required in S12. The private `selected-pair-v1.json` receipt binds this decision before Stage B execution.

@@ -2,7 +2,9 @@
 mod codec;
 mod metrics;
 pub use codec::PREPARATION_VERSION;
-pub use codec::{Codec, CodecSettings, PreparedRgb, decode, encode, prepare, versions};
+pub use codec::{
+    Codec, CodecSettings, PreparedRgb, decode, encode, encoded_dimensions, prepare, versions,
+};
 pub use metrics::{QualityMetrics, quality_metrics};
 mod identity;
 mod memory;
@@ -15,5 +17,5 @@ pub use scheduler::{
     WorkerOutcome,
 };
 pub use store::{
-    CachedPreview, Layout, PreviewKey, PreviewStore, Publication, StoreConfig, StoreUsage,
+    CachedPreview, Layout, PreviewKey, PreviewStore, Publication, StoreConfig, StoreUsage, Tier,
 };

@@ -9,7 +9,8 @@ unsafe extern "C" {
     fn cmsGetEncodedCMMversion() -> i32;
 }
 /// Includes the selected build's pixel-producing sources, locked Rust libraries
-/// and actual native codec versions. The official DNG SDK pin is in its fetcher.
+/// and actual native codec versions plus compiled DNG source/header identity.
+/// The prefix versions this key format, not the renderer pipeline.
 pub fn renderer_identity() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     VALUE.get_or_init(|| {
@@ -30,13 +31,15 @@ pub fn renderer_identity() -> &'static str {
         ] {
             hash.update(bytes);
         }
+        hash.update(env!("PHOTOCATALOG_DNG_SOURCE_BLAKE3").as_bytes());
+        hash.update(crate::media::decoder_versions().as_bytes());
         hash.update(super::versions().as_bytes());
         hash.update(unsafe { CStr::from_ptr(libraw_version()) }.to_bytes());
         hash.update(&unsafe { JxlDecoderVersion() }.to_le_bytes());
         hash.update(&unsafe { cmsGetEncodedCMMversion() }.to_le_bytes());
         hash.update(std::env::consts::OS.as_bytes());
         hash.update(std::env::consts::ARCH.as_bytes());
-        format!("photocatalog-render-3:{}", hash.finalize().to_hex())
+        format!("photocatalog-render-key-1:{}", hash.finalize().to_hex())
     })
 }
 
@@ -46,7 +49,7 @@ mod tests {
     fn native_render_identity_is_stable_and_key_sized() {
         let first = super::renderer_identity();
         assert_eq!(first, super::renderer_identity());
-        assert!(first.starts_with("photocatalog-render-3:"));
+        assert!(first.starts_with("photocatalog-render-key-1:"));
         assert!(first.len() <= 128);
         let digest = first.rsplit_once(':').unwrap().1;
         assert_eq!(digest.len(), 64);

@@ -89,6 +89,22 @@ extern "C" int pc_preview_avif(const unsigned char *rgb, uint32_t w, uint32_t h,
     } catch (const std::exception &e) { return fail(out,e.what()); }
       catch (...) { return fail(out,"AVIF native exception"); }
 }
+extern "C" int pc_preview_avif_dimensions(const unsigned char *encoded, size_t len, PcPreviewBuffer *out) {
+    try {
+        if (!len || len > 256u*1024u*1024u) return fail(out,"AVIF encoded limit");
+        std::unique_ptr<avifDecoder,decltype(&avifDecoderDestroy)> decoder(avifDecoderCreate(),avifDecoderDestroy);
+        if (!decoder) return fail(out,"AVIF parser allocation");
+        decoder->imageSizeLimit=uint32_t(max_pixels); decoder->imageDimensionLimit=8192; decoder->imageCountLimit=1;
+        decoder->ignoreExif=AVIF_TRUE; decoder->ignoreXMP=AVIF_TRUE;
+        auto result=avifDecoderSetIOMemory(decoder.get(),encoded,len);
+        if (result==AVIF_RESULT_OK) result=avifDecoderParse(decoder.get());
+        if (result!=AVIF_RESULT_OK) return fail(out,avifResultToString(result));
+        if (!dimensions(decoder->image->width,decoder->image->height)) return fail(out,"AVIF dimensions");
+        out->width=decoder->image->width; out->height=decoder->image->height;
+        return 0;
+    } catch (const std::exception &e) { return fail(out,e.what()); }
+      catch (...) { return fail(out,"AVIF header exception"); }
+}
 extern "C" int pc_preview_avif_decode(const unsigned char *encoded, size_t len, PcPreviewBuffer *out) {
     try {
         if (!avifCodecName(AVIF_CODEC_CHOICE_AOM,AVIF_CODEC_FLAG_CAN_DECODE)) return fail(out,"AOM decoding unavailable");
