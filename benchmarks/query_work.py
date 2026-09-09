@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only work diagnostics, independent of latency eligibility (protocol 2)."""
+"""Read-only work diagnostics, independent of latency eligibility (protocol 3)."""
 
 import argparse
 import ctypes as C
@@ -14,7 +14,8 @@ import duckdb
 
 import catalog_benchmark as bench
 
-VERSION = 2
+VERSION = 3
+VARIANTS = ("baseline", "sqlite_page_candidate")
 SCALES = (1_000_000, 5_000_000, 10_000_000)
 CURSORS = (50, 90)
 WORKLOADS = ("page_deep", "rating")
@@ -29,6 +30,28 @@ def require(value, message):
 def digest(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def query_selection(engine, variant="baseline"):
+    """Copy the selected SQL and describe it without modifying either registry."""
+    require(engine in ("sqlite", "duckdb"), "invalid engine")
+    require(variant in VARIANTS, "invalid query variant")
+    candidate_source = None
+    if variant == "sqlite_page_candidate":
+        require(engine == "sqlite", "sqlite_page_candidate requires SQLite")
+        import query_candidates
+
+        require(set(query_candidates.CANDIDATE_SQL) == set(WORKLOADS), "candidate workload set mismatch")
+        registry = query_candidates.CANDIDATE_SQL
+        candidate_source = digest(query_candidates.__file__)
+    else:
+        registry = bench.QUERY_SQL
+    sql_map = {name: registry[name] for name in WORKLOADS}
+    require(all(isinstance(sql, str) and sql for sql in sql_map.values()), "missing selected SQL")
+    encoded_map = json.dumps(sql_map, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return {"variant": variant, "sql_map": sql_map,
+            "sql_map_sha256": hashlib.sha256(encoded_map).hexdigest(),
+            "candidate_source_sha256": candidate_source}
 
 
 def integer(value, name, positive=False):
@@ -272,7 +295,8 @@ def source_state(path):
     return {"bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "inode": stat.st_ino, "sha256": digest(path)}
 
 
-def run(snapshot, engine, count, memory_mb, output):
+def run(snapshot, engine, count, memory_mb, output, variant="baseline"):
+    selection = query_selection(engine, variant)
     snapshot, output = Path(snapshot).resolve(), Path(output).resolve()
     require(not output.is_relative_to(snapshot) and not snapshot.is_relative_to(output), "output must be separate from snapshot")
     require(engine in ("sqlite", "duckdb") and memory_mb > 0 and count > 0, "invalid engine/memory/count")
@@ -285,7 +309,7 @@ def run(snapshot, engine, count, memory_mb, output):
     require(path.is_relative_to(snapshot), "database escapes snapshot")
     artifact = manifest["snapshots"][str(relative)]
     output.mkdir(parents=True, exist_ok=False)
-    receipt = {"version": VERSION, "complete": False, "diagnostic_only": True, "latency_eligibility": "not evaluated", "engine": engine, "count": count, "memory_mib": memory_mb, "python": sys.version, "platform": platform.platform(), "script_sha256": digest(__file__), "frozen_harness_sha256": FROZEN_SHA256, "snapshot_manifest_sha256": digest(manifest_path), "database": str(path), "queries": []}
+    receipt = {**selection, "version": VERSION, "complete": False, "diagnostic_only": True, "latency_eligibility": "not evaluated", "engine": engine, "count": count, "memory_mib": memory_mb, "python": sys.version, "platform": platform.platform(), "script_sha256": digest(__file__), "frozen_harness_sha256": FROZEN_SHA256, "snapshot_manifest_sha256": digest(manifest_path), "database": str(path), "queries": []}
     db = None
     before = None
     try:
@@ -302,7 +326,7 @@ def run(snapshot, engine, count, memory_mb, output):
             receipt.update(engine_version=duckdb.__version__, settings=bench.measured_settings(db, engine), requested_settings=options, open_mode="read_only=True")
         for case in query_cases(count):
             name, parameters = case["workload"], case["parameters"]
-            sql = bench.QUERY_SQL[name]
+            sql = selection["sql_map"][name]
             item = {**case, "sql": sql}
             receipt["queries"].append(item)
             if engine == "sqlite":
@@ -345,8 +369,12 @@ def main():
     parser.add_argument("--count", type=int, choices=SCALES, required=True)
     parser.add_argument("--memory-mb", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--variant", choices=VARIANTS, default="baseline",
+                        help="baseline uses frozen SQL; sqlite_page_candidate is an explicit experiment")
     args = parser.parse_args()
-    run(args.snapshot, args.engine, args.count, args.memory_mb, args.output)
+    if args.variant == "sqlite_page_candidate" and args.engine != "sqlite":
+        parser.error("sqlite_page_candidate requires --engine sqlite")
+    run(args.snapshot, args.engine, args.count, args.memory_mb, args.output, variant=args.variant)
 
 
 if __name__ == "__main__":

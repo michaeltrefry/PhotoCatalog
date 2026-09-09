@@ -1,6 +1,7 @@
 """Bounded diagnostic checks. Execute only after the reference timing lane is released."""
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -16,7 +17,7 @@ import query_work as diagnostic
 
 class QueryCases(unittest.TestCase):
     def test_original_cursors_are_retained_and_iteration_nine_is_distinct(self):
-        self.assertEqual(diagnostic.VERSION, 2)
+        self.assertEqual(diagnostic.VERSION, 3)
         for count in diagnostic.SCALES:
             cases = diagnostic.query_cases(count)
             self.assertEqual(len(cases), 6)
@@ -57,6 +58,74 @@ class QueryCases(unittest.TestCase):
         self.assertEqual(cases[4]["parameters"], [314_159])
         self.assertEqual(cases[5]["parameters"], [5, 271_828])
         self.assertEqual(frozen.call_count, 3)
+
+
+class QuerySelection(unittest.TestCase):
+    def test_default_and_explicit_baseline_keep_exact_frozen_sql(self):
+        before = copy.deepcopy(bench.QUERY_SQL)
+        expected = {name: before[name] for name in diagnostic.WORKLOADS}
+        expected_digest = hashlib.sha256(json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        for engine in ("sqlite", "duckdb"):
+            selected = diagnostic.query_selection(engine)
+            self.assertEqual(selected, diagnostic.query_selection(engine, "baseline"))
+            self.assertEqual(selected["variant"], "baseline")
+            self.assertEqual(selected["sql_map"], expected)
+            self.assertEqual(selected["sql_map_sha256"], expected_digest)
+            self.assertIsNone(selected["candidate_source_sha256"])
+            selected["sql_map"]["page_deep"] = "local change"
+        self.assertEqual(bench.QUERY_SQL, before)
+        self.assertEqual(diagnostic.query_selection("sqlite")["sql_map"], expected)
+
+    def test_candidate_records_source_and_sql_without_global_mutation(self):
+        import query_candidates
+
+        frozen_before = copy.deepcopy(bench.QUERY_SQL)
+        candidate_before = copy.deepcopy(query_candidates.CANDIDATE_SQL)
+        with patch.object(diagnostic, "digest", return_value="a" * 64) as digest:
+            selected = diagnostic.query_selection("sqlite", "sqlite_page_candidate")
+            digest.assert_called_once_with(query_candidates.__file__)
+        self.assertEqual(selected["variant"], "sqlite_page_candidate")
+        self.assertEqual(selected["sql_map"], candidate_before)
+        self.assertEqual(selected["candidate_source_sha256"], "a" * 64)
+        self.assertEqual(selected["sql_map_sha256"], hashlib.sha256(json.dumps(
+            candidate_before, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest())
+        self.assertNotEqual(selected["sql_map_sha256"], diagnostic.query_selection("sqlite")["sql_map_sha256"])
+        selected["sql_map"]["rating"] = "local change"
+        self.assertEqual(query_candidates.CANDIDATE_SQL, candidate_before)
+        self.assertEqual(bench.QUERY_SQL, frozen_before)
+
+    def test_cli_defaults_and_explicit_candidate_dispatch(self):
+        common = ["query_work.py", "--snapshot", "unused-snapshot", "--engine", "sqlite",
+                  "--count", "1000000", "--memory-mb", "256", "--output", "unused-output"]
+        for extra, variant in (([], "baseline"), (["--variant", "sqlite_page_candidate"], "sqlite_page_candidate")):
+            with self.subTest(variant=variant), patch.object(diagnostic.sys, "argv", common + extra), \
+                 patch.object(diagnostic, "run") as run:
+                diagnostic.main()
+                run.assert_called_once_with(Path("unused-snapshot"), "sqlite", 1000000, 256,
+                                            Path("unused-output"), variant=variant)
+        bad = common.copy()
+        bad[bad.index("sqlite")] = "duckdb"
+        with patch.object(diagnostic.sys, "argv", bad + ["--variant", "sqlite_page_candidate"]), \
+             patch.object(diagnostic, "run") as run, \
+             patch.object(diagnostic.sys, "stderr"):
+            with self.assertRaises(SystemExit):
+                diagnostic.main()
+            run.assert_not_called()
+
+    def test_invalid_selection_is_rejected_before_source_or_database_access(self):
+        for engine, variant in (("duckdb", "sqlite_page_candidate"), ("sqlite", "unknown")):
+            with self.subTest(engine=engine, variant=variant), \
+                 patch.object(diagnostic.Path, "read_text") as read_source, \
+                 patch.object(diagnostic, "source_state") as state, \
+                 patch.object(diagnostic, "digest") as digest:
+                with self.assertRaises(ValueError):
+                    diagnostic.run("unused-snapshot", engine, 1000, 16, "unused-output", variant=variant)
+                read_source.assert_not_called()
+                state.assert_not_called()
+                digest.assert_not_called()
 
 
 class MetricValidation(unittest.TestCase):
@@ -194,6 +263,10 @@ class ReadOnlyEngines(unittest.TestCase):
                 diagnostic.run(source, "sqlite", 1000, 16, output)
             receipt = json.loads((output / "receipt.json").read_text())
             self.assertFalse(receipt["complete"])
+            self.assertEqual(receipt["variant"], "baseline")
+            self.assertEqual(receipt["sql_map"], {name: bench.QUERY_SQL[name] for name in diagnostic.WORKLOADS})
+            self.assertEqual(receipt["sql_map_sha256"], diagnostic.query_selection("sqlite")["sql_map_sha256"])
+            self.assertIsNone(receipt["candidate_source_sha256"])
             self.assertTrue(receipt["source_preserved"])
             self.assertEqual(receipt["queries"], [])
             with self.assertRaises(FileExistsError):
