@@ -17,6 +17,7 @@ import random
 import subprocess
 import time
 import psutil
+from preview_host import HostObservation, host_identity
 
 EDGES = (256, 512, 1600, 2560)
 QUALITIES = {"jpeg": (50, 65, 80), "webp": (50, 65, 80), "avif": (45, 60, 75)}
@@ -46,7 +47,11 @@ def stats(samples):
         return ordered[lo]+(ordered[hi]-ordered[lo])*(position-lo)
     return {"n":len(samples),"p50_ms":percentile(.5),"p95_ms":percentile(.95),"p99_ms":percentile(.99),"max_ms":ordered[-1]}
 
-def validate_case(result,edge,codec,quality,surface,folder):
+def validate_case(result,edge,codec,quality,surface,folder,verification):
+    if verification.get("complete") is not True or verification.get("identity") != result.get("identity"):
+        raise ValueError("artifact verification missing or wrong identity")
+    if verification.get("prepared_blake3") != result.get("prepared_blake3") or verification.get("decoded_blake3") != result.get("decoded_blake3"):
+        raise ValueError("verified pixel identity mismatch")
     if result.get("complete") is not True or result.get("version")!=1 or result.get("edge")!=edge:
         raise ValueError("incomplete/wrong codec receipt")
     if (result.get("width"),result.get("height")) != (surface["width"],surface["height"]) or result.get("prepared_blake3")!=surface["rgb_blake3"]:
@@ -61,7 +66,12 @@ def validate_case(result,edge,codec,quality,surface,folder):
     artifacts=result["artifacts"]
     if len(artifacts)!=3:
         raise ValueError("all three encoded outputs required")
+    if len(verification.get("artifacts",[])) != 3:
+        raise ValueError("all encoded artifacts need verification")
     for n,artifact in enumerate(artifacts):
+        verified=verification["artifacts"][n]
+        if verified.get("blake3") != artifact.get("blake3") or not artifact.get("blake3") or verified.get("bytes") != artifact["bytes"] or verified.get("decoded_blake3") != result.get("decoded_blake3"):
+            raise ValueError("encoded artifact verification mismatch")
         suffix="jpg" if codec=="jpeg" else codec
         path=folder/f"encode-{n}.{suffix}"
         if path.stat().st_size!=artifact["bytes"] or artifact["bytes"]<=0:
@@ -71,6 +81,8 @@ def validate_case(result,edge,codec,quality,surface,folder):
             sampling=artifact["jpeg_sampling"]
             if sampling["precision"]!=8 or len(sampling["components"])!=3 or any(c["horizontal"]!=1 or c["vertical"]!=1 for c in sampling["components"]):
                 raise ValueError("JPEG sampling differs from frozen444 configuration")
+    if not (folder/"decoded.png").is_file():
+        raise ValueError("decoded quality PNG missing")
     metrics=result["quality"]
     if not math.isfinite(metrics["mse_rgb8"]) or metrics["mse_rgb8"]<0 or not math.isfinite(metrics["block_rgb_ssim"]):
         raise ValueError("invalid quality metric")
@@ -132,6 +144,14 @@ def child(command, prefix):
                 "peak_rss_bytes":peak or None,"cpu_seconds_last_sample":cpu,
                 "observation_errors":sorted(set(unavailable)),"rss_sample_interval_ms":10}
 
+def require_capabilities(identity):
+    fields=identity.get("versions", "").split(";")
+    if "aom_encode=available" not in fields or "aom_decode=available" not in fields:
+        raise ValueError("frozen AVIF AOM encoder/decoder unavailable")
+
+def campaign_complete(outcomes, source, after, binary_preserved):
+    return source == after and binary_preserved and len(outcomes) == 30 and all(x["preparation"]["returncode"]==0 and "error" not in x and len(x["cases"])==36 and all(c["returncode"]==0 for c in x["cases"]) and len(x.get("quality_review",[]))==4 and all(r["complete"] for r in x["quality_review"]) for x in outcomes)
+
 def run(args):
     if args.lane_token != "coordinator-authorized":
         raise ValueError("timed/rendering lane must be explicitly authorized")
@@ -158,12 +178,20 @@ def run(args):
     exclusive(output/"manifest.json", manifest)
     identity = {"version":1,"started_utc":utc(),"binary_sha256":digest(binary),
                 "runner_sha256":digest(__file__),"manifest_sha256":digest(manifest_path),
-                "host":{"platform":os.uname().sysname if hasattr(os,"uname") else os.name,
-                        "cpus":psutil.cpu_count(),"ram_bytes":psutil.virtual_memory().total},
+                "host":host_identity(output,[x["path"] for x in manifest["inputs"]]),
                 "seed":SEED,"settings":{"edges":EDGES,"qualities":QUALITIES,"encode_warmups":1,"encode_repetitions":3,"decode_warmups":3,"decode_repetitions":20}}
     versions = subprocess.run([str(binary),"versions"],capture_output=True,text=True,check=True)
     identity["codec_versions"] = json.loads(versions.stdout)
     exclusive(output/"identity.json",identity)
+    try:
+        require_capabilities(identity["codec_versions"])
+    except ValueError as exc:
+        exclusive(output/"capability-preflight-failed.json",{"complete":False,"error":str(exc)})
+        raise
+    with HostObservation(output) as observer:
+        execute_matrix(manifest,output,binary,identity,source,observer)
+
+def execute_matrix(manifest,output,binary,identity,source,observer):
     outcomes=[]
     items=list(manifest["inputs"])
     random.Random(SEED).shuffle(items)
@@ -197,7 +225,14 @@ def run(args):
                             case_result=json.loads((fixture/name/"receipt.json").read_text())
                             if case_result.get("identity")!=identity["codec_versions"]:
                                 raise ValueError("compiled codec identity changed")
-                            info["verified_artifacts"]=validate_case(case_result,edge,codec,q,result["surfaces"][str(edge)],fixture/name)
+                            verify_info=child([str(binary),"verify-case",str(prepared),str(fixture/name)],fixture/f"{name}-verification")
+                            info["untimed_verification"]=verify_info
+                            if verify_info["returncode"]:
+                                raise ValueError("artifact chain verification failed")
+                            verification=json.loads((fixture/f"{name}-verification.stdout").read_text())
+                            info["verified_artifacts"]=validate_case(case_result,edge,codec,q,result["surfaces"][str(edge)],fixture/name,verification)
+                            info["verification"]=verification
+                            info["decoded_png_sha256"]=digest(fixture/name/"decoded.png")
                         except (ValueError,KeyError,OSError,TypeError) as exc:
                             info["validation_error"]=str(exc)
                             info["returncode"]=-1
@@ -209,22 +244,38 @@ def run(args):
                         record["quality_review"].append({"edge":edge,"complete":False,"error":"candidate failure retained"})
                         continue
                     random.Random(f"{SEED}:blind:{item['id']}:{edge}").shuffle(cases)
-                    review={"reference":str(prepared/f"{edge}.png"),"candidates":[]}
+                    review={"reference":str(prepared/f"{edge}.png"),"reference_blake3":result["surfaces"][str(edge)]["rgb_blake3"],"candidates":[]}
                     mapping=[]
                     for number,case in enumerate(cases):
                         label=chr(ord('A')+number)
-                        review["candidates"].append({"label":label,"path":str(fixture/f"{edge}-{case['codec']}-{case['quality']}"/"decoded.png")})
+                        review["candidates"].append({"label":label,"path":str(fixture/f"{edge}-{case['codec']}-{case['quality']}"/"decoded.png"),"decoded_blake3":case["verification"]["decoded_blake3"]})
                         mapping.append({"label":label,"codec":case["codec"],"quality":case["quality"]})
                     review_manifest=fixture/f"review-{edge}-inputs.json"
                     exclusive(review_manifest,review)
                     exclusive(fixture/f"review-{edge}-mapping.json",mapping)
                     observed=child([str(binary),"review",str(review_manifest),str(fixture/f"review-{edge}")],fixture/f"review-{edge}")
-                    record["quality_review"].append({"edge":edge,"complete":observed["returncode"]==0,"observation":observed})
+                    quality_record={"edge":edge,"complete":False,"observation":observed}
+                    if observed["returncode"] == 0:
+                        try:
+                            review_result=json.loads((fixture/f"review-{edge}"/"receipt.json").read_text())
+                            if review_result.get("inputs") != review:
+                                raise ValueError("blinded input identity mismatch")
+                            verification=child([str(binary),"verify-review",str(fixture/f"review-{edge}")],fixture/f"review-{edge}-verification")
+                            quality_record["verification"]=verification
+                            if verification["returncode"]:
+                                raise ValueError("blinded output artifact verification failed")
+                            quality_record["artifact_sha256"]={p.name:digest(p) for p in sorted((fixture/f"review-{edge}").iterdir())}
+                            quality_record["mapping_sha256"]=digest(fixture/f"review-{edge}-mapping.json")
+                            quality_record["manifest_sha256"]=digest(review_manifest)
+                            quality_record["complete"]=True
+                        except (ValueError,KeyError,OSError,TypeError) as exc:
+                            quality_record["error"]=str(exc)
+                    record["quality_review"].append(quality_record)
         exclusive(fixture/"summary.json",record)
         outcomes.append(record)
     after={item["id"]:digest(item["path"]) for item in manifest["inputs"]}
     binary_preserved=digest(binary)==identity["binary_sha256"]
-    complete=binary_preserved and all(x["preparation"]["returncode"]==0 and "error" not in x and len(x["cases"])==36 and all(c["returncode"]==0 for c in x["cases"]) and len(x.get("quality_review",[]))==4 and all(r["complete"] for r in x["quality_review"]) for x in outcomes)
+    complete=campaign_complete(outcomes,source,after,binary_preserved)
     aggregate={}
     for item,record in zip(items,outcomes):
         for case in record["cases"]:
@@ -244,7 +295,9 @@ def run(args):
         summary["projection_scope"]="equal-weight compatibility corpus, not library frequency; quality artifacts excluded"
         summary["rss_scope"]="whole measurement child including prepared input, encode/decode, metrics and PNG output; not isolated codec stage"
     exclusive(output/"aggregate.json",aggregate)
-    exclusive(output/"campaign.json",{"version":1,"complete":complete,"binary_preserved":binary_preserved,"source_preserved":source==after,"finished_utc":utc(),"outcomes":outcomes,"selection":"not evaluated; quality/layout/interaction review required"})
+    telemetry=observer.finish()
+    complete=complete and telemetry["complete"]
+    exclusive(output/"campaign.json",{"version":1,"complete":complete,"binary_preserved":binary_preserved,"source_preserved":source==after,"telemetry":telemetry,"finished_utc":utc(),"outcomes":outcomes,"selection":"not evaluated; quality/layout/interaction review required"})
     if not complete or source != after:
         raise RuntimeError("campaign contains failures; retained receipts must be reviewed")
 

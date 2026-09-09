@@ -46,20 +46,50 @@ class ProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             folder=Path(temp)
             for n in range(3):(folder/f'encode-{n}.webp').write_bytes(b'fixture')
+            (folder/'decoded.png').write_bytes(b'PNG')
             encode={**campaign.stats([1.,2.,3.]),'samples_ms':[1.,2.,3.]}
             decode={**campaign.stats([1.]*20),'samples_ms':[1.]*20}
             surface={'width':1,'height':1,'rgb_blake3':'fixture'}
             value={'complete':True,'version':1,'edge':256,**surface,'prepared_blake3':'fixture',
                 'settings':{'codec':'webp','quality':65},'encode':encode,'decode':decode,
-                'artifacts':[{'bytes':7} for _ in range(3)],'quality':{'mse_rgb8':0.,'block_rgb_ssim':1.}}
-            campaign.validate_case(value,256,'webp',65,surface,folder)
-            for change in ('samples','summary','settings','bytes','surface'):
+                'decoded_blake3':'decoded','identity':{},'artifacts':[{'bytes':7,'blake3':'hash'} for _ in range(3)],'quality':{'mse_rgb8':0.,'block_rgb_ssim':1.}}
+            verification={'complete':True,'identity':{},'prepared_blake3':'fixture','decoded_blake3':'decoded','artifacts':[{'bytes':7,'blake3':'hash','decoded_blake3':'decoded'} for _ in range(3)]}
+            campaign.validate_case(value,256,'webp',65,surface,folder,verification)
+            for change in ('samples','summary','settings','bytes','surface','hash'):
                 bad=copy.deepcopy(value)
                 if change=='samples':bad['decode']['samples_ms'].pop()
                 if change=='summary':bad['encode']['p95_ms']=0.
                 if change=='settings':bad['settings']['quality']=50
                 if change=='bytes':bad['artifacts'][0]['bytes']=10
                 if change=='surface':bad['prepared_blake3']='wrong'
-                with self.subTest(change=change),self.assertRaises(ValueError):campaign.validate_case(bad,256,'webp',65,surface,folder)
+                if change=='hash':bad['artifacts'][0]['blake3']='wrong'
+                with self.subTest(change=change),self.assertRaises(ValueError):campaign.validate_case(bad,256,'webp',65,surface,folder,verification)
+
+    def test_source_changes_exclude_complete_even_when_all_cases_pass(self):
+        outcome={'preparation':{'returncode':0},'cases':[{'returncode':0}]*36,'quality_review':[{'complete':True}]*4}
+        records=[copy.deepcopy(outcome) for _ in range(30)]
+        self.assertTrue(campaign.campaign_complete(records,{'a':'one'},{'a':'one'},True))
+        self.assertFalse(campaign.campaign_complete(records,{'a':'one'},{'a':'two'},True))
+        self.assertFalse(campaign.campaign_complete(records,{}, {},False))
+
+    def test_capability_preflight_rejects_before_measured_children(self):
+        import argparse
+        import json
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/'source';source.mkdir()
+            fixture=source/'input.png';fixture.write_bytes(b'fixture')
+            value=self.manifest()
+            for item in value['inputs']:
+                item.update(path=str(fixture),sha256=campaign.digest(fixture))
+                if item['kind']=='preparation':
+                    item['oracle']={str(edge):{'path':str(fixture),'sha256':campaign.digest(fixture)} for edge in campaign.EDGES}
+            manifest=root/'manifest.json';manifest.write_text(json.dumps(value))
+            binary=root/'probe';binary.write_bytes(b'probe')
+            args=argparse.Namespace(lane_token='coordinator-authorized',manifest=str(manifest),binary=str(binary),output=str(root/'output'))
+            class Result:stdout='{"versions":"aom_encode=unavailable;aom_decode=available"}'
+            with patch.object(campaign,'host_identity',return_value={}), patch.object(campaign.subprocess,'run',return_value=Result()), patch.object(campaign,'child',side_effect=AssertionError('measured child started')):
+                with self.assertRaisesRegex(ValueError,'unavailable'):campaign.run(args)
+            self.assertTrue((root/'output'/'capability-preflight-failed.json').exists())
+            self.assertFalse((root/'output'/'host.jsonl').exists())
 
 if __name__=='__main__':unittest.main()
