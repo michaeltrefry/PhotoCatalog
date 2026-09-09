@@ -282,3 +282,49 @@ python3 scripts/preview_navigation_campaign.py --binary ABS_NAVIGATION_PROBE \
 
 The coordinator, verifier, ownership-contract tests and two-child reservation
 regression are source-ready and UNRUN pending the native correctness lane.
+
+The source-ready `preview_layout_campaign.py` makes layout execution reproducible:
+prepare 10k flat, 10k prefix, 100k flat, 100k prefix, each in a separate new folder;
+then run one six-pass lookup child for each in that same fixed order. This is four
+preparation children plus four measured lookup children, with zero retries or
+replacement passes. Lookup OS state follows all preparations and prior lookups;
+it is recorded and is never described as cold. Preparation has a 3600-second
+safety deadline per group; lookup has 900 seconds. Only owned children are killed
+and joined on timeout; partial files/receipts remain available for inspection.
+
+Admission binds the verified 30-worker campaign and its actual selected 512 JPEG
+files against their independent SHA-256 receipts, plus clean source archive,
+layout binary, protocol/coordinator, and physical-storage evidence. The JSON
+binding uses `version: 1`, `clean: true`, exact `source_revision`,
+`planned_preparation_children: 4`, `planned_lookup_children: 4`,
+`minimum_free_bytes`, and `binary_sha256`, `archive_sha256`, `storage_sha256`,
+`worker_campaign_sha256`, `protocol_sha256`, `coordinator_sha256`. Free capacity
+must meet that reviewed minimum before execution. The minimum must cover the
+exact projected encoded bytes for all 220,000 objects plus an explicit 2 GiB
+headroom floor for indexes, metadata, directory/file allocation and receipts.
+That floor is resource admission, not a filesystem overhead prediction or a
+guarantee against competing disk use. Actual allocated/logical footprint remains
+the result. The constant COM construction contributes 8,140,000 encoded bytes
+across these four filesets. No dataset is deleted automatically to fit capacity.
+
+Every accepted pass must contain its fixed count of actual distinct returned
+payloads and actual files, the original pass/seed identity and exactly N finite
+raw samples. The coordinator retains raw samples and their SHA-256, and reports
+nearest-rank distributions for all six passes individually, including first-pass
+and later-pass differences. It records preparation/lookup footprints and keeps
+file versus directory allocation and manifest/marker/index bytes visible. Final
+comparison requires all four groups and equal encoded-payload totals for the two
+layouts at each count; it does not pool passes into a more favorable result or
+pick a layout automatically. All bound source files, seed JPEGs and generated
+dataset descriptors are rechecked; failures retain partial observations. Host
+telemetry starts before the first preparation and must complete, without itself
+awarding quiet-host timing. No timing or layout selection has yet been executed
+from this new source.
+
+```
+python3 scripts/preview_layout_campaign.py --binary ABS_LAYOUT_PROBE \
+  --archive CLEAN_SOURCE_ARCHIVE --storage STORAGE_EVIDENCE \
+  --worker-campaign ABS_VERIFIED_WORKER_CAMPAIGN_JSON \
+  --binding REVIEWED_LAYOUT_BINDING_JSON --output NEW_PRIVATE_DIRECTORY \
+  --lane-token coordinator-authorized
+```
