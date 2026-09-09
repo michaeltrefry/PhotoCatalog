@@ -1,8 +1,10 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 pub mod catalog_metadata;
+pub mod catalog_storage;
 mod import_storage;
 pub mod media;
 pub mod metadata_export;
+pub mod storage_volume;
 pub mod xmp;
 pub mod xmp_packets;
 mod xmp_rdf;
@@ -85,7 +87,7 @@ impl Catalog {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 2,
+            version <= 3,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -125,6 +127,10 @@ impl Catalog {
         if version < 2 {
             tx.execute_batch(catalog_metadata::SCHEMA)?;
             tx.pragma_update(None, "user_version", 2)?;
+        }
+        if version < 3 {
+            tx.execute_batch(catalog_storage::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 3)?;
         }
         tx.commit()?;
         Ok(Self { db, root })
@@ -632,7 +638,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            2
+            3
         );
         assert_eq!(
             catalog
