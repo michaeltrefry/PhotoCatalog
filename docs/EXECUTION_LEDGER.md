@@ -14,7 +14,7 @@ sc-22836–sc-22838 are verified Done. S4 metadata integration is in review; ind
 | sc-22839 | In Review | [Draft PR #4](https://github.com/michaeltrefry/PhotoCatalog/pull/4); codex/sc-22839-xmp | Private byte/count/source-invariance checks reconcile, but RDF preservation review found identifier loss; comment 22904 | Repair SDK normalization boundary; corrected semantic evidence, review and final CI |
 | sc-22840 | In Progress | Offline storage and relinking; codex/sc-22840-relink and codex/sc-22840-volume | Live acceptance revalidated; source-only volume adapter work during S6 measurements; comment 22903 | Implement volume binding, atomic relink/undo and controlled removable-volume proof |
 | sc-22841 | In Progress | Preview storage and scheduling; codex/sc-22841-previews | Phase A reviewed at 157347f; frozen campaign sc-22841-codec-v1 running without retries | Review full quality/measurement evidence; complete cache/scheduling/recovery and Stage B |
-| sc-22842 | To Do | Organization and search | Prerequisite sc-22839 | Dependency-bound |
+| sc-22842 | In Progress | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7); organization/search core, schema 5 and shared writer admission | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md): exact runtime 0cfc1fd, all 17 cases × 3 scales and actual-overlap saves PASS; 183 Rust/52 Python checks pass | Final report review, batched push, three-platform CI (including Windows import), merge and tracker read-back |
 | sc-22843 | To Do | Editing and export | Prerequisites sc-22838/sc-22839/sc-22841 | Dependency-bound |
 | sc-22844 | To Do | Lightroom dry run | Prerequisite sc-22839 | Dependency-bound |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
@@ -59,3 +59,12 @@ PR #2 reviewed head 2d30647 and merged a0bf374 have identical trees. Private cor
 ## Foundation risk register
 
 Incomplete previews after interruption; duplicate asset creation on retry; source changes during extraction; generated fixtures falsely standing in for real CR2 compatibility; private images or metadata being committed; unbounded directory/file reads; platform differences in path and file publication semantics. Validate these within sc-22836's scope before closeout.
+
+## S7 qualification checkpoint — 2026-09-09
+
+The [organization report](ORGANIZATION_PERFORMANCE_RESULTS.md) records the final
+v4 query and actual-overlap transition PASS at runtime source `0cfc1fd`. The v1/v2
+failures and rejected v3 mixed summary remain retained. Worst warm/fresh page p95
+was 60.295/61.871 ms; browse RSS peaked at 480.781 MiB. All 200 saves overlapped
+background activity at every scale, with p95 12.788/12.161/11.543 ms. Final CI and
+PR/merged-head verification remain required; this checkpoint is not a Done claim.

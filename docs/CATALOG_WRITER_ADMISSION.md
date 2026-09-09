@@ -58,11 +58,10 @@ and overlapping/nonoverlapping distributions and counts remain reported. The
 calculation are unchanged. The previous full v3 pass is superseded for mixed
 acceptance, rather than rewritten.
 
-Source-ready regressions queue actual source-retention and organization API calls
+Executed regressions queue actual source-retention and organization API calls
 behind a held admission, prove FIFO/foreground ordering through committed history,
 and verify rollback, unwind, recursive rejection, distinct catalogs, current-schema
-open/read behavior, stable revisions and source-byte preservation. Native test and
-measurement results must be recorded separately after the coordinated lane opens.
+open/read behavior, stable revisions and source-byte preservation. The [results report](ORGANIZATION_PERFORMANCE_RESULTS.md) records the executed native gates and v4 mixed qualification separately.
 
 
 For v4 preparation, existing frozen v3 schema5 fixtures may be reused only with

@@ -3,7 +3,7 @@
 The Rust core exposes durable folders, flat and hierarchical keywords, ratings,
 pick/reject flags, color labels, collections, combined filters, and recorded batch
 operations. The CLI is the current interface; the desktop interface remains a
-separate story. This document describes behavior, not a scale-performance result.
+separate story. This document describes behavior; the [performance report](ORGANIZATION_PERFORMANCE_RESULTS.md) records the qualified Mac workload and remaining delivery gates.
 
 ## Metadata authority and identity
 

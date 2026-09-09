@@ -1,10 +1,9 @@
-# sc-22842 organization query experiment — protocol 1 (preflight draft)
+# sc-22842 organization query experiment — protocol and retained design
 
 This experiment is separate from S2 backend selection. SQLite remains the selected
 backend; no alternative backend/profile or threshold search is performed here.
 The protocol, production code, probe, fixture formula, and coordinator must be
-frozen and independently reviewed before scale preparation/timing. Current status:
-preflight source, no scale measurements, no acceptance claim.
+frozen and independently reviewed before scale preparation/timing. The original protocol-1 design is retained below, with subsequent admission corrections noted. Driver 4 completed local qualification; see the [results report](ORGANIZATION_PERFORMANCE_RESULTS.md) for exact source identities, failed predecessors and pending delivery gates.
 
 ## Workload and independent oracle
 
@@ -93,9 +92,7 @@ space before preparation and use exclusive paths; never touch the user's photo
 RAID. Supplemental write/source-transition work must use separate verified copies
 so it cannot alter the frozen read workload.
 
-The coordinator and transition workload are implemented below. Final assembled
-17-case smoke validation, actual scale execution, and independent review remain
-required before this protocol supplies acceptance evidence.
+The coordinator and transition workload are described below. Their final smoke, scale and review evidence is recorded in the results report; this protocol alone is not acceptance evidence.
 
 ## Coordinator and source transitions
 

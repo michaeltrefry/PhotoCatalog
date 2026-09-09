@@ -1,7 +1,6 @@
 # sc-22842 text repair — source checkpoint and corrective preflight
 
-Status: source and corrective driver frozen for review; the new tests have not run. No scale qualification
-or story completion is claimed. The immutable protocol-1 binary/source and failed
+Historical checkpoints follow, including their then-pending gates. Current driver 4 qualification and remaining delivery gates are recorded in the [results report](ORGANIZATION_PERFORMANCE_RESULTS.md). The immutable protocol-1 binary/source and failed
 partial campaign remain under
 `sc-22842-scale-v1-0vk7e9qu` in private results. At 1M assets, the reverse-filename
 case's 100 warm pages had p95 5870.494938 ms (min 4794.837, max 6023.286); all 20
@@ -158,9 +157,7 @@ are never described as identical to v1/v2 source mains. All originals and their
 companions remain untouched. Migration scans/index construction are preparation
 work and are excluded from query timing with explicit provenance.
 
-This schema5/driver3 correction is source-only and awaits independent review,
-local regression execution and a separately frozen expanded diagnostic before
-any new scale qualification. The full 17 cases/all three scales and transition
+At the schema5/driver3 freeze, independent review, local regression execution and a separately frozen expanded diagnostic were required before scale qualification. Those later outcomes are recorded in the results report. The full 17 cases/all three scales and transition
 acceptance remain mandatory. The corrective diagnostic is now fixed to reverse-filename, direct text,
 text+capture and date+camera at 1M and 10M: eight children, each with 3 warmups,
 5 samples and the unchanged 120-second diagnostic deadline. These remain
