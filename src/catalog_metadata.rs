@@ -1056,6 +1056,7 @@ impl Catalog {
             changed |= c;
             warnings += usize::from(w);
         }
+        crate::catalog_storage::record_metadata_path(&self.db, &asset, "embedded", path)?;
         let directory = path.parent().context("original has no parent")?;
         self.index_metadata_directory(directory)?;
         let stem = name_key(path.file_stem().context("original has no stem")?);
@@ -1079,6 +1080,7 @@ impl Catalog {
                 provenance: serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}}),
             };
             let (c, w) = self.inspect_metadata_source(&asset, &sidecar, &source, true)?;
+            crate::catalog_storage::record_metadata_path(&self.db, &asset, "sidecar", &sidecar)?;
             changed |= c;
             warnings += usize::from(w || source.ambiguous);
         }
