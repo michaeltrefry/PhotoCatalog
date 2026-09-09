@@ -868,6 +868,9 @@ fn foreign_catalog_locators_remain_tagged_through_folder_file_relink_and_undo() 
         "UPDATE metadata_sources SET locator=?2 WHERE asset_id=?1 AND kind='sidecar'",
         rusqlite::params![asset.id, encoded(&foreign_sidecar)],
     )?;
+    for (kind, native) in [("embedded", &foreign_photo), ("sidecar", &foreign_sidecar)] {
+        connection.execute("UPDATE storage_source_locators SET tag=?2 WHERE source_id IN (SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?3)",rusqlite::params![asset.id,serde_json::json!({"native":native}).to_string(),kind])?;
+    }
     drop(connection);
     drop(cat);
     let mut cat = Catalog::open(&root)?;
@@ -1082,5 +1085,194 @@ fn excluding_prepared_sidecar_swap_rechecks_retained_locator_collision() -> Resu
     let after: Vec<(i64,String)> = db(&root)?.prepare("SELECT id,display FROM metadata_sources WHERE asset_id=? AND kind='sidecar' ORDER BY id")?.query_map([&asset.id], |r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     ensure!(sources == after);
     ensure!(fs::read(a)? == xml && fs::read(b)? == xml);
+    Ok(())
+}
+
+#[test]
+fn excluded_foreign_sidecar_keeps_independent_encoding_across_remaps_and_reverse_undo() -> Result<()>
+{
+    for legacy_untagged in [false, true] {
+        let (temp, old, root, mut cat) = setup()?;
+        photo(&old.join("one.jpg"), 20);
+        let xml=br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="foreign-excluded" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="4"/></rdf:RDF>"#;
+        fs::write(old.join("one.xmp"), xml)?;
+        cat.import(&old, None, |_| Ok(()))?;
+        let asset = cat.browse(0, 1)?.remove(0);
+        let sidecar: i64 = db(&root)?.query_row(
+            "SELECT id FROM metadata_sources WHERE asset_id=? AND kind='sidecar'",
+            [&asset.id],
+            |r| r.get(0),
+        )?;
+        let models: Vec<i64> = db(&root)?
+            .prepare("SELECT id FROM metadata_models ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        #[cfg(unix)]
+        let (foreign_photo, foreign_sidecar) = (
+            NativePath::WindowsWide("R:\\Photos\\one.jpg".encode_utf16().collect()),
+            NativePath::WindowsWide("R:\\Photos\\one.xmp".encode_utf16().collect()),
+        );
+        #[cfg(windows)]
+        let (foreign_photo, foreign_sidecar) = (
+            NativePath::UnixBytes(b"/Volumes/Old/Photos/one.jpg".to_vec()),
+            NativePath::UnixBytes(b"/Volumes/Old/Photos/one.xmp".to_vec()),
+        );
+        let encoded = |p: &NativePath| match p {
+            NativePath::UnixBytes(v) => v.clone(),
+            NativePath::WindowsWide(v) => v.iter().flat_map(|u| u.to_le_bytes()).collect(),
+        };
+        let connection = db(&root)?;
+        connection.execute(
+            "UPDATE assets SET location=?2,path_display='foreign original' WHERE id=?1",
+            rusqlite::params![asset.id, encoded(&foreign_photo)],
+        )?;
+        connection.execute("UPDATE storage_bindings SET reference=?2,native_path=?3,volume_id=NULL,relative=NULL,file_key=NULL WHERE asset_id=?1",rusqlite::params![asset.id,serde_json::to_string(&PathReference::Native(foreign_photo.clone()))?,serde_json::to_string(&foreign_photo)?])?;
+        for (kind, native) in [("embedded", &foreign_photo), ("sidecar", &foreign_sidecar)] {
+            connection.execute(
+                "UPDATE metadata_sources SET locator=?2 WHERE asset_id=?1 AND kind=?3",
+                rusqlite::params![asset.id, encoded(native), kind],
+            )?;
+            if legacy_untagged {
+                connection.execute("DELETE FROM storage_source_locators WHERE source_id IN (SELECT id FROM metadata_sources WHERE asset_id=? AND kind=?)",rusqlite::params![asset.id,kind])?;
+            } else {
+                connection.execute("UPDATE storage_source_locators SET tag=?2 WHERE source_id IN (SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?3)",rusqlite::params![asset.id,serde_json::json!({"native":native}).to_string(),kind])?;
+            }
+        }
+        drop(connection);
+        let native = temp.path().join("native");
+        fs::create_dir(&native)?;
+        fs::copy(old.join("one.jpg"), native.join("one.jpg"))?;
+        let a = cat.begin_relink(RelinkScope::Asset {
+            asset_id: asset.id.clone(),
+            destinations: vec![NativePath::from_path(&native.join("one.jpg"))],
+        })?;
+        cat.set_relink_source_candidates(&a.id, sidecar, vec![])?;
+        cat.prepare_relink_batch(&a.id, 1)?;
+        cat.apply_relink(&a.id)?;
+        let tag: String = db(&root)?.query_row(
+            "SELECT tag FROM storage_source_locators WHERE source_id=?",
+            [sidecar],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            serde_json::from_str::<serde_json::Value>(&tag)?
+                == serde_json::json!({"native":foreign_sidecar})
+        );
+        let renamed = native.join("renamed.jpg");
+        fs::copy(native.join("one.jpg"), &renamed)?;
+        let local_sidecar = native.join("restored.xmp");
+        fs::copy(old.join("one.xmp"), &local_sidecar)?;
+        let b = cat.begin_relink(RelinkScope::Asset {
+            asset_id: asset.id.clone(),
+            destinations: vec![NativePath::from_path(&renamed)],
+        })?;
+        cat.set_relink_source_candidates(
+            &b.id,
+            sidecar,
+            vec![NativePath::from_path(&local_sidecar)],
+        )?;
+        cat.prepare_relink_batch(&b.id, 1)?;
+        let item = cat.relink_items(&b.id, 0, 1)?.remove(0);
+        let source = cat
+            .relink_sources(&b.id, item.sequence, 0, 10)?
+            .into_iter()
+            .find(|s| s.source_id == sidecar)
+            .unwrap();
+        ensure!(source.original == PathReference::Native(foreign_sidecar.clone()));
+        cat.apply_relink(&b.id)?;
+        cat.undo_relink(&b.id)?;
+        let restored: String = db(&root)?.query_row(
+            "SELECT tag FROM storage_source_locators WHERE source_id=?",
+            [sidecar],
+            |r| r.get(0),
+        )?;
+        ensure!(restored == tag);
+        cat.undo_relink(&a.id)?;
+        let locator: Vec<u8> = db(&root)?.query_row(
+            "SELECT locator FROM metadata_sources WHERE id=?",
+            [sidecar],
+            |r| r.get(0),
+        )?;
+        ensure!(locator == encoded(&foreign_sidecar));
+        let after: Vec<i64> = db(&root)?
+            .prepare("SELECT id FROM metadata_models ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ensure!(models == after);
+        // A fresh excluded-source relink followed by native import cannot retag
+        // the old foreign sidecar merely because its asset now lives on this OS.
+        let c = cat.begin_relink(RelinkScope::Asset {
+            asset_id: asset.id.clone(),
+            destinations: vec![NativePath::from_path(&native.join("one.jpg"))],
+        })?;
+        cat.set_relink_source_candidates(&c.id, sidecar, vec![])?;
+        cat.prepare_relink_batch(&c.id, 1)?;
+        cat.apply_relink(&c.id)?;
+        fs::remove_file(&renamed)?;
+        fs::remove_file(&local_sidecar)?;
+        cat.import(&native, None, |_| Ok(()))?;
+        let tag_after: String = db(&root)?.query_row(
+            "SELECT tag FROM storage_source_locators WHERE source_id=?",
+            [sidecar],
+            |r| r.get(0),
+        )?;
+        ensure!(tag_after == tag);
+        ensure!(fs::read(old.join("one.xmp"))? == xml);
+    }
+    Ok(())
+}
+
+#[test]
+fn excluded_unknown_source_never_inherits_new_asset_encoding_and_tag_changes_block_undo()
+-> Result<()> {
+    let (temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    fs::write(old.join("one.xmp"),br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="unknown"/></rdf:RDF>"#)?;
+    cat.import(&old, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let sidecar: i64 = db(&root)?.query_row(
+        "SELECT id FROM metadata_sources WHERE asset_id=? AND kind='sidecar'",
+        [&asset.id],
+        |r| r.get(0),
+    )?;
+    db(&root)?.execute("DELETE FROM storage_bindings WHERE asset_id=?", [&asset.id])?;
+    db(&root)?.execute(
+        "DELETE FROM storage_source_locators WHERE source_id=?",
+        [sidecar],
+    )?;
+    let new = temp.path().join("new.jpg");
+    fs::copy(old.join("one.jpg"), &new)?;
+    let a = cat.begin_relink(RelinkScope::Asset {
+        asset_id: asset.id.clone(),
+        destinations: vec![NativePath::from_path(&new)],
+    })?;
+    cat.set_relink_source_candidates(&a.id, sidecar, vec![])?;
+    cat.prepare_relink_batch(&a.id, 1)?;
+    cat.apply_relink(&a.id)?;
+    let b = cat.begin_relink(RelinkScope::Asset {
+        asset_id: asset.id.clone(),
+        destinations: vec![NativePath::from_path(&new)],
+    })?;
+    cat.set_relink_source_candidates(
+        &b.id,
+        sidecar,
+        vec![NativePath::from_path(&old.join("one.xmp"))],
+    )?;
+    cat.prepare_relink_batch(&b.id, 1)?;
+    let item = cat.relink_items(&b.id, 0, 1)?.remove(0);
+    let source = cat
+        .relink_sources(&b.id, item.sequence, 0, 10)?
+        .into_iter()
+        .find(|s| s.source_id == sidecar)
+        .unwrap();
+    ensure!(matches!(source.original, PathReference::Unspecified(_)));
+    cat.apply_relink(&b.id)?;
+    let before = paths(&cat)?;
+    db(&root)?.execute(
+        "UPDATE storage_source_locators SET tag='{}' WHERE source_id=?",
+        [sidecar],
+    )?;
+    ensure!(cat.undo_relink(&b.id).is_err());
+    ensure!(paths(&cat)? == before);
     Ok(())
 }

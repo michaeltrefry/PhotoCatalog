@@ -29,6 +29,7 @@ CREATE TABLE storage_exceptions(plan TEXT NOT NULL REFERENCES storage_plans(id),
 CREATE TABLE storage_items(plan TEXT NOT NULL REFERENCES storage_plans(id), sequence INTEGER NOT NULL, asset_id TEXT NOT NULL REFERENCES assets(id), status TEXT NOT NULL, detail TEXT NOT NULL, destination BLOB, file_key TEXT, data TEXT NOT NULL, PRIMARY KEY(plan,sequence), UNIQUE(plan,asset_id));
 CREATE INDEX storage_item_destination ON storage_items(plan,destination);
 CREATE INDEX storage_item_object ON storage_items(plan,file_key);
+CREATE TABLE storage_source_locators(source_id INTEGER PRIMARY KEY REFERENCES metadata_sources(id),tag TEXT NOT NULL);
 CREATE TABLE storage_source_items(plan TEXT NOT NULL, sequence INTEGER NOT NULL, source_id INTEGER NOT NULL REFERENCES metadata_sources(id), status TEXT NOT NULL, detail TEXT NOT NULL, destination BLOB, data TEXT NOT NULL, PRIMARY KEY(plan,source_id), FOREIGN KEY(plan,sequence) REFERENCES storage_items(plan,sequence));
 CREATE INDEX storage_source_parent ON storage_source_items(plan,sequence,source_id);
 CREATE INDEX storage_source_destination ON storage_source_items(plan,sequence,destination);
@@ -38,6 +39,9 @@ CREATE TRIGGER storage_asset_change AFTER UPDATE OF location,fingerprint ON asse
 CREATE TRIGGER storage_binding_insert AFTER INSERT ON storage_bindings BEGIN UPDATE storage_epoch SET revision=revision+1; END;
 CREATE TRIGGER storage_binding_update AFTER UPDATE ON storage_bindings BEGIN UPDATE storage_epoch SET revision=revision+1; END;
 CREATE TRIGGER storage_binding_delete AFTER DELETE ON storage_bindings BEGIN UPDATE storage_epoch SET revision=revision+1; END;
+CREATE TRIGGER storage_source_locator_insert AFTER INSERT ON storage_source_locators BEGIN UPDATE storage_epoch SET revision=revision+1; END;
+CREATE TRIGGER storage_source_locator_update AFTER UPDATE ON storage_source_locators BEGIN UPDATE storage_epoch SET revision=revision+1; END;
+CREATE TRIGGER storage_source_locator_delete AFTER DELETE ON storage_source_locators BEGIN UPDATE storage_epoch SET revision=revision+1; END;
 CREATE TRIGGER storage_source_insert AFTER INSERT ON metadata_sources BEGIN UPDATE storage_epoch SET revision=revision+1; END;
 CREATE TRIGGER storage_source_update AFTER UPDATE ON metadata_sources WHEN OLD.asset_id IS NOT NEW.asset_id OR OLD.kind IS NOT NEW.kind OR OLD.locator IS NOT NEW.locator OR OLD.display IS NOT NEW.display OR OLD.association IS NOT NEW.association OR OLD.availability IS NOT NEW.availability OR OLD.current_observation IS NOT NEW.current_observation BEGIN UPDATE storage_epoch SET revision=revision+1; END;
 CREATE TRIGGER storage_source_delete AFTER DELETE ON metadata_sources BEGIN UPDATE storage_epoch SET revision=revision+1; END;
@@ -179,10 +183,15 @@ struct ItemData {
     evidence: Option<Evidence>,
     binding: Option<BindingDraft>,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceTag {
+    native: Option<NativePath>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceData {
     embedded: bool,
     old_native: Option<NativePath>,
+    old_tag: Option<SourceTag>,
     old_locator: Vec<u8>,
     old_display: String,
     old_availability: String,
@@ -256,7 +265,89 @@ fn decode_bytes(bytes: &[u8], encoding: StorageEncoding) -> Result<NativePath> {
         }
     }
 }
-fn source_native(item: &ItemData, bytes: &[u8]) -> Result<Option<NativePath>> {
+fn get_source_tag(db: &Connection, source: i64) -> Result<Option<SourceTag>> {
+    db.query_row(
+        "SELECT tag FROM storage_source_locators WHERE source_id=?",
+        [source],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|v| Ok(serde_json::from_str(&v)?))
+    .transpose()
+}
+fn put_source_tag(db: &Connection, source: i64, tag: Option<&SourceTag>) -> Result<()> {
+    if get_source_tag(db, source)?.as_ref() == tag {
+        return Ok(());
+    }
+    if let Some(tag) = tag {
+        if let Some(path) = &tag.native {
+            let bytes: Vec<u8> = db.query_row(
+                "SELECT locator FROM metadata_sources WHERE id=?",
+                [source],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                encoded_bytes(path) == bytes,
+                "source locator tag does not match current bytes"
+            );
+        }
+        db.execute("INSERT INTO storage_source_locators VALUES(?1,?2) ON CONFLICT(source_id) DO UPDATE SET tag=excluded.tag",params![source,json(tag)?])?;
+    } else {
+        db.execute(
+            "DELETE FROM storage_source_locators WHERE source_id=?",
+            [source],
+        )?;
+    }
+    Ok(())
+}
+pub(crate) fn record_metadata_path(
+    db: &Connection,
+    asset: &str,
+    kind: &str,
+    path: &Path,
+) -> Result<()> {
+    let source: Option<i64> = db
+        .query_row(
+            "SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",
+            params![asset, kind, location_bytes(path)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(source) = source {
+        let native = NativePath::from_path(path);
+        if let Some(SourceTag { native: Some(old) }) = get_source_tag(db, source)? {
+            ensure!(
+                old == native,
+                "source locator encoding differs; explicit review required"
+            );
+        }
+        put_source_tag(
+            db,
+            source,
+            Some(&SourceTag {
+                native: Some(native),
+            }),
+        )?;
+    }
+    Ok(())
+}
+fn source_native(
+    db: &Connection,
+    source: i64,
+    item: &ItemData,
+    bytes: &[u8],
+) -> Result<Option<NativePath>> {
+    if let Some(tag) = get_source_tag(db, source)? {
+        if let Some(native) = &tag.native {
+            ensure!(
+                encoded_bytes(native) == bytes,
+                "source locator tag differs from stored bytes"
+            );
+        }
+        return Ok(tag.native);
+    }
+    // Only legacy untagged sources inherit the asset's original encoding. Every
+    // apply seals even an unknown source tag before changing that asset binding.
     item.old_binding
         .as_ref()
         .map(|b| {
@@ -1019,7 +1110,7 @@ impl Catalog {
             );
             verify_destination(data.destination.as_ref(), data.evidence.as_ref())?;
             visit_sources(&tx, plan, sequence, |source, status, data| {
-                check_source_snapshot(&tx, source, data, false)?;
+                check_source_snapshot(&tx, source, data, false, false)?;
                 if status == "matched" && !data.embedded {
                     verify_destination(data.destination.as_ref(), data.evidence.as_ref())?;
                 }
@@ -1070,6 +1161,15 @@ impl Catalog {
                     file_key: data.evidence.as_ref().map(Evidence::key),
                 },
             )?;
+            visit_sources(&tx, plan, sequence, |source, _, data| {
+                put_source_tag(
+                    &tx,
+                    source,
+                    Some(&SourceTag {
+                        native: data.old_native.clone(),
+                    }),
+                )
+            })?;
             // Move every source to temporary keys first so source swaps cannot
             // violate (asset,kind,locator) halfway through this transaction.
             visit_sources(&tx, plan, sequence, |source, status, _| {
@@ -1092,6 +1192,13 @@ impl Catalog {
                         .context("source destination missing")?
                         .to_path()?;
                     tx.execute("UPDATE metadata_sources SET locator=?2,display=?3,availability='available' WHERE id=?1",params![source,location_bytes(&p),p.to_string_lossy()])?;
+                    put_source_tag(
+                        &tx,
+                        source,
+                        Some(&SourceTag {
+                            native: data.destination.clone(),
+                        }),
+                    )?;
                 }
                 Ok(())
             })?;
@@ -1182,9 +1289,7 @@ impl Catalog {
                 "applied location changed"
             );
             visit_sources(&tx, plan, sequence, |source, status, data| {
-                if status == "matched" {
-                    check_source_snapshot(&tx, source, data, true)?;
-                }
+                check_source_snapshot(&tx, source, data, true, status == "matched")?;
                 Ok(())
             })?;
             boundary(RelinkBoundary::Verified(sequence))?;
@@ -1228,6 +1333,7 @@ impl Catalog {
                 if status == "matched" {
                     tx.execute("UPDATE metadata_sources SET locator=?2,display=?3,availability=?4 WHERE id=?1",params![source,data.old_locator,data.old_display,data.old_availability])?;
                 }
+                put_source_tag(&tx, source, data.old_tag.as_ref())?;
                 Ok(())
             })?;
             if changed || sources_changed(&tx, plan, sequence)? {
@@ -1436,13 +1542,14 @@ fn check_source_snapshot(
     source: i64,
     data: &SourceData,
     applied: bool,
+    moved: bool,
 ) -> Result<()> {
     let (locator, observation): (Vec<u8>, Option<i64>) = db.query_row(
         "SELECT locator,current_observation FROM metadata_sources WHERE id=?",
         [source],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let expected = if applied {
+    let expected = if applied && moved {
         location_bytes(
             &data
                 .destination
@@ -1453,6 +1560,21 @@ fn check_source_snapshot(
     } else {
         data.old_locator.clone()
     };
+    let expected_tag = if applied {
+        Some(SourceTag {
+            native: if moved {
+                data.destination.clone()
+            } else {
+                data.old_native.clone()
+            },
+        })
+    } else {
+        data.old_tag.clone()
+    };
+    ensure!(
+        get_source_tag(db, source)? == expected_tag,
+        "source locator encoding changed after planning"
+    );
     ensure!(
         locator == expected && observation == data.observation,
         "metadata source changed after planning"
@@ -1812,7 +1934,7 @@ fn prepare_sources(
                 vec![]
             }
         } else {
-            sidecar_paths(request, item, &locator)?
+            sidecar_paths(request, item, source_native(db, id, item, &locator)?)?
         };
         let expected = provenance
             .map(|v| serde_json::from_str::<serde_json::Value>(&v))
@@ -1866,7 +1988,8 @@ fn prepare_sources(
             .unwrap_or((None, None));
         let data = SourceData {
             embedded: kind == "embedded",
-            old_native: source_native(item, &locator)?,
+            old_native: source_native(db, id, item, &locator)?,
+            old_tag: get_source_tag(db, id)?,
             old_locator: locator,
             old_display: display,
             old_availability: availability,
@@ -1896,9 +2019,9 @@ fn prepare_sources(
 fn sidecar_paths(
     request: &RelinkScope,
     item: &ItemData,
-    locator: &[u8],
+    native: Option<NativePath>,
 ) -> Result<Vec<NativePath>> {
-    let Some(native) = source_native(item, locator)? else {
+    let Some(native) = native else {
         return Ok(vec![]);
     };
     if let RelinkScope::Prefix { from, destinations } = request {
