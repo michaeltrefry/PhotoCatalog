@@ -162,10 +162,9 @@ fn explicit_removal_and_subsequent_edits_do_not_resurrect_source_values() -> Res
             == Some(Value::Removed)
     );
     ensure!(
-        xmp::project(&cat.metadata_model(&asset.id, added.model_ids[0])?)?
+        !xmp::project(&cat.metadata_model(&asset.id, added.model_ids[0])?)?
             .fields
-            .get("rating")
-            .is_none()
+            .contains_key("rating")
     );
     Ok(())
 }
@@ -369,5 +368,215 @@ fn jpeg_main_and_extended_are_joined_by_guid_and_original_fragments_remain_intac
     let target = temp.path().join("export.xmp");
     cat.plan_metadata_export(&asset.id, view.revision, merged.id, &target)?;
     ensure!(fs::read(&path)? == bytes);
+    Ok(())
+}
+
+#[test]
+fn equal_values_with_distinct_qualifiers_require_explicit_source_choice() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals)?;
+    jpeg(&originals.join("photo.jpg"));
+    let mut cat = Catalog::open(temp.path().join("catalog"))?;
+    cat.import(&originals, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let mut ids = Vec::new();
+    for note in ["embedded", "sidecar"] {
+        let payload = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:u="https://example.invalid/unknown/"><xmp:Rating rdf:parseType="Resource"><rdf:value>3</rdf:value><u:note>{note}</u:note></xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let path = temp.path().join(format!("{note}.xmp"));
+        fs::write(&path, payload)?;
+        let change = cat.retain_metadata(
+            &asset.id,
+            &Source {
+                kind: note.into(),
+                locator: note.as_bytes().to_vec(),
+                display: note.into(),
+                ambiguous: false,
+                provenance: serde_json::Value::Null,
+            },
+            &xmp_packets::inspect_sidecar(&path, &Limits::default())?,
+        )?;
+        ids.push(change.model_ids[0]);
+    }
+    let view = cat.metadata(&asset.id)?;
+    let field = &view.fields[0];
+    ensure!(
+        field.conflicted
+            && field.candidates[0].value == field.candidates[1].value
+            && field.candidates[0].semantic_hash != field.candidates[1].semantic_hash
+    );
+    let target = temp.path().join("export.xmp");
+    ensure!(
+        cat.plan_metadata_export(&asset.id, view.revision, ids[1], &target)
+            .is_err()
+    );
+    let revision = cat.resolve_metadata(&asset.id, view.revision, "rating", ids[1])?;
+    let plan = cat.plan_metadata_export(&asset.id, revision, ids[1], &target)?;
+    cat.apply_metadata_export(&plan.destination.operation)?;
+    ensure!(
+        xmp::parse(&fs::read(target)?)?
+            .qualifier(
+                xmp::XMP,
+                "Rating",
+                "https://example.invalid/unknown/",
+                "note"
+            )
+            .unwrap()
+            .value
+            == "sidecar"
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_catalog_recovery_restores_capture_without_publishing_stale_payload() -> Result<()> {
+    use photocatalog::metadata_export::{self, ExportBoundary, ExportState};
+    use std::io::Read;
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals)?;
+    jpeg(&originals.join("photo.jpg"));
+    let sidecar = originals.join("photo.xmp");
+    fs::write(&sidecar, packet(2))?;
+    let root = temp.path().join("catalog");
+    let mut cat = Catalog::open(&root)?;
+    cat.import(&originals, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let view = cat.metadata(&asset.id)?;
+    let base = view.fields[0].selected_model.unwrap();
+    let edit = cat.edit_metadata(
+        &asset.id,
+        view.revision,
+        Some(base),
+        &[Edit::Set {
+            namespace: xmp::XMP.into(),
+            path: "Rating".into(),
+            value: "4".into(),
+        }],
+    )?;
+    let plan = cat.plan_metadata_export(&asset.id, edit.revision, base, &sidecar)?;
+    let db = rusqlite::Connection::open(root.join("catalog.sqlite3"))?;
+    let compressed:Vec<u8>=db.query_row("SELECT b.compressed FROM metadata_export_plans p JOIN metadata_blobs b ON b.hash=p.payload_hash WHERE p.operation=?1",[&plan.destination.operation],|r|r.get(0))?;
+    drop(db);
+    let mut payload = Vec::new();
+    flate2::read::ZlibDecoder::new(compressed.as_slice()).read_to_end(&mut payload)?;
+    let receipt =
+        metadata_export::apply_export_with_hook(&plan.destination, &payload, |boundary| {
+            if matches!(
+                boundary,
+                ExportBoundary::Captured | ExportBoundary::BeforeRestore
+            ) {
+                Err(std::io::Error::other("injected interruption"))
+            } else {
+                Ok(())
+            }
+        })?;
+    ensure!(receipt.state == ExportState::Recoverable && !sidecar.exists());
+    cat.edit_metadata(
+        &asset.id,
+        edit.revision,
+        Some(edit.model_ids[0]),
+        &[Edit::Set {
+            namespace: xmp::XMP.into(),
+            path: "Rating".into(),
+            value: "5".into(),
+        }],
+    )?;
+    let restored = cat.recover_metadata_export(&receipt.recovery_directory)?;
+    ensure!(restored.state == ExportState::Restored && fs::read(&sidecar)? == packet(2).as_bytes());
+    ensure!(
+        cat.apply_metadata_export(&plan.destination.operation)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn preview_attachment_guard_rejects_stale_authority_and_holds_writer_lock() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals)?;
+    jpeg(&originals.join("photo.jpg"));
+    let root = temp.path().join("catalog");
+    let mut cat = Catalog::open(&root)?;
+    cat.import(&originals, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let identity = cat.render_identity(&asset.id)?;
+    let db = rusqlite::Connection::open(root.join("catalog.sqlite3"))?;
+    db.busy_timeout(std::time::Duration::from_millis(1))?;
+    ensure!(
+        cat.with_render_identity(&identity, || {
+            ensure!(
+                db.execute(
+                    "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
+                    [&asset.id]
+                )
+                .is_err()
+            );
+            Ok(7)
+        })? == Some(7)
+    );
+    db.execute(
+        "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
+        [&asset.id],
+    )?;
+    ensure!(
+        cat.with_render_identity(&identity, || -> Result<()> {
+            panic!("stale attachment entered")
+        })?
+        .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn qualifier_only_catalog_edits_are_explicitly_selected_and_stay_selected() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals)?;
+    jpeg(&originals.join("photo.jpg"));
+    let payload = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:u="https://example.invalid/qualifier-review/"><xmp:Rating rdf:parseType="Resource"><rdf:value>3</rdf:value><u:note>before</u:note></xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+    fs::write(originals.join("photo.xmp"), payload)?;
+    let mut cat = Catalog::open(temp.path().join("catalog"))?;
+    cat.import(&originals, None, |_| Ok(()))?;
+    let asset = cat.browse(0, 1)?.remove(0);
+    let view = cat.metadata(&asset.id)?;
+    let base = view.fields[0].selected_model.unwrap();
+    let prefix =
+        xmp_toolkit::XmpMeta::namespace_prefix("https://example.invalid/qualifier-review/")
+            .unwrap();
+    let edit = cat.edit_metadata(
+        &asset.id,
+        view.revision,
+        Some(base),
+        &[Edit::Set {
+            namespace: xmp::XMP.into(),
+            path: format!("Rating/?{prefix}note"),
+            value: "after".into(),
+        }],
+    )?;
+    let view = cat.metadata(&asset.id)?;
+    ensure!(!view.fields[0].conflicted && view.fields[0].selected_model == Some(edit.model_ids[0]));
+    let next = cat.edit_metadata(
+        &asset.id,
+        edit.revision,
+        Some(edit.model_ids[0]),
+        &[Edit::Set {
+            namespace: xmp::XMP.into(),
+            path: "Label".into(),
+            value: "Red".into(),
+        }],
+    )?;
+    ensure!(
+        cat.metadata(&asset.id)?
+            .fields
+            .iter()
+            .find(|f| f.name == "rating")
+            .unwrap()
+            .selected_model
+            == Some(next.model_ids[0])
+    );
     Ok(())
 }

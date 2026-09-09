@@ -602,12 +602,15 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(schema_after, schema_before);
+        assert_eq!(
+            schema_after.replace(", render_generation INTEGER NOT NULL DEFAULT 0", ""),
+            schema_before
+        );
         assert_eq!(
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            1
+            2
         );
         assert_eq!(
             catalog

@@ -24,7 +24,7 @@ CREATE INDEX metadata_sources_asset ON metadata_sources(asset_id);
 CREATE TABLE metadata_observations(id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES metadata_sources(id), revision TEXT NOT NULL, status TEXT NOT NULL, issues TEXT NOT NULL, provenance TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(source_id,revision));
 CREATE TABLE metadata_packets(observation_id INTEGER NOT NULL REFERENCES metadata_observations(id), ordinal INTEGER NOT NULL, blob_hash TEXT NOT NULL REFERENCES metadata_blobs(hash), descriptor TEXT NOT NULL, PRIMARY KEY(observation_id,ordinal));
 CREATE TABLE metadata_models(id INTEGER PRIMARY KEY, observation_id INTEGER NOT NULL REFERENCES metadata_observations(id), ordinal INTEGER NOT NULL, blob_hash TEXT NOT NULL REFERENCES metadata_blobs(hash), descriptor TEXT NOT NULL, projection TEXT NOT NULL, error TEXT, UNIQUE(observation_id,ordinal));
-CREATE TABLE metadata_values(model_id INTEGER NOT NULL REFERENCES metadata_models(id), field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(model_id,field));
+CREATE TABLE metadata_values(model_id INTEGER NOT NULL REFERENCES metadata_models(id), field TEXT NOT NULL, value TEXT NOT NULL, semantic_hash TEXT NOT NULL, PRIMARY KEY(model_id,field));
 CREATE INDEX metadata_values_field ON metadata_values(field,value,model_id);
 CREATE TABLE metadata_choices(asset_id TEXT NOT NULL REFERENCES assets(id), field TEXT NOT NULL, model_id INTEGER NOT NULL REFERENCES metadata_models(id), PRIMARY KEY(asset_id,field));
 CREATE TABLE metadata_history(id INTEGER PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id), revision INTEGER NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')));
@@ -53,6 +53,7 @@ pub struct Candidate {
     pub observation_id: i64,
     pub ambiguous: bool,
     pub value: Value,
+    pub semantic_hash: String,
 }
 #[derive(Debug, Serialize)]
 pub struct Field {
@@ -107,7 +108,7 @@ pub struct PacketEvidence {
     pub bytes: Vec<u8>,
     pub blake3: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RenderIdentity {
     pub asset_id: String,
     pub generation: i64,
@@ -125,6 +126,7 @@ pub struct Change {
 
 struct PreparedModel {
     hash: String,
+    semantics: BTreeMap<String, String>,
     descriptor: String,
     projection: Projection,
     error: Option<String>,
@@ -189,7 +191,7 @@ impl Prepared {
                 Ok(p) => (p, None),
                 Err(e) => (Projection::default(), Some(format!("{e:#}"))),
             };
-            value.models.push(PreparedModel {hash,descriptor:serde_json::to_string(&serde_json::json!({"packet_indices":input.packet_indices,"transformation":input.transformation,"group":input.group}))?,projection,error});
+            value.models.push(PreparedModel {semantics:if error.is_none() {xmp::field_semantics(&input.bytes)?} else {BTreeMap::new()},hash,descriptor:serde_json::to_string(&serde_json::json!({"packet_indices":input.packet_indices,"transformation":input.transformation,"group":input.group}))?,projection,error});
         }
         // Extended JPEG data is linked by its declared GUID, never by adjacency.
         let mut joined = BTreeSet::new();
@@ -233,7 +235,7 @@ impl Prepared {
             match xmp::merge_jpeg(&input.bytes, &extension.bytes) {
                 Ok(bytes) => {
                     let hash = value.blob(&bytes)?;
-                    value.models.push(PreparedModel{hash,descriptor:serde_json::to_string(&serde_json::json!({"transformation":"JpegMainAndExtendedMerged","derived_from_inputs":[index,extension_index],"packet_indices":input.packet_indices.iter().chain(extension.packet_indices.iter()).collect::<Vec<_>>(),"guid":guid.value}))?,projection:xmp::project(&bytes)?,error:None});
+                    value.models.push(PreparedModel{semantics:xmp::field_semantics(&bytes)?,hash,descriptor:serde_json::to_string(&serde_json::json!({"transformation":"JpegMainAndExtendedMerged","derived_from_inputs":[index,extension_index],"packet_indices":input.packet_indices.iter().chain(extension.packet_indices.iter()).collect::<Vec<_>>(),"guid":guid.value}))?,projection:xmp::project(&bytes)?,error:None});
                     value.models[index].error = Some(
                         "JPEG main fragment; use the associated merged model for editing/export"
                             .into(),
@@ -339,8 +341,15 @@ fn store(
             let mid = db.last_insert_rowid();
             for (field, value) in &m.projection.fields {
                 db.execute(
-                    "INSERT INTO metadata_values VALUES(?1,?2,?3)",
-                    params![mid, field, serde_json::to_string(value)?],
+                    "INSERT INTO metadata_values VALUES(?1,?2,?3,?4)",
+                    params![
+                        mid,
+                        field,
+                        serde_json::to_string(value)?,
+                        m.semantics
+                            .get(field)
+                            .context("missing field semantic identity")?
+                    ],
                 )?;
             }
         }
@@ -365,7 +374,7 @@ fn store(
 }
 fn candidates(db: &Connection, asset: &str) -> Result<BTreeMap<String, Vec<Candidate>>> {
     let mut result: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-    let mut stmt=db.prepare("SELECT v.field,v.value,m.id,s.id,s.kind,s.display,m.observation_id,CASE WHEN s.association='ambiguous' OR o.status!='Complete' THEN 'ambiguous' ELSE 'confirmed' END FROM metadata_sources s JOIN metadata_observations o ON o.id=s.current_observation JOIN metadata_models m ON m.observation_id=s.current_observation JOIN metadata_values v ON v.model_id=m.id WHERE s.asset_id=?1 ORDER BY v.field,s.id,m.ordinal")?;
+    let mut stmt=db.prepare("SELECT v.field,v.value,m.id,s.id,s.kind,s.display,m.observation_id,CASE WHEN s.association='ambiguous' OR o.status!='Complete' THEN 'ambiguous' ELSE 'confirmed' END,v.semantic_hash FROM metadata_sources s JOIN metadata_observations o ON o.id=s.current_observation JOIN metadata_models m ON m.observation_id=s.current_observation JOIN metadata_values v ON v.model_id=m.id WHERE s.asset_id=?1 ORDER BY v.field,s.id,m.ordinal")?;
     let rows = stmt.query_map([asset], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -376,6 +385,7 @@ fn candidates(db: &Connection, asset: &str) -> Result<BTreeMap<String, Vec<Candi
             r.get::<_, String>(5)?,
             r.get::<_, i64>(6)?,
             r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
         ))
     })?;
     for row in rows {
@@ -388,6 +398,7 @@ fn candidates(db: &Connection, asset: &str) -> Result<BTreeMap<String, Vec<Candi
             source_display,
             observation_id,
             association,
+            semantic_hash,
         ) = row?;
         result.entry(field).or_default().push(Candidate {
             model_id,
@@ -397,6 +408,7 @@ fn candidates(db: &Connection, asset: &str) -> Result<BTreeMap<String, Vec<Candi
             observation_id,
             ambiguous: association == "ambiguous",
             value: serde_json::from_str(&value)?,
+            semantic_hash,
         });
     }
     Ok(result)
@@ -419,9 +431,9 @@ fn rebuild(db: &Connection, asset: &str) -> Result<()> {
         let chosen = choices.get(field);
         let selected = chosen.and_then(|mid| values.iter().find(|c| c.model_id == *mid));
         let consensus = values.first().filter(|first| {
-            values
-                .iter()
-                .all(|c| !c.ambiguous && c.value == first.value)
+            values.iter().all(|c| {
+                !c.ambiguous && c.value == first.value && c.semantic_hash == first.semantic_hash
+            })
         });
         let selected = if chosen.is_some() {
             selected
@@ -465,6 +477,25 @@ fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 impl Catalog {
+    /// Hold catalog generation authority only for the final preview-manifest CAS.
+    /// Stage and flush image bytes before entering this guard; callbacks must not
+    /// acquire catalog locks in reverse order. Visible reads still check current keys.
+    pub fn with_render_identity<T>(
+        &mut self,
+        expected: &RenderIdentity,
+        attach: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current=tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[&expected.asset_id],|r|Ok(RenderIdentity{asset_id:expected.asset_id.clone(),generation:r.get(0)?,fingerprint:r.get(1)?,state:r.get(2)?,metadata_revision:r.get(3)?})).optional()?;
+        if current.as_ref() != Some(expected) {
+            return Ok(None);
+        }
+        let result = attach()?;
+        tx.commit()?;
+        Ok(Some(result))
+    }
     pub fn render_identity(&self, asset: &str) -> Result<RenderIdentity> {
         let (generation, fingerprint, state, metadata_revision) = self.db.query_row(
             "SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",
@@ -695,6 +726,16 @@ impl Catalog {
         } else {
             xmp::project(&input)?
         };
+        let original_semantics = if let Some(mid) = base_model {
+            self.db
+                .prepare("SELECT field,semantic_hash FROM metadata_values WHERE model_id=?1")?
+                .query_map([mid], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
+        } else {
+            BTreeMap::new()
+        };
         let mut updated = xmp::project(&bytes)?;
         for field in original.fields.keys() {
             if !updated.fields.contains_key(field) {
@@ -735,6 +776,16 @@ impl Catalog {
         };
         let mut prepared = Prepared::new(&inspection, &source)?;
         prepared.models[0].projection = updated.clone();
+        for (field, value) in &updated.fields {
+            if *value == Value::Removed {
+                prepared.models[0].semantics.insert(
+                    field.clone(),
+                    blake3::hash(b"catalog-explicit-removal-v1")
+                        .to_hex()
+                        .to_string(),
+                );
+            }
+        }
         prepared.revision = blake3::hash(&serde_json::to_vec(&(&prepared.revision, &updated))?)
             .to_hex()
             .to_string();
@@ -743,14 +794,15 @@ impl Catalog {
             revision(&tx, asset)? == expected_revision,
             "metadata changed while preparing edit"
         );
-        let previous_choices=tx.prepare("SELECT c.field,v.value FROM metadata_choices c JOIN metadata_values v ON v.model_id=c.model_id AND v.field=c.field JOIN metadata_models m ON m.id=c.model_id JOIN metadata_observations o ON o.id=m.observation_id JOIN metadata_sources s ON s.id=o.source_id WHERE c.asset_id=?1 AND s.kind='catalog' AND s.locator=?2 AND s.current_observation=o.id")?.query_map(params![asset,source.locator],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
+        let previous_choices=tx.prepare("SELECT c.field,v.semantic_hash FROM metadata_choices c JOIN metadata_values v ON v.model_id=c.model_id AND v.field=c.field JOIN metadata_models m ON m.id=c.model_id JOIN metadata_observations o ON o.id=m.observation_id JOIN metadata_sources s ON s.id=o.source_id WHERE c.asset_id=?1 AND s.kind='catalog' AND s.locator=?2 AND s.current_observation=o.id")?.query_map(params![asset,source.locator],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
         let (observation_id, model_ids, _) = store(&tx, asset, &source, &prepared)?;
         let mid = model_ids[0];
         for (field, value) in &updated.fields {
             if original.fields.get(field) != Some(value)
-                || previous_choices.get(field).is_some_and(|old| {
-                    serde_json::from_str::<Value>(old).ok().as_ref() == Some(value)
-                })
+                || original_semantics.get(field) != prepared.models[0].semantics.get(field)
+                || previous_choices
+                    .get(field)
+                    .is_some_and(|old| Some(old) == prepared.models[0].semantics.get(field))
             {
                 tx.execute("INSERT INTO metadata_choices VALUES(?1,?2,?3) ON CONFLICT(asset_id,field) DO UPDATE SET model_id=excluded.model_id",params![asset,field,mid])?;
             }
@@ -972,10 +1024,12 @@ fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
 #[cfg(windows)]
 fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
-    ensure!(bytes.len() % 2 == 0, "invalid native path");
+    ensure!(bytes.len().is_multiple_of(2), "invalid native path");
     Ok(PathBuf::from(std::ffi::OsString::from_wide(
         &bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect::<Vec<_>>(),
     )))
@@ -1115,5 +1169,45 @@ impl Catalog {
             let (id,revision,action,detail,created_at)=row?;out.push(serde_json::json!({"id":id,"revision":revision,"action":action,"detail":serde_json::from_str::<serde_json::Value>(&detail)?,"created_at":created_at}));
         }
         Ok(out)
+    }
+}
+
+impl Catalog {
+    pub fn recover_metadata_export(
+        &mut self,
+        directory: &Path,
+    ) -> Result<crate::metadata_export::ExportReceipt> {
+        let directory = directory.canonicalize()?;
+        let name = directory
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("invalid recovery operation directory")?;
+        let operation = name
+            .strip_prefix(".photocatalog-xmp-export-")
+            .context("not a PhotoCatalog export operation")?;
+        let (asset, expected, plan): (String, i64, String) = self.db.query_row(
+            "SELECT asset_id,revision,plan FROM metadata_export_plans WHERE operation=?1",
+            [operation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let plan: crate::metadata_export::ExportPlan = serde_json::from_str(&plan)?;
+        ensure!(
+            plan.destination
+                .parent()
+                .context("export destination has no parent")?
+                .join(format!(".photocatalog-xmp-export-{}", plan.operation))
+                .canonicalize()?
+                == directory,
+            "recovery operation path differs from catalog plan"
+        );
+        if revision(&self.db, &asset)? == expected {
+            return self.apply_metadata_export(operation);
+        }
+        let receipt = crate::metadata_export::restore_planned_export(&plan)?;
+        self.db.execute(
+            "UPDATE metadata_export_plans SET receipt=?1 WHERE operation=?2",
+            params![serde_json::to_string(&receipt)?, operation],
+        )?;
+        Ok(receipt)
     }
 }

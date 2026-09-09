@@ -1,6 +1,5 @@
-#[path = "../src/metadata_export.rs"]
-mod metadata_export;
 use metadata_export::*;
+use photocatalog::metadata_export;
 use std::{fs, io, path::Path};
 
 fn bytes(path: &Path) -> Vec<u8> {

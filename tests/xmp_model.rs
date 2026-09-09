@@ -16,14 +16,13 @@ const QUALIFIED_PACKET: &str = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTcz
 
 fn canonical(meta: &mut XmpMeta) -> Result<String> {
     meta.sort().context("sort complete XMP model")?;
-    Ok(meta
-        .to_string_with_options(
-            ToStringOptions::default()
-                .omit_packet_wrapper()
-                .use_canonical_format()
-                .omit_all_formatting(),
-        )
-        .context("serialize complete XMP model")?)
+    meta.to_string_with_options(
+        ToStringOptions::default()
+            .omit_packet_wrapper()
+            .use_canonical_format()
+            .omit_all_formatting(),
+    )
+    .context("serialize complete XMP model")
 }
 
 #[test]
@@ -172,5 +171,97 @@ fn strict_transport_decoding_and_structure_guards() -> Result<()> {
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn qualified_keyword_items_survive_append_and_scalar_change() -> Result<()> {
+    use photocatalog::xmp::{self, Edit};
+    let original=br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:u="https://example.invalid/unknown/"><dc:subject><rdf:Bag><rdf:li rdf:parseType="Resource"><rdf:value>snow</rdf:value><u:confidence>0.9</u:confidence></rdf:li></rdf:Bag></dc:subject></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+    let output = xmp::apply_edits(
+        original,
+        &[
+            Edit::Set {
+                namespace: xmp::DC.into(),
+                path: "subject[1]".into(),
+                value: "winter".into(),
+            },
+            Edit::Append {
+                namespace: xmp::DC.into(),
+                path: "subject".into(),
+                value: "mountain".into(),
+                ordered: false,
+            },
+        ],
+    )?;
+    let meta = xmp::parse(&output)?;
+    ensure!(
+        meta.qualifier(
+            xmp::DC,
+            "subject[1]",
+            "https://example.invalid/unknown/",
+            "confidence"
+        )
+        .unwrap()
+        .value
+            == "0.9"
+    );
+    let reversed = xmp::apply_edits(
+        &output,
+        &[
+            Edit::Remove {
+                namespace: xmp::DC.into(),
+                path: "subject[2]".into(),
+            },
+            Edit::Set {
+                namespace: xmp::DC.into(),
+                path: "subject[1]".into(),
+                value: "snow".into(),
+            },
+        ],
+    )?;
+    ensure!(xmp::canonical(&xmp::parse(&reversed)?)? == xmp::canonical(&xmp::parse(original)?)?);
+    Ok(())
+}
+
+#[test]
+fn malformed_transport_declarations_are_not_normalized_into_valid_xmp() -> Result<()> {
+    use photocatalog::xmp;
+    for declaration in [
+        "<?xml THIS IS NOT A DECLARATION?>",
+        "<?xml encoding='UTF-16'?>",
+        "<?xml version='1.0' unexpected='yes'?>",
+    ] {
+        let text = format!("{declaration}{QUALIFIED_PACKET}");
+        let mut utf16 = vec![255, 254];
+        for unit in text.encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        ensure!(xmp::parse(&utf16).is_err());
+        let mut utf32 = vec![0, 0, 254, 255];
+        for c in text.chars() {
+            utf32.extend((c as u32).to_be_bytes());
+        }
+        ensure!(xmp::parse(&utf32).is_err());
+    }
+    let text = format!("<?xml version='1.0' encoding='UTF-16'?>{QUALIFIED_PACKET}");
+    let mut bytes = vec![255, 254];
+    for unit in text.encode_utf16() {
+        bytes.extend(unit.to_le_bytes());
+    }
+    ensure!(
+        xmp::canonical(&xmp::parse(&bytes)?)?
+            == xmp::canonical(&xmp::parse(QUALIFIED_PACKET.as_bytes())?)?
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_model_subject_survives_no_change_export_and_property_removal() -> Result<()> {
+    use photocatalog::xmp;
+    let packet=br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="urn:review:subject"/></rdf:RDF></x:xmpmeta>"#;
+    let output = xmp::reconcile_fields(packet, &[])?;
+    ensure!(xmp::parse(&output)?.name() == "urn:review:subject");
+    ensure!(xmp::canonical(&xmp::parse(packet)?)? == xmp::canonical(&xmp::parse(&output)?)?);
     Ok(())
 }

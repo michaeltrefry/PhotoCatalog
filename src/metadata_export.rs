@@ -129,12 +129,19 @@ pub fn apply_export_with_hook(
             }
         }
     }
-    run_recovery(&directory, Some(plan), &mut hook)
+    run_recovery(&directory, Some(plan), &mut hook, false)
 }
 
 /// Resume a known operation. No file is unlinked or overwritten by recovery.
 pub fn recover_export(directory: &Path) -> Result<ExportReceipt> {
-    run_recovery(directory, None, &mut |_| Ok(()))
+    run_recovery(directory, None, &mut |_| Ok(()), false)
+}
+
+/// Restore only; never publish staged metadata. Used when catalog revisions have
+/// changed since an interrupted export. Concurrent destinations remain untouched.
+pub fn restore_planned_export(plan: &ExportPlan) -> Result<ExportReceipt> {
+    validate_plan(plan)?;
+    run_recovery(&recovery_path(plan), Some(plan), &mut |_| Ok(()), true)
 }
 
 /// Includes interrupted preparation directories; malformed/incomplete operations
@@ -155,6 +162,7 @@ fn run_recovery(
     directory: &Path,
     expected_plan: Option<&ExportPlan>,
     hook: &mut impl FnMut(ExportBoundary) -> io::Result<()>,
+    restore_only: bool,
 ) -> Result<ExportReceipt> {
     ensure!(
         fs::symlink_metadata(directory)?.file_type().is_dir(),
@@ -179,6 +187,14 @@ fn run_recovery(
         );
         if let Some(expected) = expected_plan {
             ensure!(*expected == plan, "existing operation has a different plan");
+        }
+        if restore_only {
+            return rollback(
+                &plan,
+                &directory,
+                "catalog revision changed; staged payload must not be published".into(),
+                hook,
+            );
         }
         let result = resume(&plan, &directory, hook);
         match result {

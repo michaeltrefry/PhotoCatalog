@@ -195,7 +195,7 @@ fn main() -> Result<()> {
             &photocatalog::metadata_export::discover_exports(&directory)?,
         )?,
         Command::MetadataExportRecover { directory } => {
-            print_json(&photocatalog::metadata_export::recover_export(&directory)?)?
+            print_json(&catalog.recover_metadata_export(&directory)?)?
         }
     }
     Ok(())

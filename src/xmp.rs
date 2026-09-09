@@ -81,14 +81,16 @@ pub fn xml_text(bytes: &[u8]) -> Result<String> {
         )
     };
     let body = &bytes[skip..];
-    let mut text = match width {
+    let text = match width {
         1 => std::str::from_utf8(body)
             .context("XMP is not UTF-8")?
             .to_owned(),
         2 => {
-            ensure!(body.len() % 2 == 0, "truncated UTF-16 XMP");
+            ensure!(body.len().is_multiple_of(2), "truncated UTF-16 XMP");
             let units = body
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| {
                     if little {
                         u16::from_le_bytes([b[0], b[1]])
@@ -100,8 +102,10 @@ pub fn xml_text(bytes: &[u8]) -> Result<String> {
             String::from_utf16(&units).context("invalid UTF-16 XMP")?
         }
         4 => {
-            ensure!(body.len() % 4 == 0, "truncated UTF-32 XMP");
-            body.chunks_exact(4)
+            ensure!(body.len().is_multiple_of(4), "truncated UTF-32 XMP");
+            body.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| {
                     let a = [b[0], b[1], b[2], b[3]];
                     char::from_u32(if little {
@@ -120,11 +124,6 @@ pub fn xml_text(bytes: &[u8]) -> Result<String> {
         !text.contains("<!DOCTYPE") && !text.contains("<!ENTITY"),
         "DTD/entity declarations are not accepted in XMP"
     );
-    // The SDK receives UTF-8, so remove only the transport encoding declaration.
-    if width != 1 && text.starts_with("<?xml ") {
-        let end = text.find("?>").context("unterminated XML declaration")? + 2;
-        text.replace_range(..end, "");
-    }
     Ok(text)
 }
 pub fn parse(bytes: &[u8]) -> Result<XmpMeta> {
@@ -150,7 +149,14 @@ pub fn parse(bytes: &[u8]) -> Result<XmpMeta> {
             "XMP nesting exceeds model limit"
         );
     }
-    XmpMeta::from_str_with_options(&text, FromStrOptions::default().strict_aliasing())
+    // Validate the original decoded declaration before normalizing transport.
+    // The SDK receives UTF-8 bytes, independent of the original UTF-16/32 declaration.
+    let sdk_text = if text.starts_with("<?xml ") {
+        &text[text.find("?>").context("unterminated XML declaration")? + 2..]
+    } else {
+        &text
+    };
+    XmpMeta::from_str_with_options(sdk_text, FromStrOptions::default().strict_aliasing())
         .context("parse XMP model")
 }
 fn serialize(meta: &XmpMeta) -> Result<Vec<u8>> {
@@ -558,7 +564,7 @@ fn properties(bytes: &[u8]) -> Result<(String, Properties)> {
     }
     Ok((name, output))
 }
-fn assemble(properties: &Properties) -> Result<Vec<u8>> {
+fn assemble(properties: &Properties, subject: &str) -> Result<Vec<u8>> {
     let mut text = String::from(
         "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
     );
@@ -566,7 +572,10 @@ fn assemble(properties: &Properties) -> Result<Vec<u8>> {
         text.push_str(fragment);
     }
     if properties.is_empty() {
-        text.push_str("<rdf:Description rdf:about=\"\"/>");
+        text.push_str(&format!(
+            "<rdf:Description rdf:about=\"{}\"/>",
+            xml_attribute(subject)
+        ));
     }
     text.push_str("</rdf:RDF></x:xmpmeta>");
     serialize(&parse(text.as_bytes())?)
@@ -574,12 +583,16 @@ fn assemble(properties: &Properties) -> Result<Vec<u8>> {
 /// Copy selected complete common properties, including nested data and qualifiers.
 /// A None source is an explicit removal. Everything outside these properties remains from base.
 pub fn reconcile_fields(base: &[u8], fields: &[(String, Option<Vec<u8>>)]) -> Result<Vec<u8>> {
-    let (_, mut props) = properties(base)?;
+    let (subject, mut props) = properties(base)?;
     for (field, source) in fields {
         let (ns, path) = field_address(field).context("unknown indexed metadata field")?;
         let key = (ns.to_owned(), path.to_owned());
         if let Some(source) = source {
-            let (_, incoming) = properties(source)?;
+            let (incoming_subject, incoming) = properties(source)?;
+            ensure!(
+                incoming_subject == subject,
+                "selected source RDF subject differs from base"
+            );
             props.insert(
                 key.clone(),
                 incoming
@@ -591,7 +604,11 @@ pub fn reconcile_fields(base: &[u8], fields: &[(String, Option<Vec<u8>>)]) -> Re
             props.remove(&key);
         }
     }
-    let output = assemble(&props)?;
+    let output = assemble(&props, &subject)?;
+    ensure!(
+        parse(&output)?.name() == subject,
+        "reconciled export changed RDF subject"
+    );
     let (_, actual) = properties(&output)?;
     ensure!(
         props.len() == actual.len(),
@@ -605,7 +622,8 @@ pub fn reconcile_fields(base: &[u8], fields: &[(String, Option<Vec<u8>>)]) -> Re
         let expected = BTreeMap::from([(key.clone(), expected)]);
         let actual = BTreeMap::from([(key, actual.clone())]);
         ensure!(
-            canonical(&parse(&assemble(&expected)?)?)? == canonical(&parse(&assemble(&actual)?)?)?,
+            canonical(&parse(&assemble(&expected, &subject)?)?)?
+                == canonical(&parse(&assemble(&actual, &subject)?)?)?,
             "reconciled export changed property semantics"
         );
     }
@@ -626,5 +644,58 @@ pub(crate) fn merge_jpeg(main: &[u8], extended: &[u8]) -> Result<Vec<u8>> {
             "JPEG main/extended properties overlap; explicit reconciliation required"
         );
     }
-    assemble(&props)
+    assemble(&props, &name)
+}
+
+/// Prefix-independent full-property identities for conflict detection. Values alone
+/// cannot distinguish two ratings or keywords carrying different unknown qualifiers.
+pub(crate) fn field_semantics(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
+    fn node_value(node: roxmltree::Node<'_, '_>) -> serde_json::Value {
+        if node.is_text() {
+            return serde_json::json!(["text", node.text().unwrap_or_default()]);
+        }
+        let mut attributes = node
+            .attributes()
+            .map(|a| (a.namespace().unwrap_or_default(), a.name(), a.value()))
+            .collect::<Vec<_>>();
+        attributes.sort();
+        serde_json::json!([
+            node.tag_name().namespace().unwrap_or_default(),
+            node.tag_name().name(),
+            attributes,
+            node.children()
+                .filter(|n| n.is_element() || n.is_text())
+                .map(node_value)
+                .collect::<Vec<_>>()
+        ])
+    }
+    let meta = parse(bytes)?;
+    let serialized = canonical(&meta)?;
+    let doc = roxmltree::Document::parse(&serialized)?;
+    let projection = project(bytes)?;
+    let mut result = BTreeMap::new();
+    for field in projection.fields.keys() {
+        let address = field_address(field).context("unknown projected field")?;
+        let node = doc
+            .descendants()
+            .find(|n| {
+                n.has_tag_name(address)
+                    && n.parent().is_some_and(|p| {
+                        p.has_tag_name((
+                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                            "Description",
+                        )) && p.parent().is_some_and(|r| {
+                            r.has_tag_name(("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "RDF"))
+                        })
+                    })
+            })
+            .context("canonical projected property missing")?;
+        result.insert(
+            field.clone(),
+            blake3::hash(&serde_json::to_vec(&node_value(node))?)
+                .to_hex()
+                .to_string(),
+        );
+    }
+    Ok(result)
 }
