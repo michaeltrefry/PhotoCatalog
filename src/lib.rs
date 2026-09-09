@@ -1,7 +1,10 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 pub mod catalog_metadata;
+pub mod catalog_storage;
+mod import_storage;
 pub mod media;
 pub mod metadata_export;
+pub mod storage_volume;
 pub mod xmp;
 pub mod xmp_packets;
 mod xmp_rdf;
@@ -84,7 +87,7 @@ impl Catalog {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 2,
+            version <= 3,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -125,6 +128,11 @@ impl Catalog {
             tx.execute_batch(catalog_metadata::SCHEMA)?;
             tx.pragma_update(None, "user_version", 2)?;
         }
+        if version < 3 {
+            tx.execute_batch(catalog_storage::SCHEMA)?;
+            tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
+            tx.pragma_update(None, "user_version", 3)?;
+        }
         tx.commit()?;
         Ok(Self { db, root })
     }
@@ -146,6 +154,7 @@ impl Catalog {
         self.begin_metadata_scan()?;
         let mut report = ImportReport::default();
         let mut processed = 0;
+        let mut volumes = import_storage::ImportVolumes::new();
         for entry in walkdir::WalkDir::new(&folder)
             .follow_links(false)
             .max_open(16)
@@ -175,6 +184,7 @@ impl Catalog {
                 Ok(value) => value,
                 Err(error) => {
                     self.reserve(path, &location)?;
+                    self.record_import_path(path)?;
                     let (changed, warnings) = self.refresh_metadata(path, true)?;
                     report.metadata_updated += u64::from(changed);
                     report.metadata_warnings += warnings as u64;
@@ -183,6 +193,8 @@ impl Catalog {
                     continue;
                 }
             };
+            let observation = volumes.observe(path)?;
+            self.reconnect_storage_asset(path, &observation, &fingerprint, volumes.snapshot())?;
             let existing: Option<(String, String, Option<String>)> = self
                 .db
                 .query_row(
@@ -202,6 +214,7 @@ impl Catalog {
                 && state == "ready"
                 && self.read_preview_hash(&hash).is_ok()
             {
+                self.bind_import_storage(path, &observation)?;
                 let (changed, warnings) = self.refresh_metadata(path, false)?;
                 report.metadata_updated += u64::from(changed);
                 report.metadata_warnings += warnings as u64;
@@ -209,6 +222,7 @@ impl Catalog {
                 continue;
             }
             self.reserve(path, &location)?;
+            self.bind_import_storage(path, &observation)?;
             observer(ImportEvent::Reserved)?;
             let (changed, warnings) = self.refresh_metadata(path, true)?;
             report.metadata_updated += u64::from(changed);
@@ -246,6 +260,26 @@ impl Catalog {
             report.imported += 1;
         }
         Ok(report)
+    }
+    fn bind_import_storage(
+        &mut self,
+        path: &Path,
+        observation: &storage_volume::VolumeLocation,
+    ) -> Result<()> {
+        let asset = self.record_import_path(path)?;
+        if observation.state == storage_volume::LocationState::Available {
+            self.bind_storage(&asset, observation)?;
+        }
+        Ok(())
+    }
+    fn record_import_path(&mut self, path: &Path) -> Result<String> {
+        let asset: String = self.db.query_row(
+            "SELECT id FROM assets WHERE location=?1",
+            [location_bytes(path)],
+            |row| row.get(0),
+        )?;
+        self.record_storage_path(&asset, &storage_volume::NativePath::from_path(path))?;
+        Ok(asset)
     }
     fn reserve(&self, path: &Path, location: &[u8]) -> Result<()> {
         self.db.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
@@ -611,7 +645,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            2
+            3
         );
         assert_eq!(
             catalog

@@ -124,6 +124,21 @@ pub struct Change {
     pub changed: bool,
 }
 
+pub(crate) const FILE_INSTANCE_SCHEMA: &str = "
+CREATE TABLE metadata_file_instances(id INTEGER PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id), source_id INTEGER NOT NULL REFERENCES metadata_sources(id), evidence_hash TEXT NOT NULL, provenance TEXT NOT NULL, observed_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(source_id,evidence_hash));
+CREATE INDEX metadata_file_instances_asset ON metadata_file_instances(asset_id,id);
+";
+
+/// File-instance observations preserve relocation/copy timing without replacing an
+/// unchanged immutable XMP observation or invalidating selected model identities.
+#[derive(Debug, Serialize)]
+pub struct FileInstance {
+    pub id: i64,
+    pub source_id: i64,
+    pub provenance: serde_json::Value,
+    pub observed_at: String,
+}
+
 struct PreparedModel {
     hash: String,
     semantics: BTreeMap<String, String>,
@@ -255,11 +270,47 @@ impl Prepared {
             }
         }
         // Distinguish repeated observations with changed extraction/parser status as well as bytes.
-        let identity = serde_json::to_vec(
-            &serde_json::json!({"version":1,"source_revision":inspection.revision,"status":value.status,"issues":value.issues,"packets":value.packets,"models":value.models.iter().map(|m| (&m.hash,&m.descriptor,&m.projection,&m.error)).collect::<Vec<_>>(),"provenance":value.provenance}),
-        )?;
-        value.revision = blake3::hash(&identity).to_hex().to_string();
+        value.revision = value.revision_with_provenance(&value.provenance)?;
         Ok(value)
+    }
+    fn revision_with_provenance(&self, provenance: &str) -> Result<String> {
+        let parsed: serde_json::Value = serde_json::from_str(provenance)?;
+        let source_revision = parsed
+            .get("file_revision")
+            .context("missing source revision")?;
+        let identity = serde_json::to_vec(
+            &serde_json::json!({"version":1,"source_revision":source_revision,"status":self.status,"issues":self.issues,"packets":self.packets,"models":self.models.iter().map(|m| (&m.hash,&m.descriptor,&m.projection,&m.error)).collect::<Vec<_>>(),"provenance":provenance}),
+        )?;
+        Ok(blake3::hash(&identity).to_hex().to_string())
+    }
+    /// Compare the current observation with its original file-instance provenance.
+    /// File bytes, source provenance, packet layout and parser results must all match.
+    /// Location and timestamp describe a file instance, including same-path copies.
+    /// Their new provenance is retained separately from the immutable model.
+    fn matches_relocated_observation(&self, db: &Connection, id: i64) -> Result<bool> {
+        let (revision, provenance): (String, String) = db.query_row(
+            "SELECT revision,provenance FROM metadata_observations WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut previous: serde_json::Value = serde_json::from_str(&provenance)?;
+        let mut current: serde_json::Value = serde_json::from_str(&self.provenance)?;
+        previous
+            .as_object_mut()
+            .context("invalid previous provenance")?
+            .remove("source_location");
+        current
+            .as_object_mut()
+            .context("invalid current provenance")?
+            .remove("source_location");
+        for value in [&mut previous, &mut current] {
+            value
+                .get_mut("file_revision")
+                .and_then(serde_json::Value::as_object_mut)
+                .context("invalid file revision")?
+                .remove("modified_unix_ns");
+        }
+        Ok(previous == current && self.revision_with_provenance(&provenance)? == revision)
     }
     fn blob(&mut self, bytes: &[u8]) -> Result<String> {
         ensure!(
@@ -312,13 +363,24 @@ fn store(
         params![asset, source.kind, source.locator],
         |r| r.get(0),
     )?;
-    let observed: Option<i64> = db
+    let mut observed: Option<i64> = db
         .query_row(
             "SELECT id FROM metadata_observations WHERE source_id=?1 AND revision=?2",
             params![sid, prepared.revision],
             |r| r.get(0),
         )
         .optional()?;
+    if observed.is_none()
+        && let Some((_, Some(current), _, _)) = &old
+        && prepared.matches_relocated_observation(db, *current)?
+    {
+        observed = Some(*current);
+        let hash = blake3::hash(prepared.provenance.as_bytes())
+            .to_hex()
+            .to_string();
+        db.execute("INSERT OR IGNORE INTO metadata_file_instances(asset_id,source_id,evidence_hash,provenance) VALUES(?1,?2,?3,?4)",
+            params![asset, sid, hash, prepared.provenance])?;
+    }
     let oid = if let Some(id) = observed {
         id
     } else {
@@ -477,6 +539,29 @@ fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 impl Catalog {
+    pub fn metadata_file_instances(
+        &self,
+        asset: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<FileInstance>> {
+        ensure!((1..=1000).contains(&limit), "page limit must be 1..1000");
+        revision(&self.db, asset)?;
+        let mut stmt = self.db.prepare("SELECT id,source_id,provenance,observed_at FROM metadata_file_instances WHERE asset_id=?1 AND id>?2 ORDER BY id LIMIT ?3")?;
+        let mut result = Vec::new();
+        for row in stmt.query_map(params![asset, after, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?, r.get(3)?))
+        })? {
+            let (id, source_id, provenance, observed_at) = row?;
+            result.push(FileInstance {
+                id,
+                source_id,
+                provenance: serde_json::from_str(&provenance)?,
+                observed_at,
+            });
+        }
+        Ok(result)
+    }
     /// Hold catalog generation authority only for the final preview-manifest CAS.
     /// Stage and flush image bytes before entering this guard; callbacks must not
     /// acquire catalog locks in reverse order. Visible reads still check current keys.
@@ -971,6 +1056,7 @@ impl Catalog {
             changed |= c;
             warnings += usize::from(w);
         }
+        crate::catalog_storage::record_metadata_path(&self.db, &asset, "embedded", path)?;
         let directory = path.parent().context("original has no parent")?;
         self.index_metadata_directory(directory)?;
         let stem = name_key(path.file_stem().context("original has no stem")?);
@@ -994,6 +1080,7 @@ impl Catalog {
                 provenance: serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}}),
             };
             let (c, w) = self.inspect_metadata_source(&asset, &sidecar, &source, true)?;
+            crate::catalog_storage::record_metadata_path(&self.db, &asset, "sidecar", &sidecar)?;
             changed |= c;
             warnings += usize::from(w || source.ambiguous);
         }
