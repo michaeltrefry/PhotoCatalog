@@ -8,7 +8,7 @@ Acceptance for integration includes the existing rejection tests for unrelated/f
 
 ## Controlled native run
 
-After code review, targeted tests, and the applicable CI checks pass, preserve the original frozen native executable and receipts. Build the new `catalog_probe` with the pinned Rust toolchain and lockfile, recording executable/source/toolchain/dependency identities. Use separate verified pristine writable copies at 1M, 5M, and 10M; never point this binary at the preserved snapshot, a prior mixed-run database, user originals, or the source RAID. The coordinator should reuse the reviewed checkpointed-copy helper and reconcile each independent target proof before execution.
+After code review and local checks pass, preserve the original frozen native executable and receipts. Build the new `catalog_probe` with the pinned Rust toolchain and lockfile, recording executable/source/toolchain/dependency identities. Use separate verified pristine writable copies at 1M, 5M, and 10M; never point this binary at the preserved snapshot, a prior mixed-run database, user originals, or the source RAID. The coordinator should reuse the reviewed checkpointed-copy helper and reconcile each independent target proof before execution. Hosted cross-platform CI must pass on the final integration before story closeout; it may run independently of local controlled measurement.
 
 Run one dedicated browse-only process and one combined native process at each scale, both with **`--repetitions 200`**, using separate pristine writable copies:
 
