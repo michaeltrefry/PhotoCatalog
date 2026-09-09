@@ -45,6 +45,19 @@ fn work(root: &Path) -> RenderWork {
         encoded_limit: 1024 * 1024,
     }
 }
+fn native_work(root: &Path) -> RenderWork {
+    let mut request = work(root);
+    let path = root.join("original.dng");
+    std::fs::write(&path, include_bytes!("fixtures/generated-linear-mask.dng")).unwrap();
+    let fingerprint = blake3::hash(&std::fs::read(&path).unwrap())
+        .to_hex()
+        .to_string();
+    request.source = NativePath::from_path(&path);
+    for key in &mut request.keys {
+        key.fingerprint = fingerprint.clone();
+    }
+    request
+}
 fn executable() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_photocatalog"))
 }
@@ -83,9 +96,19 @@ fn actual_worker_renders_both_tiers_and_validates_full_outputs() {
 #[test]
 fn actual_child_cancellation_waits_and_cleans_private_staging() {
     let root = tempfile::tempdir().unwrap();
-    let request = work(root.path());
+    let request = native_work(root.path());
+    let source = request.source.to_path().unwrap();
+    let original_hash = request.keys[0].fingerprint.clone();
     let mut worker =
         WorkerProcess::spawn(executable(), &root.path().join("staging"), request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !worker.awaiting_encode_admission().unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "worker did not reach decoded holding checkpoint"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         worker
             .poll(&AtomicBool::new(true))
@@ -96,6 +119,12 @@ fn actual_child_cancellation_waits_and_cleans_private_staging() {
     );
     drop(worker);
     assert_eq!(
+        blake3::hash(&std::fs::read(source).unwrap())
+            .to_hex()
+            .as_str(),
+        original_hash
+    );
+    assert_eq!(
         std::fs::read_dir(root.path().join("staging"))
             .unwrap()
             .count(),
@@ -104,8 +133,19 @@ fn actual_child_cancellation_waits_and_cleans_private_staging() {
 }
 #[test]
 fn owner_pipe_eof_terminates_child_without_a_graceful_cancel_command() {
+    owner_eof(false);
+}
+#[test]
+fn owner_pipe_eof_terminates_actual_post_decode_holding_process() {
+    owner_eof(true);
+}
+fn owner_eof(after_decode: bool) {
     let root = tempfile::tempdir().unwrap();
-    let request = work(root.path());
+    let request = if after_decode {
+        native_work(root.path())
+    } else {
+        work(root.path())
+    };
     let stage = tempfile::Builder::new()
         .prefix("worker-")
         .tempdir_in(root.path())
@@ -122,15 +162,35 @@ fn owner_pipe_eof_terminates_child_without_a_graceful_cancel_command() {
     input
         .write_all(&serde_json::to_vec(&request).unwrap())
         .unwrap();
-    input.write_all(b"\n").unwrap();
+    input
+        .write_all(if after_decode { b"\n!" } else { b"\n" })
+        .unwrap();
     input.flush().unwrap();
+    if after_decode {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !stage.path().join("decoded.ready").exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("decoded checkpoint not reached");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read(stage.path().join("decoded.ready")).unwrap(),
+            b"decoded"
+        );
+    }
     // Kernel pipe EOF is also what the child observes when its owner crashes.
-    // No start token: deterministic proof that orphan work cannot start later.
+    // The post-decode case exercises the armed watchdog with decoded pixels held.
     drop(input);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(!status.success());
+            if after_decode {
+                assert_eq!(status.code(), Some(74));
+            }
             break;
         }
         if Instant::now() >= deadline {
@@ -141,4 +201,10 @@ fn owner_pipe_eof_terminates_child_without_a_graceful_cancel_command() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(!stage.path().join("0.preview").exists());
+    assert_eq!(
+        blake3::hash(&std::fs::read(request.source.to_path().unwrap()).unwrap())
+            .to_hex()
+            .as_str(),
+        request.keys[0].fingerprint
+    );
 }

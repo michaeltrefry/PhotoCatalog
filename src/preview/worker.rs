@@ -122,6 +122,7 @@ pub struct WorkerProcess {
     staging: PathBuf,
     request: RenderWork,
     exited: bool,
+    encoding_admitted: bool,
 }
 impl WorkerProcess {
     pub fn spawn(executable: &Path, staging_root: &Path, request: RenderWork) -> Result<Self> {
@@ -154,6 +155,7 @@ impl WorkerProcess {
             staging,
             request,
             exited: false,
+            encoding_admitted: false,
         };
         let input = value.lease.as_mut().unwrap();
         input.write_all(&bytes)?;
@@ -173,6 +175,12 @@ impl WorkerProcess {
             bail!("preview request canceled");
         }
         let Some(status) = self.child.try_wait()? else {
+            if !self.encoding_admitted && self.awaiting_encode_admission()? {
+                let lease = self.lease.as_mut().context("worker lease closed")?;
+                lease.write_all(b"E")?;
+                lease.flush()?;
+                self.encoding_admitted = true;
+            }
             return Ok(None);
         };
         self.exited = true;
@@ -222,6 +230,22 @@ impl WorkerProcess {
             objects,
         }))
     }
+    /// The worker holds a decoded source under its reservation until a subsequent
+    /// owner poll admits encoding. No output transport or blocking read is needed.
+    pub fn awaiting_encode_admission(&self) -> Result<bool> {
+        if self.encoding_admitted || self.exited {
+            return Ok(false);
+        }
+        let path = self.staging.join("decoded.ready");
+        if !path.exists() {
+            return Ok(false);
+        }
+        ensure!(
+            read_bounded(&path, 16)? == b"decoded",
+            "invalid worker checkpoint"
+        );
+        Ok(true)
+    }
     fn stop(&mut self) -> Result<()> {
         self.lease.take();
         if !self.exited {
@@ -257,7 +281,7 @@ pub fn recover_worker_staging(root: &Path, limit: usize) -> Result<usize> {
                 && entry
                     .file_name()
                     .to_str()
-                    .is_some_and(|name| name.starts_with("worker-")),
+                    .is_some_and(|name| name.starts_with("worker-") || name.starts_with("claimed-")),
             "unrecognized worker staging entry"
         );
         removed += usize::from(clean_staging_directory(&entry.path())?);
@@ -273,12 +297,18 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let lock = OpenOptions::new()
+    let lock = match OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path.join("active.lock"))?;
+        .open(path.join("active.lock"))
+    {
+        Ok(lock) => lock,
+        #[cfg(windows)]
+        Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33 | 303)) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     if let Err(error) = lock.try_lock_exclusive() {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
             return Ok(false);
@@ -289,10 +319,12 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         "active.lock",
         "result.json",
         "error.json",
+        "decoded.ready",
+        "decoded.pending",
         "0.preview",
         "1.preview",
     ];
-    let mut entries = Vec::new();
+    let mut names = Vec::new();
     for entry in fs::read_dir(path)?.take(allowed.len() + 1) {
         let entry = entry?;
         ensure!(
@@ -303,14 +335,59 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
                     .is_some_and(|name| allowed.contains(&name)),
             "unexpected worker artifact requires inspection"
         );
-        entries.push(entry.path());
+        names.push(entry.file_name());
     }
+    // Claim the whole directory before releasing ownership. A child which opened
+    // the old lock before this claim must revalidate its absolute startup path
+    // after locking; it cannot enter a claimed/replaced working directory.
+    let claimed = if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("claimed-"))
+    {
+        path.to_owned()
+    } else {
+        let claimed = path
+            .parent()
+            .context("staging parent")?
+            .join(format!("claimed-{}", uuid::Uuid::new_v4()));
+        match fs::rename(path, &claimed) {
+            Ok(()) => {}
+            // Windows may deny renaming a directory that a delayed child still
+            // has open as its working directory. Leave it unchanged for a later
+            // bounded tick after owner EOF makes that child exit.
+            #[cfg(windows)]
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        claimed
+    };
+    for name in names
+        .iter()
+        .filter(|name| name.as_os_str() != "active.lock")
+    {
+        fs::remove_file(claimed.join(name))?;
+    }
+    // Rust file handles permit delete sharing on Windows. Keep the lock owned
+    // while unlinking it, then close its pending-delete handle before removing
+    // the directory. A recovered claimed directory is never a launch location.
+    fs::remove_file(claimed.join("active.lock"))?;
     drop(lock);
-    for entry in entries {
-        fs::remove_file(entry)?;
+    match fs::remove_dir(claimed) {
+        Ok(()) => Ok(true),
+        // An old, delayed Windows handle can retain an already-unlinked lock.
+        // The claimed path remains non-launchable and is retried after close.
+        #[cfg(windows)]
+        Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33 | 145)) => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    fs::remove_dir(path)?;
-    Ok(true)
+}
+fn validate_staging_identity(expected: &Path) -> Result<()> {
+    ensure!(
+        expected.is_dir() && std::env::current_dir()? == expected,
+        "worker staging was claimed for recovery"
+    );
+    Ok(())
 }
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
@@ -353,8 +430,9 @@ pub fn worker_main() -> Result<()> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open("active.lock")?;
+        .open(current.join("active.lock"))?;
     lock.try_lock_exclusive().context("worker staging lease")?;
+    validate_staging_identity(&current)?;
     let result = run_worker();
     if let Err(error) = &result {
         let mut message = format!("{error:#}");
@@ -388,12 +466,17 @@ fn run_worker() -> Result<()> {
         .read_exact(&mut start)
         .context("owner lease ended before admission")?;
     ensure!(&start == b"!", "invalid worker start token");
+    let (encode_admission, admitted) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("preview-owner-lease".into())
         .spawn(move || {
-            let mut unexpected = [0];
-            // EOF, errors and unexpected commands all revoke this one-shot lease.
-            let _ = input.read(&mut unexpected);
+            let mut command = [0];
+            if input.read_exact(&mut command).is_ok() && &command == b"E" {
+                let _ = encode_admission.send(());
+                // Exactly one encode token is permitted. EOF, another token,
+                // or an error revokes the lease for the remainder of native work.
+                let _ = input.read(&mut command);
+            }
             std::process::exit(74);
         })?;
     ensure!(
@@ -401,6 +484,9 @@ fn run_worker() -> Result<()> {
         "original changed before rendering"
     );
     let rendered = crate::media::decode_full(&source)?;
+    write_exclusive(Path::new("decoded.pending"), b"decoded")?;
+    fs::rename("decoded.pending", "decoded.ready")?;
+    admitted.recv().context("owner encode admission ended")?;
     let mut objects = Vec::new();
     let mut total = 0u64;
     for (index, key) in request.keys.iter().enumerate() {
@@ -514,6 +600,7 @@ mod tests {
             staging: stage.clone(),
             request,
             exited: false,
+            encoding_admitted: false,
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -528,6 +615,41 @@ mod tests {
         assert_eq!(fs::read(stage.join("0.preview")).unwrap(), b"partial");
         drop(worker);
         assert!(!stage.exists());
+    }
+    #[test]
+    fn delayed_startup_handle_cannot_enter_recovered_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("worker-delayed");
+        fs::create_dir(&stage).unwrap();
+        // Exact race order: old child opened the lock but has not acquired it.
+        let delayed = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(stage.join("active.lock"))
+            .unwrap();
+        let removed = clean_staging_directory(&stage).unwrap();
+        // A platform may deny locking an already-unlinked handle; if it permits
+        // locking, the mandatory post-lock startup identity check still rejects.
+        if delayed.try_lock_exclusive().is_ok() {
+            assert!(validate_staging_identity(&stage).is_err());
+        }
+        assert!(!stage.exists());
+        drop(delayed);
+        if !removed {
+            assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 1);
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn interrupted_claim_cleanup_is_resumable() {
+        let root = tempfile::tempdir().unwrap();
+        let claimed = root.path().join("claimed-interrupted");
+        fs::create_dir(&claimed).unwrap();
+        fs::write(claimed.join("0.preview"), b"partial").unwrap();
+        assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 1);
+        assert!(!claimed.exists());
     }
     #[test]
     fn hostile_output_length_is_rejected_before_reading() {
