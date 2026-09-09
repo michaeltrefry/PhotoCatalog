@@ -65,3 +65,7 @@ The ordinary missing-path and pure ambiguity tests remain separate evidence.
 Primary references: Microsoft's [Win32_Volume provider](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/vdswmi/win32-volume),
 [relative-path calculation](https://learn.microsoft.com/en-us/dotnet/api/system.io.path.getrelativepath?view=net-9.0),
 and [PowerShell junction creation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/new-item?view=powershell-7.5).
+
+## File-mount regression discovered in CI
+
+The first native Linux run (34390759693, head `9b593a8`) passed the ordinary suite but failed the bind-mount assertion: joining an empty relative suffix appended a separator to a regular-file locator. Both candidate reconstruction and filesystem-relative mapping now preserve the exact root/subpath when the suffix is empty. Portable tests compare `OsStr` bytes and read the resulting regular file, because normalized `Path` equality alone hides this defect. The original failed log is retained privately as `sc-22840-linux-ci-v1.log`. The repaired adapter passed the pinned standalone macOS fixture suite and Clippy; actual Linux execution on the repaired PR head remains required.
