@@ -193,8 +193,8 @@ pub(super) fn decode(bytes: &[u8], max_pixels: u64, max_allocation: u64) -> Resu
                 .ok_or_else(|| anyhow::anyhow!("PSD row table overflow"))?;
             let sizes = r.take(table_bytes)?;
             let mut output = Vec::with_capacity(total);
-            for size in sizes.chunks_exact(2) {
-                let size = u16::from_be_bytes(size.try_into().unwrap()) as usize;
+            for size in sizes.as_chunks::<2>().0 {
+                let size = u16::from_be_bytes(*size) as usize;
                 let row = r.take(size)?;
                 let mut i = 0;
                 let start = output.len();
