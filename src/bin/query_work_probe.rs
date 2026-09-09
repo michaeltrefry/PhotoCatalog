@@ -4,7 +4,11 @@ use clap::Parser;
 use rusqlite::{Connection, OpenFlags, StatementStatus, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{fs, io::Write, path::{Path, PathBuf}};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 const VERSION: u32 = 1;
 const PROTOCOL: u32 = 3;
@@ -46,12 +50,21 @@ struct Manifest {
 impl Manifest {
     fn validate(&self) -> Result<()> {
         ensure!(self.protocol_version == PROTOCOL, "case protocol must be 3");
-        ensure!(self.count >= 10_000 && self.count <= 10_000_000, "invalid synthetic scale");
+        ensure!(
+            self.count >= 10_000 && self.count <= 10_000_000,
+            "invalid synthetic scale"
+        );
         ensure!(self.cases.len() == 6, "exactly six cases required");
         for (index, case) in self.cases.iter().enumerate() {
             let rating = index % 2 == 1;
-            ensure!(case.workload == if rating { "rating" } else { "page_deep" }, "case order/workload mismatch");
-            ensure!(case.parameters.len() == if rating { 2 } else { 1 }, "parameter count mismatch");
+            ensure!(
+                case.workload == if rating { "rating" } else { "page_deep" },
+                "case order/workload mismatch"
+            );
+            ensure!(
+                case.parameters.len() == if rating { 2 } else { 1 },
+                "parameter count mismatch"
+            );
             if rating {
                 ensure!((1..=5).contains(&case.parameters[0]), "invalid rating");
             }
@@ -59,18 +72,39 @@ impl Manifest {
             ensure!(cursor > 0 && cursor < self.count, "cursor out of bounds");
             if index < 4 {
                 let percent = if index < 2 { 50 } else { 90 };
-                ensure!(case.case_label == format!("cursor_{percent}_percent") && case.iteration.is_none(), "legacy case identity mismatch");
-                ensure!(cursor == self.count * percent / 100 && case.cursor_percent == percent as f64, "legacy cursor mismatch");
+                ensure!(
+                    case.case_label == format!("cursor_{percent}_percent")
+                        && case.iteration.is_none(),
+                    "legacy case identity mismatch"
+                );
+                ensure!(
+                    cursor == self.count * percent / 100 && case.cursor_percent == percent as f64,
+                    "legacy cursor mismatch"
+                );
             } else {
-                ensure!(case.case_label == "frozen_iteration_9" && case.iteration == Some(9), "iteration case identity mismatch");
+                ensure!(
+                    case.case_label == "frozen_iteration_9" && case.iteration == Some(9),
+                    "iteration case identity mismatch"
+                );
                 // Consume Python's exact cursor; never reimplement its floating-point arithmetic.
-                ensure!(case.cursor_percent == cursor as f64 * 100.0 / self.count as f64 && case.cursor_percent > 90.0 && case.cursor_percent < 95.0, "iteration cursor metadata mismatch");
+                ensure!(
+                    case.cursor_percent == cursor as f64 * 100.0 / self.count as f64
+                        && case.cursor_percent > 90.0
+                        && case.cursor_percent < 95.0,
+                    "iteration cursor metadata mismatch"
+                );
             }
             if rating {
-                ensure!(cursor == self.cases[index - 1].parameters[0], "paired cursors differ");
+                ensure!(
+                    cursor == self.cases[index - 1].parameters[0],
+                    "paired cursors differ"
+                );
             }
         }
-        ensure!(self.cases[1].parameters[0] == self.cases[3].parameters[0], "legacy ratings differ");
+        ensure!(
+            self.cases[1].parameters[0] == self.cases[3].parameters[0],
+            "legacy ratings differ"
+        );
         Ok(())
     }
 }
@@ -94,9 +128,17 @@ fn immutable_uri(path: &Path) -> Result<String> {
     };
     #[cfg(not(unix))]
     let bytes = {
-        let text = path.to_str().context("SQLite URI requires a Unicode path on this platform")?;
-        let text = text.strip_prefix("\\\\?\\").unwrap_or(text).replace('\\', "/");
-        ensure!(!text.starts_with("UNC/") && !text.starts_with("//"), "UNC snapshots are unsupported; use a local synthetic copy");
+        let text = path
+            .to_str()
+            .context("SQLite URI requires a Unicode path on this platform")?;
+        let text = text
+            .strip_prefix("\\\\?\\")
+            .unwrap_or(text)
+            .replace('\\', "/");
+        ensure!(
+            !text.starts_with("UNC/") && !text.starts_with("//"),
+            "UNC snapshots are unsupported; use a local synthetic copy"
+        );
         format!("/{text}").into_bytes()
     };
     let mut uri = String::from("file://");
@@ -113,18 +155,39 @@ fn immutable_uri(path: &Path) -> Result<String> {
 }
 
 fn connection(path: &Path, memory_mib: u32) -> Result<(Connection, String)> {
-    ensure!((1..=4096).contains(&memory_mib), "memory setting must be 1..4096 MiB");
+    ensure!(
+        (1..=4096).contains(&memory_mib),
+        "memory setting must be 1..4096 MiB"
+    );
     let canonical = path.canonicalize()?;
     ensure!(canonical.is_file(), "database must be an existing file");
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = canonical.as_os_str().to_os_string();
         sidecar.push(suffix);
-        ensure!(!Path::new(&sidecar).exists(), "immutable source has a sidecar: {suffix}");
+        ensure!(
+            !Path::new(&sidecar).exists(),
+            "immutable source has a sidecar: {suffix}"
+        );
     }
     let uri = immutable_uri(&canonical)?;
-    let db = Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let db = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
     ensure!(db.is_readonly("main")?, "source connection is writable");
-    for (name, value) in [("query_only", 1_i64), ("synchronous", 2), ("fullfsync", 1), ("foreign_keys", 1), ("cache_size", -(i64::from(memory_mib) * 1024)), ("mmap_size", 0), ("temp_store", 1), ("busy_timeout", 5000), ("wal_autocheckpoint", 1000)] {
+    for (name, value) in [
+        ("query_only", 1_i64),
+        ("synchronous", 2),
+        ("fullfsync", 1),
+        ("foreign_keys", 1),
+        ("cache_size", -(i64::from(memory_mib) * 1024)),
+        ("mmap_size", 0),
+        ("temp_store", 1),
+        ("busy_timeout", 5000),
+        ("wal_autocheckpoint", 1000),
+    ] {
         db.pragma_update(None, name, value)?;
     }
     // journal_mode is reported, never changed on an immutable source.
@@ -136,29 +199,59 @@ type Record = (i64, String, i64, i64, i64, String);
 fn measure(db: &Connection, variant: &str, case: &Case) -> Result<Value> {
     let query = sql(variant, &case.workload)?;
     let mut explanation = db.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
-    let plan: Vec<(i64, i64, i64, String)> = explanation.query_map(params_from_iter(&case.parameters), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+    let plan: Vec<(i64, i64, i64, String)> = explanation
+        .query_map(params_from_iter(&case.parameters), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
     ensure!(!plan.is_empty(), "missing query plan");
     let mut statement = db.prepare(query)?;
     ensure!(statement.readonly(), "compiled query is not read-only");
-    let rows: Vec<Record> = statement.query_map(params_from_iter(&case.parameters), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?.collect::<rusqlite::Result<_>>()?;
+    let rows: Vec<Record> = statement
+        .query_map(params_from_iter(&case.parameters), |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
     let vm_step = statement.get_status(StatementStatus::VmStep);
     let sort = statement.get_status(StatementStatus::Sort);
     let fullscan_step = statement.get_status(StatementStatus::FullscanStep);
-    ensure!(vm_step > 0 && sort >= 0 && fullscan_step >= 0, "invalid/missing work counters");
-    ensure!(rows.len() == 200, "query returned {} rows instead of 200", rows.len());
+    ensure!(
+        vm_step > 0 && sort >= 0 && fullscan_step >= 0,
+        "invalid/missing work counters"
+    );
+    ensure!(
+        rows.len() == 200,
+        "query returned {} rows instead of 200",
+        rows.len()
+    );
     let cursor = *case.parameters.last().context("missing cursor")?;
     for (offset, row) in rows.iter().enumerate() {
-        ensure!(row.0 > cursor && row.1 == format!("00000000-0000-4000-8000-{:012x}", row.0), "identity/cursor mismatch");
-        ensure!(offset == 0 || rows[offset - 1].0 < row.0, "unstable row order");
+        ensure!(
+            row.0 > cursor && row.1 == format!("00000000-0000-4000-8000-{:012x}", row.0),
+            "identity/cursor mismatch"
+        );
+        ensure!(
+            offset == 0 || rows[offset - 1].0 < row.0,
+            "unstable row order"
+        );
         if case.workload == "rating" {
             ensure!(row.4 == case.parameters[0], "rating mismatch");
         } else {
             ensure!(row.0 == cursor + offset as i64 + 1, "deep page has a gap");
         }
     }
-    Ok(json!({"variant":variant,"case":case,"sql":query,"plan":plan,"rows":rows,
+    Ok(
+        json!({"variant":variant,"case":case,"sql":query,"plan":plan,"rows":rows,
         "work":{"VM_STEP":vm_step,"SORT":sort,"FULLSCAN_STEP":fullscan_step},
-        "counter_scope":"single prepared statement, fully consumed exactly once; FULLSCAN_STEP alone misses range scans"}))
+        "counter_scope":"single prepared statement, fully consumed exactly once; FULLSCAN_STEP alone misses range scans"}),
+    )
 }
 
 fn run(args: &Args, manifest: &Manifest, receipt: &mut Value) -> Result<()> {
@@ -169,7 +262,17 @@ fn run(args: &Args, manifest: &Manifest, receipt: &mut Value) -> Result<()> {
     let source_id: String = db.query_row("SELECT sqlite_source_id()", [], |row| row.get(0))?;
     receipt["sqlite_source_id"] = json!(source_id);
     let mut settings = serde_json::Map::new();
-    for name in ["query_only", "synchronous", "fullfsync", "foreign_keys", "cache_size", "mmap_size", "temp_store", "busy_timeout", "wal_autocheckpoint"] {
+    for name in [
+        "query_only",
+        "synchronous",
+        "fullfsync",
+        "foreign_keys",
+        "cache_size",
+        "mmap_size",
+        "temp_store",
+        "busy_timeout",
+        "wal_autocheckpoint",
+    ] {
         let value: i64 = db.pragma_query_value(None, name, |row| row.get(0))?;
         settings.insert(name.into(), json!(value));
     }
@@ -178,24 +281,48 @@ fn run(args: &Args, manifest: &Manifest, receipt: &mut Value) -> Result<()> {
     receipt["settings_actual"] = json!(settings);
     let application: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    ensure!(application == 1_346_913_089 && schema == 1, "not a recognized synthetic benchmark database");
-    let (count, maximum): (i64, i64) = db.query_row("SELECT count(*),max(sequence) FROM assets", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    ensure!(count == manifest.count && maximum == manifest.count, "snapshot scale mismatch");
+    ensure!(
+        application == 1_346_913_089 && schema == 1,
+        "not a recognized synthetic benchmark database"
+    );
+    let (count, maximum): (i64, i64) =
+        db.query_row("SELECT count(*),max(sequence) FROM assets", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    ensure!(
+        count == manifest.count && maximum == manifest.count,
+        "snapshot scale mismatch"
+    );
     let edits: i64 = db.query_row("SELECT count(*) FROM edits", [], |row| row.get(0))?;
-    let recovery: i64 = db.query_row("SELECT value FROM recovery_probe WHERE id=1", [], |row| row.get(0))?;
+    let recovery: i64 = db.query_row("SELECT value FROM recovery_probe WHERE id=1", [], |row| {
+        row.get(0)
+    })?;
     ensure!(edits == 0 && recovery == 0, "snapshot is not pristine");
     for case in &manifest.cases {
-        receipt["active_query"] = json!({"variant":"baseline","case":case,"sql":sql("baseline", &case.workload)?});
+        receipt["active_query"] =
+            json!({"variant":"baseline","case":case,"sql":sql("baseline", &case.workload)?});
         let original = measure(&db, "baseline", case)?;
-        receipt["queries"].as_array_mut().context("receipt queries missing")?.push(original.clone());
+        receipt["queries"]
+            .as_array_mut()
+            .context("receipt queries missing")?
+            .push(original.clone());
         receipt["active_query"] = json!({"variant":"sqlite_page_candidate","case":case,"sql":sql("sqlite_page_candidate", &case.workload)?});
         let candidate = measure(&db, "sqlite_page_candidate", case)?;
-        receipt["queries"].as_array_mut().context("receipt queries missing")?.push(candidate.clone());
-        ensure!(original["rows"] == candidate["rows"], "native variants return different records");
+        receipt["queries"]
+            .as_array_mut()
+            .context("receipt queries missing")?
+            .push(candidate.clone());
+        ensure!(
+            original["rows"] == candidate["rows"],
+            "native variants return different records"
+        );
     }
     drop(db);
     let after = fs::metadata(&args.db)?;
-    ensure!(before.len() == after.len() && before.modified()? == after.modified()?, "source file metadata changed");
+    ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "source file metadata changed"
+    );
     receipt["source_bytes"] = json!(after.len());
     receipt["source_metadata_unchanged"] = json!(true);
     receipt["active_query"] = Value::Null;
@@ -208,12 +335,18 @@ fn main() -> Result<()> {
 }
 
 fn execute(args: &Args) -> Result<()> {
-    ensure!(fs::metadata(&args.cases)?.len() <= 65_536, "case manifest too large");
+    ensure!(
+        fs::metadata(&args.cases)?.len() <= 65_536,
+        "case manifest too large"
+    );
     let manifest_bytes = fs::read(&args.cases)?;
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate()?;
     // Reserve the output before any database access; never overwrite a receipt.
-    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&args.output)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&args.output)?;
     let mut receipt = json!({"version":VERSION,"protocol_version":PROTOCOL,"complete":false,
         "diagnostic_only":true,"sqlite_version":rusqlite::version(),"memory_mib":args.memory_mib,
         "manifest":manifest,"manifest_blake3":blake3::hash(&manifest_bytes).to_hex().to_string(),
@@ -247,11 +380,19 @@ mod tests {
                     case_label: label.into(),
                     iteration,
                     cursor_percent: percent,
-                    parameters: if workload == "rating" { vec![rating, cursor] } else { vec![cursor] },
+                    parameters: if workload == "rating" {
+                        vec![rating, cursor]
+                    } else {
+                        vec![cursor]
+                    },
                 });
             }
         }
-        Manifest { protocol_version: PROTOCOL, count: 20_000, cases }
+        Manifest {
+            protocol_version: PROTOCOL,
+            count: 20_000,
+            cases,
+        }
     }
 
     fn fixture(path: &Path) -> Result<()> {
@@ -265,8 +406,20 @@ mod tests {
             INSERT INTO recovery_probe VALUES(1,0);")?;
         let tx = db.transaction()?;
         for sequence in 1..=20_000_i64 {
-            tx.execute("INSERT INTO assets VALUES(?1,?2,?3,?4,?5)", rusqlite::params![sequence,format!("00000000-0000-4000-8000-{sequence:012x}"),sequence%9,1_600_000_000+sequence,format!("preview-{sequence}")])?;
-            tx.execute("INSERT INTO annotations VALUES(?1,?2)", [sequence,sequence%5+1])?;
+            tx.execute(
+                "INSERT INTO assets VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    sequence,
+                    format!("00000000-0000-4000-8000-{sequence:012x}"),
+                    sequence % 9,
+                    1_600_000_000 + sequence,
+                    format!("preview-{sequence}")
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO annotations VALUES(?1,?2)",
+                [sequence, sequence % 5 + 1],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -276,7 +429,9 @@ mod tests {
     fn both_variants_return_six_fields_and_real_work_without_modifying_source() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         #[cfg(unix)]
-        let database = temporary.path().join("space # percent% question? 雪.sqlite3");
+        let database = temporary
+            .path()
+            .join("space # percent% question? 雪.sqlite3");
         #[cfg(not(unix))]
         let database = temporary.path().join("space # percent% 雪.sqlite3");
         fixture(&database)?;
@@ -284,7 +439,12 @@ mod tests {
         let cases_path = temporary.path().join("cases.json");
         fs::write(&cases_path, serde_json::to_vec(&manifest())?)?;
         let output = temporary.path().join("receipt.json");
-        execute(&Args { db: database.clone(), cases: cases_path, output: output.clone(), memory_mib: 256 })?;
+        execute(&Args {
+            db: database.clone(),
+            cases: cases_path,
+            output: output.clone(),
+            memory_mib: 256,
+        })?;
         let receipt: Value = serde_json::from_slice(&fs::read(output)?)?;
         assert_eq!(receipt["complete"], true);
         let queries = receipt["queries"].as_array().context("missing queries")?;
@@ -304,7 +464,13 @@ mod tests {
                 assert_eq!(first[2], sequence % 9);
                 assert_eq!(first[3], 1_600_000_000 + sequence);
                 assert_eq!(first[5], format!("preview-{sequence}"));
-                assert_eq!(measured["sql"], sql(measured["variant"].as_str().unwrap(), measured["case"]["workload"].as_str().unwrap())?);
+                assert_eq!(
+                    measured["sql"],
+                    sql(
+                        measured["variant"].as_str().unwrap(),
+                        measured["case"]["workload"].as_str().unwrap()
+                    )?
+                );
             }
         }
         assert_eq!(receipt["settings_actual"]["cache_size"], -262144);
@@ -327,7 +493,9 @@ mod tests {
         for change in 0..6 {
             let mut cases = manifest();
             match change {
-                0 => { cases.cases.pop(); }
+                0 => {
+                    cases.cases.pop();
+                }
                 1 => cases.cases.swap(0, 1),
                 2 => cases.cases[4].iteration = Some(0),
                 3 => cases.cases[2].parameters[0] -= 1,
@@ -351,7 +519,13 @@ mod tests {
         fs::write(&cases, serde_json::to_vec(&manifest())?)?;
         let output = temporary.path().join("existing.json");
         fs::write(&output, b"original receipt")?;
-        let error = execute(&Args { db: database, cases, output: output.clone(), memory_mib: 256 }).unwrap_err();
+        let error = execute(&Args {
+            db: database,
+            cases,
+            output: output.clone(),
+            memory_mib: 256,
+        })
+        .unwrap_err();
         assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(fs::read(output)?, b"original receipt");
         Ok(())
@@ -368,10 +542,23 @@ mod tests {
         let cases = temporary.path().join("cases.json");
         fs::write(&cases, serde_json::to_vec(&manifest())?)?;
         let output = temporary.path().join("failed.json");
-        assert!(execute(&Args { db: database, cases, output: output.clone(), memory_mib: 256 }).is_err());
+        assert!(
+            execute(&Args {
+                db: database,
+                cases,
+                output: output.clone(),
+                memory_mib: 256
+            })
+            .is_err()
+        );
         let receipt: Value = serde_json::from_slice(&fs::read(output)?)?;
         assert_eq!(receipt["complete"], false);
-        assert!(receipt["error"].as_str().unwrap().contains("instead of 200"));
+        assert!(
+            receipt["error"]
+                .as_str()
+                .unwrap()
+                .contains("instead of 200")
+        );
         assert!(!receipt["queries"].as_array().unwrap().is_empty());
         Ok(())
     }
