@@ -75,8 +75,38 @@ corrected native source produces `(1.833333, 1.833333, 1.833333)` at the same pi
 the 0.125 neutral patch remains approximately 0.125 in both. This directly
 reproduces the new regression's failure on the previous production code.
 
-The full 22-image private corpus and two pinned CC0 RAW checks are pending at
-this implementation checkpoint. Their completed evidence will be recorded in a
-separate validation update. No frozen S6 source,
+The candidate implementation `4c81da00fd44a0b3935c57da5cfca684d4089d18`
+completed all 22 private corpus cases (44 fresh-process renders), including six
+LibRaw RAWs. Independently referenced dimensions/crop, source precision, camera
+identity, finiteness and alpha coverage passed. Source hashes and modification
+times remained unchanged, and each pair of pixel digests matched. All 16 images
+using other decoders have exactly the previous S3 pixel digest.
+
+The two pinned public CC0 RAWs (Canon EOS 6D CR2 and Panasonic GX7MK2 RW2) also
+passed their source/header checks, with matching pixel digests in separate repeat
+renders. Signed/HDR float ranges were retained: approximately -0.308 to 1.747
+and -0.060 to 1.373 respectively. Their full previews were visually checked
+against the extracted camera JPEGs for expected object colors; camera tone and
+exposure differences remain. All six private LibRaw previews were inspected for
+gross false highlight colors, including the repaired G15 sky. The exact cropped
+G15 sample changes from `(3.089364, -0.049095, 2.960948)` to approximately
+`(1.920204, 1.920204, 1.920204)`. Fine edge chromatic aberration is not claimed
+corrected. These checks are not a colorimetric calibration certification.
+
+Private receipts, never original photographs in Git:
+
+- `/Users/michael/PhotoCatalog-private-results/sc-22838-highlight-corpus-v1/receipt.json`,
+  SHA256 `c159b4fb4c9d06e9233fd505f021d4686658e115911d0b424aad27ae50a90818`.
+- `/Users/michael/PhotoCatalog-private-results/sc-22841-source-anomalies-volume/highlight-public.jsonl`,
+  SHA256 `e83e0f6f54dc738dce1aee179abe62c606a18e0f44964be030bc35ac6f43bd17`.
+- `/Users/michael/PhotoCatalog-private-results/sc-22841-source-anomalies-volume/repair-validation.json`,
+  SHA256 `c5f31103ff7eb9fcdea64baf8b6966efbebb1cafa701e031c86466b125e59109`;
+  binds exact source and executable hashes, before/after numeric probes, repeat
+  comparisons and inspected image identities.
+
+Validation uses the existing `validate_image_corpus.py` and
+`validate_public_raw.py` scripts with the built `render_probe`, a new output
+directory, four Cargo build jobs and `OMP_NUM_THREADS=1`. These are macOS
+correctness results; hosted platform CI remains a separate integration gate. No frozen S6 source,
 reference, candidate, timing, quality judgment or metric artifact is overwritten.
 Performance qualification and a new preview campaign remain separate gates.
