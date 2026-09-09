@@ -4,12 +4,12 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836 and sc-22838 are verified Done. The user released the reference Mac on 2026-09-09, and sc-22837's controlled comparison is running in its isolated worktree. The frozen harness, supplemental driver and native probe hashes match the saved checkpoint. No local build/render/GPU workload runs alongside timing; ordinary desktop load is recorded. The remaining stories depend on the database decision.
+sc-22836 and sc-22838 are verified Done. The user released the reference Mac on 2026-09-09, and sc-22837's original controlled comparison completed at all three scales. Neither default 256 MiB profile qualifies. The predeclared supplemental comparison is running in its isolated worktree. The frozen harness, supplemental driver and native probe hashes match the saved checkpoint. No local build/render/GPU workload runs alongside timing; ordinary desktop load is recorded. The remaining stories depend on the database decision.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
 | sc-22836 | Done | [PR #1](https://github.com/michaeltrefry/PhotoCatalog/pull/1), merged 56f0b37 | Independent review PASS; 18 local tests; real CR2/JPEG source-invariance receipt; PR and merged-main three-platform CI 34227667817 SUCCESS; Shortcut read-back | Complete |
-| sc-22837 | In Progress | [Draft PR #3](https://github.com/michaeltrefry/PhotoCatalog/pull/3); frozen harness 625d677 | Hosted CI 34350272575 SUCCESS at bc7c453; independent review of completed 1M/5M receipts; default-profile failures retained at 5M | Finish comparisons and runtime-work evidence, integrate decision |
+| sc-22837 | In Progress | [Draft PR #3](https://github.com/michaeltrefry/PhotoCatalog/pull/3); frozen harness 625d677 | Hosted CI 34350272575 SUCCESS at bc7c453; independent review of all original receipts (1,026 distributions); 21 Python evidence tests pass; default-profile failures retained at 5M/10M | Finish supplemental comparison and runtime-work evidence, integrate decision |
 | sc-22838 | Done | [Merged PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2), a0bf374 | Independent review PASS; 31 release tests; 22 private samples/44 deterministic renders; strict public RAW checks; PR CI 34237848026 and merged-main CI 34242815786 SUCCESS on three platforms; Shortcut read-back | Complete |
 | sc-22839 | To Do | XMP fidelity | Prerequisites sc-22837/sc-22838 | Dependency-bound |
 | sc-22840 | To Do | Offline storage and relinking | Prerequisite sc-22837 | Dependency-bound |
@@ -34,7 +34,8 @@ sc-22836 and sc-22838 are verified Done. The user released the reference Mac on 
 ## Current evidence boundaries
 
 - Database preparation and verified pristine snapshots are complete. The original comparison began on 2026-09-09 after the user released the Mac. The prior SceneWorks model workload is gone; no foreign workload was stopped. Live telemetry is `/Users/michael/PhotoCatalog-private-results/sc-22837-measurement-20260909-host.jsonl`.
-- At 1M, both engines pass the default 256 MiB page/fresh/write/RSS and recovery checks with matching data. At 5M, SQLite rating-page warm p95 is 126.031 ms (>100 ms) and DuckDB's 256 MiB mixed workload fails with OOM and incomplete samples. These results are preliminary; no backend is selected. Original receipts are under `/Users/michael/PhotoCatalog-private-results/sc-22837-final-v2`.
+- At 1M, both engines pass the default 256 MiB page/fresh/write/RSS and recovery checks with matching data. At 5M, SQLite rating-page warm p95 is 126.031 ms (>100 ms) and DuckDB's 256 MiB mixed workload fails with OOM and incomplete samples. At 10M, SQLite deep-page/rating warm p95 is 132.594/266.941 ms; DuckDB mixed OOM leaves only one rating/edit/page sample. The independent review reconciled all six load proofs, read hashes, 48 plans, interrupted-transaction outcomes and 1,026 distributions across engine/native receipts. No backend is selected. Original receipts are complete under `/Users/michael/PhotoCatalog-private-results/sc-22837-final-v2`.
+- Original native Rust 10M rating/edit p95 is 99.544/99.189 ms, with less than 1 ms headroom; the probe verifies restart identity and metadata but does not establish all filtered production paths. The independent runtime query-work diagnostic passed all six actual tests after repairing DuckDB profiling initialization order (21 combined Python tests). Review passed integrated 42e623a; scale profiling remains outstanding and is excluded from active latency timing.
 - The original benchmark's all-cache-profile summary is diagnostic. Production eligibility uses one declared configuration across all scales, with the unchanged latency, durability and actual RSS budgets; see the sc-22837 supplemental protocol.
 - S3 preflight reproduced and repaired AVIF orientation precedence, PSD transparency and missing-composite semantics, and private-validator format mislabeling. Subsequent crop, source-metadata and spatial DNG calibration repairs passed independent review and the full private corpus.
 - Private source headers independently identify precision, intended dimensions and camera metadata. Two DNG fixtures derive from JPEG/TIFF and do not establish native camera RAW coverage. Private images and evidence remain outside Git.
@@ -45,7 +46,7 @@ sc-22836 and sc-22838 are verified Done. The user released the reference Mac on 
 
 ## Measurement commands and checkpoint
 
-Reconcile live Shortcut, Git state, process ownership, and receipts before resuming anything. Do not repeat a running or completed measurement. The original command below was started on 2026-09-09; its stderr progress is `/Users/michael/PhotoCatalog-private-results/sc-22837-final-v2-20260909.stderr.log`. The supplemental command has not yet run at this checkpoint. Retain passive host observations with the private receipts; see `benchmarks/observe_host.py` and the benchmark README.
+Reconcile live Shortcut, Git state, process ownership, and receipts before resuming anything. Do not repeat a running or completed measurement. The original command below completed on 2026-09-09 with `campaign.complete=true`; its stderr progress is `/Users/michael/PhotoCatalog-private-results/sc-22837-final-v2-20260909.stderr.log`. The supplemental command started next (session 14164, PID 38458 at this checkpoint); its stderr is `/Users/michael/PhotoCatalog-private-results/sc-22837-production-profiles-20260909.stderr.log`. Retain passive host observations with the private receipts; see `benchmarks/observe_host.py` and the benchmark README.
 
 From the `sc-22837` worktree, use the existing environment and original frozen probe:
 

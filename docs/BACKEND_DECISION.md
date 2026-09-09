@@ -1,6 +1,6 @@
 # Catalog backend decision — sc-22837
 
-Status: **Pending the complete scale measurements.** SQLite remains the skeleton's provisional implementation. Preparation or smoke results do not select the production backend.
+Status: **Original comparison complete; supplemental profiles and production integration pending.** SQLite remains the skeleton's provisional implementation. Neither engine's original 256 MiB profile meets all required scales. The declared 256/1024/2048 MiB production-profile campaign is running; no production backend is selected yet.
 
 ## Decision contract
 
@@ -27,6 +27,10 @@ SQLite uses WAL with `synchronous=FULL` and `fullfsync=ON`. The latter matches t
 Python drives both native engine bindings, with actual versions recorded in receipts. A separate Rust probe measures the bundled SQLite version, actual catalog browse/get/reopen with metadata decoding, and durable native rating/edit transactions during import. Its measurements remain separate from Python's; this prevents binding overhead from being mistaken for native-runtime performance.
 
 ## Required final evidence
+
+The original campaign completed on 2026-09-09 with exact frozen harness hash `167b13d524c0f21a18426bb8b21acc6792f275de7884edca1cf995c6ff874c89`. Independent review reconciled 1,026 distributions, all six load proofs, cross-engine result hashes, 48 query plans and interrupted-transaction recovery. SQLite's 256 MiB rating-filter warm p95 exceeds 100 ms at 5M (126.031 ms) and 10M (266.941 ms); its 10M deep-page p95 is 132.594 ms. DuckDB's 256 MiB mixed workload runs out of memory at 5M and 10M, so its partial low write timings are not acceptance evidence. These adverse results remain in the original receipts.
+
+The original Rust 10M probe preserves identity/metadata across restart and records rating/edit p95 of 99.544/99.189 ms with only 50 samples each and less than 1 ms budget headroom. That evidence belongs to the frozen probe, not a later integrated implementation. Plan presence is also separate from bounded work: a read-only diagnostic will collect actual operator/VM work at two cursor depths after the timing lane releases. Its runtime initialization and source-preservation tests have passed; scale results are not available yet.
 
 The final decision must identify the reviewed source revision, script and input digests, exact native engine versions, reference hardware/storage, competing-load record, preparation and measurement boundaries, cache settings, and raw receipt locations. It must include p50/p95/p99 and sample counts for every required workload at every scale, all measured memory peaks, disk sizes/growth, query plans, operation failures, cross-engine result reconciliation, and interrupted-transaction outcomes.
 
