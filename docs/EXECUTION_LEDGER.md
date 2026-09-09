@@ -4,12 +4,12 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836 and sc-22838 are verified Done. sc-22837 remains in its isolated worktree. The user confirmed that SceneWorks model measurement campaigns own the reference Mac's GPU for several hours. Controlled database timings wait until the shared host is quiet because CPU and GPU workloads share memory and bandwidth. Independent correctness work and image-pipeline CI are complete; the remaining stories depend on the database decision.
+sc-22836 and sc-22838 are verified Done. The user released the reference Mac on 2026-09-09, and sc-22837's controlled comparison is running in its isolated worktree. The frozen harness, supplemental driver and native probe hashes match the saved checkpoint. No local build/render/GPU workload runs alongside timing; ordinary desktop load is recorded. The remaining stories depend on the database decision.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
 | sc-22836 | Done | [PR #1](https://github.com/michaeltrefry/PhotoCatalog/pull/1), merged 56f0b37 | Independent review PASS; 18 local tests; real CR2/JPEG source-invariance receipt; PR and merged-main three-platform CI 34227667817 SUCCESS; Shortcut read-back | Complete |
-| sc-22837 | In Progress | Benchmark branch f73fe91 integrating merged image pipeline; frozen harness 625d677 | Independent review PASS; 32 integrated Rust tests and 15 Python contract tests; six verified 1M/5M/10M preparations and pristine snapshots; 48 read-only query plans | Await quiet host, run comparisons, integrate decision |
+| sc-22837 | In Progress | [Draft PR #3](https://github.com/michaeltrefry/PhotoCatalog/pull/3); frozen harness 625d677 | Hosted CI 34350272575 SUCCESS at bc7c453; independent review of completed 1M/5M receipts; default-profile failures retained at 5M | Finish comparisons and runtime-work evidence, integrate decision |
 | sc-22838 | Done | [Merged PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2), a0bf374 | Independent review PASS; 31 release tests; 22 private samples/44 deterministic renders; strict public RAW checks; PR CI 34237848026 and merged-main CI 34242815786 SUCCESS on three platforms; Shortcut read-back | Complete |
 | sc-22839 | To Do | XMP fidelity | Prerequisites sc-22837/sc-22838 | Dependency-bound |
 | sc-22840 | To Do | Offline storage and relinking | Prerequisite sc-22837 | Dependency-bound |
@@ -33,7 +33,8 @@ sc-22836 and sc-22838 are verified Done. sc-22837 remains in its isolated worktr
 
 ## Current evidence boundaries
 
-- Database preparation is complete, but foreground timing has not started. The separate SceneWorks workload is not owned by this epic and has not been stopped. Preserve the pristine snapshots before any mixed writes.
+- Database preparation and verified pristine snapshots are complete. The original comparison began on 2026-09-09 after the user released the Mac. The prior SceneWorks model workload is gone; no foreign workload was stopped. Live telemetry is `/Users/michael/PhotoCatalog-private-results/sc-22837-measurement-20260909-host.jsonl`.
+- At 1M, both engines pass the default 256 MiB page/fresh/write/RSS and recovery checks with matching data. At 5M, SQLite rating-page warm p95 is 126.031 ms (>100 ms) and DuckDB's 256 MiB mixed workload fails with OOM and incomplete samples. These results are preliminary; no backend is selected. Original receipts are under `/Users/michael/PhotoCatalog-private-results/sc-22837-final-v2`.
 - The original benchmark's all-cache-profile summary is diagnostic. Production eligibility uses one declared configuration across all scales, with the unchanged latency, durability and actual RSS budgets; see the sc-22837 supplemental protocol.
 - S3 preflight reproduced and repaired AVIF orientation precedence, PSD transparency and missing-composite semantics, and private-validator format mislabeling. Subsequent crop, source-metadata and spatial DNG calibration repairs passed independent review and the full private corpus.
 - Private source headers independently identify precision, intended dimensions and camera metadata. Two DNG fixtures derive from JPEG/TIFF and do not establish native camera RAW coverage. Private images and evidence remain outside Git.
@@ -42,9 +43,9 @@ sc-22836 and sc-22838 are verified Done. sc-22837 remains in its isolated worktr
 - The bounded host observer passed independent review after fixing process-ID reuse attribution. Its 10-second smoke observed GPU utilization at 100%; it is diagnostic competing-load evidence, not a timing result or permission to stop another workload. Benchmark-contract CI exercises small Python tests only.
 - Read-only `EXPLAIN` collected eight plans per engine at each scale without executing the photo queries. SQLite plans indexed page access (and a temporary rating-page sort); DuckDB plans scans and hash joins. Plans alone do not establish latency or backend eligibility. Private evidence: `/Users/michael/PhotoCatalog-private-results/sc-22837-readonly-plan-preflight.json`.
 
-## Resume sc-22837 after the shared host is quiet
+## Measurement commands and checkpoint
 
-Reconcile live Shortcut, Git state, and competing CPU/GPU work first. Do not stop SceneWorks or treat low CPU utilization as proof of an idle GPU. Retain passive host observations with the private receipts; see `benchmarks/observe_host.py` and the benchmark README. No measurement command below has been run at this checkpoint.
+Reconcile live Shortcut, Git state, process ownership, and receipts before resuming anything. Do not repeat a running or completed measurement. The original command below was started on 2026-09-09; its stderr progress is `/Users/michael/PhotoCatalog-private-results/sc-22837-final-v2-20260909.stderr.log`. The supplemental command has not yet run at this checkpoint. Retain passive host observations with the private receipts; see `benchmarks/observe_host.py` and the benchmark README.
 
 From the `sc-22837` worktree, use the existing environment and original frozen probe:
 
