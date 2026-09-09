@@ -169,3 +169,40 @@ edit, unavailable-source, and export-plan writers acquire IMMEDIATE authority
 before revision/source reads; expensive packet preparation stays outside the lock.
 This prevents a stale deferred read snapshot from failing its later write upgrade.
 CAS and per-asset rollback checks still run under the acquired writer authority.
+
+### Candidate-local text admission
+
+Non-FTS ordering (including a keyword/folder/collection sequence driver) evaluates
+text in connection-private TEMP FTS5 batches, using the same `unicode61` tokenizer
+and quoted phrase-prefix expression as the persistent FTS index. Each batch admits
+at most 128 candidates and at most the remaining result slots. No global hit set
+is materialized. A direct sequence FTS driver applies MATCH once and does not
+repeat it as a correlated residual predicate.
+
+The existing `search` and `search_session` use `TextLimits` defaults of 1 MiB per
+indexed document and 8 MiB cumulative indexed source text per request. The
+`search_with_text_limits` and `search_session_with_text_limits` APIs, and CLI
+`--text-document-bytes`/`--text-page-bytes`, allow explicit limits up to 64 MiB per
+request. A document over its limit produces an error with its required size;
+retry with increased limits. Reaching the cumulative limit produces a partial
+page and continuation, including when no row matched. It never means exhaustion.
+The unadmitted boundary row remains after the cursor and is inspected again on
+continuation. Limits govern UTF-8 bytes admitted to local indexing, not SQLite
+allocator usage or total RSS; SQLite may read a source field before its admission.
+
+`Page.text_work` records candidate rows read (including that boundary inspection),
+indexed rows/bytes, MATCH batches, TEMP statement VM steps/sorts, and whether byte
+admission stopped the call. Total page VM steps/sorts include candidate and TEMP
+statements. Setup, reset, inserts, matching and cleanup occur inside page timing.
+Native FTS internal instructions remain outside VM-step accounting. The scan
+limit still caps consumed candidates; at most one additional candidate is read
+for byte admission. Result pages do not hide prefetched or staged rows beyond the
+cursor. `explain_search` describes the ordered main candidate SQL; for local text
+it deliberately contains no MATCH subquery and does not claim to explain the
+separate bounded TEMP indexing work.
+
+TEMP resets occur before each call and after each batch. An error may leave at
+most one bounded batch in the connection's TEMP database until the next reset
+or connection close; it never becomes catalog evidence. TEMP writes use the same
+main read snapshot, including sessions opened with read-only main access. They
+must not acquire a main writer lock or mutate the catalog/main WAL.

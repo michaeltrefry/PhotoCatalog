@@ -4,7 +4,7 @@ use photocatalog::{
     Catalog,
     catalog_storage::{PathReference, RelinkScope, StorageEncoding},
     organization::{BatchItem, KeywordKind, Operation},
-    organization_search::{Cursor, Query},
+    organization_search::{Cursor, Query, TextLimits},
     storage_volume::{self, NativePath},
 };
 use std::{
@@ -53,6 +53,10 @@ enum Command {
         limit: usize,
         #[arg(long, default_value_t = 2048)]
         scan: usize,
+        #[arg(long, default_value_t = 1_048_576)]
+        text_document_bytes: usize,
+        #[arg(long, default_value_t = 8_388_608)]
+        text_page_bytes: usize,
     },
     /// Emit bounded pages from one consistent snapshot; concurrent writes remain visible to new sessions.
     SearchSession {
@@ -63,6 +67,10 @@ enum Command {
         limit: usize,
         #[arg(long, default_value_t = 2048)]
         scan: usize,
+        #[arg(long, default_value_t = 1_048_576)]
+        text_document_bytes: usize,
+        #[arg(long, default_value_t = 8_388_608)]
+        text_page_bytes: usize,
         #[arg(long, default_value_t = 30)]
         seconds: u64,
     },
@@ -374,8 +382,10 @@ fn main() -> Result<()> {
             cursor,
             limit,
             scan,
+            text_document_bytes,
+            text_page_bytes,
         } => print_json(
-            &catalog.search(
+            &catalog.search_with_text_limits(
                 &read_request::<Query>(&query)?,
                 cursor
                     .as_deref()
@@ -384,6 +394,10 @@ fn main() -> Result<()> {
                     .as_ref(),
                 limit,
                 scan,
+                TextLimits {
+                    document_bytes: text_document_bytes,
+                    page_bytes: text_page_bytes,
+                },
             )?,
         )?,
         Command::SearchSession {
@@ -391,10 +405,19 @@ fn main() -> Result<()> {
             pages,
             limit,
             scan,
+            text_document_bytes,
+            text_page_bytes,
             seconds,
         } => {
             ensure!((1..=1000).contains(&pages), "session pages must be 1..1000");
-            let mut session = catalog.search_session(read_request(&query)?, seconds)?;
+            let mut session = catalog.search_session_with_text_limits(
+                read_request(&query)?,
+                seconds,
+                TextLimits {
+                    document_bytes: text_document_bytes,
+                    page_bytes: text_page_bytes,
+                },
+            )?;
             for _ in 0..pages {
                 let page = session.next_page(limit, scan)?;
                 let done = page.exhausted;

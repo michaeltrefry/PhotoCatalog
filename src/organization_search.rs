@@ -96,10 +96,55 @@ pub struct Page {
     pub exhausted: bool,
     pub page_complete: bool,
     pub next: Option<Cursor>,
-    pub vm_steps: i32,
-    pub sorts: i32,
+    pub vm_steps: i64,
+    pub sorts: i64,
+    pub text_work: TextWork,
     pub elapsed_ms: f64,
 }
+/// Admission for candidate-local text matching, independent of result/scan limits.
+/// Limits account UTF-8 source bytes, not SQLite allocator or total process RSS.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextLimits {
+    pub document_bytes: usize,
+    pub page_bytes: usize,
+}
+impl Default for TextLimits {
+    fn default() -> Self {
+        Self {
+            document_bytes: 1024 * 1024,
+            page_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+impl TextLimits {
+    fn validate(self) -> Result<()> {
+        ensure!(
+            self.document_bytes > 0
+                && self.document_bytes <= self.page_bytes
+                && self.page_bytes <= 64 * 1024 * 1024,
+            "text admission requires 0 < document_bytes <= page_bytes <= 64 MiB"
+        );
+        Ok(())
+    }
+}
+#[derive(Debug, Default, Serialize)]
+pub struct TextWork {
+    /// Includes a row inspected but left unconsumed at the byte-admission boundary.
+    pub candidate_rows_read: usize,
+    pub indexed_rows: usize,
+    pub indexed_bytes: usize,
+    pub batches: usize,
+    /// TEMP setup/reset/insert/MATCH statements, including final reset. These do
+    /// not count every instruction executed inside SQLite's FTS extension.
+    pub vm_steps: i64,
+    pub sorts: i64,
+    pub admission_limited: bool,
+}
+const TEXT_BATCH_ROWS: usize = 128;
+const LOCAL_TEXT: &str = "organization_candidate_text";
+const RESET_TEXT: &str = "INSERT INTO temp.organization_candidate_text(organization_candidate_text) VALUES('delete-all')";
+
 pub struct SearchSession {
     sender: Option<mpsc::SyncSender<SessionRequest>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -119,6 +164,7 @@ impl Drop for SnapshotPermit {
 struct Sql {
     text: String,
     params: Vec<SqlValue>,
+    local_text: bool,
 }
 fn bind(values: &mut Vec<SqlValue>, value: impl Into<SqlValue>) -> String {
     values.push(value.into());
@@ -249,11 +295,9 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     if query.only_conflicted {
         predicates.push("a.conflicts!='[]'".into());
     }
-    if let Some(value) = &query.text {
-        predicates.push(format!("EXISTS(SELECT 1 FROM organization_text WHERE rowid=a.sequence AND organization_text MATCH {})",bind(&mut params,fts_query(value))));
-    }
     let mut source = "organization_assets a".to_string();
     let mut driving = Vec::new();
+    let mut local_text = query.text.is_some();
     let mut sequence = "a.sequence";
     let mut key = match query.sort {
         Sort::Sequence => "a.sequence",
@@ -281,6 +325,8 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
             sequence = "d.sequence";
             key = sequence;
         } else if let Some(text) = &query.text {
+            // This ordered FTS stream has already applied the exact text query.
+            local_text = false;
             source =
                 "organization_text d CROSS JOIN organization_assets a ON a.sequence=d.rowid".into();
             driving.push(format!(
@@ -386,13 +432,48 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     } else {
         format!("{key} {direction},{sequence} {direction}")
     };
+    let text_column = if local_text { "a.search_text" } else { "NULL" };
     let limit = bind(&mut params, scan as i64);
     Ok(Sql {
         text: format!(
-            "SELECT a.sequence,a.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched FROM {source} WHERE {} ORDER BY {order} LIMIT {limit}",
+            "SELECT a.sequence,a.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched,{text_column} FROM {source} WHERE {} ORDER BY {order} LIMIT {limit}",
             driving.join(" AND ")
         ),
         params,
+        local_text,
+    })
+}
+fn text_execute(
+    db: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    work: &mut TextWork,
+) -> Result<()> {
+    let mut statement = db.prepare(sql)?;
+    statement.execute(params)?;
+    work.vm_steps += i64::from(statement.get_status(rusqlite::StatementStatus::VmStep));
+    work.sorts += i64::from(statement.get_status(rusqlite::StatementStatus::Sort));
+    Ok(())
+}
+fn result_row(r: &rusqlite::Row<'_>) -> Result<SearchRow> {
+    let rating: i64 = r.get(11)?;
+    Ok(SearchRow {
+        sequence: r.get(0)?,
+        asset_id: r.get(1)?,
+        state: r.get(2)?,
+        metadata_revision: r.get(3)?,
+        folder: r.get(4)?,
+        filename: r.get(5)?,
+        capture: r.get(6)?,
+        camera_make: r.get(7)?,
+        camera: r.get(8)?,
+        lens: r.get(9)?,
+        format: r.get(10)?,
+        rating: (rating != -2).then_some(rating),
+        flag: r.get(12)?,
+        label: r.get(13)?,
+        conflicts: serde_json::from_str(&r.get::<_, String>(14)?)?,
+        provenance: serde_json::from_str(&r.get::<_, String>(15)?)?,
     })
 }
 fn page(
@@ -401,8 +482,10 @@ fn page(
     cursor: Option<&Cursor>,
     limit: usize,
     scan: usize,
+    text_limits: TextLimits,
 ) -> Result<Page> {
     organization::page_limit(limit)?;
+    text_limits.validate()?;
     ensure!(
         (limit..=4096).contains(&scan),
         "scan budget must be >= page limit and <=4096"
@@ -423,58 +506,112 @@ fn page(
     }
     let high = cursor.map(|c| c.high_water).unwrap_or(max);
     let query_sql = sql(query, cursor, high, scan)?;
+    let mut text_work = TextWork::default();
+    let local_query = query
+        .text
+        .as_deref()
+        .filter(|_| query_sql.local_text)
+        .map(fts_query);
+    if local_query.is_some() {
+        // TEMP belongs to this connection, even when main is opened READ_ONLY.
+        // No main schema/index writes and no catalog-sized posting set are made.
+        text_execute(
+            db,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.organization_candidate_text USING fts5(text,content='',tokenize='unicode61')",
+            [],
+            &mut text_work,
+        )?;
+        text_execute(db, RESET_TEXT, [], &mut text_work)?;
+    }
     let mut statement = db.prepare(&query_sql.text)?;
     let mut rows = statement.query(params_from_iter(query_sql.params))?;
     let mut output = Vec::new();
     let mut scanned = 0;
     let mut last = None;
     let mut exhausted = false;
-    while scanned < scan && output.len() < limit {
-        let Some(r) = rows.next()? else {
-            exhausted = true;
-            break;
-        };
-        scanned += 1;
-        let sequence: i64 = r.get(0)?;
-        let key = match query.sort {
-            Sort::Sequence => Key::Integer(sequence),
-            Sort::Capture => Key::Text(r.get(6)?),
-            Sort::Filename => Key::Text(r.get(5)?),
-            Sort::Rating => Key::Integer(r.get(11)?),
-        };
-        last = Some(Cursor {
-            version: 1,
-            query_hash: hash.clone(),
-            epoch,
-            high_water: high,
-            sequence,
-            key,
-        });
-        if r.get::<_, bool>(16)? {
-            let rating: i64 = r.get(11)?;
-            output.push(SearchRow {
+    while scanned < scan && output.len() < limit && !text_work.admission_limited {
+        // Never stage more rows than remaining output slots: every admitted row
+        // is consumed in order before advancing the public cursor, even if all
+        // rows match. No buffered matches or invisible prefetch survives a call.
+        let capacity = TEXT_BATCH_ROWS
+            .min(limit - output.len())
+            .min(scan - scanned);
+        let mut batch = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            let Some(r) = rows.next()? else {
+                exhausted = true;
+                break;
+            };
+            text_work.candidate_rows_read += 1;
+            let matched = r.get::<_, bool>(16)?;
+            if matched && local_query.is_some() {
+                let text = r.get_ref(17)?.as_str()?;
+                ensure!(
+                    text.len() <= text_limits.document_bytes,
+                    "candidate {} text requires {} bytes; document admission is {} bytes; retry with larger TextLimits",
+                    r.get::<_, i64>(0)?,
+                    text.len(),
+                    text_limits.document_bytes
+                );
+                if text.len() > text_limits.page_bytes - text_work.indexed_bytes {
+                    text_work.admission_limited = true;
+                    break;
+                }
+                text_execute(
+                    db,
+                    "INSERT INTO temp.organization_candidate_text(rowid,text) VALUES(?1,?2)",
+                    rusqlite::params![r.get::<_, i64>(0)?, text],
+                    &mut text_work,
+                )?;
+                text_work.indexed_rows += 1;
+                text_work.indexed_bytes += text.len();
+            }
+            scanned += 1;
+            let sequence = r.get(0)?;
+            let key = match query.sort {
+                Sort::Sequence => Key::Integer(sequence),
+                Sort::Capture => Key::Text(r.get(6)?),
+                Sort::Filename => Key::Text(r.get(5)?),
+                Sort::Rating => Key::Integer(r.get(11)?),
+            };
+            last = Some(Cursor {
+                version: 1,
+                query_hash: hash.clone(),
+                epoch,
+                high_water: high,
                 sequence,
-                asset_id: r.get(1)?,
-                state: r.get(2)?,
-                metadata_revision: r.get(3)?,
-                folder: r.get(4)?,
-                filename: r.get(5)?,
-                capture: r.get(6)?,
-                camera_make: r.get(7)?,
-                camera: r.get(8)?,
-                lens: r.get(9)?,
-                format: r.get(10)?,
-                rating: (rating != -2).then_some(rating),
-                flag: r.get(12)?,
-                label: r.get(13)?,
-                conflicts: serde_json::from_str(&r.get::<_, String>(14)?)?,
-                provenance: serde_json::from_str(&r.get::<_, String>(15)?)?,
+                key,
             });
+            if matched {
+                batch.push(result_row(r)?);
+            }
+        }
+        if let Some(text) = &local_query {
+            if !batch.is_empty() {
+                text_work.batches += 1;
+                let mut matcher = db.prepare(&format!(
+                    "SELECT rowid FROM temp.{LOCAL_TEXT} WHERE {LOCAL_TEXT} MATCH ?1"
+                ))?;
+                let hits = matcher
+                    .query_map([text], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+                text_work.vm_steps +=
+                    i64::from(matcher.get_status(rusqlite::StatementStatus::VmStep));
+                text_work.sorts += i64::from(matcher.get_status(rusqlite::StatementStatus::Sort));
+                output.extend(batch.into_iter().filter(|r| hits.contains(&r.sequence)));
+            }
+            text_execute(db, RESET_TEXT, [], &mut text_work)?;
+        } else {
+            output.extend(batch);
+        }
+        if exhausted {
+            break;
         }
     }
     drop(rows);
-    let vm_steps = statement.get_status(rusqlite::StatementStatus::VmStep);
-    let sorts = statement.get_status(rusqlite::StatementStatus::Sort);
+    let vm_steps =
+        i64::from(statement.get_status(rusqlite::StatementStatus::VmStep)) + text_work.vm_steps;
+    let sorts = i64::from(statement.get_status(rusqlite::StatementStatus::Sort)) + text_work.sorts;
     Ok(Page {
         page_complete: output.len() == limit || exhausted,
         rows: output,
@@ -484,6 +621,7 @@ fn page(
         next: if exhausted { None } else { last },
         vm_steps,
         sorts,
+        text_work,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -497,12 +635,31 @@ impl Catalog {
         limit: usize,
         scan: usize,
     ) -> Result<Page> {
+        self.search_with_text_limits(query, cursor, limit, scan, TextLimits::default())
+    }
+    pub fn search_with_text_limits(
+        &mut self,
+        query: &Query,
+        cursor: Option<&Cursor>,
+        limit: usize,
+        scan: usize,
+        text_limits: TextLimits,
+    ) -> Result<Page> {
         let tx = self.db.transaction()?;
-        let result = page(&tx, query, cursor, limit, scan)?;
+        let result = page(&tx, query, cursor, limit, scan, text_limits)?;
         tx.commit()?;
         Ok(result)
     }
     pub fn search_session(&self, query: Query, lifetime_seconds: u64) -> Result<SearchSession> {
+        self.search_session_with_text_limits(query, lifetime_seconds, TextLimits::default())
+    }
+    pub fn search_session_with_text_limits(
+        &self,
+        query: Query,
+        lifetime_seconds: u64,
+        text_limits: TextLimits,
+    ) -> Result<SearchSession> {
+        text_limits.validate()?;
         ensure!(
             (1..=300).contains(&lifetime_seconds),
             "snapshot lifetime must be 1..300 seconds"
@@ -562,7 +719,14 @@ impl Catalog {
                             .send(Err(anyhow::anyhow!("search snapshot expired")));
                         break;
                     }
-                    let result = page(&db, &query, next.as_ref(), request.limit, request.scan);
+                    let result = page(
+                        &db,
+                        &query,
+                        next.as_ref(),
+                        request.limit,
+                        request.scan,
+                        text_limits,
+                    );
                     let exhausted = result.as_ref().is_ok_and(|p| p.exhausted);
                     if let Ok(result) = &result {
                         next = result.next.clone();

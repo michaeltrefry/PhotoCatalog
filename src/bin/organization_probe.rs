@@ -213,7 +213,7 @@ fn measure(
     loop {
         let page = cat.search(query, next.as_ref(), 200 - rows.len(), 4096)?;
         next = page.next.clone();
-        chunks.push(json!({"scanned":page.scanned,"returned":page.rows.len(),"page_complete":page.page_complete,"exhausted":page.exhausted,"has_more":page.has_more,"cursor":page.next,"vm_steps":page.vm_steps,"sorts":page.sorts,"elapsed_ms":page.elapsed_ms}));
+        chunks.push(json!({"scanned":page.scanned,"returned":page.rows.len(),"page_complete":page.page_complete,"exhausted":page.exhausted,"has_more":page.has_more,"cursor":page.next,"vm_steps":page.vm_steps,"sorts":page.sorts,"text_work":page.text_work,"elapsed_ms":page.elapsed_ms}));
         rows.extend(page.rows);
         if rows.len() == 200 || page.exhausted {
             break;
