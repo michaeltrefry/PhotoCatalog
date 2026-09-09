@@ -1355,9 +1355,9 @@ fn schema_four_to_five_adds_only_index_and_preserves_data_and_readonly_queries()
             let columns = stmt.column_count();
             let mut rows = stmt
                 .query_map([], |r| {
-                    Ok((0..columns)
+                    (0..columns)
                         .map(|i| r.get_ref(i).map(|v| format!("{v:?}")))
-                        .collect::<rusqlite::Result<Vec<_>>>()?)
+                        .collect::<rusqlite::Result<Vec<_>>>()
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows.sort();
