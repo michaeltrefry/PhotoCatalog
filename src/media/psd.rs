@@ -186,11 +186,15 @@ pub(super) fn decode(bytes: &[u8], max_pixels: u64, max_allocation: u64) -> Resu
             let rows = (height as usize)
                 .checked_mul(channels)
                 .ok_or_else(|| anyhow::anyhow!("PSD row overflow"))?;
-            let sizes = (0..rows)
-                .map(|_| r.u16().map(usize::from))
-                .collect::<Result<Vec<_>>>()?;
+            // Keep the row-size table in the admitted encoded buffer. Expanding
+            // u16 lengths into a usize Vec can exceed a narrow image's allowance.
+            let table_bytes = rows
+                .checked_mul(2)
+                .ok_or_else(|| anyhow::anyhow!("PSD row table overflow"))?;
+            let sizes = r.take(table_bytes)?;
             let mut output = Vec::with_capacity(total);
-            for size in sizes {
+            for size in sizes.chunks_exact(2) {
+                let size = u16::from_be_bytes(size.try_into().unwrap()) as usize;
                 let row = r.take(size)?;
                 let mut i = 0;
                 let start = output.len();
@@ -231,11 +235,13 @@ pub(super) fn decode(bytes: &[u8], max_pixels: u64, max_allocation: u64) -> Resu
             output
         }
         2 | 3 => {
-            let mut output = Vec::new();
-            flate2::read::ZlibDecoder::new(&bytes[r.offset..])
-                .take(total as u64 + 1)
-                .read_to_end(&mut output)?;
-            ensure!(output.len() == total, "PSD ZIP size mismatch");
+            // Exact allocation avoids geometric Vec growth crossing the admitted
+            // plane limit. The stack byte still detects excess decompressed data.
+            let mut output = vec![0; total];
+            let mut decoder = flate2::read::ZlibDecoder::new(&bytes[r.offset..]);
+            decoder.read_exact(&mut output)?;
+            let mut extra = [0];
+            ensure!(decoder.read(&mut extra)? == 0, "PSD ZIP size mismatch");
             output
         }
         _ => bail!("unsupported PSD compression {compression}"),

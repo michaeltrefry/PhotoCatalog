@@ -586,3 +586,74 @@ fn public_panasonic_raw_admission_retry() {
     assert_eq!(image.provenance.source_bits_per_channel, 12);
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
+
+#[test]
+fn psd_rle_narrow_many_channel_table_stays_in_encoded_buffer() {
+    use photocatalog::media::{DecodeLimits, decode_full_limited};
+    let mut bytes = psd_test_header(1, 1000, 56, 8, 1);
+    for _ in 0..56_000 {
+        bytes.extend(2u16.to_be_bytes());
+    }
+    for _ in 0..56_000 {
+        bytes.extend([0, 128]);
+    }
+    assert_eq!(bytes.len(), 224040);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("narrow.psd");
+    std::fs::write(&path, &bytes).unwrap();
+    let image = decode_full_limited(
+        &path,
+        DecodeLimits {
+            max_encoded_bytes: 256 * 1024,
+            max_intermediate_pixels: 1000,
+            max_allocation_bytes: 256 * 1024,
+        },
+    )
+    .unwrap();
+    assert_eq!((image.width, image.height), (1, 1000));
+    assert!(
+        image
+            .pixels
+            .iter()
+            .all(|p| (p[0] - 0.2158605).abs() < 1e-6 && p[3] == 1.0)
+    );
+}
+fn psd_test_header(
+    width: u32,
+    height: u32,
+    channels: u16,
+    depth: u16,
+    compression: u16,
+) -> Vec<u8> {
+    let mut bytes = b"8BPS\0\x01\0\0\0\0\0\0".to_vec();
+    bytes.extend(channels.to_be_bytes());
+    bytes.extend(height.to_be_bytes());
+    bytes.extend(width.to_be_bytes());
+    bytes.extend(depth.to_be_bytes());
+    bytes.extend(3u16.to_be_bytes());
+    for _ in 0..3 {
+        bytes.extend(0u32.to_be_bytes());
+    }
+    bytes.extend(compression.to_be_bytes());
+    bytes
+}
+#[test]
+fn psd_zip_exact_output_rejects_short_and_excess_planes() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("zip.psd");
+    for size in [23, 24, 25] {
+        let mut bytes = psd_test_header(4, 2, 3, 8, 2);
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![128; size]).unwrap();
+        bytes.extend(encoder.finish().unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        let result = decode_full(&path);
+        if size == 24 {
+            assert_eq!(result.unwrap().pixels.len(), 8);
+        } else {
+            assert_eq!(result.err().unwrap().status, DecodeStatus::Corrupt);
+        }
+    }
+}
