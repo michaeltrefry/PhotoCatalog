@@ -256,6 +256,8 @@ enum StorageCommand {
     },
 }
 
+// Variant names intentionally preserve the existing flat CLI command names.
+#[allow(clippy::enum_variant_names)]
 #[derive(Subcommand)]
 enum RelinkCommand {
     /// Start a reviewed folder/root remap, even while its old location is online.
