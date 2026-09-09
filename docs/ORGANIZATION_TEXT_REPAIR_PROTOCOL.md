@@ -166,3 +166,14 @@ text+capture and date+camera at 1M and 10M: eight children, each with 3 warmups,
 5 samples and the unchanged 120-second diagnostic deadline. These remain
 nonqualifying samples. All eight outcomes must be retained and reviewed before
 the full campaign.
+
+
+The pre-v3 budget audit found an acceptance-check omission in prior drivers:
+fresh processes were checked only against a one-second whole-child guard, with
+no separate 500 ms indexed-page p95 check. Prior v1/v2 failures and samples remain
+retained and cannot establish that omitted gate. Before the v3 release freeze,
+driver3 now computes the full native page p95 from all 20 fresh samples and
+requires <=500 ms, alongside warm p95 <=100 ms. Both include all continuation
+and temporary-text work. The separate whole-child <1 second guard remains
+visible. Save/browse transition p95 uses the same inclusive <=100 ms contract.
+No workload, fixture formula, sample count or performance target has changed.

@@ -9,6 +9,35 @@ import unittest
 import organization_campaign as campaign
 
 class CampaignTests(unittest.TestCase):
+    def test_full_page_budgets_include_fresh_percentile_and_separate_startup(self):
+        trials = [dict(kind="warm", index=0, elapsed_samples_ms=[100.0]*100,
+                       observer=dict(elapsed_ms=11000, rss_peak_bytes=4*1024**3))]
+        trials += [dict(kind="fresh", index=i, elapsed_samples_ms=[500.0],
+                        observer=dict(elapsed_ms=900.0, rss_peak_bytes=1024)) for i in range(20)]
+        evidence = campaign.query_budgets(trials)
+        self.assertTrue(all(evidence["passes"].values()))
+        bad = copy.deepcopy(trials)
+        for trial in bad[1:]: trial["elapsed_samples_ms"] = [501.0]
+        self.assertFalse(campaign.query_budgets(bad)["passes"]["fresh_page"])
+        self.assertTrue(campaign.query_budgets(bad)["passes"]["fresh_child_startup_guard"])
+        # One 900ms outlier leaves interpolated p95=500ms; two exceed it.
+        trials[1]["elapsed_samples_ms"] = [900.0]
+        for trial in trials[2:]: trial["elapsed_samples_ms"] = [478.94736842105266]
+        self.assertAlmostEqual(campaign.query_budgets(trials)["measurements"]["fresh_page_ms"]["p95"], 500)
+        trials[2]["elapsed_samples_ms"] = [900.0]
+        self.assertFalse(campaign.query_budgets(trials)["passes"]["fresh_page"])
+        bad = copy.deepcopy(trials);bad[0]["elapsed_samples_ms"] = [100.001]*100
+        self.assertFalse(campaign.query_budgets(bad)["passes"]["warm_page"])
+        bad[1]["observer"]["elapsed_ms"] = 1000
+        self.assertFalse(campaign.query_budgets(bad)["passes"]["fresh_child_startup_guard"])
+        bad[1]["observer"]["rss_peak_bytes"] = 4*1024**3+1
+        self.assertFalse(campaign.query_budgets(bad)["passes"]["browse_memory"])
+        for mutation in [lambda t:t.pop(),lambda t:t[1].update(index=2),
+                         lambda t:t[1].update(elapsed_samples_ms=[]),
+                         lambda t:t[1].update(elapsed_samples_ms=[float('nan')])]:
+            bad=copy.deepcopy(trials);mutation(bad)
+            with self.assertRaises((AssertionError,ValueError)):campaign.query_budgets(bad)
+
     def receipt(self):
         rows=[]
         for i in range(501,701):

@@ -65,6 +65,29 @@ def distribution(values):
     return {"n": len(values), "p50": q(.5), "p95": q(.95), "p99": q(.99), "max": max(values)}
 
 
+def query_budgets(trials, smoke=False):
+    """Full visible-page native latency; child startup is a separate extra guard."""
+    expected_fresh = 2 if smoke else 20
+    expected_warm = 2 if smoke else 100
+    identities = [(t["kind"], t["index"]) for t in trials]
+    assert len(identities) == 1 + expected_fresh
+    assert set(identities) == {("warm", 0), *(("fresh", i) for i in range(expected_fresh))}
+    warm = next(t["elapsed_samples_ms"] for t in trials if t["kind"] == "warm")
+    fresh_trials = [t for t in trials if t["kind"] == "fresh"]
+    assert len(warm) == expected_warm and all(len(t["elapsed_samples_ms"]) == 1 for t in fresh_trials)
+    fresh = [t["elapsed_samples_ms"][0] for t in fresh_trials]
+    wall = [t["observer"]["elapsed_ms"] for t in fresh_trials]
+    rss = [t["observer"]["rss_peak_bytes"] for t in trials]
+    assert all(finite(v) and v > 0 for v in rss)
+    measurements = {"warm_page_ms": distribution(warm), "fresh_page_ms": distribution(fresh),
+                    "fresh_child_wall_ms": distribution(wall), "peak_rss_bytes": max(rss)}
+    return {"measurements": measurements, "passes": {
+        "warm_page": measurements["warm_page_ms"]["p95"] <= 100,
+        "fresh_page": measurements["fresh_page_ms"]["p95"] <= 500,
+        "fresh_child_startup_guard": measurements["fresh_child_wall_ms"]["max"] < 1000,
+        "browse_memory": measurements["peak_rss_bytes"] <= 4 * 1024**3}}
+
+
 def run_child(binary, catalog, output, args, timeout):
     """Always terminate/reap a child on observation failure; preserve raw stderr."""
     output = pathlib.Path(output)
@@ -313,7 +336,7 @@ def run_transitions(args, manifest):
             measures=validate_transitions(data,observer,count,repetitions)
             after_work=sha(source);assert after_work==before
             result["scales"].append({"count":count,"measurements":measures,"observer":observer,"copy_proof":proof,"source_after_work":after_work,
-                                    "numerical_pass":all(measures[name]["p95"]<100 for name in ("rating","label","snapshot_browse")),"raw":str(receipt)})
+                                    "numerical_pass":all(measures[name]["p95"]<=100 for name in ("rating","label","snapshot_browse")),"raw":str(receipt)})
         except Exception as error:
             result["errors"].append({"count":count,"error":f"{type(error).__name__}: {error}"})
     result["complete"]=len(result["scales"])==len(manifest["fixtures"]) and not result["errors"]
@@ -572,10 +595,10 @@ def main():
                     except Exception as error:
                         record["errors"].append({"kind": kind, "index": index, "error": f"{type(error).__name__}: {error}", "observer": observer, "raw": str(receipt)})
                 good = record["trials"]
-                record["numerical_pass"] = (not record["errors"] and len(good) == (3 if args.smoke else 21)
-                    and all(t["observer"]["rss_peak_bytes"] <= 4 * 1024**3 for t in good)
-                    and all(t["distribution"]["p95"] < 100 for t in good if t["kind"] == "warm")
-                    and all(t["observer"]["elapsed_ms"] < 1000 for t in good if t["kind"] == "fresh"))
+                record["numerical_pass"] = False
+                if not record["errors"]:
+                    record["budget_evidence"] = query_budgets(good, args.smoke)
+                    record["numerical_pass"] = all(record["budget_evidence"]["passes"].values())
                 result["cases"].append(record)
             after = sha(catalog / "catalog.sqlite3")
             proof = {"count": count, "before": fixture["main_sha256"], "after": after, "unchanged": after == fixture["main_sha256"],

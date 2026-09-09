@@ -72,8 +72,13 @@ or database hashes. Full row validation runs after timing. Preserve every failur
 raw sample, child exit, settings receipt, and source/binary hash. No favorable
 retries or deletion of failed runs. All three scales are attempted.
 
-Use the inherited budgets: warmed page p95 <100 ms, initial page <1 second,
-browse-only process RSS <=4 GiB. Compute quantiles using linear interpolation on
+Use the inherited indexed-metadata budgets: warmed full-page p95 <=100 ms and
+fresh-process full-page p95 <=500 ms, aggregated from all 20 native fresh-page
+samples per case/scale. Native page time includes every continuation chunk and
+TEMP text operation. Child startup/whole-process wall time remains a separate
+extra guard (<1 second for each fresh child), not a substitute for the 500 ms
+query budget or proof of the retained-thumbnail first-visible-page target.
+Browse-only process RSS must be <=4 GiB. Compute quantiles using linear interpolation on
 all raw samples. Report p50/p95/p99/max and exact returned counts. A numerical
 pass alone does not prove bounded engine work. Compare deep work and sorts across
 scales, including sparse filters and FTS. A requirement failure remains visible;
