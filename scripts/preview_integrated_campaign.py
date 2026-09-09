@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed 10M retained-page experiment on a raw copied schema-4 fixture only.
+"""Fixed 10M retained-page experiment on a raw copied schema-5 fixture only.
 
 Never opens a source database through SQLite. Both commands require a reviewed
 binding and an explicit execution lane; copying and hashing are untimed setup.
@@ -7,6 +7,8 @@ binding and an explicit execution lane; copying and hashing are untimed setup.
 from __future__ import annotations
 import argparse
 import os
+import json
+import hashlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +18,47 @@ from preview_host import HostObservation, host_identity
 from preview_navigation_campaign import anchor, read_json, expected_trials, validate_trial, distribution
 
 SUFFIXES = ("", "-wal", "-shm", "-journal")
+INDEX_SQL = "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
+
+
+def ancestry_evidence(source):
+    """Validate original migration provenance without opening a donor database."""
+    entries=source.get("migration_ancestry",{})
+    if set(entries) not in ({"proof","native"},{"proof","native","verification"}):
+        raise ValueError("original schema4-to-5 ancestry required")
+    payloads, parsed = {}, {}
+    for name, entry in entries.items():
+        path=Path(entry["path"])
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            raise ValueError("regular absolute ancestry receipt required")
+        with path.open("rb") as stream:
+            payloads[name]=stream.read(1024*1024+1)
+        if len(payloads[name])>1024*1024 or hashlib.sha256(payloads[name]).hexdigest()!=entry["sha256"]:
+            raise ValueError("ancestry bytes changed or oversized")
+        parsed[name]=json.loads(payloads[name])
+    proof,native=parsed["proof"],parsed["native"]
+    if (proof.get("schema_before"),proof.get("schema_after"),native.get("schema_before"),native.get("schema_after"))!=(4,5,4,5):
+        raise ValueError("original migration must remain explicitly 4-to-5")
+    if proof.get("native_receipt_sha256")!=entries["native"]["sha256"] or native.get("protocol")!=1 or native.get("complete") is not True or native.get("mode")!="migrate_fixture" or native.get("count")!=10000000 or native.get("engine_version")!="3.51.1":
+        raise ValueError("native migration identity mismatch")
+    main=source["files"][""]["sha256"]
+    if proof.get("owned_copy_after_sha256")!=main or proof.get("owned_copy_before_sha256")==main:
+        raise ValueError("donor is not the pristine migrated main")
+    logical=native.get("logical_before")
+    if not isinstance(logical,str) or len(logical)!=64 or any(c not in "0123456789abcdef" for c in logical) or any(row.get(field)!=logical for row in (proof,native) for field in ("logical_before","logical_after")):
+        raise ValueError("migration logical identity changed")
+    tables=native.get("table_counts_before")
+    if not tables or any(row.get(field)!=tables for row in (proof,native) for field in ("table_counts_before","table_counts_after")):
+        raise ValueError("migration table identities changed")
+    if len(dict(tables))!=len(tables) or any(dict(tables).get(k)!=10000000 for k in ("assets","organization_assets","organization_text")):
+        raise ValueError("migration table cardinalities mismatch")
+    if proof.get("index_sql")!=INDEX_SQL or native.get("index_sql")!=INDEX_SQL or proof.get("observer",{}).get("exit_code")!=0 or proof.get("observer",{}).get("error") is not None:
+        raise ValueError("migration index or observer failed")
+    if "verification" in parsed:
+        verified=parsed["verification"]
+        if verified.get("kind")!="schema5_verification" or verified.get("schema_before")!=5 or verified.get("schema_after")!=5 or any(verified.get(f)!=main for f in ("owned_copy_before_sha256","owned_copy_after_sha256")) or any(verified.get(f)!=logical for f in ("logical_before","logical_after")) or any(verified.get(f)!=tables for f in ("table_counts_before","table_counts_after")) or verified.get("index_sql")!=INDEX_SQL:
+            raise ValueError("later verification cannot replace original migration ancestry")
+    return payloads
 
 
 def source_state(catalog):
@@ -58,7 +101,7 @@ def raw_copy(source, target, expected, after_copy=None):
 
 def checked_binding(binding, files, kind):
     revision = binding.get("source_revision", "")
-    if binding.get("version") != 1 or binding.get("clean") is not True or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+    if binding.get("version") != 2 or binding.get("clean") is not True or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
         raise ValueError("clean exact source binding required")
     if binding.get("kind") != kind:
         raise ValueError("binding operation mismatch")
@@ -87,7 +130,7 @@ def invoke(command, root, name, timeout):
 
 def prepare(args):
     args.output.mkdir(parents=False, exist_ok=False)
-    receipt = {"version":1,"complete":False,"started":anchor(),"source_catalog":str(args.source_catalog),
+    receipt = {"version":2,"complete":False,"started":anchor(),"source_catalog":str(args.source_catalog),
                "copied_catalog":str(args.output/"catalog/catalog.sqlite3"),"source_sqlite_connections":0}
     error = None
     expected = None
@@ -98,8 +141,8 @@ def prepare(args):
         binding = read_json(args.binding,65536)
         checked_binding(binding,files,"prepare")
         source = read_json(args.source_binding,65536)
-        if source.get("catalog_count") != 10000000 or source.get("schema_version") != 4 or source.get("source_catalog") != str(args.source_catalog):
-            raise ValueError("exact schema-4 10M source binding required")
+        if source.get("catalog_count") != 10000000 or source.get("schema_version") != 5 or source.get("source_catalog") != str(args.source_catalog):
+            raise ValueError("exact schema-5 10M source binding required")
         expected = source["files"]
         source_revision=source.get("source_revision", "")
         if len(source_revision)!=40 or any(c not in "0123456789abcdef" for c in source_revision):
@@ -122,6 +165,14 @@ def prepare(args):
         required = sum(v.get("bytes",0) for v in expected.values()) + cache_bytes + 2*1024**3
         if type(minimum) is not int or minimum < required or shutil.disk_usage(args.output).free < minimum:
             raise ValueError("reviewed copy/cache/filesystem headroom unavailable")
+        payloads=ancestry_evidence(source)
+        ancestry=args.output/"ancestry"
+        ancestry.mkdir()
+        for name,payload in payloads.items():
+            with (ancestry/(name+".json")).open("xb") as stream:
+                stream.write(payload); stream.flush(); os.fsync(stream.fileno())
+        receipt["schema_version"]=5
+        receipt["ancestry"]={"complete":True,"files":{name:{"path":str(ancestry/(name+".json")),"sha256":digest(ancestry/(name+".json"))} for name in payloads}}
         receipt["identities"] = files
         receipt["binding_sha256"] = digest(args.binding)
         receipt.update(raw_copy(args.source_catalog,args.output/"catalog/catalog.sqlite3",expected))
@@ -147,7 +198,7 @@ def prepare(args):
         raise error
     # An interrupted/failed overlay is retained; this command never reuses that bundle.
     overlay_error = None
-    final = {"version":1,"complete":False,"started":anchor()}
+    final = {"version":2,"complete":False,"started":anchor()}
     try:
         final["child"] = invoke([str(args.binary),"overlay","--bundle",str(args.output),"--dataset",str(args.dataset)],args.output,"overlay",3600)
         overlay = read_json(args.output/"overlay-receipt.json",1024*1024)
@@ -162,11 +213,13 @@ def prepare(args):
         try:
             final["source_preserved"] = source_state(args.source_catalog) == expected
             final["bound_files_preserved"] = all(digest(p)==files[k] for k,p in paths.items())
+            final["original_ancestry_preserved"] = ancestry_evidence(source)==payloads
         except (OSError,ValueError) as exc:
             final["source_preserved"]=False
             final["bound_files_preserved"]=False
+            final["original_ancestry_preserved"]=False
             final["invariance_error"]=str(exc)
-        final["complete"] &= final["source_preserved"] and final["bound_files_preserved"]
+        final["complete"] &= final["source_preserved"] and final["bound_files_preserved"] and final["original_ancestry_preserved"]
         final["finished"] = anchor()
         exclusive(args.output/"preparation.json",final)
     if overlay_error is not None:
@@ -178,23 +231,33 @@ def prepare(args):
 def run(args):
     args.output.mkdir(parents=False, exist_ok=False)
     root = Path(__file__).resolve().parents[1]
-    receipt = {"version":1,"complete":False,"started":anchor(),"children":[],"metadata_count":10000000,
+    receipt = {"version":2,"complete":False,"started":anchor(),"children":[],"metadata_count":10000000,
                "planned_measured_children":2,"planned_verifiers":2,"automatic_retries":0,
                "desktop_frame_time":"unavailable; S12","quietness_verified":False}
     error = None
     paths, frozen, expected = {}, {}, None
     source_catalog = None
+    source, payloads = None, None
     try:
         fixture = read_json(args.fixture,65536)
         bundle = args.fixture.parent
         paths = {k:getattr(args,k) for k in ("binary","worker","archive","storage","fixture","source_binding")}
         paths.update(dataset=Path(fixture["dataset"]),overlay=bundle/"overlay-receipt.json",copy=bundle/"copy-receipt.json",preparation=bundle/"preparation.json",coordinator=Path(__file__),protocol=root/"docs/PREVIEW_INTEGRATED_PROTOCOL.md",navigation_coordinator=root/"scripts/preview_navigation_campaign.py")
+        copied_proof=read_json(paths["copy"],65536)
+        for name,entry in copied_proof.get("ancestry",{}).get("files",{}).items():
+            paths["ancestry_"+name]=Path(entry["path"])
         frozen = {k:digest(v) for k,v in paths.items()}
         binding = read_json(args.binding,65536)
         checked_binding(binding,frozen,"run")
         if binding.get("planned_measured_children") != 2 or binding.get("planned_verifiers") != 2:
             raise ValueError("fixed two-profile plan required")
         source = read_json(args.source_binding,65536)
+        payloads=ancestry_evidence(source)
+        if set(payloads)!={name.removeprefix("ancestry_") for name in paths if name.startswith("ancestry_")}:
+            raise ValueError("copied ancestry missing")
+        for name,payload in payloads.items():
+            if paths["ancestry_"+name].read_bytes()!=payload:
+                raise ValueError("copied migration bytes differ")
         expected = source["files"]
         source_catalog = Path(source["source_catalog"])
         if source_state(source_catalog) != expected:
@@ -217,7 +280,7 @@ def run(args):
                 result = read_json(folder/"receipt.json",1024*1024)
                 child["receipt_sha256"] = digest(folder/"receipt.json")
                 child["result"] = result
-                if result.get("complete") is not True or result.get("profile") != profile or result.get("workload") != "warm" or result.get("catalog_count") != 10000000 or result.get("catalog_schema") != 4 or result.get("actual_preserved_source_paths_verified") is not True or result.get("native_jobs") != 0 or result.get("dataset_blake3") != fixture["dataset_blake3"]:
+                if result.get("complete") is not True or result.get("profile") != profile or result.get("workload") != "warm" or result.get("catalog_count") != 10000000 or result.get("catalog_schema") != 5 or result.get("actual_preserved_source_paths_verified") is not True or result.get("native_jobs") != 0 or result.get("dataset_blake3") != fixture["dataset_blake3"]:
                     raise ValueError("child count/schema/offline/key/native proof failed")
                 child["verifier"] = invoke([str(args.binary),"verify",str(folder)],args.output,profile+"-verify",60)
                 if read_json(args.output/(profile+"-verify.stdout"),65536).get("complete") is not True:
@@ -250,10 +313,11 @@ def run(args):
         try:
             receipt["source_preserved"]=expected is not None and source_catalog is not None and source_state(source_catalog)==expected
             receipt["bound_files_preserved"]=bool(frozen) and all(digest(paths[k])==v for k,v in frozen.items())
+            receipt["original_ancestry_preserved"]=source is not None and payloads is not None and ancestry_evidence(source)==payloads
         except (OSError,ValueError) as exc:
             receipt["invariance_error"]=str(exc)
             receipt["source_preserved"]=False
-        receipt["complete"] &= receipt.get("source_preserved",False) and receipt.get("bound_files_preserved",False)
+        receipt["complete"] &= receipt.get("source_preserved",False) and receipt.get("bound_files_preserved",False) and receipt.get("original_ancestry_preserved",False)
         receipt["finished"]=anchor()
         exclusive(args.output/"campaign.json",receipt)
     if error is not None:

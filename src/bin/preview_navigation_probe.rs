@@ -506,7 +506,7 @@ fn run(
             let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             let count: u64 = db.query_row("SELECT count(*) FROM assets", [], |r| r.get(0))?;
             ensure!(
-                schema == 4 && count == fixture.catalog_count,
+                schema == 5 && count == fixture.catalog_count,
                 "catalog count/schema changed"
             );
             receipt["catalog_count"] = json!(count);

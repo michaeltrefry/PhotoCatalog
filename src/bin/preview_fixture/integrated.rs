@@ -3,6 +3,8 @@
 use super::*;
 use preview_fixture::{IdScheme, distinct_jpeg, verify_object};
 
+const INDEX_SQL: &str =
+    "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)";
 const TOTAL: u64 = 10_000_000;
 const OFFLINE: &str = "/synthetic";
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -52,8 +54,16 @@ fn schema(db: &Connection) -> Result<Vec<SchemaEntry>> {
 }
 fn count_schema(db: &Connection, total: u64) -> Result<()> {
     ensure!(
-        db.query_row::<u32, _, _>("PRAGMA user_version", [], |r| r.get(0))? == 4,
-        "schema must be exactly 4; no migration in this experiment"
+        db.query_row::<u32, _, _>("PRAGMA user_version", [], |r| r.get(0))? == 5,
+        "schema must be exactly 5; no migration in this experiment"
+    );
+    ensure!(
+        db.query_row::<String, _, _>(
+            "SELECT sql FROM sqlite_schema WHERE name='organization_lens_capture'",
+            [],
+            |r| r.get(0)
+        )? == INDEX_SQL,
+        "schema5 lens/capture index differs"
     );
     ensure!(
         db.query_row::<u32, _, _>("PRAGMA application_id", [], |r| r.get(0))? == 1346913089,
@@ -160,7 +170,7 @@ fn overlay(
         "schema/sequence changed"
     );
     count_schema(&tx, total)?;
-    let receipt = json!({"changed_columns":["fingerprint","render_generation","preview_hash"],"rows":window,"catalog_count":total,"schema_version":4,"rows_before_blake3":hash(&before)?,"rows_after_blake3":hash(&after)?,"keys_blake3":hash(&keys)?,"schema_blake3":hash(&schema_before)?,"storage_epoch_before":epoch,"storage_epoch_after":epoch_after,"connection_total_changes_delta":changes_after-changes,"remaining_asset_columns_unchanged":true,"sqlite_sequence_unchanged":true,"actual_offline_root":offline,"source_path_formula":"/synthetic/folder{sequence%5}/file{sequence:012}.jpg","all_overlay_source_paths_verified":true,"organization_effect":"none: only storage_asset_change fires; exact 2*window DML, existing schema unchanged"});
+    let receipt = json!({"changed_columns":["fingerprint","render_generation","preview_hash"],"rows":window,"catalog_count":total,"schema_version":5,"rows_before_blake3":hash(&before)?,"rows_after_blake3":hash(&after)?,"keys_blake3":hash(&keys)?,"schema_blake3":hash(&schema_before)?,"storage_epoch_before":epoch,"storage_epoch_after":epoch_after,"connection_total_changes_delta":changes_after-changes,"remaining_asset_columns_unchanged":true,"sqlite_sequence_unchanged":true,"actual_offline_root":offline,"source_path_formula":"/synthetic/folder{sequence%5}/file{sequence:012}.jpg","all_overlay_source_paths_verified":true,"organization_effect":"none: only storage_asset_change fires; exact 2*window DML, existing schema unchanged"});
     tx.commit()?;
     Ok(receipt)
 }
@@ -173,7 +183,10 @@ pub(super) fn run(bundle: &Path, dataset_path: &Path) -> Result<()> {
     let proof: Value =
         serde_json::from_slice(&read_bounded(&bundle.join("copy-receipt.json"), 65536)?)?;
     ensure!(
-        proof["complete"] == true && proof["copied_catalog"] == copied.to_string_lossy().as_ref(),
+        proof["complete"] == true
+            && proof["schema_version"] == 5
+            && proof["ancestry"]["complete"] == true
+            && proof["copied_catalog"] == copied.to_string_lossy().as_ref(),
         "verified raw-copy receipt required"
     );
     let original = PathBuf::from(
@@ -335,7 +348,7 @@ mod tests {
         for mode in 0..3 {
             let (_dir, mut db, mut keys, offline) = fixture();
             if mode == 1 {
-                db.pragma_update(None, "user_version", 5).unwrap();
+                db.pragma_update(None, "user_version", 6).unwrap();
             }
             if mode == 2 {
                 keys[1].asset_id = "wrong".into();

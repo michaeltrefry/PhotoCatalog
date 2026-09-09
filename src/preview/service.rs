@@ -528,13 +528,18 @@ impl PreviewService {
             .to_hex()
             .to_string();
         let stored = serde_json::to_string(&job)?;
-        let admitted = catalog.with_render_identity(&job.expected, || {
-            self.store.save_job(&id, &stored, self.limits.requests)?;
-            for key in &job.request.keys {
-                self.store.desire(key, || Ok(true))?;
-            }
-            Ok(())
-        })?;
+        let writer_priority = match priority {
+            Priority::Foreground => crate::catalog_writer::Priority::Foreground,
+            Priority::Background => crate::catalog_writer::Priority::Background,
+        };
+        let admitted =
+            catalog.with_render_identity_priority(&job.expected, writer_priority, || {
+                self.store.save_job(&id, &stored, self.limits.requests)?;
+                for key in &job.request.keys {
+                    self.store.desire(key, || Ok(true))?;
+                }
+                Ok(())
+            })?;
         ensure!(admitted.is_some(), "stale preview request");
         let consumer =
             self.scheduler

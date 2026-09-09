@@ -1,4 +1,4 @@
-# Integrated retained previews at 10 million assets — version 1
+# Integrated retained previews at 10 million assets — version 2
 
 Status: source preparation, **UNRUN**. This fixed extension closes the integrated
 catalog-plus-preview resident-memory measurement left open by the 10k navigation
@@ -7,17 +7,29 @@ Execution requires independent source review, a clean release build bound to the
 whole source archive, and the parent's explicit serialized Mac lane. Existing
 codec, worker-reservation, quality, and headless page targets do not change.
 
-The donor is the independently verified schema-4 S7 v1 synthetic 10M catalog,
-produced by c24d256cf26d5563557a7ee873b49a4279cd86f6. The last preserved main
-identity is 13,273,456,640 bytes, SHA256
-35168905dd43b75b0be2a56d48f664b5d8931b9e52f210a5f02f5fe25681adb2.
-The original recorded WAL/SHM/journal were absent; execution rechecks their exact
-presence and identities. Private donor paths and receipts remain outside Git.
-The source binding contains `source_catalog`, `source_revision`, `catalog_count`
-(10000000), `schema_version` (4), `files` (keys `""`, `-wal`, `-shm`, `-journal`,
-each with `present` and, if present, `bytes`/`sha256`), and `receipts` with
-`build_reference`, `preparation`, and `source_verification` path/SHA256 pairs.
-Do not substitute the evolving schema-5 fixture without a reviewed protocol change.
+The donor is the pristine, independently verified schema-5 S7 synthetic 10M
+catalog, with its original schema-4-to-5 migration ancestry. The parent-recorded
+pristine main SHA256 is
+0ac57eefbfbfeee46e83c17b8116c48ae3cb0dedae01605c1016981a536e91db;
+execution must verify it against the selected donor's receipts, actual bytes and
+companion presence. Never use a transition/mixed-workload-mutated copy. A later
+S7 schema-5-to-5 verification can accompany, but cannot replace, original migration
+proof. The previous schema-4-only protocol in f9b2905 was source-reviewed and
+never executed; this revision reconciles the merged schema before any measurement.
+
+Private paths remain outside Git. The source binding contains `source_catalog`,
+`source_revision`, `catalog_count` (10000000), `schema_version` (5), and `files`
+(keys `""`, `-wal`, `-shm`, `-journal`, each with `present` and, if present,
+`bytes`/`sha256`). Its `receipts` retain `build_reference`, `preparation`, and
+`source_verification` path/SHA256 pairs. `migration_ancestry` contains `proof` and
+`native` path/SHA256 pairs for the original 4-to-5 change; optional `verification`
+is the separately labeled later 5-to-5 proof. Copy the original receipt bytes
+unchanged into the new bundle's ancestry directory. Check native protocol1,
+complete migration/count/SQLite3.51.1 identity, unchanged logical and table
+identities, exact index SQL, successful observer and original migration physical
+output equal to the selected pristine donor main. If supplied, the later 5-to-5
+proof must preserve the same physical/logical/table identities. No regeneration
+of source metadata or replacement of historical receipt paths is allowed.
 
 ## Source-preserving setup
 
@@ -34,7 +46,9 @@ and failure receipts are retained; retries use a new directory.
 
 Only after a complete raw-copy receipt does the Rust `preview_navigation_probe
 overlay` command open the new copied catalog. It requires application ID
-1346913089, schema exactly 4, and exactly 10M assets. It republishes the selected
+1346913089, schema exactly 5 with the exact `organization_lens_capture` index, and
+exactly 10M assets. Both overlay and measured preflight reject schema 4 before
+Catalog::open; there is no implicit measurement-time migration. It republishes the selected
 512/JPEG80 cache under the existing first-10k `fixture-{sequence:012}` IDs. It
 reuses the reviewed layout's 30 seed payload identities and identical 37-byte
 unique COM construction, verifies each seed's full RGB identity, and requires
@@ -98,11 +112,12 @@ frame-time award. Both profiles, all 208 page observations, zero native jobs,
 actual offline path proof, exact schema/count and source invariance are required
 for a complete evidence receipt; completion is distinct from passing budgets.
 
-Each command's binding has version1, clean=true, exact 40-character source revision,
+Each command's binding has version2, clean=true, exact 40-character source revision,
 kind `prepare` or `run`, and SHA256 fields for every declared input. Prepare binds
 binary/archive/storage/source_binding/dataset/protocol/coordinator and
 `minimum_free_bytes`. Run binds binary/worker/archive/storage/fixture/source_binding,
-dataset/overlay/copy/preparation/protocol/coordinator/navigation_coordinator and
+dataset/overlay/copy/preparation/protocol/coordinator/navigation_coordinator,
+ancestry_proof/ancestry_native (plus ancestry_verification when present), and
 planned_measured_children=2/planned_verifiers=2. The whole archive and exact
 compiled binary identities bind shared Rust/native code; a script digest alone
 is insufficient. Raw donor files and immutable bound receipts are rechecked at
@@ -113,10 +128,11 @@ children. Preserve timeout/failure logs and all partial artifacts without retrie
 ## Focused correctness validation
 
 Tests are source-ready and **UNRUN for this extension** until a native lane is
-granted. Tiny real schema-4 test catalogs check only-three-field success,
+granted. Tiny real schema-5 test catalogs check only-three-field success,
 unchanged tail/organization dirty rows, wrong count/schema/key rejection,
 extra-row and remaining-column mutation rollback, and actual path/absence checks.
 Python byte fixtures check main/companion preservation, wrong source binding,
-source mutation/new WAL during copy, exclusive output, and binding admission.
+source mutation/new WAL during copy, exclusive output, binding admission, and
+original migration-byte preservation with mutated donor/ancestry rejection.
 No test opens an original catalog or allocates a 10M fixture. Existing layout and
 navigation correctness suites must remain green before any campaign execution.

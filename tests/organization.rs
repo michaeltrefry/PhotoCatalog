@@ -421,7 +421,22 @@ fn collection_flags_restart_relink_and_xmp_choice_refresh_stay_consistent() -> R
         [folder],
         |r| r.get(0),
     )?;
-    ensure!(serde_json::from_str::<NativePath>(&stored)? == NativePath::from_path(&new));
+    // Windows canonical temp roots can use extended spelling; folder keys use the
+    // corresponding drive/UNC spelling. Ask the filesystem whether they identify
+    // the actual relocated directory, rather than comparing alias bytes.
+    let stored_folder = serde_json::from_str::<NativePath>(&stored)?.to_path()?;
+    ensure!(stored_folder.canonicalize()? == new.canonicalize()?);
+    let stored_original: String = db(&root)?.query_row(
+        "SELECT native_path FROM storage_bindings WHERE asset_id=?",
+        [&asset.id],
+        |r| r.get(0),
+    )?;
+    let canonical_original = new.join("one.jpg").canonicalize()?;
+    ensure!(
+        serde_json::from_str::<NativePath>(&stored_original)?
+            == NativePath::from_path(&canonical_original)
+    );
+    ensure!(cat.get(&asset.id)?.original_path == canonical_original.to_string_lossy());
     cat.undo_relink(&plan.id)?;
     ensure!(cat.search(&Query::default(), None, 10, 10)?.rows[0].asset_id == asset.id);
     Ok(())
@@ -980,5 +995,421 @@ fn deferred_upgrade_repro_and_real_distinct_asset_writers_serialize_without_lost
     for name in ["one", "two"] {
         ensure!(fs::read_to_string(photos.join(format!("{name}.xmp")))? == packet(3));
     }
+    Ok(())
+}
+
+// Independent source text fixtures: both production projections are populated
+// identically, while expected IDs below are specified without the SQL builder.
+fn replace_search_text(root: &Path, texts: &[&str]) -> Result<()> {
+    let mut conn = db(root)?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM organization_text", [])?;
+    for (index, text) in texts.iter().enumerate() {
+        let sequence = index as i64 + 1;
+        tx.execute(
+            "UPDATE organization_assets SET search_text=?1 WHERE sequence=?2",
+            params![text, sequence],
+        )?;
+        tx.execute(
+            "INSERT INTO organization_text(rowid,text) VALUES(?1,?2)",
+            params![sequence, text],
+        )?;
+    }
+    tx.execute("UPDATE organization_state SET epoch=epoch+1", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[test]
+fn local_text_preserves_native_unicode_phrase_prefix_and_literal_syntax_all_orders() -> Result<()> {
+    let (_temp, root, mut cat) = synthetic(12)?;
+    replace_search_text(
+        &root,
+        &[
+            "Café sunset",
+            "CAFE\u{301} SUNSETS",
+            "cafe sun",
+            "pré-visualisation glacier",
+            "pre visualization glacial",
+            "pre something visualization glacier",
+            "東京 山道",
+            "東京 山岳",
+            "россия Закат",
+            "coöperate \"quoted\" alpha beta",
+            "ab\"cd xy",
+            "literal OR NEAR NOT",
+        ],
+    )?;
+    let cases: &[(&str, &[i64])] = &[
+        ("cafe suns", &[1, 2]),
+        ("pre-visu glac", &[4, 5]),
+        ("東京 山", &[7, 8]),
+        ("РОСС за", &[9]),
+        ("cooperate quo", &[10]),
+        ("ab\"c", &[11]),
+        ("OR", &[12]),
+        ("\"quoted\"", &[10]),
+        ("absent", &[]),
+    ];
+    for (text, expected_ids) in cases {
+        for sort in [Sort::Sequence, Sort::Capture, Sort::Filename, Sort::Rating] {
+            for direction in [Direction::Ascending, Direction::Descending] {
+                for lens in [None, Some("lens0".to_string())] {
+                    let query = Query {
+                        text: Some((*text).into()),
+                        lens: lens.clone(),
+                        sort,
+                        direction,
+                        ..Query::default()
+                    };
+                    let mut expected: Vec<i64> = expected_ids
+                        .iter()
+                        .copied()
+                        .filter(|i| lens.is_none() || i % 4 == 0)
+                        .collect();
+                    expected.sort_by_key(|i| match sort {
+                        Sort::Capture => (i % 28, *i),
+                        Sort::Rating => (i % 6, *i),
+                        _ => (*i, *i),
+                    });
+                    if direction == Direction::Descending {
+                        expected.reverse();
+                    }
+                    ensure!(
+                        all(&mut cat, &query, 2, 3)? == expected,
+                        "text={text:?} sort={sort:?} direction={direction:?} lens={lens:?}"
+                    );
+                    let first = cat.search(&query, None, 2, 3)?;
+                    ensure!(first.sorts == 0);
+                    let plans = cat.explain_search(&query, None, 3)?;
+                    ensure!(
+                        !plans
+                            .iter()
+                            .any(|p| p.contains("CORRELATED SCALAR SUBQUERY"))
+                    );
+                    if sort == Sort::Sequence {
+                        ensure!(first.text_work.indexed_rows == 0 && first.text_work.vm_steps == 0);
+                        ensure!(plans.iter().filter(|p| p.contains("VIRTUAL TABLE")).count() == 1);
+                    } else {
+                        ensure!(!plans.iter().any(|p| p.contains("VIRTUAL TABLE")));
+                        ensure!(first.text_work.vm_steps > 0);
+                    }
+                }
+            }
+        }
+    }
+    // A membership driver must use local text even when sorting by sequence.
+    let keyword: i64 = db(&root)?.query_row(
+        "SELECT id FROM organization_keywords WHERE kind='hierarchical' AND name='Group4'",
+        [],
+        |r| r.get(0),
+    )?;
+    let query = Query {
+        text: Some("pre-visu".into()),
+        keyword: Some(keyword),
+        ..Query::default()
+    };
+    ensure!(all(&mut cat, &query, 2, 3)? == vec![4]);
+    ensure!(cat.search(&query, None, 2, 3)?.text_work.indexed_rows > 0);
+    Ok(())
+}
+
+#[test]
+fn local_text_byte_admission_continues_without_skips_and_oversize_retry_is_explicit() -> Result<()>
+{
+    use photocatalog::organization_search::TextLimits;
+    let (_temp, root, mut cat) = synthetic(31)?;
+    let text = "cafe sunset a moderately sized document";
+    replace_search_text(&root, &vec![text; 31])?;
+    let limits = TextLimits {
+        document_bytes: text.len(),
+        page_bytes: text.len() * 2,
+    };
+    for direction in [Direction::Ascending, Direction::Descending] {
+        let query = Query {
+            text: Some("cafe suns".into()),
+            sort: Sort::Filename,
+            direction,
+            ..Query::default()
+        };
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = cat.search_with_text_limits(&query, cursor.as_ref(), 7, 9, limits)?;
+            ensure!(page.scanned <= 2 && page.text_work.indexed_rows == page.scanned);
+            ensure!(page.text_work.indexed_bytes == page.scanned * text.len());
+            ensure!(page.text_work.indexed_bytes <= limits.page_bytes);
+            ensure!(page.vm_steps >= page.text_work.vm_steps && page.text_work.vm_steps > 0);
+            if page.text_work.admission_limited {
+                ensure!(!page.page_complete && page.has_more && !page.exhausted);
+                ensure!(page.text_work.candidate_rows_read == page.scanned + 1);
+            }
+            ids.extend(page.rows.iter().map(|r| r.sequence));
+            if page.exhausted {
+                break;
+            }
+            ensure!(page.next.is_some());
+            cursor = page.next;
+        }
+        let mut expected: Vec<i64> = (1..=31).collect();
+        if direction == Direction::Descending {
+            expected.reverse();
+        }
+        ensure!(ids == expected);
+        let error = cat
+            .search_with_text_limits(
+                &query,
+                None,
+                2,
+                3,
+                TextLimits {
+                    document_bytes: text.len() - 1,
+                    ..limits
+                },
+            )
+            .unwrap_err();
+        ensure!(error.to_string().contains("retry with larger TextLimits"));
+        // A failed call cannot leave stale TEMP matches in the next call.
+        let page = cat.search_with_text_limits(&query, None, 2, 3, limits)?;
+        ensure!(page.rows.iter().map(|r| r.sequence).collect::<Vec<_>>() == expected[..2]);
+    }
+    let query = Query {
+        text: Some("notpresent".into()),
+        sort: Sort::Filename,
+        ..Query::default()
+    };
+    let partial = cat.search_with_text_limits(&query, None, 2, 3, limits)?;
+    ensure!(
+        partial.rows.is_empty()
+            && !partial.page_complete
+            && !partial.exhausted
+            && partial.next.is_some()
+    );
+    ensure!(partial.text_work.admission_limited && partial.scanned == 2);
+    Ok(())
+}
+
+#[test]
+fn local_text_snapshot_temp_writes_preserve_main_and_do_not_upgrade_writer() -> Result<()> {
+    use photocatalog::organization_search::TextLimits;
+    let (_temp, root, mut cat) = synthetic(19)?;
+    replace_search_text(&root, &vec!["café sunset"; 19])?;
+    let query = Query {
+        text: Some("cafe sun".into()),
+        sort: Sort::Filename,
+        ..Query::default()
+    };
+    let limits = TextLimits {
+        document_bytes: 64,
+        page_bytes: 64,
+    };
+    let mut session = cat.search_session_with_text_limits(query.clone(), 30, limits)?;
+    let first = session.next_page(2, 3)?;
+    let serial = cat.search(&query, None, 2, 3)?.next.unwrap();
+    let writer = db(&root)?;
+    writer.execute_batch("BEGIN IMMEDIATE")?;
+    let image = || -> Result<Vec<(String, Vec<u8>)>> {
+        let mut data = Vec::new();
+        for name in ["catalog.sqlite3", "catalog.sqlite3-wal"] {
+            let path = root.join(name);
+            if path.exists() {
+                data.push((name.into(), fs::read(path)?));
+            }
+        }
+        Ok(data)
+    };
+    let before = image()?;
+    // Both ordinary pages and the read-only-main snapshot may write TEMP while
+    // another connection already owns main's writer reservation.
+    ensure!(cat.search(&query, None, 2, 3)?.rows.len() == 2);
+    let second = session.next_page(2, 3)?;
+    ensure!(before == image()?);
+    writer.execute_batch("ROLLBACK")?;
+    drop(writer);
+    replace_search_text(&root, &vec!["unrelated mountain"; 19])?;
+    ensure!(cat.search(&query, Some(&serial), 2, 3).is_err());
+    ensure!(all(&mut cat, &query, 2, 3)?.is_empty());
+    let mut ids: Vec<_> = first
+        .rows
+        .into_iter()
+        .chain(second.rows)
+        .map(|r| r.sequence)
+        .collect();
+    loop {
+        let page = session.next_page(2, 3)?;
+        ids.extend(page.rows.iter().map(|r| r.sequence));
+        if page.exhausted {
+            break;
+        }
+    }
+    ensure!(ids == (1..=19).collect::<Vec<_>>());
+    session.close()?;
+    // A new snapshot sees the new authoritative text.
+    let mut fresh = cat.search_session(query, 30)?;
+    let mut found = 0;
+    loop {
+        let p = fresh.next_page(2, 3)?;
+        found += p.rows.len();
+        if p.exhausted {
+            break;
+        }
+    }
+    ensure!(found == 0);
+    fresh.close()?;
+    Ok(())
+}
+
+#[test]
+fn local_text_work_is_candidate_bounded_as_unrelated_postings_grow() -> Result<()> {
+    let mut proofs = Vec::new();
+    for count in [64, 640] {
+        let (_temp, root, mut cat) = synthetic(count)?;
+        replace_search_text(&root, &vec!["café sunset"; count as usize])?;
+        let query = Query {
+            text: Some("cafe suns".into()),
+            sort: Sort::Filename,
+            ..Query::default()
+        };
+        let page = cat.search(&query, None, 9, 17)?;
+        ensure!(
+            page.rows.iter().map(|r| r.sequence).collect::<Vec<_>>() == (1..=9).collect::<Vec<_>>()
+        );
+        ensure!(page.scanned == 9 && page.text_work.candidate_rows_read == 9);
+        ensure!(page.text_work.indexed_rows == 9 && page.text_work.batches == 1 && page.sorts == 0);
+        proofs.push((page.text_work.indexed_bytes, page.text_work.vm_steps));
+    }
+    ensure!(proofs[0] == proofs[1]);
+    // This proves bounded staging on small inputs, not a scale latency or RSS gate.
+    Ok(())
+}
+
+#[test]
+fn capture_cursor_seeks_bound_ties_and_lens_dates_without_prefix_scans() -> Result<()> {
+    let (_temp, root, mut cat) = synthetic(5600)?;
+    for direction in [Direction::Ascending, Direction::Descending] {
+        for lens in [None, Some("lens0".to_string())] {
+            let query = Query {
+                sort: Sort::Capture,
+                direction,
+                lens: lens.clone(),
+                date_from: Some("2024-01-05".into()),
+                date_until: Some("2024-01-20".into()),
+                camera: Some("camera1".into()),
+                ..Query::default()
+            };
+            let mut expected: Vec<_> = (1..=5600)
+                .filter(|i| {
+                    i % 3 == 1 && (4..19).contains(&(i % 28)) && (lens.is_none() || i % 4 == 0)
+                })
+                .collect();
+            expected.sort_by_key(|i| (i % 28, *i));
+            if direction == Direction::Descending {
+                expected.reverse();
+            }
+            ensure!(all(&mut cat, &query, 13, 31)? == expected);
+            let mut cursor = cat.search(&query, None, 13, 31)?.next;
+            for _ in 0..4 {
+                let page = cat.search(&query, cursor.as_ref(), 13, 31)?;
+                ensure!(
+                    page.vm_steps < 12000 && page.sorts == 0,
+                    "prefix scan leaked: {} steps",
+                    page.vm_steps
+                );
+                cursor = page.next;
+                if page.exhausted {
+                    break;
+                }
+            }
+        }
+    }
+    // Day 26..28 have residues 25..27 modulo28, none divisible by4.
+    // A lens-leading capture index must prove this true empty tail without
+    // visiting every asset in those dates; the source data/formula is unchanged.
+    let query = Query {
+        sort: Sort::Capture,
+        text: Some("blue sunset".into()),
+        lens: Some("lens0".into()),
+        date_from: Some("2024-01-26".into()),
+        ..Query::default()
+    };
+    let page = cat.search(&query, None, 200, 4096)?;
+    ensure!(
+        page.rows.is_empty()
+            && page.exhausted
+            && page.scanned == 0
+            && page.vm_steps < 1000
+            && page.sorts == 0
+    );
+    ensure!(
+        cat.explain_search(&query, None, 4096)?
+            .iter()
+            .any(|p| p.contains("organization_lens_capture"))
+    );
+    // Keep the table shape and exact logical data; only the additive index exists.
+    ensure!(
+        db(&root)?.query_row("SELECT COUNT(*) FROM organization_assets", [], |r| r
+            .get::<_, i64>(0))?
+            == 5600
+    );
+    Ok(())
+}
+
+#[test]
+fn schema_four_to_five_adds_only_index_and_preserves_data_and_readonly_queries() -> Result<()> {
+    let (_temp, root, cat) = synthetic(113)?;
+    drop(cat);
+    let conn = db(&root)?;
+    conn.execute_batch("DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    fn contents(conn: &Connection) -> Result<Vec<(String, Vec<Vec<String>>)>> {
+        let tables=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_stat1' ORDER BY name")?
+            .query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut result = Vec::new();
+        for table in tables {
+            let quoted = table.replace('"', "\"\"");
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{quoted}\""))?;
+            let columns = stmt.column_count();
+            let mut rows = stmt
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get_ref(i).map(|v| format!("{v:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.sort();
+            result.push((table, rows));
+        }
+        Ok(result)
+    }
+    let before = contents(&conn)?;
+    drop(conn);
+    let mut cat = Catalog::open(&root)?;
+    let conn = db(&root)?;
+    ensure!(contents(&conn)? == before);
+    ensure!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? == 5);
+    let index: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE name='organization_lens_capture'",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(index.contains("(lens,capture,sequence)"));
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); BEGIN IMMEDIATE")?;
+    let main = fs::read(root.join("catalog.sqlite3"))?;
+    let wal = fs::read(root.join("catalog.sqlite3-wal"))?;
+    drop(Catalog::open(&root)?);
+    let query = Query {
+        sort: Sort::Capture,
+        lens: Some("lens0".into()),
+        text: Some("blue sunset".into()),
+        ..Query::default()
+    };
+    ensure!(!cat.search(&query, None, 3, 10)?.rows.is_empty());
+    let mut session = cat.search_session(query, 30)?;
+    ensure!(!session.next_page(3, 10)?.rows.is_empty());
+    session.close()?;
+    ensure!(
+        fs::read(root.join("catalog.sqlite3"))? == main
+            && fs::read(root.join("catalog.sqlite3-wal"))? == wal
+    );
+    conn.execute_batch("ROLLBACK")?;
     Ok(())
 }

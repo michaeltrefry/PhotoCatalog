@@ -404,6 +404,9 @@ impl Catalog {
     /// must match the stored bytes exactly and remain unavailable until relinked.
     pub fn record_storage_path(&mut self, asset: &str, path: &NativePath) -> Result<()> {
         components(&PathReference::Native(path.clone()))?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Background)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -434,6 +437,7 @@ impl Catalog {
             )?;
         }
         tx.commit()?;
+        drop(_write);
         Ok(())
     }
     /// Explicit migration declaration, bounded and restartable. Existing tags are
@@ -445,6 +449,9 @@ impl Catalog {
         limit: usize,
     ) -> Result<EncodingProgress> {
         ensure!((1..=1000).contains(&limit), "batch limit must be 1..1000");
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -469,6 +476,7 @@ impl Catalog {
             scanned_through: rows.last().map(|v| v.0).unwrap_or(after),
         };
         tx.commit()?;
+        drop(_write);
         Ok(progress)
     }
     /// Caller supplies the volume observation from the same verified import. This
@@ -479,6 +487,9 @@ impl Catalog {
             "cannot bind unavailable original"
         );
         let path = observation.requested_path.to_path()?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Background)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -505,6 +516,7 @@ impl Catalog {
             )?;
             if known.is_some() {
                 tx.commit()?;
+                drop(_write);
                 return Ok(());
             }
         }
@@ -531,6 +543,7 @@ impl Catalog {
             },
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(())
     }
     /// Explicit migration input; this never converts or guesses the host syntax.
@@ -540,6 +553,9 @@ impl Catalog {
             "use bind_storage for native locations"
         );
         components(&reference)?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -561,6 +577,7 @@ impl Catalog {
             },
         )?;
         tx.commit()?;
+        drop(_write);
         Ok(())
     }
     pub fn storage_status(&self, asset: &str, snapshot: &MountSnapshot) -> Result<StorageStatus> {
@@ -734,6 +751,9 @@ impl Catalog {
         {
             *path = NativePath::from_path(&crate::prospective_directory(&native)?);
         }
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -769,6 +789,7 @@ impl Catalog {
         let id = uuid::Uuid::new_v4().to_string();
         tx.execute("INSERT INTO storage_plans(id,request,epoch,high_water,state) VALUES(?1,?2,?3,?4,'preparing')",params![id,json(&request)?,epoch(&tx)?,high])?;
         tx.commit()?;
+        drop(_write);
         self.relink_plan(&id)
     }
     /// Exceptions are disk-backed and must be fixed before preparing any rows.
@@ -806,6 +827,9 @@ impl Catalog {
         candidates: Vec<NativePath>,
     ) -> Result<()> {
         validate_candidates(&candidates)?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -834,11 +858,15 @@ impl Catalog {
         ensure!(exists, "exception entity does not exist");
         tx.execute("INSERT INTO storage_exceptions VALUES(?1,?2,?3,?4) ON CONFLICT(plan,kind,entity) DO UPDATE SET candidates=excluded.candidates",params![plan,kind,entity,json(&candidates)?])?;
         tx.commit()?;
+        drop(_write);
         Ok(())
     }
     pub fn prepare_relink_batch(&mut self, plan: &str, limit: usize) -> Result<RelinkPlan> {
         ensure!((1..=1000).contains(&limit), "batch limit must be 1..1000");
         let catalog_root = self.root.clone();
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -938,6 +966,7 @@ impl Catalog {
             mark_collisions(&tx, plan)?;
         }
         tx.commit()?;
+        drop(_write);
         self.relink_plan(plan)
     }
     /// Restart discovery, ordered by opaque operation ID with a bounded cursor.
@@ -1044,6 +1073,9 @@ impl Catalog {
         self.exclude_storage(plan, 0, Some(source))
     }
     fn exclude_storage(&mut self, plan: &str, sequence: i64, source: Option<i64>) -> Result<()> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1062,6 +1094,7 @@ impl Catalog {
         };
         ensure!(changed == 1, "relink item not found");
         tx.commit()?;
+        drop(_write);
         Ok(())
     }
     pub fn apply_relink(&mut self, plan: &str) -> Result<RelinkPlan> {
@@ -1075,6 +1108,9 @@ impl Catalog {
         plan: &str,
         mut boundary: impl FnMut(RelinkBoundary) -> Result<()>,
     ) -> Result<RelinkPlan> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1085,6 +1121,7 @@ impl Catalog {
         )?;
         if state == "applied" {
             tx.commit()?;
+            drop(_write);
             return self.relink_plan(plan);
         }
         ensure!(
@@ -1229,6 +1266,7 @@ impl Catalog {
         )?;
         boundary(RelinkBoundary::BeforeCommit)?;
         tx.commit()?;
+        drop(_write);
         self.relink_plan(plan)
     }
     pub fn undo_relink(&mut self, plan: &str) -> Result<RelinkPlan> {
@@ -1240,6 +1278,9 @@ impl Catalog {
         plan: &str,
         mut boundary: impl FnMut(RelinkBoundary) -> Result<()>,
     ) -> Result<RelinkPlan> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1249,6 +1290,7 @@ impl Catalog {
             })?;
         if state == "undone" {
             tx.commit()?;
+            drop(_write);
             return self.relink_plan(plan);
         }
         ensure!(state == "applied", "only an applied relink can be undone");
@@ -1349,6 +1391,7 @@ impl Catalog {
         tx.execute("UPDATE storage_plans SET state='undone' WHERE id=?", [plan])?;
         boundary(RelinkBoundary::BeforeCommit)?;
         tx.commit()?;
+        drop(_write);
         self.relink_plan(plan)
     }
 }
@@ -2263,4 +2306,53 @@ fn object_key(file: &File) -> Result<(u64, u64)> {
         info.volume as u64,
         ((info.index_high as u64) << 32) | info.index_low as u64,
     ))
+}
+
+#[cfg(test)]
+mod folder_alias_tests {
+    use super::*;
+
+    #[test]
+    fn windows_folder_aliases_preserve_roots_case_and_exact_utf16() -> Result<()> {
+        // These expected folder keys are literal code-unit sequences, independent
+        // of the component parser. No Windows filesystem is needed for this test.
+        for (root, verbatim_root) in [
+            (r"Q:\", r"\\?\Q:\"),
+            (r"\\SeRvEr\ShArE\", r"\\?\UNC\SeRvEr\ShArE\"),
+        ] {
+            let root_units: Vec<u16> = root.encode_utf16().collect();
+            let first: Vec<u16> = format!("{root}MiXeD").encode_utf16().collect();
+            let mut leaf: Vec<u16> = format!("{root}MiXeD\\東京🚀").encode_utf16().collect();
+            leaf.push(0xd800); // An unpaired surrogate is identity, not display text.
+            let expected = [root_units, first, leaf.clone()]
+                .map(NativePath::WindowsWide)
+                .to_vec();
+            let mut regular = leaf.clone();
+            regular.extend("\\photo.jpg".encode_utf16());
+            let mut extended: Vec<u16> = format!("{verbatim_root}MiXeD\\東京🚀")
+                .encode_utf16()
+                .collect();
+            extended.push(0xd800);
+            extended.extend("\\photo.jpg".encode_utf16());
+            for input in [regular, extended] {
+                let tagged = NativePath::WindowsWide(input);
+                let before = tagged.clone();
+                let actual = native_folder_chain(&tagged)?;
+                assert_eq!(
+                    actual.into_iter().map(|(path, _)| path).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(tagged, before);
+            }
+            // Lossy display would collapse these two names; folder identities must not.
+            *leaf.last_mut().unwrap() = 0xd801;
+            leaf.extend("\\photo.jpg".encode_utf16());
+            let different = native_folder_chain(&NativePath::WindowsWide(leaf))?;
+            assert_ne!(&different.last().unwrap().0, expected.last().unwrap());
+            let different_case =
+                NativePath::WindowsWide(format!("{root}mixed\\photo.jpg").encode_utf16().collect());
+            assert_ne!(native_folder_chain(&different_case)?[1].0, expected[1]);
+        }
+        Ok(())
+    }
 }
