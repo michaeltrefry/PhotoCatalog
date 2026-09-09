@@ -895,6 +895,23 @@ fn incremental_import_yields_to_foreground_and_resumes_its_background_worker() {
     };
     previews.tick(&mut catalog).unwrap();
     assert_eq!(previews.scheduler_usage().active, 1);
+    let reserved = previews.scheduler_usage().reserved_bytes;
+    let retained = previews
+        .queue_read(
+            &catalog,
+            &existing.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert_eq!(previews.tick_read(&catalog), Some(retained));
+    let ReadOutcome::Ready(visible) = previews.take_read(retained).unwrap().outcome else {
+        panic!("retained foreground read must progress while import owns the native slot");
+    };
+    assert_eq!(previews.scheduler_usage().active, 1);
+    assert_eq!(previews.scheduler_usage().reserved_bytes, reserved);
+    assert!(previews.decoded_live_bytes() > 0);
     let foreground = previews
         .request(
             &mut catalog,
@@ -923,4 +940,7 @@ fn incremental_import_yields_to_foreground_and_resumes_its_background_worker() {
             .iter()
             .all(|asset| asset.state == "ready")
     );
+    drop(visible);
+    previews.clear_decoded_cache();
+    assert_eq!(previews.decoded_live_bytes(), 0);
 }

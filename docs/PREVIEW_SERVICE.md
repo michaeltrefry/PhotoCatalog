@@ -112,3 +112,14 @@ regressions. All passed in the same local gate; logs and initial compile/fixture
 failures are retained privately in `sc-22841-service-repair-v1`. The runtime probe
 was also exercised through a tiny generated DNG and its saved JPEG verifier,
 including same-size byte corruption rejection. No Stage B campaign has run.
+
+Additional source-ready fault coverage now writes a real partial staging file
+before injecting `StorageFull`, then requires cleanup, the prior retained object
+and a successful replacement retry. A separate tiny SQLite `max_page_count`
+case forces the engine's actual `SQLITE_FULL` result during journal insertion,
+checks retained reads/integrity/no provisional job, restores capacity and retries.
+These are precise fault-injection/engine-capacity checks, not a claim that the host
+filesystem was filled. The import-interleaving regression also consumes a real
+retained foreground read while the native import reservation remains active and
+keeps that caller-owned view alive across native foreground preemption/recovery.
+These new tests remain UNRUN pending the next bounded native gate.

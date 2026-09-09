@@ -1190,6 +1190,42 @@ mod tests {
         );
     }
     #[test]
+    fn sqlite_full_preserves_retained_state_and_allows_journal_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PreviewStore::open(config(root.path(), 100, 100), &[]).unwrap();
+        let old = key(1, Tier::Thumbnail);
+        store.desire(&old, || Ok(true)).unwrap();
+        store.publish(&old, b"old", authority).unwrap();
+        let pages: i64 = store
+            .db
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        store
+            .db
+            .pragma_update(None, "max_page_count", pages)
+            .unwrap();
+        let id = "a".repeat(64);
+        let error = store.save_job(&id, &"x".repeat(64000), 10).unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_FULL)
+        );
+        assert!(store.db.is_autocommit());
+        assert!(store.saved_jobs(0, 10).unwrap().is_empty());
+        assert_eq!(store.read(&old, false).unwrap().unwrap().bytes, b"old");
+        assert_eq!(store.usage().unwrap().pending_objects, 0);
+        let integrity: String = store
+            .db
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        store
+            .db
+            .pragma_update(None, "max_page_count", pages + 128)
+            .unwrap();
+        store.save_job(&id, &"x".repeat(64000), 10).unwrap();
+        assert_eq!(store.saved_jobs(0, 10).unwrap().len(), 1);
+    }
+    #[test]
     fn failed_write_and_stale_catalog_authority_do_not_attach() {
         let root = tempfile::tempdir().unwrap();
         let store = PreviewStore::open(config(root.path(), 100, 100), &[]).unwrap();
@@ -1200,9 +1236,22 @@ mod tests {
         store.desire(&new, || Ok(true)).unwrap();
         assert!(
             store
-                .publish_controlled(&new, b"new", authority, || Err(
-                    std::io::Error::from_raw_os_error(28).into()
-                ))
+                .publish_controlled(&new, b"new", authority, || {
+                    // Write a real partial staging file before injecting ENOSPC.
+                    let destination = store.path(&new.digest()?, new.tier)?;
+                    let pending = fs::read_dir(destination.parent().unwrap())?
+                        .map(|entry| entry.map(|e| e.path()))
+                        .collect::<std::io::Result<Vec<_>>>()?
+                        .into_iter()
+                        .find(|p| p.extension().is_some_and(|e| e == "pending"))
+                        .context("created staging file missing")?;
+                    fs::write(pending, b"par")?;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::StorageFull,
+                        "injected disk full after partial staging write",
+                    )
+                    .into())
+                })
                 .is_err()
         );
         assert_eq!(store.usage().unwrap().pending_objects, 0);
