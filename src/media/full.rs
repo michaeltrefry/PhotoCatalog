@@ -460,6 +460,7 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
             camera_make: text(exif::Tag::Make).or(make),
             camera_model: text(exif::Tag::Model).or(model),
             captured_at: text(exif::Tag::DateTimeOriginal),
+            lens: text(exif::Tag::LensModel),
             preview_source: "full-quality original rendering".into(),
         },
         width: out_width,

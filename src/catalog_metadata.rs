@@ -338,6 +338,7 @@ fn advance(db: &Connection, asset: &str, action: &str, detail: &serde_json::Valu
         "INSERT INTO metadata_history(asset_id,revision,action,detail) VALUES(?1,?2,?3,?4)",
         params![asset, next, action, serde_json::to_string(detail)?],
     )?;
+    crate::organization::refresh(db, asset)?;
     Ok(next)
 }
 fn store(
@@ -792,16 +793,73 @@ impl Catalog {
         base_model: Option<i64>,
         edits: &[Edit],
     ) -> Result<Change> {
+        self.edit_metadata_commit(asset, expected_revision, base_model, edits, &[], |_, _| {
+            Ok(())
+        })
+    }
+    pub(crate) fn organization_edit_input(
+        &self,
+        asset: &str,
+        base_model: Option<i64>,
+        organization_fields: &[String],
+    ) -> Result<Vec<u8>> {
+        let mut input = base_model
+            .map(|id| self.editable_metadata_model(asset, id))
+            .transpose()?
+            .unwrap_or(xmp::empty_packet()?);
+        if !organization_fields.is_empty() {
+            let view = self.metadata(asset)?;
+            let mut fields = Vec::new();
+            for field in view
+                .fields
+                .iter()
+                .filter(|f| organization_fields.contains(&f.name))
+            {
+                ensure!(
+                    !field.conflicted,
+                    "resolve {} metadata conflict before organization edits",
+                    field.name
+                );
+                let bytes = if field.value == Some(Value::Removed) {
+                    None
+                } else {
+                    Some(
+                        self.editable_metadata_model(
+                            asset,
+                            field
+                                .selected_model
+                                .context("field has no selected model")?,
+                        )?,
+                    )
+                };
+                fields.push((field.name.clone(), bytes));
+            }
+            input = xmp::reconcile_fields(&input, &fields)?;
+        }
+        Ok(input)
+    }
+    pub(crate) fn edit_metadata_commit(
+        &mut self,
+        asset: &str,
+        expected_revision: i64,
+        base_model: Option<i64>,
+        edits: &[Edit],
+        organization_fields: &[String],
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<Change> {
         ensure!(
             revision(&self.db, asset)? == expected_revision,
             "metadata changed; refresh before editing"
         );
-        let input = base_model
-            .map(|id| self.editable_metadata_model(asset, id))
-            .transpose()?
-            .unwrap_or(xmp::empty_packet()?);
-        let bytes = xmp::apply_edits(&input, edits)?;
-        let original = if let Some(mid) = base_model {
+        let input = self.organization_edit_input(asset, base_model, organization_fields)?;
+        let bytes = if organization_fields.is_empty() {
+            xmp::apply_edits(&input, edits)?
+        } else {
+            xmp::apply_organization_edits(&input, edits)?
+        };
+        let original = if organization_fields.is_empty()
+            && let Some(mid) = base_model
+        {
             let json: String = self.db.query_row(
                 "SELECT projection FROM metadata_models WHERE id=?1",
                 [mid],
@@ -811,7 +869,9 @@ impl Catalog {
         } else {
             xmp::project(&input)?
         };
-        let original_semantics = if let Some(mid) = base_model {
+        let original_semantics = if organization_fields.is_empty()
+            && let Some(mid) = base_model
+        {
             self.db
                 .prepare("SELECT field,semantic_hash FROM metadata_values WHERE model_id=?1")?
                 .query_map([mid], |r| {
@@ -819,7 +879,7 @@ impl Catalog {
                 })?
                 .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
         } else {
-            BTreeMap::new()
+            xmp::field_semantics(&input)?
         };
         let mut updated = xmp::project(&bytes)?;
         for field in original.fields.keys() {
@@ -883,7 +943,8 @@ impl Catalog {
         let (observation_id, model_ids, _) = store(&tx, asset, &source, &prepared)?;
         let mid = model_ids[0];
         for (field, value) in &updated.fields {
-            if original.fields.get(field) != Some(value)
+            if organization_fields.contains(field)
+                || original.fields.get(field) != Some(value)
                 || original_semantics.get(field) != prepared.models[0].semantics.get(field)
                 || previous_choices
                     .get(field)
@@ -903,6 +964,7 @@ impl Catalog {
             "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
             [asset],
         )?;
+        after(&tx, revision)?;
         tx.commit()?;
         Ok(Change {
             revision,

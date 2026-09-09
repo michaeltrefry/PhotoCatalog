@@ -24,6 +24,8 @@ pub struct Metadata {
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
     pub captured_at: Option<String>,
+    #[serde(default)]
+    pub lens: Option<String>,
     pub preview_source: String,
 }
 
@@ -113,6 +115,7 @@ fn decode_embedded_cr2(path: &Path) -> Result<(Metadata, Vec<u8>)> {
         camera_make: raw.make.or_else(|| text(exif::Tag::Make)),
         camera_model: raw.model.or_else(|| text(exif::Tag::Model)),
         captured_at: raw.date.or_else(|| text(exif::Tag::DateTimeOriginal)),
+        lens: raw.lens.or_else(|| text(exif::Tag::LensModel)),
         preview_source: source.into(),
     };
     let thumbnail = orient(
@@ -138,6 +141,7 @@ fn orient(image: DynamicImage, orientation: u32) -> DynamicImage {
 }
 #[derive(Default)]
 struct RawTags {
+    lens: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     orientation: Option<u32>,
@@ -237,7 +241,7 @@ fn cr2_preview(file: &mut File) -> Result<(Vec<u8>, RawTags)> {
                         queue.push(v);
                     }
                 }
-                271 | 272 | 36867 if kind == 2 && count > 0 && count <= 4096 => {
+                271 | 272 | 36867 | 42036 if kind == 2 && count > 0 && count <= 4096 => {
                     let bytes = if count <= 4 {
                         entry[8..8 + count as usize].to_vec()
                     } else {
@@ -254,6 +258,7 @@ fn cr2_preview(file: &mut File) -> Result<(Vec<u8>, RawTags)> {
                     match tag {
                         271 => tags.make = Some(value),
                         272 => tags.model = Some(value),
+                        42036 => tags.lens = Some(value),
                         _ => tags.date = Some(value),
                     }
                 }

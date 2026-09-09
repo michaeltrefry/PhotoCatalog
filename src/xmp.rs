@@ -363,6 +363,15 @@ fn set_scalar(meta: &mut XmpMeta, ns: &str, path: &str, value: &str) -> Result<(
 
 pub fn apply_edits(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
     ensure!(edits.len() <= 1000, "too many metadata edits");
+    apply_organization_edits(bytes, edits)
+}
+/// Organization may update each of the already bounded 10,000 array items. Keep
+/// one native mutation pass: sorting between chunks would change item addresses.
+pub(crate) fn apply_organization_edits(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
+    ensure!(
+        edits.len() <= MAX_ITEMS,
+        "too many organization array edits"
+    );
     let mut meta = parse(bytes)?;
     for edit in edits {
         match edit {
