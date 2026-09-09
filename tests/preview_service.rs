@@ -29,6 +29,173 @@ fn image(path: &Path, color: [u8; 3]) {
         .unwrap();
 }
 #[test]
+fn retained_read_queue_prioritizes_and_shares_admission_with_native_jobs() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("a.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    let mut previews = service(
+        &root.path().join("cache"),
+        &originals,
+        ServiceLimits {
+            requests: 3,
+            ..ServiceLimits::default()
+        },
+    );
+    catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let native = previews
+        .request(&mut catalog, &asset.id, Tier::Large, Priority::Background)
+        .unwrap();
+    let background = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Background,
+        )
+        .unwrap();
+    let foreground = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert_eq!(previews.available_request_slots(), 0);
+    assert!(
+        previews
+            .queue_read(
+                &catalog,
+                &asset.id,
+                Tier::Thumbnail,
+                false,
+                Priority::Foreground
+            )
+            .is_err()
+    );
+    assert_eq!(previews.tick_read(&catalog), Some(foreground));
+    assert_eq!(previews.tick_read(&catalog), Some(background));
+    assert_eq!(
+        previews.available_request_slots(),
+        0,
+        "unconsumed results remain admitted"
+    );
+    let ReadOutcome::Ready(held) = previews.take_read(foreground).unwrap().outcome else {
+        panic!("expected retained pixels");
+    };
+    previews.cancel(native).unwrap();
+    assert!(previews.cancel_read(background));
+    previews.clear_decoded_cache();
+    assert!(
+        previews.decoded_live_bytes() > 0,
+        "caller-held pixels remain charged after cancellation/eviction"
+    );
+    assert!(!previews.cancel_read(foreground));
+    drop(held);
+    assert_eq!(previews.decoded_live_bytes(), 0);
+    let old = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert!(previews.cancel_read(old));
+    let new = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert!(new.0 > old.0);
+    assert_eq!(previews.tick_read(&catalog), Some(new));
+    assert!(previews.take_read(old).is_none());
+    assert!(previews.cancel_read(new));
+    assert!(previews.is_drained());
+}
+
+#[test]
+fn retained_read_error_is_consumable_and_does_not_poison_future_progress() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("a.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    let mut previews = service(
+        &root.path().join("cache"),
+        &originals,
+        ServiceLimits::default(),
+    );
+    catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let ticket = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    previews.tick_read(&catalog);
+    let ReadOutcome::Ready(view) = previews.take_read(ticket).unwrap().outcome else {
+        panic!("retained read");
+    };
+    let digest = view.key.as_ref().unwrap().digest().unwrap();
+    drop(view);
+    let encoded = previews
+        .cache_configuration()
+        .thumbnail_root
+        .join(&digest[..2])
+        .join(&digest[2..4])
+        .join(digest);
+    std::fs::write(encoded, b"corrupt").unwrap();
+    let ticket = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert_eq!(previews.tick_read(&catalog), Some(ticket));
+    assert!(matches!(
+        previews.take_read(ticket).unwrap().outcome,
+        ReadOutcome::Failed { .. }
+    ));
+    assert!(previews.is_drained());
+    let retry = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
+    assert_eq!(previews.tick_read(&catalog), Some(retry));
+    assert!(matches!(
+        previews.take_read(retry).unwrap().outcome,
+        ReadOutcome::Missing
+    ));
+    assert!(previews.is_drained());
+}
+#[test]
 fn measured_cache_reads_use_identical_pixels_and_report_hits_misses_and_errors() {
     let root = tempfile::tempdir().unwrap();
     let originals = root.path().join("originals");
@@ -339,6 +506,15 @@ fn catalog_generation_rejects_completed_old_worker_pixels() {
         .unwrap();
     previews.tick(&mut catalog).unwrap();
     assert_eq!(previews.scheduler_usage().active, 1);
+    let retained = previews
+        .queue_read(
+            &catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            false,
+            Priority::Foreground,
+        )
+        .unwrap();
     let revision = catalog.metadata(&asset.id).unwrap().revision;
     catalog
         .edit_metadata(
@@ -352,6 +528,13 @@ fn catalog_generation_rejects_completed_old_worker_pixels() {
             }],
         )
         .unwrap();
+    assert_eq!(previews.tick_read(&catalog), Some(retained));
+    let stale = previews.take_read(retained).unwrap();
+    assert!(matches!(stale.outcome, ReadOutcome::Stale));
+    assert_eq!(
+        stale.metrics.decoded_misses, 0,
+        "changed generation is rejected before decode"
+    );
     assert!(matches!(
         await_result(&mut previews, &mut catalog, consumer),
         ServiceCompletion::Stale

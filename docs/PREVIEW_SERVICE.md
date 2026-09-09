@@ -9,6 +9,19 @@ CI remain required before S6 is complete. The `ServiceLimits::default()` values
 are provisional admission settings for fixture execution, not a measured product
 memory profile; Stage B freezes worker reservation and its accounting margin.
 
+The subsequent retained-read queue is source-ready and unrun. `queue_read`,
+`tick_read`, `take_read` and `cancel_read` are service APIs, sharing request and
+unconsumed-completion admission with native render consumers. Read tickets have a
+separate Rust type/namespace and monotonic service-lifetime IDs. Foreground reads
+precede background reads; one owner iteration performs at most one retained
+decode, with catalog generation checked before entering it. Missing cache data,
+stale requests and errors produce consumable outcomes. Canceling queued or
+unconsumed results releases service ownership, while caller-held pixel references
+remain charged to their live memory budget. Cancellation is cooperative between
+in-process retained decodes; the existing original-render process kill/wait
+mechanism remains separate. These APIs will drive the fixed headless navigation
+trace; a harness-only queue cannot substitute for them.
+
 `Catalog::import_with_previews` drives the application service. `begin_import`
 and `ImportSession::advance` expose the same discovery/metadata/reservation path
 one directory entry at a time, queuing full-image rendering instead of waiting

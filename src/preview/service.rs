@@ -1,8 +1,11 @@
 //! Application-owned preview service. All catalog/manifest mutations occur on
 //! the owner; native workers can only return isolated, validated image results.
+#[path = "read_queue.rs"]
+mod read_queue;
 use super::*;
 use crate::{Catalog, catalog_metadata::RenderIdentity, storage_volume::NativePath};
 use anyhow::{Context, Result, ensure};
+pub use read_queue::{ReadCompletion, ReadOutcome, ReadQueueUsage, ReadTicket};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -169,6 +172,7 @@ fn measured<T>(
 }
 type ServiceObserver = Box<dyn FnMut(ServiceEvent) -> Result<()> + Send>;
 pub struct PreviewService {
+    reads: read_queue::ReadQueue,
     observer: std::cell::RefCell<Option<ServiceObserver>>,
     store: PreviewStore,
     decoded: DecodedCache,
@@ -220,6 +224,7 @@ impl PreviewService {
         let staging = store.configuration().manifest_root.join("workers");
         recover_worker_staging(&staging, 128)?;
         Ok(Self {
+            reads: read_queue::ReadQueue::default(),
             observer: std::cell::RefCell::new(None),
             store,
             decoded: DecodedCache::new(
@@ -513,10 +518,7 @@ impl PreviewService {
         job: SavedJob,
         priority: Priority,
     ) -> Result<Consumer> {
-        ensure!(
-            self.consumers.len() < self.limits.requests,
-            "preview consumer limit"
-        );
+        ensure!(self.available_request_slots() > 0, "preview consumer limit");
         let id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
             .to_hex()
             .to_string();
@@ -791,7 +793,7 @@ impl PreviewService {
         let mut consumers = Vec::new();
         let result = (|| -> Result<()> {
             for (position, id, descriptor) in self.store.saved_jobs(after, limit)? {
-                if self.consumers.len() >= self.limits.requests {
+                if self.available_request_slots() == 0 {
                     break;
                 }
                 cursor = position;
@@ -876,7 +878,10 @@ impl PreviewService {
     /// Synchronous import owns all handles it creates. Applications sharing the
     /// service with foreground work use ImportSession::advance instead.
     pub fn is_drained(&self) -> bool {
-        self.consumers.is_empty() && self.active.is_empty() && self.scheduler.usage().queued == 0
+        self.reads.len() == 0
+            && self.consumers.is_empty()
+            && self.active.is_empty()
+            && self.scheduler.usage().queued == 0
     }
     pub fn take_completion(&mut self, consumer: Consumer) -> Option<ServiceCompletion> {
         let result = self.completed.remove(&consumer);
@@ -914,7 +919,9 @@ impl PreviewService {
         self.store.relocation_step(tier, limit, bytes)
     }
     pub fn available_request_slots(&self) -> usize {
-        self.limits.requests.saturating_sub(self.consumers.len())
+        self.limits
+            .requests
+            .saturating_sub(self.consumers.len() + self.reads.len())
     }
     pub fn scheduler_usage(&self) -> SchedulerUsage {
         self.scheduler.usage()
