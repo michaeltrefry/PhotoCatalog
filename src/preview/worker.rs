@@ -4,7 +4,7 @@ use super::{
     Codec, PreparedRgb, PreviewKey, decode, encode, encoded_dimensions, prepare, renderer_identity,
 };
 use crate::{
-    media::{Metadata, RenderProvenance},
+    media::{DecodeError, DecodeLimits, DecodeStatus, Metadata, RenderProvenance},
     storage_volume::NativePath,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -24,9 +24,11 @@ pub struct RenderWork {
     pub source: NativePath,
     pub keys: Vec<PreviewKey>,
     pub encoded_limit: u64,
+    pub decode_limits: DecodeLimits,
 }
 impl RenderWork {
     fn validate(&self) -> Result<PathBuf> {
+        self.decode_limits.validate()?;
         ensure!((1..=2).contains(&self.keys.len()), "worker tier count");
         ensure!(
             (1..=256 * 1024 * 1024).contains(&self.encoded_limit),
@@ -66,6 +68,21 @@ impl RenderWork {
         Ok(path)
     }
 }
+/// A source can remain supported while its current worker allowance is too
+/// small. The service persists ResourceLimit failures for explicit retry after
+/// configuration changes, retaining the previous offline thumbnail.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkerFailure {
+    pub decode_status: Option<DecodeStatus>,
+    pub message: String,
+}
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for WorkerFailure {}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ObjectReceipt {
     key: PreviewKey,
@@ -188,9 +205,12 @@ impl WorkerProcess {
         if !status.success() {
             let detail = read_bounded(&self.staging.join("error.json"), RECEIPT_LIMIT)
                 .ok()
-                .and_then(|bytes| serde_json::from_slice::<String>(&bytes).ok())
-                .unwrap_or_else(|| format!("preview worker failed ({status})"));
-            bail!("{detail}");
+                .and_then(|bytes| serde_json::from_slice::<WorkerFailure>(&bytes).ok())
+                .unwrap_or_else(|| WorkerFailure {
+                    decode_status: None,
+                    message: format!("preview worker failed ({status})"),
+                });
+            return Err(detail.into());
         }
         let receipt: RenderReceipt = serde_json::from_slice(&read_bounded(
             &self.staging.join("result.json"),
@@ -443,7 +463,11 @@ pub fn worker_main() -> Result<()> {
             }
             message.truncate(boundary);
         }
-        if let Ok(bytes) = serde_json::to_vec(&message) {
+        let failure = WorkerFailure {
+            decode_status: error.downcast_ref::<DecodeError>().map(|e| e.status),
+            message,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&failure) {
             let _ = write_exclusive(Path::new("error.json"), &bytes);
         }
     }
@@ -483,7 +507,7 @@ fn run_worker() -> Result<()> {
         crate::fingerprint(&source)? == request.keys[0].fingerprint,
         "original changed before rendering"
     );
-    let rendered = crate::media::decode_full(&source)?;
+    let rendered = crate::media::decode_full_limited(&source, request.decode_limits)?;
     write_exclusive(Path::new("decoded.pending"), b"decoded")?;
     fs::rename("decoded.pending", "decoded.ready")?;
     admitted.recv().context("owner encode admission ended")?;
@@ -593,6 +617,7 @@ mod tests {
             source: NativePath::from_path(&root.path().join("original")),
             keys: vec![key()],
             encoded_limit: 1024,
+            decode_limits: DecodeLimits::default(),
         };
         let mut worker = WorkerProcess {
             child,

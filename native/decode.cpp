@@ -19,9 +19,9 @@ const char *pc_avif_version() { return avifVersion(); }
 int fail(PcImage *out, const char *message) {
     pc_free(out); snprintf(out->error, sizeof(out->error), "%s", message); return -1;
 }
-bool allocate(PcImage *out) {
+bool allocate(PcImage *out, const PcDecodeLimits *limits) {
     uint64_t count = uint64_t(out->width) * out->height;
-    if (!count || out->width > 40000 || out->height > 40000 || count > 100000000) return false;
+    if (!count || out->width > 40000 || out->height > 40000 || count > 100000000 || count > limits->max_intermediate_pixels || count*16 > limits->max_allocation_bytes) return false;
     out->pixels = static_cast<float *>(malloc(size_t(count) * 4 * sizeof(float)));
     return out->pixels != nullptr;
 }
@@ -47,15 +47,26 @@ public:
         };
     }
 };
-extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
+static int raw_failure(PcImage *out,int status) {
+    if(status==LIBRAW_UNSUFFICIENT_MEMORY || status==LIBRAW_TOO_BIG)
+        return fail(out,"resource limit: RAW allocation ceiling");
+    return fail(out,libraw_strerror(status));
+}
+extern "C" int pc_raw(const unsigned char *bytes, size_t len, const PcDecodeLimits *limits, PcImage *out) {
     try {
         OriginalCropRaw raw;
-        raw.imgdata.rawparams.max_raw_memory_mb = 768;
+        raw.imgdata.rawparams.max_raw_memory_mb = unsigned(std::min<uint64_t>(768, limits->max_allocation_bytes/(1024*1024)));
+        if (!raw.imgdata.rawparams.max_raw_memory_mb) return fail(out,"resource limit: RAW allocation allowance below 1 MiB");
         raw.imgdata.rawparams.options &= ~LIBRAW_RAWOPTIONS_CONVERTFLOAT_TO_INT;
         int status = raw.open_buffer(const_cast<unsigned char *>(bytes), len);
-        if (status) return fail(out, libraw_strerror(status));
+        if (status) return raw_failure(out, status);
         out->width = raw.imgdata.sizes.width; out->height = raw.imgdata.sizes.height;
         if (uint64_t(out->width) * out->height > 100000000) return fail(out, "resource limit: RAW exceeds 100 megapixels");
+        uint64_t sensor_pixels=uint64_t(raw.imgdata.sizes.raw_width)*raw.imgdata.sizes.raw_height;
+        uint64_t developed_pixels=uint64_t(out->width)*out->height;
+        if(sensor_pixels>limits->max_intermediate_pixels || developed_pixels>limits->max_intermediate_pixels ||
+           sensor_pixels*8>limits->max_allocation_bytes || developed_pixels*16>limits->max_allocation_bytes)
+            return fail(out,"resource limit: RAW sensor/development exceeds configured admission");
         snprintf(out->make, sizeof(out->make), "%s", raw.imgdata.idata.make);
         snprintf(out->model, sizeof(out->model), "%s", raw.imgdata.idata.model);
         out->bits = raw.imgdata.color.raw_bps;
@@ -78,10 +89,10 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
         p.use_camera_matrix = 1; p.output_color = 0; p.output_bps = 16;
         p.gamm[0] = 1.0; p.gamm[1] = 1.0; p.no_auto_bright = 1;
         p.user_qual = 3; p.highlight = 2;
-        status = raw.unpack(); if (status) return fail(out, libraw_strerror(status));
+        status = raw.unpack(); if (status) return raw_failure(out, status);
         if (raw.imgdata.rawdata.float_image || raw.imgdata.rawdata.float3_image || raw.imgdata.rawdata.float4_image)
             return fail(out, "unsupported floating DNG: requires validated ForwardMatrix/profile and transparency-mask rendering; integer conversion is forbidden");
-        status = raw.dcraw_process(); if (status) return fail(out, libraw_strerror(status));
+        status = raw.dcraw_process(); if (status) return raw_failure(out, status);
         // scale_colors normalizes the actual WB (including camera white-patch or
         // already-balanced RAW handling) into pre_mul. Undo only its common
         // headroom scale in float; never apply the channel WB twice. The 3-channel
@@ -96,7 +107,7 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
         const float headroom=1.f/minimum_wb;
         if (!std::isfinite(headroom)) return fail(out,"unsupported RAW white balance range");
         auto *processed = raw.dcraw_make_mem_image(&status);
-        if (!processed) return fail(out, libraw_strerror(status));
+        if (!processed) return raw_failure(out, status);
         std::unique_ptr<libraw_processed_image_t, decltype(&LibRaw::dcraw_clear_mem)> image(processed, LibRaw::dcraw_clear_mem);
         if (processed->type != LIBRAW_IMAGE_BITMAP || processed->colors != 3 || processed->bits != 16)
             return fail(out, "unsupported RAW development output");
@@ -114,7 +125,7 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
                 return fail(out,"unsupported RAW vendor crop outside developed area");
             out->width=crop.cwidth;out->height=crop.cheight;
         }
-        if (!allocate(out)) return fail(out, "resource limit: RAW output allocation");
+        if (!allocate(out, limits)) return fail(out, "resource limit: RAW output allocation");
         const auto *samples = reinterpret_cast<const uint16_t *>(processed->data);
         for (size_t i = 0; i < size_t(out->width) * out->height; ++i) {
             size_t source=(i/out->width+crop_top)*processed->width+(i%out->width+crop_left);
@@ -127,18 +138,24 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, PcImage *out) {
         }
         out->primaries = 1; out->transfer = 8; // linear sRGB primaries
         return 0;
-    } catch (const std::exception &error) { return fail(out, error.what()); }
+    } catch (const std::bad_alloc &) { return fail(out,"resource limit: RAW allocation failed"); }
+    catch (const std::exception &error) { return fail(out, error.what()); }
     catch (...) { return fail(out, "RAW decoder exception"); }
 }
-extern "C" int pc_avif(const unsigned char *bytes, size_t len, PcImage *out) {
+extern "C" int pc_avif(const unsigned char *bytes, size_t len, const PcDecodeLimits *limits, PcImage *out) {
     std::unique_ptr<avifDecoder, decltype(&avifDecoderDestroy)> decoder(avifDecoderCreate(), avifDecoderDestroy);
-    if (!decoder) return fail(out, "AVIF allocation failed");
+    if (!decoder) return fail(out, "resource limit: AVIF allocation failed");
     decoder->maxThreads = 1; decoder->imageSizeLimit = 100000000; decoder->imageDimensionLimit = 40000;
     decoder->imageCountLimit = 1;
     auto result = avifDecoderSetIOMemory(decoder.get(), bytes, len);
     if (result == AVIF_RESULT_OK) result = avifDecoderParse(decoder.get());
-    if (result == AVIF_RESULT_OK) result = avifDecoderNextImage(decoder.get());
-    if (result != AVIF_RESULT_OK) return fail(out, avifResultToString(result));
+    if (result == AVIF_RESULT_OK) {
+        uint64_t pixels=uint64_t(decoder->image->width)*decoder->image->height;
+        if(pixels>limits->max_intermediate_pixels || pixels*16>limits->max_allocation_bytes)
+            return fail(out,"resource limit: AVIF exceeds configured admission");
+        result = avifDecoderNextImage(decoder.get());
+    }
+    if (result != AVIF_RESULT_OK) return fail(out, result==AVIF_RESULT_OUT_OF_MEMORY ? "resource limit: AVIF allocation failed" : avifResultToString(result));
     const avifImage *img = decoder->image;
     avifCropRect crop{0,0,img->width,img->height};
     if ((img->transformFlags & AVIF_TRANSFORM_CLAP) && !avifCropRectConvertCleanApertureBox(&crop,&img->clap,img->width,img->height,img->yuvFormat,&decoder->diag))
@@ -155,7 +172,7 @@ extern "C" int pc_avif(const unsigned char *bytes, size_t len, PcImage *out) {
         const uint32_t horizontal[]={2,7,4,5},vertical[]={4,5,2,7};
         out->orientation=(img->imir.axis==1?horizontal:vertical)[angle&3];
     }
-    if (!allocate(out)) return fail(out, "resource limit: AVIF output allocation");
+    if (!allocate(out, limits)) return fail(out, "resource limit: AVIF output allocation");
     if (img->icc.size) {
         if (img->icc.size > 16*1024*1024) return fail(out, "resource limit: ICC profile");
         out->icc = static_cast<unsigned char *>(malloc(img->icc.size));
@@ -165,7 +182,7 @@ extern "C" int pc_avif(const unsigned char *bytes, size_t len, PcImage *out) {
     avifRGBImage rgb; avifRGBImageSetDefaults(&rgb, img);
     rgb.depth = 16; rgb.format = AVIF_RGB_FORMAT_RGBA; rgb.alphaPremultiplied = AVIF_FALSE;
     (void)avifRGBImageAllocatePixels(&rgb);
-    if (!rgb.pixels) return fail(out, "AVIF RGB allocation failed");
+    if (!rgb.pixels) return fail(out, "resource limit: AVIF RGB allocation failed");
     result = avifImageYUVToRGB(img, &rgb);
     if (result == AVIF_RESULT_OK) {
         for (size_t y = 0; y < out->height; ++y) {
@@ -174,6 +191,6 @@ extern "C" int pc_avif(const unsigned char *bytes, size_t len, PcImage *out) {
         }
     }
     avifRGBImageFreePixels(&rgb);
-    if (result != AVIF_RESULT_OK) return fail(out, avifResultToString(result));
+    if (result != AVIF_RESULT_OK) return fail(out, result==AVIF_RESULT_OUT_OF_MEMORY ? "resource limit: AVIF allocation failed" : avifResultToString(result));
     return 0;
 }

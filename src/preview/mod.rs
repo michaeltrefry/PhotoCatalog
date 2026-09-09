@@ -22,6 +22,6 @@ pub use store::{
 
 mod worker;
 pub use worker::{
-    ProducedPreview, RenderWork, RenderedPreviewBatch, WorkerProcess, recover_worker_staging,
-    worker_main,
+    ProducedPreview, RenderWork, RenderedPreviewBatch, WorkerFailure, WorkerProcess,
+    recover_worker_staging, worker_main,
 };

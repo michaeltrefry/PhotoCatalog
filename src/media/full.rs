@@ -13,6 +13,57 @@ use std::{
 const MAX_ENCODED: u64 = 512 * 1024 * 1024;
 const MAX_PIXELS: u64 = 100_000_000;
 
+/// Per-request admission ceilings, checked before pixel allocation. These bound
+/// individual surfaces/buffers, not total process RSS or native library scratch.
+/// The preview scheduler must separately reserve measured peak memory plus margin.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DecodeLimits {
+    pub max_encoded_bytes: u64,
+    /// Includes uncropped sensor data, DNG stages and masks. It may exceed the
+    /// final output's 100 MP format ceiling because sensor margins are retained.
+    pub max_intermediate_pixels: u64,
+    pub max_allocation_bytes: u64,
+}
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_encoded_bytes: MAX_ENCODED,
+            max_intermediate_pixels: u64::MAX,
+            // Each decoder retains its historical built-in ceiling. A default
+            // request adds no narrower cross-codec allocation policy.
+            max_allocation_bytes: u64::MAX,
+        }
+    }
+}
+impl DecodeLimits {
+    pub fn validate(self) -> Result<()> {
+        if self.max_encoded_bytes == 0
+            || self.max_intermediate_pixels == 0
+            || self.max_allocation_bytes == 0
+        {
+            return Err(error(
+                DecodeStatus::ResourceLimit,
+                "decode admission ceilings must be positive",
+            ));
+        }
+        Ok(())
+    }
+    fn surface(self, width: u32, height: u32) -> Result<()> {
+        dimensions(width, height)?;
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > self.max_intermediate_pixels
+            || pixels.saturating_mul(16) > self.max_allocation_bytes
+        {
+            return Err(error(
+                DecodeStatus::ResourceLimit,
+                "pixel surface exceeds configured decode admission; increase worker allowance",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecodeStatus {
@@ -140,9 +191,24 @@ struct NativeImage {
     error: [c_char; 256],
 }
 unsafe extern "C" {
-    fn pc_raw(bytes: *const u8, len: usize, out: *mut NativeImage) -> i32;
-    fn pc_dng(bytes: *const u8, len: usize, out: *mut NativeImage) -> i32;
-    fn pc_avif(bytes: *const u8, len: usize, out: *mut NativeImage) -> i32;
+    fn pc_raw(
+        bytes: *const u8,
+        len: usize,
+        limits: *const DecodeLimits,
+        out: *mut NativeImage,
+    ) -> i32;
+    fn pc_dng(
+        bytes: *const u8,
+        len: usize,
+        limits: *const DecodeLimits,
+        out: *mut NativeImage,
+    ) -> i32;
+    fn pc_avif(
+        bytes: *const u8,
+        len: usize,
+        limits: *const DecodeLimits,
+        out: *mut NativeImage,
+    ) -> i32;
     fn pc_free(out: *mut NativeImage);
     fn pc_raw_version() -> *const c_char;
     fn pc_avif_version() -> *const c_char;
@@ -165,26 +231,38 @@ pub fn decoder_versions() -> String {
 }
 
 pub fn decode_full(path: &Path) -> Result<RenderedImage> {
-    let file = File::open(path).map_err(|e| error(DecodeStatus::Io, e))?;
-    if file
+    decode_full_limited(path, DecodeLimits::default())
+}
+
+pub fn decode_full_limited(path: &Path, limits: DecodeLimits) -> Result<RenderedImage> {
+    limits.validate()?;
+    let mut file = File::open(path).map_err(|e| error(DecodeStatus::Io, e))?;
+    let length = file
         .metadata()
         .map_err(|e| error(DecodeStatus::Io, e))?
-        .len()
-        > MAX_ENCODED
+        .len();
+    let encoded_limit = MAX_ENCODED
+        .min(limits.max_encoded_bytes)
+        .min(limits.max_allocation_bytes);
+    if length > encoded_limit {
+        return Err(error(
+            DecodeStatus::ResourceLimit,
+            "encoded source exceeds configured decode admission",
+        ));
+    }
+    // A known-length allocation avoids Vec growth exceeding the admitted buffer.
+    let mut bytes = vec![0; length as usize];
+    file.read_exact(&mut bytes)
+        .map_err(|e| error(DecodeStatus::Io, e))?;
+    let mut extra = [0u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|e| error(DecodeStatus::Io, e))?
+        != 0
     {
         return Err(error(
             DecodeStatus::ResourceLimit,
-            "encoded image exceeds 512 MiB",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_ENCODED + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| error(DecodeStatus::Io, e))?;
-    if bytes.len() as u64 > MAX_ENCODED {
-        return Err(error(
-            DecodeStatus::ResourceLimit,
-            "source grew beyond limit",
+            "source grew beyond admitted length",
         ));
     }
     let ext = path
@@ -255,11 +333,11 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
             let mut out: NativeImage = unsafe { std::mem::zeroed() };
             let status = unsafe {
                 if ext == "dng" {
-                    pc_dng(bytes.as_ptr(), bytes.len(), &mut out)
+                    pc_dng(bytes.as_ptr(), bytes.len(), &limits, &mut out)
                 } else if is_raw {
-                    pc_raw(bytes.as_ptr(), bytes.len(), &mut out)
+                    pc_raw(bytes.as_ptr(), bytes.len(), &limits, &mut out)
                 } else {
-                    pc_avif(bytes.as_ptr(), bytes.len(), &mut out)
+                    pc_avif(bytes.as_ptr(), bytes.len(), &limits, &mut out)
                 }
             };
             if status != 0 {
@@ -273,7 +351,7 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
                 };
                 return Err(error(kind, message));
             }
-            dimensions(out.width, out.height)?;
+            limits.surface(out.width, out.height)?;
             if out.pixels.is_null() {
                 return Err(error(
                     DecodeStatus::Corrupt,
@@ -365,7 +443,12 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
                 notes,
             )
         } else if bytes.starts_with(b"8BPS") {
-            let decoded = super::psd::decode(&bytes).map_err(|e| {
+            let decoded = super::psd::decode(
+                &bytes,
+                limits.max_intermediate_pixels,
+                limits.max_allocation_bytes,
+            )
+            .map_err(|e| {
                 let msg = e.to_string();
                 error(
                     if msg.contains("unsupported") {
@@ -404,13 +487,13 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
                 return Err(error(DecodeStatus::Unsupported, "unsupported raster codec"));
             }
             let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(40000);
-            limits.max_image_height = Some(40000);
-            limits.max_alloc = Some(1600 * 1024 * 1024);
-            reader.limits(limits);
+            let mut raster_limits = image::Limits::default();
+            raster_limits.max_image_width = Some(40000);
+            raster_limits.max_image_height = Some(40000);
+            raster_limits.max_alloc = Some(limits.max_allocation_bytes.min(1600 * 1024 * 1024));
+            reader.limits(raster_limits);
             let mut decoder = reader.into_decoder().map_err(image_error)?;
-            dimensions(decoder.dimensions().0, decoder.dimensions().1)?;
+            limits.surface(decoder.dimensions().0, decoder.dimensions().1)?;
             let mut icc = decoder.icc_profile().map_err(image_error)?;
             if format == image::ImageFormat::Png && icc.is_none() {
                 icc = png_profile(&bytes)?;
@@ -443,7 +526,7 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
     if !(1..=8).contains(&orientation) {
         return Err(error(DecodeStatus::Corrupt, "invalid orientation"));
     }
-    dimensions(image.width(), image.height())?;
+    limits.surface(image.width(), image.height())?;
     let (width, height) = (image.width(), image.height());
     let already_linear = (is_raw || is_avif) && icc.is_none();
     if !already_linear {

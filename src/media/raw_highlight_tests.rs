@@ -1,6 +1,6 @@
 //! Synthetic CFA DNG is sent directly to the LibRaw ABI, not the DNG SDK.
 //! This tests the same native path used by CR2/RW2 without claiming a real camera.
-use super::{NativeImage, pc_raw};
+use super::{DecodeLimits, NativeImage, pc_raw};
 
 fn u16s(values: &[u16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -130,7 +130,14 @@ fn raw_clipped_neutral_and_real_colors_preserve_linear_headroom() {
         let bytes = fixture(neutral);
         let before = blake3::hash(&bytes);
         let mut out: NativeImage = unsafe { std::mem::zeroed() };
-        let status = unsafe { pc_raw(bytes.as_ptr(), bytes.len(), &mut out) };
+        let status = unsafe {
+            pc_raw(
+                bytes.as_ptr(),
+                bytes.len(),
+                &DecodeLimits::default(),
+                &mut out,
+            )
+        };
         assert_eq!(
             status,
             0,
@@ -186,4 +193,33 @@ fn raw_clipped_neutral_and_real_colors_preserve_linear_headroom() {
             "bright color incorrectly neutralized: {color:?}"
         );
     }
+}
+
+#[test]
+fn raw_sensor_admission_precedes_unpack() {
+    let bytes = fixture([0.5, 1.0, 0.7]);
+    let mut out: NativeImage = unsafe { std::mem::zeroed() };
+    let limits = DecodeLimits {
+        max_intermediate_pixels: 1,
+        ..Default::default()
+    };
+    assert_ne!(
+        unsafe { pc_raw(bytes.as_ptr(), bytes.len(), &limits, &mut out) },
+        0
+    );
+    assert!(out.pixels.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(out.error.as_ptr()) }.to_string_lossy();
+    assert!(message.contains("resource limit: RAW sensor/development"));
+    assert_eq!(
+        unsafe {
+            pc_raw(
+                bytes.as_ptr(),
+                bytes.len(),
+                &DecodeLimits::default(),
+                &mut out,
+            )
+        },
+        0
+    );
+    assert!(!out.pixels.is_null());
 }

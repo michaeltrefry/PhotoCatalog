@@ -2,6 +2,9 @@
 #include <cstdint>
 #include <cstddef>
 extern "C" {
+struct PcDecodeLimits {
+    uint64_t max_encoded_bytes, max_intermediate_pixels, max_allocation_bytes;
+};
 struct PcImage {
     float *pixels;
     unsigned char *icc;
@@ -13,4 +16,4 @@ struct PcImage {
 void pc_free(PcImage *out);
 }
 int fail(PcImage *out, const char *message);
-bool allocate(PcImage *out);
+bool allocate(PcImage *out, const PcDecodeLimits *limits);

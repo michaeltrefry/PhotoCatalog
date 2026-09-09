@@ -63,7 +63,7 @@ pub(super) fn source_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     }
     Ok(None)
 }
-pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
+pub(super) fn decode(bytes: &[u8], max_pixels: u64, max_allocation: u64) -> Result<Composite> {
     let mut r = Reader { bytes, offset: 0 };
     ensure!(r.take(4)? == b"8BPS", "invalid PSD signature");
     ensure!(r.u16()? == 1, "unsupported PSB version");
@@ -87,6 +87,10 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
         width > 0 && height > 0 && width <= 40000 && height <= 40000 && pixels <= 100_000_000,
         "PSD resource limit"
     );
+    ensure!(
+        pixels as u64 <= max_pixels && (pixels as u64).saturating_mul(16) <= max_allocation,
+        "PSD configured resource limit"
+    );
     let bps = depth / 8;
     let plane = pixels
         .checked_mul(bps)
@@ -94,7 +98,10 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Composite> {
     let total = plane
         .checked_mul(channels)
         .ok_or_else(|| anyhow::anyhow!("PSD channel overflow"))?;
-    ensure!(total <= 1600 * 1024 * 1024, "PSD resource limit");
+    ensure!(
+        total <= 1600 * 1024 * 1024 && total as u64 <= max_allocation,
+        "PSD resource limit"
+    );
     r.block()?;
     let resources = r.block()?;
     let mut rr = Reader {

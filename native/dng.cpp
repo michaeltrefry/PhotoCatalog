@@ -17,15 +17,32 @@
 #include "dng_bottlenecks.h"
 #include "dng_tag_values.h"
 #include <vector>
+#include <algorithm>
 #include <memory>
 #include <cmath>
 #include <cstdio>
 
 class BoundedAllocator : public dng_memory_allocator {
 public:
+    uint64_t ceiling;
+    explicit BoundedAllocator(uint64_t bytes):ceiling(std::min<uint64_t>(bytes,768u*1024u*1024u)) {}
     dng_memory_block *Allocate(uint32 size) override {
-        if (size > 768u*1024u*1024u) ThrowMemoryFull("PhotoCatalog DNG allocation limit");
+        if (size > ceiling) ThrowMemoryFull("PhotoCatalog DNG allocation limit");
         return dng_memory_allocator::Allocate(size);
+    }
+};
+// Covers SDK-created stage images and transparency masks before their pixel
+// buffers are allocated. The allocator independently bounds each scratch block.
+class AdmissionHost : public dng_host {
+    const PcDecodeLimits &limits;
+public:
+    AdmissionHost(dng_memory_allocator *allocator,const PcDecodeLimits &value):dng_host(allocator),limits(value) {}
+    dng_image *Make_dng_image(const dng_rect &bounds,uint32 planes,uint32 pixelType) override {
+        uint64_t pixels=uint64_t(bounds.W())*bounds.H();
+        uint64_t bytes_per_pixel=uint64_t(planes)*TagTypeSize(pixelType);
+        if(!bytes_per_pixel || pixels>limits.max_intermediate_pixels || pixels>limits.max_allocation_bytes/bytes_per_pixel)
+            ThrowMemoryFull("PhotoCatalog DNG configured stage resource limit");
+        return dng_host::Make_dng_image(bounds,planes,pixelType);
     }
 };
 static dng_pixel_buffer row_buffer(const dng_rect &area, uint32 planes, float *data) {
@@ -35,17 +52,17 @@ static dng_pixel_buffer row_buffer(const dng_rect &area, uint32 planes, float *d
     buffer.fPixelType=ttFloat; buffer.fPixelSize=4; buffer.fData=data; buffer.fDirty=true;
     return buffer;
 }
-extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
+extern "C" int pc_dng(const unsigned char *bytes, size_t len, const PcDecodeLimits *limits, PcImage *out) {
     try {
-        BoundedAllocator allocator;
-        dng_host host(&allocator); host.SetNeedsMeta(true); host.SetForPreview(false);
+        BoundedAllocator allocator(limits->max_allocation_bytes);
+        AdmissionHost host(&allocator,*limits); host.SetNeedsMeta(true); host.SetForPreview(false);
         // Prefer the full source RAW over optional enhanced/proxy renderings.
         host.SetIgnoreEnhanced(true);
         dng_stream stream(bytes,len);
         dng_info info; info.Parse(host,stream); info.PostParse(host);
         if (!info.IsValidDNG() || info.fMainIndex<0) return fail(out,"corrupt DNG structure");
         auto *ifd=info.fIFD.at(info.fMainIndex);
-        if (!ifd->fImageWidth || !ifd->fImageLength || uint64_t(ifd->fImageWidth)*ifd->fImageLength>100000000)
+        if (!ifd->fImageWidth || !ifd->fImageLength || uint64_t(ifd->fImageWidth)*ifd->fImageLength>100000000 || uint64_t(ifd->fImageWidth)*ifd->fImageLength>limits->max_intermediate_pixels || uint64_t(ifd->fImageWidth)*ifd->fImageLength*16>limits->max_allocation_bytes)
             return fail(out,"resource limit: DNG dimensions");
         AutoPtr<dng_negative> negative(host.Make_dng_negative());
         negative->Parse(host,stream,info); negative->PostParse(host,stream,info);
@@ -64,7 +81,7 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
         if (ifd->fSampleFormat[0]==3) out->flags|=1;
         if (info.fEnhancedIndex!=-1) out->flags|=2;
         out->orientation=negative->BaseOrientation().GetTIFF(); out->primaries=1; out->transfer=8;
-        if (!allocate(out)) return fail(out,"resource limit: DNG output allocation");
+        if (!allocate(out, limits)) return fail(out,"resource limit: DNG output allocation");
         AutoPtr<dng_color_spec> spec(negative->MakeColorSpec(dng_camera_profile_id()));
         dng_camera_profile profile;
         if (negative->GetProfileByID(dng_camera_profile_id(),profile)) {
@@ -171,6 +188,7 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, PcImage *out) {
         if (e.ErrorCode()==dng_error_not_yet_implemented || e.ErrorCode()==dng_error_unsupported_dng || e.ErrorCode()==dng_error_host_insufficient)
             return fail(out,"unsupported DNG capability required by source");
         char text[128];snprintf(text,sizeof(text),"DNG SDK error %u: %s",e.ErrorCode(),e.what());return fail(out,text);
-    } catch (const std::exception &e) { return fail(out,e.what()); }
+    } catch (const std::bad_alloc &) { return fail(out,"resource limit: DNG allocation failed"); }
+    catch (const std::exception &e) { return fail(out,e.what()); }
     catch (...) {return fail(out,"DNG SDK exception");}
 }

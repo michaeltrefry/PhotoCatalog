@@ -43,6 +43,7 @@ fn work(root: &Path) -> RenderWork {
         source: NativePath::from_path(&path),
         keys,
         encoded_limit: 1024 * 1024,
+        decode_limits: photocatalog::media::DecodeLimits::default(),
     }
 }
 fn native_work(root: &Path) -> RenderWork {
@@ -207,4 +208,41 @@ fn owner_eof(after_decode: bool) {
             .as_str(),
         request.keys[0].fingerprint
     );
+}
+
+#[test]
+fn actual_worker_preserves_resource_refusal_for_retry_with_more_allowance() {
+    use photocatalog::{media::DecodeStatus, preview::WorkerFailure};
+    let root = tempfile::tempdir().unwrap();
+    let mut request = native_work(root.path());
+    request.decode_limits.max_intermediate_pixels = 1;
+    let mut worker =
+        WorkerProcess::spawn(executable(), &root.path().join("staging"), request.clone()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let error = loop {
+        match worker.poll(&AtomicBool::new(false)) {
+            Err(error) => break error,
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("limited worker unexpectedly completed"),
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        error.downcast_ref::<WorkerFailure>().unwrap().decode_status,
+        Some(DecodeStatus::ResourceLimit)
+    );
+    assert!(!worker.awaiting_encode_admission().unwrap());
+    drop(worker);
+    request.decode_limits = photocatalog::media::DecodeLimits::default();
+    let mut worker =
+        WorkerProcess::spawn(executable(), &root.path().join("staging"), request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if worker.poll(&AtomicBool::new(false)).unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

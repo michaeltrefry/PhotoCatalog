@@ -11,3 +11,23 @@ Encoder scratch and the temporary encoded Vec belong to the worker working-memor
 A child holds an OS file lock while accessing staging. Startup recovery examines at most 128 directory entries per call and skips live child locks. After acquiring a lock it claims the directory with an atomic rename, keeps lock ownership through known-file cleanup and can resume an interrupted claim. The child revalidates its original absolute working-directory identity after acquiring its lock, preventing delayed startup into a recovered directory. Windows rename denial for an open working directory leaves the original staging untouched for a later recovery tick. Unknown files or links require inspection rather than a recursive cleanup. An interrupted child cannot leave a completed result that bypasses image validation. Recovery and output-size checks do not sandbox an arbitrary replacement executable or impose a filesystem quota on foreign code.
 
 Local focused evidence uses a 17×11 PNG through the actual CLI child, plus a generated 36×16 linear DNG through the native SDK before cancellation and owner EOF at the decoded holding checkpoint. The checkpoint cases exercise the armed watchdog and actual admitted native/render work with decoded pixels retained; they do not claim a deterministic kill inside an uninterruptible codec call. Other cases cover EOF before admission, an actually killed child leaving a partial file, active-lock recovery, delayed startup after lock-file open, interrupted claimed-directory cleanup, an oversized sparse output and a correctly checksummed truncated JPEG. These are correctness tests, not throughput or memory measurements. The ordinary import command is still being connected to the service; these worker checks do not complete S6 or establish its browsing budgets.
+
+Per-request decode admission uses `DecodeLimits`: encoded source bytes are
+length-checked before allocation; raster dimensions are checked before full pixel
+decode; PSD plane/float sizes, AVIF dimensions before `NextImage`, LibRaw's
+uncropped sensor and processing sizes before `unpack`, and DNG main/stage/mask
+surfaces are checked before pixel allocation. SDK scratch blocks and LibRaw's
+allocation ceiling also receive the configured per-allocation limit. The float
+conversion and orientation surfaces use the same dimensions and allocation
+ceiling. These checks do not constitute an aggregate native-memory allocator or
+an OS RSS limit. Peak memory plus margin remains required before the service's
+worker reservation is frozen.
+
+`decode_full` retains its existing default 100 MP output support and allocation
+limits. `decode_full_limited` allows a caller to reduce admission limits, including
+native intermediate dimensions; the intermediate ceiling can exceed 100 MP to
+accommodate uncropped sensor margins. A refusal remains `ResourceLimit`, carried
+through the actual child error receipt as `WorkerFailure.decode_status`, so the
+service can retain a durable retryable job and the prior thumbnail. Increasing
+admission permits retry of the same source identity. This change alone does not
+complete that service persistence or establish a production memory default.
