@@ -4,7 +4,7 @@ A Rust photo catalog and non-destructive editor in development for macOS, Window
 
 ## Foundation CLI
 
-The foundation provides a UI-independent library and CLI with SQLite metadata storage and provisional JPEG thumbnails. The [database decision](docs/BACKEND_DECISION.md) records the measured configuration and its limits; preview formats retain their own benchmark story. The image pipeline adds full-resolution RAW/DNG development and common raster/PSD composite decoding, with explicit color/precision provenance and compatibility limits. See [image pipeline](docs/IMAGE_PIPELINE.md) for the supported variants and native build requirements. Editing recipes and the desktop interface remain tracked work.
+The foundation provides a UI-independent library and CLI with SQLite metadata storage and provisional JPEG thumbnails. The [database decision](docs/BACKEND_DECISION.md) records the measured configuration and its limits; preview formats retain their own benchmark story. The image pipeline adds full-resolution RAW/DNG development and common raster/PSD composite decoding, with explicit color/precision provenance and compatibility limits. See [image pipeline](docs/IMAGE_PIPELINE.md) for the supported variants and native build requirements. XMP source retention, conflict review, catalog-only metadata edits, and controlled export are described in [metadata workflow](docs/XMP_METADATA.md). Editing recipes and the desktop interface remain tracked work.
 
 Install the native dependencies documented in the image pipeline, fetch the verified SDK, then build and check:
 
@@ -12,7 +12,7 @@ Install the native dependencies documented in the image pipeline, fetch the veri
 python3 scripts/fetch_dng_sdk.py --destination .deps
 export PHOTOCATALOG_DNG_SDK="$PWD/.deps/dng_sdk_1_7_1_2724/dng_sdk_1_7_1"
 cargo build --locked
-cargo fmt --all --check
+cargo fmt --package photocatalog --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
@@ -43,4 +43,4 @@ This check imports, restarts, paginates, retrieves previews, retries without dup
 
 ## Delivery
 
-See [requirements](docs/REQUIREMENTS.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md), and [execution ledger](docs/EXECUTION_LEDGER.md). The live Shortcut epic and stories are the operational source of truth. The first slice does not yet provide the desktop interface, full XMP handling, relinking, editing, Lightroom migration, or backup/restore; those remain open tracked requirements in the epic.
+See [requirements](docs/REQUIREMENTS.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md), and [execution ledger](docs/EXECUTION_LEDGER.md). The live Shortcut epic and stories are the operational source of truth. The current foundation does not yet provide the desktop interface, relinking, photo-edit recipes, Lightroom migration, or backup/restore; those remain open tracked requirements in the epic.

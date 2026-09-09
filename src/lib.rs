@@ -1,6 +1,14 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
+pub mod catalog_metadata;
+pub mod catalog_storage;
+mod import_storage;
 pub mod media;
 pub mod preview;
+pub mod metadata_export;
+pub mod storage_volume;
+pub mod xmp;
+pub mod xmp_packets;
+mod xmp_rdf;
 use anyhow::{Context, Result, bail, ensure};
 pub use media::Metadata;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -27,6 +35,8 @@ pub struct ImportReport {
     pub unchanged: u64,
     pub failed: u64,
     pub skipped: u64,
+    pub metadata_updated: u64,
+    pub metadata_warnings: u64,
     pub stopped: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,11 +84,11 @@ impl Catalog {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
         fs::create_dir_all(root.join("previews"))?;
-        let db = Connection::open(root.join("catalog.sqlite3"))?;
+        let mut db = Connection::open(root.join("catalog.sqlite3"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 1,
+            version <= 3,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -99,7 +109,8 @@ impl Catalog {
             );
         }
         configure_catalog_connection(&db)?;
-        db.execute_batch("BEGIN IMMEDIATE;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch("
             CREATE TABLE IF NOT EXISTS assets (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
@@ -113,8 +124,17 @@ impl Catalog {
                 CHECK(state != 'ready' OR (metadata IS NOT NULL AND preview_hash IS NOT NULL AND fingerprint IS NOT NULL))
             );
             PRAGMA application_id = 1346913089;
-            PRAGMA user_version = 1;
-            COMMIT;")?;
+            ")?;
+        if version < 2 {
+            tx.execute_batch(catalog_metadata::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 2)?;
+        }
+        if version < 3 {
+            tx.execute_batch(catalog_storage::SCHEMA)?;
+            tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
+            tx.pragma_update(None, "user_version", 3)?;
+        }
+        tx.commit()?;
         Ok(Self { db, root })
     }
     /// Imports one explicitly selected directory. Repeating a scan resumes pending/failed files.
@@ -132,8 +152,10 @@ impl Catalog {
             "catalog and originals must be separate directories"
         );
         let _lock = ImportLock::acquire(&self.root.join("import.lock"))?;
+        self.begin_metadata_scan()?;
         let mut report = ImportReport::default();
         let mut processed = 0;
+        let mut volumes = import_storage::ImportVolumes::new();
         for entry in walkdir::WalkDir::new(&folder)
             .follow_links(false)
             .max_open(16)
@@ -163,11 +185,17 @@ impl Catalog {
                 Ok(value) => value,
                 Err(error) => {
                     self.reserve(path, &location)?;
+                    self.record_import_path(path)?;
+                    let (changed, warnings) = self.refresh_metadata(path, true)?;
+                    report.metadata_updated += u64::from(changed);
+                    report.metadata_warnings += warnings as u64;
                     self.fail(&location, &error)?;
                     report.failed += 1;
                     continue;
                 }
             };
+            let observation = volumes.observe(path)?;
+            self.reconnect_storage_asset(path, &observation, &fingerprint, volumes.snapshot())?;
             let existing: Option<(String, String, Option<String>)> = self
                 .db
                 .query_row(
@@ -187,11 +215,19 @@ impl Catalog {
                 && state == "ready"
                 && self.read_preview_hash(&hash).is_ok()
             {
+                self.bind_import_storage(path, &observation)?;
+                let (changed, warnings) = self.refresh_metadata(path, false)?;
+                report.metadata_updated += u64::from(changed);
+                report.metadata_warnings += warnings as u64;
                 report.unchanged += 1;
                 continue;
             }
             self.reserve(path, &location)?;
+            self.bind_import_storage(path, &observation)?;
             observer(ImportEvent::Reserved)?;
+            let (changed, warnings) = self.refresh_metadata(path, true)?;
+            report.metadata_updated += u64::from(changed);
+            report.metadata_warnings += warnings as u64;
             let (metadata, preview) = match media::decode(path) {
                 Ok(value) => value,
                 Err(error) => {
@@ -226,8 +262,28 @@ impl Catalog {
         }
         Ok(report)
     }
+    fn bind_import_storage(
+        &mut self,
+        path: &Path,
+        observation: &storage_volume::VolumeLocation,
+    ) -> Result<()> {
+        let asset = self.record_import_path(path)?;
+        if observation.state == storage_volume::LocationState::Available {
+            self.bind_storage(&asset, observation)?;
+        }
+        Ok(())
+    }
+    fn record_import_path(&mut self, path: &Path) -> Result<String> {
+        let asset: String = self.db.query_row(
+            "SELECT id FROM assets WHERE location=?1",
+            [location_bytes(path)],
+            |row| row.get(0),
+        )?;
+        self.record_storage_path(&asset, &storage_volume::NativePath::from_path(path))?;
+        Ok(asset)
+    }
     fn reserve(&self, path: &Path, location: &[u8]) -> Result<()> {
-        self.db.execute("INSERT INTO assets(id,location,path_display,state) VALUES(?1,?2,?3,'pending') ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
+        self.db.execute("INSERT INTO assets(id,location,path_display,state,render_generation) VALUES(?1,?2,?3,'pending',1) ON CONFLICT(location) DO UPDATE SET state='pending',preview_hash=NULL,error=NULL,render_generation=render_generation+1", params![Uuid::new_v4().to_string(),location,path.to_string_lossy()])?;
         Ok(())
     }
     fn fail(&self, location: &[u8], error: &anyhow::Error) -> Result<()> {
@@ -582,12 +638,15 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(schema_after, schema_before);
+        assert_eq!(
+            schema_after.replace(", render_generation INTEGER NOT NULL DEFAULT 0", ""),
+            schema_before
+        );
         assert_eq!(
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            1
+            3
         );
         assert_eq!(
             catalog

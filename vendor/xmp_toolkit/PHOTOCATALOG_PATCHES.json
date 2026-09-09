@@ -1,0 +1,52 @@
+{
+  "upstream_version": "1.12.1",
+  "upstream_crate_sha256": "04517ad6f440d16e52ade0ad6d781029313bdacaac4590de9a9114f8d737af61",
+  "feature": "source-preservation",
+  "changes": [
+    {
+      "file": "Cargo.toml",
+      "before_sha256": "51cfc3c8612f4f1753bca29e3c312aacecc4d9edb8c1a21c1296dcea099fa369",
+      "after_sha256": "849a54a5210d4970872cad2f607f19565d8f2d9c79324d0d9cd90417359f8853"
+    },
+    {
+      "file": "build.rs",
+      "before_sha256": "38f152fe2b3ab7b7648189f246daea26ac291d6863deb9a8cb6845c7e6d80a73",
+      "after_sha256": "21813b0774af59a8437049821a296f31d2d40d1c6fad84b5eaffda65a79ae76a"
+    },
+    {
+      "file": "build.rs",
+      "before_sha256": "21813b0774af59a8437049821a296f31d2d40d1c6fad84b5eaffda65a79ae76a",
+      "after_sha256": "f1442ac0095d3c33da1f34d112c3d8edcf023533a5730fc49bd79480107b5ea8"
+    },
+    {
+      "file": "build.rs",
+      "before_sha256": "f1442ac0095d3c33da1f34d112c3d8edcf023533a5730fc49bd79480107b5ea8",
+      "after_sha256": "620edb21b8b3646e94b592ee0206930ba1ea663410b3fcf0dcd15b882e13decf"
+    },
+    {
+      "file": "build.rs",
+      "before_sha256": "620edb21b8b3646e94b592ee0206930ba1ea663410b3fcf0dcd15b882e13decf",
+      "after_sha256": "a56ca2256a6c5138a23a7f09ae6725acb5e295213bbc54f992e65ac249669ea5"
+    },
+    {
+      "file": "external/xmp_toolkit/XMPCore/source/XMPMeta-Parse.cpp",
+      "before_sha256": "edbb19f9d157879b8d47ee45881a4dcf6b89f123fc3071efb37c6706b9e1075c",
+      "after_sha256": "1678b010496056ecfc38becc1b96cbd728b6b8806fc706d3aa8b1352af6a0b1f"
+    },
+    {
+      "file": "external/xmp_toolkit/XMPCore/source/XMPMeta.cpp",
+      "before_sha256": "0479db966cb1be44b4bffa902c4064c79442b178a7a9a70fd53e038a69459681",
+      "after_sha256": "11f0edaf2647321e1a0c07c58267cc87be13efc8f4cbc4244a7b31b790c3841c"
+    },
+    {
+      "file": "external/xmp_toolkit/XMPCore/source/XMPCore_Impl.cpp",
+      "before_sha256": "0a9f2117461fa4066388f24a61e7a2ee95d530b0311c4131ea096be1c54bd9fa",
+      "after_sha256": "ea38714a0d32e219139a76b1a55e0484b7a94d13109ed8a5ec82e96e0ba751a1"
+    },
+    {
+      "file": "external/xmp_toolkit/XMPCore/source/ParseRDF.cpp",
+      "before_sha256": "58545a128ff375bf3714081a0d56bc89040109126d206475ffe5e320130f9cd8",
+      "after_sha256": "8a5aadd3b364256e9e9145eb2d04da55e1f404eb4db2f8d2e1d877ad1de83b39"
+    }
+  ]
+}
