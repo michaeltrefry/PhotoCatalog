@@ -153,22 +153,51 @@ fn modified(metadata: &fs::Metadata) -> Option<u128> {
         .ok()
         .map(|v| v.as_nanos())
 }
+/// Opens only regular files. Unix flags close the metadata/open race: a FIFO
+/// replacement cannot block, and a symlink replacement cannot be followed.
+fn open_regular(path: &Path, expected: &fs::Metadata) -> io::Result<File> {
+    if !expected.is_file() || expected.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source must be a non-symlink regular file",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point itself, never its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let actual = file.metadata()?;
+    let same = actual.is_file()
+        && !actual.file_type().is_symlink()
+        && actual.len() == expected.len()
+        && modified(&actual) == modified(expected);
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        same && actual.dev() == expected.dev() && actual.ino() == expected.ino()
+    };
+    if !same {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source changed or became non-regular while opening",
+        ));
+    }
+    Ok(file)
+}
 fn inspect_file(path: &Path, limits: &Limits, sidecar: bool) -> io::Result<Inspection> {
     let path_before = fs::symlink_metadata(path)?;
-    if path_before.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "source symlinks are not supported",
-        ));
-    }
-    let mut file = File::open(path)?;
+    let mut file = open_regular(path, &path_before)?;
     let before = file.metadata()?;
-    if !before.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "source must be a regular file",
-        ));
-    }
     let mut revision = SourceRevision {
         length: before.len(),
         blake3: String::new(),
@@ -224,7 +253,8 @@ fn inspect_file(path: &Path, limits: &Limits, sidecar: bool) -> io::Result<Inspe
     {
         // Portable path replacement verification when no stable file-id API is exposed.
         if same {
-            let (path_hash, length_matches) = hash_file(&mut File::open(path)?, before.len())?;
+            let (path_hash, length_matches) =
+                hash_file(&mut open_regular(path, &current)?, before.len())?;
             same &= length_matches && path_hash == after_hash;
         }
     }
@@ -416,7 +446,18 @@ impl<'a, R: Read + Seek> Parser<'a, R> {
         length: u64,
         group: String,
     ) -> PResult<()> {
-        let available = self.length.saturating_sub(offset).min(length);
+        self.simple_within(container, offset, length, group, self.length)
+    }
+    fn simple_within(
+        &mut self,
+        container: Container,
+        offset: u64,
+        length: u64,
+        group: String,
+        end: u64,
+    ) -> PResult<()> {
+        self.bounds(offset, 0, end)?;
+        let available = end.min(self.length).saturating_sub(offset).min(length);
         let bytes = self.read(offset, available)?;
         if available != length {
             self.packet(
@@ -470,8 +511,8 @@ impl<'a, R: Read + Seek> Parser<'a, R> {
             return self.raf();
         }
         if header.get(4..8) == Some(b"ftyp") {
-            let boxes = self.boxes(0, self.length)?;
-            if let Some(ftyp) = boxes.first() {
+            let ftyp = self.box_at(0, self.length)?;
+            {
                 let brands = self.read(ftyp.payload, ftyp.end - ftyp.payload)?;
                 if brands.len() < 8 || (brands.len() - 8) % 4 != 0 {
                     return Err(malformed(ftyp.start, "invalid BMFF file type box"));
@@ -860,14 +901,16 @@ impl<R: Read + Seek> Parser<'_, R> {
         let mut offset = 12;
         while offset < end {
             self.tick(offset)?;
+            self.bounds(offset, 8, end)?;
             let header = self.read(offset, 8)?;
             let length = le32(&header[4..8]) as u64;
             if &header[..4] == b"XMP " {
-                self.simple(
+                self.simple_within(
                     Container::WebpXmp,
                     offset + 8,
                     length,
                     format!("webp:{offset}"),
+                    end,
                 )?;
             }
             offset = self.bounds(offset + 8, length + length % 2, end)?;
@@ -903,11 +946,12 @@ impl<R: Read + Seek> Parser<'_, R> {
             let length = be32(&self.read(size_offset, 4)?) as u64;
             let payload = size_offset + 4;
             if be16(&header[4..6]) == 1060 {
-                self.simple(
+                self.simple_within(
                     Container::PsdResource1060,
                     payload,
                     length,
                     format!("psd:{offset}"),
+                    end,
                 )?;
             }
             offset = self.bounds(payload, length + length % 2, end)?;
@@ -1169,36 +1213,49 @@ const XMP_UUID: [u8; 16] = [
     0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf, 0xac,
 ];
 impl<R: Read + Seek> Parser<'_, R> {
+    fn box_at(&mut self, offset: u64, end: u64) -> PResult<BmffBox> {
+        self.tick(offset)?;
+        self.bounds(offset, 8, end)?;
+        let header = self.read(offset, 8)?;
+        let size = be32(&header[..4]);
+        let (size, header_length) = if size == 1 {
+            self.bounds(offset, 16, end)?;
+            let bytes = self.read(offset + 8, 8)?;
+            (
+                u64::from_be_bytes(bytes.try_into().expect("eight bytes")),
+                16,
+            )
+        } else if size == 0 {
+            (end - offset, 8)
+        } else {
+            (u64::from(size), 8)
+        };
+        if size < header_length {
+            return Err(malformed(offset, "BMFF box smaller than its header"));
+        }
+        let next = self.bounds(offset, size, end)?;
+        Ok(BmffBox {
+            kind: header[4..8].try_into().expect("four bytes"),
+            start: offset,
+            payload: offset + header_length,
+            end: next,
+        })
+    }
     fn boxes(&mut self, mut offset: u64, end: u64) -> PResult<Vec<BmffBox>> {
         let mut boxes = Vec::new();
         while offset < end {
-            self.tick(offset)?;
-            self.bounds(offset, 8, end)?;
-            let header = self.read(offset, 8)?;
-            let size = be32(&header[..4]);
-            let (size, header_length) = if size == 1 {
-                self.bounds(offset, 16, end)?;
-                let bytes = self.read(offset + 8, 8)?;
-                (
-                    u64::from_be_bytes(bytes.try_into().expect("eight bytes")),
-                    16,
-                )
-            } else if size == 0 {
-                (end - offset, 8)
-            } else {
-                (u64::from(size), 8)
-            };
-            if size < header_length {
-                return Err(malformed(offset, "BMFF box smaller than its header"));
+            match self.box_at(offset, end) {
+                Ok(entry) => {
+                    offset = entry.end;
+                    boxes.push(entry);
+                }
+                Err(error) => {
+                    // A malformed later box cannot erase validated earlier carriers.
+                    // Stop at the damaged boundary; never guess a resynchronization.
+                    self.record(error);
+                    break;
+                }
             }
-            let next = self.bounds(offset, size, end)?;
-            boxes.push(BmffBox {
-                kind: header[4..8].try_into().expect("four bytes"),
-                start: offset,
-                payload: offset + header_length,
-                end: next,
-            });
-            offset = next;
         }
         Ok(boxes)
     }
@@ -1382,6 +1439,7 @@ impl<R: Read + Seek> Parser<'_, R> {
         Ok(())
     }
     fn bmff_iinf(&mut self, entry: &BmffBox, items: &mut BTreeMap<u64, Item>) -> PResult<()> {
+        self.bounds(entry.payload, 4, entry.end)?;
         let prefix = self.read(entry.payload, 4)?;
         let width = match prefix[0] {
             0 => 2,
@@ -1506,6 +1564,7 @@ impl<R: Read + Seek> Parser<'_, R> {
         entry: &BmffBox,
         associations: &mut BTreeMap<u64, Vec<u64>>,
     ) -> PResult<()> {
+        self.bounds(entry.payload, 4, entry.end)?;
         let prefix = self.read(entry.payload, 4)?;
         let width = match prefix[0] {
             0 => 2,
@@ -1550,5 +1609,61 @@ mod bounded_hash_tests {
         assert_eq!(file.stream_position().unwrap(), 8);
         let (_, matches) = hash_file(&mut file, 100).unwrap();
         assert!(!matches);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_open_worker() {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(mode) = std::env::var_os("PHOTOCATALOG_PACKET_OPEN_RACE") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("PHOTOCATALOG_PACKET_RACE_DIRECTORY").unwrap(),
+        );
+        let path = directory.join("source");
+        fs::write(&path, b"original").unwrap();
+        // Keep the old inode alive so a replacement cannot reuse its identity.
+        let _held_original = File::open(&path).unwrap();
+        let expected = fs::symlink_metadata(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        match mode.to_str().unwrap() {
+            "fifo" | "direct-fifo" => {
+                let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+            }
+            "symlink" => {
+                let target = directory.join("target");
+                fs::write(&target, b"original").unwrap();
+                std::os::unix::fs::symlink(target, &path).unwrap();
+            }
+            "regular" => {
+                fs::write(&path, b"original").unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(expected.modified().unwrap()))
+                    .unwrap();
+            }
+            _ => panic!("unknown race test mode"),
+        }
+        if mode == "direct-fifo" {
+            assert_eq!(
+                inspect(&path, &Limits::default()).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                inspect_sidecar(&path, &Limits::default())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        } else {
+            assert!(
+                open_regular(&path, &expected).is_err(),
+                "replacement accepted"
+            );
+        }
     }
 }

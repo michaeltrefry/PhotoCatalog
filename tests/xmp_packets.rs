@@ -663,3 +663,111 @@ fn raf_declared_jpeg_is_inspected_and_proprietary_coverage_is_explicit() {
     assert_eq!(result.parse_inputs[0].bytes, b"RAF XMP");
     assert!(!result.issues.is_empty());
 }
+
+#[test]
+fn carrier_bytes_cannot_escape_webp_or_psd_parent_bounds() {
+    let mut riff = webp(&[(b"XMP ", b"abcdef")]);
+    riff[4..8].copy_from_slice(&16u32.to_le_bytes()); // parent ends after "abcd"
+    let mut photoshop = psd(&[b"abcdef"]);
+    photoshop[30..34].copy_from_slice(&16u32.to_be_bytes()); // resource block ends after "abcd"
+    for bytes in [riff, photoshop] {
+        let result = run(&bytes);
+        assert_eq!(result.status, Status::Malformed);
+        assert_eq!(result.packets.len(), 1);
+        assert_eq!(result.packets[0].bytes, b"abcd");
+        assert_eq!(result.packets[0].attributes["incomplete"], "true");
+        assert!(
+            result.parse_inputs.is_empty(),
+            "outside-parent bytes became parse input"
+        );
+    }
+}
+#[test]
+fn bmff_fullbox_prefix_cannot_borrow_following_sibling_bytes() {
+    let mut meta = vec![0; 4];
+    meta.extend_from_slice(&bmff_box(b"iref", &[]));
+    meta.extend_from_slice(&bmff_box(b"free", &[0; 8]));
+    let mut bytes = bmff_box(b"ftyp", b"avif\0\0\0\0avif");
+    bytes.extend_from_slice(&bmff_box(b"meta", &meta));
+    let result = run(&bytes);
+    assert_eq!(result.status, Status::Malformed);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("parent"))
+    );
+    assert!(result.parse_inputs.is_empty());
+}
+#[test]
+fn malformed_later_bmff_box_preserves_valid_carriers_in_each_container() {
+    let mut uuid = vec![
+        0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf,
+        0xac,
+    ];
+    uuid.extend_from_slice(b"<retained/>");
+    let mut payload = bmff_box(b"uuid", &uuid);
+    payload.extend_from_slice(b"\0\0\0\x04free");
+    let mut meta_payload = vec![0; 4];
+    meta_payload.extend_from_slice(&payload);
+    for container in [
+        payload.clone(),
+        bmff_box(b"moov", &payload),
+        bmff_box(b"meta", &meta_payload),
+    ] {
+        let mut bytes = bmff_box(b"ftyp", b"avif\0\0\0\0avif");
+        bytes.extend_from_slice(&container);
+        let result = run(&bytes);
+        assert_eq!(result.status, Status::Malformed);
+        assert_eq!(result.packets.len(), 1);
+        assert_eq!(result.parse_inputs[0].bytes, b"<retained/>");
+    }
+    let mut bytes = avif(&[b"retained MIME item"], 1);
+    let meta_start = bytes.windows(4).position(|b| b == b"meta").unwrap() - 4;
+    let size = u32::from_be_bytes(bytes[meta_start..meta_start + 4].try_into().unwrap());
+    bytes[meta_start..meta_start + 4].copy_from_slice(&(size + 8).to_be_bytes());
+    bytes.extend_from_slice(b"\0\0\0\x04free");
+    let result = run(&bytes);
+    assert_eq!(result.status, Status::Malformed);
+    assert_eq!(result.parse_inputs[0].bytes, b"retained MIME item");
+}
+#[cfg(unix)]
+#[test]
+fn fifo_and_open_races_finish_in_bounded_child_processes() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for mode in ["direct-fifo", "fifo", "symlink", "regular"] {
+        // Parent owns cleanup even if a regression requires killing the worker.
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "xmp_packets::bounded_hash_tests::nonregular_open_worker",
+                    "--nocapture",
+                ])
+                .env("PHOTOCATALOG_PACKET_OPEN_RACE", mode)
+                .env("PHOTOCATALOG_PACKET_RACE_DIRECTORY", directory.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "{mode} worker failed: {status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "{mode} source open blocked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
