@@ -1,5 +1,7 @@
 //! Fixed headless retained-page/navigation evidence through the production service.
 //! Synthetic catalog preparation is explicit; no original import or render occurs.
+#[path = "preview_fixture/integrated.rs"]
+mod integrated;
 mod preview_fixture;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -25,6 +27,13 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Apply a bounded preview identity overlay only to an externally copied fixture.
+    Overlay {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        dataset: PathBuf,
+    },
     /// Untimed receipt-chain validation; never opens images or originals.
     Verify { folder: PathBuf },
     /// Seed only a new disposable catalog; the cache dataset must already exist.
@@ -62,12 +71,17 @@ enum Workload {
 }
 #[derive(Serialize, Deserialize)]
 struct Fixture {
+    #[serde(default = "small_catalog_count")]
+    catalog_count: u64,
     version: u32,
     dataset: PathBuf,
     dataset_blake3: String,
     catalog: PathBuf,
     offline_originals: PathBuf,
     count: u32,
+}
+fn small_catalog_count() -> u64 {
+    u64::from(ASSETS)
 }
 fn exclusive(path: &Path, value: &Value) -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -126,11 +140,12 @@ fn prepare(dataset_path: &Path, output: &Path) -> Result<()> {
     );
     let data = dataset(dataset_path)?;
     ensure!(
-        data.count == ASSETS,
+        data.count == ASSETS && data.id_scheme == preview_fixture::IdScheme::Layout,
         "headless fixture requires the fixed 10,000-entry layout dataset"
     );
     fs::create_dir(output).context("new fixture directory required")?;
     let fixture = Fixture {
+        catalog_count: u64::from(ASSETS),
         version: 1,
         dataset: fs::canonicalize(dataset_path)?,
         dataset_blake3: blake3::hash(&read_bounded(dataset_path, 1024 * 1024)?)
@@ -200,9 +215,17 @@ fn load_fixture(path: &Path) -> Result<(Fixture, Dataset)> {
     );
     let data = dataset(&fixture.dataset)?;
     ensure!(data.count == ASSETS, "headless dataset count changed");
+    ensure!(
+        matches!(
+            (fixture.catalog_count, data.id_scheme),
+            (10_000, preview_fixture::IdScheme::Layout)
+                | (10_000_000, preview_fixture::IdScheme::OrganizationFixture)
+        ),
+        "catalog/preview identity mode mismatch"
+    );
     Ok((fixture, data))
 }
-fn browse(catalog: &Catalog, first: u32) -> Result<Vec<photocatalog::Asset>> {
+fn browse(catalog: &Catalog, data: &Dataset, first: u32) -> Result<Vec<photocatalog::Asset>> {
     let mut rows = catalog.browse(i64::from(first), VISIBLE.min((ASSETS - first) as usize))?;
     if rows.len() < VISIBLE {
         rows.extend(catalog.browse(0, VISIBLE - rows.len())?);
@@ -212,7 +235,7 @@ fn browse(catalog: &Catalog, first: u32) -> Result<Vec<photocatalog::Asset>> {
         let index = (first + offset as u32) % ASSETS;
         ensure!(
             row.sequence == i64::from(index) + 1
-                && row.id == format!("layout-{index:010}")
+                && row.id == key(data, index).asset_id
                 && row.state == "ready",
             "catalog page oracle mismatch"
         );
@@ -272,7 +295,7 @@ fn page(
     let started = Instant::now();
     row["started"] = anchor(started);
     let db_start = Instant::now();
-    let assets = browse(catalog, 0)?;
+    let assets = browse(catalog, data, 0)?;
     row["db_ms"] = json!(ms(db_start));
     let enqueue = Instant::now();
     let mut pending = HashMap::new();
@@ -375,7 +398,7 @@ fn navigation(
             }
             views.retain(|index, _| visible.contains(index));
             let db_start = Instant::now();
-            let assets = browse(catalog, expected[0])?;
+            let assets = browse(catalog, data, expected[0])?;
             let db_ms = ms(db_start);
             let event_start = ms(started);
             for (asset, index) in assets.iter().zip(expected) {
@@ -473,6 +496,30 @@ fn run(
         receipt["dataset_blake3"] = json!(fixture.dataset_blake3);
         receipt["layout"] = json!(data.store.layout);
         receipt["sqlite_version"] = json!(rusqlite::version());
+        // Count/schema preflight uses only the owned fixture copy. Its memory is
+        // included in process HWM, outside every page timer.
+        {
+            let db = Connection::open_with_flags(
+                fixture.catalog.join("catalog.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let count: u64 = db.query_row("SELECT count(*) FROM assets", [], |r| r.get(0))?;
+            ensure!(
+                schema == 4 && count == fixture.catalog_count,
+                "catalog count/schema changed"
+            );
+            receipt["catalog_count"] = json!(count);
+            receipt["catalog_schema"] = json!(schema);
+            if data.id_scheme == preview_fixture::IdScheme::OrganizationFixture {
+                ensure!(
+                    fixture.offline_originals == Path::new("/synthetic"),
+                    "integrated offline root mismatch"
+                );
+                integrated::verify_offline(&db, &data)?;
+                receipt["actual_preserved_source_paths_verified"] = json!(true);
+            }
+        }
         let catalog = Catalog::open(&fixture.catalog)?;
         let mut service = PreviewService::open(
             data.store.clone(),
@@ -514,6 +561,7 @@ fn run(
             !fixture.offline_originals.exists(),
             "offline source invariant changed"
         );
+        receipt["native_jobs"] = json!(service.scheduler_usage().active);
         receipt["peak_resident_bytes"] = json!(peak_rss());
         receipt["complete"] = json!(true);
         Ok(())
@@ -577,6 +625,7 @@ fn verify(folder: &Path) -> Result<()> {
 }
 fn main() -> Result<()> {
     match Args::parse().command {
+        Command::Overlay { bundle, dataset } => integrated::run(&bundle, &dataset),
         Command::Verify { folder } => verify(&folder),
         Command::Prepare { dataset, output } => prepare(&dataset, &output),
         Command::Run {

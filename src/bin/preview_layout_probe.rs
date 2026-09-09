@@ -4,7 +4,8 @@ mod preview_fixture;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use photocatalog::preview::*;
-use preview_fixture::{Dataset, Seed, dataset, key, read_bounded};
+use preview_fixture::{Dataset, IdScheme, Seed, dataset, key, read_bounded};
+use preview_fixture::{distinct_jpeg, verify_object};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -55,39 +56,6 @@ fn exclusive(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn stamp(start: Instant) -> Value {
     json!({"unix_ns":SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d|d.as_nanos().to_string()),"elapsed_ns":start.elapsed().as_nanos().to_string()})
-}
-fn distinct_jpeg(base: &[u8], index: u32) -> Result<Vec<u8>> {
-    ensure!(
-        base.starts_with(&[0xff, 0xd8]) && base.ends_with(&[0xff, 0xd9]),
-        "complete JPEG required"
-    );
-    let comment = format!("photocatalog-layout-v1:{index:010}");
-    ensure!(comment.len() == 33, "fixed layout marker length");
-    let mut result = Vec::with_capacity(base.len() + 37);
-    result.extend_from_slice(&base[..2]);
-    result.extend_from_slice(&[0xff, 0xfe]);
-    result.extend_from_slice(&35u16.to_be_bytes());
-    result.extend_from_slice(comment.as_bytes());
-    result.extend_from_slice(&base[2..]);
-    Ok(result)
-}
-fn verify_object(bytes: &[u8], index: u32, base_hash: &str) -> Result<[u8; 32]> {
-    ensure!(
-        bytes.len() > 39 && bytes[..6] == [0xff, 0xd8, 0xff, 0xfe, 0, 35],
-        "generated COM header mismatch"
-    );
-    ensure!(
-        &bytes[6..39] == format!("photocatalog-layout-v1:{index:010}").as_bytes(),
-        "generated object index mismatch"
-    );
-    let mut original = blake3::Hasher::new();
-    original.update(&bytes[..2]);
-    original.update(&bytes[39..]);
-    ensure!(
-        original.finalize().to_hex().as_str() == base_hash,
-        "generated object source payload mismatch"
-    );
-    Ok(*blake3::hash(bytes).as_bytes())
 }
 fn admit_seed_id(ids: &mut HashSet<String>, id: &str) -> Result<()> {
     ensure!(
@@ -210,6 +178,7 @@ fn prepare(campaign: &Path, output: &Path, count: u32, layout: LayoutArg) -> Res
             .map(|i| payloads[i as usize % 30].len() as u64 + 37)
             .sum::<u64>();
         let data = Dataset {
+            id_scheme: IdScheme::Layout,
             version: 1,
             count,
             store: StoreConfig {
