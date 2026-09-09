@@ -61,3 +61,116 @@ fn changing_a_scalar_preserves_its_unknown_qualifier_and_unrelated_model() -> Re
     ensure!(canonical(&mut reparsed)? == original);
     Ok(())
 }
+
+#[test]
+fn public_edits_preserve_nested_data_and_language_siblings() -> Result<()> {
+    use photocatalog::xmp::{self, Edit, Value};
+    let original = QUALIFIED_PACKET.as_bytes();
+    let edits = vec![
+        Edit::Set {
+            namespace: XMP.into(),
+            path: "Rating".into(),
+            value: "5".into(),
+        },
+        Edit::Localized {
+            namespace: xmp::DC.into(),
+            path: "title".into(),
+            language: "fr".into(),
+            value: "Neige".into(),
+        },
+        Edit::Localized {
+            namespace: xmp::DC.into(),
+            path: "title".into(),
+            language: "en".into(),
+            value: "Snow".into(),
+        },
+        Edit::Append {
+            namespace: xmp::DC.into(),
+            path: "subject".into(),
+            value: "winter".into(),
+            ordered: false,
+        },
+        Edit::Append {
+            namespace: xmp::DC.into(),
+            path: "subject".into(),
+            value: "mountain".into(),
+            ordered: false,
+        },
+    ];
+    let output = xmp::apply_edits(original, &edits)?;
+    let projected = xmp::project(&output)?;
+    ensure!(projected.issues.is_empty(), "{:?}", projected.issues);
+    ensure!(projected.fields["rating"] == Value::Text("5".into()));
+    let Value::Localized(title) = &projected.fields["title"] else {
+        panic!("localized title")
+    };
+    ensure!(title["fr"] == "Neige" && title["en"] == "Snow" && title["x-default"] == "Neige");
+    let undo = vec![
+        Edit::Set {
+            namespace: XMP.into(),
+            path: "Rating".into(),
+            value: "2".into(),
+        },
+        Edit::Remove {
+            namespace: xmp::DC.into(),
+            path: "title".into(),
+        },
+        Edit::Remove {
+            namespace: xmp::DC.into(),
+            path: "subject".into(),
+        },
+    ];
+    ensure!(
+        xmp::canonical(&xmp::parse(&xmp::apply_edits(&output, &undo)?)?)?
+            == xmp::canonical(&xmp::parse(original)?)?
+    );
+    Ok(())
+}
+
+#[test]
+fn strict_transport_decoding_and_structure_guards() -> Result<()> {
+    use photocatalog::xmp::{self, Edit};
+    let expected = xmp::canonical(&xmp::parse(QUALIFIED_PACKET.as_bytes())?)?;
+    for little in [false, true] {
+        let mut utf16 = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in QUALIFIED_PACKET.encode_utf16() {
+            utf16.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        ensure!(xmp::canonical(&xmp::parse(&utf16)?)? == expected);
+        let mut utf32 = if little {
+            vec![0xff, 0xfe, 0, 0]
+        } else {
+            vec![0, 0, 0xfe, 0xff]
+        };
+        for c in QUALIFIED_PACKET.chars() {
+            utf32.extend(if little {
+                (c as u32).to_le_bytes()
+            } else {
+                (c as u32).to_be_bytes()
+            });
+        }
+        ensure!(xmp::canonical(&xmp::parse(&utf32)?)? == expected);
+    }
+    ensure!(xmp::parse(b"<!DOCTYPE a [<!ENTITY x SYSTEM 'file:///x'>]><a>&x;</a>").is_err());
+    ensure!(xmp::parse(&[0xff, 0xfe, 0]).is_err());
+    ensure!(
+        xmp::apply_edits(
+            QUALIFIED_PACKET.as_bytes(),
+            &[Edit::Set {
+                namespace: UNKNOWN.into(),
+                path: "history".into(),
+                value: "flattened".into()
+            }]
+        )
+        .is_err()
+    );
+    Ok(())
+}
