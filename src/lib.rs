@@ -38,6 +38,24 @@ pub struct Catalog {
     db: Connection,
     root: PathBuf,
 }
+
+/// Apply the measured SQLite settings to an app-owned, already validated connection.
+/// This changes journal mode; callers must not pass unrelated or read-only databases.
+/// The cache budget is per connection. It is a target, not a process-memory ceiling.
+pub fn configure_catalog_connection(db: &Connection) -> Result<()> {
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    db.pragma_update(None, "synchronous", "FULL")?;
+    // Match macOS durable WAL commits to storage flush semantics (ignored elsewhere).
+    db.pragma_update(None, "fullfsync", true)?;
+    db.pragma_update(None, "foreign_keys", true)?;
+    db.pragma_update(None, "cache_size", -262144)?;
+    db.pragma_update(None, "mmap_size", 0)?;
+    db.pragma_update(None, "temp_store", 1)?;
+    db.pragma_update(None, "wal_autocheckpoint", 1000)?;
+    Ok(())
+}
+
 impl Catalog {
     /// Resolve source and prospective catalog locations before creating any files.
     /// Use this entry point when opening a catalog for an import operation.
@@ -79,11 +97,7 @@ impl Catalog {
                 "database is not a PhotoCatalog catalog"
             );
         }
-        db.pragma_update(None, "journal_mode", "WAL")?;
-        db.pragma_update(None, "synchronous", "FULL")?;
-        // Match macOS durable WAL commits to storage flush semantics (ignored elsewhere).
-        db.pragma_update(None, "fullfsync", true)?;
-        db.pragma_update(None, "foreign_keys", true)?;
+        configure_catalog_connection(&db)?;
         db.execute_batch("BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS assets (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -492,17 +506,108 @@ fn catalog_connections_use_full_durable_wal_commits() -> Result<()> {
             .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
         "wal"
     );
-    assert_eq!(
-        catalog
+    for (name, expected) in [
+        ("synchronous", 2),
+        ("fullfsync", 1),
+        ("foreign_keys", 1),
+        ("cache_size", -262144),
+        ("mmap_size", 0),
+        ("temp_store", 1),
+        ("busy_timeout", 5000),
+        ("wal_autocheckpoint", 1000),
+    ] {
+        let actual: i64 = catalog
             .db
-            .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?,
-        2
-    );
-    assert_eq!(
-        catalog
-            .db
-            .query_row("PRAGMA fullfsync", [], |r| r.get::<_, i64>(0))?,
-        1
-    );
+            .pragma_query_value(None, name, |row| row.get(0))?;
+        assert_eq!(actual, expected, "{name}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    fs::create_dir(root.join("previews"))?;
+    let preview = b"opaque stored preview fixture";
+    let hash = blake3::hash(preview).to_hex().to_string();
+    fs::write(root.join("previews").join(format!("{hash}.jpg")), preview)?;
+    let db = Connection::open(root.join("catalog.sqlite3"))?;
+    // Build the previous v1 schema independently, without Catalog::open or the new helper.
+    db.execute_batch("CREATE TABLE assets (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE, location BLOB NOT NULL UNIQUE, path_display TEXT NOT NULL,
+        fingerprint TEXT, state TEXT NOT NULL CHECK(state IN ('pending','ready','failed')),
+        metadata TEXT, preview_hash TEXT, error TEXT,
+        CHECK(state != 'ready' OR (metadata IS NOT NULL AND preview_hash IS NOT NULL AND fingerprint IS NOT NULL))
+        ); PRAGMA application_id=1346913089; PRAGMA user_version=1;")?;
+    let metadata = r#"{"format":"JPEG","width":120,"height":80,"orientation":1,"camera_make":null,"camera_model":null,"captured_at":null,"preview_source":"fixture","opaque":"preserve this exact JSON"}"#;
+    let location = [0_u8, 255, 10, 120];
+    db.execute("INSERT INTO assets VALUES(41,'stable-ready',?1,'/offline/日本語.jpg','fingerprint','ready',?2,?3,NULL)", params![location.as_slice(),metadata,hash])?;
+    db.execute("INSERT INTO assets(sequence,id,location,path_display,state,error) VALUES(80,'stable-pending',X'00AB','/offline/pending.CR2','pending','retry after interruption')", [])?;
+    let schema_before: String = db.query_row(
+        "SELECT sql FROM sqlite_master WHERE name='assets'",
+        [],
+        |row| row.get(0),
+    )?;
+    drop(db);
+    for _ in 0..2 {
+        let catalog = Catalog::open(root)?;
+        let rows = catalog.browse(0, 200)?;
+        assert_eq!(
+            rows.iter()
+                .map(|asset| (asset.sequence, asset.id.as_str()))
+                .collect::<Vec<_>>(),
+            [(41, "stable-ready"), (80, "stable-pending")]
+        );
+        assert_eq!(catalog.get("stable-ready")?.metadata.unwrap().width, 120);
+        assert_eq!(catalog.preview("stable-ready")?, preview);
+        assert_eq!(
+            catalog.get("stable-pending")?.error.as_deref(),
+            Some("retry after interruption")
+        );
+        let stored: (Vec<u8>, String, String) = catalog.db.query_row(
+            "SELECT location,metadata,preview_hash FROM assets WHERE id='stable-ready'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            stored,
+            (location.to_vec(), metadata.to_string(), hash.clone())
+        );
+        let schema_after: String = catalog.db.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='assets'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(schema_after, schema_before);
+        assert_eq!(
+            catalog
+                .db
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+            1
+        );
+        assert_eq!(
+            catalog
+                .db
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))?,
+            1346913089
+        );
+        assert_eq!(
+            catalog
+                .db
+                .pragma_query_value(None, "cache_size", |row| row.get::<_, i64>(0))?,
+            -262144
+        );
+        assert_eq!(
+            catalog.db.query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='assets'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            80
+        );
+    }
     Ok(())
 }

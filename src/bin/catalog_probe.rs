@@ -1,7 +1,7 @@
 //! Native-engine integration probe for synthetic benchmark catalogs. No image processing.
 use anyhow::{Result, ensure};
 use clap::Parser;
-use photocatalog::Catalog;
+use photocatalog::{Catalog, configure_catalog_connection};
 use serde_json::json;
 use std::{path::PathBuf, time::Instant};
 
@@ -13,6 +13,8 @@ struct Args {
     count: i64,
     #[arg(long, default_value_t = 100)]
     repetitions: usize,
+    #[arg(long)]
+    browse_only: bool,
 }
 fn percentile(values: &[f64], fraction: f64) -> f64 {
     let mut sorted = values.to_vec();
@@ -61,8 +63,12 @@ fn main() -> Result<()> {
     drop(catalog);
     let reopened = Catalog::open(&args.catalog)?;
     ensure!(reopened.get(&id)?.id == id, "identity changed after reopen");
-    let connection = rusqlite::Connection::open(args.catalog.join("catalog.sqlite3"))?;
-    let mixed = native_mixed(&args.catalog, args.repetitions)?;
+    let connection = configured_connection(&args.catalog)?;
+    let mixed = if args.browse_only {
+        None
+    } else {
+        Some(native_mixed(&args.catalog, args.repetitions)?)
+    };
     let mut statement = connection.prepare("EXPLAIN QUERY PLAN SELECT sequence,id,path_display,state,metadata,error FROM assets WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
     let plans: Vec<String> = statement
         .query_map(rusqlite::params![args.count * 9 / 10, 200], |r| r.get(3))?
@@ -81,33 +87,51 @@ fn main() -> Result<()> {
     );
     println!(
         "{}",
-        json!({"sqlite_version":rusqlite::version(),"count":args.count,"open_ms":open_ms,"n":times.len(),
+        json!({"native_runtime_protocol":1,"browse_only":args.browse_only,"settings":connection_settings(&connection)?,"sqlite_version":rusqlite::version(),"count":args.count,"open_ms":open_ms,"n":times.len(),
         "p50_ms":percentile(&times,0.5),"p95_ms":percentile(&times,0.95),"p99_ms":percentile(&times,0.99),
         "samples_ms":times,"plans":plans,"identity_metadata_restart_verified":true,"native_mixed":mixed,
-        "scope":"actual Rust Catalog browse/get JSON deserialization; synthetic metadata only"})
+        "scope":if args.browse_only {"actual Rust Catalog browse/get/reopen and JSON deserialization; browsing only; synthetic metadata"} else {"actual Rust Catalog browse/get/reopen and JSON deserialization, followed by native mixed writes; synthetic metadata"}})
     );
     Ok(())
 }
 
 fn configured_connection(path: &std::path::Path) -> Result<rusqlite::Connection> {
     let connection = rusqlite::Connection::open(path.join("catalog.sqlite3"))?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.pragma_update(None, "fullfsync", true)?;
-    connection.pragma_update(None, "foreign_keys", true)?;
-    connection.pragma_update(None, "cache_size", -262144)?;
+    configure_catalog_connection(&connection)?;
     Ok(connection)
 }
+
+fn connection_settings(connection: &rusqlite::Connection) -> Result<serde_json::Value> {
+    let mut settings = serde_json::Map::new();
+    let journal: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    settings.insert("journal_mode".into(), json!(journal));
+    for name in [
+        "synchronous",
+        "fullfsync",
+        "foreign_keys",
+        "cache_size",
+        "mmap_size",
+        "temp_store",
+        "busy_timeout",
+        "wal_autocheckpoint",
+    ] {
+        let value: i64 = connection.pragma_query_value(None, name, |row| row.get(0))?;
+        settings.insert(name.into(), json!(value));
+    }
+    Ok(json!(settings))
+}
+
 fn native_mixed(path: &std::path::Path, repetitions: usize) -> Result<serde_json::Value> {
     let mut foreground = configured_connection(path)?;
+    let foreground_settings = connection_settings(&foreground)?;
     let original_count: i64 =
         foreground.query_row("SELECT max(sequence) FROM assets", [], |r| r.get(0))?;
     let background_path = path.to_path_buf();
     let (ready, receiver) = std::sync::mpsc::sync_channel(0);
     let (acknowledge, acknowledged) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || -> Result<Vec<f64>> {
+    let worker = std::thread::spawn(move || -> Result<(Vec<f64>, serde_json::Value)> {
         let mut background = configured_connection(&background_path)?;
+        let background_settings = connection_settings(&background)?;
         let mut samples = Vec::new();
         for iteration in 0..repetitions {
             let started = Instant::now();
@@ -136,7 +160,7 @@ fn native_mixed(path: &std::path::Path, repetitions: usize) -> Result<serde_json
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
             acknowledged.recv_timeout(std::time::Duration::from_secs(30))?;
         }
-        Ok(samples)
+        Ok((samples, background_settings))
     });
     let mut ratings = Vec::new();
     let mut edits = Vec::new();
@@ -184,7 +208,7 @@ fn native_mixed(path: &std::path::Path, repetitions: usize) -> Result<serde_json
     })();
     drop(acknowledge);
     drop(receiver);
-    let background = worker
+    let (background, background_settings) = worker
         .join()
         .map_err(|_| anyhow::anyhow!("native importer panicked"))??;
     work?;
@@ -197,6 +221,19 @@ fn native_mixed(path: &std::path::Path, repetitions: usize) -> Result<serde_json
     Ok(
         json!({"rating":stats(&ratings),"edit":stats(&edits),"background":stats(&background),"imported_rows":repetitions*32,
         "method":"Rust rusqlite native transactions; 32 cloned synthetic template rows plus relationships per batch; foreground released after background obtains write lock",
-        "settings":{"journal_mode":"wal","synchronous":"FULL","fullfsync":true,"cache_size_kib":262144,"busy_timeout_ms":5000}}),
+        "settings":foreground_settings,"background_settings":background_settings}),
     )
+}
+
+#[cfg(test)]
+#[test]
+fn native_probe_connections_read_back_the_measured_catalog_settings() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    drop(Catalog::open(temporary.path())?);
+    let connection = configured_connection(temporary.path())?;
+    assert_eq!(
+        connection_settings(&connection)?,
+        json!({"journal_mode":"wal","synchronous":2,"fullfsync":1,"foreign_keys":1,"cache_size":-262144,"mmap_size":0,"temp_store":1,"busy_timeout":5000,"wal_autocheckpoint":1000})
+    );
+    Ok(())
 }
