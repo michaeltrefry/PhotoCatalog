@@ -4,7 +4,7 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836–sc-22840 are verified Done. S6 preview integration and final measurements remain in progress. S7 has passed local correctness and full scale qualification and is preparing final hosted CI. S9 is inspecting Lightroom catalogs in resumable, read-only source passes. Heavy local validation and timed measurements are coordinated separately; the live Shortcut epic remains authoritative.
+sc-22836–sc-22842 are verified Done. S8 editing/export implementation and qualification are in progress. S9 is inspecting Lightroom catalogs through bounded, resumable, read-only source passes. Native builds and large-I/O/measurement work use one owned lane. Live Shortcut remains authoritative; this checkpoint was reconciled on 2026-09-10.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
@@ -13,10 +13,10 @@ sc-22836–sc-22840 are verified Done. S6 preview integration and final measurem
 | sc-22838 | Done | [PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2) and corrective [PR #5](https://github.com/michaeltrefry/PhotoCatalog/pull/5), merged bef8b6c | Final renderer review; 115 tests; private camera/render comparisons; PR CI 34386168135 and main CI 34390636314 all four jobs SUCCESS; Shortcut read-back | Complete |
 | sc-22839 | Done | [PR #4](https://github.com/michaeltrefry/PhotoCatalog/pull/4), merged be85c16 | SDK normalization repaired; independent RDF/opaque XMP preservation checks; PR CI 34380874912 and main CI 34382746592 all four jobs SUCCESS; Shortcut Done read-back | Complete |
 | sc-22840 | Done | [PR #6](https://github.com/michaeltrefry/PhotoCatalog/pull/6), merged 60fc33c | Controlled APFS detach/remount/reorganization/replacement/undo; Linux bind mount and Windows volume GUID/junction proof; PR CI 34394610454 and main CI 34395883109 all four jobs SUCCESS; Shortcut Done read-back | Complete |
-| sc-22841 | In Progress | Preview storage and scheduling; codex/sc-22841-previews | Quality and full-worker memory qualification complete; a2f33b7 correctness: 242 Rust, 18 preview/39 benchmark/5 image Python checks PASS; integrated 10M probe source reviewed | Integrate S7 writer/schema changes, validate current source, execute layout/navigation/integrated 10M gates and select defaults, then final CI/merge |
-| sc-22842 | In Progress | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7); organization/search core, schema 5 and shared writer admission | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md): exact runtime 0cfc1fd, all 17 cases × 3 scales and actual-overlap saves PASS; 183 Rust/52 Python checks pass | Final report review, batched push, three-platform CI (including Windows import), merge and tracker read-back |
-| sc-22843 | To Do | Editing and export | Prerequisites sc-22838/sc-22839/sc-22841 | Dependency-bound |
-| sc-22844 | In Progress | Lightroom inspection; codex/sc-22844-lightroom-inspection | Seed byte/row preservation independently verified; current inventory of 48 candidates admitted unchanged; two outcomes complete, next member resumed; comments 22939/22945 | Complete bounded main inspection, review companion/path/packet evidence and current-family ambiguities before migration |
+| sc-22841 | Done | [PR #8](https://github.com/michaeltrefry/PhotoCatalog/pull/8), merged789a39d | Reviewed preview defaults and full30-file memory/quality, layout, navigation and integrated10M evidence; PR CI34430709720 and main CI34432335579 SUCCESS; Shortcut Done read-back | Complete |
+| sc-22842 | Done | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7), mergede68d375 | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md); reviewed scale/actual-overlap evidence; main CI34418548263 SUCCESS; Shortcut Done read-back | Complete |
+| sc-22843 | In Progress | codex/sc-22843-edits; persistent recipes/variants, copy jobs, edited previews, exact batch export |107 library tests; actual six-format/depth export, cancellation/restart/preemption/undo-ABA and orphan-seal recovery; four edited-preview process tests. These are focused correctness evidence only | Complete writer-lock responsiveness repair, full corpus/100MP/performance qualification, independent review and batched PR/three-platform CI/merge |
+| sc-22844 | In Progress | codex/sc-22844-page-memory; frozen v5 main inspection | Recovery adoption and first main slice independently verified: eight completed members/5,311,732 rows; ninth550,000 retained/pending;978 command results pass and observed processes reaped | Continue bounded main slices; independently admit auxiliary/path/packet phases and current-family ambiguity review before migration |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
 | sc-22847 | To Do | Desktop UI | Prerequisites sc-22840/sc-22841/sc-22842/sc-22843/sc-22845/sc-22846 | Dependency-bound |
@@ -68,3 +68,42 @@ failures and rejected v3 mixed summary remain retained. Worst warm/fresh page p9
 was 60.295/61.871 ms; browse RSS peaked at 480.781 MiB. All 200 saves overlapped
 background activity at every scale, with p95 12.788/12.161/11.543 ms. Final CI and
 PR/merged-head verification remain required; this checkpoint is not a Done claim.
+
+## S8 implementation checkpoint — 2026-09-10
+
+The Rust core implements versioned complete basic recipes, independent variants,
+persistent undo/redo, bounded copy-adjustment jobs, and variant-aware retained and
+interactive previews. Full-original JPEG8, PNG8/16 and TIFF8/16/float32 export uses
+immutable plans, selected metadata, explicit overwrite approval, a process lease,
+read-back seals and guarded durable publication. Actual process tests demonstrate
+cancel/reap, preview preemption, undo ABA rejection and owner restart. An orphan
+seal is never published just because it exists: a resumed worker rerenders the
+original and requires full byte equality before reuse.
+
+Integrated library107 tests passed. Actual export4 and edited-preview4 tests,
+organization migration/probe3 tests, an additional state-seek VM-work regression,
+and the three-mode actual-child orphan-seal crash test passed. Logs preserve the
+initial unsigned-SQL conversion failure and macOS physical staging-path mismatch,
+then the corrected outcomes. Worker phase timing fields were added afterward and
+still require the next integrated gate. No S8 performance or three-platform
+qualification has been claimed.
+
+Independent review identified long file scans under the global writer as a
+responsiveness defect. The active repair moves full verification outside writer
+admission, uses fresh content-change stamps inside short namespace operations,
+and records publication intent before a possible install. Qualification remains
+blocked on this repair and its adversarial tests, not on user permission. The
+prospective S8 operation/resource targets remain in the epic; the new serial
+qualification harness must freeze exact source/cohort/settings before execution.
+
+## S9 v5 recovery checkpoint — 2026-09-10
+
+The failed v4 memory attempt remains preserved. V5 used one verified owned-copy
+adoption retaining5,311,732 rows; sampled Python peak412,172,288 bytes was below
+the unchanged512MiB admission. First v5 main slice passed978 command receipts,
+completed the eighth member, and paused at journal979 after601.839 seconds.
+Python sampled peak362,971,136 bytes was below the same bound. These samples are
+not OS high-water marks. Known observed processes were checked absent; no global
+process-absence claim was made. Second main slice is separately admitted using
+an immutable recipe and exact owned pause. No source originals/catalogs are
+modified; no automatic family choice or live migration has occurred.
