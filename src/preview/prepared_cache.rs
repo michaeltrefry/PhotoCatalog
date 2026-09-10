@@ -26,14 +26,35 @@ pub(crate) struct SourceInstance {
     modified: SystemTime,
     created: Option<SystemTime>,
     changed: Option<(i64, i64)>,
+    /// Older persisted jobs lack this field and safely miss current preparation.
+    #[serde(default)]
+    native_change_stamp: Option<i128>,
 }
 
 impl SourceInstance {
     pub(crate) fn read(path: &Path) -> Result<Self> {
         let canonical = fs::canonicalize(path)?;
-        let metadata = fs::metadata(&canonical)?;
-        ensure!(metadata.is_file(), "prepared input source is not a file");
-        let (device, object) = crate::storage_volume::object_key(&canonical, &metadata)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000);
+        }
+        let file = options.open(&canonical)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "prepared input source is not an ordinary file"
+        );
+        let (device, object) = crate::metadata_export::held_file_identity(&file)?;
+        let object = u128::from(object);
+        let native_change_stamp = Some(crate::metadata_export::content_change_stamp(&file)?);
         #[cfg(unix)]
         let changed = {
             use std::os::unix::fs::MetadataExt;
@@ -49,6 +70,7 @@ impl SourceInstance {
             modified: metadata.modified()?,
             created: metadata.created().ok(),
             changed,
+            native_change_stamp,
         })
     }
 }
@@ -311,5 +333,39 @@ mod tests {
         assert_eq!(cache.bytes, produced.receipt.bytes);
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(fs::read_dir(&cache.root).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod source_change_tests {
+    use super::*;
+    #[test]
+    fn same_size_source_write_with_restored_mtime_invalidates_prepared_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.png");
+        fs::write(&path, b"original").unwrap();
+        let before = SourceInstance::read(&path).unwrap();
+        fs::write(&path, b"modified").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(before.modified))
+            .unwrap();
+        let after = SourceInstance::read(&path).unwrap();
+        assert_eq!(before.device, after.device);
+        assert_eq!(before.object, after.object);
+        assert_eq!(before.bytes, after.bytes);
+        assert_eq!(before.modified, after.modified);
+        assert_ne!(before.native_change_stamp, after.native_change_stamp);
+        assert_ne!(before, after);
+        let mut legacy = serde_json::to_value(&before).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("native_change_stamp");
+        let legacy: SourceInstance = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.native_change_stamp.is_none());
+        assert_ne!(legacy, before);
     }
 }
