@@ -29,6 +29,49 @@ def tiff(entries):
     return b'II*\0\x08\0\0\0'+table+b'\0'*4+tail
 
 
+def builtin_profile(gamma=1):
+    """Independent Decimal construction from sRGB xy/D65 and ICC D50.
+
+    The custom matrix_profile intentionally has different fixed XYZ columns;
+    it must not be used as a builtin-positive fixture. No oracle matrix solve
+    or measured profile values are used to construct these builtin XYZ tags.
+    """
+    from decimal import Decimal as D, localcontext
+    def multiply(a,b):
+        return [[sum(x*y for x,y in zip(row,column)) for column in zip(*b)] for row in a]
+    def inverse(a):
+        cofactors=[]
+        for i in range(3):
+            row=[]
+            for j in range(3):
+                minor=[[a[y][x] for x in range(3) if x!=j] for y in range(3) if y!=i]
+                row.append((minor[0][0]*minor[1][1]-minor[0][1]*minor[1][0])*(-1)**(i+j))
+            cofactors.append(row)
+        determinant=sum(a[0][j]*cofactors[0][j] for j in range(3))
+        return [[cofactors[j][i]/determinant for j in range(3)] for i in range(3)]
+    def diagonal(values):return [[v if i==j else D(0) for j in range(3)] for i,v in enumerate(values)]
+    with localcontext() as context:
+        context.prec=50
+        xy=[(D('.64'),D('.33')),(D('.30'),D('.60')),(D('.15'),D('.06'))]
+        primary=[list(row) for row in zip(*[(x/y,D(1),(1-x-y)/y) for x,y in xy])]
+        white=[[D('.3127')/D('.3290')],[D(1)],[(1-D('.3127')-D('.3290'))/D('.3290')]]
+        d50=[[D('.9642')],[D(1)],[D('.8249')]]
+        basis=[[D(v) for v in row] for row in (('.8951','.2664','-.1614'),('-.7502','1.7135','.0367'),('.0389','-.0685','1.0296'))]
+        scales=[row[0] for row in multiply(inverse(primary),white)]
+        source=multiply(basis,white); target=multiply(basis,d50)
+        adaptation=multiply(multiply(inverse(basis),diagonal([target[i][0]/source[i][0] for i in range(3)])),basis)
+        columns=multiply(adaptation,multiply(primary,diagonal(scales)))
+        profile=bytearray(ref.matrix_profile(gamma))
+        count=int.from_bytes(profile[128:132],'big')
+        for i in range(count):
+            at=132+12*i; key=bytes(profile[at:at+4])
+            if key in (b'rXYZ',b'gXYZ',b'bXYZ'):
+                channel=(b'rXYZ',b'gXYZ',b'bXYZ').index(key)
+                offset=int.from_bytes(profile[at+4:at+8],'big')
+                profile[offset+8:offset+20]=b''.join(struct.pack('>i',round(columns[row][channel]*65536)) for row in range(3))
+        return bytes(profile)
+
+
 class FramingContracts(unittest.TestCase):
     def test_full_rdf_subject_qualifier_nesting_and_extra_properties(self):
         original=packet('<q:p xml:lang="en">text</q:p>')
@@ -113,8 +156,12 @@ class NumericContracts(unittest.TestCase):
             with self.assertRaises(ValueError):ref.compare(np.zeros((1,1,4)),np.full((1,1,4),invalid))
 
     def test_builtin_icc_rejects_wrong_transfer_or_primaries(self):
-        linear=ref.matrix_profile(1)
+        linear=builtin_profile(1)
         rb.verify_profile(linear,{'kind':'linear_srgb'})
+        custom=ref.matrix_profile(1)
+        rb.verify_profile(custom,{'kind':'icc','bytes':list(custom)})
+        with self.assertRaisesRegex(ValueError,'primaries'):
+            rb.verify_profile(custom,{'kind':'linear_srgb'})
         tags=rb.icc_tags(linear)
         curve=b'para'+b'\0'*4+struct.pack('>HH',3,0)+b''.join(struct.pack('>i',round(v*65536)) for v in (2.4,1/1.055,.055/1.055,1/12.92,.04045))
         for channel in b'rgb':tags[bytes([channel])+b'TRC']=curve
@@ -129,7 +176,7 @@ class NumericContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'transfer'):
             rb.verify_profile(linear,{'kind':'srgb'})
         with self.assertRaisesRegex(ValueError,'transfer'):
-            rb.verify_profile(ref.matrix_profile(2),{'kind':'linear_srgb'})
+            rb.verify_profile(builtin_profile(2),{'kind':'linear_srgb'})
         bad=bytearray(linear)
         count=int.from_bytes(bad[128:132],'big')
         for i in range(count):
@@ -144,7 +191,7 @@ class NumericContracts(unittest.TestCase):
                     size={'mode':'original'},alpha={'mode':'composite','linear_rgb':[1,1,1]} if composite else {'mode':'preserve'})
 
     def info(self,fmt='png',bits=8,width=1,height=1,composite=False):
-        return dict(format=fmt,icc=ref.matrix_profile(),packets=[],transport_guids=[],sha256='0'*64,
+        return dict(format=fmt,icc=builtin_profile(),packets=[],transport_guids=[],sha256='0'*64,
                     tags={274:1,256:width,257:height,40962:width,40963:height},
                     metadata={'bits':bits,'sample_format':3 if bits==32 else 1,'extrasamples':[] if composite else [2]})
 
