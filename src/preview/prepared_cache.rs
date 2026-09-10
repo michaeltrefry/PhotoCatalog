@@ -29,6 +29,11 @@ pub(crate) struct SourceInstance {
     /// Older persisted jobs lack this field and safely miss current preparation.
     #[serde(default)]
     native_change_stamp: Option<i128>,
+    /// Windows timestamps are not content proof. Only admitted workers hash
+    /// sources; the actor uses metadata solely to select a possible cache hit.
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_digest: Option<String>,
 }
 
 impl SourceInstance {
@@ -36,6 +41,73 @@ impl SourceInstance {
         Ok(blake3::hash(&serde_json::to_vec(self)?)
             .to_hex()
             .to_string())
+    }
+    pub(crate) fn same_observed_metadata(&self, other: &Self) -> bool {
+        #[cfg(windows)]
+        {
+            let mut left = self.clone();
+            let mut right = other.clone();
+            left.content_digest = None;
+            right.content_digest = None;
+            left == right
+        }
+        #[cfg(not(windows))]
+        {
+            self == other
+        }
+    }
+    /// Retain the returned Windows lease through native work and final receipt.
+    /// Hashing runs only in the admitted child, never on the foreground actor.
+    pub(crate) fn read_for_worker(path: &Path, max_bytes: u64) -> Result<(Self, Option<File>)> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1 | 4)
+                .custom_flags(0x0020_0000)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.file_type().is_file(),
+                "prepared source is not an ordinary file"
+            );
+            if metadata.len() > max_bytes {
+                return Err(crate::edit::RenderError::ResourceLimit {
+                    resource: "original bytes",
+                    required: metadata.len(),
+                    limit: max_bytes,
+                }
+                .into());
+            }
+            let mut instance = Self::read(path)?;
+            ensure!(
+                crate::storage_volume::held_object_key(&file)?
+                    == (instance.device, instance.object),
+                "prepared source path changed before hashing"
+            );
+            let mut remaining = metadata.len();
+            let mut hash = blake3::Hasher::new();
+            let mut buffer = [0; 65536];
+            while remaining > 0 {
+                let count = usize::try_from(remaining.min(buffer.len() as u64))?;
+                file.read_exact(&mut buffer[..count])?;
+                hash.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            ensure!(
+                file.read(&mut buffer[..1])? == 0
+                    && instance.same_observed_metadata(&Self::read(path)?),
+                "prepared source changed during hashing"
+            );
+            instance.content_digest = Some(hash.finalize().to_hex().to_string());
+            Ok((instance, Some(file)))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = max_bytes;
+            Ok((Self::read(path)?, None))
+        }
     }
     pub(crate) fn read(path: &Path) -> Result<Self> {
         let canonical = fs::canonicalize(path)?;
@@ -75,6 +147,8 @@ impl SourceInstance {
             created: metadata.created().ok(),
             changed,
             native_change_stamp,
+            #[cfg(windows)]
+            content_digest: None,
         })
     }
 }
@@ -193,7 +267,11 @@ impl PreparedCache {
         let Some(entry) = self.entries.get_mut(&key) else {
             return Ok(None);
         };
-        if entry.value.source != SourceInstance::read(source)? {
+        if !entry
+            .value
+            .source
+            .same_observed_metadata(&SourceInstance::read(source)?)
+        {
             return Ok(None);
         }
         // Verification runs in the child under the worker allowance, not on the
@@ -343,12 +421,56 @@ mod tests {
 #[cfg(test)]
 mod source_change_tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn worker_digest_admission_and_lease_preserve_legacy_cache_safety() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        fs::write(&path, b"original").unwrap();
+        let err = SourceInstance::read_for_worker(&path, 7).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<crate::edit::RenderError>(),
+            Some(crate::edit::RenderError::ResourceLimit {
+                required: 8,
+                limit: 7,
+                ..
+            })
+        ));
+        let writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let err = SourceInstance::read_for_worker(&path, 8).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().raw_os_error(),
+            Some(32)
+        );
+        drop(writer);
+        let (verified, lease) = SourceInstance::read_for_worker(&path, 8).unwrap();
+        let candidate = SourceInstance::read(&path).unwrap();
+        assert!(verified.same_observed_metadata(&candidate));
+        assert_ne!(
+            verified, candidate,
+            "unhashed legacy/candidate cannot authorize a worker hit"
+        );
+        assert_eq!(
+            verified.content_digest.as_deref(),
+            Some(blake3::hash(b"original").to_hex().as_str())
+        );
+        assert_eq!(
+            fs::write(&path, b"modified").unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        drop(lease);
+        fs::write(&path, b"modified").unwrap();
+        let (new, _lease) = SourceInstance::read_for_worker(&path, 8).unwrap();
+        assert_ne!(verified.content_digest, new.content_digest);
+    }
     #[test]
     fn same_size_source_write_with_restored_mtime_invalidates_prepared_identity() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("source.png");
         fs::write(&path, b"original").unwrap();
-        let before = SourceInstance::read(&path).unwrap();
+        let (before, lease) = SourceInstance::read_for_worker(&path, 8).unwrap();
+        drop(lease);
         fs::write(&path, b"modified").unwrap();
         fs::OpenOptions::new()
             .write(true)
@@ -356,12 +478,15 @@ mod source_change_tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(before.modified))
             .unwrap();
-        let after = SourceInstance::read(&path).unwrap();
+        let (after, _lease) = SourceInstance::read_for_worker(&path, 8).unwrap();
         assert_eq!(before.device, after.device);
         assert_eq!(before.object, after.object);
         assert_eq!(before.bytes, after.bytes);
         assert_eq!(before.modified, after.modified);
+        #[cfg(not(windows))]
         assert_ne!(before.native_change_stamp, after.native_change_stamp);
+        #[cfg(windows)]
+        assert_ne!(before.content_digest, after.content_digest);
         assert_ne!(before, after);
         let mut legacy = serde_json::to_value(&before).unwrap();
         legacy

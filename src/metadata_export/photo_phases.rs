@@ -25,8 +25,9 @@ fn stamp(file: &File) -> Result<Stamp> {
     })
 }
 
-/// Opaque OS content-change value read from this exact held handle. Never
-/// substitute mtime or creation time when the OS query is unsupported.
+/// OS change metadata from the exact held handle. On Windows this is not a
+/// monotonic content counter: callers requiring content stability must retain
+/// a deny-write handle. Never substitute mtime or creation time on query failure.
 pub(crate) fn content_change_stamp(file: &File) -> Result<i128> {
     #[cfg(unix)]
     let changed = {
@@ -67,10 +68,8 @@ pub(crate) fn content_change_stamp(file: &File) -> Result<i128> {
             return Err(io::Error::last_os_error().into());
         }
         let info = unsafe { info.assume_init() };
-        ensure!(
-            info.change != 0,
-            "filesystem does not expose a content-change stamp"
-        );
+        // Zero is legitimate on filesystems without this timestamp. Windows
+        // content authority comes from the held deny-write lease, not this value.
         i128::from(info.change)
     };
     Ok(changed)
@@ -78,7 +77,8 @@ pub(crate) fn content_change_stamp(file: &File) -> Result<i128> {
 
 /// In-memory evidence only: callers cannot construct, deserialize or reset the
 /// stamp. A full bounded hash is tied to a retained handle and exact current path.
-/// This is not a lock on external writers; every namespace action revalidates it.
+/// Windows retains a deny-write lease (read/delete sharing remains enabled).
+/// Unix uses change metadata. Every namespace action revalidates the path.
 pub struct VerifiedFile {
     file: File,
     path: PathBuf,
@@ -95,10 +95,25 @@ impl VerifiedFile {
         max_bytes: u64,
         checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
     ) -> Result<Self> {
+        #[cfg(not(windows))]
         let file = open_regular(path)?;
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(1 | 4) // FILE_SHARE_READ | FILE_SHARE_DELETE; never WRITE.
+                .custom_flags(0x0020_0000)
+                .open(path)?;
+            ensure!(
+                file.metadata()?.file_type().is_file(),
+                "not an ordinary file"
+            );
+            file
+        };
         let before = stamp(&file)?;
-        // The outer held handle/change stamp also catches same-length in-place
-        // writes whose mtime was restored during stream_revision's scan.
+        // The held Windows share mode prevents writes throughout the scan. Unix
+        // change metadata also detects in-place writes with restored mtime.
         let revision = stream_revision(path, max_bytes, checkpoint, None)?;
         ensure!(
             revision.identity == super::held_file_identity(&file)? && stamp(&file)? == before,
@@ -379,6 +394,17 @@ impl PhotoPublication {
         &mut self,
         checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
     ) -> Result<ExportReceipt> {
+        #[cfg(windows)]
+        {
+            // Outside catalog authority only. FlushFileBuffers requires a write
+            // handle, incompatible with our deny-write proofs. Retire those
+            // proofs, flush, then fully verify both names before re-admission.
+            self.payload = None;
+            self.destination = None;
+            let start = Instant::now();
+            sync_regular(&self.seal.snapshot.destination)?;
+            self.timings.durability_ms += start.elapsed().as_secs_f64() * 1000.;
+        }
         let start = Instant::now();
         self.payload = Some(VerifiedFile::read_with_checkpoint(
             &self.directory.join("payload"),
@@ -402,6 +428,7 @@ impl PhotoPublication {
         );
         self.destination = Some(destination);
         let start = Instant::now();
+        #[cfg(not(windows))]
         sync_regular(&self.seal.snapshot.destination)?;
         sync_directory(self.seal.snapshot.destination.parent().unwrap())?;
         self.timings.durability_ms += start.elapsed().as_secs_f64() * 1000.;
@@ -456,6 +483,18 @@ impl PhotoPublication {
             .context("missing capture proof")?
             .revision()
             .clone();
+        #[cfg(windows)]
+        {
+            // Same outside-authority barrier as verify_installed. Any retained
+            // name may alias the restored object; none may keep write exclusion
+            // while FlushFileBuffers opens it. Fresh hashes bind expected below.
+            self.payload = None;
+            self.captured = None;
+            self.destination = None;
+            let start = Instant::now();
+            sync_regular(&self.seal.snapshot.destination)?;
+            self.timings.durability_ms += start.elapsed().as_secs_f64() * 1000.;
+        }
         let start = Instant::now();
         let captured = VerifiedFile::read(
             &self.directory.join("original"),
@@ -473,6 +512,7 @@ impl PhotoPublication {
         self.captured = Some(captured);
         self.destination = Some(destination);
         let start = Instant::now();
+        #[cfg(not(windows))]
         sync_regular(&self.seal.snapshot.destination)?;
         sync_directory(self.seal.snapshot.destination.parent().unwrap())?;
         self.timings.durability_ms += start.elapsed().as_secs_f64() * 1000.;

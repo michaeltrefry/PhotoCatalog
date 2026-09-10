@@ -179,7 +179,7 @@ fn open_original(path: &Path, limit: u64) -> Result<File, RenderError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x0020_0000);
+        options.custom_flags(0x0020_0000).share_mode(1 | 4);
     }
     let file = options.open(path)?;
     let opened = file.metadata()?;
@@ -228,8 +228,9 @@ fn decode_original_with_hook(
         ));
     }
     cancel.check()?;
-    // Keep the same full object and non-restorable change stamp across every
-    // hash and native path-based decode. Independent equal hashes cannot detect
+    // Keep the same full object across every hash and native path-based decode:
+    // Windows denies writable opens/mappings; Unix binds change metadata.
+    // Independent equal hashes cannot detect
     // a temporary rewrite whose original bytes/mtime are restored afterwards.
     let held = open_original(request.path, limits.max_encoded_bytes)?;
     let before = original_stamp(&held)?;
@@ -715,18 +716,48 @@ mod fingerprint_tests {
             if after {
                 decoded = true;
             }
-            fs::write(&path, if after { &original } else { &replacement })?;
-            OpenOptions::new()
-                .write(true)
-                .open(&path)?
-                .set_times(fs::FileTimes::new().set_modified(modified))?;
+            #[cfg(windows)]
+            {
+                let err =
+                    fs::write(&path, if after { &original } else { &replacement }).unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(32));
+                assert_eq!(fs::read(&path).unwrap(), original);
+            }
+            #[cfg(not(windows))]
+            {
+                fs::write(&path, if after { &original } else { &replacement })?;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)?
+                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+            }
             Ok(())
         });
         assert!(
             decoded,
             "fixture must reach and complete actual native image decoding"
         );
+        #[cfg(not(windows))]
         assert!(matches!(result, Err(RenderError::SourceChanged)));
+        #[cfg(windows)]
+        {
+            let rendered = result.unwrap();
+            assert!(rendered.pixels()[0][0] > rendered.pixels()[0][1]);
+            // Once the decode lease is gone, normal editing is allowed and the
+            // unchanged expected fingerprint rejects the modified source.
+            fs::write(&path, &replacement).unwrap();
+            assert!(matches!(
+                decode_original(request(), DecodeLimits::default(), &()),
+                Err(RenderError::SourceChanged)
+            ));
+            fs::write(&path, &original).unwrap();
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
         assert_eq!(

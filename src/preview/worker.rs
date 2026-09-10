@@ -677,7 +677,8 @@ fn run_worker() -> Result<()> {
             }
             std::process::exit(74);
         })?;
-    let instance = SourceInstance::read(&source)?;
+    let (instance, _source_write_lease) =
+        SourceInstance::read_for_worker(&source, request.decode_limits.max_encoded_bytes)?;
     let mut prepared_receipt = None;
     let mut prepared_reused = false;
     let mut edit_input = None;
@@ -810,7 +811,7 @@ fn run_worker() -> Result<()> {
         });
     }
     ensure!(
-        SourceInstance::read(&source)? == instance,
+        instance.same_observed_metadata(&SourceInstance::read(&source)?),
         "original file instance changed during rendering"
     );
     if request.edit.is_none() {
