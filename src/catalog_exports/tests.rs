@@ -225,6 +225,182 @@ fn accepted_overwrite(
     Ok((j, work, sealed))
 }
 
+// Construct the durable, authority-bound state an older renderer could have
+// produced. These are synthetic bookkeeping fixtures, not old codec execution.
+fn legacy_renderer_work(c: &mut Catalog, temp: &Path) -> Result<(ExportJob, ExportWork)> {
+    let destination = temp.join("legacy-export.png");
+    std::fs::write(&destination, b"old destination bytes")?;
+    let job = c.begin_photo_export()?;
+    let mut target = target(destination);
+    target.overwrite = true;
+    c.append_photo_export(&job.id, 0, &target, &output(), 1024, 1024)?;
+    c.seal_photo_export_job(&job.id, 1)?;
+    let mut work = c.claim_photo_export(&job.id)?.unwrap();
+    work.plan.renderer_identity = "photocatalog-photo-export-1:synthetic-retired-renderer".into();
+    let encoded = serde_json::to_string(&work.plan)?;
+    work.authority = blake3::hash(encoded.as_bytes()).to_hex().to_string();
+    c.db.execute(
+        "UPDATE photo_export_items SET plan=?1,authority=?2 WHERE job=?3 AND sequence=?4",
+        params![encoded, work.authority, work.job, work.sequence],
+    )?;
+    Ok((job, work))
+}
+
+fn retain_legacy_seal(
+    c: &mut Catalog,
+    work: &ExportWork,
+    sealed: &SealedPhotoExport,
+    with_intent: bool,
+) -> Result<()> {
+    let intent = with_intent
+        .then(|| {
+            serde_json::to_string(&PublicationIntent {
+                version: 1,
+                token: uuid::Uuid::new_v4().to_string(),
+                authority: work.authority.clone(),
+            })
+        })
+        .transpose()?;
+    c.db.execute(
+        "UPDATE photo_export_items SET state='sealed',seal=?1,publication=?2 WHERE job=?3 AND sequence=?4",
+        params![serde_json::to_string(sealed)?, intent, work.job, work.sequence],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn retired_renderer_cannot_accept_new_seal_and_retains_original_evidence() -> Result<()> {
+    let (temp, mut c, original) = fixture()?;
+    let (job, work) = legacy_renderer_work(&mut c, temp.path())?;
+    let sealed = seal(temp.path(), &work)?;
+    let error = c.accept_photo_export_seal(&work, &sealed).unwrap_err();
+    assert!(error.to_string().contains("export renderer changed"));
+    assert_eq!(c.photo_export_items(&job.id, 0, 1)?[0].state, "rendering");
+    assert_eq!(c.photo_export_job(&job.id)?.completed, 0);
+    assert_eq!(
+        metadata_export::read_photo_seal(&work.plan.destination, &work.authority)?,
+        sealed
+    );
+    assert_eq!(
+        std::fs::read(&work.plan.destination.destination)?,
+        b"old destination bytes"
+    );
+    assert_eq!(std::fs::read(original)?, b"source bytes unchanged");
+    assert!(!sealed.recovery_directory().join("original").exists());
+    Ok(())
+}
+
+#[test]
+fn retired_renderer_cannot_install_retained_seal_but_capture_can_be_restored() -> Result<()> {
+    for captured in [false, true] {
+        let (temp, mut c, original) = fixture()?;
+        let (job, work) = legacy_renderer_work(&mut c, temp.path())?;
+        let sealed = seal(temp.path(), &work)?;
+        retain_legacy_seal(&mut c, &work, &sealed, captured)?;
+        if captured {
+            let mut old_publication = metadata_export::PhotoPublication::prepare(&sealed)?;
+            old_publication.capture()?;
+            old_publication.verify_capture()?;
+        }
+        drop(c);
+        let mut c = Catalog::open(temp.path().join("catalog"))?;
+        let error = c.publish_photo_export_item(&job.id, 1).unwrap_err();
+        assert!(error.to_string().contains("export renderer changed"));
+        assert_eq!(c.photo_export_items(&job.id, 0, 1)?[0].state, "sealed");
+        assert_eq!(c.photo_export_job(&job.id)?.completed, 0);
+        assert_eq!(c.photo_export_plan(&job.id, 1)?.1, work.authority);
+        assert_eq!(
+            metadata_export::read_photo_seal(&work.plan.destination, &work.authority)?,
+            sealed
+        );
+        if captured {
+            assert!(!work.plan.destination.destination.exists());
+            assert_eq!(
+                std::fs::read(sealed.recovery_directory().join("original"))?,
+                b"old destination bytes"
+            );
+            let receipt = c.restore_photo_export_item(&job.id, 1)?;
+            assert_eq!(receipt.state, metadata_export::ExportState::Restored);
+        } else {
+            assert!(!sealed.recovery_directory().join("original").exists());
+            let intent: Option<String> = c.db.query_row(
+                "SELECT publication FROM photo_export_items WHERE job=?1 AND sequence=1",
+                [&job.id],
+                |row| row.get(0),
+            )?;
+            assert!(
+                intent.is_none(),
+                "stale renderer committed a new publication intent"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&work.plan.destination.destination)?,
+            b"old destination bytes"
+        );
+        assert_eq!(std::fs::read(original)?, b"source bytes unchanged");
+    }
+    Ok(())
+}
+
+#[test]
+fn retired_renderer_installed_output_finalizes_once_without_new_publication() -> Result<()> {
+    for via_restore in [false, true] {
+        let (temp, mut c, original) = fixture()?;
+        let (job, work) = legacy_renderer_work(&mut c, temp.path())?;
+        let sealed = seal(temp.path(), &work)?;
+        retain_legacy_seal(&mut c, &work, &sealed, true)?;
+        // Simulate the old process completing its authorized link, then stopping
+        // before catalog finalization. The current renderer never performs a link.
+        {
+            let mut old_publication = metadata_export::PhotoPublication::prepare(&sealed)?;
+            old_publication.capture()?;
+            old_publication.verify_capture()?;
+            old_publication.link()?;
+        }
+        let installed =
+            metadata_export::VerifiedFile::read(&work.plan.destination.destination, 1024)?;
+        let before = installed.revision().clone();
+        drop(installed);
+        c.cancel_photo_export_job(&job.id)?;
+        std::fs::rename(original, temp.path().join("offline-original"))?;
+        drop(c);
+        let mut c = Catalog::open(temp.path().join("catalog"))?;
+        let receipt = if via_restore {
+            c.restore_photo_export_item(&job.id, 1)?
+        } else {
+            c.publish_photo_export_item_with_hook(&job.id, 1, |phase| {
+                ensure!(
+                    !matches!(
+                        phase,
+                        PhotoExportBoundary::IntentCommitted
+                            | PhotoExportBoundary::Captured
+                            | PhotoExportBoundary::Linked
+                    ),
+                    "installed legacy output attempted new publication"
+                );
+                Ok(())
+            })?
+            .0
+        };
+        assert_eq!(receipt.state, metadata_export::ExportState::Published);
+        assert_eq!(c.photo_export_items(&job.id, 0, 1)?[0].state, "published");
+        assert_eq!(c.photo_export_job(&job.id)?.state, "canceled");
+        assert_eq!(c.photo_export_job(&job.id)?.completed, 1);
+        c.publish_photo_export_item(&job.id, 1)?;
+        assert_eq!(c.photo_export_job(&job.id)?.completed, 1);
+        assert_eq!(
+            metadata_export::VerifiedFile::read(&work.plan.destination.destination, 1024)?
+                .revision(),
+            &before
+        );
+        assert_eq!(
+            std::fs::read(sealed.recovery_directory().join("original"))?,
+            b"old destination bytes"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn queued_export_rechecks_same_inode_restored_mtime_and_atomic_replacement() -> Result<()> {
     use std::{fs, sync::mpsc, time::Duration};

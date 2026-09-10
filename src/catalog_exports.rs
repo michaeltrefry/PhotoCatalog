@@ -208,6 +208,13 @@ fn checked_plan(bytes: &str, authority: &str) -> Result<PhotoExportPlan> {
     );
     Ok(plan)
 }
+fn require_current_renderer(plan: &PhotoExportPlan) -> Result<()> {
+    ensure!(
+        plan.renderer_identity == crate::photo_render::output_renderer_identity(),
+        "export renderer changed; create a new export plan before publishing new output"
+    );
+    Ok(())
+}
 fn verify_original(
     plan: &PhotoExportPlan,
     checkpoint: &mut dyn FnMut(u64) -> std::io::Result<()>,
@@ -792,6 +799,7 @@ impl Catalog {
         mut hook: impl FnMut(PhotoExportBoundary) -> Result<()>,
     ) -> Result<()> {
         checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
+        require_current_renderer(&work.plan)?;
         ensure!(
             seal.authority_digest == work.authority
                 && seal.snapshot == work.plan.destination
@@ -876,6 +884,9 @@ impl Catalog {
                 "installed payload has no committed intent"
             );
         } else {
+            // Renderer changes revoke permission to install an old derivative,
+            // but must not strand finalization of an already installed object.
+            require_current_renderer(&plan)?;
             let start = std::time::Instant::now();
             let original = verify_original(&plan, &mut |_| {
                 hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)
