@@ -7,8 +7,10 @@ repair also passed its 18 affected tests. Layout measurement and independent
 reconciliation passed, selecting Flat. Current-renderer quality and the 30-source
 worker-memory calibration are complete. Retained navigation, integrated 10M
 page/RSS qualification and final cross-platform delivery remain pending. The
-Windows worker recovery repair is separately source-reviewed; its runtime CI
-must pass before S6 is complete. See [the acceptance ledger](PREVIEW_ACCEPTANCE_LEDGER.md)
+Windows worker recovery repair at `0a9daf610fa17e4f0a655e43549207fbd4d2ad64`
+passed all four hosted CI jobs in run `34425527698`, including the parent audit
+of eight affected tests and public RAW validation. The subsequent 2164 MiB
+default change still requires its final affected checks. See [the acceptance ledger](PREVIEW_ACCEPTANCE_LEDGER.md)
 and [layout evidence](PREVIEW_LAYOUT_RESULTS.md) for exact evidence boundaries.
 
 The retained-read queue passed local correctness; its fixed measured campaign remains pending. `queue_read`,
@@ -127,7 +129,7 @@ filesystem was filled. The import-interleaving regression also consumes a real
 retained foreground read while the native import reservation remains active and
 keeps that caller-owned view alive across native foreground preemption/recovery.
 These tests passed in the final local correctness gate; the repaired Windows
-paths still require their own terminal CI evidence.
+paths also passed terminal hosted CI run `34425527698`.
 
 Source admission no longer relies only on configured original-root hints. Direct
 render requests and import submissions resolve each actual source and reject
@@ -150,6 +152,18 @@ JSON-escaped backslashes. The three writable cache/manifest roots must be separa
 and must not overlap originals. The original-root list points at the user's
 existing storage and does not move originals. An existing store retains its
 layout; changing the JSON layout is rejected rather than silently repacking it.
+
+Place the manifest and retained thumbnails in durable application data, preferably
+on a local SSD. Offline coverage must not depend on an OS-purgeable cache
+location; only the evictable large-preview tier belongs there. Use a separate,
+catalog-specific parent namespace with sibling manifest, retained and large
+roots, so catalogs do not share ownership markers or overwrite each other's
+state. Choose writable native paths appropriate to each operating system.
+
+For an existing store, persisted quotas and relocated tier locations are
+authoritative. Use `cache-budgets` to change quotas and the `cache-relocate-begin`
+and `cache-relocate-step` workflow to change tier locations. Editing a stale
+configuration JSON alone does not override those durable choices.
 
 The illustrative retained quota is 64 GiB (`68719476736` encoded bytes), and the
 large-preview quota is 16 GiB (`17179869184` encoded bytes). These are explicit
