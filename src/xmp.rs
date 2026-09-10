@@ -723,6 +723,132 @@ pub fn reconcile_fields(base: &[u8], fields: &[(String, Option<Vec<u8>>)]) -> Re
     Ok(output)
 }
 
+/// Technical metadata for physically rendered pixels. This explicit derivative
+/// policy removes active Adobe development instructions, old thumbnails and
+/// source encoding declarations. Retained source packets are never modified.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivativeFields {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u8,
+    pub bits_per_sample: u8,
+    pub mime_type: String,
+    pub profile_name: String,
+    pub is_srgb: bool,
+}
+
+pub fn rendered_derivative(base: &[u8], fields: &DerivativeFields) -> Result<Vec<u8>> {
+    const TIFF: &str = "http://ns.adobe.com/tiff/1.0/";
+    const EXIF: &str = "http://ns.adobe.com/exif/1.0/";
+    const PHOTOSHOP: &str = "http://ns.adobe.com/photoshop/1.0/";
+    const CRS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
+    ensure!(
+        fields.width > 0
+            && fields.height > 0
+            && (3..=4).contains(&fields.channels)
+            && [8, 16, 32].contains(&fields.bits_per_sample),
+        "invalid derivative dimensions/depth"
+    );
+    ensure!(
+        ["image/jpeg", "image/png", "image/tiff"].contains(&fields.mime_type.as_str()),
+        "unsupported derivative MIME type"
+    );
+    ensure!(
+        !fields.profile_name.is_empty() && fields.profile_name.len() <= 1024,
+        "derivative profile name limit"
+    );
+    let (subject, mut props) = properties(base)?;
+    let replaced = |namespace: &str, name: &str| -> bool {
+        namespace == CRS
+            || (namespace == TIFF
+                && [
+                    "ImageWidth",
+                    "ImageLength",
+                    "Orientation",
+                    "BitsPerSample",
+                    "SamplesPerPixel",
+                    "PhotometricInterpretation",
+                    "Compression",
+                    "PlanarConfiguration",
+                ]
+                .contains(&name))
+            || (namespace == EXIF
+                && [
+                    "PixelXDimension",
+                    "PixelYDimension",
+                    "ColorSpace",
+                    "ComponentsConfiguration",
+                    "CompressedBitsPerPixel",
+                ]
+                .contains(&name))
+            || (namespace == PHOTOSHOP && name == "ICCProfile")
+            || (namespace == DC && name == "format")
+            || (namespace == XMP && ["Thumbnails", "CreatorTool"].contains(&name))
+            || (namespace == "http://ns.adobe.com/xmp/note/" && name == "HasExtendedXMP")
+    };
+    props.retain(|(namespace, name), _| !replaced(namespace, name));
+    let preserved = props.clone();
+    let mut edits = Vec::new();
+    for (namespace, path, value) in [
+        (TIFF, "ImageWidth", fields.width.to_string()),
+        (TIFF, "ImageLength", fields.height.to_string()),
+        (TIFF, "Orientation", "1".into()),
+        (TIFF, "SamplesPerPixel", fields.channels.to_string()),
+        (TIFF, "PhotometricInterpretation", "2".into()),
+        (EXIF, "PixelXDimension", fields.width.to_string()),
+        (EXIF, "PixelYDimension", fields.height.to_string()),
+        (
+            EXIF,
+            "ColorSpace",
+            if fields.is_srgb { "1" } else { "65535" }.into(),
+        ),
+        (PHOTOSHOP, "ICCProfile", fields.profile_name.clone()),
+        (DC, "format", fields.mime_type.clone()),
+        (XMP, "CreatorTool", "PhotoCatalog".into()),
+    ] {
+        edits.push(Edit::Set {
+            namespace: namespace.into(),
+            path: path.into(),
+            value,
+        });
+    }
+    for _ in 0..fields.channels {
+        edits.push(Edit::Append {
+            namespace: TIFF.into(),
+            path: "BitsPerSample".into(),
+            value: fields.bits_per_sample.to_string(),
+            ordered: true,
+        });
+    }
+    let mut technical_base = parse(&empty_packet()?)?;
+    technical_base.set_name(&subject)?;
+    let technical = apply_edits(&serialize(&technical_base)?, &edits)?;
+    let (_, new) = properties(&technical)?;
+    for (key, fragment) in new {
+        props.insert(key, fragment);
+    }
+    let output = assemble(&props, &subject)?;
+    let (actual_subject, actual) = properties(&output)?;
+    ensure!(
+        actual_subject == subject && actual.len() == props.len(),
+        "derivative changed RDF subject or property count"
+    );
+    for (key, expected) in preserved {
+        let observed = actual
+            .get(&key)
+            .context("derivative lost unrelated metadata")?;
+        let before = BTreeMap::from([(key.clone(), expected)]);
+        let after = BTreeMap::from([(key, observed.clone())]);
+        ensure!(
+            canonical(&parse(&assemble(&before, &subject)?)?)?
+                == canonical(&parse(&assemble(&after, &subject)?)?)?,
+            "derivative changed unrelated XMP semantics"
+        );
+    }
+    Ok(output)
+}
+
 pub(crate) fn merge_jpeg(main: &[u8], extended: &[u8]) -> Result<Vec<u8>> {
     let (name, mut props) = properties(main)?;
     let (other, more) = properties(extended)?;

@@ -9,6 +9,7 @@ pub struct EditTarget {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyJob {
+    pub sequence: i64,
     pub id: String,
     pub state: String,
     pub total: i64,
@@ -25,7 +26,7 @@ pub struct CopyItem {
 
 fn job(db: &Connection, id: &str) -> Result<CopyJob> {
     Ok(db.query_row(
-        "SELECT state,total,completed FROM edit_copy_jobs WHERE id=?1",
+        "SELECT state,total,completed,sequence FROM edit_copy_jobs WHERE id=?1",
         [id],
         |r| {
             Ok(CopyJob {
@@ -33,6 +34,7 @@ fn job(db: &Connection, id: &str) -> Result<CopyJob> {
                 state: r.get(0)?,
                 total: r.get(1)?,
                 completed: r.get(2)?,
+                sequence: r.get(3)?,
             })
         },
     )?)
@@ -158,6 +160,14 @@ impl Catalog {
 
     pub fn edit_copy_job(&self, id: &str) -> Result<CopyJob> {
         job(&self.db, id)
+    }
+
+    pub fn edit_copy_jobs(&self, after: i64, limit: usize) -> Result<Vec<CopyJob>> {
+        ensure!(
+            after >= 0 && (1..=200).contains(&limit),
+            "copy job page bounds"
+        );
+        Ok(self.db.prepare("SELECT sequence,id,state,total,completed FROM edit_copy_jobs WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?.query_map(params![after,limit as i64],|r|Ok(CopyJob{sequence:r.get(0)?,id:r.get(1)?,state:r.get(2)?,total:r.get(3)?,completed:r.get(4)?}))?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn edit_copy_items(&self, id: &str, after: i64, limit: usize) -> Result<Vec<CopyItem>> {

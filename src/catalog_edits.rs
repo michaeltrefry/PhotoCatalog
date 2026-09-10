@@ -41,7 +41,8 @@ CREATE TABLE edit_changes(
  UNIQUE(asset_id,variant_id,revision),
  FOREIGN KEY(asset_id,variant_id) REFERENCES edit_variants(asset_id,id));
 CREATE TABLE edit_copy_jobs(
- id TEXT PRIMARY KEY, source TEXT NOT NULL, recipe BLOB NOT NULL, digest TEXT NOT NULL,
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+ source TEXT NOT NULL, recipe BLOB NOT NULL, digest TEXT NOT NULL,
  groups_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('building','queued','complete','canceled')),
  total INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE edit_copy_items(
