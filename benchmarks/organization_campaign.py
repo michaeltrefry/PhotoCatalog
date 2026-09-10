@@ -20,6 +20,7 @@ import os
 import stat
 
 PROTOCOL = 2  # Current native receipt; synthetic fixture row marker stays 1.
+FIXTURE_PROTOCOL = 1
 DRIVER_PROTOCOL = 5
 CURRENT_SCHEMA = 6
 EDIT_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
@@ -143,7 +144,7 @@ def row_valid(row):
             and row["rating"] == i % 6 and row["flag"] == ["reject", "pick", "unflagged"][i % 3]
             and row["label"] == ("red" if i % 2 == 0 else "blue")
             and row["conflicts"] == (["gps_latitude"] if i % 97 == 0 else [])
-            and row["provenance"] == {"synthetic_fixture": PROTOCOL})
+            and row["provenance"] == {"synthetic_fixture": FIXTURE_PROTOCOL})
 
 
 
