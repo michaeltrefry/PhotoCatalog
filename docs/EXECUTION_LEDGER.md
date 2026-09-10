@@ -15,7 +15,7 @@ sc-22836–sc-22842 are verified Done. S8 editing/export implementation and qual
 | sc-22840 | Done | [PR #6](https://github.com/michaeltrefry/PhotoCatalog/pull/6), merged 60fc33c | Controlled APFS detach/remount/reorganization/replacement/undo; Linux bind mount and Windows volume GUID/junction proof; PR CI 34394610454 and main CI 34395883109 all four jobs SUCCESS; Shortcut Done read-back | Complete |
 | sc-22841 | Done | [PR #8](https://github.com/michaeltrefry/PhotoCatalog/pull/8), merged789a39d | Reviewed preview defaults and full30-file memory/quality, layout, navigation and integrated10M evidence; PR CI34430709720 and main CI34432335579 SUCCESS; Shortcut Done read-back | Complete |
 | sc-22842 | Done | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7), mergede68d375 | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md); reviewed scale/actual-overlap evidence; main CI34418548263 SUCCESS; Shortcut Done read-back | Complete |
-| sc-22843 | In Progress | codex/sc-22843-edits; persistent recipes/variants, copy jobs, edited previews, exact batch export |370 tests passed at45df945 (33 suites,3 intentional ignored); strict all-target Clippy/package fmt PASS; probe compile at a5ac9d6;42 Python checker contracts at6bdb95f. Correctness evidence only | Complete full corpus/100MP/performance qualification, independent review and batched PR/three-platform CI/merge |
+| sc-22843 | In Progress | codex/sc-22843-edits; persistent recipes/variants, copy jobs, edited previews, exact batch export | 377 native tests passed at1ded7b6 (34 suites,3 intentional ignored); strict all-target Clippy/package fmt and debug/release builds PASS;122 Python contracts passed at809e434. Correctness evidence only | Complete corrective service smoke, full corpus/100MP/performance qualification, independent review and batched PR/three-platform CI/merge |
 | sc-22844 | In Progress | codex/sc-22844-page-memory; frozen v5 main inspection | Recovery adoption and five main slices independently verified: twelve completed members/7,906,054 rows; thirteenth606,924 retained/readback partial; latest571 command results pass and observed processes reaped | Continue bounded main slices; independently admit auxiliary/path/packet phases and current-family ambiguity review before migration |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
@@ -183,10 +183,24 @@ derivative preservation.
 JPEG with a large selected XMP packet exposed a product preservation defect:
 the pinned SDK's extended packet loses the named RDF subject. The strict checker
 and importer reject the resulting subject mismatch. Encoder transport correction
-and stale-renderer publication guards are in progress. Two tiny overlap cases
+`afaa4ca` preserves the named subject and recomputes the extension digest;
+seven native export tests pass, including full export/reimport preservation and
+rejection of a changed extension subject. Stale-renderer publication guards
+`1ded7b6` pass 17 native tests while retaining finalization of already-installed
+outputs. Both changes passed independent source review. Two tiny overlap cases
 still lack a sufficiently long-lived natural worker. All v4 known processes are
 absent; no performance award follows from this correctness smoke. Full campaign
-preparation also awaits scalable bounded outer supervision and funded host logs.
+preparation still awaits final source binding and an explicit phase admission.
+
+Bounded outer supervision and host-log funding are implemented in `ac373d1` and
+`a649807`, with a separate preparation limit. Final review found late zero-exit
+acceptance, repeated zombie accounting, and unresolved ancestry reporting;
+`809e434` fixes all three. The integrated Python gate passes 122 tests with no
+skips, and independent exact-source review passes. The full native gate passes
+377 tests with three intentional skips; strict Clippy and both debug and release
+builds pass. These results qualify the source checks, not the unstarted full
+campaign. The next service smoke must use the corrected native binaries and
+final supervisor helpers; v5 remains an unexecuted source proposal.
 
 S9 supplementary funding control `90a0f1a` passed 12 synthetic tests and parent
 independent source review. It preserves the frozen inspector and adopted evidence
