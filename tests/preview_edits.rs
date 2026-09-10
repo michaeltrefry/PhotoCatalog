@@ -250,7 +250,9 @@ fn prepared_cache_reuses_only_same_source_instance_and_recovers_corruption_as_mi
             };
             assert_eq!(
                 receipt.identity.source_fingerprint,
-                photocatalog::fingerprint(&originals.join("pixel.png")).unwrap()
+                blake3::hash(&std::fs::read(originals.join("pixel.png")).unwrap())
+                    .to_hex()
+                    .to_string()
             );
             assert_eq!(receipt.identity.longest_edge, 1600);
             assert_eq!(receipt.identity.original_dimensions, (24, 16));
