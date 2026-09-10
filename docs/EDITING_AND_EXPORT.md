@@ -56,15 +56,20 @@ Cache keys include variant, monotonic edit revision, recipe and renderer identit
 A disk-bounded prepared linear proxy can serve compatible warm interactions; white
 balance, source-instance or renderer changes require new preparation. A proxy never
 qualifies as an exact export input. Retained offline previews keep their own recorded
-revision, and pending reads reject stale revisions.
+revision, and pending reads reject stale revisions. Each new edited preview records
+whether its worker decoded the original or consumed a fully validated prepared
+proxy, including the proxy receipt and source-instance digest. Older cached records
+have no such evidence. This describes the worker that produced the pixels; a cached
+delivery is not a new worker execution.
 
 An export actor suspends new native preview launches and waits for existing work to
 drain before starting its one export process. Foreground development can preempt it:
 the actor stops and reaps the export, fences its attempt, releases its reservation,
 and then resumes preview launches. Cached preview reads can continue. Completion
 verification and durability are blocking filesystem work and belong on an executor
-thread. The active writer-proof repair and performance gates must finish before a
-foreground responsiveness claim.
+thread. Full file verification and durability barriers occur outside catalog writer
+authority. Short guarded capture/link steps recheck held file identities and content
+change stamps. Performance qualification must still establish responsiveness.
 
 ## Batch export
 
@@ -107,14 +112,20 @@ Output JSON mirrors `OutputSize`, `OutputFormat` and `AlphaPolicy`; its profile 
 `{"kind":"icc","path":"/absolute/profile.icc"}`. ICC bytes are read with an
 explicit 16 MiB bound and retained by content identity rather than expanded into IPC.
 
-`photo-export-cancel` prevents further publication. `photo-export-recover` retires
+`photo-export-cancel` prevents new capture/link operations. An output already
+installed under a committed publication intent can still be finalized after
+cancellation; this records the operation that occurred before cancellation. `photo-export-recover` retires
 abandoned worker transports and fences rendering attempts in bounded pages. A
 worker-discovered sealed file does not by itself authorize publication: restarting
 an unaccepted item independently rerenders and compares the complete encoded bytes.
 Canceled or stale work cannot use this path to publish. Explicit accepted-seal retry
 and safe restoration of captured destination bytes are separately exposed by
 `photo-export-retry-seal` and `photo-export-restore`. Conflicting external revisions
-remain preserved and visible in the receipt.
+remain preserved and visible in the receipt. Publication commits intent before a
+possible install, so crash recovery can distinguish an installed result from stale
+unfinished work. Safe restoration retains captured bytes and supports retry after
+interruption, including when the staged new payload is missing. A replacement file
+with equal bytes but a different object identity does not authorize clobbering it.
 
 ## Evidence boundary
 
