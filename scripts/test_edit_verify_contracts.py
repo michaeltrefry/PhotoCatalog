@@ -25,6 +25,16 @@ class VerificationAdmission(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verify.sample_coverage(self.request,attempts,self.values)
 
+    def test_large_cancellation_requires_same_explicit_recipe_identity(self):
+        request=dict(phase='large_cancellation',warmups=0,repetitions=1,
+                     recipes=[{}],outputs=[])
+        sample=dict(recipe_index=0,iteration=0)
+        verify.sample_coverage(request,[sample],[sample])
+        with self.assertRaises(ValueError):
+            verify.sample_coverage(request,[dict(iteration=0)],[sample])
+        with self.assertRaises(ValueError):
+            verify.sample_coverage(request,[sample],[dict(recipe_index=1,iteration=0)])
+
     def test_missing_all_or_one_encoding_and_duplicate_paths_rejected(self):
         for value in ({},{'exports':[]},{'exports':[{'path':'one'}]},
                       {'exports':[{'path':'one'},{'path':'one'}]}):

@@ -910,7 +910,7 @@ fn large_cancellation(request: &Request, samples: &mut File) -> Result<()> {
     let before = linear_digest(original.pixels());
     record(
         samples,
-        json!({"kind":"attempt","iteration":0,"started":stamp()}),
+        json!({"kind":"attempt","recipe_index":0,"iteration":0,"started":stamp()}),
     )?;
     let started = stamp();
     let timer = Instant::now();
