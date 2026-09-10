@@ -388,7 +388,7 @@ fn restart_discards_stale_recipes_and_retries_explicit_resource_failures() {
             thumbnail_bytes: 8 * 1024 * 1024,
             large_bytes: 8 * 1024 * 1024,
         },
-        &[originals.clone()],
+        std::slice::from_ref(&originals),
         PathBuf::from(env!("CARGO_BIN_EXE_photocatalog")),
         PreviewPolicy::default(),
         limits,
