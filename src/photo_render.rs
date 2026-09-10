@@ -32,7 +32,7 @@ pub struct PhotoRenderRequest<'a> {
     pub selected_xmp: Option<&'a [u8]>,
     pub staging: &'a Path,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StagedPhoto {
     pub staging: PathBuf,
     pub encoding: EncodingReport,

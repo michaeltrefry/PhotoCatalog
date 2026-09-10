@@ -392,6 +392,54 @@ impl Catalog {
         )?;
         Ok((checked_plan(&encoded, &authority)?, authority))
     }
+    /// Read-only cancellation hint for an owning actor. Publication separately
+    /// revalidates all authority inside its transaction; this is not a permit.
+    pub fn photo_export_work_current(&self, work: &ExportWork) -> Result<bool> {
+        checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
+        let current = self.edit_render_identity(&work.plan.identity.key)?;
+        let expected = &work.plan.identity;
+        if current.revision != expected.revision
+            || current.recipe_digest != expected.recipe_digest
+            || current.source.generation != expected.source.generation
+            || current.source.fingerprint != expected.source.fingerprint
+            || current.source.state != expected.source.state
+        {
+            return Ok(false);
+        }
+        if let MetadataSelection::Resolved {
+            expected_revision, ..
+        } = work.plan.metadata
+            && current.source.metadata_revision != expected_revision
+        {
+            return Ok(false);
+        }
+        let original: String = self.db.query_row(
+            "SELECT native_path FROM storage_bindings WHERE asset_id=?1",
+            [&work.plan.identity.key.asset_id],
+            |r| r.get(0),
+        )?;
+        if serde_json::from_str::<NativePath>(&original)? != work.plan.original {
+            return Ok(false);
+        }
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM photo_export_items i JOIN photo_export_jobs j ON j.id=i.job WHERE i.job=?1 AND i.sequence=?2 AND i.attempt=?3 AND i.authority=?4 AND i.state='rendering' AND j.state='queued')",params![work.job,work.sequence,work.attempt,work.authority],|r|r.get(0))?)
+    }
+    /// Fence a stopped attempt. The executor must reap its worker before launching
+    /// another; a late result with the old token can never be accepted afterward.
+    pub fn requeue_photo_export_attempt(&mut self, work: &ExportWork) -> Result<()> {
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state = if job(&tx, &work.job)?.state == "queued" {
+            "pending"
+        } else {
+            "canceled"
+        };
+        let changed=tx.execute("UPDATE photo_export_items SET state=?1,attempt=NULL WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![state,work.job,work.sequence,work.attempt,work.authority])?;
+        ensure!(changed == 1, "export attempt is no longer owned/rendering");
+        tx.commit()?;
+        Ok(())
+    }
     pub fn photo_export_inputs(
         &self,
         plan: &PhotoExportPlan,

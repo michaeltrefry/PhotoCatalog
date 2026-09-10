@@ -469,6 +469,12 @@ enum MetadataCommand {
 fn main() -> Result<()> {
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|arg| arg == "--photo-export-worker")
+    {
+        return photocatalog::export_worker::export_worker_main();
+    }
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|arg| arg == "--preview-worker")
     {
         return photocatalog::preview::worker_main();

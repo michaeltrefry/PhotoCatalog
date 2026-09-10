@@ -12,7 +12,7 @@ use std::{
 };
 use tiff::encoder::{DirectoryEncoder, TiffEncoder, TiffKindStandard, TiffValue};
 use tiff::tags::{Tag, Type};
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncodingReport {
     pub output: OutputDescriptor,
     pub encoded_extent: u64,

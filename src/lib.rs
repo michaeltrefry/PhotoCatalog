@@ -8,6 +8,7 @@ pub mod catalog_metadata;
 pub mod catalog_storage;
 mod catalog_writer;
 pub mod edit;
+pub mod export_worker;
 pub mod image_export;
 mod import_storage;
 pub mod media;
