@@ -9,7 +9,7 @@ import math
 import struct
 
 # Proposed before measurements. Source RGB magnitude <=4; small fixture dimensions
-# <=32. 2e-5 absolute covers matrix quantization, <=64 float32 accumulation ulps;
+# <=48. 2e-5 absolute covers matrix quantization, <=64 float32 accumulation ulps;
 # 2e-5 relative covers nonlinear rounding propagation. No observed-error fitting.
 ABS_TOL = 2e-5
 REL_TOL = 2e-5
@@ -171,11 +171,13 @@ def render(pixels, recipe, include_wb=True):
 
 def compare(actual, expected, *, geometry_changed=False):
     np = np_module()
-    if actual.shape != expected.shape or not np.isfinite(actual).all():
+    if actual.shape != expected.shape or not np.isfinite(actual).all() or not np.isfinite(expected).all():
         raise ValueError('shape/nonfinite oracle failure')
     absolute = GEOMETRY_ABS_TOL if geometry_changed else ABS_TOL
     error = np.abs(actual-expected)
     allowed = absolute+REL_TOL*np.abs(expected)
+    if not np.isfinite(error).all() or not np.isfinite(allowed).all() or (allowed < 0).any():
+        raise ValueError('invalid oracle error/tolerance')
     failed = error>allowed
     return dict(pass_=not bool(failed.any()), failed_components=int(failed.sum()),
                 components=int(error.size), max_abs=float(error.max()),
@@ -259,16 +261,24 @@ def resize(pixels, width, height):
     return out
 
 
+def output_dimensions(width, height, size):
+    if min(width,height)<=0: raise ValueError('zero source dimensions')
+    if size['mode']=='original':return width,height
+    if size['mode']!='fit' or min(size['width'],size['height'])<=0:
+        raise ValueError('invalid output size')
+    factor=min(size['width']/width,size['height']/height)
+    if not size['allow_upscale']:factor=min(1,factor)
+    return max(1,math.floor(width*factor+.5)),max(1,math.floor(height*factor+.5))
+
+
 def output_pixels(pixels, spec):
     np=np_module()
     result=pixels.copy()
     size=spec['size']
     if size['mode']=='fit':
         h,w=result.shape[:2]
-        factor=min(size['width']/w,size['height']/h)
-        if not size['allow_upscale']:
-            factor=min(1,factor)
-        result=resize(result,max(1,math.floor(w*factor+.5)),max(1,math.floor(h*factor+.5)))
+        width,height=output_dimensions(w,h,size)
+        result=resize(result,width,height)
     if spec['alpha']['mode']=='composite':
         result[...,:3]=result[...,:3]*result[...,3,None]+np.asarray(spec['alpha']['linear_rgb'])*(1-result[...,3,None])
         result[...,3]=1
@@ -295,7 +305,7 @@ def output_pixels(pixels, spec):
             result[...,:3] **= 1/gamma
     fmt=spec['format']
     if fmt.get('depth')=='float32':
-        return result
+        return result[...,:3] if spec['alpha']['mode']=='composite' else result
     maximum=65535 if fmt.get('depth')=='sixteen' else 255
     quantized=np.floor(np.clip(result,0,1)*maximum+.5)
     if fmt['format']=='jpeg' or spec['alpha']['mode']=='composite':
