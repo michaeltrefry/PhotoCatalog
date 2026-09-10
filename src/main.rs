@@ -12,6 +12,7 @@ use std::{
     path::PathBuf,
 };
 mod cli_edits;
+mod cli_exports;
 #[derive(Parser)]
 #[command(version, about = "PhotoCatalog Rust catalog and metadata tools")]
 struct Cli {
@@ -60,6 +61,8 @@ impl From<PreviewTier> for photocatalog::preview::Tier {
 enum Command {
     #[command(flatten)]
     Edits(cli_edits::EditCommand),
+    #[command(flatten)]
+    Exports(cli_exports::ExportCommand),
     #[command(flatten)]
     Cache(CacheCommand),
     #[command(flatten)]
@@ -485,6 +488,10 @@ fn main() -> Result<()> {
 // Windows executable main stacks are smaller than Rust's test-thread stacks.
 fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Exports(command) => {
+            let mut catalog = Catalog::open(&cli.catalog)?;
+            cli_exports::run(&mut catalog, cli.preview_config, command)
+        }
         Command::Edits(command) => {
             let mut catalog = Catalog::open(cli.catalog)?;
             cli_edits::run(&mut catalog, command)
@@ -823,6 +830,7 @@ fn run_catalog_command(
             print_json(&previews.relocation_step(tier.into(), limit, bytes)?)?;
         }
         Command::Import { .. } => unreachable!("import uses its isolated dispatch path"),
+        Command::Exports(_) => unreachable!("exports use their isolated dispatch path"),
         Command::Edits(_) => unreachable!("edits use their isolated dispatch path"),
         Command::Browse { after, limit } => println!(
             "{}",

@@ -276,6 +276,20 @@ fn schema_five_upgrade_is_lazy_and_keeps_existing_assets() -> Result<()> {
     let before: i64 = catalog
         .db
         .query_row("SELECT count(*) FROM assets", [], |r| r.get(0))?;
+    let triggers = catalog
+        .db
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'export_alias_*'",
+        )?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for trigger in triggers {
+        catalog.db.execute_batch(&format!(
+            "DROP TRIGGER \"{}\"",
+            trigger.replace('"', "\"\"")
+        ))?;
+    }
+    catalog.db.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE export_alias_paths; DROP TABLE export_alias_dirty; DROP TABLE export_alias_directories; DROP TABLE export_alias_state;")?;
     catalog.db.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5;")?;
     drop(catalog);
     let catalog = Catalog::open(temp.path().join("catalog"))?;

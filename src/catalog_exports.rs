@@ -25,9 +25,10 @@ CREATE TABLE photo_export_jobs(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEX
 CREATE TABLE photo_export_blobs(hash TEXT PRIMARY KEY,raw_length INTEGER NOT NULL CHECK(raw_length>=0 AND raw_length<=16777216),compressed BLOB NOT NULL);
 CREATE TABLE photo_export_items(job TEXT NOT NULL REFERENCES photo_export_jobs(id),sequence INTEGER NOT NULL,
  destination TEXT NOT NULL,plan TEXT NOT NULL,authority TEXT NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('pending','rendering','sealed','published','failed','canceled')),
+ state TEXT NOT NULL CHECK(state IN ('pending','rendering','sealed','published','failed','canceled','restored')),
  attempt TEXT,seal TEXT,receipt TEXT,error TEXT,
  PRIMARY KEY(job,sequence),UNIQUE(job,destination));
+CREATE INDEX photo_export_rendering ON photo_export_items(job,sequence) WHERE state='rendering';
 CREATE INDEX photo_export_pending ON photo_export_items(job,sequence) WHERE state IN ('pending','sealed');
 CREATE INDEX storage_export_path ON storage_bindings(native_path);
 CREATE INDEX storage_export_object ON storage_bindings(file_key) WHERE file_key IS NOT NULL;
@@ -84,6 +85,7 @@ pub struct PhotoExportPlan {
     pub destination: DestinationSnapshot,
     pub max_original_bytes: u64,
     pub max_payload_bytes: u64,
+    pub alias_limits: crate::catalog_export_alias::AliasLimits,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportJob {
@@ -175,10 +177,16 @@ fn check_original(db: &Connection, plan: &PhotoExportPlan) -> Result<()> {
         current == plan.original_revision,
         "original changed since export planning"
     );
-    protect_destination(db, &plan.destination.destination, &path)?;
+    protect_destination(db, &plan.destination.destination, &path, plan.alias_limits)?;
     Ok(())
 }
-fn protect_destination(db: &Connection, destination: &Path, original: &Path) -> Result<()> {
+fn protect_destination(
+    db: &Connection,
+    destination: &Path,
+    original: &Path,
+    limits: crate::catalog_export_alias::AliasLimits,
+) -> Result<()> {
+    crate::catalog_export_alias::protect_destination(db, destination, limits)?;
     ensure!(
         destination != original.canonicalize()?,
         "export destination is the original"
@@ -242,6 +250,145 @@ fn finish_item(db: &Connection, job_id: &str) -> Result<()> {
     Ok(())
 }
 impl Catalog {
+    pub fn reconcile_export_paths(
+        &mut self,
+        limit: usize,
+    ) -> Result<crate::catalog_export_alias::AliasProgress> {
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let result = crate::catalog_export_alias::reconcile_paths(&tx, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+    pub fn rendering_photo_export_attempts(&self, limit: usize) -> Result<Vec<ExportWork>> {
+        ensure!(limit > 0 && limit <= 200, "export recovery page limit");
+        let mut statement=self.db.prepare("SELECT job,sequence,attempt,plan,authority FROM photo_export_items WHERE state='rendering' ORDER BY job,sequence LIMIT ?1")?;
+        let rows = statement.query_map([limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (job, sequence, attempt, encoded, authority) = row?;
+            let plan = checked_plan(&encoded, &authority)?;
+            result.push(ExportWork {
+                job,
+                sequence,
+                attempt,
+                authority,
+                plan,
+            });
+        }
+        Ok(result)
+    }
+    /// One accepted result ready for guarded publication, including after restart.
+    pub fn next_sealed_photo_export(&self, id: &str) -> Result<Option<i64>> {
+        Ok(self.db.query_row("SELECT sequence FROM photo_export_items WHERE job=?1 AND state='sealed' ORDER BY sequence LIMIT 1",[id],|r|r.get(0)).optional()?)
+    }
+    /// Recover a single stored rendering authority. An executor must hold the
+    /// catalog export lease and retire/reap its transport before fencing it.
+    pub fn photo_export_attempt(&self, id: &str, sequence: i64) -> Result<ExportWork> {
+        self.photo_export_attempt_if_rendering(id, sequence)?
+            .context("export item is not rendering")
+    }
+    pub fn photo_export_attempt_if_rendering(
+        &self,
+        id: &str,
+        sequence: i64,
+    ) -> Result<Option<ExportWork>> {
+        let attempt:Option<String>=self.db.query_row("SELECT attempt FROM photo_export_items WHERE job=?1 AND sequence=?2 AND state='rendering'",params![id,sequence],|r|r.get(0)).optional()?;
+        let Some(attempt) = attempt else {
+            return Ok(None);
+        };
+        let (plan, authority) = self.photo_export_plan(id, sequence)?;
+        Ok(Some(ExportWork {
+            job: id.to_owned(),
+            sequence,
+            attempt,
+            authority,
+            plan,
+        }))
+    }
+    /// Preserve failed publication evidence without repeatedly retrying it on each
+    /// actor tick. Only an explicit recovery request can try its accepted seal again.
+    pub fn fail_sealed_photo_export(&mut self, id: &str, sequence: i64, error: &str) -> Result<()> {
+        ensure!(error.len() <= 8192, "export error detail limit");
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(tx.execute("UPDATE photo_export_items SET state='failed',error=?1 WHERE job=?2 AND sequence=?3 AND state='sealed'",params![error,id,sequence])?==1,"export is no longer sealed");
+        finish_item(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Explicitly retry publication of an already accepted seal. A canceled job
+    /// remains canceled. This never promotes a worker-discovered orphan.
+    pub fn retry_sealed_photo_export(&mut self, id: &str, sequence: i64) -> Result<()> {
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            ["queued", "complete"].contains(&job(&tx, id)?.state.as_str()),
+            "export canceled or not sealed"
+        );
+        ensure!(tx.execute("UPDATE photo_export_items SET state='sealed',error=NULL WHERE job=?1 AND sequence=?2 AND state='failed' AND seal IS NOT NULL",params![id,sequence])?==1,"no accepted failed seal to recover");
+        tx.execute(
+            "UPDATE photo_export_jobs SET state='queued',completed=completed-1 WHERE id=?1",
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Restore captured destination bytes under the same immutable authority.
+    /// Safe restoration remains available when edits or source bindings change.
+    pub fn restore_photo_export_item(&mut self, id: &str, sequence: i64) -> Result<ExportReceipt> {
+        let (plan, authority) = self.photo_export_plan(id, sequence)?;
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (state,encoded):(String,Option<String>)=tx.query_row("SELECT state,seal FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3",params![id,sequence,authority],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(
+            state != "rendering",
+            "stop and fence the worker before restoration"
+        );
+        let seal = if let Some(encoded) = encoded {
+            serde_json::from_str::<SealedPhotoExport>(&encoded)?
+        } else {
+            metadata_export::read_photo_seal(&plan.destination, &authority)?
+        };
+        ensure!(
+            seal.snapshot == plan.destination && seal.authority_digest == authority,
+            "restoration seal authority mismatch"
+        );
+        // Restoration must also refuse a destination now used by a catalog original.
+        crate::catalog_export_alias::protect_destination(
+            &tx,
+            &plan.destination.destination,
+            plan.alias_limits,
+        )?;
+        let receipt = metadata_export::restore_photo_export(&seal)?;
+        let next = if receipt.state == metadata_export::ExportState::Restored {
+            "restored"
+        } else {
+            "failed"
+        };
+        tx.execute("UPDATE photo_export_items SET state=?1,receipt=?2,error=?3 WHERE job=?4 AND sequence=?5",params![next,serde_json::to_string(&receipt)?,(next=="failed").then(||receipt.detail.clone()),id,sequence])?;
+        if ["pending", "sealed"].contains(&state.as_str()) {
+            finish_item(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(receipt)
+    }
     pub fn begin_photo_export(&mut self) -> Result<ExportJob> {
         let id = uuid::Uuid::new_v4().to_string();
         let _write = self.writers.enter(Priority::Foreground)?;
@@ -262,6 +409,30 @@ impl Catalog {
         max_original_bytes: u64,
         max_payload_bytes: u64,
     ) -> Result<ExportItem> {
+        self.append_photo_export_with_alias_limits(
+            id,
+            expected_total,
+            target,
+            output,
+            max_original_bytes,
+            max_payload_bytes,
+            Default::default(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_photo_export_with_alias_limits(
+        &mut self,
+        id: &str,
+        expected_total: i64,
+        target: &ExportTarget,
+        output: &OutputSpec,
+        max_original_bytes: u64,
+        max_payload_bytes: u64,
+        alias_limits: crate::catalog_export_alias::AliasLimits,
+    ) -> Result<ExportItem> {
+        // One bounded catch-up handles newly imported assets; large catalogs use
+        // explicit pages through reconcile_export_paths before planning.
+        self.reconcile_export_paths(512)?;
         ensure!(
             max_original_bytes > 0 && max_payload_bytes > 0,
             "export byte limits must be positive"
@@ -336,10 +507,10 @@ impl Catalog {
         let guarded = identity.clone();
         self.with_edit_transaction(&guarded,Priority::Foreground,|tx|{
             let j=job(tx,id)?;ensure!(j.state=="building" && j.total==expected_total,"export job changed or sealed");
-            protect_destination(tx,&destination.destination,&path)?;
+            protect_destination(tx,&destination.destination,&path,alias_limits)?;
             let profile=match &output.profile {OutputProfile::Srgb=>StoredProfile::Srgb,OutputProfile::LinearSrgb=>StoredProfile::LinearSrgb,OutputProfile::Icc{bytes}=>StoredProfile::Icc{blob:store_blob(tx,bytes)?}};
             let xmp_blob=packet.as_deref().map(|b|store_blob(tx,b)).transpose()?;
-            let plan=PhotoExportPlan{version:1,renderer_identity:crate::photo_render::output_renderer_identity().to_owned(),identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes};
+            let plan=PhotoExportPlan{version:1,renderer_identity:crate::photo_render::output_renderer_identity().to_owned(),identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes,alias_limits};
             metadata_current(tx,&plan)?;
             let encoded=serde_json::to_string(&plan)?;ensure!(encoded.len()<=PLAN_LIMIT,"export plan limit");
             let authority=blake3::hash(encoded.as_bytes()).to_hex().to_string();let sequence=j.total.checked_add(1).context("export job exhausted")?;
@@ -515,7 +686,7 @@ impl Catalog {
             let encoded:String=tx.query_row("SELECT seal FROM photo_export_items WHERE job=?1 AND sequence=?2 AND state='sealed' AND authority=?3",params![id,sequence,authority],|r|r.get(0))?;
             let sealed:SealedPhotoExport=serde_json::from_str(&encoded)?;
             ensure!(sealed.authority_digest==authority && sealed.snapshot==plan.destination,"stored seal authority mismatch");
-            protect_destination(tx,&plan.destination.destination,&plan.original.to_path()?)?;
+            protect_destination(tx,&plan.destination.destination,&plan.original.to_path()?,plan.alias_limits)?;
             let receipt=metadata_export::publish_photo_export(&sealed)?;
             let state = if receipt.state == metadata_export::ExportState::Published { "published" } else { "failed" };
             let error = (state == "failed").then(|| format!("publication ended in {:?}", receipt.state));
