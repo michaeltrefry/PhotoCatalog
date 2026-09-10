@@ -7,14 +7,35 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import edit_reference as ref
 import edit_readback
 import edit_fixtures
+import edit_statistics
 
 MAX_JSON=256*1024
 MAX_SAMPLES=16*1024*1024
+PIXEL_PHASES={'correctness','kernel','full','support100mp','proxy_reference'}
+
+
+def strict_json(data):
+    def pairs(items):
+        result={}
+        for key,value in items:
+            if key in result:
+                raise ValueError('duplicate JSON key')
+            result[key]=value
+        return result
+    def floating(value):
+        result=float(value)
+        if not math.isfinite(result):
+            raise ValueError('nonfinite JSON number')
+        return result
+    def constant(value):
+        raise ValueError('nonfinite JSON constant: '+value)
+    return json.loads(data,object_pairs_hook=pairs,parse_float=floating,parse_constant=constant)
 
 
 def read_json(path, limit=MAX_JSON):
@@ -25,7 +46,7 @@ def read_json(path, limit=MAX_JSON):
         data=stream.read(limit+1)
     if len(data)>limit:
         raise ValueError('JSON grew')
-    return json.loads(data)
+    return strict_json(data)
 
 
 def digest(path, algorithm, limit):
@@ -61,24 +82,101 @@ def owned(root,path):
     return path
 
 
+def sample_records(stream, total_limit=MAX_SAMPLES, line_limit=MAX_JSON):
+    # Bound every read before allocation, including growth after initial stat.
+    used=0
+    while True:
+        line=stream.readline(min(line_limit,total_limit-used)+1)
+        if not line:
+            return
+        used+=len(line)
+        if used>total_limit or len(line)>line_limit:
+            raise ValueError('sample byte admission exceeded')
+        yield strict_json(line)
+
+
 def observations(root):
     path=Path(root)/'samples.jsonl'
-    if path.stat().st_size>MAX_SAMPLES:
-        raise ValueError('sample file byte bound')
+    if path.is_symlink() or not path.is_file() or path.stat().st_size>MAX_SAMPLES:
+        raise ValueError('sample file admission')
     attempts=[]
     values=[]
     with path.open('rb') as stream:
-        for line in stream:
-            if len(line)>MAX_JSON:
-                raise ValueError('sample line byte bound')
-            value=json.loads(line)
-            if value.get('kind')=='attempt':
+        pending=None
+        for value in sample_records(stream):
+            if value.get('kind')=='attempt' and pending is None:
+                pending=(value.get('recipe_index',0),value.get('iteration'))
                 attempts.append(value)
-            elif value.get('kind')=='observation':
+            elif value.get('kind')=='observation' and pending is not None:
+                if pending!=(value.get('recipe_index',0),value.get('iteration')):
+                    raise ValueError('attempt/observation ordering mismatch')
                 values.append(value)
+                pending=None
             else:
-                raise ValueError('unknown sample record')
+                raise ValueError('unknown, unpaired or reordered sample record')
+        if pending is not None:
+            raise ValueError('incomplete attempted sample')
     return attempts,values
+
+
+def sample_coverage(request,attempts,values):
+    expected=edit_statistics.expected_identities(request)
+    if not expected or len(attempts)!=len(expected) or len(values)!=len(expected):
+        raise ValueError('partial/missing/extra sample coverage')
+    for records in (attempts,values):
+        seen=set()
+        for record in records:
+            key=edit_statistics.sample_identity(record,request)
+            if any(type(v) is not int for v in key) or key not in expected or key in seen:
+                raise ValueError('duplicate/out-of-range sample identity')
+            seen.add(key)
+        if seen!=expected:
+            raise ValueError('sample Cartesian coverage mismatch')
+    if [(v.get('recipe_index',0),v['iteration']) for v in attempts]!=[(v.get('recipe_index',0),v['iteration']) for v in values]:
+        raise ValueError('attempt/observation identity mismatch')
+
+
+def output_coverage(request,value):
+    expected=request['outputs'] if request['phase'] in ('correctness','support100mp') else []
+    artifacts=value.get('exports')
+    if not isinstance(artifacts,list) or len(artifacts)!=len(expected):
+        raise ValueError('missing/extra requested encodings')
+    paths=[item.get('path') for item in artifacts]
+    if any(not isinstance(path,str) for path in paths) or len(set(paths))!=len(paths):
+        raise ValueError('duplicate or invalid output artifact')
+    return zip(expected,artifacts,strict=True)
+
+
+def overlap_proof(value,receipt,process_samples):
+    before=value['live_workers_before']
+    after=value['live_workers_after']
+    if len(before)!=1 or before!=after:
+        raise ValueError('save lacks stable kernel worker identity')
+    identity=before[0]
+    if (identity['parent_pid']!=receipt['probe_pid']
+            or identity['pid'] not in value['owned_pids_before']
+            or value['owned_pids_before']!=value['owned_pids_after']):
+        raise ValueError('live worker is not the admitted direct child')
+    anchors=[value[field]['unix_ns'] for field in ('live_before_at','started','finished','live_after_at')]
+    if any(not isinstance(n,str) or not n.isdecimal() or len(n)>24 for n in anchors):
+        raise ValueError('invalid kernel observation timestamp')
+    times=[int(n) for n in anchors]
+    if any(n<=0 for n in times) or times!=sorted(times):
+        raise ValueError('kernel observations do not bracket durable save')
+    created=identity['start_seconds']+identity['start_microseconds']/1_000_000
+    if not math.isfinite(created) or created*1_000_000_000>times[0]:
+        raise ValueError('impossible worker creation identity')
+    matched=[]
+    for sample in process_samples:
+        for process in sample['processes']:
+            if process['pid']==identity['pid'] and abs(process['create_time']-created)<=0.000001:
+                if process['status'] in ('zombie','dead'):
+                    raise ValueError('external observer saw terminated worker as live')
+                matched.append(sample['at']['unix_ns'])
+    if not matched:
+        raise ValueError('kernel identity lacks independent OS observer corroboration')
+    return dict(pid=identity['pid'],start_seconds=identity['start_seconds'],
+                start_microseconds=identity['start_microseconds'],external_observations=len(matched))
 
 
 def verify_case(root):
@@ -96,20 +194,24 @@ def verify_case(root):
         raise ValueError('owned source BLAKE3 differs')
     attempts,values=observations(root)
     per_recipe=request['warmups']+request['repetitions']
-    pixel_phase=request['phase'] in ('correctness','kernel','full','support100mp','proxy_reference')
-    expected=per_recipe*len(request['recipes']) if pixel_phase else per_recipe
-    if len(attempts)!=expected or len(values)!=expected:
-        raise ValueError('partial/missing/extra sample coverage')
-    seen=set()
+    pixel_phase=request['phase'] in PIXEL_PHASES
+    sample_coverage(request,attempts,values)
+    process_samples=[]
+    if request['phase'] in ('overlap_import','overlap_export'):
+        if not root.name.endswith('-output'):
+            raise ValueError('overlap requires frozen coordinator output namespace')
+        telemetry=owned(root.parent,root.parent/root.name[:-7]/'processes.jsonl')
+        with telemetry.open('rb') as stream:
+            process_samples=list(sample_records(stream,total_limit=32*1024*1024))
+    overlap=[]
     proofs=[]
     numerical=[]
     for value in values:
         identity=(value.get('recipe_index',0),value['iteration'])
-        if identity in seen or not 0<=identity[1]<per_recipe:
-            raise ValueError('duplicate/out-of-range sample identity')
-        seen.add(identity)
         if value.get('warmup')!=(identity[1]<request['warmups']):
             raise ValueError('warmup marker mismatch')
+        if request['phase'] in ('overlap_import','overlap_export'):
+            overlap.append(overlap_proof(value,receipt,process_samples))
         if request['phase']=='refusal':
             if not value.get('expected_refusal','').startswith('typed_'):
                 raise ValueError('negative case lacks typed refusal')
@@ -138,13 +240,13 @@ def verify_case(root):
                 numerical.append(dict(recipe_index=identity[0],**proof))
                 if not proof['pass_']:
                     raise ValueError('independent analytic pixel mismatch')
-            for index,artifact in enumerate(value.get('exports',[])):
+            for specification,artifact in output_coverage(request,value):
                 path=owned(root,artifact['path'])
                 if digest(path,'blake3',request['encoded_extent'])!=artifact['blake3']:
                     raise ValueError('encoded artifact identity')
                 if actual is None:
                     raise ValueError('export correctness lacks edited linear reference')
-                proof=edit_readback.verify(path,actual,request['outputs'][index],request.get('metadata',{}),
+                proof=edit_readback.verify(path,actual,specification,request.get('metadata',{}),
                                           constant_jpeg=fixture=='analytic-flat')
                 if proof['pixel_pass'] is False:
                     raise ValueError('independent encoded pixel mismatch')
@@ -152,8 +254,8 @@ def verify_case(root):
     return dict(version=1,verified=True,whole_story_qualified=False,request_sha256=digest(root/'request.json','sha256',MAX_JSON),
                 receipt_sha256=digest(root/'receipt.json','sha256',MAX_JSON),
                 samples_sha256=digest(root/'samples.jsonl','sha256',MAX_SAMPLES),
-                sample_count=len(values),analytic=numerical,encoded=proofs,
-                remaining=['100MP streaming full/point oracle','service/export per-sample artifact oracle','overlap process intervals'])
+                sample_count=len(values),analytic=numerical,encoded=proofs,overlap=overlap,
+                remaining=['100MP streaming full/point oracle','service/export per-sample artifact oracle'])
 
 
 def main():

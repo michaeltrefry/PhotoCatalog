@@ -204,54 +204,88 @@ remain retained. Exact arithmetic and the live-free-space stop remain mandatory
 before an execution request can be admitted; no disk cleanup has run.
 
 ## Integrated probe and supplemental request checkpoint
-+
-+The source probe now consumes typed `EditInputProvenance`, checks current
-+variant/revision/key, observes a newly active worker PID for every delivery, and
-+requires each timed warm sample's consumed proxy fingerprint, WB, renderer, edge,
-+original dimensions and digest to agree. First-RAW requires `OriginalDecoded`.
-+New, previously unseen WB values remain cold work; the warm result covers exactly
-+the two prewarmed values. Owner PID observations are not OS liveness proof: the
-+external process telemetry binds PID plus creation time and excludes zombies.
-+
-+Supplemental source requests currently add 160 format/profile/size/alpha cases,
-+eight independent-process analytic passes, eight full recipe-pair proxy references,
-+two 100-MP admission cases, six typed failure cases, six durable metadata exports,
-+and two foreground overlap cases. Together with the preliminary337 registry this
-+is 529 proposed probe children; verifier/generator children and exact disk bounds
-+are still to be finalized. No automatic execution plan is produced from this count.
-+All four profile paths are represented: built-in sRGB, built-in linear sRGB,
-+custom linear matrix ICC and custom nonlinear matrix ICC where supported.
-+
-+The controlled metadata packet contains a named RDF subject, unknown qualified
-+and structured properties, Bag/Seq/Alt arrays, multilingual text, an80KB JPEG
-+extension payload, safe EXIF source values, active CRS settings and stale technical
-+fields. Direct encoding must retain the exact supplied packet semantics. The six
-+durable-service cases select the sole controlled full metadata base and require a
-+separate explicit derivative expectation: preserve unrelated metadata and original
-+packet bytes while replacing technical fields and removing active develop/source
-+pointer properties. A direct encoder check is not evidence of this durable policy.
-+
-+The foreground probe uses a distinct catalog connection and virtual copy, so saves
-+do not invalidate the background export's master plan. Import advances and export
-+polling run continuously on the background thread. All100 saves must begin/end
-+inside the same owned worker lifecycle; no delay/holding checkpoint is inserted
-+into background work. The external audit must additionally establish the actual
-+process lifetime. Failed overlap aborts acceptance and retains its evidence.
-+
-+The serial coordinator rejects any binding with unresolved execution gates,
-+unfunded disk bounds, nonfinite limits, changed build/protocol artifacts or escaped
-+action paths. It samples owned process identities/RSS/free space at0.1seconds,
-+caps stdout/stderr at4MiB each and process telemetry at32MiB per child, handles
-+SIGINT/SIGTERM with known-process termination/reaping, and never retries. SIGKILL
-+or host failure still requires explicit ownership reconciliation before another
-+run. The first prototype planner remains non-executable because the final
-+aggregate/oracle/funding gates are unresolved. No generated source or process has
-+been launched by this harness checkpoint.
-+
-+Reference bindings add [blake3-py1.0.9](https://pypi.org/project/blake3/1.0.9/)
-+for independent artifact-byte reconciliation. This is a separate verifier process
-+using the standard hash implementation, not an independent editing implementation.
-+The native requested-WB evidence is recorded separately: the existing direct
-+LibRaw CFA inverse-channel-ratio regression and the parent's newly declared Adobe
-+DNG requested-white camera-neutral regression. Neither is real-camera appearance
-+parity; both must be bound to their actual final source/test results.
+
+The source probe now consumes typed `EditInputProvenance`, checks current
+variant/revision/key, observes a newly active worker PID for every delivery, and
+requires each timed warm sample's consumed proxy fingerprint, WB, renderer, edge,
+original dimensions and digest to agree. First-RAW requires `OriginalDecoded`.
+New, previously unseen WB values remain cold work; the warm result covers exactly
+the two prewarmed values. Owner PID observations are not OS liveness proof: the
+external process telemetry binds PID plus creation time and excludes zombies.
+
+Supplemental source requests currently add 160 format/profile/size/alpha cases,
+eight independent-process analytic passes, eight full recipe-pair proxy references,
+two 100-MP admission cases, six typed failure cases, six durable metadata exports,
+and two foreground overlap cases. Together with the preliminary337 registry this
+is 529 proposed probe children; verifier/generator children and exact disk bounds
+are still to be finalized. No automatic execution plan is produced from this count.
+All four profile paths are represented: built-in sRGB, built-in linear sRGB,
+custom linear matrix ICC and custom nonlinear matrix ICC where supported.
+
+The controlled metadata packet contains a named RDF subject, unknown qualified
+and structured properties, Bag/Seq/Alt arrays, multilingual text, an80KB JPEG
+extension payload, safe EXIF source values, active CRS settings and stale technical
+fields. Direct encoding must retain the exact supplied packet semantics. The six
+durable-service cases select the sole controlled full metadata base and require a
+separate explicit derivative expectation: preserve unrelated metadata and original
+packet bytes while replacing technical fields and removing active develop/source
+pointer properties. A direct encoder check is not evidence of this durable policy.
+
+The foreground probe uses a distinct catalog connection and virtual copy, so saves
+do not invalidate the background export's master plan. Import advances and export
+polling run continuously on the background thread. All100 saves must begin/end
+inside the same owned worker lifecycle; no delay/holding checkpoint is inserted
+into background work. The external audit must additionally establish the actual
+process lifetime. Failed overlap aborts acceptance and retains its evidence.
+
+The serial coordinator rejects any binding with unresolved execution gates,
+unfunded disk bounds, nonfinite limits, changed build/protocol artifacts or escaped
+action paths. It samples owned process identities/RSS/free space at0.1seconds,
+caps stdout/stderr at4MiB each and process telemetry at32MiB per child, handles
+SIGINT/SIGTERM with known-process termination/reaping, and never retries. SIGKILL
+or host failure still requires explicit ownership reconciliation before another
+run. The first prototype planner remains non-executable because the final
+aggregate/oracle/funding gates are unresolved. No generated source or process has
+been launched by this harness checkpoint.
+
+Reference bindings add [blake3-py1.0.9](https://pypi.org/project/blake3/1.0.9/)
+for independent artifact-byte reconciliation. This is a separate verifier process
+using the standard hash implementation, not an independent editing implementation.
+Native requested-WB evidence is recorded separately: the direct LibRaw CFA inverse-channel-ratio regression and Adobe DNG requested-white camera-neutral regression both passed the parent core gate at08e56fd/45df945. Neither is real-camera appearance parity. The qualification probe compiled at a5ac9d6; scientific fixture/contracts and complete campaign qualification are separate gates.
+
+### Evidence admission repair (source only, before campaign approval)
+
+The case verifier now requires the exact Cartesian set of recipe/iteration
+identities, paired attempt/observation ordering, every requested encoding exactly
+once, and bounded reads before allocating each JSONL line. Duplicate JSON fields,
+NaN, infinity and overflowing decimal numbers are rejected. Requested output
+specifications remain independently checked by the readback oracle.
+
+For the fixed Mac overlap campaign, the probe queries `PROC_PIDTBSDINFO` before
+and after each durable save. Both snapshots must describe the same non-zombie
+direct child and kernel creation timestamp. Actor-held PIDs alone are not proof:
+they can remain populated during post-reap hashing or publication. The verifier
+also reconciles each kernel identity with the coordinator's independent psutil
+observations. This establishes process-lifetime overlap; it does not claim every
+CPU instruction occurred inside a native decoder. Other platforms refuse this
+Mac-specific measurement phase explicitly; ordinary product APIs remain portable.
+
+The final Python launch is a stdlib-only, externally hashed `edit_binding.py`
+invoked with `-I`. Before importing campaign helpers it checks the copied private
+`scripts` package and `benchmarks/observe_host.py`, rejects extra import-shadowing
+files, validates exact helper paths and bytes, and checks Python executable/build
+plus installed scientific distribution file manifests, including native extension
+bytes and metadata. Versions alone do not bind dependency code. No worktree helper
+imports are admitted. Collection/copy/hash work belongs to untimed preparation;
+this source checkpoint has not constructed or admitted a real binding.
+
+`edit_disk_budget.py` computes prospective retained raw/encoded artifacts,
+per-service namespaces, bounded logs, source copies, active exports, allocation
+overhead and 16 GiB free reserve from the complete matrix. The old preliminary
+96 GiB minimum / 128 GiB output limit is not an admission rule. Final binding must
+fund the calculated complete peak, retain all failed work, and declare cleanup of
+verified successful repeated exports explicitly. Filesystem/SQLite overhead is an
+explicit allowance guarded by actual free-space observations, not a forecast of
+compression or immunity to external disk consumption. The final action registry,
+source-copy binding, derivative/service/100-MP verification and aggregate remain
+open; no source-only verification result awards whole-story acceptance.
