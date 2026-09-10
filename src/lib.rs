@@ -2,6 +2,7 @@
 pub mod catalog_edits;
 pub mod catalog_metadata;
 pub mod catalog_storage;
+pub mod edit;
 mod catalog_writer;
 mod import_storage;
 pub mod media;
