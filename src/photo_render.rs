@@ -119,6 +119,19 @@ pub fn render_staged_photo(
         ));
     }
     let recipe = request.recipe.validate()?;
+    if let Some(packet) = request.selected_xmp {
+        let limit = limits
+            .encode
+            .max_metadata_bytes
+            .min(crate::xmp::MAX_PACKET_BYTES as u64);
+        if packet.len() as u64 > limit {
+            return Err(RenderError::ResourceLimit {
+                resource: "selected XMP bytes",
+                required: packet.len() as u64,
+                limit,
+            });
+        }
+    }
     if limits.max_encoded_extent == 0 {
         return Err(RenderError::ResourceLimit {
             resource: "encoded extent",
@@ -317,7 +330,7 @@ fn derive_metadata(
         ],
     );
     let date_time_original = date.and_then(|v| match capture_date(&v) {
-        Some(s) => Some(s),
+        Some(s) => {if v.len()>19 {notes.push("capture date: subsecond/timezone details retained in XMP; EXIF stores local whole seconds".into());}Some(s)},
         None => {
             notes.push("capture date: invalid/unrepresentable date retained only in XMP".into());
             None
@@ -367,6 +380,9 @@ fn derive_metadata(
     ))
 }
 fn one_literal(node: roxmltree::Node<'_, '_>) -> Option<String> {
+    if node.attribute((RDF, "resource")).is_some() {
+        return None;
+    }
     let children = node
         .children()
         .filter(|n| n.is_element())
@@ -538,7 +554,7 @@ mod tests {
         );
         assert!(m.exif.artist.is_none());
         assert!(m.exif.description.is_none());
-        assert_eq!(notes.len(), 2);
+        assert_eq!(notes.len(), 3);
         let xmp = m.xmp.unwrap();
         assert!(xmp.contains("caf"));
         assert!(!xmp.contains("Exposure2012"));
