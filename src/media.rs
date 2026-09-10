@@ -2,7 +2,7 @@ mod full;
 mod psd;
 pub use full::{
     ColorCalibration, DecodeError, DecodeLimits, DecodeStatus, RenderProvenance, RenderedImage,
-    decode_full, decode_full_limited, decoder_versions,
+    decode_full, decode_full_limited, decode_with_white_point, decoder_versions, linear_profile,
 };
 
 use anyhow::{Context, Result, bail, ensure};

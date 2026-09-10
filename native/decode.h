@@ -5,6 +5,7 @@ extern "C" {
 struct PcDecodeLimits {
     uint64_t max_encoded_bytes, max_intermediate_pixels, max_allocation_bytes;
 };
+struct PcWhitePoint { double x, y; }; // {0,0} preserves the as-shot path.
 struct PcImage {
     float *pixels;
     unsigned char *icc;

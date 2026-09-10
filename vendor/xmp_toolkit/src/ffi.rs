@@ -183,6 +183,14 @@ extern "C" {
         base_indent: u32,
     ) -> *const c_char;
 
+    pub(crate) fn CXmpMetaPackageForJPEG(
+        meta: *const CXmpMeta,
+        out_error: *mut CXmpError,
+        standard: *mut *const c_char,
+        extended: *mut *const c_char,
+        digest: *mut *const c_char,
+    );
+
     pub(crate) fn CXmpMetaRegisterNamespace(
         out_error: *mut CXmpError,
         namespace_uri: *const c_char,
