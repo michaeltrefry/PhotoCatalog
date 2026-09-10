@@ -1,4 +1,5 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
+pub mod catalog_edits;
 pub mod catalog_metadata;
 pub mod catalog_storage;
 mod catalog_writer;
@@ -212,7 +213,7 @@ impl Catalog {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 5,
+            version <= 6,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -235,13 +236,13 @@ impl Catalog {
         configure_catalog_connection(&db)?;
         // Opening a current catalog must not rewrite its header or acquire an
         // unnecessary writer transaction. Only actual initialization/migration writes.
-        if version < 5 {
+        if version < 6 {
             let _write = writers.enter(catalog_writer::Priority::Foreground)?;
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // Another admitted opener may have completed migration while we waited.
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             ensure!(
-                version <= 5,
+                version <= 6,
                 "catalog schema changed while waiting for migration"
             );
             tx.execute_batch("
@@ -275,6 +276,10 @@ impl Catalog {
             if version < 5 {
                 tx.execute_batch(organization::CAPTURE_LENS_SCHEMA)?;
                 tx.pragma_update(None, "user_version", 5)?;
+            }
+            if version < 6 {
+                tx.execute_batch(catalog_edits::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 6)?;
             }
             tx.commit()?;
         }
