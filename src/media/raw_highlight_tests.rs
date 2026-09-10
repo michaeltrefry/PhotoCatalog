@@ -1,6 +1,6 @@
 //! Synthetic CFA DNG is sent directly to the LibRaw ABI, not the DNG SDK.
 //! This tests the same native path used by CR2/RW2 without claiming a real camera.
-use super::{DecodeLimits, NativeImage, pc_raw};
+use super::{DecodeLimits, NativeImage, NativeWhitePoint, pc_raw};
 
 fn u16s(values: &[u16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -135,6 +135,7 @@ fn raw_clipped_neutral_and_real_colors_preserve_linear_headroom() {
                 bytes.as_ptr(),
                 bytes.len(),
                 &DecodeLimits::default(),
+                &NativeWhitePoint { x: 0.0, y: 0.0 },
                 &mut out,
             )
         };
@@ -204,7 +205,15 @@ fn raw_sensor_admission_precedes_unpack() {
         ..Default::default()
     };
     assert_ne!(
-        unsafe { pc_raw(bytes.as_ptr(), bytes.len(), &limits, &mut out) },
+        unsafe {
+            pc_raw(
+                bytes.as_ptr(),
+                bytes.len(),
+                &limits,
+                &NativeWhitePoint { x: 0.0, y: 0.0 },
+                &mut out,
+            )
+        },
         0
     );
     assert!(out.pixels.is_null());
@@ -216,10 +225,50 @@ fn raw_sensor_admission_precedes_unpack() {
                 bytes.as_ptr(),
                 bytes.len(),
                 &DecodeLimits::default(),
+                &NativeWhitePoint { x: 0.0, y: 0.0 },
                 &mut out,
             )
         },
         0
     );
     assert!(!out.pixels.is_null());
+}
+
+#[test]
+fn custom_raw_white_uses_camera_response_before_development() {
+    let bytes = fixture([0.5, 1.0, 0.4]);
+    // Independent illuminant A XYZ, multiplied by fixed IEC XYZ->sRGB.
+    // For the fixture's diagonal camera model, each developed neutral patch
+    // must have channel ratios inverse to this illuminant's RGB response.
+    let (x, y) = (0.44757f64, 0.40745f64);
+    let xyz = [x / y, 1.0, (1.0 - x - y) / y];
+    let rgb = [
+        [3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0556434, -0.2040259, 1.0572252],
+    ]
+    .map(|r| r[0] * xyz[0] + r[1] * xyz[1] + r[2] * xyz[2]);
+    let mut out: NativeImage = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        pc_raw(
+            bytes.as_ptr(),
+            bytes.len(),
+            &DecodeLimits::default(),
+            &NativeWhitePoint { x, y },
+            &mut out,
+        )
+    };
+    assert_eq!(
+        status,
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(out.error.as_ptr()) }.to_string_lossy()
+    );
+    let pixels = unsafe {
+        std::slice::from_raw_parts(out.pixels, out.width as usize * out.height as usize * 4)
+    };
+    let p = &pixels[(32 * out.width as usize + 96) * 4..][..3];
+    assert!((f64::from(p[0] / p[1]) - rgb[1] / rgb[0]).abs() < 0.015);
+    assert!((f64::from(p[2] / p[1]) - rgb[1] / rgb[2]).abs() < 0.03);
+    unsafe { super::pc_image_free(&mut out) };
 }

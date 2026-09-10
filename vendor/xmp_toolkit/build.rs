@@ -15,6 +15,7 @@ use std::{env, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/ffi.cpp");
 
     // Published source is vendored completely; builds never mutate Git submodules.
 
