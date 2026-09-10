@@ -1,4 +1,3 @@
-pub mod image_export;
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 /// Current on-disk catalog schema; probes must preflight before timed opens.
 pub const CURRENT_SCHEMA_VERSION: i64 = 6;
@@ -8,6 +7,7 @@ pub mod catalog_metadata;
 pub mod catalog_storage;
 mod catalog_writer;
 pub mod edit;
+pub mod image_export;
 mod import_storage;
 pub mod media;
 pub mod metadata_export;
