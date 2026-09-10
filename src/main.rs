@@ -97,14 +97,16 @@ enum Command {
 #[derive(Subcommand)]
 enum CacheCommand {
     /// List durable preview jobs, including resource/availability errors.
-    CacheJobs {
+    #[command(name = "cache-jobs")]
+    Jobs {
         #[arg(long, default_value_t = 0)]
         after: i64,
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
     /// Resume queued jobs; --retry-blocked retries after resources/storage recover.
-    CacheResume {
+    #[command(name = "cache-resume")]
+    Resume {
         #[arg(long, default_value_t = 0)]
         after: i64,
         #[arg(long, default_value_t = 100)]
@@ -112,18 +114,21 @@ enum CacheCommand {
         #[arg(long)]
         retry_blocked: bool,
     },
-    CacheBudgets {
+    #[command(name = "cache-budgets")]
+    Budgets {
         #[arg(long)]
         thumbnail_bytes: u64,
         #[arg(long)]
         large_bytes: u64,
     },
-    CacheRelocateBegin {
+    #[command(name = "cache-relocate-begin")]
+    RelocateBegin {
         #[arg(value_enum)]
         tier: PreviewTier,
         destination: PathBuf,
     },
-    CacheRelocateStep {
+    #[command(name = "cache-relocate-step")]
+    RelocateStep {
         #[arg(value_enum)]
         tier: PreviewTier,
         #[arg(long, default_value_t = 100)]
@@ -754,12 +759,12 @@ fn run_catalog_command(
         Command::Relink(RelinkCommand::RelinkUndo { plan }) => {
             print_json(&catalog.undo_relink(&plan)?)?
         }
-        Command::Cache(CacheCommand::CacheJobs { after, limit }) => {
+        Command::Cache(CacheCommand::Jobs { after, limit }) => {
             let settings = load_preview_settings(&preview_config)?;
             let previews = settings.open(std::env::current_exe()?, None)?;
             print_json(&previews.jobs(after, limit)?)?;
         }
-        Command::Cache(CacheCommand::CacheResume {
+        Command::Cache(CacheCommand::Resume {
             after,
             limit,
             retry_blocked,
@@ -785,7 +790,7 @@ fn run_catalog_command(
             }
             print_json(&serde_json::json!({"cursor":cursor,"results":results}))?;
         }
-        Command::Cache(CacheCommand::CacheBudgets {
+        Command::Cache(CacheCommand::Budgets {
             thumbnail_bytes,
             large_bytes,
         }) => {
@@ -794,12 +799,12 @@ fn run_catalog_command(
             previews.set_cache_budgets(thumbnail_bytes, large_bytes)?;
             print_json(&previews.store_usage()?)?;
         }
-        Command::Cache(CacheCommand::CacheRelocateBegin { tier, destination }) => {
+        Command::Cache(CacheCommand::RelocateBegin { tier, destination }) => {
             let settings = load_preview_settings(&preview_config)?;
             let mut previews = settings.open(std::env::current_exe()?, None)?;
             previews.begin_relocation(tier.into(), &destination, &settings.original_roots)?;
         }
-        Command::Cache(CacheCommand::CacheRelocateStep { tier, limit, bytes }) => {
+        Command::Cache(CacheCommand::RelocateStep { tier, limit, bytes }) => {
             let settings = load_preview_settings(&preview_config)?;
             let mut previews = settings.open(std::env::current_exe()?, None)?;
             print_json(&previews.relocation_step(tier.into(), limit, bytes)?)?;
