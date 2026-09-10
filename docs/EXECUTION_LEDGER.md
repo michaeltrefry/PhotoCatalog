@@ -15,8 +15,8 @@ sc-22836–sc-22842 are verified Done. S8 editing/export implementation and qual
 | sc-22840 | Done | [PR #6](https://github.com/michaeltrefry/PhotoCatalog/pull/6), merged 60fc33c | Controlled APFS detach/remount/reorganization/replacement/undo; Linux bind mount and Windows volume GUID/junction proof; PR CI 34394610454 and main CI 34395883109 all four jobs SUCCESS; Shortcut Done read-back | Complete |
 | sc-22841 | Done | [PR #8](https://github.com/michaeltrefry/PhotoCatalog/pull/8), merged789a39d | Reviewed preview defaults and full30-file memory/quality, layout, navigation and integrated10M evidence; PR CI34430709720 and main CI34432335579 SUCCESS; Shortcut Done read-back | Complete |
 | sc-22842 | Done | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7), mergede68d375 | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md); reviewed scale/actual-overlap evidence; main CI34418548263 SUCCESS; Shortcut Done read-back | Complete |
-| sc-22843 | In Progress | codex/sc-22843-edits; persistent recipes/variants, copy jobs, edited previews, exact batch export |134 focused tests passed at7a97b8b (120 library,14 integration); actual crash/restoration/cache-hit evidence; strict all-target Clippy at8f8bc58. These are correctness evidence only | Complete retained decode-source guard, full corpus/100MP/performance qualification, independent review and batched PR/three-platform CI/merge |
-| sc-22844 | In Progress | codex/sc-22844-page-memory; frozen v5 main inspection | Recovery adoption and three main slices independently verified: ten completed members/6,619,809 rows; eleventh677,581 retained/readback partial; latest988 command results pass and observed processes reaped | Continue bounded main slices; independently admit auxiliary/path/packet phases and current-family ambiguity review before migration |
+| sc-22843 | In Progress | codex/sc-22843-edits; persistent recipes/variants, copy jobs, edited previews, exact batch export |370 tests passed at45df945 (33 suites,3 intentional ignored); strict all-target Clippy/package fmt PASS; probe compile at a5ac9d6;42 Python checker contracts at6bdb95f. Correctness evidence only | Complete full corpus/100MP/performance qualification, independent review and batched PR/three-platform CI/merge |
+| sc-22844 | In Progress | codex/sc-22844-page-memory; frozen v5 main inspection | Recovery adoption and five main slices independently verified: twelve completed members/7,906,054 rows; thirteenth606,924 retained/readback partial; latest571 command results pass and observed processes reaped | Continue bounded main slices; independently admit auxiliary/path/packet phases and current-family ambiguity review before migration |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
 | sc-22847 | To Do | Desktop UI | Prerequisites sc-22840/sc-22841/sc-22842/sc-22843/sc-22845/sc-22846 | Dependency-bound |
@@ -92,9 +92,9 @@ held-file identities/change stamps for short guarded namespace steps, and commit
 intent before capture/link. Tests cover interrupted and repeated restoration,
 actual crash after publication, cancellation and later offline originals. Warm
 preview records identify the actual checksum-validated prepared input consumed;
-corruption is an explicit cache miss. An independent review identified a further
-source-consistency gap across native export decode (temporary rewrite followed by
-restored original bytes); a retained identity/change-stamp guard is being added.
+corruption is an explicit cache miss. The retained identity/change-stamp guard now spans native export decode; its
+regression rewrites the same inode before decode and restores bytes/mtime afterward.
+The inconsistent decode is rejected while the stable positive control passes.
 The prospective S8 targets remain unchanged. The serial qualification harness
 must freeze exact source/cohort/oracles/settings/resources before execution.
 
@@ -112,3 +112,29 @@ separately admitted using an immutable recipe and exact owned pause. No source
 originals/catalogs are modified; no automatic family choice or live migration has
 occurred. Auxiliary, referenced-path and packet work remains to be independently
 admitted after main inspection.
+
+## S8 qualification preparation checkpoint
+
+At `45df945`, the full locked all-target Rust gate passed 370 tests across 33
+suites, with three intentional ignored fixtures. Strict Clippy and package
+formatting passed. The initial broad gate exposed 16 dirty-binding trigger
+failures; conditional inserts fixed repeated UPSERT/REPLACE conflict behavior.
+The failures remain retained. The independent Adobe DNG sensor-neutral test
+passed; it does not establish real-camera Adobe appearance parity.
+
+The probe compiled at `a5ac9d6`. At `6bdb95f`, all 42 Python checker contracts
+passed, including actual subprocess cleanup, evidence failures and the fixed
+per-configuration statistics. Independent statistics review passed. Receipts:
+`sc-22843-core-and-probe-gate-v1/receipt.json` and
+`sc-22843-supervisor-statistics-v1/receipt.json` under private results.
+Later `b14c357` source adds exact sample/output coverage, Mac kernel identity
+checks, and draft immutable helper/runtime and disk accounting; its new tests
+remain unrun. No large editing campaign has started. Final aggregate, durable
+metadata/service and 100MP independent checks, binding, campaign, review and
+three-platform delivery remain required.
+
+The fifth v5 Lightroom slice paused cleanly after 602.051 seconds. Its 571 new
+commands and 12 complete outcomes were independently reconciled; all 190
+observed processes were absent. Python sampled peak was 495,927,296 bytes.
+The sixth unchanged 600-second slice is running exclusively; no later slice
+is automatically authorized.
