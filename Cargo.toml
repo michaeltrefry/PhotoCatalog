@@ -12,6 +12,8 @@ fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
 lcms2 = { version = "6", features = ["static"] }
 flate2 = "1"
+png = "=0.18.1"
+tiff = "=0.10.3"
 kamadak-exif = "0.6"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

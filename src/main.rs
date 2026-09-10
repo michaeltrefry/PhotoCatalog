@@ -11,6 +11,8 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
 };
+mod cli_edits;
+mod cli_exports;
 #[derive(Parser)]
 #[command(version, about = "PhotoCatalog Rust catalog and metadata tools")]
 struct Cli {
@@ -57,6 +59,10 @@ impl From<PreviewTier> for photocatalog::preview::Tier {
 // generated debug-mode argument builders out of a single large stack frame.
 #[derive(Subcommand)]
 enum Command {
+    #[command(flatten)]
+    Edits(cli_edits::EditCommand),
+    #[command(flatten)]
+    Exports(cli_exports::ExportCommand),
     #[command(flatten)]
     Cache(CacheCommand),
     #[command(flatten)]
@@ -466,6 +472,12 @@ enum MetadataCommand {
 fn main() -> Result<()> {
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|arg| arg == "--photo-export-worker")
+    {
+        return photocatalog::export_worker::export_worker_main();
+    }
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|arg| arg == "--preview-worker")
     {
         return photocatalog::preview::worker_main();
@@ -476,6 +488,14 @@ fn main() -> Result<()> {
 // Windows executable main stacks are smaller than Rust's test-thread stacks.
 fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Exports(command) => {
+            let mut catalog = Catalog::open(&cli.catalog)?;
+            cli_exports::run(&mut catalog, cli.preview_config, command)
+        }
+        Command::Edits(command) => {
+            let mut catalog = Catalog::open(cli.catalog)?;
+            cli_edits::run(&mut catalog, command)
+        }
         Command::Import { folder, max_files } => {
             let mut catalog = Catalog::open_for_import(&cli.catalog, &folder)?;
             let configuration = photocatalog::preview::PreviewConfiguration::read(
@@ -810,6 +830,8 @@ fn run_catalog_command(
             print_json(&previews.relocation_step(tier.into(), limit, bytes)?)?;
         }
         Command::Import { .. } => unreachable!("import uses its isolated dispatch path"),
+        Command::Exports(_) => unreachable!("exports use their isolated dispatch path"),
+        Command::Edits(_) => unreachable!("edits use their isolated dispatch path"),
         Command::Browse { after, limit } => println!(
             "{}",
             serde_json::to_string_pretty(&catalog.browse(after, limit)?)?

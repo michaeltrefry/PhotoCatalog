@@ -156,7 +156,7 @@ fn prepare(dataset_path: &Path, output: &Path) -> Result<()> {
         count: ASSETS,
     };
     let started = Instant::now();
-    let mut receipt = json!({"version":1,"complete":false,"started":anchor(started),"rows":0,"kind":"synthetic direct SQL seed; not an import"});
+    let mut receipt = json!({"version":2,"catalog_schema":photocatalog::CURRENT_SCHEMA_VERSION,"complete":false,"started":anchor(started),"rows":0,"kind":"synthetic direct SQL seed; not an import"});
     let result = (|| -> Result<()> {
         drop(Catalog::open(&fixture.catalog)?);
         let mut db = Connection::open(fixture.catalog.join("catalog.sqlite3"))?;
@@ -481,7 +481,7 @@ fn run(
     );
     fs::create_dir(output).context("new output directory required")?;
     let started = Instant::now();
-    let mut receipt = json!({"version":1,"complete":false,"started":anchor(started),"profile":profile,"workload":workload,
+    let mut receipt = json!({"version":2,"complete":false,"started":anchor(started),"profile":profile,"workload":workload,
         "source_blake3":blake3::hash(include_bytes!("preview_navigation_probe.rs")).to_hex().to_string(),
         "fixture_module_blake3":blake3::hash(include_bytes!("preview_fixture/mod.rs")).to_hex().to_string(),
         "cargo_lock_blake3":blake3::hash(include_bytes!("../../Cargo.lock")).to_hex().to_string(),
@@ -510,8 +510,8 @@ fn run(
                 |r| r.get(0),
             )?)?;
             ensure!(
-                schema == 5 && count == fixture.catalog_count,
-                "catalog count/schema changed"
+                schema == photocatalog::CURRENT_SCHEMA_VERSION && count == fixture.catalog_count,
+                "catalog count/schema changed; explicitly migrate before measurement"
             );
             receipt["catalog_count"] = json!(count);
             receipt["catalog_schema"] = json!(schema);
@@ -582,7 +582,9 @@ fn verify(folder: &Path) -> Result<()> {
     let receipt: Value =
         serde_json::from_slice(&read_bounded(&folder.join("receipt.json"), 1024 * 1024)?)?;
     ensure!(
-        receipt["complete"] == true && receipt["version"] == 1,
+        receipt["complete"] == true
+            && receipt["version"] == 2
+            && receipt["catalog_schema"] == photocatalog::CURRENT_SCHEMA_VERSION,
         "incomplete run"
     );
     ensure!(

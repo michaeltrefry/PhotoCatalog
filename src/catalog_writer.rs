@@ -43,6 +43,18 @@ pub(crate) fn for_catalog(canonical_root: &Path) -> Arc<Writers> {
 }
 
 impl Writers {
+    #[cfg(test)]
+    pub(crate) fn wait_until_queued(&self, foreground: u64, background: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        while state.next[0] - state.serving[0] != foreground
+            || state.next[1] - state.serving[1] != background
+        {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "writer did not reach admission");
+            state = self.changed.wait_timeout(state, left).unwrap().0;
+        }
+    }
     pub(crate) fn enter(self: &Arc<Self>, priority: Priority) -> Result<Permit> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let owner = thread::current().id();
@@ -90,18 +102,10 @@ mod tests {
     use super::*;
     use crate::{Catalog, catalog_metadata::Source, organization::Operation, xmp_packets};
     use rusqlite::params;
-    use std::{fs, time::Duration};
+    use std::fs;
 
     fn queued(gate: &Writers, foreground: u64, background: u64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut state = gate.state.lock().unwrap();
-        while state.next[0] - state.serving[0] != foreground
-            || state.next[1] - state.serving[1] != background
-        {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(!left.is_zero(), "writer did not reach admission");
-            state = gate.changed.wait_timeout(state, left).unwrap().0;
-        }
+        gate.wait_until_queued(foreground, background);
     }
     fn source() -> Source {
         Source {
@@ -111,6 +115,165 @@ mod tests {
             ambiguous: false,
             provenance: serde_json::json!({"test":true}),
         }
+    }
+
+    #[test]
+    fn export_revalidates_original_after_waiting_for_writer() -> Result<()> {
+        use crate::{
+            catalog_edits::VariantKey,
+            catalog_exports::{ExportTarget, MetadataSelection},
+            image_export::{
+                AlphaPolicy, IntegerDepth, OutputFormat, OutputProfile, OutputSize, OutputSpec,
+            },
+            metadata_export,
+            storage_volume::NativePath,
+        };
+        for publish in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("catalog");
+            let original = temp.path().join("original.png");
+            let destination = temp.path().join("export.png");
+            fs::write(&original, b"original fixture bytes")?;
+            let mut catalog = Catalog::open(&root)?;
+            let metadata=serde_json::json!({"format":"PNG","width":100,"height":100,"orientation":1,"camera_make":null,"camera_model":null,"captured_at":null,"preview_source":"fixture"}).to_string();
+            catalog.db.execute("INSERT INTO assets(id,location,path_display,state,metadata,preview_hash,fingerprint) VALUES('source',?1,'original','ready',?2,'fixture',?3)",params![crate::location_bytes(&original),metadata,blake3::hash(b"original fixture bytes").to_hex().to_string()])?;
+            catalog.record_storage_path("source", &NativePath::from_path(&original))?;
+            let job = catalog.begin_photo_export()?;
+            let target = ExportTarget {
+                key: VariantKey::master("source"),
+                expected_revision: 0,
+                destination: destination.clone(),
+                overwrite: false,
+                metadata: MetadataSelection::Omit,
+            };
+            let output = OutputSpec {
+                size: OutputSize::Original,
+                format: OutputFormat::Png {
+                    depth: IntegerDepth::Eight,
+                },
+                profile: OutputProfile::Srgb,
+                alpha: AlphaPolicy::Preserve,
+            };
+            catalog.append_photo_export(&job.id, 0, &target, &output, 1024, 1024)?;
+            catalog.seal_photo_export_job(&job.id, 1)?;
+            let work = catalog.claim_photo_export(&job.id)?.unwrap();
+            let staged = temp.path().join("rendered");
+            fs::write(&staged, b"rendered derivative")?;
+            let seal = metadata_export::seal_photo_export(
+                &work.plan.destination,
+                &staged,
+                1024,
+                &work.authority,
+                |_| Ok(()),
+            )?;
+            if publish {
+                catalog.accept_photo_export_seal(&work, &seal)?;
+            }
+            let gate = catalog.writers.clone();
+            let held = gate.enter(Priority::Background)?;
+            let job_id = job.id.clone();
+            let worker = thread::spawn(move || -> Result<()> {
+                let mut other = Catalog::open(root)?;
+                if publish {
+                    other.publish_photo_export_item(&job_id, 1).map(|_| ())
+                } else {
+                    other.accept_photo_export_seal(&work, &seal)
+                }
+            });
+            queued(&gate, 1, 0);
+            let mutation = fs::write(&original, b"changed while waiting");
+            // Even a refused Windows write must release the gate and join.
+            drop(held);
+            let result = worker.join().expect("export worker panicked");
+            if cfg!(windows) {
+                assert_eq!(
+                    mutation
+                        .expect_err("held proof allowed a write")
+                        .raw_os_error(),
+                    Some(32)
+                );
+                result?;
+                assert_eq!(fs::read(&original)?, b"original fixture bytes");
+                assert_eq!(destination.exists(), publish);
+                if publish {
+                    assert_eq!(fs::read(&destination)?, b"rendered derivative");
+                }
+                assert_eq!(
+                    catalog.photo_export_items(&job.id, 0, 1)?[0].state,
+                    if publish { "published" } else { "sealed" }
+                );
+            } else {
+                mutation?;
+                assert!(format!("{:#}", result.unwrap_err()).contains("original changed"));
+                assert!(!destination.exists());
+                assert_eq!(
+                    catalog.photo_export_items(&job.id, 0, 1)?[0].state,
+                    if publish { "sealed" } else { "rendering" }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn edit_copy_validates_current_dimensions_after_waiting_for_writer() -> Result<()> {
+        use crate::{
+            catalog_edits::{EditTarget, VariantKey},
+            edit::{AdjustmentGroup, NormalizedRect, Recipe, RecipeV1},
+        };
+        for (before, after, expected) in [(1000, 2, "incompatible"), (2, 1000, "applied")] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("catalog");
+            let mut catalog = Catalog::open(&root)?;
+            let metadata = |size| {
+                serde_json::json!({"format":"PNG","width":size,"height":size,"orientation":1,"camera_make":null,"camera_model":null,"captured_at":null,"preview_source":"fixture"}).to_string()
+            };
+            for (asset, size) in [("source", 1000), ("target", before)] {
+                catalog.db.execute("INSERT INTO assets(id,location,path_display,state,metadata) VALUES(?1,?2,?1,'pending',?3)",params![asset,asset.as_bytes(),metadata(size)])?;
+            }
+            let source = VariantKey::master("source");
+            let target = VariantKey::master("target");
+            let recipe = Recipe::V1(RecipeV1 {
+                crop: Some(NormalizedRect {
+                    left: 0.1,
+                    top: 0.0,
+                    right: 0.11,
+                    bottom: 1.0,
+                }),
+                ..RecipeV1::default()
+            });
+            catalog.save_edit_recipe(&source, 0, &recipe)?;
+            let job = catalog.begin_edit_copy(&source, 1, &[AdjustmentGroup::Geometry])?;
+            catalog.append_edit_copy(
+                &job.id,
+                0,
+                &[EditTarget {
+                    key: target.clone(),
+                    expected_revision: 0,
+                }],
+            )?;
+            catalog.seal_edit_copy(&job.id, 1)?;
+            let gate = catalog.writers.clone();
+            let held = gate.enter(Priority::Background)?;
+            let job_id = job.id.clone();
+            let worker = thread::spawn(move || -> Result<()> {
+                let mut other = Catalog::open(root)?;
+                other.apply_edit_copy_step(&job_id, 1)?;
+                Ok(())
+            });
+            queued(&gate, 1, 0);
+            // Model the import transaction holding this writer permit: its new
+            // dimensions become authoritative before the waiting copy is admitted.
+            catalog.db.execute("UPDATE assets SET metadata=?1,render_generation=render_generation+1 WHERE id='target'",[metadata(after)])?;
+            drop(held);
+            worker.join().expect("copy worker panicked")?;
+            assert_eq!(catalog.edit_copy_items(&job.id, 0, 1)?[0].state, expected);
+            assert_eq!(
+                catalog.edit_variant(&target)?.revision,
+                i64::from(expected == "applied")
+            );
+        }
+        Ok(())
     }
     fn fixture() -> Result<(tempfile::TempDir, Catalog, PathBuf)> {
         let temp = tempfile::tempdir()?;

@@ -1,5 +1,35 @@
 # sc-22842 organization query experiment — protocol and retained design
 
+Current source compatibility revision: driver **5**, native receipt protocol **2**,
+catalog schema **6**. This revision is source preparation, not a new performance
+qualification. The qualified driver-4/native-1/schema-5 binaries, source archives,
+private fixtures and receipts remain unchanged.
+
+The synthetic `organization_fixture.protocol=1`, row formulas and provenance,
+17 workloads, sample counts and performance budgets stay unchanged. Current
+native query/transition entrypoints refuse older catalogs before `Catalog::open`;
+no schema migration belongs to a timed query. `prepare` creates schema 6 directly.
+For reused owned copies, run `migrate-fixture` explicitly during preparation.
+Migration receipts identify `identity_scope=pre_existing_tables`: the before/after
+typed hash and table counts cover exactly that old table set, including FTS and
+row identities. `added_tables` separately names the nine initially empty
+edit/export tables and four derived alias tables. Alias directories/paths start
+empty; alias state has one row, and dirty membership contains every existing
+storage binding. `alias_initial_state` reports the exact unbound-asset and dirty
+counts, checked against existing assets/bindings and exact dirty membership.
+This is not a claim that the entire schema-6 hash equals the old schema-5 hash.
+A pristine 6-to-6 verification reports no additions and validates that same
+initial state. Projection reconciliation is not timed query work.
+
+The driver preserves the original native-protocol-1 4-to-5 proof bytes, then records
+a distinct 5-to-6 migration and changed physical main hash. A copied schema-6
+fixture instead requires current producer evidence or a bound predecessor
+migration receipt, retains predecessor proof bytes/manifest identity, and records
+a separate 6-to-6 verification with unchanged physical bytes. Old-schema test
+fixtures remove all schema-6 tables, indexes and attached alias triggers rather
+than merely relabeling a current database. Existing frozen 4-to-5 proof bytes
+and their native-protocol-1 interpretation remain unchanged.
+
 This experiment is separate from S2 backend selection. SQLite remains the selected
 backend; no alternative backend/profile or threshold search is performed here.
 The protocol, production code, probe, fixture formula, and coordinator must be

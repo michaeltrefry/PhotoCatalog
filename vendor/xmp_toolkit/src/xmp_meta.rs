@@ -20,9 +20,9 @@ use std::{
 };
 
 use crate::{
-    ffi::{self, CXmpString},
     IterOptions, OpenFileOptions, XmpDateTime, XmpError, XmpErrorType, XmpFile, XmpIterator,
     XmpProperty, XmpResult, XmpValue,
+    ffi::{self, CXmpString},
 };
 
 /// Represents the data model of an XMP packet.
@@ -1987,6 +1987,31 @@ impl XmpMeta {
         }
 
         Ok(result)
+    }
+
+    /// Packages this metadata using Adobe's standard and extended JPEG XMP rules.
+    /// Returns (standard packet, extended packet, extended packet digest).
+    /// Empty extension strings mean the standard packet contains all metadata.
+    pub fn package_for_jpeg(&self) -> XmpResult<(String, String, String)> {
+        if let Some(m) = self.m {
+            let mut err = ffi::CXmpError::default();
+            let (mut a, mut b, mut c) = (std::ptr::null(), std::ptr::null(), std::ptr::null());
+            unsafe {
+                ffi::CXmpMetaPackageForJPEG(m, &mut err, &mut a, &mut b, &mut c);
+                let (a, b, c) = (
+                    CXmpString::from_ptr(a),
+                    CXmpString::from_ptr(b),
+                    CXmpString::from_ptr(c),
+                );
+                XmpError::raise_from_c(&err)?;
+                if a.s.is_null() || b.s.is_null() || c.s.is_null() {
+                    return Err(no_cpp_toolkit());
+                }
+                Ok((a.as_string(), b.as_string(), c.as_string()))
+            }
+        } else {
+            Err(no_cpp_toolkit())
+        }
     }
 
     /// Converts metadata in this XMP object into a string as RDF.

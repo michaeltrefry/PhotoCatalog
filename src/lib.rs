@@ -1,12 +1,23 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
+/// Current on-disk catalog schema; probes must preflight before timed opens.
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+
+pub mod catalog_edits;
+pub mod catalog_export_alias;
+pub mod catalog_exports;
 pub mod catalog_metadata;
 pub mod catalog_storage;
 mod catalog_writer;
+pub mod edit;
+pub mod export_service;
+pub mod export_worker;
+pub mod image_export;
 mod import_storage;
 pub mod media;
 pub mod metadata_export;
 pub mod organization;
 pub mod organization_search;
+pub mod photo_render;
 pub mod preview;
 pub mod storage_volume;
 pub mod xmp;
@@ -212,7 +223,7 @@ impl Catalog {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            version <= 5,
+            version <= CURRENT_SCHEMA_VERSION,
             "catalog schema {version} is newer than this application supports"
         );
         let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -235,13 +246,13 @@ impl Catalog {
         configure_catalog_connection(&db)?;
         // Opening a current catalog must not rewrite its header or acquire an
         // unnecessary writer transaction. Only actual initialization/migration writes.
-        if version < 5 {
+        if version < CURRENT_SCHEMA_VERSION {
             let _write = writers.enter(catalog_writer::Priority::Foreground)?;
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // Another admitted opener may have completed migration while we waited.
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             ensure!(
-                version <= 5,
+                version <= CURRENT_SCHEMA_VERSION,
                 "catalog schema changed while waiting for migration"
             );
             tx.execute_batch("
@@ -275,6 +286,12 @@ impl Catalog {
             if version < 5 {
                 tx.execute_batch(organization::CAPTURE_LENS_SCHEMA)?;
                 tx.pragma_update(None, "user_version", 5)?;
+            }
+            if version < 6 {
+                tx.execute_batch(catalog_edits::SCHEMA)?;
+                tx.execute_batch(catalog_exports::SCHEMA)?;
+                tx.execute_batch(catalog_export_alias::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 6)?;
             }
             tx.commit()?;
         }
@@ -970,7 +987,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            5
+            6
         );
         assert_eq!(
             catalog

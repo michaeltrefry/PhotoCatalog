@@ -1287,46 +1287,8 @@ impl Catalog {
         base_model: i64,
         destination: &Path,
     ) -> Result<MetadataExportPlan> {
-        let view = self.metadata(asset)?;
-        ensure!(
-            view.revision == expected_revision,
-            "metadata changed before export planning"
-        );
-        ensure!(
-            view.fields.iter().all(|f| !f.conflicted),
-            "resolve metadata conflicts before export"
-        );
-        let base = self.editable_metadata_model(asset, base_model)?;
-        let mut fields = Vec::new();
-        for field in &view.fields {
-            let value = field
-                .value
-                .as_ref()
-                .context("effective metadata field has no value")?;
-            let bytes = if *value == Value::Removed {
-                None
-            } else {
-                Some(self.editable_metadata_model(
-                    asset,
-                    field.selected_model.context("field has no source model")?,
-                )?)
-            };
-            fields.push((field.name.clone(), bytes));
-        }
-        let payload = xmp::reconcile_fields(&base, &fields)?;
-        let projected = xmp::project(&payload)?;
-        for field in &view.fields {
-            let actual = projected.fields.get(&field.name);
-            ensure!(
-                if field.value == Some(Value::Removed) {
-                    actual.is_none()
-                } else {
-                    actual == field.value.as_ref()
-                },
-                "export does not match resolved field {}",
-                field.name
-            );
-        }
+        let (payload, projected) =
+            self.resolved_export_xmp(asset, expected_revision, base_model)?;
         let plan = crate::metadata_export::plan_export(destination, &payload)?;
         let hash = blake3::hash(&payload).to_hex().to_string();
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
@@ -1367,6 +1329,61 @@ impl Catalog {
             projected,
         })
     }
+    /// Immutable selected full XMP base with resolved common fields. Native photo
+    /// export freezes these bytes separately from its later derivative transforms.
+    pub(crate) fn resolved_export_xmp(
+        &self,
+        asset: &str,
+        expected_revision: i64,
+        base_model: i64,
+    ) -> Result<(Vec<u8>, Projection)> {
+        let view = self.metadata(asset)?;
+        ensure!(
+            view.revision == expected_revision,
+            "metadata changed before export planning"
+        );
+        ensure!(
+            view.fields.iter().all(|f| !f.conflicted),
+            "resolve metadata conflicts before export"
+        );
+        let base = self.editable_metadata_model(asset, base_model)?;
+        let mut fields = Vec::new();
+        for field in &view.fields {
+            let value = field
+                .value
+                .as_ref()
+                .context("effective metadata field has no value")?;
+            let bytes = if *value == Value::Removed {
+                None
+            } else {
+                Some(self.editable_metadata_model(
+                    asset,
+                    field.selected_model.context("field has no source model")?,
+                )?)
+            };
+            fields.push((field.name.clone(), bytes));
+        }
+        let payload = xmp::reconcile_fields(&base, &fields)?;
+        let projected = xmp::project(&payload)?;
+        for field in &view.fields {
+            let actual = projected.fields.get(&field.name);
+            ensure!(
+                if field.value == Some(Value::Removed) {
+                    actual.is_none()
+                } else {
+                    actual == field.value.as_ref()
+                },
+                "export does not match resolved field {}",
+                field.name
+            );
+        }
+        ensure!(
+            self.metadata(asset)?.revision == expected_revision,
+            "metadata changed during export snapshot"
+        );
+        Ok((payload, projected))
+    }
+
     /// Publish exactly the planned bytes, with catalog revision and destination revision checks.
     pub fn apply_metadata_export(
         &mut self,

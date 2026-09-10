@@ -51,10 +51,10 @@ class NavigationContractTests(unittest.TestCase):
 
     def test_review_binding_requires_exact_whole_archive_binary_and_protocol(self):
         files={k:"a"*64 for k in ("archive","binary","worker","protocol","fixture","dataset","layout_receipt","storage","coordinator")}
-        binding={"version":1,"clean":True,"source_revision":"b"*40,"planned_measured_children":44,"planned_verifiers":44,
+        binding={"version":2,"catalog_schema":6,"clean":True,"source_revision":"b"*40,"planned_measured_children":44,"planned_verifiers":44,
                  **{name+"_sha256":value for name,value in files.items()}}
         validate_binding(binding,files)
-        for field in ("clean","archive_sha256","binary_sha256","protocol_sha256","planned_measured_children"):
+        for field in ("catalog_schema","version","clean","archive_sha256","binary_sha256","protocol_sha256","planned_measured_children"):
             bad=copy.deepcopy(binding);bad[field]=None
             with self.assertRaises(ValueError): validate_binding(bad,files)
 

@@ -54,8 +54,9 @@ fn schema(db: &Connection) -> Result<Vec<SchemaEntry>> {
 }
 fn count_schema(db: &Connection, total: u64) -> Result<()> {
     ensure!(
-        db.query_row::<u32, _, _>("PRAGMA user_version", [], |r| r.get(0))? == 5,
-        "schema must be exactly 5; no migration in this experiment"
+        db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))?
+            == photocatalog::CURRENT_SCHEMA_VERSION,
+        "schema must be current (6); explicitly migrate before this experiment"
     );
     ensure!(
         db.query_row::<String, _, _>(
@@ -171,7 +172,7 @@ fn overlay(
         "schema/sequence changed"
     );
     count_schema(&tx, total)?;
-    let receipt = json!({"changed_columns":["fingerprint","render_generation","preview_hash"],"rows":window,"catalog_count":total,"schema_version":5,"rows_before_blake3":hash(&before)?,"rows_after_blake3":hash(&after)?,"keys_blake3":hash(&keys)?,"schema_blake3":hash(&schema_before)?,"storage_epoch_before":epoch,"storage_epoch_after":epoch_after,"connection_total_changes_delta":changes_after-changes,"remaining_asset_columns_unchanged":true,"sqlite_sequence_unchanged":true,"actual_offline_root":offline,"source_path_formula":"/synthetic/folder{sequence%5}/file{sequence:012}.jpg","all_overlay_source_paths_verified":true,"organization_effect":"none: only storage_asset_change fires; exact 2*window DML, existing schema unchanged"});
+    let receipt = json!({"changed_columns":["fingerprint","render_generation","preview_hash"],"rows":window,"catalog_count":total,"schema_version":photocatalog::CURRENT_SCHEMA_VERSION,"rows_before_blake3":hash(&before)?,"rows_after_blake3":hash(&after)?,"keys_blake3":hash(&keys)?,"schema_blake3":hash(&schema_before)?,"storage_epoch_before":epoch,"storage_epoch_after":epoch_after,"connection_total_changes_delta":changes_after-changes,"remaining_asset_columns_unchanged":true,"sqlite_sequence_unchanged":true,"actual_offline_root":offline,"source_path_formula":"/synthetic/folder{sequence%5}/file{sequence:012}.jpg","all_overlay_source_paths_verified":true,"organization_effect":"none: only storage_asset_change fires; exact 2*window DML, existing schema unchanged"});
     tx.commit()?;
     Ok(receipt)
 }
@@ -185,7 +186,8 @@ pub(super) fn run(bundle: &Path, dataset_path: &Path) -> Result<()> {
         serde_json::from_slice(&read_bounded(&bundle.join("copy-receipt.json"), 65536)?)?;
     ensure!(
         proof["complete"] == true
-            && proof["schema_version"] == 5
+            && proof["version"] == 3
+            && proof["schema_version"] == photocatalog::CURRENT_SCHEMA_VERSION
             && proof["ancestry"]["complete"] == true
             && proof["copied_catalog"] == copied.to_string_lossy().as_ref(),
         "verified raw-copy receipt required"
@@ -349,7 +351,7 @@ mod tests {
         for mode in 0..3 {
             let (_dir, mut db, mut keys, offline) = fixture();
             if mode == 1 {
-                db.pragma_update(None, "user_version", 6).unwrap();
+                db.pragma_update(None, "user_version", 5).unwrap();
             }
             if mode == 2 {
                 keys[1].asset_id = "wrong".into();

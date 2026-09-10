@@ -4,7 +4,7 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836–sc-22840 are verified Done. S6 preview integration and final measurements remain in progress. S7 has passed local correctness and full scale qualification and is preparing final hosted CI. S9 is inspecting Lightroom catalogs in resumable, read-only source passes. Heavy local validation and timed measurements are coordinated separately; the live Shortcut epic remains authoritative.
+sc-22836–sc-22842 are verified Done. S8's full headless editing/export qualification and independent evidence review have passed; PR #9's first CI exposed Linux recovery ownership and Windows change-detection defects, with corrective validation active. S9 has an adopted inspection checkpoint and locally validated integration candidate, with its next main run held until S8 delivery and fresh resource admission. Native builds and large-I/O/measurement work use one owned lane. Live Shortcut remains authoritative; this checkpoint was reconciled on 2026-09-10. Sections below the current ledger retain historical checkpoints.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
@@ -13,10 +13,10 @@ sc-22836–sc-22840 are verified Done. S6 preview integration and final measurem
 | sc-22838 | Done | [PR #2](https://github.com/michaeltrefry/PhotoCatalog/pull/2) and corrective [PR #5](https://github.com/michaeltrefry/PhotoCatalog/pull/5), merged bef8b6c | Final renderer review; 115 tests; private camera/render comparisons; PR CI 34386168135 and main CI 34390636314 all four jobs SUCCESS; Shortcut read-back | Complete |
 | sc-22839 | Done | [PR #4](https://github.com/michaeltrefry/PhotoCatalog/pull/4), merged be85c16 | SDK normalization repaired; independent RDF/opaque XMP preservation checks; PR CI 34380874912 and main CI 34382746592 all four jobs SUCCESS; Shortcut Done read-back | Complete |
 | sc-22840 | Done | [PR #6](https://github.com/michaeltrefry/PhotoCatalog/pull/6), merged 60fc33c | Controlled APFS detach/remount/reorganization/replacement/undo; Linux bind mount and Windows volume GUID/junction proof; PR CI 34394610454 and main CI 34395883109 all four jobs SUCCESS; Shortcut Done read-back | Complete |
-| sc-22841 | In Progress | Preview storage and scheduling; codex/sc-22841-previews | Quality and full-worker memory qualification complete; a2f33b7 correctness: 242 Rust, 18 preview/39 benchmark/5 image Python checks PASS; integrated 10M probe source reviewed | Integrate S7 writer/schema changes, validate current source, execute layout/navigation/integrated 10M gates and select defaults, then final CI/merge |
-| sc-22842 | In Progress | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7); organization/search core, schema 5 and shared writer admission | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md): exact runtime 0cfc1fd, all 17 cases × 3 scales and actual-overlap saves PASS; 183 Rust/52 Python checks pass | Final report review, batched push, three-platform CI (including Windows import), merge and tracker read-back |
-| sc-22843 | To Do | Editing and export | Prerequisites sc-22838/sc-22839/sc-22841 | Dependency-bound |
-| sc-22844 | In Progress | Lightroom inspection; codex/sc-22844-lightroom-inspection | Seed byte/row preservation independently verified; current inventory of 48 candidates admitted unchanged; two outcomes complete, next member resumed; comments 22939/22945 | Complete bounded main inspection, review companion/path/packet evidence and current-family ambiguities before migration |
+| sc-22841 | Done | [PR #8](https://github.com/michaeltrefry/PhotoCatalog/pull/8), merged789a39d | Reviewed preview defaults and full30-file memory/quality, layout, navigation and integrated10M evidence; PR CI34430709720 and main CI34432335579 SUCCESS; Shortcut Done read-back | Complete |
+| sc-22842 | Done | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7), mergede68d375 | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md); reviewed scale/actual-overlap evidence; main CI34418548263 SUCCESS; Shortcut Done read-back | Complete |
+| sc-22843 | In Review | [PR #9](https://github.com/michaeltrefry/PhotoCatalog/pull/9); [qualification report](EDIT_QUALIFICATION_RESULTS.md) | Reviewed 533 cases/249 numerical configurations PASS with zero missed targets; first CI34532778141 passed Mac/contracts and failed Linux/Windows. Corrections integrated at6147307; original measurements retain original identities | Review and validate combined corrections, batched CI push, merge and main CI |
+| sc-22844 | In Progress | Frozen v6 adoption; codex/sc-22844-s8-integration at427e9f6 | 15 captures/14 completed outcomes/9,739,671 retained rows independently reconciled; active member has24 verified pages. Integrated412 native/71 Python tests, fmt/strict Clippy/build PASS; main still held | After S8 delivery, fresh resource admission for main; finish auxiliary/path/packet phases and family ambiguity review before migration |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
 | sc-22847 | To Do | Desktop UI | Prerequisites sc-22840/sc-22841/sc-22842/sc-22843/sc-22845/sc-22846 | Dependency-bound |
@@ -68,3 +68,143 @@ failures and rejected v3 mixed summary remain retained. Worst warm/fresh page p9
 was 60.295/61.871 ms; browse RSS peaked at 480.781 MiB. All 200 saves overlapped
 background activity at every scale, with p95 12.788/12.161/11.543 ms. Final CI and
 PR/merged-head verification remain required; this checkpoint is not a Done claim.
+
+## S8 implementation checkpoint — 2026-09-10
+
+The Rust core implements versioned complete basic recipes, independent variants,
+persistent undo/redo, bounded copy-adjustment jobs, and variant-aware retained and
+interactive previews. Full-original JPEG8, PNG8/16 and TIFF8/16/float32 export uses
+immutable plans, selected metadata, explicit overwrite approval, a process lease,
+read-back seals and guarded durable publication. Actual process tests demonstrate
+cancel/reap, preview preemption, undo ABA rejection and owner restart. An orphan
+seal is never published just because it exists: a resumed worker rerenders the
+original and requires full byte equality before reuse.
+
+The focused gate at `7a97b8b` passed 120 library tests and 14 integration tests
+(organization3, actual export service5, publication2, edited previews4).
+Strict all-target Clippy passed at `8f8bc58`. Preserved logs include the earlier
+error-context assertion, private fixture-helper compile error and lint failures.
+These results establish focused correctness, not S8 performance or platform
+qualification.
+
+Publication now performs full verification outside the catalog writer, retains
+held-file identities/change stamps for short guarded namespace steps, and commits
+intent before capture/link. Tests cover interrupted and repeated restoration,
+actual crash after publication, cancellation and later offline originals. Warm
+preview records identify the actual checksum-validated prepared input consumed;
+corruption is an explicit cache miss. The retained identity/change-stamp guard now spans native export decode; its
+regression rewrites the same inode before decode and restores bytes/mtime afterward.
+The inconsistent decode is rejected while the stable positive control passes.
+The prospective S8 targets remain unchanged. The serial qualification harness
+must freeze exact source/cohort/oracles/settings/resources before execution.
+
+## S9 inspection resumption checkpoint — 2026-09-10
+
+The seventh v5 inspection attempt stopped after macOS reused the PID of a
+completed inspector for a later command. All 198 observed PIDs are absent and
+the wrapper was reaped. The failed result remains preserved; user Lightroom
+catalogs are unchanged. Commands 5020–5848 succeeded, and read-only row command
+5849 was interrupted. Fourteen completed members retain 9,256,288 rows; the
+fifteenth retains 483,383 rows with 24 successful readback pages. Its failed
+25th page does not establish progress.
+
+The supervisor now identifies owned processes using native birth seconds and
+microseconds. Independent source reviews passed this correction and protocol3
+checkpoint `cda4a65`, which admits the exact failed attempt into a separate v6
+inspection namespace while retaining v5/v4/v2 provenance. Eight supervisor
+fixtures and 60 Lightroom contracts passed.
+Receipt: `sc-22844-pid-recovery-gate-cda4a65-v1/result.json` under private results.
+The actual v6 init/adopt phases subsequently exited successfully. Independent
+review reconciled 13 typed tables, 1,774 descriptors, 9,739,671 retained rows,
+15 captures and 14 completed member outcomes. The active member retains 24
+successful pages through cursor 9,280,288; failed command 5849 adds no progress.
+Known processes are absent and v6 main has not started. Evidence is
+`sc-22844-generation-request-v6-cda4a65/independent-adoption-review.json`
+under private results. Adoption finished before the tiny editing smoke began.
+The next main request is held: its existing growth allowance plus protected S8
+qualification funding exceeds currently available space. Continuous protection
+of that funding is required before further inspection growth. Auxiliary,
+referenced-path, packet and current family selection work remains outstanding.
+
+## S8 qualification preparation checkpoint
+
+At `45df945`, the full locked all-target Rust gate passed 370 tests across 33
+suites, with three intentional ignored fixtures. Strict Clippy and package
+formatting passed. The initial broad gate exposed 16 dirty-binding trigger
+failures; conditional inserts fixed repeated UPSERT/REPLACE conflict behavior.
+The failures remain retained. The independent Adobe DNG sensor-neutral test
+passed; it does not establish real-camera Adobe appearance parity.
+
+The probe compiled at `a5ac9d6`. At `6bdb95f`, all 42 Python checker contracts
+passed, including actual subprocess cleanup, evidence failures and the fixed
+per-configuration statistics. Independent statistics review passed. Receipts:
+`sc-22843-core-and-probe-gate-v1/receipt.json` and
+`sc-22843-supervisor-statistics-v1/receipt.json` under private results.
+The expanded checker gate at `d38a526` passed 80 tests. Nine actual preview/export
+process tests and strict all-target Clippy passed, including worker high-water
+receipts. Fifteen memory/cleanup checker tests passed at `3539509`. These gates
+exercise checker contracts; they are not actual corpus or timing qualification. No large editing campaign has started. Final aggregate, durable
+metadata/service and 100MP independent checks, binding, campaign, review and
+three-platform delivery remain required.
+
+The first tiny synthetic end-to-end smoke failed because image 0.25.9 silently
+missed the recognized TIFF ICC tag. Commit `9483835` reads that tag through the
+existing TIFF dependency and rejects malformed profiles. The native regression
+reproduced the wrong gamma before the fix; the media suite then passed 19 tests
+with one intentional external-fixture ignore. Independent source review passed.
+Tiny smoke v2 passed all four analytic fixtures with 14 recipes each using the
+unchanged independent oracle and tolerances. Both smoke attempts are retained
+under `sc-22843-tiny-smoke-v1` / `sc-22843-tiny-smoke-v2` in private results.
+This is correctness evidence only; performance and large-image qualification
+remain pending.
+
+Tiny production-path smoke v3 passed two references, warm previews (2+100) and
+first-original lifecycle on TIFF (2+20), and retained nine failures. Six metadata
+cases exposed invalid RDF in the controlled fixture; `3473220` preserves its
+intended nested qualifier in valid explicit RDF syntax. Twenty-two JPEG exports
+completed, but the checker incorrectly expected no XMP despite the service's
+regenerated technical metadata. `26d38cc` corrects that expectation while keeping
+direct-codec omission checks strict. All 98 Python contracts and the focused
+native RDF regression passed; independent source review passed. Two tiny overlap
+cases did not retain a live worker long enough. No overlap or performance result
+is awarded, and a fresh corrective smoke remains required. Failed v3 artifacts
+are preserved under `sc-22843-service-smoke-v3` in private results.
+
+Corrected read-only verification of v3's 22 retained JPEG outputs passed, with
+the original inputs and failed receipts unchanged. Fresh smoke v4 then passed
+seven cases: the two references, warm preview, first-original delivery, the
+22-output export including cleanup, and PNG8/16 selected-metadata preservation.
+Six failures remain retained. `48a2d17` fixes TIFF readback through the held file
+descriptor by providing the Python decoder a display name; the regression failed
+at all three precisions before the fix, then all 18 readback contracts passed.
+Independent source review passed. These results do not yet qualify actual TIFF
+derivative preservation.
+
+JPEG with a large selected XMP packet exposed a product preservation defect:
+the pinned SDK's extended packet loses the named RDF subject. The strict checker
+and importer reject the resulting subject mismatch. Encoder transport correction
+`afaa4ca` preserves the named subject and recomputes the extension digest;
+seven native export tests pass, including full export/reimport preservation and
+rejection of a changed extension subject. Stale-renderer publication guards
+`1ded7b6` pass 17 native tests while retaining finalization of already-installed
+outputs. Both changes passed independent source review. Two tiny overlap cases
+still lack a sufficiently long-lived natural worker. All v4 known processes are
+absent; no performance award follows from this correctness smoke. Full campaign
+preparation still awaits final source binding and an explicit phase admission.
+
+Bounded outer supervision and host-log funding are implemented in `ac373d1` and
+`a649807`, with a separate preparation limit. Final review found late zero-exit
+acceptance, repeated zombie accounting, and unresolved ancestry reporting;
+`809e434` fixes all three. The integrated Python gate passes 122 tests with no
+skips, and independent exact-source review passes. The full native gate passes
+377 tests with three intentional skips; strict Clippy and both debug and release
+builds pass. These results qualify the source checks, not the unstarted full
+campaign. The next service smoke must use the corrected native binaries and
+final supervisor helpers; v5 remains an unexecuted source proposal.
+
+S9 supplementary funding control `90a0f1a` passed 12 synthetic tests and parent
+independent source review. It preserves the frozen inspector and adopted evidence
+while checking free space before new commands and at outer observation points.
+It is not a filesystem quota. Its prepared main request remains held and must
+bind the final S8 funding amount before any execution; no further large plan copy
+is needed solely for this control change.

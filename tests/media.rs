@@ -94,6 +94,60 @@ fn embedded_linear_icc_is_applied_and_alpha_is_unmodified() {
 }
 
 #[test]
+fn embedded_linear_tiff_icc_preserves_signed_hdr_and_straight_alpha() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("linear.tiff");
+    let profile = photocatalog::media::linear_profile()
+        .unwrap()
+        .icc()
+        .unwrap();
+    let pixels = [0.5_f32, -0.125, 1.875, 0.25];
+    for icc in [profile.as_slice(), b"invalid ICC profile".as_slice()] {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(&mut bytes).unwrap();
+            let mut image = encoder
+                .new_image::<tiff::encoder::colortype::RGBA32Float>(1, 1)
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(tiff::tags::Tag::IccProfile, icc)
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(tiff::tags::Tag::ExtraSamples, &[2_u16][..])
+                .unwrap();
+            image.write_data(&pixels).unwrap();
+        }
+        std::fs::write(&path, bytes.get_ref()).unwrap();
+        if icc == profile.as_slice() {
+            let rendered = decode_full(&path).unwrap();
+            for (actual, expected) in rendered.pixels[0].iter().zip(pixels) {
+                assert!(
+                    (actual - expected).abs() < 0.0001,
+                    "{:?}",
+                    rendered.pixels[0]
+                );
+            }
+            assert_eq!(rendered.provenance.source_bits_per_channel, 32);
+            assert!(
+                !rendered
+                    .provenance
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("No embedded ICC"))
+            );
+        } else {
+            assert_eq!(
+                decode_full(&path).err().unwrap().status,
+                DecodeStatus::Corrupt
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), *bytes.get_ref());
+    }
+}
+
+#[test]
 fn corrupt_and_unsupported_are_observable() {
     let dir = tempfile::tempdir().unwrap();
     let unknown = dir.path().join("unknown.xyz");

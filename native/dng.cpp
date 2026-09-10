@@ -12,6 +12,7 @@
 #include "dng_tag_types.h"
 #include "dng_exceptions.h"
 #include "dng_xy_coord.h"
+#include "dng_temperature.h"
 #include "dng_1d_table.h"
 #include "dng_gain_map.h"
 #include "dng_bottlenecks.h"
@@ -25,7 +26,7 @@
 class BoundedAllocator : public dng_memory_allocator {
 public:
     uint64_t ceiling;
-    explicit BoundedAllocator(uint64_t bytes):ceiling(std::min<uint64_t>(bytes,768u*1024u*1024u)) {}
+    explicit BoundedAllocator(uint64_t bytes):ceiling(bytes==UINT64_MAX ? 768u*1024u*1024u : std::min<uint64_t>(bytes,UINT32_MAX)) {}
     dng_memory_block *Allocate(uint32 size) override {
         if (size > ceiling) ThrowMemoryFull("PhotoCatalog DNG allocation limit");
         return dng_memory_allocator::Allocate(size);
@@ -52,7 +53,7 @@ static dng_pixel_buffer row_buffer(const dng_rect &area, uint32 planes, float *d
     buffer.fPixelType=ttFloat; buffer.fPixelSize=4; buffer.fData=data; buffer.fDirty=true;
     return buffer;
 }
-extern "C" int pc_dng(const unsigned char *bytes, size_t len, const PcDecodeLimits *limits, PcImage *out) {
+extern "C" int pc_dng(const unsigned char *bytes, size_t len, const PcDecodeLimits *limits, const PcWhitePoint *white, PcImage *out) {
     try {
         BoundedAllocator allocator(limits->max_allocation_bytes);
         AdmissionHost host(&allocator,*limits); host.SetNeedsMeta(true); host.SetForPreview(false);
@@ -100,7 +101,8 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, const PcDecodeLimi
                 return fail(out,"corrupt DNG spatial calibration exposure weight");
             out->flags|=32;
         }
-        if (negative->HasCameraNeutral()) spec->SetWhiteXY(spec->NeutralToXY(negative->CameraNeutral()));
+        if (white->y) spec->SetWhiteXY(dng_xy_coord(white->x,white->y));
+        else if (negative->HasCameraNeutral()) spec->SetWhiteXY(spec->NeutralToXY(negative->CameraNeutral()));
         else if (negative->HasCameraWhiteXY()) spec->SetWhiteXY(negative->CameraWhiteXY());
         else return fail(out,"unsupported DNG without as-shot white balance");
         const auto matrix=dng_space_sRGB_Linear::Get().MatrixFromPCS()*spec->CameraToPCS();
@@ -191,4 +193,11 @@ extern "C" int pc_dng(const unsigned char *bytes, size_t len, const PcDecodeLimi
     } catch (const std::bad_alloc &) { return fail(out,"resource limit: DNG allocation failed"); }
     catch (const std::exception &e) { return fail(out,e.what()); }
     catch (...) {return fail(out,"DNG SDK exception");}
+}
+
+extern "C" int pc_temperature_xy(double kelvin,double tint,PcWhitePoint *out) {
+    if(!std::isfinite(kelvin)||!std::isfinite(tint)||kelvin<2000||kelvin>50000||tint<-150||tint>150) return -1;
+    const auto xy=dng_temperature(kelvin,tint).Get_xy_coord();
+    out->x=xy.x;out->y=xy.y;
+    return std::isfinite(xy.x)&&std::isfinite(xy.y)&&xy.x>0&&xy.y>0&&xy.x+xy.y<1 ? 0 : -1;
 }

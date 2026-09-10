@@ -44,6 +44,13 @@ pub struct PreviewKey {
     pub encoding: CodecSettings,
 }
 impl PreviewKey {
+    fn channel(&self) -> &'static str {
+        if self.renderer_version.ends_with(":proxy1600") {
+            "interactive"
+        } else {
+            "refined"
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.asset_id.is_empty() && self.asset_id.len() <= 256 && self.variant_id.len() <= 256,
@@ -91,8 +98,22 @@ pub struct StoreConfig {
 }
 /// The metadata/provenance belong to these pixels, including an explicitly stale
 /// retained fallback. General catalog metadata can independently be newer.
+/// Observed input used by the successful editing worker, bound to its preview key.
+/// A prepared hit is recorded only after the complete proxy checksum and identity
+/// have been validated. Older cached records have no such evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum EditInputProvenance {
+    OriginalDecoded,
+    PreparedProxy {
+        receipt: crate::edit::PreparedProxyReceipt,
+        source_instance_digest: String,
+    },
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderRecord {
+    #[serde(default)]
+    pub edit_input: Option<EditInputProvenance>,
     pub width: u32,
     pub height: u32,
     pub metadata: crate::media::Metadata,
@@ -244,7 +265,7 @@ impl PreviewStore {
             ensure!(count == 0 && app == 0, "unrelated preview manifest");
         } else {
             ensure!(
-                (1..=2).contains(&version) && app == 0x50435056,
+                (1..=3).contains(&version) && app == 0x50435056,
                 "unsupported preview manifest"
             );
         }
@@ -271,7 +292,26 @@ impl PreviewStore {
             CREATE TRIGGER IF NOT EXISTS object_touched AFTER UPDATE OF touched ON objects BEGIN UPDATE counter SET value=max(value,NEW.touched) WHERE id=1; END;
             CREATE TRIGGER IF NOT EXISTS object_removed AFTER DELETE ON objects BEGIN UPDATE usage SET bytes=bytes-OLD.bytes,objects=objects-1,pending=pending-(OLD.status='pending') WHERE tier=OLD.tier; END;
             CREATE TRIGGER IF NOT EXISTS object_status AFTER UPDATE OF status ON objects BEGIN UPDATE usage SET pending=pending+(NEW.status='pending')-(OLD.status='pending') WHERE tier=NEW.tier; END;
-            PRAGMA application_id=1346588758; PRAGMA user_version=2; COMMIT;")?;
+            PRAGMA application_id=1346588758;")?;
+        // Under the manifest lease and the same transaction as table creation:
+        // old desired/current pointers retain refined-channel meaning exactly.
+        let migration = (|| -> Result<()> {
+            if version < 3 {
+                db.execute_batch("ALTER TABLE wanted RENAME TO wanted_v2;
+                    DROP INDEX wanted_current;
+                    CREATE TABLE wanted(asset TEXT NOT NULL,variant TEXT NOT NULL,tier TEXT NOT NULL,
+                        generation INTEGER NOT NULL,desired TEXT NOT NULL,current TEXT,
+                        channel TEXT NOT NULL DEFAULT 'refined' CHECK(channel IN ('refined','interactive')),
+                        PRIMARY KEY(asset,variant,tier,channel));
+                    INSERT INTO wanted(asset,variant,tier,generation,desired,current)
+                        SELECT asset,variant,tier,generation,desired,current FROM wanted_v2;
+                    DROP TABLE wanted_v2;
+                    CREATE INDEX wanted_current ON wanted(current);")?;
+            }
+            db.execute_batch("PRAGMA user_version=3")?;
+            Ok(())
+        })();
+        finish(&db, migration)?;
         let clock = db.query_row("SELECT value FROM counter WHERE id=1", [], |r| r.get(0))?;
         db.execute(
             "INSERT OR IGNORE INTO store_identity VALUES(1,?1)",
@@ -431,8 +471,8 @@ impl PreviewStore {
         let old: Option<(i64, String)> = self
             .db
             .query_row(
-                "SELECT generation,desired FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3",
-                params![key.asset_id, key.variant_id, key.tier.name()],
+                "SELECT generation,desired FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3 AND channel=?4",
+                params![key.asset_id, key.variant_id, key.tier.name(), key.channel()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -442,11 +482,11 @@ impl PreviewStore {
                 "stale catalog generation"
             );
         }
-        self.db.execute("INSERT INTO wanted VALUES(?1,?2,?3,?4,?5,NULL) ON CONFLICT(asset,variant,tier) DO UPDATE SET generation=excluded.generation,desired=excluded.desired",params![key.asset_id,key.variant_id,key.tier.name(),key.generation as i64,digest])?;
+        self.db.execute("INSERT INTO wanted VALUES(?1,?2,?3,?4,?5,NULL,?6) ON CONFLICT(asset,variant,tier,channel) DO UPDATE SET generation=excluded.generation,desired=excluded.desired",params![key.asset_id,key.variant_id,key.tier.name(),key.generation as i64,digest,key.channel()])?;
         Ok(())
     }
     fn desired(&self, key: &PreviewKey, digest: &str) -> Result<bool> {
-        Ok(self.db.query_row("SELECT desired=?4 AND generation=?5 FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3",params![key.asset_id,key.variant_id,key.tier.name(),digest,key.generation as i64],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(false))
+        Ok(self.db.query_row("SELECT desired=?4 AND generation=?5 FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3 AND channel=?6",params![key.asset_id,key.variant_id,key.tier.name(),digest,key.generation as i64,key.channel()],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(false))
     }
     pub fn usage(&self) -> Result<StoreUsage> {
         let used = |tier: &str| {
@@ -670,8 +710,8 @@ impl PreviewStore {
                 return Ok(Publication::Stale);
             }
             previous = self.db.query_row(
-                "SELECT current FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3",
-                params![key.asset_id, key.variant_id, key.tier.name()],
+                "SELECT current FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3 AND channel=?4",
+                params![key.asset_id, key.variant_id, key.tier.name(), key.channel()],
                 |r| r.get::<_, Option<String>>(0),
             )?;
             self.db.execute_batch("BEGIN IMMEDIATE")?;
@@ -690,7 +730,7 @@ impl PreviewStore {
                 }
                 self.db
                     .execute("UPDATE objects SET status='ready' WHERE key=?1", [&digest])?;
-                let changed=self.db.execute("UPDATE wanted SET current=?4 WHERE asset=?1 AND variant=?2 AND tier=?3 AND desired=?4 AND generation=?5",params![key.asset_id,key.variant_id,key.tier.name(),digest,key.generation as i64])?;
+                let changed=self.db.execute("UPDATE wanted SET current=?4 WHERE asset=?1 AND variant=?2 AND tier=?3 AND desired=?4 AND generation=?5 AND channel=?6",params![key.asset_id,key.variant_id,key.tier.name(),digest,key.generation as i64,key.channel()])?;
                 ensure!(changed == 1, "stale preview attachment");
                 Ok(())
             })();
@@ -791,8 +831,8 @@ impl PreviewStore {
     pub fn current_is_intact(&self, expected: &PreviewKey) -> Result<bool> {
         let digest = expected.digest()?;
         let row: Option<(u64, String)> = self.db.query_row(
-            "SELECT o.bytes,o.checksum FROM wanted w JOIN objects o ON o.key=w.current WHERE w.asset=?1 AND w.variant=?2 AND w.tier=?3 AND o.key=?4 AND o.status='ready'",
-            params![expected.asset_id, expected.variant_id, expected.tier.name(), digest],
+            "SELECT o.bytes,o.checksum FROM wanted w JOIN objects o ON o.key=w.current WHERE w.asset=?1 AND w.variant=?2 AND w.tier=?3 AND w.channel=?5 AND o.key=?4 AND o.status='ready'",
+            params![expected.asset_id, expected.variant_id, expected.tier.name(), digest, expected.channel()],
             |r| Ok((unsigned(r, 0)?, r.get(1)?)),
         ).optional()?;
         let Some((len, checksum)) = row else {
@@ -850,7 +890,7 @@ impl PreviewStore {
         max_bytes: u64,
     ) -> Result<Option<CachedPreview>> {
         expected.validate()?;
-        let row:Option<(String,String,u64,String)>=self.db.query_row("SELECT o.key,o.descriptor,o.bytes,o.checksum FROM wanted w JOIN objects o ON o.key=w.current WHERE w.asset=?1 AND w.variant=?2 AND w.tier=?3 AND o.status='ready'",params![expected.asset_id,expected.variant_id,expected.tier.name()],|r|Ok((r.get(0)?,r.get(1)?,unsigned(r,2)?,r.get(3)?))).optional()?;
+        let row:Option<(String,String,u64,String)>=self.db.query_row("SELECT o.key,o.descriptor,o.bytes,o.checksum FROM wanted w JOIN objects o ON o.key=w.current WHERE w.asset=?1 AND w.variant=?2 AND w.tier=?3 AND w.channel=?4 AND o.status='ready'",params![expected.asset_id,expected.variant_id,expected.tier.name(),expected.channel()],|r|Ok((r.get(0)?,r.get(1)?,unsigned(r,2)?,r.get(3)?))).optional()?;
         let Some((digest, descriptor, len, checksum)) = row else {
             return Ok(None);
         };
@@ -863,6 +903,7 @@ impl PreviewStore {
             key.digest()? == digest
                 && key.asset_id == expected.asset_id
                 && key.variant_id == expected.variant_id
+                && key.channel() == expected.channel()
                 && key.tier == expected.tier,
             "manifest descriptor identity mismatch"
         );
@@ -1117,6 +1158,7 @@ mod tests {
     }
     fn record(label: &str) -> RenderRecord {
         RenderRecord {
+            edit_input: None,
             width: 2,
             height: 1,
             metadata: crate::media::Metadata {
@@ -1198,7 +1240,12 @@ mod tests {
         store
             .db
             .execute_batch(
-                "DROP TABLE render_records; DROP TABLE render_jobs; PRAGMA user_version=1;",
+                "DROP TABLE render_records; DROP TABLE render_jobs;
+                ALTER TABLE wanted RENAME TO current_wanted; DROP INDEX wanted_current;
+                CREATE TABLE wanted(asset TEXT NOT NULL,variant TEXT NOT NULL,tier TEXT NOT NULL,generation INTEGER NOT NULL,desired TEXT NOT NULL,current TEXT,PRIMARY KEY(asset,variant,tier));
+                INSERT INTO wanted SELECT asset,variant,tier,generation,desired,current FROM current_wanted;
+                DROP TABLE current_wanted; CREATE INDEX wanted_current ON wanted(current);
+                PRAGMA user_version=1;",
             )
             .unwrap();
         drop(store);
@@ -1206,6 +1253,64 @@ mod tests {
         let old = store.read(&key, false).unwrap().unwrap();
         assert_eq!(old.bytes, b"old");
         assert!(old.record.is_none());
+    }
+    #[test]
+    fn channels_migrate_atomically_and_preserve_refined_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path(), 1000, 1000);
+        let store = PreviewStore::open(cfg.clone(), &[]).unwrap();
+        let refined = key(1, Tier::Thumbnail);
+        store.desire(&refined, || Ok(true)).unwrap();
+        store
+            .publish(&refined, b"original-preview", authority)
+            .unwrap();
+        store.db.execute_batch("ALTER TABLE wanted RENAME TO wanted_v3; DROP INDEX wanted_current;
+            CREATE TABLE wanted(asset TEXT NOT NULL,variant TEXT NOT NULL,tier TEXT NOT NULL,generation INTEGER NOT NULL,desired TEXT NOT NULL,current TEXT,PRIMARY KEY(asset,variant,tier));
+            INSERT INTO wanted SELECT asset,variant,tier,generation,desired,current FROM wanted_v3;
+            DROP TABLE wanted_v3; CREATE INDEX wanted_current ON wanted(current);
+            PRAGMA user_version=2;
+            CREATE TABLE wanted_v2(blocker INTEGER);").unwrap();
+        drop(store);
+        assert!(PreviewStore::open(cfg.clone(), &[]).is_err());
+        let db = Connection::open(cfg.manifest_root.join("previews.sqlite3")).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT current FROM wanted", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            refined.digest().unwrap()
+        );
+        db.execute_batch("DROP TABLE wanted_v2").unwrap();
+        drop(db);
+        let store = PreviewStore::open(cfg, &[]).unwrap();
+        assert_eq!(
+            store.read(&refined, false).unwrap().unwrap().bytes,
+            b"original-preview"
+        );
+        let mut interactive = refined.clone();
+        interactive.renderer_version = "test-renderer:proxy1600".into();
+        store.desire(&interactive, || Ok(true)).unwrap();
+        store
+            .publish(&interactive, b"interactive-preview", authority)
+            .unwrap();
+        assert_eq!(
+            store.read(&refined, false).unwrap().unwrap().bytes,
+            b"original-preview"
+        );
+        assert_eq!(
+            store.read(&interactive, false).unwrap().unwrap().bytes,
+            b"interactive-preview"
+        );
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM wanted", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
     #[test]
     fn encoded_read_budget_rejects_without_invalidating_retained_thumbnail() {

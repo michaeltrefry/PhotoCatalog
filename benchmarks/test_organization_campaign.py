@@ -59,7 +59,7 @@ class CampaignTests(unittest.TestCase):
             rows.append(dict(sequence=i,asset_id=f"fixture-{i:012}",state="ready",metadata_revision=0,folder=2+i%5,filename=f"file{i:012}.jpg",capture=f"2024-01-{i%28+1:02}T12:00:00",camera_make="fixture",camera=f"camera{i%3}",lens=f"lens{i%4}",format="JPEG" if i%2==0 else "DNG",rating=i%6,flag=["reject","pick","unflagged"][i%3],label="red" if i%2==0 else "blue",conflicts=["gps_latitude"] if i%97==0 else [],provenance={"synthetic_fixture":1}))
         anchor=dict(version=1,epoch=0,high_water=1000,sequence=500,key=dict(kind="integer",value=500))
         sample=dict(iteration=0,anchor=anchor,elapsed_ms=20.0,error=None,rows=rows,oracle_sequences=list(range(501,701)),chunks=[dict(scanned=200,returned=200,sorts=0,vm_steps=4000,elapsed_ms=19.0,exhausted=False,has_more=True,cursor=dict(sequence=700),text_work=dict(candidate_rows_read=200,indexed_rows=0,indexed_bytes=0,batches=0,vm_steps=0,sorts=0,admission_limited=False))])
-        receipt=dict(protocol=1,complete=True,mode="query",count=1000,case="browse",repetitions=1,warmups=0,start=0,errors=[],plans=["SEARCH"],settings=dict(diagnostic_shared_helper_connection=campaign.SETTINGS),engine_version="3.51.1",text_limits=campaign.TEXT_LIMITS,open_ms=2.0,samples=[sample],warmup_samples=[])
+        receipt=dict(protocol=2,catalog_schema=6,complete=True,mode="query",count=1000,case="browse",repetitions=1,warmups=0,start=0,errors=[],plans=["SEARCH"],settings=dict(diagnostic_shared_helper_connection=campaign.SETTINGS),engine_version="3.51.1",text_limits=campaign.TEXT_LIMITS,open_ms=2.0,samples=[sample],warmup_samples=[])
         observer=dict(exit_code=0,error=None,rss_samples=1,rss_peak_bytes=1024,elapsed_ms=50)
         return receipt,observer
     def test_closed_gates_reject_false_pages_settings_missing_memory_and_errors(self):
@@ -145,7 +145,7 @@ class CampaignTests(unittest.TestCase):
         schema4=fixture['main_sha256']
         header=bytearray(main.read_bytes());header[60:64]=(5).to_bytes(4,'big');main.write_bytes(header)
         fixture.update(schema=5,source_main_sha256=schema4,main_sha256=campaign.sha(main))
-        tables=[['assets',1000],['organization_assets',1000],['organization_text',1000],['organization_text_idx',12]]
+        tables=[['assets',1000],['organization_assets',1000],['organization_text',1000],['organization_text_idx',12],['storage_bindings',0]]
         native=dict(protocol=1,complete=True,mode='migrate_fixture',count=1000,engine_version='3.51.1',schema_before=4,schema_after=5,
                     logical_before='a'*64,logical_after='a'*64,table_counts_before=tables,table_counts_after=tables,
                     index_sql='CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)')
@@ -157,7 +157,7 @@ class CampaignTests(unittest.TestCase):
         fixture['migration_proof']=str(proof_path);args.binary=pathlib.Path('unused-binary')
         return args,fixture,main,native
 
-    def test_schema5_reuse_retains_ancestor_bytes_and_checks_noop_separately(self):
+    def test_schema5_reuse_retains_ancestor_bytes_and_migrates_to_six_separately(self):
         with tempfile.TemporaryDirectory() as directory:
             args,fixture,main,native=self.schema5_reusable(pathlib.Path(directory))
             before=campaign.source_state(main)
@@ -165,19 +165,38 @@ class CampaignTests(unittest.TestCase):
             ancestor=copied['prior_migration']
             self.assertEqual(pathlib.Path(ancestor['proof']).read_bytes(),pathlib.Path(fixture['migration_proof']).read_bytes())
             self.assertEqual(campaign.sha(ancestor['native']),ancestor['native_sha256'])
-            native['schema_before']=5
+            native.update(protocol=2,catalog_schema=6,schema_before=5,schema_after=6,identity_scope="pre_existing_tables",added_tables=campaign.schema6_initial_rows(native["table_counts_before"]),alias_initial_state=campaign.schema6_alias_state(native["table_counts_before"]))
             def child(binary,catalog,output,argv,timeout):
                 self.assertEqual(argv,['migrate-fixture']);campaign.save(output,native)
+                target=catalog/'catalog.sqlite3';header=bytearray(target.read_bytes());header[60:64]=(6).to_bytes(4,'big');target.write_bytes(header)
                 return dict(exit_code=0,error=None)
             with mock.patch.object(campaign,'run_child',side_effect=child):
                 result=campaign.migrate_reused_fixture(args,copied)
             proof=json.loads(pathlib.Path(result['migration_proof']).read_text())
-            self.assertEqual(proof['kind'],'schema5_verification')
-            self.assertEqual(proof['owned_copy_before_sha256'],proof['owned_copy_after_sha256'])
+            self.assertEqual(proof['kind'],'schema5_to_6_migration')
+            self.assertNotEqual(proof['owned_copy_before_sha256'],proof['owned_copy_after_sha256'])
             self.assertEqual(result['prior_migration'],ancestor)
             self.assertNotEqual(ancestor['schema4_main_sha256'],result['main_sha256'])
             self.assertEqual(campaign.source_state(main),before)
             with self.assertRaises(FileExistsError):campaign.preserve_schema5_ancestry(args,args.reuse_prepared,fixture)
+
+    def test_current_reuse_preserves_previous_migration_proof_and_rejects_substitution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args,fixture,main,native=self.schema5_reusable(pathlib.Path(directory))
+            header=bytearray(main.read_bytes());header[60:64]=(6).to_bytes(4,"big");main.write_bytes(header)
+            fixture.update(schema=6,main_sha256=campaign.sha(main),source_main_sha256="b"*64)
+            native.update(protocol=2,catalog_schema=6,schema_before=5,schema_after=6,identity_scope="pre_existing_tables",added_tables=campaign.schema6_initial_rows(native["table_counts_before"]),alias_initial_state=campaign.schema6_alias_state(native["table_counts_before"]))
+            native_path=args.reuse_prepared.parent/"schema6-native.json";campaign.save(native_path,native)
+            proof={**native,"native_receipt":str(native_path),"native_receipt_sha256":campaign.sha(native_path),"owned_copy_before_sha256":"b"*64,"owned_copy_after_sha256":fixture["main_sha256"],"observer":{"exit_code":0,"error":None}}
+            proof_path=args.reuse_prepared.parent/"schema6-proof.json";campaign.save(proof_path,proof)
+            fixture["migration_proof"]=str(proof_path)
+            retained=campaign.preserve_current_ancestry(args,args.reuse_prepared,fixture)
+            self.assertEqual(pathlib.Path(retained["proof"]).read_bytes(),proof_path.read_bytes())
+            self.assertEqual(pathlib.Path(retained["native"]).read_bytes(),native_path.read_bytes())
+            self.assertEqual(retained["predecessor_manifest_sha256"],campaign.sha(args.reuse_prepared))
+            proof["owned_copy_after_sha256"]="f"*64;proof_path.write_text(json.dumps(proof))
+            with self.assertRaises(AssertionError):
+                campaign.preserve_current_ancestry(args,args.reuse_prepared,fixture)
 
     def test_schema5_ancestry_rejects_changed_native_index_logical_or_physical_claim(self):
         for failure in ['native_bytes','index','logical','physical','schema']:
@@ -266,5 +285,25 @@ class CampaignTests(unittest.TestCase):
         bad=copy.deepcopy(receipt);bad.update(start=0);bad["samples"][0].update(iteration=0)
         bad["samples"][0]["anchor"].update(sequence=500000,key={"kind":"text","value":"2024-01-15T12:00:00"})
         with self.assertRaises(AssertionError):campaign.validate_receipt(bad,observer,"text-capture",1_000_000,1,0,0)
+
+class CurrentSchemaContracts(unittest.TestCase):
+    def test_migration_scope_additions_and_old_protocol_reject(self):
+        tables=[["assets",1000],["organization_assets",1000],["organization_text",1000],["storage_bindings",7]]
+        native=dict(protocol=2,catalog_schema=6,complete=True,mode="migrate_fixture",count=1000,
+                    schema_before=5,schema_after=6,identity_scope="pre_existing_tables",
+                    logical_before="a"*64,logical_after="a"*64,table_counts_before=tables,table_counts_after=tables,
+                    added_tables=campaign.schema6_initial_rows(tables),alias_initial_state={"unbound":993,"dirty":7},
+                    index_sql="CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)")
+        self.assertEqual(dict(native["added_tables"])["export_alias_state"],1)
+        self.assertEqual(dict(native["added_tables"])["export_alias_dirty"],7)
+        self.assertEqual(dict(native["added_tables"])["export_alias_paths"],0)
+        campaign.validate_current_migration(native,1000,5)
+        for field,value in [("protocol",1),("catalog_schema",5),("schema_after",5),("identity_scope","all_tables"),("logical_after","b"*64),("added_tables",[]),("added_tables",[[name,0] for name in campaign.SCHEMA6_TABLES]),("alias_initial_state",{"unbound":1000,"dirty":0})]:
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                campaign.validate_current_migration({**native,field:value},1000,5)
+        current={**native,"schema_before":6,"added_tables":[],"table_counts_before":tables+campaign.schema6_initial_rows(tables),"table_counts_after":tables+campaign.schema6_initial_rows(tables)}
+        campaign.validate_current_migration(current,1000,6)
+        with self.assertRaises(AssertionError):
+            campaign.validate_current_migration({**current,"added_tables":native["added_tables"]},1000,6)
 
 if __name__=="__main__":unittest.main()

@@ -1355,11 +1355,13 @@ fn capture_cursor_seeks_bound_ties_and_lens_dates_without_prefix_scans() -> Resu
 }
 
 #[test]
-fn schema_four_to_five_adds_only_index_and_preserves_data_and_readonly_queries() -> Result<()> {
+fn schema_four_to_current_preserves_old_rows_and_initial_derived_state_without_query_writes()
+-> Result<()> {
     let (_temp, root, cat) = synthetic(113)?;
     drop(cat);
     let conn = db(&root)?;
-    conn.execute_batch("DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    remove_alias_schema(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
     fn contents(conn: &Connection) -> Result<Vec<(String, Vec<Vec<String>>)>> {
         let tables=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_stat1' ORDER BY name")?
             .query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1384,8 +1386,35 @@ fn schema_four_to_five_adds_only_index_and_preserves_data_and_readonly_queries()
     drop(conn);
     let mut cat = Catalog::open(&root)?;
     let conn = db(&root)?;
-    ensure!(contents(&conn)? == before);
-    ensure!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? == 5);
+    let mut after = contents(&conn)?;
+    let added: Vec<_> = after
+        .iter()
+        .filter(|(name, _)| name.starts_with("edit_") || name.starts_with("photo_export_"))
+        .collect();
+    ensure!(added.len() == 9 && added.iter().all(|(_, rows)| rows.is_empty()));
+    ensure!(
+        conn.query_row::<(i64, i64), _, _>("SELECT id,unbound FROM export_alias_state", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })? == (1, 113)
+    );
+    ensure!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM export_alias_dirty", [], |r| r.get(0))?
+            == 0
+    );
+    ensure!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM export_alias_paths", [], |r| r.get(0))?
+            == 0
+    );
+    after.retain(|(name, _)| {
+        !(name.starts_with("edit_")
+            || name.starts_with("photo_export_")
+            || name.starts_with("export_alias_"))
+    });
+    ensure!(after == before);
+    ensure!(
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?
+            == photocatalog::CURRENT_SCHEMA_VERSION
+    );
     let index: String = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE name='organization_lens_capture'",
         [],
@@ -1411,5 +1440,53 @@ fn schema_four_to_five_adds_only_index_and_preserves_data_and_readonly_queries()
             && fs::read(root.join("catalog.sqlite3-wal"))? == wal
     );
     conn.execute_batch("ROLLBACK")?;
+    Ok(())
+}
+
+#[test]
+fn failed_schema_six_upgrade_rolls_back_all_added_tables_and_marker() -> Result<()> {
+    let (_temp, root, catalog) = synthetic(3)?;
+    drop(catalog);
+    let conn = db(&root)?;
+    remove_alias_schema(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; CREATE TABLE export_alias_dirty(unexpected TEXT); PRAGMA wal_checkpoint(TRUNCATE)")?;
+    fn schema(conn: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
+        Ok(conn
+            .prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY type,name")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    let before = schema(&conn)?;
+    let assets: i64 = conn.query_row("SELECT count(*) FROM assets", [], |row| row.get(0))?;
+    drop(conn);
+    ensure!(Catalog::open(&root).is_err());
+    let conn = db(&root)?;
+    ensure!(
+        schema(&conn)? == before,
+        "failed migration left partial schema"
+    );
+    ensure!(conn.query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))? == 5);
+    ensure!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM assets", [], |row| row.get(0))? == assets
+    );
+    Ok(())
+}
+
+// Reconstruct a genuine pre-schema6 fixture; dropping only tables would leave
+// alias triggers attached to pre-existing assets/storage_bindings.
+fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
+    let triggers = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'export_alias_*'",
+        )?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for trigger in triggers {
+        conn.execute_batch(&format!(
+            "DROP TRIGGER \"{}\"",
+            trigger.replace('"', "\"\"")
+        ))?;
+    }
+    conn.execute_batch("DROP TABLE export_alias_paths; DROP TABLE export_alias_dirty; DROP TABLE export_alias_directories; DROP TABLE export_alias_state")?;
     Ok(())
 }

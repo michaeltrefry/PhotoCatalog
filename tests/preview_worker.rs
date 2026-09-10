@@ -40,6 +40,7 @@ fn work(root: &Path) -> RenderWork {
         })
         .collect();
     RenderWork {
+        edit: None,
         source: NativePath::from_path(&path),
         keys,
         encoded_limit: 1024 * 1024,

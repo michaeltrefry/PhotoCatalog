@@ -190,17 +190,24 @@ struct NativeImage {
     profile: [c_char; 128],
     error: [c_char; 256],
 }
+#[repr(C)]
+struct NativeWhitePoint {
+    x: f64,
+    y: f64,
+}
 unsafe extern "C" {
     fn pc_raw(
         bytes: *const u8,
         len: usize,
         limits: *const DecodeLimits,
+        white: *const NativeWhitePoint,
         out: *mut NativeImage,
     ) -> i32;
     fn pc_dng(
         bytes: *const u8,
         len: usize,
         limits: *const DecodeLimits,
+        white: *const NativeWhitePoint,
         out: *mut NativeImage,
     ) -> i32;
     fn pc_avif(
@@ -235,15 +242,38 @@ pub fn decode_full(path: &Path) -> Result<RenderedImage> {
 }
 
 pub fn decode_full_limited(path: &Path, limits: DecodeLimits) -> Result<RenderedImage> {
+    decode_with_white_point(path, limits, None)
+}
+/// Absolute source illuminant xy. RAW applies this before development/profile
+/// calibration; raster pixels use a D65-reference Bradford adaptation afterward.
+/// None is byte-for-byte the previous as-shot path.
+pub fn decode_with_white_point(
+    path: &Path,
+    limits: DecodeLimits,
+    white: Option<[f64; 2]>,
+) -> Result<RenderedImage> {
     limits.validate()?;
+    if let Some([x, y]) = white
+        && (!x.is_finite() || !y.is_finite() || x <= 0.0 || y <= 0.0 || x + y >= 1.0)
+    {
+        return Err(error(
+            DecodeStatus::Unsupported,
+            "invalid requested white point",
+        ));
+    }
+    let native_white = NativeWhitePoint {
+        x: white.map_or(0.0, |p| p[0]),
+        y: white.map_or(0.0, |p| p[1]),
+    };
     let mut file = File::open(path).map_err(|e| error(DecodeStatus::Io, e))?;
     let length = file
         .metadata()
         .map_err(|e| error(DecodeStatus::Io, e))?
         .len();
-    let encoded_limit = MAX_ENCODED
-        .min(limits.max_encoded_bytes)
-        .min(limits.max_allocation_bytes);
+    let encoded_limit = limits
+        .max_encoded_bytes
+        .min(limits.max_allocation_bytes)
+        .min(isize::MAX as u64);
     if length > encoded_limit {
         return Err(error(
             DecodeStatus::ResourceLimit,
@@ -251,7 +281,14 @@ pub fn decode_full_limited(path: &Path, limits: DecodeLimits) -> Result<Rendered
         ));
     }
     // A known-length allocation avoids Vec growth exceeding the admitted buffer.
-    let mut bytes = vec![0; length as usize];
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length as usize).map_err(|_| {
+        error(
+            DecodeStatus::ResourceLimit,
+            "encoded source allocation unavailable",
+        )
+    })?;
+    bytes.resize(length as usize, 0);
     file.read_exact(&mut bytes)
         .map_err(|e| error(DecodeStatus::Io, e))?;
     let mut extra = [0u8; 1];
@@ -333,9 +370,21 @@ pub fn decode_full_limited(path: &Path, limits: DecodeLimits) -> Result<Rendered
             let mut out: NativeImage = unsafe { std::mem::zeroed() };
             let status = unsafe {
                 if ext == "dng" {
-                    pc_dng(bytes.as_ptr(), bytes.len(), &limits, &mut out)
+                    pc_dng(
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        &limits,
+                        &native_white,
+                        &mut out,
+                    )
                 } else if is_raw {
-                    pc_raw(bytes.as_ptr(), bytes.len(), &limits, &mut out)
+                    pc_raw(
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        &limits,
+                        &native_white,
+                        &mut out,
+                    )
                 } else {
                     pc_avif(bytes.as_ptr(), bytes.len(), &limits, &mut out)
                 }
@@ -498,6 +547,35 @@ pub fn decode_full_limited(path: &Path, limits: DecodeLimits) -> Result<Rendered
             if format == image::ImageFormat::Png && icc.is_none() {
                 icc = png_profile(&bytes)?;
             }
+            if format == image::ImageFormat::Tiff && icc.is_none() {
+                // image 0.25.9 uses Unknown(34675), which does not match the
+                // recognized IccProfile key in tiff 0.10.3. Read that tag directly
+                // until the image decoder is upgraded; a malformed tag is not sRGB.
+                let tag_error = |err: tiff::TiffError| {
+                    error(
+                        if matches!(err, tiff::TiffError::LimitsExceeded) {
+                            DecodeStatus::ResourceLimit
+                        } else {
+                            DecodeStatus::Corrupt
+                        },
+                        err,
+                    )
+                };
+                let mut tag_limits = tiff::decoder::Limits::default();
+                tag_limits.decoding_buffer_size = tag_limits
+                    .decoding_buffer_size
+                    .min(usize::try_from(limits.max_allocation_bytes).unwrap_or(usize::MAX));
+                tag_limits.ifd_value_size = 16 * 1024 * 1024;
+                let mut tags = tiff::decoder::Decoder::new(Cursor::new(&bytes))
+                    .map_err(tag_error)?
+                    .with_limits(tag_limits);
+                icc = tags
+                    .find_tag(tiff::tags::Tag::IccProfile)
+                    .map_err(tag_error)?
+                    .map(|value| value.into_u8_vec())
+                    .transpose()
+                    .map_err(tag_error)?;
+            }
             let orientation = exif_orientation
                 .unwrap_or(decoder.orientation().map_err(image_error)?.to_exif() as u32);
             let color = decoder.original_color_type();
@@ -540,7 +618,28 @@ pub fn decode_full_limited(path: &Path, limits: DecodeLimits) -> Result<Rendered
     }
     let image = orient(image, orientation).into_rgba32f();
     let (out_width, out_height) = image.dimensions();
-    let pixels: Vec<[f32; 4]> = image.into_raw().as_chunks::<4>().0.to_vec();
+    let mut pixels: Vec<[f32; 4]> = image.into_raw().as_chunks::<4>().0.to_vec();
+    if let Some(xy) = white {
+        for note in &mut notes {
+            *note = note.replace("as-shot white balance", "requested camera white balance");
+        }
+        if let Some(table) = &mut calibration {
+            table.table = table.table.replace("as-shot white", "requested white");
+        }
+        if !is_raw {
+            crate::edit::color::adapt_white(&mut pixels, xy);
+        }
+        notes.push(format!(
+            "Recipe white point xy {},{}; {}",
+            xy[0],
+            xy[1],
+            if is_raw {
+                "camera development/profile calibration"
+            } else {
+                "Bradford source-white to D65 adaptation in linear sRGB"
+            }
+        ));
+    }
     if pixels
         .iter()
         .any(|p| p.iter().any(|x| !x.is_finite()) || !(0.0..=1.0).contains(&p[3]))

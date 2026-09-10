@@ -52,10 +52,37 @@ static int raw_failure(PcImage *out,int status) {
         return fail(out,"resource limit: RAW allocation ceiling");
     return fail(out,libraw_strerror(status));
 }
-extern "C" int pc_raw(const unsigned char *bytes, size_t len, const PcDecodeLimits *limits, PcImage *out) {
+// Recover the selected camera response from the actual camera-to-sRGB matrix,
+// rather than assuming the optional cam_xyz matches an in-file camera profile.
+// R maps daylight-balanced camera values to linear sRGB. Therefore the raw
+// response to XYZ white is inverse(R)*XYZ_to_sRGB*white / daylight_multipliers.
+static bool custom_wb(LibRaw &raw,const PcWhitePoint &white) {
+    double a[3][6]{};
+    for(int i=0;i<3;++i) for(int j=0;j<3;++j) { a[i][j]=raw.imgdata.color.rgb_cam[i][j];a[i][j+3]=(i==j); }
+    for(int c=0;c<3;++c) {
+        int best=c;for(int r=c+1;r<3;++r) if(std::abs(a[r][c])>std::abs(a[best][c])) best=r;
+        if(std::abs(a[best][c])<1e-10) return false;
+        for(int j=0;j<6;++j) std::swap(a[c][j],a[best][j]);
+        double scale=a[c][c];for(int j=0;j<6;++j) a[c][j]/=scale;
+        for(int r=0;r<3;++r) if(r!=c) {double k=a[r][c];for(int j=0;j<6;++j) a[r][j]-=k*a[c][j];}
+    }
+    const double xyz[3]={white.x/white.y,1.0,(1.0-white.x-white.y)/white.y};
+    const double xyz_to_rgb[3][3]={{3.2404542,-1.5371385,-0.4985314},{-0.9692660,1.8760108,0.0415560},{0.0556434,-0.2040259,1.0572252}};
+    double rgb[3]{};for(int c=0;c<3;++c) for(int j=0;j<3;++j) rgb[c]+=xyz_to_rgb[c][j]*xyz[j];
+    for(int c=0;c<3;++c) {
+        double response=0;for(int j=0;j<3;++j) response+=a[c][j+3]*rgb[j];
+        double daylight=raw.imgdata.color.pre_mul[c];
+        if(!std::isfinite(response)||response<=0||!std::isfinite(daylight)||daylight<=0) return false;
+        raw.imgdata.params.user_mul[c]=float(daylight/response);
+    }
+    raw.imgdata.params.user_mul[3]=raw.imgdata.params.user_mul[1];
+    raw.imgdata.params.use_camera_wb=0;raw.imgdata.params.use_auto_wb=0;
+    return true;
+}
+extern "C" int pc_raw(const unsigned char *bytes, size_t len, const PcDecodeLimits *limits, const PcWhitePoint *white, PcImage *out) {
     try {
         OriginalCropRaw raw;
-        raw.imgdata.rawparams.max_raw_memory_mb = unsigned(std::min<uint64_t>(768, limits->max_allocation_bytes/(1024*1024)));
+        raw.imgdata.rawparams.max_raw_memory_mb = unsigned(limits->max_allocation_bytes==UINT64_MAX ? 768 : std::min<uint64_t>(4096, limits->max_allocation_bytes/(1024*1024)));
         if (!raw.imgdata.rawparams.max_raw_memory_mb) return fail(out,"resource limit: RAW allocation allowance below 1 MiB");
         raw.imgdata.rawparams.options &= ~LIBRAW_RAWOPTIONS_CONVERTFLOAT_TO_INT;
         int status = raw.open_buffer(const_cast<unsigned char *>(bytes), len);
@@ -77,7 +104,7 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, const PcDecodeLimi
         auto &p = raw.imgdata.params;
         float camera_to_rgb[3][3];
         for (int c=0;c<3;++c) {
-            if (!(raw.imgdata.color.cam_mul[c]>0) || !std::isfinite(raw.imgdata.color.cam_mul[c]))
+            if (!white->y && (!(raw.imgdata.color.cam_mul[c]>0) || !std::isfinite(raw.imgdata.color.cam_mul[c])))
                 return fail(out,"unsupported RAW missing as-shot white balance");
             for(int k=0;k<3;++k) camera_to_rgb[c][k]=raw.imgdata.color.rgb_cam[c][k];
         }
@@ -89,6 +116,7 @@ extern "C" int pc_raw(const unsigned char *bytes, size_t len, const PcDecodeLimi
         p.use_camera_matrix = 1; p.output_color = 0; p.output_bps = 16;
         p.gamm[0] = 1.0; p.gamm[1] = 1.0; p.no_auto_bright = 1;
         p.user_qual = 3; p.highlight = 2;
+        if(white->y && !custom_wb(raw,*white)) return fail(out,"unsupported RAW custom white point for selected camera matrix");
         status = raw.unpack(); if (status) return raw_failure(out, status);
         if (raw.imgdata.rawdata.float_image || raw.imgdata.rawdata.float3_image || raw.imgdata.rawdata.float4_image)
             return fail(out, "unsupported floating DNG: requires validated ForwardMatrix/profile and transparency-mask rendering; integer conversion is forbidden");

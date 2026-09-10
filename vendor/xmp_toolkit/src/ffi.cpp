@@ -396,6 +396,32 @@ extern "C" {
         return NULL;
     }
 
+    void CXmpMetaPackageForJPEG(CXmpMeta* m, CXmpError* outError,
+                                const char** standard, const char** extended,
+                                const char** digest) {
+        *standard = *extended = *digest = NULL;
+        #ifndef NOOP_FFI
+            if (!init_xmp()) { signalXmpInitFailure(outError); return; }
+            try {
+                std::string a, b, c;
+                SXMPUtils::PackageForJPEG(m->m, &a, &b, &c);
+                // Allocate all outputs before publishing any pointer to Rust.
+                char* aa = static_cast<char*>(malloc(a.size() + 1));
+                char* bb = static_cast<char*>(malloc(b.size() + 1));
+                char* cc = static_cast<char*>(malloc(c.size() + 1));
+                if (!aa || !bb || !cc) {
+                    free(aa); free(bb); free(cc);
+                    signalUnknownError(outError); return;
+                }
+                memcpy(aa, a.c_str(), a.size() + 1);
+                memcpy(bb, b.c_str(), b.size() + 1);
+                memcpy(cc, c.c_str(), c.size() + 1);
+                *standard = aa; *extended = bb; *digest = cc;
+            } catch (XMP_Error& e) { copyErrorForResult(e, outError); }
+              catch (...) { signalUnknownError(outError); }
+        #endif
+    }
+
     const char* CXmpMetaRegisterNamespace(CXmpError* outError,
                                           const char* namespaceURI,
                                           const char* suggestedPrefix) {

@@ -1,0 +1,556 @@
+"""Reconcile the complete frozen S8 campaign without running another renderer.
+
+The result qualifies this headless campaign only. Platform delivery and the UI
+remain separate story/epic acceptance requirements. Missing evidence is failure.
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import edit_disk_budget
+import edit_fixtures
+import edit_memory
+import edit_qualification
+import edit_statistics
+import edit_verify
+
+MIB = 1024**2
+MAX_BINDING = 16*MIB
+MAX_REPORT = 64*MIB
+PHASE_COVERAGE = {
+    'correctness': {'pixel_finite'}, 'kernel': {'pixel_finite'},
+    'full': {'pixel_finite'}, 'proxy_reference': {'pixel_finite', 'proxy_artifacts'},
+    'support100mp': {'pixel_finite', 'large_image_oracle'},
+    'large_cancellation': {'pixel_finite', 'large_image_oracle'},
+    'refusal': {'typed_refusal'}, 'warm_service': {'service_artifacts'},
+    'first_raw': {'service_artifacts'}, 'export': {'export_artifacts'},
+    'export_correctness': {'export_artifacts', 'encoded_pixels_metadata'},
+    'overlap_import': {'live_overlap'}, 'overlap_export': {'live_overlap'},
+}
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+def same(left, right):
+    # Rust may normalize integral floats (4300 -> 4300.0). Boolean/integer
+    # interchange remains forbidden; it changes the typed request contract.
+    if type(left) in (int, float) and type(right) in (int, float):
+        return math.isfinite(left) and math.isfinite(right) and left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(same(value, right[key]) for key, value in left.items())
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right, strict=True))
+    return left == right
+
+
+def positive_integer(value):
+    if type(value) is not int or value <= 0:
+        raise ValueError('positive integer evidence value required')
+    return value
+
+
+def bound_path(root, path):
+    root = Path(root).resolve(strict=True)
+    path = Path(path)
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError('absolute ordinary owned evidence path required')
+    resolved = path.resolve(strict=True)
+    if resolved != path or root not in resolved.parents:
+        raise ValueError('indirect or unowned evidence path')
+    return resolved
+
+
+def admitted_file(root, path, limit):
+    path = bound_path(root, path)
+    if not path.is_file() or path.stat().st_size > limit:
+        raise ValueError('owned evidence file admission')
+    return path
+
+
+def supervisor(root, folder, reference, command, limits, expected_pid=None):
+    """Validate the retained observation result, launch and all bounded streams."""
+    folder = bound_path(root, folder)
+    result_path = admitted_file(root, reference, MIB)
+    if result_path != folder/'result.json':
+        raise ValueError('supervisor result namespace differs')
+    result = edit_verify.read_json(result_path, MIB)
+    start = edit_verify.read_json(folder/'start.json', MIB)
+    if not same(start['command'], command) or not same(start['limits'], limits):
+        raise ValueError('supervisor launched a different command or admission')
+    ownership = result['ownership']
+    if (result.get('complete') is not True or result.get('error') is not None
+            or ownership.get('known_absent') is not True
+            or ownership.get('root_reaped') is not True
+            or type(ownership.get('root_returncode')) is not int
+            or ownership['root_returncode'] != 0
+            or ownership.get('remaining') != [] or ownership.get('errors') != []):
+        raise ValueError('supervisor did not establish successful cleanup')
+    spawn = edit_verify.read_json(folder/'spawn.json')
+    if expected_pid is not None and positive_integer(spawn['pid']) != positive_integer(expected_pid):
+        raise ValueError('probe receipt PID differs from actually launched child')
+    count = positive_integer(result['samples'])
+    spawn_identity = (positive_integer(spawn['pid']), edit_statistics.nonnegative(spawn['create_time']))
+    begin = positive_integer(start['started']['monotonic_ns'])
+    finish = positive_integer(result['finished']['monotonic_ns'])
+    if finish < begin or finish-begin > (limits['deadline_seconds']+30)*1_000_000_000:
+        raise ValueError('supervisor elapsed/deadline evidence differs')
+    if count > 36002:
+        raise ValueError('supervisor sample count exceeds fixed maximum')
+    peak = edit_statistics.nonnegative(result['sampled_peak_group_rss'])
+    if peak > limits['group_rss_bytes']:
+        raise ValueError('supervisor sampled group limit exceeded')
+    telemetry_path = bound_path(root, folder/'processes.jsonl')
+    proof = result['processes.jsonl']
+    if (telemetry_path.stat().st_size != proof['bytes']
+            or edit_verify.digest(telemetry_path, 'sha256', 32*MIB) != proof['sha256']):
+        raise ValueError('supervisor telemetry changed')
+    observed = 0
+    actual_peak = 0
+    previous = None
+    observed_root = False
+    with telemetry_path.open('rb') as stream:
+        for value in edit_verify.sample_records(stream, total_limit=32*MIB):
+            observed += 1
+            now = positive_integer(value['at']['monotonic_ns'])
+            if previous is not None and now < previous:
+                raise ValueError('supervisor clock moved backwards')
+            if not begin <= now <= finish:
+                raise ValueError('supervisor sample outside actual launch interval')
+            previous = now
+            processes = value['processes']
+            if not isinstance(processes, list) or len(processes) > 4:
+                raise ValueError('supervisor active-process limit exceeded')
+            identities = set()
+            total = 0
+            for process in processes:
+                key = (positive_integer(process['pid']), edit_statistics.nonnegative(process['create_time']))
+                if key in identities or process['status'] in ('zombie', 'dead'):
+                    raise ValueError('invalid live process observation')
+                identities.add(key)
+                observed_root |= key == spawn_identity
+                rss = process['rss']
+                if type(rss) is not int or not 0 <= rss <= limits['process_rss_bytes']:
+                    raise ValueError('sampled per-process RSS admission exceeded')
+                total += rss
+            if type(value['total_rss']) is not int or value['total_rss'] != total or total > limits['group_rss_bytes']:
+                raise ValueError('sampled group RSS does not reconcile')
+            if type(value['free_bytes']) is not int or value['free_bytes'] < limits['free_reserve_bytes']:
+                raise ValueError('sampled disk reserve exhausted')
+            actual_peak = max(actual_peak, total)
+    if observed != count or actual_peak != peak or not observed_root:
+        raise ValueError('sample count/peak/root identity does not reconcile')
+    for name in ('stdout.log', 'stderr.log'):
+        capture = result['captures'][name]
+        artifact = result[name]
+        if (capture['reader_joined'] is not True or capture['eof'] is not True
+                or capture['truncated'] is not False or capture['errors'] != []
+                or capture['limit_bytes'] != 4*MIB
+                or capture['observed_bytes'] != capture['retained_bytes']
+                or capture['retained_bytes'] != artifact['bytes']):
+            raise ValueError('incomplete supervisor evidence stream')
+        path = bound_path(root, folder/name)
+        if path.stat().st_size != artifact['bytes'] or edit_verify.digest(path, 'sha256', 4*MIB) != artifact['sha256']:
+            raise ValueError('supervisor evidence stream changed')
+    return dict(samples=count, sampled_peak_group_rss=actual_peak, root_reaped=True)
+
+
+def registry(manifest, binding, records):
+    expected = edit_disk_budget.complete_cases(manifest)
+    if len({case['id'] for case in expected}) != len(expected) or not same(binding['cases'], expected):
+        raise ValueError('frozen registry differs from the entire prospective matrix')
+    if hashlib.sha256(canonical(expected)).hexdigest() != binding['cases_sha256']:
+        raise ValueError('frozen matrix digest differs')
+    ids = [case['id'] for case in expected]
+    if not isinstance(records, list) or [record['id'] for record in records] != ids:
+        raise ValueError('missing, duplicate, reordered or substituted case record')
+    return expected
+
+
+def required_coverage(request):
+    required = PHASE_COVERAGE[request['phase']] | {'sample_identity', 'source_hashes'}
+    if request['phase'] in ('correctness', 'support100mp'):
+        if request['fixture_id'].startswith('analytic-'):
+            required |= {'analytic_pixels'}
+        if request['outputs']:
+            required |= {'encoded_pixels_metadata'}
+    return required
+
+
+EXIF_FIELDS = ('make', 'model', 'lens', 'date_time_original', 'artist', 'copyright',
+               'description', 'exposure_time', 'f_number', 'iso', 'focal_length')
+
+
+def normalized_metadata(value):
+    if not isinstance(value, dict) or set(value)-{'xmp', 'exif'}:
+        raise ValueError('unexpected metadata request field')
+    exif = value.get('exif', {})
+    if not isinstance(exif, dict) or set(exif)-set(EXIF_FIELDS):
+        raise ValueError('unexpected safe EXIF request field')
+    return {'xmp': value.get('xmp'), 'exif': {key: exif.get(key) for key in EXIF_FIELDS}}
+
+
+def case_semantics(case, request, normal_limits):
+    for field in ('phase', 'fixture_id', 'operation', 'recipes', 'outputs', 'warmups', 'repetitions'):
+        if not same(request[field], case[field]):
+            raise ValueError('request changed prospective case: '+field)
+    if not same(normalized_metadata(request['metadata']), normalized_metadata(case.get('metadata', {}))):
+        raise ValueError('request changed selected XMP or EXIF metadata')
+    if not same(request['resolve_embedded'], case.get('resolve_embedded', False)):
+        raise ValueError('request changed embedded metadata resolution')
+    explicit = case.get('limits', {})
+    for key in ('decode', 'render'):
+        if not same(request[key], explicit.get(key, normal_limits[key])):
+            raise ValueError('request changed prospective resource admission: '+key)
+    extent = case.get('encoded_extent', explicit.get('encoded_extent', normal_limits['encoded_extent']))
+    if not same(request['encoded_extent'], extent):
+        raise ValueError('request changed encoded output extent')
+
+
+def preparation(root, binding):
+    records = binding['preparation_records']
+    if (not isinstance(records, list) or len(records) != len(edit_fixtures.FIXTURES)
+            or {r['id'] for r in records} != set(edit_fixtures.FIXTURES)):
+        raise ValueError('missing, duplicate or substituted fixture preparation')
+    proofs = {}
+    for record in records:
+        # Preparation happens before final request hashes exist. Its exact
+        # process and generated-source receipts are then frozen in the binding.
+        folder = Path(record['supervisor_path']).parent
+        proof = supervisor(root, folder, record['supervisor_path'], record['command'], record['limits'])
+        receipt_path = admitted_file(root, record['receipt_path'], MIB)
+        receipt = edit_verify.read_json(receipt_path, MIB)
+        if (receipt['id'] != record['id'] or receipt['path'] != record['output']
+                or (receipt['width'], receipt['height']) != edit_fixtures.FIXTURES[record['id']]
+                or receipt.get('construction') != 'edit_fixtures.row/v1'):
+            raise ValueError('fixture generation identity differs')
+        path = bound_path(root, record['output'])
+        if path.stat().st_size != receipt['bytes'] or edit_verify.digest(path, 'sha256', 2*1024**3) != receipt['sha256']:
+            raise ValueError('generated fixture changed after preparation')
+        proofs[record['id']] = dict(receipt=receipt, supervisor=proof,
+            receipt_sha256=edit_verify.digest(receipt_path, 'sha256', MIB))
+    return proofs
+
+
+def background_source(root, binding, cohort):
+    value = binding['background_source']
+    directory = bound_path(root, value['directory'])
+    path = bound_path(root, value['path'])
+    if path.parent != directory or value['fixture_id'] not in cohort:
+        raise ValueError('background source identity or directory differs')
+    with os.scandir(directory) as entries:
+        names = []
+        for entry in entries:
+            if names or not entry.is_file(follow_symlinks=False) or entry.path != str(path):
+                raise ValueError('background input must contain exactly one ordinary source')
+            names.append(entry.name)
+    if len(names) != 1 or value['sha256'] != cohort[value['fixture_id']]['sha256']:
+        raise ValueError('background source does not match independent cohort')
+    for algorithm in ('sha256', 'blake3'):
+        if edit_verify.digest(path, algorithm, 512*MIB) != value[algorithm]:
+            raise ValueError('background original changed')
+    return value
+
+
+def cleanup_evidence(root, record, request, verification, values):
+    if request['phase'] != 'export':
+        if record.get('cleanup_path') is not None:
+            raise ValueError('cleanup is not admitted for this phase')
+        return None
+    case_id = record['id']
+    path = admitted_file(root, record['cleanup_path'], MAX_REPORT)
+    if path != root/(case_id+'-cleanup.json'):
+        raise ValueError('cleanup receipt namespace differs')
+    done = edit_verify.read_json(path, MAX_REPORT)
+    start_path = admitted_file(root, root/(case_id+'-cleanup-start.json'), MAX_REPORT)
+    if done.get('complete') is not True or done.get('error') is not None or done['start_sha256'] != edit_verify.digest(start_path, 'sha256', MAX_REPORT):
+        raise ValueError('cleanup is incomplete or its plan changed')
+    start = edit_verify.read_json(start_path, MAX_REPORT)
+    if start['case_id'] != case_id:
+        raise ValueError('cleanup belongs to another case')
+    for field, evidence in (('verifier_receipt_sha256', record['verification_path']),
+                            ('probe_supervisor_sha256', record['probe_supervisor_path']),
+                            ('verify_supervisor_sha256', record['verify_supervisor_path'])):
+        if start[field] != edit_verify.digest(evidence, 'sha256', MAX_REPORT):
+            raise ValueError('cleanup used different success/ownership evidence')
+    by_iteration = {value['iteration']: value for value in values}
+    retained = by_iteration[request['warmups']]
+    destination = bound_path(root, retained['path'])
+    encoded = {p['path']: p for p in verification['result']['encoded']}
+    if len(encoded) != len(values) or set(encoded) != {v['path'] for v in values}:
+        raise ValueError('cleanup lacks independent verification of every output')
+    expected_retained = dict(path=str(destination), sha256=encoded[str(destination)]['sha256'], blake3=retained['blake3'])
+    if not same(start['retained'], expected_retained) or not same(done['retained'], expected_retained):
+        raise ValueError('cleanup retained the wrong measured output')
+    for algorithm in ('sha256', 'blake3'):
+        if edit_verify.digest(destination, algorithm, request['encoded_extent']) != expected_retained[algorithm]:
+            raise ValueError('retained measured output changed')
+    output = Path(request['output'])
+    removable_roots = {output/'catalog'}
+    for value in values:
+        directory = Path(value['items'][0]['receipt']['recovery_directory'])
+        if directory.parent != output or not directory.name.startswith('.photocatalog-photo-export-'):
+            raise ValueError('cleanup recovery root differs from authoritative item')
+        removable_roots.add(directory)
+    if len(removable_roots) != len(values)+1:
+        raise ValueError('duplicate export recovery namespace')
+    discarded = {v['path']: v for v in values if v['path'] != str(destination)}
+    files, directories = start['delete_files'], start['delete_directories']
+    if not isinstance(files, list) or not isinstance(directories, list) or len(files)+len(directories) > 10000:
+        raise ValueError('cleanup inventory admission')
+    deleted_files = {f['path']: f for f in files}
+    if len(deleted_files) != len(files) or len(set(directories)) != len(directories):
+        raise ValueError('duplicate cleanup target')
+    if not set(discarded).issubset(deleted_files) or not {str(p) for p in removable_roots}.issubset(directories):
+        raise ValueError('cleanup left encoded/sealed/catalog extents retained')
+    for name in list(deleted_files)+directories:
+        target = Path(name)
+        if (not target.is_absolute() or '..' in target.parts or target == destination
+                or (name not in discarded and not any(target == p or p in target.parents for p in removable_roots))):
+            raise ValueError('cleanup target escaped its disposable namespaces')
+        if target.exists() or target.is_symlink():
+            raise ValueError('cleanup target still occupies its namespace')
+    for name in discarded:
+        if deleted_files[name]['sha256'] != encoded[name]['sha256']:
+            raise ValueError('discarded destination differs from verified pixels')
+    expected_deleted = list(deleted_files)+directories
+    if len(done['deleted_paths']) != len(expected_deleted) or set(done['deleted_paths']) != set(expected_deleted):
+        raise ValueError('cleanup deletion receipt does not reconcile')
+    return dict(case_id=case_id, start_sha256=done['start_sha256'],
+                receipt_sha256=edit_verify.digest(path, 'sha256', MAX_REPORT), retained=expected_retained,
+                deleted_files=len(files), deleted_directories=len(directories))
+
+
+def case_result(request, receipt, verification, attempts, values):
+    if verification.get('complete') is not True or verification.get('error') is not None:
+        raise ValueError('independent case verifier failed')
+    result = verification['result']
+    if result.get('verified') is not True or result.get('whole_story_qualified') is not False:
+        raise ValueError('missing or overclaiming independent verification')
+    if result.get('remaining', []) != []:
+        raise ValueError('case verifier reports unresolved coverage')
+    coverage = result['coverage']
+    if not isinstance(coverage, list) or any(not isinstance(x, str) for x in coverage) or len(set(coverage)) != len(coverage):
+        raise ValueError('invalid independent coverage labels')
+    if not required_coverage(request).issubset(coverage):
+        raise ValueError('independent verifier lacks required phase coverage')
+    if receipt.get('probe_complete') is not True or receipt.get('qualification_complete') is not False or receipt.get('error') is not None:
+        raise ValueError('probe incomplete or overclaiming')
+    for field in ('phase', 'fixture_id', 'operation', 'source_sha256', 'source_blake3'):
+        if not same(receipt[field], request[field]):
+            raise ValueError('probe request identity differs')
+    edit_verify.sample_coverage(request, attempts, values)
+    if type(result['sample_count']) is not int or result['sample_count'] != len(values):
+        raise ValueError('verifier observed a different sample count')
+    return edit_statistics.summarize_case(request, values)
+
+
+def deterministic_pairs(case_values):
+    """Every real cohort recipe is repeated in separate probe processes."""
+    pairs = {}
+    for request, values in case_values:
+        if request['phase'] != 'correctness' or request['operation'] not in ('all-0', 'all-1'):
+            continue
+        key = request['fixture_id']
+        pair = pairs.setdefault(key, {})
+        if request['operation'] in pair:
+            raise ValueError('duplicate repeated camera case')
+        pair[request['operation']] = (request, values)
+    if len(pairs) != 30:
+        raise ValueError('missing full-cohort repeat pairs')
+    proofs = []
+    for fixture, pair in sorted(pairs.items()):
+        if set(pair) != {'all-0', 'all-1'}:
+            raise ValueError('missing independent repeat')
+        (left, a), (right, b) = pair['all-0'], pair['all-1']
+        if not same(left['recipes'], right['recipes']) or left['source_sha256'] != right['source_sha256']:
+            raise ValueError('repeat recipe/source differs')
+        fields = ('width', 'height', 'rgba_f32le_blake3', 'minimum', 'maximum', 'alpha_zero_partial_opaque', 'nonfinite')
+        by_identity = lambda rows: {edit_statistics.sample_identity(v, left): {k: v['pixels'][k] for k in fields} for v in rows}
+        if not same(by_identity_as_json(by_identity(a)), by_identity_as_json(by_identity(b))):
+            raise ValueError('repeated pixel observations differ: '+fixture)
+        proofs.append(dict(fixture_id=fixture, recipes=len(left['recipes']), exact_repeat=True))
+    return proofs
+
+
+def by_identity_as_json(values):
+    return [[list(key), value] for key, value in sorted(values.items())]
+
+
+def aggregate(root, binding):
+    root = Path(root).resolve(strict=True)
+    manifest_path = Path(binding['manifest']['path'])
+    if edit_verify.digest(manifest_path, 'sha256', MIB) != binding['manifest']['sha256']:
+        raise ValueError('source cohort manifest changed')
+    manifest = edit_verify.read_json(manifest_path, MIB)
+    normal_limits = edit_qualification.plan(manifest)['normal_limits']
+    if not same(binding['normal_limits'], normal_limits):
+        raise ValueError('normal resource configuration differs from prospective plan')
+    preparation_root = Path(binding['preparation_root'])
+    if (not preparation_root.is_absolute() or preparation_root.is_symlink()
+            or preparation_root.resolve(strict=True) != preparation_root
+            or preparation_root.parent != root.parent or preparation_root == root):
+        raise ValueError('explicit separate owned preparation sibling required')
+    prepared = preparation(preparation_root, binding)
+    cohort = {item['id']: item for item in manifest['inputs']}
+    background = background_source(preparation_root, binding, cohort)
+    records = binding['case_records']
+    cases = registry(manifest, binding, records)
+    summaries, raw_cases, references, supervisors, cleanups, memory = [], [], {}, [], [], []
+    required_sources = {}
+    repeat_pids = set()
+    actions = {item['id']: item for item in binding['actions']}
+    if len(actions) != len(binding['actions']):
+        raise ValueError('duplicate frozen action')
+    for case, record in zip(cases, records, strict=True):
+        case_id = case['id']
+        output = bound_path(root, record['probe_output'])
+        if output != root/(case_id+'-output'):
+            raise ValueError('case output namespace differs')
+        request_path = admitted_file(root, record['request_path'], edit_verify.MAX_JSON)
+        if request_path != output/'request.json':
+            raise ValueError('case request namespace differs')
+        request = edit_verify.read_json(request_path)
+        if not same(request, record['request']) or not same(request, actions[case_id]['request']):
+            raise ValueError('executed request differs from frozen request')
+        case_semantics(case, request, normal_limits)
+        if request['phase'] == 'overlap_import':
+            if request['background_source'] != background['directory'] or request['fixture_id'] != background['fixture_id']:
+                raise ValueError('foreground/import request used a different background source')
+        elif request['background_source'] is not None:
+            raise ValueError('unexpected background input for non-import case')
+        input_proof = cohort.get(request['fixture_id']) or prepared[request['fixture_id']]['receipt']
+        if (request['source_sha256'] != input_proof['sha256']
+                or not same([request['width'], request['height']], [input_proof['width'], input_proof['height']])):
+            raise ValueError('request differs from independent cohort source hash/dimensions')
+        receipt = edit_verify.read_json(output/'receipt.json')
+        verification_path = admitted_file(root, record['verification_path'], MAX_REPORT)
+        if verification_path != root/('verify-'+case_id+'-verification.json'):
+            raise ValueError('verifier output namespace differs')
+        verification = edit_verify.read_json(verification_path, MAX_REPORT)
+        attempts, values = edit_verify.observations(output)
+        proof = verification['result']
+        hashes = {name: edit_verify.digest(path, 'sha256', limit) for name, path, limit in (
+            ('request_sha256', request_path, edit_verify.MAX_JSON),
+            ('receipt_sha256', output/'receipt.json', edit_verify.MAX_JSON),
+            ('samples_sha256', output/'samples.jsonl', edit_verify.MAX_SAMPLES))}
+        if any(proof[key] != value for key, value in hashes.items()):
+            raise ValueError('verified request/receipt/samples changed')
+        references[case_id] = hashes
+        summaries.append(case_result(request, receipt, verification, attempts, values))
+        background_metrics = None
+        if request['phase'] in ('overlap_import', 'overlap_export'):
+            background_path = admitted_file(root, output/'background.json', MIB)
+            if proof['background_sha256'] != edit_verify.digest(background_path, 'sha256', MIB):
+                raise ValueError('verified background memory/lifecycle evidence changed')
+            background_metrics = edit_verify.read_json(background_path, MIB)
+        memory_proof = edit_memory.evidence(request, receipt, values, background=background_metrics,
+                                           process_limit=actions[case_id]['process_rss_bytes'])
+        if not same(memory_proof, proof['memory']):
+            raise ValueError('whole-worker memory evidence differs from verified result')
+        memory.append(dict(case_id=case_id, **memory_proof))
+        existing = required_sources.setdefault(request['fixture_id'], request)
+        if any(not same(existing[key], request[key]) for key in ('source', 'source_sha256', 'source_blake3', 'width', 'height')):
+            raise ValueError('cases substituted a different source for one fixture')
+        if request['phase'] == 'correctness' and request['operation'] in ('all-0', 'all-1'):
+            # PID alone is not identity; spawn creation time is retained below.
+            raw_cases.append((request, values))
+        for action_id, ref_key in ((case_id, 'probe_supervisor_path'), ('verify-'+case_id, 'verify_supervisor_path')):
+            action = actions[action_id]
+            limits = {name: action[name] for name in ('deadline_seconds', 'process_rss_bytes', 'group_rss_bytes')}
+            limits['free_reserve_bytes'] = binding['free_reserve_bytes']
+            # The builder freezes argv after selecting isolated launcher paths.
+            supervisors.append(supervisor(root, root/action_id, record[ref_key], action['command'], limits,
+                                          receipt['probe_pid'] if action_id == case_id else None))
+        cleanup = cleanup_evidence(root, record, request, verification, values)
+        if cleanup is not None:
+            cleanups.append(cleanup)
+        if request['phase'] == 'correctness' and request['operation'] in ('all-0', 'all-1'):
+            spawn = edit_verify.read_json(root/case_id/'spawn.json')
+            identity = (positive_integer(spawn['pid']), edit_statistics.nonnegative(spawn['create_time']))
+            if identity in repeat_pids:
+                raise ValueError('independent repeats reused one process instance')
+            repeat_pids.add(identity)
+    for record in records:
+        proof = edit_verify.read_json(record['verification_path'], MAX_REPORT)['result']
+        for reference in proof.get('reference_cases', []):
+            if reference['id'] not in references or not same({k: reference[k] for k in references[reference['id']]}, references[reference['id']]):
+                raise ValueError('verifier used an unbound/stale reference case')
+    repeat = deterministic_pairs(raw_cases)
+    # The coordinator must retain the complete serial action roster; terminal
+    # aggregate itself is excluded because this invocation has not yet returned.
+    expected_actions = [name for case in cases for name in (case['id'], 'verify-'+case['id'])]
+    if [a['id'] for a in binding['actions'] if a['kind'] != 'aggregate'] != expected_actions:
+        raise ValueError('incomplete, extra or reordered executed action roster')
+    source_proofs = []
+    sources = binding['sources']
+    if len(sources) != len(required_sources) or {item['id'] for item in sources} != set(required_sources):
+        raise ValueError('incomplete source preservation roster')
+    for source in sources:
+        request = required_sources[source['id']]
+        path = bound_path(preparation_root, source['path'])
+        if str(path) != request['source'] or source['sha256'] != request['source_sha256'] or source['blake3'] != request['source_blake3']:
+            raise ValueError('source roster differs from actual request')
+        limit = request['decode']['max_encoded_bytes']
+        for algorithm in ('sha256', 'blake3'):
+            if edit_verify.digest(path, algorithm, limit) != source[algorithm]:
+                raise ValueError('owned source changed after campaign')
+        original = cohort.get(source['id'])
+        if original:
+            if source['original_path'] != original['path'] or edit_verify.digest(original['path'], 'sha256', limit) != original['sha256']:
+                raise ValueError('original cohort file changed after owned copy')
+        else:
+            generated = source['generated_receipt']
+            if (admitted_file(preparation_root, generated['path'], MIB) != Path(next(r['receipt_path'] for r in binding['preparation_records'] if r['id'] == source['id']))
+                    or generated['sha256'] != prepared[source['id']]['receipt_sha256']
+                    or str(path) != prepared[source['id']]['receipt']['path']):
+                raise ValueError('source does not match admitted generated-fixture receipt')
+        source_proofs.append(dict(id=source['id'], sha256=source['sha256'], blake3=source['blake3'], unchanged=True,
+                                 original_unchanged=bool(original), generated=original is None))
+    missed = [dict(fixture_id=s['fixture_id'], phase=s['phase'], operation=s['operation'], recipe_index=c['recipe_index'], p95_ms=c['elapsed']['p95_ms'], target_ms=c['p95_target_ms'])
+              for s in summaries for c in s['configurations'] if c['numeric_target_met'] is False]
+    return dict(version=1, complete=True, headless_campaign_qualified=not missed,
+                whole_story_qualified=False, case_count=len(cases), cases_sha256=binding['cases_sha256'],
+                summaries=summaries, missed_latency_targets=missed, deterministic_repeats=repeat,
+                sources=source_proofs, supervisor_count=len(supervisors),
+                sampled_peak_group_rss=max(s['sampled_peak_group_rss'] for s in supervisors),
+                generated_preparations=prepared,
+                verified_cleanup=cleanups,
+                process_high_water=memory,
+                caveat='Sampled RSS and disk checks are not hard allocation limits; platform/UI delivery remains separate.')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--binding', type=Path, required=True)
+    parser.add_argument('--binding-sha256', required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    result, error = None, None
+    try:
+        if edit_verify.digest(args.binding, 'sha256', MAX_BINDING) != args.binding_sha256:
+            raise ValueError('aggregate binding differs from reviewed identity')
+        result = aggregate(args.root, edit_verify.read_json(args.binding, MAX_BINDING))
+    except Exception as exc:
+        error = type(exc).__name__+': '+str(exc)
+    payload = dict(complete=error is None, error=error, result=result)
+    encoded = canonical(payload)
+    if len(encoded) > MAX_REPORT:
+        raise ValueError('aggregate report exceeds fixed byte bound')
+    with args.output.open('xb') as stream:
+        stream.write(encoded+b'\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    if error or not result['headless_campaign_qualified']:
+        raise SystemExit(error or 'headless campaign misses retained latency targets')
+
+
+if __name__ == '__main__':
+    main()

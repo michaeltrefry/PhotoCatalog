@@ -196,3 +196,57 @@ passed with these explicit settings. The example also passed an actual CLI
 loader/service-open check after replacing only its private paths. Final remote
 CI still needs to validate the subsequently changed compiled default constant;
 these results do not qualify future cameras or image distributions.
+
+### Edited variants and interactive preparation (S8)
+
+`request_variant` / `cached_variant` render the current catalog variant from the
+original. The existing asset methods select the current master. Master revision
+zero retains the original S6 key/renderer; undoing an edited master advances its
+revision and therefore does not regain that old key. Saved recipes, source
+identity and monotonic edit revision are checked before dispatch and during owner
+ticks, then atomically with final attachment. Obsolete active work is killed and
+joined before its reservations release. Persistent retry jobs carry the exact
+recipe and authority; reopening cannot silently retarget an old edit job.
+
+`request_interactive` / `cached_interactive` explicitly use a developed linear
+source proxy with edge 1600. `queue_read_variant` and `encoded_cached_variant`
+accept the same explicit quality choice. A tight crop can yield less than 1600
+pixels, without upscaling; denoise/sharpen and other spatial operations on the
+proxy are approximations. Request original refinement separately. Render keys
+include the quality path, variant and revision. Manifest schema 3 adds an explicit
+`refined`/`interactive` channel to its desired/current primary key; the atomic
+migration preserves existing compressed objects and pointers as `refined`.
+Both channels can remain current for the same variant and tier.
+
+The optional transient prepared cache defaults to 256 MiB and 16 entries,
+configured by `prepared_cache_bytes` and `prepared_cache_entries`. These are
+prospective configurable allowances, not new measured performance claims. Its
+files live under the service-owned manifest's `prepared` directory, and restart
+clears them with bounded ownership checks. It holds no service-side float buffers:
+proxy loading and recipe work remain inside the existing admitted child.
+Per-child prepared staging is bounded to one 1600×1600 RGBAf32 container plus a
+128 KiB header and framing. This disk allowance is separate from retained JPEG
+quotas and bounded encoded staging; child live pixel surfaces are checked against
+the configured worker allowance. Zero entries, or insufficient bytes for one
+maximum-sized container, disables prepared persistence.
+
+Reuse binds source generation/fingerprint, exact white balance, renderer and
+proxy size. It also checks canonical native source path, volume/device and file
+identity, length, modification/creation timestamps, and Unix change timestamps
+where available. Changed or missing instances cannot reuse a prepared input;
+changed bytes require import/revalidation. Every loaded container is bounded and
+checks its complete digest, identity, float validity and EOF. Corruption becomes
+a cold source-decode miss. The worker records actual cache reuse and actual output
+dimensions in render provenance. This stat-based warm instance check is not a
+fresh whole-original digest on every interaction; first preparation verifies the
+original content before and after development. Retained compressed previews remain
+usable offline independently of prepared input availability.
+
+An application serializing photo export with preview work can hold
+`pause_native_launches()`, cancel active consumers and tick until
+`native_work_drained()`, then admit its owned export worker. Retained cache reads
+continue while launches are paused. The owner must terminate/join that external
+worker before dropping the RAII token; foreground native work can resume then.
+The token does not kill an export or claim parallel-worker memory enforcement.
+These source additions still require focused native tests and S8 measurements;
+previous S6 measurements remain evidence for their frozen implementation.
