@@ -20,3 +20,14 @@ Preparation, no-upscaling behavior, JPEG YUV444 settings and production decode r
 Equal weighting of the compatibility corpus gives about 44.4 GB of encoded thumbnails per million assets, excluding allocation and catalog overhead. This is a corpus projection, not a prediction of the user's image distribution. The larger preview cache is evictable rather than multiplied by library size.
 
 Confidence is medium for comparative visual quality and exploratory codec cost. Stage A recorded concurrent background activity, so those timings do not establish a quiet-host performance budget. Stage B must measure actual retained-storage overhead, bounded page decode/cache behavior, cancellation/recovery and the frozen interaction limits. Tauri frame-path validation remains required in S12. The private `selected-pair-v1.json` receipt binds this decision before Stage B execution.
+
+
+Flat is now selected from the completed 10k/100k four-group layout experiment.
+[PREVIEW_LAYOUT_RESULTS.md](PREVIEW_LAYOUT_RESULTS.md) retains all 24 distributions,
+footprints, actual host conditions and the authoritative corrected decision.
+[PREVIEW_SERVICE.md](PREVIEW_SERVICE.md#selected-settings-and-explicit-disk-capacity)
+documents the adopted 2164 MiB worker reservation and complete illustrative
+64 GiB retained/16 GiB larger-cache configuration. These decisions preserve the
+existing JPEG80/512/1600 quality choice. Navigation, integrated 10M RSS and final
+cross-platform delivery remain required; the layout result alone does not satisfy
+them.

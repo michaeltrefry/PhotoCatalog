@@ -1,75 +1,62 @@
 # S6 acceptance ledger
 
-Checkpoint: S6 source integration of merged S7 e68d37500ca87f057d56137376fe5aeab0fc419b.
-Parent and independent source review of integration 8b49038 passed; runtime gates
-remain pending. S7 is Done after exact e68d375 main CI 34418548263 passed all four
-jobs and Shortcut closeout/readback (comment 22955). S6 remains **In Progress**. This ledger reconciles the three sc-22841
-criteria in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md#sc-22841--deliver-compressed-previews-with-bounded-storage-and-responsive-scheduling).
-It does not replace the frozen experiment protocols or historical receipts.
-Confidence: high for the evidence boundaries below; runtime confidence for the
-new integrated probe remains unestablished.
+S6 remains **In Progress**. S7 is Done at merged
+`e68d37500ca87f057d56137376fe5aeab0fc419b`, with all four main-CI jobs in
+34418548263 passed and Shortcut closeout/readback recorded in comment 22955.
+This ledger reconciles the three sc-22841 criteria in
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md#sc-22841--deliver-compressed-previews-with-bounded-storage-and-responsive-scheduling).
+Frozen protocols and historical receipts retain their original source identities.
 
 ## Completed evidence
 
 | Evidence | Exact scope and result |
 | --- | --- |
-| Local correctness at a2f33b7e1ecdc6c293913376adc002cf57ab9d12 | Package rebuilt to avoid stale artifacts. 242 Rust tests passed, 0 failed, 3 ignored, across 25 suites; 18 preview Python, 39 benchmark Python, and 5 corpus Python contracts passed. Package fmt and all-target Clippy passed. Focused selections: preview library 30, service 17, layout 3, navigation 2. These are not full measured campaigns. |
-| JPEG/WebP/AVIF comparison | Frozen Stage A completed with preserved failures/artifact chains and blinded review. Timing is exploratory under recorded background load, not verified quiet-host budget evidence; no favorable subset or corrected ranking is claimed. |
-| Selected codec/tier quality | JPEG80, edges 512/1600 selected. Current renderer qualification completed: 16 changed groups visually inspected; 44 unchanged groups inherited through exact reference/selected-RGB identities. Per tier: 26 acceptable, 0 unacceptable, 4 uninformative; the four remain uninformative. No Adobe-equivalence claim. |
-| Full-worker memory | All 30 sources, 30 native workers and 30 verifiers completed; source hashes preserved. Largest observed native HWM 1,760,837,632 bytes. Frozen Stage B reservation is 2,269,118,464 bytes (2164 MiB), total renderer allowance 3 GiB, one normally admitted worker. This is a cohort accounting profile, not OS-enforced RSS or a guarantee for every supported camera. |
-| Offline/import/priority correctness | Actual child renders both tiers; import publishes and later reads without originals. Incremental import yields to a retained foreground read while the actual native import lease exists. Two configured worker slots admit only one under the frozen allowance, queue the second and progress after release. |
-| Resource/cancellation correctness | Shared native/read request admission, foreground ordering, held-pixel accounting beyond LRU eviction, typed encoded/decoded pressure, release/retry progress, maximum-u64 admission arithmetic, last-consumer cancel and same-key resubmission before reap passed. Native cancel/owner EOF are proven at an admitted post-decode checkpoint, not as deterministic interruption inside a codec. |
-| Quota/fault correctness | Separate large LRU budget never evicts retained thumbnails; retained quota refusal preserves fallback. Injected StorageFull follows a real partial staging write; actual SQLite FULL is induced by max_page_count, checks integrity/no provisional state, then capacity restoration and retry. A checksummed truncated worker image is rejected; an actually killed Unix helper's partial output is not published. This does not claim the host filesystem was filled. |
-| Revision/crash/relocation correctness | Catalog-authoritative generation/fingerprint rejects stale completion, known nonpixel edits retain valid previews, cross-store journal interruption/restart tests cover manifest attachment, catalog commit boundaries and journal removal. Relocation resumes copying/switch/cleanup, handles admission-marker interruption and rejects foreign roots. Source-overlap guards include omitted configured roots and an actual relink into relocated cache. |
+| Integrated local correctness | The final v4 receipt for frozen `e535d00a28ebbbb62c240dc00bbefc937272c555` reconciles 261 Rust passes, 0 failures, 3 ignored, across 27 suites; 28 scripts and 52 benchmark Python contracts passed. The final CLI-only repair passed 18 affected tests, package fmt and all-target Clippy. Earlier compile/fixture/Clippy failures are preserved. Package rebuild isolation prevented sibling-worktree stale artifacts. |
+| S7 integration and donor contracts | Shared catalog writer admission is acquired once: import reserve/failure/publication/recovery use Background; visible work uses Foreground. Stable preview references and the actual priority/parser/CLI regressions passed. Schema5 donor checks preserve original 4-to-5 ancestry and separately bind the pristine 5-to-5 verification. The small adversarial integrated tests passed; no 10M preview campaign is implied. |
+| Release freeze | Three e535d00 release binaries, whole clean source archive, protocols, inputs, native versions, APFS Data attribution and 159 SDK source checks were bound; SDK before/after checks matched. Parent freeze audit passed. |
+| JPEG/WebP/AVIF comparison | Stage A completed with artifact chains, preserved failures and sealed blinded review. Timing is exploratory under recorded background load, not a verified quiet-host budget result; no favorable subset or corrected ranking is claimed. |
+| Selected codec/tier quality | JPEG80 at 512/1600. Current-renderer qualification inspected 16 changed groups and inherited 44 unchanged groups through exact reference/selected-RGB hashes. Per tier: 26 acceptable, 0 unacceptable, 4 uninformative, with those labels preserved. No Adobe-equivalence claim. |
+| Worker memory calibration | Thirty sources, native workers and verifiers completed with unchanged source hashes. Largest observed native HWM was 1,760,837,632 bytes. The reviewed reservation plus margin is 2,269,118,464 bytes (2164 MiB), adopted by ServiceLimits within a 3 GiB total and one normal worker. This is inherited cohort calibration, not exact repaired-binary HWM, OS enforcement or a future-camera guarantee. |
+| Layout | Four preparation and four lookup children completed; 220,000 distinct stored objects and 1,320,000 timed lookups across 24 fixed passes. COM/seed-byte and unique-content/file-count proofs passed, raw samples independently reconciled, all inputs preserved, zero retries. Flat was selected by the authoritative corrected parent review. Full distributions, allocation counts and desktop-load limitations are in [PREVIEW_LAYOUT_RESULTS.md](PREVIEW_LAYOUT_RESULTS.md). |
+| Offline/import/priority | Actual children render both tiers; imports publish and later read without originals. Incremental import yields to retained foreground reads while a native lease exists. Two worker slots under the frozen allowance admit one, queue the other and progress after release. |
+| Resource/cancellation | Shared request/completion admission, foreground ordering, held-pixel accounting beyond LRU eviction, typed encoded/decoded pressure, release/retry progress, maximum-u64 arithmetic and same-key resubmission before reap passed. Actual cancel/owner EOF evidence uses an admitted post-decode checkpoint; it is not deterministic interruption inside a codec. |
+| Quota/fault | The large LRU never evicts retained thumbnails. Capacity refusal preserves fallback. Injected StorageFull follows a real partial write; actual SQLite FULL uses max_page_count and verifies integrity, no provisional state, capacity restoration and retry. Truncated checksummed output and an actually killed Unix helper's partial output are rejected. This does not mean the host filesystem was filled. |
+| Revision/crash/relocation | Catalog generation/fingerprint rejects stale completion; known nonpixel edits retain previews. Journal tests cover manifest attachment and catalog commit boundaries. Relocation resumes copying/switch/cleanup, preserves foreign files and handles marker-admission interruption. Source-overlap tests include omitted roots and actual relinking into a relocated cache. |
 
-Private receipt identities (portable names; absolute user paths are not committed):
+Private receipt identities use portable names; no original images or raw samples
+are committed:
 
-- `sc-22841-service-navigation-gate-v1/receipt.json`: SHA256 `d74c43fa956616cf960ff87dbb8ead523e6d4c81f0a7e703248458a0ff8f8390`.
+- `sc-22841-final-correctness-v4/receipt.json`: SHA256 `f20c7d1628f931d1718476fe094c906dff6a611edcb8b1ba120feb9371f699a7`.
+- `sc-22841-stage-b-release-v2-gvj3ffrx/build-reference.json`: SHA256 `2dbed204e0ec4b01cc555889e73021f42eb0016fa4ff9252160ba6a7f63b6155`.
 - `sc-22841-memory-v1-imt0b3ko/campaign/campaign.json`: SHA256 `b02edc6043ecb78d254be097fa765811a81a3234cd4ac110b4c4326b47e2321f`; independent audit `a21f2d6a4719e574f53c179a2552c826b20e52d8b5aa646097203251ca705f1b`.
 - `sc-22841-current-quality-v1-q3reqlv0/current-renderer-quality-decision.json`: SHA256 `6dd8a185fc3f8e5fe363fd7eb46886288fd4ac025d5cbc22e3c290b5dcd6906d`.
+- `sc-22841-layout-v1-sy3xj63s/campaign/campaign.json`: SHA256 `a218b31481ff061fcdbdcfb3b27ed5ddf970a7647a96a69b418b05b538912123`.
+- `sc-22841-layout-v1-sy3xj63s/reconciliation.json`: SHA256 `1bc3415f47ca59ee681aece43e31c9629ec0ab0763f08a11093048a545102e90`.
+- `sc-22841-layout-v1-sy3xj63s/parent-layout-review-v2.json`: SHA256 `38aeb39d9d0fe9453182de1fe4fb0273d8091726dbf1f71c6064b74e332f0957`; v2 corrects prior selection prose, not numeric evidence.
 
-Older source-checkpoint documents describe then-pending tests/memory/quality.
-The identities above establish their completed scope without rewriting old evidence.
+## Remaining gates
 
-## Remaining gates, in execution order
+| Gate | Required work and acceptance boundary |
+| --- | --- |
+| Flat retained navigation | Explicit preparation, then the reviewed 44 measured children and 44 verifiers: each standard/constrained profile has one warm child (3 warmups +100 measured +1 hot), 20 fresh-process children and ten fixed 100-viewport traces. Require all pixel/ownership oracles, raw latency and resource classifications, offline originals and host telemetry. Warm headless page p95 ≤1000 ms; fresh process is not cold OS cache. Ten-thousand-row RSS is component evidence only. |
+| Integrated 10M browsing | Exclusively copy the verified pristine schema5 main/companions, preserve original migration ancestry, apply only the approved three-column 10k preview overlay, and run two measured warm children plus two verifiers. Require exact 10M count, stable IDs, actual absent synthetic original paths, 200 held views, zero native jobs and source invariance. Retain all 208 trials; warm page p95 ≤1000 ms and entire browse-process HWM ≤4 GiB per profile. No original SQLite connection or implicit migration. |
+| Current repair/default correctness | Original e535d00 hosted macOS/Linux/contracts passed, but Windows exposed five worker-recovery/relocation failures. The isolated `0a9daf610fa17e4f0a655e43549207fbd4d2ad64` retirement/owning-handle repair passed independent source review. Repaired runtime CI and the subsequent 2164 MiB default change still need their final applicable gate. Include actual worker cleanup/cancellation, delayed-handle and retired-before-claim recovery, unknown-marker preservation and the relocation marker fixture. No new host-disk-fill experiment is required. |
+| Configuration qualification | Flat and the JPEG pair are selected; the worker reservation now follows the reviewed calibration. The complete example supplies explicit 64 GiB retained/16 GiB large encoded quotas and replaceable absolute paths. These quotas are illustrative capacity choices, not universal defaults or a million-photo guarantee. The remaining page/RSS results must qualify the complete configuration before delivery. |
+| Final review/delivery | Independent exact-head review, final applicable macOS/Linux/Windows CI, parent-authorized merge, terminal main CI and Shortcut readback. Draft PR8 is not delivery proof. No S6 Done from local tests or component timings alone. |
 
-| Gate | Exact remaining work | Acceptance boundary |
-| --- | --- | --- |
-| S7 integration | Source integrated: shared admission acquired once in the preview transaction helper; import reserve/failure/publication/recovery and background submission use Background, visible submission and ordinary final generation authority use Foreground. Preserve previous preview references. Review and run the added priority regression. | Current correctness predates this change. No claim that native-worker priority alone prevents catalog-writer starvation. |
-| Integrated donor/schema reconciliation | Source reconciled to schema 5 plus exact lens/capture index. Protocol2 preserves original 4-to-5 ancestry and binds pristine schema5 donor bytes; optional later 5-to-5 proof stays separate. Review and run new ancestry rejection tests. | **Execution remains blocked until integration review/gates/build freeze.** Reject schema4 before Catalog::open; no migration during measurement. No original SQLite connections. |
-| Current-head correctness and build freeze | Run the nine source-ready integrated tests and added catalog-writer priority/parser regressions plus affected shared fixture/layout/navigation tests, then complete relevant Rust/Python/fmt/Clippy gates. Freeze clean whole-source archive, actual release app/probes, native dependency versions, storage and input receipts. | The merged source has formatting/syntax inspection only; no new runtime test or campaign results. Rebuild the package after checkout switches. |
-| Layout comparison | `preview_layout_campaign.py`: 10k flat, 10k prefix, 100k flat, 100k prefix; four preparation and four measured lookup children. Six fixed passes each (three sequential, three seeded random), zero retries. | All four groups and 24 pass distributions; exactly N distinct actual files/read-content hashes per pass, seed+COM oracle, identical payload totals across layouts, allocated file/directory/manifest/index overhead. Select layout from the full evidence; no automatic winner or synthetic-distribution forecast. |
-| Retained service/navigation | `preview_navigation_campaign.py`: **44 measured children + 44 untimed verifiers**. Each profile: one warm child (3 warmups +100 measured +1 hot), 20 fresh-process children, one child with ten fixed 100-viewport navigation traces. Standard and constrained profiles. | Actual production queue/read path, all ownership/pixel oracles, raw timings/late-work/resource classifications, offline originals and complete host telemetry. Warm headless page p95 ≤1000 ms. Fresh process is not cold OS cache. Ten-thousand-row RSS is component evidence only. |
-| Integrated 10M retained browsing | After schema reconciliation, `preview_integrated_campaign.py`: exclusive source/companion copy, bounded three-column 10k identity overlay, then **2 measured warm children +2 untimed verifiers** (standard/constrained), each 3 warmups +100 measured +1 hot. | Exact 10M count; preserved stable IDs and actual offline paths; held 200 views; zero native jobs; source invariance. Report all 208 trial observations, warm p95 ≤1000 ms and entire browse process HWM ≤4 GiB per profile. No UI frame-time award. |
-| Integrated fault/quota gate | Rerun existing fault, concurrent-import, stale completion, journal recovery and relocation tests at the final integrated head, including native CI. Preserve the distinction between injected filesystem failure and actual SQLite capacity failure. | Tests already passed at a2f33b7; new writer/schema/default integration must not regress them. No new performance threshold or unrequested host-disk fill campaign. |
-| Final defaults/configuration decision | Combine reviewed layout, quality, footprint and page/RSS results. Record selected layout, explicit retained/larger quotas, cache locations, request/cache/live-memory budgets, worker reservation and supported-source resource-retry behavior. Make shipped defaults/configuration examples agree with that decision. | Codec/edges are selected; storage/resource defaults remain provisional. `ServiceLimits::default()` currently reserves 3 GiB per worker, while the frozen experiment uses 2164 MiB. Thumbnail quota exhaustion reports retained-capacity pressure rather than evicting offline coverage. Configurable larger allowance must retain the full decoder's supported-source capability. |
-| Final review and delivery | Independent review of exact integrated head/evidence; parent-authorized PR, terminal applicable macOS/Linux/Windows CI, merge, terminal main CI and Shortcut readback. | Source workflow contains native WebP provisioning, all-target tests/Clippy and Linux preview Python-contract discovery. Workflow source is not execution proof. No S6 Done from local tests alone. |
+The Windows repair leaves codec/preparation/renderer and measured layout reads
+unchanged. Its native staging retirement adds durable I/O, so native rendering,
+cancellation and recovery timings cannot be inherited. Retained navigation
+applicability requires empty worker staging at startup and zero native jobs; keep
+the exact frozen source/binary identities. Existing memory evidence remains
+calibration rather than a measurement of the changed executable.
 
-## Coverage limits requiring explicit final-review attention
-
-No additional unimplemented story-local mechanism was identified in this bounded
-source pass beyond the integration/default/measurement work listed above. Three
-limits must remain explicit rather than being mistaken for completed coverage:
-
-- The current pixel recipe is revision zero. Keys include edit revision, but S8
-  must supply actual recipe data and matching identity when editing is added;
-  arbitrary nonzero recipe revisions are not silently rendered as unedited images.
-- Native Windows/Linux execution of the current S6 worker/recovery/relocation
-  paths is still pending. The killed-partial helper test is Unix-only. Relocation
-  publishes through hard links on the destination filesystem; support on filesystems
-  without hard links (for example exFAT) has not been qualified. Source paths remain
-  preserved on failure; do not claim arbitrary cache-filesystem compatibility.
-- Cancellation of retained in-process decode is cooperative between decoder calls;
-  original rendering uses a killable child. Navigation must report the observed
-  latency under that contract. S12 owns desktop/UI time; the headless components
-  cannot satisfy the UI portion of the one-second budget by omission.
-
-
-Final correctness gate is one complete Rust all-target invocation, followed by all
-`scripts/test*.py` and `benchmarks/test_*.py` contracts, package fmt and all-target
-Clippy. It binds a clean source archive and exact environment, forces a package-only
-debug rebuild in this worktree's own target, and preserves private frozen/release
-binaries. Required writer/parser/integrated/actual-CLI tests are verified within
-that full-suite output, not redundantly rerun. The private gate wrapper and every
-step's command/log/timestamps/hash are retained with the receipt; failure stops
-execution for diagnosis. No timing campaign or release build is part of this gate.
+Current pixel recipe revision zero is explicit. S8 must provide actual recipe
+values and matching identity; arbitrary nonzero edits are not silently rendered
+as unedited images. Retained decode cancellation is cooperative between decoder
+calls; native original rendering uses a killable child. S12 owns desktop frame
+time. Relocation uses hard links on the destination filesystem; filesystems
+without hard links, such as exFAT, are not qualified cache destinations. Failures
+preserve readable/source copies. Confidence is high in completed correctness and
+integrity evidence, moderate in the bounded layout decision, and unestablished
+for the still-unrun navigation/integrated performance gates.

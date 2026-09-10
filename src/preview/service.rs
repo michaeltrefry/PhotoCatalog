@@ -68,7 +68,7 @@ impl Default for ServiceLimits {
             requests: 400,
             workers: 1,
             working_bytes: 3 * 1024 * 1024 * 1024,
-            per_worker_bytes: 3 * 1024 * 1024 * 1024,
+            per_worker_bytes: 2164 * 1024 * 1024,
             encoded_staging_bytes: 32 * 1024 * 1024,
             per_worker_encoded_bytes: 8 * 1024 * 1024,
             decoded_cache_bytes: 256 * 1024 * 1024,

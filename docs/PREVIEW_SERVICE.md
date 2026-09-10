@@ -1,15 +1,17 @@
 # Preview service and retained storage
 
-This source checkpoint joins the selected 512/1600 JPEG80 pair to actual isolated
-workers, catalog revision guards, durable jobs and cache relocation. The Mac gate
-passes 228 Rust tests and 11 Python preview-contract tests, with package formatting
-and all-target Clippy clean. Stage B layout/timing, full-worker peak-memory
-qualification, current-renderer visual qualification and cross-platform native
-CI remain required before S6 is complete. The `ServiceLimits::default()` values
-are provisional admission settings for fixture execution, not a measured product
-memory profile; Stage B freezes worker reservation and its accounting margin.
+The selected pair is JPEG80 at 512/1600 pixels. Local correctness through the
+frozen e535d00 source passed 261 Rust tests (three ignored), 28 scripts contracts,
+52 benchmark contracts, package formatting and all-target Clippy; the final CLI
+repair also passed its 18 affected tests. Layout measurement and independent
+reconciliation passed, selecting Flat. Current-renderer quality and the 30-source
+worker-memory calibration are complete. Retained navigation, integrated 10M
+page/RSS qualification and final cross-platform delivery remain pending. The
+Windows worker recovery repair is separately source-reviewed; its runtime CI
+must pass before S6 is complete. See [the acceptance ledger](PREVIEW_ACCEPTANCE_LEDGER.md)
+and [layout evidence](PREVIEW_LAYOUT_RESULTS.md) for exact evidence boundaries.
 
-The subsequent retained-read queue is source-ready and unrun. `queue_read`,
+The retained-read queue passed local correctness; its fixed measured campaign remains pending. `queue_read`,
 `tick_read`, `take_read` and `cancel_read` are service APIs, sharing request and
 unconsumed-completion admission with native render consumers. Read tickets have a
 separate Rust type/namespace and monotonic service-lifetime IDs. Foreground reads
@@ -26,7 +28,7 @@ completion classifies either as transient resource pressure; no message matching
 or cache invalidation is used for admission failures. The constrained navigation
 receipt must keep resource-refused reads separate from corrupt/I/O failures and
 missing/stale results. A held encoded export, refused read, released export and
-successful subsequent read are covered by a source-ready regression.
+successful subsequent read passed the local regression gate.
 
 `Catalog::import_with_previews` drives the application service. `begin_import`
 and `ImportSession::advance` expose the same discovery/metadata/reservation path
@@ -41,7 +43,8 @@ the configured service, including complete-original rendering for RAW.
 
 CLI import, preview and cache commands take `--preview-config <JSON>`, containing
 `PreviewConfiguration { store, policy, limits, original_roots }`. Settings are
-explicit while the layout and memory profile are under measurement. Native worker
+explicit: StoreConfig has no implicit paths, layout or disk quotas. The complete
+[configuration example](preview-config.example.json) selects Flat for a new store. Native worker
 launch uses the actual application executable; library callers inject an absolute
 worker executable. Both retained/evictable locations and byte quotas are
 configurable. `cache-jobs` exposes queued, resource-limited, unavailable and failed
@@ -111,9 +114,10 @@ admission, all root-overlap pairs, and deferred-constraint COMMIT failure/reuse
 regressions. All passed in the same local gate; logs and initial compile/fixture
 failures are retained privately in `sc-22841-service-repair-v1`. The runtime probe
 was also exercised through a tiny generated DNG and its saved JPEG verifier,
-including same-size byte corruption rejection. No Stage B campaign has run.
+including same-size byte corruption rejection. The subsequent worker-memory and
+layout campaigns passed within their documented scopes; navigation remains pending.
 
-Additional source-ready fault coverage now writes a real partial staging file
+Additional passing fault coverage writes a real partial staging file
 before injecting `StorageFull`, then requires cleanup, the prior retained object
 and a successful replacement retry. A separate tiny SQLite `max_page_count`
 case forces the engine's actual `SQLITE_FULL` result during journal insertion,
@@ -122,7 +126,8 @@ These are precise fault-injection/engine-capacity checks, not a claim that the h
 filesystem was filled. The import-interleaving regression also consumes a real
 retained foreground read while the native import reservation remains active and
 keeps that caller-owned view alive across native foreground preemption/recovery.
-These new tests remain UNRUN pending the next bounded native gate.
+These tests passed in the final local correctness gate; the repaired Windows
+paths still require their own terminal CI evidence.
 
 Source admission no longer relies only on configured original-root hints. Direct
 render requests and import submissions resolve each actual source and reject
@@ -132,5 +137,45 @@ their scan; incremental advances recheck their root and each file before reserve
 The guard also covers both sides of an unfinished relocation, and launch rechecks
 protect jobs whose filesystem mapping changed while queued. Missing legitimate
 originals remain admissible for the existing explicit unavailable/retry flow.
-Source-ready tests cover omitted root configuration, all three cache roots,
+Passing local tests cover omitted root configuration, all three cache roots,
 real catalog relinking into a relocated tier, and copy/cleanup root ownership.
+
+
+## Selected settings and explicit disk capacity
+
+The example is a complete `PreviewConfiguration`, not an automatically installed
+configuration. Replace **every** `/REPLACE/WITH/...` placeholder with an actual
+absolute path appropriate to the host; on Windows use drive-qualified paths with
+JSON-escaped backslashes. The three writable cache/manifest roots must be separate
+and must not overlap originals. The original-root list points at the user's
+existing storage and does not move originals. An existing store retains its
+layout; changing the JSON layout is rejected rather than silently repacking it.
+
+The illustrative retained quota is 64 GiB (`68719476736` encoded bytes), and the
+large-preview quota is 16 GiB (`17179869184` encoded bytes). These are explicit
+capacity choices, not measured universal defaults or a guarantee that a million
+photos will fit. Both count encoded objects including pending writes. Database,
+filesystem/ownership metadata, directory allocation and relocation's temporary
+second copy require additional free storage. The retained quota refuses new work
+when full and preserves offline thumbnails; only the larger tier is evictable.
+Increasing a retained quota and deliberately retrying resource-limited jobs can
+extend offline coverage without discarding earlier previews.
+
+`ServiceLimits::default()` reserves 2164 MiB (`2269118464` bytes) per worker within
+the unchanged 3 GiB total working allowance, with one normal worker. This adopts
+the reviewed 30-source calibration plus its accounting margin. It is not an
+OS-enforced aggregate RSS limit, a fresh measurement of the repaired binary, or a
+future-camera memory guarantee. Two workers at that reservation cannot fit in
+3 GiB. The remaining selected settings are 400 requests, 32 MiB encoded staging
+with 8 MiB per worker, a 256 MiB decoded LRU, a 256 MiB live-pixel allowance and
+400 cache entries. Caller-held pixels remain charged when evicted from the LRU;
+the two byte ceilings are distinct constraints, not a claim of two copied buffers.
+
+The example's source admission ceilings are 256 MiB encoded input, 32 million
+intermediate pixels and 768 MiB for each checked allocation. A larger supported
+source can require larger explicit ceilings and a sufficient worker/total
+allowance. A too-small configuration leaves a retryable resource-limited job and
+retained fallback; it does not redefine format support or silently substitute a
+thumbnail for full-quality input. The full decoder's existing support ceiling is
+unchanged. Actual retained-page costs and whole-process RSS still require the
+fixed standard/constrained navigation and integrated 10M gates.
