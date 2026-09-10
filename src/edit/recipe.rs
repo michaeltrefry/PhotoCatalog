@@ -24,8 +24,8 @@ pub struct RecipeV1 {
     pub sharpening: Sharpening,
     pub noise_reduction: NoiseReduction,
 }
-/// Normalized edges in the physically oriented, straightened bounding canvas.
-/// Rotation may introduce transparent corners. Crop never silently zooms to an
+/// Normalized edges in the physically oriented original-size canvas. Rotation
+/// keeps that extent, rotates about its center, and introduces transparent corners. Crop never silently zooms to an
 /// inscribed rectangle; exports preserve alpha or use an explicit background.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +60,19 @@ impl ValidatedRecipe {
     pub fn settings(&self) -> &RecipeV1 { let Recipe::V1(value) = &self.recipe; value }
     pub fn canonical_bytes(&self) -> &[u8] { &self.canonical }
     pub fn digest(&self) -> &str { &self.digest }
+    /// Pixel edges round to nearest (half upward). Report a collapsed crop on
+    /// the target source rather than expanding it during adjustment transfer.
+    pub fn validate_dimensions(&self, width: u32, height: u32) -> Result<(u32,u32), RecipeError> {
+        if width == 0 || height == 0 || width > 40000 || height > 40000 || u64::from(width)*u64::from(height)>100_000_000 {
+            return Err(RecipeError("source dimensions must be nonzero and within 100 MP/40000 per edge".into()));
+        }
+        if let Some(c) = self.settings().crop {
+            let w = (f64::from(c.right)*f64::from(width)).round() as u32 - (f64::from(c.left)*f64::from(width)).round() as u32;
+            let h = (f64::from(c.bottom)*f64::from(height)).round() as u32 - (f64::from(c.top)*f64::from(height)).round() as u32;
+            if w == 0 || h == 0 { return Err(RecipeError("crop collapses at this source resolution".into())); }
+            Ok((w,h))
+        } else { Ok((width,height)) }
+    }
 }
 impl Default for Recipe { fn default() -> Self { Self::V1(RecipeV1::default()) } }
 impl Default for RecipeV1 {
@@ -149,6 +162,15 @@ mod tests {
         assert!(serde_json::from_value::<Recipe>(value).is_err());
         let mut r = RecipeV1::default(); r.crop = Some(NormalizedRect { left: 0.5, top: 0.0, right: 0.5, bottom: 1.0 });
         assert!(Recipe::V1(r).validate().is_err());
+    }
+    #[test]
+    fn crop_reports_target_resolution_incompatibility() {
+        let mut r = RecipeV1::default();
+        r.crop = Some(NormalizedRect { left: 0.1, top: 0.0, right: 0.11, bottom: 1.0 });
+        let v = Recipe::V1(r).validate().unwrap();
+        assert!(v.validate_dimensions(2,2).is_err());
+        assert_eq!(v.validate_dimensions(1000,1000).unwrap(), (10,1000));
+        assert!(v.validate_dimensions(10001,10000).is_err());
     }
     #[test]
     fn copy_keeps_unselected_groups_and_changes_canonical_identity() {
