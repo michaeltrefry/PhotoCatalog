@@ -6,6 +6,7 @@ therefore cannot launch a campaign. No retries and no failed-output cleanup.
 """
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import math
@@ -14,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 import psutil
 from preview_host import HostObservation, host_identity
@@ -52,60 +54,189 @@ def same_alive(key):
         return False
 
 
+def owned_process(key):
+    """Return the same identity-bound Process that will receive a signal."""
+    try:
+        process=psutil.Process(key[0])
+        if process.create_time()!=key[1]:
+            return None
+        return process
+    except psutil.NoSuchProcess:
+        return None
+
+
+@contextmanager
+def cleanup_signals():
+    # A second coordinator interrupt must not abort its bounded reap sequence.
+    prior={}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT,signal.SIGTERM):
+            prior[signum]=signal.signal(signum,signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        for signum,handler in prior.items():
+            signal.signal(signum,handler)
+
+
 def terminate_owned(child,known):
     errors=[]
-    live=[]
-    for key in known:
+    def failed(stage,exc):
+        value=stage+': '+type(exc).__name__+': '+str(exc)[:512]
+        if value not in errors and len(errors)<64:
+            errors.append(value)
+
+    with cleanup_signals():
+        # Popen owns the unreaped child on POSIX and a process handle on Windows.
+        # Its signal methods avoid a reaped/reused root PID. Never substitute a
+        # raw os.kill(pid) or a process-group ID recovered from telemetry here.
         try:
-            if same_alive(key):
-                live.append(psutil.Process(key[0]))
-        except psutil.Error as exc:
-            errors.append(type(exc).__name__)
-    # Only the group created by this Popen, while one known identity still belongs
-    # to that group. No PID guessed from a stale receipt is ever signaled.
-    if os.name=='posix':
-        grouped=[]
-        for process in live:
+            child.terminate()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            failed('root terminate',exc)
+        for key in known:
             try:
-                if os.getpgid(process.pid)==child.pid:
-                    grouped.append(process)
-                else:
-                    errors.append('owned child escaped expected process group')
-            except ProcessLookupError:
-                pass
-        if grouped:
-            try:
-                os.killpg(child.pid,signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-    else:
-        for process in reversed(live):
-            try:
-                process.terminate()
+                process=owned_process(key)
+                if process is not None:
+                    process.terminate()  # psutil rechecks this object's identity.
             except psutil.NoSuchProcess:
                 pass
-    deadline=time.monotonic()+3
-    while time.monotonic()<deadline and any(same_alive(k) for k in known):
-        time.sleep(.05)
-    for key in known:
+            except Exception as exc:
+                failed('known terminate',exc)
         try:
-            if same_alive(key):
-                psutil.Process(key[0]).kill()
-        except psutil.Error as exc:
-            errors.append(type(exc).__name__)
-    try:
-        child.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        errors.append('root was not reaped')
-    remaining=[]
-    for key in known:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as exc:
+            failed('root wait',exc)
+        # Always reach the Popen kill/wait fallback, including failed discovery
+        # and AccessDenied while inspecting any descendant. No telemetry call is
+        # a prerequisite for reaping the root we launched.
         try:
-            if same_alive(key):
-                remaining.append(key)
-        except psutil.Error as exc:
-            errors.append(type(exc).__name__)
-    return dict(known_absent=not remaining and not errors,remaining=remaining,errors=errors,
-                root_returncode=child.returncode)
+            child.kill()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            failed('root kill',exc)
+        for key in known:
+            try:
+                process=owned_process(key)
+                if process is not None:
+                    process.kill()
+            except psutil.NoSuchProcess:
+                pass
+            except Exception as exc:
+                failed('known kill',exc)
+        try:
+            child.wait(timeout=5)
+        except Exception as exc:
+            failed('root final wait',exc)
+        remaining=[]
+        deadline=time.monotonic()+3
+        while True:
+            remaining=[]
+            for key in known:
+                try:
+                    if same_alive(key):
+                        remaining.append(key)
+                except Exception as exc:
+                    failed('known final inspection',exc)
+                    remaining.append(key)
+            if not remaining or errors or time.monotonic()>=deadline:
+                break
+            time.sleep(.05)
+        return dict(known_absent=not remaining and not errors and child.returncode is not None,
+                    scope='Popen root and individually discovered identities; not undiscovered descendants',
+                    remaining=remaining,errors=errors,root_reaped=child.returncode is not None,
+                    root_returncode=child.returncode)
+
+
+class BoundedCapture:
+    """Retain a bounded prefix; drain overflow so cleanup cannot deadlock on IO."""
+    def __init__(self,pipe,path,limit):
+        self.pipe=pipe
+        self.path=Path(path)
+        self.limit=limit
+        self.observed=0
+        self.retained=0
+        self.eof=False
+        self.errors=[]
+        self.failed=threading.Event()
+        self.lock=threading.Lock()
+        self.thread=threading.Thread(target=self.collect,name='edit-evidence-'+self.path.name,daemon=True)
+        self.thread.start()
+
+    def fault(self,exc):
+        with self.lock:
+            if len(self.errors)<8:
+                self.errors.append(type(exc).__name__+': '+str(exc)[:512])
+        self.failed.set()
+
+    def collect(self):
+        output=None
+        try:
+            try:
+                output=self.path.open('xb',buffering=0)
+            except Exception as exc:
+                self.fault(exc)
+            while True:
+                part=self.pipe.read(65536)
+                if not part:
+                    with self.lock:
+                        self.eof=True
+                    break
+                with self.lock:
+                    self.observed+=len(part)
+                    capacity=max(0,self.limit-self.retained)
+                    if self.observed>self.limit:
+                        self.failed.set()
+                if output is not None and capacity:
+                    try:
+                        view=memoryview(part)[:capacity]
+                        while view:
+                            count=output.write(view)
+                            if not count:
+                                raise OSError('evidence write made no progress')
+                            with self.lock:
+                                self.retained+=count
+                            view=view[count:]
+                    except Exception as exc:
+                        self.fault(exc)
+                        broken=output
+                        output=None
+                        try:
+                            broken.close()
+                        except Exception as close_error:
+                            self.fault(close_error)
+        except Exception as exc:
+            self.fault(exc)
+        finally:
+            if output is not None:
+                try:
+                    output.flush()
+                    os.fsync(output.fileno())
+                except Exception as exc:
+                    self.fault(exc)
+                finally:
+                    try:
+                        output.close()
+                    except Exception as exc:
+                        self.fault(exc)
+            try:
+                self.pipe.close()
+            except Exception as exc:
+                self.fault(exc)
+
+    def finish(self):
+        self.thread.join(timeout=3)
+        if self.thread.is_alive():
+            self.fault(RuntimeError('pipe EOF not established after owned process cleanup'))
+        with self.lock:
+            return dict(limit_bytes=self.limit,observed_bytes=self.observed,
+                        retained_bytes=self.retained,truncated=self.observed>self.retained,
+                        eof=self.eof,reader_joined=not self.thread.is_alive(),errors=list(self.errors))
 
 
 def invoke(command, folder, limits, disk_root):
@@ -116,15 +247,19 @@ def invoke(command, folder, limits, disk_root):
                                       stdout='stdout.log',stderr='stderr.log'))
     child=None
     known={}
+    captures={}
     samples=0
-    error=None
+    errors=[]
     peak=0
     ownership=None
+    telemetry_bytes=0
     try:
-        with (folder/'stdout.log').open('xb') as stdout, (folder/'stderr.log').open('xb') as stderr, (folder/'processes.jsonl').open('x') as telemetry:
-            child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,
-                                   start_new_session=os.name=='posix',
+        with (folder/'processes.jsonl').open('xb') as telemetry:
+            child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                   bufsize=0,start_new_session=os.name=='posix',
                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name=='nt' else 0)
+            for name,pipe in (('stdout.log',child.stdout),('stderr.log',child.stderr)):
+                captures[name]=BoundedCapture(pipe,folder/name,MAX_STDIO)
             root=psutil.Process(child.pid)
             root_key=identity(root)
             known[root_key]=True
@@ -133,20 +268,20 @@ def invoke(command, folder, limits, disk_root):
             while True:
                 at=anchor()
                 records=[]
-                # Root can exit before a poll; previously identified descendants
-                # remain checked until absent. Unknown ownership is a failure.
                 try:
                     if same_alive(root_key):
                         found=[root]+psutil.Process(child.pid).children(recursive=True)
                         for process in found:
                             key=identity(process)
                             known[key]=True
+                            if len(known)>MAX_SEEN:
+                                raise RuntimeError('owned process-count admission exceeded')
                 except psutil.NoSuchProcess:
                     pass
                 for key in known:
                     try:
-                        process=psutil.Process(key[0])
-                        if identity(process)!=key:
+                        process=owned_process(key)
+                        if process is None:
                             continue
                         status=process.status()
                         if status==psutil.STATUS_ZOMBIE:
@@ -160,17 +295,21 @@ def invoke(command, folder, limits, disk_root):
                 total=sum(p['rss'] for p in records)
                 peak=max(peak,total)
                 free=psutil.disk_usage(disk_root).free
-                telemetry.write(json.dumps(dict(at=at,processes=records,total_rss=total,free_bytes=free))+'\n')
+                line=(json.dumps(dict(at=at,processes=records,total_rss=total,free_bytes=free))+'\n').encode()
+                if telemetry_bytes+len(line)>MAX_TELEMETRY:
+                    raise RuntimeError('process telemetry byte cap exceeded')
+                telemetry.write(line)
                 telemetry.flush()
+                telemetry_bytes+=len(line)
                 samples+=1
-                if len(known)>MAX_SEEN or len(records)>MAX_ACTIVE:
+                if len(records)>MAX_ACTIVE:
                     raise RuntimeError('owned process-count admission exceeded')
                 if total>limits['group_rss_bytes'] or any(p['rss']>limits['process_rss_bytes'] for p in records):
                     raise RuntimeError('sampled RSS admission exceeded')
                 if free<limits['free_reserve_bytes']:
                     raise RuntimeError('live filesystem free-space reserve exhausted')
-                if any((folder/name).stat().st_size>MAX_STDIO for name in ('stdout.log','stderr.log')) or telemetry.tell()>MAX_TELEMETRY:
-                    raise RuntimeError('evidence stream byte cap exceeded')
+                if any(capture.failed.is_set() for capture in captures.values()):
+                    raise RuntimeError('bounded stdout/stderr capture failed or overflowed')
                 code=child.poll()
                 if code is not None:
                     if any(key!=root_key and same_alive(key) for key in known):
@@ -181,19 +320,49 @@ def invoke(command, folder, limits, disk_root):
                 if time.monotonic()>=deadline:
                     raise RuntimeError('sampled child deadline exceeded')
                 time.sleep(.1)
-        ownership=terminate_owned(child,known)
+            telemetry.flush()
+            os.fsync(telemetry.fileno())
     except BaseException as exc:
-        error=f'{type(exc).__name__}: {exc}'
+        errors.append(f'{type(exc).__name__}: {exc}')
+    finally:
+        # Evidence writes, telemetry and capture inspection cannot gate cleanup.
         if child is not None:
             ownership=terminate_owned(child,known)
-    result=dict(complete=error is None and ownership is not None and ownership['known_absent'],
-                started=started,finished=anchor(),error=error,ownership=ownership,
-                sampled_peak_group_rss=peak,samples=samples,
-                caveat='0.1 second sampled guards are not hard per-allocation RSS enforcement')
-    for name in ('stdout.log','stderr.log','processes.jsonl'):
+        capture_proofs={}
+        for name,capture in captures.items():
+            try:
+                proof=capture.finish()
+                capture_proofs[name]=proof
+                if proof['truncated'] or proof['errors'] or not proof['eof'] or not proof['reader_joined']:
+                    errors.append('incomplete/overflowed capture: '+name)
+            except Exception as exc:
+                errors.append('capture finalization: '+type(exc).__name__+': '+str(exc))
+        if child is not None:
+            # A capture constructor may fail before taking ownership of a pipe.
+            for name,pipe in (('stdout.log',child.stdout),('stderr.log',child.stderr)):
+                if name not in captures and pipe is not None:
+                    pipe.close()
+    artifacts={}
+    for name,limit in (('stdout.log',MAX_STDIO),('stderr.log',MAX_STDIO),('processes.jsonl',MAX_TELEMETRY)):
         path=folder/name
-        if path.exists():
-            result[name]=dict(bytes=path.stat().st_size,sha256=digest(path,'sha256',MAX_TELEMETRY+MIB))
+        try:
+            if path.exists():
+                if name=='processes.jsonl':
+                    # Flush already-written failure telemetry too; success-only
+                    # fsync above does not cover interrupted sampling.
+                    with path.open('r+b') as retained:
+                        os.fsync(retained.fileno())
+                artifacts[name]=dict(bytes=path.stat().st_size,sha256=digest(path,'sha256',limit))
+        except Exception as exc:
+            # Preserve the failure receipt even if retained evidence cannot be
+            # hashed (IO fault, external mutation, or incomplete pipe capture).
+            artifacts[name]=dict(error=type(exc).__name__+': '+str(exc))
+            errors.append('artifact verification failed: '+name)
+    result=dict(complete=not errors and ownership is not None and ownership['known_absent'],
+                started=started,finished=anchor(),error='; '.join(errors) if errors else None,
+                ownership=ownership,captures=capture_proofs,sampled_peak_group_rss=peak,samples=samples,
+                caveat='0.1 second sampled RSS/deadline guards are not hard allocation enforcement; streams retain bounded prefixes',
+                **artifacts)
     exclusive(folder/'result.json',result)
     if not result['complete']:
         raise RuntimeError('child failed; retained at '+str(folder))
