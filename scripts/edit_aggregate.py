@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import edit_disk_budget
 import edit_fixtures
+import edit_memory
 import edit_qualification
 import edit_statistics
 import edit_verify
@@ -401,7 +402,7 @@ def aggregate(root, binding):
     background = background_source(preparation_root, binding, cohort)
     records = binding['case_records']
     cases = registry(manifest, binding, records)
-    summaries, raw_cases, references, supervisors, cleanups = [], [], {}, [], []
+    summaries, raw_cases, references, supervisors, cleanups, memory = [], [], {}, [], [], []
     required_sources = {}
     repeat_pids = set()
     actions = {item['id']: item for item in binding['actions']}
@@ -443,6 +444,17 @@ def aggregate(root, binding):
             raise ValueError('verified request/receipt/samples changed')
         references[case_id] = hashes
         summaries.append(case_result(request, receipt, verification, attempts, values))
+        background_metrics = None
+        if request['phase'] in ('overlap_import', 'overlap_export'):
+            background_path = admitted_file(root, output/'background.json', MIB)
+            if proof['background_sha256'] != edit_verify.digest(background_path, 'sha256', MIB):
+                raise ValueError('verified background memory/lifecycle evidence changed')
+            background_metrics = edit_verify.read_json(background_path, MIB)
+        memory_proof = edit_memory.evidence(request, receipt, values, background=background_metrics,
+                                           process_limit=actions[case_id]['process_rss_bytes'])
+        if not same(memory_proof, proof['memory']):
+            raise ValueError('whole-worker memory evidence differs from verified result')
+        memory.append(dict(case_id=case_id, **memory_proof))
         existing = required_sources.setdefault(request['fixture_id'], request)
         if any(not same(existing[key], request[key]) for key in ('source', 'source_sha256', 'source_blake3', 'width', 'height')):
             raise ValueError('cases substituted a different source for one fixture')
@@ -510,6 +522,7 @@ def aggregate(root, binding):
                 sampled_peak_group_rss=max(s['sampled_peak_group_rss'] for s in supervisors),
                 generated_preparations=prepared,
                 verified_cleanup=cleanups,
+                process_high_water=memory,
                 caveat='Sampled RSS and disk checks are not hard allocation limits; platform/UI delivery remains separate.')
 
 

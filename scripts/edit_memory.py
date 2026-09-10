@@ -1,7 +1,4 @@
 """Successful Mac worker high-water receipts, distinct from sampled group RSS."""
-import math
-
-
 def resident_bytes(value, limit):
     if type(value) is not int or type(limit) is not int or not 0 < value <= limit:
         raise ValueError('missing or excessive whole-process high-water RSS')
