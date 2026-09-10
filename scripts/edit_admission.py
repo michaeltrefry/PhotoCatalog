@@ -13,6 +13,18 @@ import edit_request
 from edit_verify import digest,read_json,owned
 
 
+def validate_record_paths(record,root,case):
+    case_id=case['id']
+    output=Path(root)/(case_id+'-output')
+    expected=dict(probe_output=str(output),request_path=str(output/'request.json'),
+        verification_path=str(Path(root)/('verify-'+case_id+'-verification.json')),
+        probe_supervisor_path=str(Path(root)/case_id/'result.json'),
+        verify_supervisor_path=str(Path(root)/('verify-'+case_id)/'result.json'),
+        cleanup_path=str(Path(root)/(case_id+'-cleanup.json')) if case['phase']=='export' else None)
+    if any(record.get(name)!=value for name,value in expected.items()):
+        raise ValueError('case receipt/cleanup path differs from its owned namespace')
+
+
 def validate_execution(binding):
     if not sys.flags.isolated or not sys.flags.dont_write_bytecode:
         raise ValueError('qualification coordinator requires isolated no-bytecode-write launcher')
@@ -76,6 +88,7 @@ def validate_execution(binding):
         raise ValueError('complete paired action/record coverage required')
     root=Path(records[0]['probe_output']).parent
     for index,(case,record) in enumerate(zip(cases,records,strict=True)):
+        validate_record_paths(record,root,case)
         expected_request=edit_request.expand_request(case,by_id[case['fixture_id']],normal,root,
             binding['worker']['path'],background['directory'])
         if record['id']!=case['id'] or not edit_aggregate.same(record['request'],expected_request):
