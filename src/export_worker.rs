@@ -161,9 +161,12 @@ impl ExportWorkerProcess {
             "selected XMP differs from plan"
         );
         fs::create_dir_all(staging_root)?;
+        // current_dir in the child is physical (for example /private/var on
+        // macOS); bind transport receipts to that same normalized parent.
+        let staging_root = staging_root.canonicalize()?;
         let staging = tempfile::Builder::new()
             .prefix("photo-worker-")
-            .tempdir_in(staging_root)?
+            .tempdir_in(&staging_root)?
             .keep();
         // The owner creates the lease before a child can be canceled or delayed
         // before startup. Children open it; they never recreate a retired lease.
