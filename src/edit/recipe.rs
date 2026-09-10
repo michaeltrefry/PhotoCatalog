@@ -262,8 +262,10 @@ mod tests {
     use super::*;
     #[test]
     fn canonical_roundtrip_zero_and_finite_validation() {
-        let mut r = RecipeV1::default();
-        r.exposure_ev = -0.0;
+        let mut r = RecipeV1 {
+            exposure_ev: -0.0,
+            ..Default::default()
+        };
         let a = Recipe::V1(r.clone()).validate().unwrap();
         let b = Recipe::default().validate().unwrap();
         assert_eq!(a.digest(), b.digest());
@@ -280,24 +282,28 @@ mod tests {
         value["version"] = serde_json::json!("1");
         value["settings"]["healing"] = serde_json::json!(true);
         assert!(serde_json::from_value::<Recipe>(value).is_err());
-        let mut r = RecipeV1::default();
-        r.crop = Some(NormalizedRect {
-            left: 0.5,
-            top: 0.0,
-            right: 0.5,
-            bottom: 1.0,
-        });
+        let r = RecipeV1 {
+            crop: Some(NormalizedRect {
+                left: 0.5,
+                top: 0.0,
+                right: 0.5,
+                bottom: 1.0,
+            }),
+            ..Default::default()
+        };
         assert!(Recipe::V1(r).validate().is_err());
     }
     #[test]
     fn crop_reports_target_resolution_incompatibility() {
-        let mut r = RecipeV1::default();
-        r.crop = Some(NormalizedRect {
-            left: 0.1,
-            top: 0.0,
-            right: 0.11,
-            bottom: 1.0,
-        });
+        let r = RecipeV1 {
+            crop: Some(NormalizedRect {
+                left: 0.1,
+                top: 0.0,
+                right: 0.11,
+                bottom: 1.0,
+            }),
+            ..Default::default()
+        };
         let v = Recipe::V1(r).validate().unwrap();
         assert!(v.validate_dimensions(2, 2).is_err());
         assert_eq!(v.validate_dimensions(1000, 1000).unwrap(), (10, 1000));
@@ -305,9 +311,11 @@ mod tests {
     }
     #[test]
     fn copy_keeps_unselected_groups_and_changes_canonical_identity() {
-        let mut source = RecipeV1::default();
-        source.exposure_ev = 1.0;
-        source.contrast = 0.5;
+        let source = RecipeV1 {
+            exposure_ev: 1.0,
+            contrast: 0.5,
+            ..Default::default()
+        };
         let target = Recipe::default();
         let copied = target
             .copy_groups_from(&Recipe::V1(source), &[AdjustmentGroup::Exposure])

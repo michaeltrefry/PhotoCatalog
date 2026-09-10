@@ -155,15 +155,14 @@ pub fn describe_output(
             "output exceeds 100 MP/40000 edge contract".into(),
         ));
     }
-    if let AlphaPolicy::Composite { linear_rgb } = spec.alpha {
-        if linear_rgb
+    if let AlphaPolicy::Composite { linear_rgb } = spec.alpha
+        && linear_rgb
             .iter()
             .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
-        {
-            return Err(RenderError::InvalidOutput(
-                "background must be finite linear RGB in [0,1]".into(),
-            ));
-        }
+    {
+        return Err(RenderError::InvalidOutput(
+            "background must be finite linear RGB in [0,1]".into(),
+        ));
     }
     let (bits, float) = match spec.format {
         OutputFormat::Jpeg { quality } => {

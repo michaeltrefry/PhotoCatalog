@@ -294,3 +294,69 @@ fn caller_profile_roundtrips_and_bad_icc_metadata_are_explicit() {
     };
     assert!(invalid.validate(1024).is_err());
 }
+
+#[test]
+fn cancellation_after_actual_output_write_preserves_partial_staging() {
+    use std::{
+        io::{Seek, SeekFrom, Write},
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    struct Trip<'a> {
+        bytes: Cursor<Vec<u8>>,
+        cancel: &'a AtomicBool,
+    }
+    impl Write for Trip<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = self.bytes.write(b)?;
+            self.cancel.store(true, Ordering::Relaxed);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for Trip<'_> {
+        fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
+            self.bytes.seek(p)
+        }
+    }
+    let i = image();
+    for format in [
+        OutputFormat::Png {
+            depth: IntegerDepth::Sixteen,
+        },
+        OutputFormat::Tiff {
+            depth: TiffDepth::Float32,
+        },
+        OutputFormat::Jpeg { quality: 80 },
+    ] {
+        let canceled = AtomicBool::new(false);
+        let mut s = spec(format);
+        if matches!(format, OutputFormat::Jpeg { .. }) {
+            s.alpha = AlphaPolicy::Composite {
+                linear_rgb: [1.; 3],
+            };
+        }
+        let mut sink = BoundedSeekWriter::new(
+            Trip {
+                bytes: Cursor::new(Vec::new()),
+                cancel: &canceled,
+            },
+            1_000_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            encode_export(
+                &i,
+                &s,
+                &Default::default(),
+                &mut sink,
+                EncodeLimits::default(),
+                &canceled
+            ),
+            Err(RenderError::Canceled)
+        ));
+        assert!(sink.extent() > 0);
+        assert!(sink.extent() < 1_000_000);
+    }
+}

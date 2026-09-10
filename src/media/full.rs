@@ -253,13 +253,13 @@ pub fn decode_with_white_point(
     white: Option<[f64; 2]>,
 ) -> Result<RenderedImage> {
     limits.validate()?;
-    if let Some([x, y]) = white {
-        if !x.is_finite() || !y.is_finite() || x <= 0.0 || y <= 0.0 || x + y >= 1.0 {
-            return Err(error(
-                DecodeStatus::Unsupported,
-                "invalid requested white point",
-            ));
-        }
+    if let Some([x, y]) = white
+        && (!x.is_finite() || !y.is_finite() || x <= 0.0 || y <= 0.0 || x + y >= 1.0)
+    {
+        return Err(error(
+            DecodeStatus::Unsupported,
+            "invalid requested white point",
+        ));
     }
     let native_white = NativeWhitePoint {
         x: white.map_or(0.0, |p| p[0]),

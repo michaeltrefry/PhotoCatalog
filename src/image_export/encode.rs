@@ -10,10 +10,7 @@ use std::{
     borrow::Cow,
     io::{self, Seek, SeekFrom, Write},
 };
-use tiff::encoder::{
-    DirectoryEncoder, TiffEncoder, TiffKindStandard, TiffValue, colortype,
-    compression::DeflateLevel,
-};
+use tiff::encoder::{DirectoryEncoder, TiffEncoder, TiffKindStandard, TiffValue};
 use tiff::tags::{Tag, Type};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EncodingReport {
@@ -34,7 +31,7 @@ struct CancelWriter<'a, W> {
 impl<W: Write> Write for CancelWriter<'_, W> {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         if self.cancel.is_canceled() {
-            return Err(io::Error::new(io::ErrorKind::Other, "export canceled"));
+            return Err(io::Error::other("export canceled"));
         }
         self.sink.write(b)
     }
@@ -45,7 +42,7 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 impl<W: Seek> Seek for CancelWriter<'_, W> {
     fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
         if self.cancel.is_canceled() {
-            return Err(io::Error::new(io::ErrorKind::Other, "export canceled"));
+            return Err(io::Error::other("export canceled"));
         }
         self.sink.seek(p)
     }
@@ -159,11 +156,10 @@ pub fn encode_export<W: Write + Seek>(
     limits.render.admit(source.width, source.height, 1)?;
     limits.render.admit(d.width, d.height, 4)?;
     limits.render.admit(source.width, source.height, 4)?;
-    let resized;
-    if (d.width, d.height) == (source.width, source.height) {
-        resized = None;
+    let resized = if (d.width, d.height) == (source.width, source.height) {
+        None
     } else {
-        resized = Some(crate::edit::geometry::resize(
+        Some(crate::edit::geometry::resize(
             &source.pixels,
             source.width,
             source.height,
@@ -171,8 +167,8 @@ pub fn encode_export<W: Write + Seek>(
             d.height,
             limits.render,
             cancel,
-        )?);
-    }
+        )?)
+    };
     let pixels = resized.as_deref().unwrap_or(&source.pixels);
     let (target, icc, _) = output_profile(&spec.profile)?;
     if blake3::hash(&icc).to_hex().as_str() != d.icc_blake3 {

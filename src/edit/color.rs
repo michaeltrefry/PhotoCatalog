@@ -86,3 +86,34 @@ pub(crate) fn adapt_white(pixels: &mut [[f32; 4]], xy: [f64; 2]) {
 pub(crate) fn luma(p: &[f32; 4]) -> f32 {
     0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn d65_raster_reference_and_straight_alpha_are_preserved() {
+        let original = [2., -0.2, 0.3, 0.5];
+        let mut p = [original];
+        adapt_white(&mut p, [0.3127, 0.3290]);
+        for c in 0..3 {
+            assert!((p[0][c] - original[c]).abs() < 2e-6);
+        }
+        assert_eq!(p[0][3], original[3]);
+    }
+    #[test]
+    fn source_white_neutral_maps_to_d65_without_rgb_clipping() {
+        let xy = [0.44757, 0.40745];
+        let rgb = vector(XYZ_RGB, [xy[0] / xy[1], 1., (1. - xy[0] - xy[1]) / xy[1]]);
+        let mut p = [[
+            rgb[0] as f32 * 2.,
+            rgb[1] as f32 * 2.,
+            rgb[2] as f32 * 2.,
+            0.25,
+        ]];
+        adapt_white(&mut p, xy);
+        for c in 0..3 {
+            assert!((p[0][c] - 2.).abs() < 5e-4);
+        }
+        assert_eq!(p[0][3], 0.25);
+    }
+}

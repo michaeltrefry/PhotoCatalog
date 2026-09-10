@@ -164,7 +164,7 @@ pub(crate) fn entries(e: &SafeExif, d: &OutputDescriptor) -> (Vec<Entry>, Vec<En
     (root, sub)
 }
 fn append_ifd(out: &mut Vec<u8>, mut entries: Vec<Entry>) -> u32 {
-    if out.len() % 2 != 0 {
+    if !out.len().is_multiple_of(2) {
         out.push(0);
     }
     let start = out.len();
@@ -179,7 +179,7 @@ fn append_ifd(out: &mut Vec<u8>, mut entries: Vec<Entry>) -> u32 {
         if e.bytes.len() <= 4 {
             out[p + 8..p + 8 + e.bytes.len()].copy_from_slice(&e.bytes);
         } else {
-            if out.len() % 2 != 0 {
+            if !out.len().is_multiple_of(2) {
                 out.push(0);
             }
             let offset = out.len() as u32;
