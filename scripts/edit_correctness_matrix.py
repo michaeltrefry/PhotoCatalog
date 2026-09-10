@@ -14,7 +14,11 @@ def metadata(extended=False):
          'xmlns:exif="http://ns.adobe.com/exif/1.0/" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/" '
          'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"><q:payload>'+payload+'</q:payload>'
          '<q:qualified rdf:parseType="Resource"><rdf:value>42</rdf:value><q:unit>mm</q:unit></q:qualified>'
-         '<q:structure rdf:parseType="Resource"><q:child q:flag="yes">value</q:child></q:structure>'
+         # RDF/XML literal properties cannot carry arbitrary property attributes.
+         # Express the intended qualified child without mixing compact structure
+         # attributes and literal text (RDF/XML productions7.2.16 and7.2.21).
+         '<q:structure rdf:parseType="Resource"><q:child rdf:parseType="Resource">'
+         '<rdf:value>value</rdf:value><q:flag>yes</q:flag></q:child></q:structure>'
          '<q:bag><rdf:Bag><rdf:li>A</rdf:li><rdf:li>B</rdf:li></rdf:Bag></q:bag>'
          '<q:ordered><rdf:Seq><rdf:li>first</rdf:li><rdf:li>second</rdf:li></rdf:Seq></q:ordered>'
          '<crs:Exposure2012>2.0</crs:Exposure2012><crs:HasSettings>True</crs:HasSettings>'

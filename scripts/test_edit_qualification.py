@@ -1,7 +1,9 @@
 """Draft source-contract tests. No image reads or subprocess execution."""
 import copy
 import unittest
+import xml.etree.ElementTree as ET
 import edit_qualification as q
+import edit_correctness_matrix
 
 
 def manifest():
@@ -11,6 +13,19 @@ def manifest():
 
 
 class MatrixContract(unittest.TestCase):
+    def test_controlled_metadata_retains_nested_qualifier_in_valid_rdf_form(self):
+        rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'
+        unknown='https://photocatalog.invalid/qualification/1/'
+        for extended in (False,True):
+            root=ET.fromstring(edit_correctness_matrix.metadata(extended)['xmp'])
+            description=root.find('.//{'+rdf+'}Description')
+            self.assertEqual(description.get('{'+rdf+'}about'),'urn:photocatalog:qualification:subject')
+            child=description.find('{'+unknown+'}structure/{'+unknown+'}child')
+            self.assertEqual(child.attrib,{'{'+rdf+'}parseType':'Resource'})
+            self.assertFalse((child.text or '').strip())
+            self.assertEqual(child.find('{'+rdf+'}value').text,'value')
+            self.assertEqual(child.find('{'+unknown+'}flag').text,'yes')
+
     def test_all_operations_receive_own_fixed_sample_counts(self):
         value = q.plan(manifest())
         self.assertEqual(len(value["cases"]), 337)

@@ -53,6 +53,25 @@ fn unknown_qualified_values_and_uri_forms_are_preserved() {
 }
 
 #[test]
+fn qualification_nested_qualified_fixture_has_a_valid_full_base() {
+    let invalid = packet(
+        "<u:structure rdf:parseType='Resource'><u:child u:flag='yes'>value</u:child></u:structure>",
+    );
+    let explicit = packet(
+        "<u:structure rdf:parseType='Resource'><u:child rdf:parseType='Resource'><rdf:value>value</rdf:value><u:flag>yes</u:flag></u:child></u:structure>",
+    );
+    assert!(assert_equivalent(&invalid, &invalid).is_err());
+    assert!(photocatalog::xmp::parse(invalid.as_bytes()).is_err());
+    let model = photocatalog::xmp::parse(explicit.as_bytes()).unwrap();
+    let serialized = photocatalog::xmp::canonical(&model).unwrap();
+    assert_equivalent(&explicit, &serialized).unwrap();
+    let lost_qualifier = packet(
+        "<u:structure rdf:parseType='Resource'><u:child>value</u:child></u:structure>",
+    );
+    assert!(assert_equivalent(&lost_qualifier, &serialized).is_err());
+}
+
+#[test]
 fn bag_order_is_semantic_free_but_duplicates_sequence_and_form_are_preserved() {
     equal(
         "<u:Tags><rdf:Bag><rdf:li>a</rdf:li><rdf:li>b</rdf:li><rdf:li>a</rdf:li></rdf:Bag></u:Tags>",
