@@ -5,15 +5,15 @@ frozen e535d00 source passed 261 Rust tests (three ignored), 28 scripts contract
 52 benchmark contracts, package formatting and all-target Clippy; the final CLI
 repair also passed its 18 affected tests. Layout measurement and independent
 reconciliation passed, selecting Flat. Current-renderer quality and the 30-source
-worker-memory calibration are complete. Retained navigation, integrated 10M
-page/RSS qualification and final cross-platform delivery remain pending. The
-Windows worker recovery repair at `0a9daf610fa17e4f0a655e43549207fbd4d2ad64`
+worker-memory calibration are complete. Retained navigation and integrated 10M
+page/RSS qualification passed both standard/constrained profiles; final
+exact-head cross-platform delivery remains pending. The Windows worker recovery repair at `0a9daf610fa17e4f0a655e43549207fbd4d2ad64`
 passed all four hosted CI jobs in run `34425527698`, including the parent audit
 of eight affected tests and public RAW validation. The subsequent 2164 MiB
 default change still requires its final affected checks. See [the acceptance ledger](PREVIEW_ACCEPTANCE_LEDGER.md)
 and [layout evidence](PREVIEW_LAYOUT_RESULTS.md) for exact evidence boundaries.
 
-The retained-read queue passed local correctness; its fixed measured campaign remains pending. `queue_read`,
+The retained-read queue passed local correctness and its fixed measured campaign. `queue_read`,
 `tick_read`, `take_read` and `cancel_read` are service APIs, sharing request and
 unconsumed-completion admission with native render consumers. Read tickets have a
 separate Rust type/namespace and monotonic service-lifetime IDs. Foreground reads
@@ -23,8 +23,8 @@ stale requests and errors produce consumable outcomes. Canceling queued or
 unconsumed results releases service ownership, while caller-held pixel references
 remain charged to their live memory budget. Cancellation is cooperative between
 in-process retained decodes; the existing original-render process kill/wait
-mechanism remains separate. These APIs will drive the fixed headless navigation
-trace; a harness-only queue cannot substitute for them.
+mechanism remains separate. These APIs drove the fixed headless navigation
+trace and integrated 10M measurement. Full results and scope are in [PREVIEW_RUNTIME_RESULTS.md](PREVIEW_RUNTIME_RESULTS.md).
 Both encoded staging refusal and decoded-live refusal have typed errors. Read
 completion classifies either as transient resource pressure; no message matching
 or cache invalidation is used for admission failures. The constrained navigation
@@ -117,7 +117,7 @@ regressions. All passed in the same local gate; logs and initial compile/fixture
 failures are retained privately in `sc-22841-service-repair-v1`. The runtime probe
 was also exercised through a tiny generated DNG and its saved JPEG verifier,
 including same-size byte corruption rejection. The subsequent worker-memory and
-layout campaigns passed within their documented scopes; navigation remains pending.
+layout, navigation and integrated campaigns passed within their documented scopes.
 
 Additional passing fault coverage writes a real partial staging file
 before injecting `StorageFull`, then requires cleanup, the prior retained object
@@ -191,5 +191,8 @@ source can require larger explicit ceilings and a sufficient worker/total
 allowance. A too-small configuration leaves a retryable resource-limited job and
 retained fallback; it does not redefine format support or silently substitute a
 thumbnail for full-quality input. The full decoder's existing support ceiling is
-unchanged. Actual retained-page costs and whole-process RSS still require the
-fixed standard/constrained navigation and integrated 10M gates.
+unchanged. The fixed standard/constrained navigation and integrated 10M gates
+passed with these explicit settings. The example also passed an actual CLI
+loader/service-open check after replacing only its private paths. Final remote
+CI still needs to validate the subsequently changed compiled default constant;
+these results do not qualify future cameras or image distributions.
