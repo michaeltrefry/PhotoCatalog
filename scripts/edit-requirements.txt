@@ -1,0 +1,6 @@
+# Private qualification environment; never install or execute implicitly.
+numpy==2.5.3
+tifffile==2026.8.23
+imagecodecs==2026.8.16
+blake3==1.0.9
+psutil==7.2.2

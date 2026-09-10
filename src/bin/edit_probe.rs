@@ -30,7 +30,7 @@ struct Args {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Phase { Correctness, Kernel, Full, FirstRaw, WarmService, Export, Support100mp }
+enum Phase { Correctness, Kernel, Full, FirstRaw, WarmService, Export, Support100mp, Refusal, ProxyReference, ExportCorrectness, OverlapImport, OverlapExport }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -53,6 +53,10 @@ struct Request {
     encoded_extent: u64,
     #[serde(default)]
     metadata: ResolvedExportMetadata,
+    #[serde(default)]
+    resolve_embedded: bool,
+    #[serde(default)]
+    background_source: Option<PathBuf>,
     warmups: usize,
     repetitions: usize,
 }
@@ -67,8 +71,25 @@ fn stamp() -> Value {
     json!({"unix_ns":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().to_string()})
 }
 fn fingerprint(path: &Path, limit: u64) -> Result<String> {
-    let mut file = File::open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut file = options.open(path)?;
     let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(metadata.file_attributes() & 0x400 == 0, "reparse input refused");
+    }
     ensure!(metadata.is_file() && metadata.len() <= limit, "source size/type admission");
     let mut left = metadata.len();
     let mut hash = blake3::Hasher::new();
@@ -146,24 +167,35 @@ fn pixels(request: &Request, samples: &mut File) -> Result<()> {
     // clocks; source/proxy retention is therefore not hidden in a per-call RSS claim.
     for (recipe_index, recipe) in request.recipes.iter().enumerate() {
         let original = load_original(request, recipe)?;
-        let input = if request.phase == Phase::Kernel {
+        let input = if matches!(request.phase, Phase::Kernel | Phase::ProxyReference) {
             let proxy = edit::prepare_linear_proxy(&original, 1600, request.render, &())?;
             drop(original);
             proxy
         } else { original };
         let validated = recipe.validate()?;
         for iteration in 0..request.warmups + request.repetitions {
+            record(samples, json!({"kind":"attempt","recipe_index":recipe_index,"iteration":iteration,"started":stamp()}))?;
             let start_anchor = stamp();
             let start = Instant::now();
             let edited = edit::render_recipe(&input, &validated,
-                if request.phase == Phase::Kernel { RenderPurpose::InteractiveProxy { longest_edge: 1600 } }
+                if matches!(request.phase, Phase::Kernel | Phase::ProxyReference) { RenderPurpose::InteractiveProxy { longest_edge: 1600 } }
                 else { RenderPurpose::ExportExact }, request.render, &())?;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             let finished = stamp();
-            let raw = (matches!(request.phase, Phase::Correctness | Phase::Support100mp) && iteration == 0
-                && (request.operation == "combined" || u64::from(request.width)*u64::from(request.height) <= 512*512))
+            let raw = (iteration == 0 && (request.phase == Phase::ProxyReference || (matches!(request.phase, Phase::Correctness | Phase::Support100mp)
+                && (request.operation == "combined" || u64::from(request.width)*u64::from(request.height) <= 512*512))))
                 .then(|| request.output.join(format!("recipe-{recipe_index}.rgba.f32")));
             let proof = surface(edited.as_rendered(), raw.as_deref())?;
+            let preview_reference = if request.phase == Phase::ProxyReference {
+                let rgb = preview::prepare(edited.as_rendered(), 1600)?;
+                let bytes = preview::encode(&rgb, preview::CodecSettings { codec:preview::Codec::Jpeg, quality:80 }, None)?;
+                let path = request.output.join(format!("recipe-{recipe_index}.jpg"));
+                let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                Some(json!({"path":path,"blake3":blake3::hash(&bytes).to_hex().to_string(),
+                    "prepared_rgb_blake3":rgb.digest(),"width":rgb.width(),"height":rgb.height()}))
+            } else { None };
             let mut exports = Vec::new();
             if matches!(request.phase, Phase::Correctness | Phase::Support100mp) {
                 for (index, output) in request.outputs.iter().enumerate() {
@@ -178,9 +210,9 @@ fn pixels(request: &Request, samples: &mut File) -> Result<()> {
                         "blake3":fingerprint(&path, request.encoded_extent)?}));
                 }
             }
-            record(samples, json!({"recipe_index":recipe_index,"recipe_digest":validated.digest(),
+            record(samples, json!({"kind":"observation","recipe_index":recipe_index,"recipe_digest":validated.digest(),
                 "iteration":iteration,"warmup":iteration<request.warmups,"started":start_anchor,
-                "finished":finished,"elapsed_ms":elapsed_ms,"pixels":proof,"exports":exports}))?;
+                "finished":finished,"elapsed_ms":elapsed_ms,"pixels":proof,"exports":exports,"preview_reference":preview_reference}))?;
         }
     }
     Ok(())
@@ -213,16 +245,21 @@ fn service(request: &Request) -> Result<(Catalog, PreviewService, VariantKey)> {
 fn delivery(request: &Request, samples: &mut File) -> Result<()> {
     let (mut catalog, mut previews, variant) = service(request)?;
     let mut revision = 0;
+    let mut prepared_digests: Vec<Option<String>> = vec![None; request.recipes.len()];
     for iteration in 0..request.warmups + request.repetitions {
         let recipe = &request.recipes[iteration % request.recipes.len()];
         let saved = catalog.save_edit_recipe(&variant, revision, recipe)?;
         ensure!(saved.revision > revision, "delivery trial reused an unchanged recipe revision");
         revision = saved.revision;
+        record(samples, json!({"kind":"attempt","iteration":iteration,"started":stamp()}))?;
         let started = stamp();
         let start = Instant::now();
         let ticket = previews.request_interactive(&mut catalog, &variant, Tier::Large, Priority::Foreground)?;
+        let mut observed_workers = std::collections::BTreeSet::new();
         loop {
+            observed_workers.extend(previews.active_worker_pids());
             previews.tick(&mut catalog)?;
+            observed_workers.extend(previews.active_worker_pids());
             if let Some(done) = previews.take_completion(ticket) {
                 ensure!(matches!(done, ServiceCompletion::Ready), "preview failed: {done:?}");
                 break;
@@ -230,13 +267,49 @@ fn delivery(request: &Request, samples: &mut File) -> Result<()> {
             ensure!(start.elapsed() < Duration::from_secs(180), "preview delivery deadline");
             std::thread::sleep(Duration::from_millis(1));
         }
+        ensure!(!observed_workers.is_empty(), "delivery did not observe a new worker lifecycle");
         let view = previews.cached_interactive(&catalog, &variant, Tier::Large, false)?.context("current preview missing")?;
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let render_record = view.record.as_ref().context("edited result lacks render record")?;
+        if request.phase == Phase::WarmService && iteration >= request.warmups {
+            let preview::EditInputProvenance::PreparedProxy { receipt, source_instance_digest } =
+                render_record.edit_input.as_ref().context("typed prepared source absent")?
+                else { anyhow::bail!("warm sample decoded original rather than reusing prepared input"); };
+            let expected_recipe = recipe.validate()?;
+            ensure!(receipt.identity.source_fingerprint == request.source_blake3
+                && receipt.identity.white_balance == expected_recipe.settings().white_balance
+                && receipt.identity.renderer_identity == edit::renderer_identity()
+                && receipt.identity.original_dimensions == (request.width, request.height)
+                && receipt.identity.longest_edge == 1600
+                && receipt.blake3.len() == 64 && source_instance_digest.len() == 64,
+                "consumed prepared identity mismatch");
+            let remembered = &mut prepared_digests[iteration % request.recipes.len()];
+            if let Some(expected) = remembered { ensure!(*expected == receipt.blake3, "warm prepared bytes changed"); }
+            else { *remembered = Some(receipt.blake3.clone()); }
+        }
+        if request.phase == Phase::FirstRaw {
+            ensure!(matches!(render_record.edit_input, Some(preview::EditInputProvenance::OriginalDecoded)),
+                "first RAW trial reused prepared input");
+        }
         let key = view.key.context("variant result lacks key")?;
         ensure!(key.edit_revision == revision as u64 && key.variant_id == variant.variant_id, "stale delivery");
-        record(samples, json!({"iteration":iteration,"warmup":iteration<request.warmups,
-            "started":started,"finished":stamp(),"elapsed_ms":elapsed_ms,"key":key,
-            "decoded_blake3":view.pixels.pixels().digest(),"record":view.record,
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let finished = stamp();
+        // Artifact reads/copies are after the completed delivery timer. Every
+        // trial is hashed; each alternating basis retains one complete JPEG.
+        let encoded = previews.encoded_cached_variant(&catalog, &variant, Tier::Large, false, true)?.context("current encoded preview missing")?;
+        let encoded_hash = blake3::hash(encoded.bytes()).to_hex().to_string();
+        let retained = if iteration < request.recipes.len() {
+            let path = request.output.join(format!("delivery-basis-{iteration}.jpg"));
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+            file.write_all(encoded.bytes())?;
+            file.sync_all()?;
+            Some(path)
+        } else { None };
+        drop(encoded);
+        record(samples, json!({"kind":"observation","iteration":iteration,"warmup":iteration<request.warmups,
+            "started":started,"finished":finished,"elapsed_ms":elapsed_ms,"key":key,
+            "encoded_blake3":encoded_hash,"retained_encoded":retained,
+            "decoded_blake3":view.pixels.pixels().digest(),"record":view.record,"observed_worker_pids":observed_workers,
             "native_drained":previews.native_work_drained()}))?;
     }
     Ok(())
@@ -244,6 +317,15 @@ fn delivery(request: &Request, samples: &mut File) -> Result<()> {
 fn export(request: &Request, samples: &mut File) -> Result<()> {
     let (mut catalog, mut previews, variant) = service(request)?;
     let saved = catalog.save_edit_recipe(&variant, 0, &request.recipes[0])?;
+    let metadata_selection = if request.resolve_embedded {
+        ensure!(request.fixture_id == "analytic-metadata", "resolved fixture must be explicitly controlled");
+        let metadata = catalog.metadata(&variant.asset_id)?;
+        let models: Vec<_> = catalog.metadata_history(&variant.asset_id, 0, 100)?.into_iter()
+            .filter(|observation| observation.current)
+            .flat_map(|observation| observation.models).collect();
+        ensure!(models.len() == 1 && models[0].error.is_none(), "controlled source must have exactly one valid full base");
+        MetadataSelection::Resolved { expected_revision:metadata.revision, base_model:Some(models[0].id) }
+    } else { MetadataSelection::Omit };
     let mut exports = ExportService::open(&catalog, &request.worker, ExportServiceLimits {
         worker_bytes: request.render.max_live_bytes, working_bytes: request.render.max_live_bytes,
         render: PhotoRenderLimits { decode: request.decode, render: request.render,
@@ -257,12 +339,13 @@ fn export(request: &Request, samples: &mut File) -> Result<()> {
             image_export::OutputFormat::Tiff { .. } => "tiff",
         };
         let destination = request.output.join(format!("export-{iteration}.{extension}"));
+        record(samples, json!({"kind":"attempt","iteration":iteration,"started":stamp()}))?;
         let started = stamp();
         let start = Instant::now();
         let job = catalog.begin_photo_export()?;
         catalog.append_photo_export(&job.id, 0, &ExportTarget {
             key: variant.clone(), expected_revision: saved.revision, destination: destination.clone(),
-            overwrite: false, metadata: MetadataSelection::Omit,
+            overwrite: false, metadata: metadata_selection.clone(),
         }, &request.outputs[0], request.decode.max_encoded_bytes, request.encoded_extent)?;
         catalog.seal_photo_export_job(&job.id, 1)?;
         let mut events = Vec::new();
@@ -278,14 +361,185 @@ fn export(request: &Request, samples: &mut File) -> Result<()> {
             std::thread::sleep(Duration::from_millis(1));
         }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let finished = stamp();
         ensure!(!exports.is_active() && exports.reserved_bytes() == 0, "export ownership not released");
-        record(samples, json!({"iteration":iteration,"warmup":iteration<request.warmups,
-            "started":started,"finished":stamp(),"elapsed_ms":elapsed_ms,"events":events,
+        let phases = exports.take_completion_metrics().context("published export lacks actual phase metrics")?;
+        ensure!(phases.job == job.id && phases.sequence == 1 && phases.publication.is_some(), "export phase authority mismatch");
+        record(samples, json!({"kind":"observation","iteration":iteration,"warmup":iteration<request.warmups,
+            "started":started,"finished":finished,"elapsed_ms":elapsed_ms,"events":events,"phases":phases,
             "path":destination,"blake3":fingerprint(&destination,request.encoded_extent)?,
-            "job":catalog.photo_export_job(&job.id)?,"items":catalog.photo_export_items(&job.id,0,10)?,
-            "internal_render_encode_seal_timings":"unavailable; no phase estimates"}))?;
+            "job":catalog.photo_export_job(&job.id)?,"items":catalog.photo_export_items(&job.id,0,10)?}))?;
     }
     Ok(())
+}
+#[derive(Default, Clone)]
+struct OverlapState { pids: Vec<u32>, done: bool }
+fn overlap(request: &Request, samples: &mut File) -> Result<()> {
+    use std::sync::{Mutex, atomic::Ordering};
+    let (mut catalog, mut previews, master) = service(request)?;
+    let foreground = catalog.create_edit_variant(&master, 0, "foreground qualification")?;
+    let catalog_root = request.output.join("catalog");
+    let state = Mutex::new(OverlapState::default());
+    let stop = AtomicBool::new(false);
+    let background_start = stamp();
+    std::thread::scope(|scope| -> Result<()> {
+        let background = scope.spawn(|| -> Result<Vec<Value>> {
+            let mut background_catalog = Catalog::open(&catalog_root)?;
+            let mut events = Vec::new();
+            let start = Instant::now();
+            if request.phase == Phase::OverlapImport {
+                let source = request.background_source.as_ref().context("owned background source directory required")?;
+                ensure!(source.is_absolute(), "absolute background directory");
+                let mut session = background_catalog.begin_import(source, Some(1))?;
+                let mut consumer = None;
+                let mut scan_done = false;
+                while !stop.load(Ordering::Acquire) {
+                    if !scan_done && consumer.is_none() {
+                        let advanced = session.advance(&mut background_catalog, &mut previews)?;
+                        scan_done = advanced.finished;
+                        consumer = advanced.consumer;
+                    }
+                    previews.tick(&mut background_catalog)?;
+                    let pids = previews.active_worker_pids();
+                    {
+                        let mut shared = state.lock().unwrap();
+                        if shared.pids != pids { events.push(json!({"at":stamp(),"pids":pids})); }
+                        shared.pids = pids;
+                    }
+                    if let Some(ticket) = consumer
+                        && let Some(done) = previews.take_completion(ticket) {
+                            ensure!(matches!(done, ServiceCompletion::Ready), "overlap import failed: {done:?}");
+                            session.record_completion(&done);
+                            consumer = None;
+                    }
+                    if scan_done && consumer.is_none() && previews.native_work_drained() { break; }
+                    ensure!(events.len() <= 256 && start.elapsed() < Duration::from_secs(180), "background import bounds");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                ensure!(request.outputs.len() == 1, "one background export configuration");
+                let mut exports = ExportService::open(&background_catalog, &request.worker, ExportServiceLimits {
+                    worker_bytes:request.render.max_live_bytes, working_bytes:request.render.max_live_bytes,
+                    render:PhotoRenderLimits { decode:request.decode, render:request.render,
+                        encode:EncodeLimits { render:request.render, ..Default::default() }, max_encoded_extent:request.encoded_extent },
+                })?;
+                ensure!(exports.recover(&mut background_catalog,128)?.complete, "fresh export recovery");
+                let job = background_catalog.begin_photo_export()?;
+                background_catalog.append_photo_export(&job.id,0,&ExportTarget { key:master.clone(), expected_revision:0,
+                    destination:request.output.join("background-export.tiff"),overwrite:false,metadata:MetadataSelection::Omit },
+                    &request.outputs[0],request.decode.max_encoded_bytes,request.encoded_extent)?;
+                background_catalog.seal_photo_export_job(&job.id,1)?;
+                while !stop.load(Ordering::Acquire) {
+                    let event = exports.tick(&mut background_catalog,&mut previews,&job.id,&stop)?;
+                    if let ExportEvent::Started { pid, .. } = event {
+                        state.lock().unwrap().pids=vec![pid];
+                        events.push(json!({"at":stamp(),"event":event}));
+                    } else if matches!(event,ExportEvent::Published { .. }) {
+                        state.lock().unwrap().pids.clear();
+                        events.push(json!({"at":stamp(),"event":event,"phases":exports.take_completion_metrics()}));
+                        break;
+                    } else if matches!(event,ExportEvent::Failed { .. } | ExportEvent::Yielded { .. }) {
+                        anyhow::bail!("background export failed: {event:?}");
+                    }
+                    ensure!(start.elapsed()<Duration::from_secs(180),"background export deadline");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(exports); // Owned process destructor reaps on early cancellation.
+            }
+            drop(previews);
+            let mut shared=state.lock().unwrap();
+            shared.pids.clear();
+            shared.done=true;
+            Ok(events)
+        });
+        let foreground_result = (|| -> Result<()> {
+            let wait = Instant::now();
+            while state.lock().unwrap().pids.is_empty() {
+                ensure!(!background.is_finished() && wait.elapsed()<Duration::from_secs(180),"background never admitted a worker");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut revision=foreground.revision;
+            for iteration in 0..request.repetitions {
+                let before=state.lock().unwrap().clone();
+                ensure!(!before.pids.is_empty() && !before.done,"save began outside background worker lifecycle");
+                record(samples,json!({"kind":"attempt","iteration":iteration,"started":stamp(),"owned_pids":before.pids}))?;
+                let started=stamp();
+                let now=Instant::now();
+                let saved=catalog.save_edit_recipe(&foreground.key,revision,&request.recipes[iteration%request.recipes.len()])?;
+                let elapsed_ms=now.elapsed().as_secs_f64()*1000.0;
+                let finished=stamp();
+                let after=state.lock().unwrap().clone();
+                ensure!(saved.revision>revision && before.pids==after.pids && !after.done,
+                    "save lacks continuous same-worker lifecycle overlap");
+                revision=saved.revision;
+                record(samples,json!({"kind":"observation","iteration":iteration,"warmup":false,
+                    "started":started,"finished":finished,"elapsed_ms":elapsed_ms,"revision":revision,
+                    "owned_pids_before":before.pids,"owned_pids_after":after.pids,
+                    "overlap_scope":"owned lifecycle; external process identities/liveness required"}))?;
+            }
+            Ok(())
+        })();
+        if foreground_result.is_err() { stop.store(true,Ordering::Release); }
+        let background_result=background.join().map_err(|_|anyhow::anyhow!("background thread panicked"))?;
+        // Keep lifecycle events even if foreground acceptance fails.
+        if let Ok(events)=&background_result {
+            exclusive(&request.output.join("background.json"),&json!({"started":background_start,"finished":stamp(),"events":events}))?;
+        }
+        foreground_result?;
+        background_result?;
+        Ok(())
+    })
+}
+fn refusal(request: &Request, samples: &mut File) -> Result<()> {
+    use edit::RenderError;
+    let recipe = request.recipes[0].validate()?;
+    record(samples, json!({"kind":"attempt","iteration":0,"started":stamp()}))?;
+    let observed = match request.operation.as_str() {
+        "decode_allocation" => {
+            let mut limits = request.decode;
+            limits.max_allocation_bytes = 1;
+            match edit::decode_original(OriginalRequest { path:&request.source,
+                expected_fingerprint:&request.source_blake3, white_balance:&recipe.settings().white_balance }, limits, &()) {
+                Err(RenderError::ResourceLimit { .. }) => "typed_render_resource_limit",
+                Err(RenderError::Decode(error)) if error.status == photocatalog::media::DecodeStatus::ResourceLimit => "typed_decode_resource_limit",
+                _ => anyhow::bail!("decode allocation refusal not observed"),
+            }
+        }
+        "canceled" | "source_changed" => {
+            let canceled = AtomicBool::new(request.operation == "canceled");
+            let expected = if request.operation == "source_changed" { "0000000000000000000000000000000000000000000000000000000000000000" } else { &request.source_blake3 };
+            match edit::decode_original(OriginalRequest { path:&request.source,
+                expected_fingerprint:expected, white_balance:&recipe.settings().white_balance }, request.decode, &canceled) {
+                Err(RenderError::Canceled) if request.operation == "canceled" => "typed_canceled",
+                Err(RenderError::SourceChanged) if request.operation == "source_changed" => "typed_source_changed",
+                _ => anyhow::bail!("expected source/cancellation refusal not observed"),
+            }
+        }
+        "render_allocation" | "encoded_extent" | "invalid_profile" => {
+            let original = load_original(request, &request.recipes[0])?;
+            let mut limits = request.render;
+            if request.operation == "render_allocation" { limits.max_allocation_bytes = 1; }
+            match edit::render_recipe(&original, &recipe, RenderPurpose::ExportExact, limits, &()) {
+                Err(RenderError::ResourceLimit { .. }) if request.operation == "render_allocation" => "typed_render_resource_limit",
+                Ok(image) if request.operation != "render_allocation" => {
+                    ensure!(request.outputs.len() == 1, "refusal output configuration");
+                    let file = OpenOptions::new().write(true).create_new(true).open(request.output.join("refused.partial"))?;
+                    let mut sink = BoundedSeekWriter::new(file, if request.operation == "encoded_extent" { 16 } else { request.encoded_extent })?;
+                    let result = image_export::encode_export(&image, &request.outputs[0], &request.metadata,
+                        &mut sink, EncodeLimits { render:request.render, ..Default::default() }, &());
+                    ensure!(sink.extent() <= sink.limit(), "encoded extent exceeded admission");
+                    match result {
+                        Err(RenderError::ResourceLimit { .. }) if request.operation == "encoded_extent" => "typed_encoded_resource_limit",
+                        Err(RenderError::InvalidProfile(_)) if request.operation == "invalid_profile" => "typed_invalid_profile",
+                        _ => anyhow::bail!("expected encoding refusal not observed"),
+                    }
+                }
+                _ => anyhow::bail!("expected rendering admission outcome not observed"),
+            }
+        }
+        _ => anyhow::bail!("unknown refusal operation"),
+    };
+    record(samples, json!({"kind":"observation","iteration":0,"warmup":false,"expected_refusal":observed}))
 }
 fn run(request: &Request, samples: &mut File) -> Result<()> {
     ensure!(request.version == 1 && request.source.is_absolute() && request.output.is_absolute()
@@ -293,19 +547,22 @@ fn run(request: &Request, samples: &mut File) -> Result<()> {
     ensure!(!request.recipes.is_empty() && request.recipes.len() <= 32 && request.outputs.len() <= 32, "matrix bound");
     let expected = match request.phase {
         Phase::Kernel | Phase::WarmService => (2, 100),
+        Phase::OverlapImport | Phase::OverlapExport => (0, 100),
         Phase::Full | Phase::FirstRaw | Phase::Export => (2, 20),
-        Phase::Correctness | Phase::Support100mp => (0, 1),
+        Phase::Correctness | Phase::Support100mp | Phase::Refusal | Phase::ProxyReference | Phase::ExportCorrectness => (0, 1),
     };
     ensure!((request.warmups, request.repetitions) == expected, "frozen sample counts changed");
-    if request.phase == Phase::Export { ensure!(request.recipes.len() == 1 && request.outputs.len() == 1, "export single configuration"); }
+    if matches!(request.phase, Phase::Export | Phase::ExportCorrectness) { ensure!(request.recipes.len() == 1 && request.outputs.len() == 1, "export single configuration"); }
     if matches!(request.phase, Phase::WarmService | Phase::FirstRaw) { ensure!(request.recipes.len() == 2 && request.recipes[0] != request.recipes[1], "delivery requires alternating recipes"); }
     let pixel_count = u64::from(request.width) * u64::from(request.height);
-    ensure!(pixel_count <= if request.phase == Phase::Support100mp { 100_000_000 } else { 32_000_000 }, "source pixel admission");
+    ensure!(pixel_count <= if matches!(request.phase, Phase::Support100mp | Phase::Refusal) { 100_000_000 } else { 32_000_000 }, "source pixel admission");
     ensure!(fingerprint(&request.source, request.decode.max_encoded_bytes)? == request.source_blake3, "source before mismatch");
     match request.phase {
-        Phase::Correctness | Phase::Kernel | Phase::Full | Phase::Support100mp => pixels(request, samples)?,
+        Phase::Correctness | Phase::Kernel | Phase::Full | Phase::Support100mp | Phase::ProxyReference => pixels(request, samples)?,
         Phase::FirstRaw | Phase::WarmService => delivery(request, samples)?,
-        Phase::Export => export(request, samples)?,
+        Phase::Export | Phase::ExportCorrectness => export(request, samples)?,
+        Phase::Refusal => refusal(request, samples)?,
+        Phase::OverlapImport | Phase::OverlapExport => overlap(request, samples)?,
     }
     ensure!(fingerprint(&request.source, request.decode.max_encoded_bytes)? == request.source_blake3, "source after mismatch");
     Ok(())

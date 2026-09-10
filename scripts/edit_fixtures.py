@@ -12,7 +12,7 @@ from pathlib import Path
 import edit_reference as ref
 
 FIXTURES = {'analytic-signed-alpha': (16,12), 'analytic-impulse': (16,12),
-            'analytic-noise': (32,24), 'analytic-flat': (48,32),
+            'analytic-noise': (32,24), 'analytic-flat': (48,32), 'analytic-metadata': (48,32),
             'support-100mp': (10000,10000)}
 
 
@@ -21,7 +21,7 @@ def row(name, y):
     w,h = FIXTURES[name]
     x = np.arange(w,dtype=np.int64)
     a = np.ones((w,4),dtype='<f4')
-    if name == 'analytic-flat':
+    if name in ('analytic-flat','analytic-metadata'):
         a[:] = [.18,.35,.7,.5]
     elif name == 'analytic-impulse':
         a[:,:3] = .18
@@ -53,13 +53,18 @@ def generate(name, path):
     import tifffile
     w,h = FIXTURES[name]
     path = Path(path)
+    tags=[(34675,'B',len(ref.matrix_profile()),ref.matrix_profile(),False)]
+    if name=='analytic-metadata':
+        import edit_correctness_matrix
+        packet=edit_correctness_matrix.metadata(True)['xmp'].encode()
+        tags.append((700,'B',len(packet),packet,False))
     # Exclusive create first; TiffWriter receives the owned file, never truncates a path.
     with path.open('xb') as stream:
         with tifffile.TiffWriter(stream, bigtiff=False) as writer:
             writer.write((row(name,y)[None,...] for y in range(h)), shape=(h,w,4),
                          dtype='<f4', photometric='rgb', extrasamples='unassalpha',
                          rowsperstrip=1, compression=None, metadata=None,
-                         extratags=[(34675,'B',len(ref.matrix_profile()),ref.matrix_profile(),False)])
+                         extratags=tags)
         stream.flush()
         os.fsync(stream.fileno())
     with path.open('rb') as stream:
