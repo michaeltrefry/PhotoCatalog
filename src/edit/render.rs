@@ -11,7 +11,7 @@ pub use prepared::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Read,
     path::Path,
     sync::OnceLock,
@@ -135,6 +135,21 @@ pub(crate) fn verify_original_fingerprint(
     cancel: &dyn CancelCheck,
 ) -> Result<(), RenderError> {
     cancel.check()?;
+    let mut file = open_original(path, limit)?;
+    let length = file.metadata()?.len();
+    if length > limit {
+        return Err(RenderError::ResourceLimit {
+            resource: "original bytes",
+            required: length,
+            limit,
+        });
+    }
+    if fingerprint_reader(&mut file, length, cancel)? != expected {
+        return Err(RenderError::SourceChanged);
+    }
+    cancel.check()
+}
+fn open_original(path: &Path, limit: u64) -> Result<File, RenderError> {
     let before = fs::symlink_metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             RenderError::SourceMissing
@@ -166,26 +181,58 @@ pub(crate) fn verify_original_fingerprint(
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x0020_0000);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     let opened = file.metadata()?;
     if !opened.file_type().is_file() || opened.len() != before.len() {
         return Err(RenderError::SourceChanged);
     }
-    if fingerprint_reader(&mut file, opened.len(), cancel)? != expected {
+    Ok(file)
+}
+#[derive(PartialEq, Eq)]
+struct OriginalStamp {
+    object: (u64, u128),
+    bytes: u64,
+    modified: std::time::SystemTime,
+    changed: i128,
+}
+fn original_stamp(file: &File) -> Result<OriginalStamp, RenderError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(RenderError::SourceChanged);
     }
-    cancel.check()
+    Ok(OriginalStamp {
+        object: crate::storage_volume::held_object_key(file)?,
+        bytes: metadata.len(),
+        modified: metadata.modified()?,
+        changed: crate::metadata_export::content_change_stamp(file)
+            .map_err(|error| RenderError::Io(std::io::Error::other(error)))?,
+    })
 }
+
 pub fn decode_original(
     request: OriginalRequest<'_>,
     limits: DecodeLimits,
     cancel: &dyn CancelCheck,
+) -> Result<PreparedLinearInput, RenderError> {
+    decode_original_with_hook(request, limits, cancel, |_| Ok(()))
+}
+fn decode_original_with_hook(
+    request: OriginalRequest<'_>,
+    limits: DecodeLimits,
+    cancel: &dyn CancelCheck,
+    mut boundary: impl FnMut(bool) -> Result<(), RenderError>,
 ) -> Result<PreparedLinearInput, RenderError> {
     if !request.path.is_absolute() {
         return Err(RenderError::InvalidInput(
             "absolute original path required".into(),
         ));
     }
+    cancel.check()?;
+    // Keep the same full object and non-restorable change stamp across every
+    // hash and native path-based decode. Independent equal hashes cannot detect
+    // a temporary rewrite whose original bytes/mtime are restored afterwards.
+    let held = open_original(request.path, limits.max_encoded_bytes)?;
+    let before = original_stamp(&held)?;
     verify_original_fingerprint(
         request.path,
         request.expected_fingerprint,
@@ -193,8 +240,10 @@ pub fn decode_original(
         cancel,
     )?;
     let xy = color::white_point(request.white_balance)?;
+    boundary(false)?;
     let image = crate::media::decode_with_white_point(request.path, limits, xy)
         .map_err(RenderError::Decode)?;
+    boundary(true)?;
     cancel.check()?;
     verify_original_fingerprint(
         request.path,
@@ -202,6 +251,10 @@ pub fn decode_original(
         limits.max_encoded_bytes,
         cancel,
     )?;
+    let current = open_original(request.path, limits.max_encoded_bytes)?;
+    if original_stamp(&held)? != before || original_stamp(&current)? != before {
+        return Err(RenderError::SourceChanged);
+    }
     let original_dimensions = (image.width, image.height);
     Ok(PreparedLinearInput {
         image,
@@ -630,6 +683,57 @@ mod tests {
 #[cfg(test)]
 mod fingerprint_tests {
     use super::*;
+    #[test]
+    fn temporary_same_inode_rewrite_during_decode_cannot_claim_restored_source_identity() {
+        use image::ImageEncoder;
+        let encode = |pixel: [u8; 3]| {
+            let mut bytes = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut bytes)
+                .write_image(&pixel, 1, 1, image::ExtendedColorType::Rgb8)
+                .unwrap();
+            bytes
+        };
+        let original = encode([255, 0, 0]);
+        let replacement = encode([0, 255, 0]);
+        assert_eq!(original.len(), replacement.len());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.png");
+        fs::write(&path, &original).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let initial_object =
+            crate::storage_volume::held_object_key(&File::open(&path).unwrap()).unwrap();
+        let expected = blake3::hash(&original).to_hex().to_string();
+        let request = || OriginalRequest {
+            path: &path,
+            expected_fingerprint: &expected,
+            white_balance: &WhiteBalance::AsShot,
+        };
+        let stable = decode_original(request(), DecodeLimits::default(), &()).unwrap();
+        assert!(stable.pixels()[0][0] > stable.pixels()[0][1]);
+        let mut decoded = false;
+        let result = decode_original_with_hook(request(), DecodeLimits::default(), &(), |after| {
+            if after {
+                decoded = true;
+            }
+            fs::write(&path, if after { &original } else { &replacement })?;
+            OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_times(fs::FileTimes::new().set_modified(modified))?;
+            Ok(())
+        });
+        assert!(
+            decoded,
+            "fixture must reach and complete actual native image decoding"
+        );
+        assert!(matches!(result, Err(RenderError::SourceChanged)));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            crate::storage_volume::held_object_key(&File::open(&path).unwrap()).unwrap(),
+            initial_object
+        );
+    }
     #[test]
     fn growing_or_short_sources_stop_at_the_declared_revision() {
         struct Endless {
