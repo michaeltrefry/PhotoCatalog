@@ -69,13 +69,16 @@ enum Case {
 const PROTOCOL: u32 = 2;
 // Row formulas/fixture marker remain compatible with frozen S7 inputs.
 const FIXTURE_PROTOCOL: u32 = 1;
-const EDIT_TABLES: [&str; 6] = [
+const EDIT_TABLES: [&str; 9] = [
     "edit_changes",
     "edit_copy_items",
     "edit_copy_jobs",
     "edit_recipe_nodes",
     "edit_redo_nodes",
     "edit_variants",
+    "photo_export_blobs",
+    "photo_export_items",
+    "photo_export_jobs",
 ];
 fn id(i: i64) -> String {
     format!("fixture-{i:012}")

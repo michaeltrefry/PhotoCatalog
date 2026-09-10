@@ -119,7 +119,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
     let root = temp.path();
     ensure!(run(root, "prepare-migration", &["prepare", "--count", "1000"])?.0);
     let conn = rusqlite::Connection::open(root.join("catalog/catalog.sqlite3"))?;
-    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
     let (okay, receipt) = run(root, "migration", &["migrate-fixture"])?;
     ensure!(
@@ -128,7 +128,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 6
+            && receipt["added_tables"].as_array().unwrap().len() == 9
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
@@ -183,7 +183,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(run(root, "prepare-six", &["prepare", "--count", "1000"])?.0);
     let main = root.join("catalog/catalog.sqlite3");
     let conn = rusqlite::Connection::open(&main)?;
-    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
     let before = fs::read(&main)?;
     let (okay, refusal) = run(
@@ -210,7 +210,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     );
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 6);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 9);
     ensure!(
         migrated["added_tables"]
             .as_array()

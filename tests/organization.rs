@@ -1360,7 +1360,7 @@ fn schema_four_to_current_preserves_old_rows_adds_empty_edit_tables_and_keeps_re
     let (_temp, root, cat) = synthetic(113)?;
     drop(cat);
     let conn = db(&root)?;
-    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
     fn contents(conn: &Connection) -> Result<Vec<(String, Vec<Vec<String>>)>> {
         let tables=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_stat1' ORDER BY name")?
             .query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1430,7 +1430,7 @@ fn failed_schema_six_upgrade_rolls_back_all_added_tables_and_marker() -> Result<
     let (_temp, root, catalog) = synthetic(3)?;
     drop(catalog);
     let conn = db(&root)?;
-    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; CREATE TABLE edit_copy_jobs(unexpected TEXT); PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; CREATE TABLE edit_copy_jobs(unexpected TEXT); PRAGMA wal_checkpoint(TRUNCATE)")?;
     fn schema(conn: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
         Ok(conn
             .prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY type,name")?
