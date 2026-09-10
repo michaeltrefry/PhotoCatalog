@@ -1,4 +1,4 @@
-# Integrated retained previews at 10 million assets — version 2
+# Integrated retained previews at 10 million assets — version 3
 
 Status: source preparation, **UNRUN**. This fixed extension closes the integrated
 catalog-plus-preview resident-memory measurement left open by the 10k navigation
@@ -7,29 +7,36 @@ Execution requires independent source review, a clean release build bound to the
 whole source archive, and the parent's explicit serialized Mac lane. Existing
 codec, worker-reservation, quality, and headless page targets do not change.
 
-The donor is the pristine, independently verified schema-5 S7 synthetic 10M
-catalog, with its original schema-4-to-5 migration ancestry. The parent-recorded
-pristine main SHA256 is
+This source revision adapts the existing workload to S8 schema 6. Version-2
+schema-5 measurements and frozen binaries remain historical evidence; this is
+not a rerun, replacement result, or a new performance claim.
+
+The donor is a separately, explicitly migrated schema-6 copy of the pristine
+schema-5 S7 synthetic 10M catalog. Original schema-4-to-5 migration ancestry must
+remain byte-identical. The historical schema-5 main SHA256 is
 0ac57eefbfbfeee46e83c17b8116c48ae3cb0dedae01605c1016981a536e91db;
-execution must verify it against the selected donor's receipts, actual bytes and
-companion presence. Never use a transition/mixed-workload-mutated copy. A later
-S7 schema-5-to-5 verification can accompany, but cannot replace, original migration
-proof. The previous schema-4-only protocol in f9b2905 was source-reviewed and
-never executed; this revision reconciles the merged schema before any measurement.
+it is an ancestor, **not** the new schema-6 donor hash. Never use a transition or
+mixed-workload-mutated copy. A later 5-to-5 verification can accompany the old
+proof but cannot substitute for either migration.
 
 Private paths remain outside Git. The source binding contains `source_catalog`,
-`source_revision`, `catalog_count` (10000000), `schema_version` (5), and `files`
+`source_revision`, `catalog_count` (10000000), `schema_version` (6), and `files`
 (keys `""`, `-wal`, `-shm`, `-journal`, each with `present` and, if present,
 `bytes`/`sha256`). Its `receipts` retain `build_reference`, `preparation`, and
-`source_verification` path/SHA256 pairs. `migration_ancestry` contains `proof` and
-`native` path/SHA256 pairs for the original 4-to-5 change; optional `verification`
-is the separately labeled later 5-to-5 proof. Copy the original receipt bytes
-unchanged into the new bundle's ancestry directory. Check native protocol1,
-complete migration/count/SQLite3.51.1 identity, unchanged logical and table
-identities, exact index SQL, successful observer and original migration physical
-output equal to the selected pristine donor main. If supplied, the later 5-to-5
-proof must preserve the same physical/logical/table identities. No regeneration
-of source metadata or replacement of historical receipt paths is allowed.
+`source_verification` path/SHA256 pairs. `migration_ancestry` still contains the
+original `proof`/`native` pairs (native protocol 1, 4-to-5) and optional separately
+labeled 5-to-5 `verification`. New `schema6_migration` contains distinct
+`proof`/`native` pairs (native protocol 2, 5-to-6, catalog_schema=6).
+
+The new proof binds the old schema-5 main to the actual schema-6 donor hash,
+requires successful native/observer results, and compares every pre-existing
+typed table/row identity with the original ancestry. `identity_scope` must be
+`pre_existing_tables`. `added_tables` separately lists the six new edit tables
+with zero rows; no whole-schema hash equivalence is claimed. The lens/capture
+index remains exact. Copy both generations' original receipt bytes into the new
+bundle, named `proof`/`native` and `schema6_proof`/`schema6_native`; never rewrite
+historical paths or migrate the preserved source. The current overlay and page
+probe refuse schema 5 before opening through `Catalog`.
 
 ## Source-preserving setup
 
@@ -112,7 +119,7 @@ frame-time award. Both profiles, all 208 page observations, zero native jobs,
 actual offline path proof, exact schema/count and source invariance are required
 for a complete evidence receipt; completion is distinct from passing budgets.
 
-Each command's binding has version2, clean=true, exact 40-character source revision,
+Each command's binding has version3, catalog_schema=6, clean=true, exact 40-character source revision,
 kind `prepare` or `run`, and SHA256 fields for every declared input. Prepare binds
 binary/archive/storage/source_binding/dataset/protocol/coordinator and
 `minimum_free_bytes`. Run binds binary/worker/archive/storage/fixture/source_binding,
@@ -128,7 +135,7 @@ children. Preserve timeout/failure logs and all partial artifacts without retrie
 ## Focused correctness validation
 
 Tests are source-ready and **UNRUN for this extension** until a native lane is
-granted. Tiny real schema-5 test catalogs check only-three-field success,
+granted. Tiny real current-schema test catalogs check only-three-field success,
 unchanged tail/organization dirty rows, wrong count/schema/key rejection,
 extra-row and remaining-column mutation rollback, and actual path/absence checks.
 Python byte fixtures check main/companion preservation, wrong source binding,

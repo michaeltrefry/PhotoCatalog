@@ -1,5 +1,28 @@
 # sc-22842 organization query experiment — protocol and retained design
 
+Current source compatibility revision: driver **5**, native receipt protocol **2**,
+catalog schema **6**. This revision is source preparation, not a new performance
+qualification. The qualified driver-4/native-1/schema-5 binaries, source archives,
+private fixtures and receipts remain unchanged.
+
+The synthetic `organization_fixture.protocol=1`, row formulas and provenance,
+17 workloads, sample counts and performance budgets stay unchanged. Current
+native query/transition entrypoints refuse older catalogs before `Catalog::open`;
+no schema migration belongs to a timed query. `prepare` creates schema 6 directly.
+For reused owned copies, run `migrate-fixture` explicitly during preparation.
+Migration receipts identify `identity_scope=pre_existing_tables`: the before/after
+typed hash and table counts cover exactly that old table set, including FTS and
+row identities. Six newly introduced `edit_*` tables are separately named in
+`added_tables` with zero counts; this is not a claim that the entire schema-6
+hash equals the old schema-5 hash. A 6-to-6 verification reports no additions.
+
+The driver preserves the original native-protocol-1 4-to-5 proof bytes, then records
+a distinct 5-to-6 migration and changed physical main hash. A copied schema-6
+fixture instead requires current producer evidence or a bound predecessor
+migration receipt, retains predecessor proof bytes/manifest identity, and records
+a separate 6-to-6 verification with unchanged physical bytes. Old-schema test
+fixtures remove edit tables rather than merely relabeling a current database.
+
 This experiment is separate from S2 backend selection. SQLite remains the selected
 backend; no alternative backend/profile or threshold search is performed here.
 The protocol, production code, probe, fixture formula, and coordinator must be

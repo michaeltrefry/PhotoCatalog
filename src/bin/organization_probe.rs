@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use photocatalog::{
-    Catalog, configure_catalog_connection,
+    CURRENT_SCHEMA_VERSION, Catalog, configure_catalog_connection,
     organization::Flag,
     organization_search::{Cursor, Direction, Key, Query, SearchRow, Sort, TextLimits},
 };
@@ -66,7 +66,17 @@ enum Case {
     FolderRecursive,
     Conflicted,
 }
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = 2;
+// Row formulas/fixture marker remain compatible with frozen S7 inputs.
+const FIXTURE_PROTOCOL: u32 = 1;
+const EDIT_TABLES: [&str; 6] = [
+    "edit_changes",
+    "edit_copy_items",
+    "edit_copy_jobs",
+    "edit_recipe_nodes",
+    "edit_redo_nodes",
+    "edit_variants",
+];
 fn id(i: i64) -> String {
     format!("fixture-{i:012}")
 }
@@ -110,7 +120,9 @@ fn main() -> Result<()> {
     let result = run(&args);
     let receipt = match &result {
         Ok(v) => v.clone(),
-        Err(error) => json!({"protocol":PROTOCOL,"complete":false,"error":format!("{error:#}")}),
+        Err(error) => {
+            json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"complete":false,"error":format!("{error:#}")})
+        }
     };
     serde_json::to_writer(&mut output, &receipt)?;
     output.write_all(b"\n")?;
@@ -139,11 +151,14 @@ fn run(args: &Args) -> Result<serde_json::Value> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(
-        protocol == PROTOCOL && (1000..=10_000_000).contains(&count),
+        protocol == FIXTURE_PROTOCOL && (1000..=10_000_000).contains(&count),
         "fixture protocol/count mismatch"
     );
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version == 5, "fixture schema mismatch");
+    ensure!(
+        version == CURRENT_SCHEMA_VERSION,
+        "fixture requires explicit migration before measurement"
+    );
     let epoch: i64 = db.query_row("SELECT epoch FROM organization_state WHERE id=1", [], |r| {
         r.get(0)
     })?;
@@ -199,15 +214,20 @@ fn run(args: &Args) -> Result<serde_json::Value> {
         }
     }
     Ok(
-        json!({"protocol":PROTOCOL,"complete":errors.is_empty(),"errors":errors,"mode":"query","count":count,"case":case,"query":query,"repetitions":repetitions,"warmups":warmups,"start":start,"open_ms":open_ms,"settings":settings,"engine_version":rusqlite::version(),"text_limits":TextLimits::default(),"plans":plans,"samples":samples,"warmup_samples":warmup_samples}),
+        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"complete":errors.is_empty(),"errors":errors,"mode":"query","count":count,"case":case,"query":query,"repetitions":repetitions,"warmups":warmups,"start":start,"open_ms":open_ms,"settings":settings,"engine_version":rusqlite::version(),"text_limits":TextLimits::default(),"plans":plans,"samples":samples,"warmup_samples":warmup_samples}),
     )
 }
-fn fixture_data_identity(db: &Connection) -> Result<(String, Vec<(String, i64)>)> {
-    use rusqlite::types::ValueRef;
-    let tables = db
+fn fixture_tables(db: &Connection) -> Result<Vec<String>> {
+    Ok(db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
         .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<_>>()?)
+}
+fn fixture_data_identity(
+    db: &Connection,
+    tables: &[String],
+) -> Result<(String, Vec<(String, i64)>)> {
+    use rusqlite::types::ValueRef;
     let mut hash = blake3::Hasher::new();
     let mut counts = Vec::new();
     for table in tables {
@@ -216,13 +236,13 @@ fn fixture_data_identity(db: &Connection) -> Result<(String, Vec<(String, i64)>)
         let quoted = table.replace('"', "\"\"");
         let without_rowid: bool = db.query_row(
             "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1",
-            [&table],
+            [table],
             |r| r.get(0),
         )?;
         let sql = if without_rowid {
             let keys = db
                 .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
-                .query_map([&table], |r| r.get::<_, String>(0))?
+                .query_map([table], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(!keys.is_empty(), "WITHOUT ROWID table has no primary key");
             let order = keys
@@ -268,7 +288,7 @@ fn fixture_data_identity(db: &Connection) -> Result<(String, Vec<(String, i64)>)
             }
         }
         hash.update(&count.to_le_bytes());
-        counts.push((table, count));
+        counts.push((table.clone(), count));
     }
     Ok((hash.finalize().to_hex().to_string(), counts))
 }
@@ -277,8 +297,8 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let before_schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     ensure!(
-        (4..=5).contains(&before_schema),
-        "migration requires fixture schema4 or5"
+        (4..=CURRENT_SCHEMA_VERSION).contains(&before_schema),
+        "migration requires fixture schema4,5 or current"
     );
     let (count, protocol): (i64, u32) = db.query_row(
         "SELECT count,protocol FROM organization_fixture WHERE id=1",
@@ -286,14 +306,55 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(
-        protocol == PROTOCOL && (1000..=10_000_000).contains(&count),
+        protocol == FIXTURE_PROTOCOL && (1000..=10_000_000).contains(&count),
         "fixture identity mismatch"
     );
-    let before = fixture_data_identity(&db)?;
+    let tables_before = fixture_tables(&db)?;
+    if before_schema < CURRENT_SCHEMA_VERSION {
+        ensure!(
+            !tables_before
+                .iter()
+                .any(|t| EDIT_TABLES.contains(&t.as_str())),
+            "legacy schema contains unexpected edit tables"
+        );
+    }
+    if before_schema == CURRENT_SCHEMA_VERSION {
+        ensure!(
+            EDIT_TABLES
+                .iter()
+                .all(|t| tables_before.iter().any(|name| name.as_str() == *t)),
+            "current schema missing edit tables"
+        );
+    }
+    let before = fixture_data_identity(&db, &tables_before)?;
     drop(db);
     drop(Catalog::open(&args.catalog)?);
     let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    let after = fixture_data_identity(&db)?;
+    let tables_after = fixture_tables(&db)?;
+    ensure!(
+        tables_before.iter().all(|t| tables_after.contains(t)),
+        "migration removed a table"
+    );
+    let added: Vec<_> = tables_after
+        .iter()
+        .filter(|t| !tables_before.contains(t))
+        .cloned()
+        .collect();
+    let expected_added: Vec<String> = if before_schema < CURRENT_SCHEMA_VERSION {
+        EDIT_TABLES.iter().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    ensure!(
+        added == expected_added,
+        "unexpected migration table additions"
+    );
+    let added_identity = fixture_data_identity(&db, &added)?;
+    ensure!(
+        added_identity.1.iter().all(|(_, count)| *count == 0),
+        "new edit tables are not empty"
+    );
+    let after = fixture_data_identity(&db, &tables_before)?;
     let after_schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let index: String = db.query_row(
         "SELECT sql FROM sqlite_master WHERE name='organization_lens_capture'",
@@ -301,7 +362,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         |r| r.get(0),
     )?;
     ensure!(
-        before == after && after_schema == 5,
+        before == after && after_schema == CURRENT_SCHEMA_VERSION,
         "fixture migration changed logical rows"
     );
     let expected =
@@ -309,7 +370,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     ensure!(index == expected, "unexpected capture index definition");
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(
-        json!({"protocol":PROTOCOL,"mode":"migrate_fixture","complete":true,"count":count,"schema_before":before_schema,"schema_after":after_schema,"logical_before":before.0,"logical_after":after.0,"table_counts_before":before.1,"table_counts_after":after.1,"index_sql":index,"engine_version":rusqlite::version(),"provenance":"Explicit owned-copy schema/index migration; streamed typed logical rows include every catalog table, FTS shadow table and row identity. Not timed query work."}),
+        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"mode":"migrate_fixture","complete":true,"count":count,"schema_before":before_schema,"schema_after":after_schema,"identity_scope":"pre_existing_tables","added_tables":added_identity.1,"logical_before":before.0,"logical_after":after.0,"table_counts_before":before.1,"table_counts_after":after.1,"index_sql":index,"engine_version":rusqlite::version(),"provenance":"Explicit owned-copy schema/index migration; streamed typed logical identity covers every pre-existing table, FTS shadow table and row identity; new empty edit tables are reported separately. Not timed query work."}),
     )
 }
 
@@ -613,7 +674,7 @@ fn validate_row(row: &SearchRow, i: i64) -> Result<()> {
             && row.flag == flag(i)
             && row.label == if i % 2 == 0 { "red" } else { "blue" }
             && row.conflicts == conflicts(i)
-            && row.provenance == json!({"synthetic_fixture":PROTOCOL}),
+            && row.provenance == json!({"synthetic_fixture":FIXTURE_PROTOCOL}),
         "full production row differs from independent fixture oracle at {i}"
     );
     Ok(())
@@ -707,7 +768,7 @@ fn prepare(args: &Args, count: i64) -> Result<serde_json::Value> {
                     flag(i),
                     if i % 2 == 0 { "red" } else { "blue" },
                     serde_json::to_string(&conflicts(i))?,
-                    json!({"synthetic_fixture":PROTOCOL}).to_string(),
+                    json!({"synthetic_fixture":FIXTURE_PROTOCOL}).to_string(),
                     title(i)
                 ])?;
                 folders.execute(params![1, i, false])?;
@@ -761,12 +822,12 @@ fn prepare(args: &Args, count: i64) -> Result<serde_json::Value> {
     );
     db.execute(
         "INSERT INTO organization_fixture VALUES(1,?1,?2)",
-        params![PROTOCOL, count],
+        params![FIXTURE_PROTOCOL, count],
     )?;
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     let settings = read_settings(&mut db)?;
     Ok(
-        json!({"protocol":PROTOCOL,"complete":true,"mode":"prepare","count":count,"counts":counts,"logical_blake3":logical.finalize().to_hex().to_string(),"elapsed_ms":started.elapsed().as_secs_f64()*1000.,"settings":settings,"engine_version":rusqlite::version(),"provenance":"Synthetic normalized query fixture; directly populated production schema. Not original-photo metadata extraction or import throughput evidence."}),
+        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"complete":true,"mode":"prepare","count":count,"counts":counts,"logical_blake3":logical.finalize().to_hex().to_string(),"elapsed_ms":started.elapsed().as_secs_f64()*1000.,"settings":settings,"engine_version":rusqlite::version(),"provenance":"Synthetic normalized query fixture; directly populated production schema. Not original-photo metadata extraction or import throughput evidence."}),
     )
 }
 
@@ -835,7 +896,7 @@ fn transitions(
                     locator: format!("transition-{}", i % 100).into_bytes(),
                     display: format!("Synthetic source {}", i % 100),
                     ambiguous: false,
-                    provenance: json!({"synthetic_transition":PROTOCOL}),
+                    provenance: json!({"synthetic_transition":FIXTURE_PROTOCOL}),
                 };
                 let inspection = xmp_packets::inspect_sidecar(&file, &Limits::default())?;
                 let before = cat.render_identity(&asset)?;
@@ -976,7 +1037,7 @@ fn transitions(
         errors.push("generated source inputs changed".into());
     }
     Ok(
-        json!({"protocol":PROTOCOL,"mode":"transitions","complete":errors.is_empty(),"errors":errors,"count":count,"repetitions":repetitions,"settings":settings,"engine_version":rusqlite::version(),"writes":writes,"snapshot_browse":browse,"source_updates":background,"reopened":reopened,"source_hashes_before":input_hashes,"source_hashes_after":after_hashes,"origin_unix_ms":origin_unix_ms,"provenance":"Separate disposable catalog copy. 200 added metadata-only cohort assets; source packet refresh is real S4 retain_metadata, not full image import or RAW processing."}),
+        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"mode":"transitions","complete":errors.is_empty(),"errors":errors,"count":count,"repetitions":repetitions,"settings":settings,"engine_version":rusqlite::version(),"writes":writes,"snapshot_browse":browse,"source_updates":background,"reopened":reopened,"source_hashes_before":input_hashes,"source_hashes_after":after_hashes,"origin_unix_ms":origin_unix_ms,"provenance":"Separate disposable catalog copy. 200 added metadata-only cohort assets; source packet refresh is real S4 retain_metadata, not full image import or RAW processing."}),
     )
 }
 

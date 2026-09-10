@@ -119,13 +119,21 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
     let root = temp.path();
     ensure!(run(root, "prepare-migration", &["prepare", "--count", "1000"])?.0);
     let conn = rusqlite::Connection::open(root.join("catalog/catalog.sqlite3"))?;
-    conn.execute_batch("DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
     let (okay, receipt) = run(root, "migration", &["migrate-fixture"])?;
     ensure!(
         okay && receipt["complete"] == true
             && receipt["schema_before"] == 4
-            && receipt["schema_after"] == 5
+            && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
+            && receipt["protocol"] == 2
+            && receipt["identity_scope"] == "pre_existing_tables"
+            && receipt["added_tables"].as_array().unwrap().len() == 6
+            && receipt["added_tables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row[1] == 0)
     );
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
@@ -165,5 +173,71 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
                 .unwrap()
                 .contains("unexpected capture index")
     );
+    Ok(())
+}
+
+#[test]
+fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    ensure!(run(root, "prepare-six", &["prepare", "--count", "1000"])?.0);
+    let main = root.join("catalog/catalog.sqlite3");
+    let conn = rusqlite::Connection::open(&main)?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    let before = fs::read(&main)?;
+    let (okay, refusal) = run(
+        root,
+        "old-query",
+        &["query", "browse", "--repetitions", "1", "--warmups", "0"],
+    )?;
+    ensure!(
+        !okay
+            && refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("explicit migration")
+    );
+    ensure!(
+        fs::read(&main)? == before,
+        "timed preflight silently migrated old fixture"
+    );
+    let (okay, migrated) = run(root, "five-to-six", &["migrate-fixture"])?;
+    ensure!(
+        okay && migrated["protocol"] == 2
+            && migrated["schema_before"] == 5
+            && migrated["schema_after"] == 6
+    );
+    ensure!(migrated["logical_before"] == migrated["logical_after"]);
+    ensure!(migrated["identity_scope"] == "pre_existing_tables");
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 6);
+    ensure!(
+        migrated["added_tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row[1] == 0)
+    );
+    ensure!(
+        migrated["table_counts_before"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row[0].as_str().unwrap().starts_with("edit_"))
+    );
+    let after = fs::read(&main)?;
+    let (okay, verified) = run(root, "six-noop", &["migrate-fixture"])?;
+    ensure!(okay && verified["schema_before"] == 6 && verified["schema_after"] == 6);
+    ensure!(verified["added_tables"] == serde_json::json!([]));
+    ensure!(
+        verified["table_counts_before"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row[0].as_str().unwrap().starts_with("edit_"))
+            .count()
+            == 6
+    );
+    ensure!(verified["logical_before"] == verified["logical_after"] && fs::read(&main)? == after);
     Ok(())
 }

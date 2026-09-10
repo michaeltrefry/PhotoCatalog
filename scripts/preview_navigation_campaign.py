@@ -118,7 +118,7 @@ def validate_trial(row, kind, index):
 
 
 def validate_binding(binding, files):
-    if binding.get("version") != 1 or binding.get("clean") is not True:
+    if binding.get("version") != 2 or binding.get("catalog_schema") != 6 or binding.get("clean") is not True:
         raise ValueError("clean reviewed source binding required")
     revision = binding.get("source_revision", "")
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
@@ -135,7 +135,7 @@ def run(args):
         raise ValueError("explicit coordinator lane required")
     args.output.mkdir(parents=False, exist_ok=False)
     root = Path(__file__).resolve().parents[1]
-    campaign = {"version": 1, "complete": False, "started": anchor(), "children": [],
+    campaign = {"version": 2, "catalog_schema": 6, "complete": False, "started": anchor(), "children": [],
                 "planned_measured_children": 44, "planned_verifiers": 44,
                 "automatic_retries": 0, "quietness_verified": False,
                 "metadata_count": 10000, "desktop_frame_time": "unavailable; S12",
@@ -190,7 +190,7 @@ def run(args):
                 if child["returncode"] != 0:
                     raise ValueError(f"measured child failed: {name}")
                 result = child["result"]
-                if result.get("complete") is not True or result.get("profile") != profile or result.get("workload") != workload:
+                if result.get("version") != 2 or result.get("catalog_schema") != 6 or result.get("complete") is not True or result.get("profile") != profile or result.get("workload") != workload:
                     raise ValueError("child result identity mismatch")
                 if result.get("dataset_blake3") != fixture["dataset_blake3"]:
                     raise ValueError("child dataset identity mismatch")
