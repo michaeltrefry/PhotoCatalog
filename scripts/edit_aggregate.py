@@ -207,7 +207,7 @@ def case_semantics(case, request, normal_limits):
     for key in ('decode', 'render'):
         if not same(request[key], explicit.get(key, normal_limits[key])):
             raise ValueError('request changed prospective resource admission: '+key)
-    extent = explicit.get('encoded_extent', case.get('encoded_extent', normal_limits['encoded_extent']))
+    extent = case.get('encoded_extent', explicit.get('encoded_extent', normal_limits['encoded_extent']))
     if not same(request['encoded_extent'], extent):
         raise ValueError('request changed encoded output extent')
 
@@ -255,6 +255,75 @@ def background_source(root, binding, cohort):
         if edit_verify.digest(path, algorithm, 512*MIB) != value[algorithm]:
             raise ValueError('background original changed')
     return value
+
+
+def cleanup_evidence(root, record, request, verification, values):
+    if request['phase'] != 'export':
+        if record.get('cleanup_path') is not None:
+            raise ValueError('cleanup is not admitted for this phase')
+        return None
+    case_id = record['id']
+    path = admitted_file(root, record['cleanup_path'], MAX_REPORT)
+    if path != root/(case_id+'-cleanup.json'):
+        raise ValueError('cleanup receipt namespace differs')
+    done = edit_verify.read_json(path, MAX_REPORT)
+    start_path = admitted_file(root, root/(case_id+'-cleanup-start.json'), MAX_REPORT)
+    if done.get('complete') is not True or done.get('error') is not None or done['start_sha256'] != edit_verify.digest(start_path, 'sha256', MAX_REPORT):
+        raise ValueError('cleanup is incomplete or its plan changed')
+    start = edit_verify.read_json(start_path, MAX_REPORT)
+    if start['case_id'] != case_id:
+        raise ValueError('cleanup belongs to another case')
+    for field, evidence in (('verifier_receipt_sha256', record['verification_path']),
+                            ('probe_supervisor_sha256', record['probe_supervisor_path']),
+                            ('verify_supervisor_sha256', record['verify_supervisor_path'])):
+        if start[field] != edit_verify.digest(evidence, 'sha256', MAX_REPORT):
+            raise ValueError('cleanup used different success/ownership evidence')
+    by_iteration = {value['iteration']: value for value in values}
+    retained = by_iteration[request['warmups']]
+    destination = bound_path(root, retained['path'])
+    encoded = {p['path']: p for p in verification['result']['encoded']}
+    if len(encoded) != len(values) or set(encoded) != {v['path'] for v in values}:
+        raise ValueError('cleanup lacks independent verification of every output')
+    expected_retained = dict(path=str(destination), sha256=encoded[str(destination)]['sha256'], blake3=retained['blake3'])
+    if not same(start['retained'], expected_retained) or not same(done['retained'], expected_retained):
+        raise ValueError('cleanup retained the wrong measured output')
+    for algorithm in ('sha256', 'blake3'):
+        if edit_verify.digest(destination, algorithm, request['encoded_extent']) != expected_retained[algorithm]:
+            raise ValueError('retained measured output changed')
+    output = Path(request['output'])
+    removable_roots = {output/'catalog'}
+    for value in values:
+        directory = Path(value['items'][0]['receipt']['recovery_directory'])
+        if directory.parent != output or not directory.name.startswith('.photocatalog-photo-export-'):
+            raise ValueError('cleanup recovery root differs from authoritative item')
+        removable_roots.add(directory)
+    if len(removable_roots) != len(values)+1:
+        raise ValueError('duplicate export recovery namespace')
+    discarded = {v['path']: v for v in values if v['path'] != str(destination)}
+    files, directories = start['delete_files'], start['delete_directories']
+    if not isinstance(files, list) or not isinstance(directories, list) or len(files)+len(directories) > 10000:
+        raise ValueError('cleanup inventory admission')
+    deleted_files = {f['path']: f for f in files}
+    if len(deleted_files) != len(files) or len(set(directories)) != len(directories):
+        raise ValueError('duplicate cleanup target')
+    if not set(discarded).issubset(deleted_files) or not {str(p) for p in removable_roots}.issubset(directories):
+        raise ValueError('cleanup left encoded/sealed/catalog extents retained')
+    for name in list(deleted_files)+directories:
+        target = Path(name)
+        if (not target.is_absolute() or '..' in target.parts or target == destination
+                or (name not in discarded and not any(target == p or p in target.parents for p in removable_roots))):
+            raise ValueError('cleanup target escaped its disposable namespaces')
+        if target.exists() or target.is_symlink():
+            raise ValueError('cleanup target still occupies its namespace')
+    for name in discarded:
+        if deleted_files[name]['sha256'] != encoded[name]['sha256']:
+            raise ValueError('discarded destination differs from verified pixels')
+    expected_deleted = list(deleted_files)+directories
+    if len(done['deleted_paths']) != len(expected_deleted) or set(done['deleted_paths']) != set(expected_deleted):
+        raise ValueError('cleanup deletion receipt does not reconcile')
+    return dict(case_id=case_id, start_sha256=done['start_sha256'],
+                receipt_sha256=edit_verify.digest(path, 'sha256', MAX_REPORT), retained=expected_retained,
+                deleted_files=len(files), deleted_directories=len(directories))
 
 
 def case_result(request, receipt, verification, attempts, values):
@@ -332,7 +401,7 @@ def aggregate(root, binding):
     background = background_source(preparation_root, binding, cohort)
     records = binding['case_records']
     cases = registry(manifest, binding, records)
-    summaries, raw_cases, references, supervisors = [], [], {}, []
+    summaries, raw_cases, references, supervisors, cleanups = [], [], {}, [], []
     required_sources = {}
     repeat_pids = set()
     actions = {item['id']: item for item in binding['actions']}
@@ -387,6 +456,9 @@ def aggregate(root, binding):
             # The builder freezes argv after selecting isolated launcher paths.
             supervisors.append(supervisor(root, root/action_id, record[ref_key], action['command'], limits,
                                           receipt['probe_pid'] if action_id == case_id else None))
+        cleanup = cleanup_evidence(root, record, request, verification, values)
+        if cleanup is not None:
+            cleanups.append(cleanup)
         if request['phase'] == 'correctness' and request['operation'] in ('all-0', 'all-1'):
             spawn = edit_verify.read_json(root/case_id/'spawn.json')
             identity = (positive_integer(spawn['pid']), edit_statistics.nonnegative(spawn['create_time']))
@@ -437,6 +509,7 @@ def aggregate(root, binding):
                 sources=source_proofs, supervisor_count=len(supervisors),
                 sampled_peak_group_rss=max(s['sampled_peak_group_rss'] for s in supervisors),
                 generated_preparations=prepared,
+                verified_cleanup=cleanups,
                 caveat='Sampled RSS and disk checks are not hard allocation limits; platform/UI delivery remains separate.')
 
 
