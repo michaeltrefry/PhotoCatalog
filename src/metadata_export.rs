@@ -14,6 +14,7 @@ use std::{
 };
 
 const PREFIX: &str = ".photocatalog-xmp-export-";
+const PHOTO_PREFIX: &str = ".photocatalog-photo-export-";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRevision {
@@ -31,6 +32,249 @@ pub struct ExportPlan {
     pub expected: Option<FileRevision>,
     pub payload_digest: String,
     pub payload_bytes: u64,
+}
+
+/// Read-only destination expectation captured before rendering. The parent owns
+/// overwrite authorization and must exclude originals, aliases and batch clashes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationSnapshot {
+    pub version: u32,
+    pub operation: String,
+    pub destination: PathBuf,
+    pub expected: Option<FileRevision>,
+    pub max_existing_bytes: u64,
+}
+
+/// Durable final-byte seal, bound to the parent's immutable photo-job plan hash.
+/// Possession is not authorization: the parent must persist its sealed job state
+/// before publication/recovery, and must never publish canceled jobs by discovery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedPhotoExport {
+    pub version: u32,
+    pub snapshot: DestinationSnapshot,
+    pub authority_digest: String,
+    pub max_payload_bytes: u64,
+    pub payload: FileRevision,
+}
+
+impl SealedPhotoExport {
+    fn plan(&self) -> ExportPlan {
+        ExportPlan {
+            version: 2,
+            operation: self.snapshot.operation.clone(),
+            destination: self.snapshot.destination.clone(),
+            expected: self.snapshot.expected.clone(),
+            payload_digest: self.payload.digest.clone(),
+            payload_bytes: self.payload.bytes,
+        }
+    }
+    pub fn recovery_directory(&self) -> PathBuf {
+        recovery_path(&self.plan())
+    }
+}
+
+pub fn snapshot_photo_destination(
+    path: &Path,
+    max_existing_bytes: u64,
+) -> Result<DestinationSnapshot> {
+    let destination = normalize_photo_destination(path)?;
+    let expected = revision_if_exists_limited(&destination, max_existing_bytes)?;
+    Ok(DestinationSnapshot {
+        version: 1,
+        operation: uuid::Uuid::new_v4().to_string(),
+        destination,
+        expected,
+        max_existing_bytes,
+    })
+}
+
+/// Inspect only an ordinary file, with a fixed memory buffer and byte admission.
+pub fn inspect_file_revision(path: &Path, max_bytes: u64) -> Result<FileRevision> {
+    stream_revision(path, max_bytes, &mut |_| Ok(()), None)
+}
+
+/// Copy a completed encoder file read-only into private recovery staging. Hashes
+/// final file bytes (including seekback edits), not the encoder's write sequence.
+/// `checkpoint` runs around each <=64KiB chunk and durable preparation step;
+/// its byte count is per read pass and resets when the copied file is verified.
+/// an error cancels preparation without touching the destination. All artifacts
+/// remain discoverable. A final directory left by a lost return is NOT permission
+/// to publish: recover its seal explicitly and reconcile the parent job first.
+pub fn seal_photo_export(
+    snapshot: &DestinationSnapshot,
+    completed_file: &Path,
+    max_payload_bytes: u64,
+    authority_digest: &str,
+    mut checkpoint: impl FnMut(u64) -> io::Result<()>,
+) -> Result<SealedPhotoExport> {
+    validate_snapshot(snapshot)?;
+    ensure!(
+        valid_digest(authority_digest),
+        "invalid photo authority digest"
+    );
+    ensure!(
+        max_payload_bytes > 0,
+        "photo payload limit must be positive"
+    );
+    let directory = photo_directory(snapshot);
+    ensure!(
+        !directory.try_exists()?,
+        "photo operation already sealed; explicitly recover its receipt"
+    );
+    checkpoint(0)?;
+    let staging = directory.with_file_name(format!(
+        "{PHOTO_PREFIX}{}-preparing-{}",
+        snapshot.operation,
+        uuid::Uuid::new_v4()
+    ));
+    create_private_directory(&staging)?;
+    sync_directory(staging.parent().unwrap())?;
+    write_journal(
+        &staging.join("photo-preparation.json"),
+        &(snapshot, authority_digest, max_payload_bytes),
+    )?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staging.join("payload"))?;
+    let copied = stream_revision(
+        completed_file,
+        max_payload_bytes,
+        &mut checkpoint,
+        Some(&mut output),
+    )?;
+    ensure!(copied.bytes > 0, "empty photo payload cannot be sealed");
+    sync_file(&output)?;
+    drop(output);
+    let payload = stream_revision(
+        &staging.join("payload"),
+        max_payload_bytes,
+        &mut checkpoint,
+        None,
+    )?;
+    ensure!(
+        payload.bytes == copied.bytes && payload.digest == copied.digest,
+        "photo staging copy differs"
+    );
+    let sealed = SealedPhotoExport {
+        version: 1,
+        snapshot: snapshot.clone(),
+        authority_digest: authority_digest.into(),
+        max_payload_bytes,
+        payload,
+    };
+    checkpoint(copied.bytes)?;
+    write_journal(&staging.join("photo-seal.json"), &sealed)?;
+    write_journal(&staging.join("plan.json"), &sealed.plan())?;
+    write_new(&staging.join("operation.lock"), b"")?;
+    sync_directory(&staging)?;
+    checkpoint(copied.bytes)?;
+    // Serialize installation of this operation with a retained admission lock.
+    // Without this lock, Unix rename of two concurrently prepared directories
+    // would only be check-then-rename, not an exclusive operation reservation.
+    let admission = photo_admission_lock(snapshot)?;
+    ensure!(
+        !directory.try_exists()?,
+        "photo operation was concurrently sealed"
+    );
+    move_to_private(&staging, &directory)?;
+    sync_directory(directory.parent().unwrap())?;
+    drop(admission);
+    checkpoint(copied.bytes)?;
+    Ok(sealed)
+}
+
+/// Read/verify a lost seal receipt without publishing. The supplied snapshot and
+/// authority digest must come from the parent's durable job, not this directory.
+pub fn read_photo_seal(
+    snapshot: &DestinationSnapshot,
+    authority_digest: &str,
+) -> Result<SealedPhotoExport> {
+    validate_snapshot(snapshot)?;
+    ensure!(
+        fs::symlink_metadata(photo_directory(snapshot))?
+            .file_type()
+            .is_dir(),
+        "photo recovery is not an ordinary directory"
+    );
+    let sealed: SealedPhotoExport =
+        read_journal(&photo_directory(snapshot).join("photo-seal.json"))?;
+    ensure!(
+        sealed.snapshot == *snapshot && sealed.authority_digest == authority_digest,
+        "photo seal does not match authoritative job"
+    );
+    validate_photo_seal(&sealed)?;
+    ensure!(
+        inspect_file_revision(
+            &sealed.recovery_directory().join("payload"),
+            sealed.max_payload_bytes
+        )? == sealed.payload,
+        "sealed photo payload changed"
+    );
+    Ok(sealed)
+}
+
+pub fn publish_photo_export(sealed: &SealedPhotoExport) -> Result<ExportReceipt> {
+    publish_photo_export_with_hook(sealed, |_| Ok(()))
+}
+
+#[doc(hidden)]
+pub fn publish_photo_export_with_hook(
+    sealed: &SealedPhotoExport,
+    mut hook: impl FnMut(ExportBoundary) -> io::Result<()>,
+) -> Result<ExportReceipt> {
+    validate_photo_seal(sealed)?;
+    run_recovery(
+        &sealed.recovery_directory(),
+        Some(&sealed.plan()),
+        &mut hook,
+        false,
+        Some(sealed),
+    )
+}
+
+/// Explicit parent-authorized recovery uses the identical publication protocol.
+pub fn recover_photo_export(sealed: &SealedPhotoExport) -> Result<ExportReceipt> {
+    publish_photo_export(sealed)
+}
+
+/// Safe restoration for a canceled/invalidated parent job. Never publishes pixels.
+pub fn restore_photo_export(sealed: &SealedPhotoExport) -> Result<ExportReceipt> {
+    validate_photo_seal(sealed)?;
+    run_recovery(
+        &sealed.recovery_directory(),
+        Some(&sealed.plan()),
+        &mut |_| Ok(()),
+        true,
+        Some(sealed),
+    )
+}
+
+/// Report committed and orphan preparation directories only; never remove or
+/// promote them. The directory-entry cap bounds discovery work and fails closed.
+pub fn discover_photo_exports(parent: &Path, max_directory_entries: usize) -> Result<Vec<PathBuf>> {
+    ensure!(
+        max_directory_entries > 0 && max_directory_entries <= 100_000,
+        "invalid photo recovery discovery limit"
+    );
+    let mut paths = Vec::new();
+    for (index, entry) in fs::read_dir(parent.canonicalize()?)?.enumerate() {
+        ensure!(
+            index < max_directory_entries,
+            "photo recovery discovery limit exceeded; results incomplete"
+        );
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PHOTO_PREFIX)
+            && entry.file_type()?.is_dir()
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +334,10 @@ pub fn apply_export_with_hook(
     payload: &[u8],
     mut hook: impl FnMut(ExportBoundary) -> io::Result<()>,
 ) -> Result<ExportReceipt> {
+    ensure!(
+        plan.version == 1,
+        "XMP entrypoint requires a version-1 plan"
+    );
     validate_plan(plan)?;
     ensure!(
         payload.len() as u64 == plan.payload_bytes
@@ -129,19 +377,29 @@ pub fn apply_export_with_hook(
             }
         }
     }
-    run_recovery(&directory, Some(plan), &mut hook, false)
+    run_recovery(&directory, Some(plan), &mut hook, false, None)
 }
 
 /// Resume a known operation. No file is unlinked or overwritten by recovery.
 pub fn recover_export(directory: &Path) -> Result<ExportReceipt> {
-    run_recovery(directory, None, &mut |_| Ok(()), false)
+    run_recovery(directory, None, &mut |_| Ok(()), false, None)
 }
 
 /// Restore only; never publish staged metadata. Used when catalog revisions have
 /// changed since an interrupted export. Concurrent destinations remain untouched.
 pub fn restore_planned_export(plan: &ExportPlan) -> Result<ExportReceipt> {
+    ensure!(
+        plan.version == 1,
+        "XMP entrypoint requires a version-1 plan"
+    );
     validate_plan(plan)?;
-    run_recovery(&recovery_path(plan), Some(plan), &mut |_| Ok(()), true)
+    run_recovery(
+        &recovery_path(plan),
+        Some(plan),
+        &mut |_| Ok(()),
+        true,
+        None,
+    )
 }
 
 /// Includes interrupted preparation directories; malformed/incomplete operations
@@ -163,6 +421,7 @@ fn run_recovery(
     expected_plan: Option<&ExportPlan>,
     hook: &mut impl FnMut(ExportBoundary) -> io::Result<()>,
     restore_only: bool,
+    photo: Option<&SealedPhotoExport>,
 ) -> Result<ExportReceipt> {
     ensure!(
         fs::symlink_metadata(directory)?.file_type().is_dir(),
@@ -174,12 +433,11 @@ fn run_recovery(
         .try_lock_exclusive()
         .context("export recovery is already running")?;
     {
-        let mut bytes = Vec::new();
-        open_regular(&directory.join("plan.json"))?
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 64 * 1024, "export journal exceeds limit");
-        let plan: ExportPlan = serde_json::from_slice(&bytes)?;
+        let plan: ExportPlan = read_journal(&directory.join("plan.json"))?;
+        ensure!(
+            plan.version == if photo.is_some() { 2 } else { 1 },
+            "photo recovery requires an authoritative seal"
+        );
         validate_plan(&plan)?;
         ensure!(
             directory == recovery_path(&plan),
@@ -187,6 +445,13 @@ fn run_recovery(
         );
         if let Some(expected) = expected_plan {
             ensure!(*expected == plan, "existing operation has a different plan");
+        }
+        if let Some(authority) = photo {
+            let stored: SealedPhotoExport = read_journal(&directory.join("photo-seal.json"))?;
+            ensure!(
+                stored == *authority && stored.plan() == plan,
+                "photo seal differs from authoritative receipt"
+            );
         }
         if restore_only {
             return rollback(
@@ -196,7 +461,16 @@ fn run_recovery(
                 hook,
             );
         }
-        let result = resume(&plan, &directory, hook);
+        let result = (|| {
+            if let Some(authority) = photo {
+                ensure!(
+                    inspect_file_revision(&directory.join("payload"), authority.max_payload_bytes)?
+                        == authority.payload,
+                    "sealed photo payload changed"
+                );
+            }
+            resume(&plan, &directory, hook)
+        })();
         match result {
             Ok(receipt) => Ok(receipt),
             Err(error) => rollback(
@@ -222,13 +496,13 @@ fn resume(
     hook: &mut impl FnMut(ExportBoundary) -> io::Result<()>,
 ) -> Result<ExportReceipt> {
     let payload = directory.join("payload");
-    let staged = revision(&payload)?;
+    let staged = revision_for_plan(&payload, plan)?;
     ensure!(
         staged.bytes == plan.payload_bytes && staged.digest == plan.payload_digest,
         "retained payload is corrupt or changed"
     );
     // Identity as well as digest proves this operation published the current file.
-    if let Ok(Some(current)) = revision_if_exists(&plan.destination)
+    if let Ok(Some(current)) = revision_if_exists_for_plan(&plan.destination, plan)
         && current.identity == staged.identity
         && current.digest == staged.digest
     {
@@ -246,7 +520,7 @@ fn resume(
     if plan.expected.is_some() && !captured.try_exists()? {
         // Preflight refuses an already visible symlink. A replacement after this
         // read is captured without following it and is checked again below.
-        match revision_if_exists(&plan.destination)? {
+        match revision_if_exists_for_plan(&plan.destination, plan)? {
             None => {
                 return Ok(receipt(
                     plan,
@@ -272,7 +546,7 @@ fn resume(
         hook(ExportBoundary::Captured)?;
     }
     if plan.expected.is_some() {
-        let actual = revision(&captured)?;
+        let actual = revision_for_plan(&captured, plan)?;
         if Some(&actual) != plan.expected.as_ref() {
             return rollback(
                 plan,
@@ -287,7 +561,7 @@ fn resume(
     hook(ExportBoundary::Published)?;
     sync_regular(&plan.destination)?;
     sync_directory(plan.destination.parent().unwrap())?;
-    let installed = revision(&plan.destination)?;
+    let installed = revision_for_plan(&plan.destination, plan)?;
     ensure!(
         installed.identity == staged.identity && installed.digest == staged.digest,
         "destination changed during publication; recovery evidence retained"
@@ -307,8 +581,8 @@ fn rollback(
     hook: &mut impl FnMut(ExportBoundary) -> io::Result<()>,
 ) -> Result<ExportReceipt> {
     if let (Ok(current), Ok(staged)) = (
-        revision(&plan.destination),
-        revision(&directory.join("payload")),
+        revision_for_plan(&plan.destination, plan),
+        revision_for_plan(&directory.join("payload"), plan),
     ) && current.identity == staged.identity
     {
         return Ok(receipt(
@@ -374,10 +648,15 @@ fn receipt(
 }
 
 fn recovery_path(plan: &ExportPlan) -> PathBuf {
+    let prefix = if plan.version == 2 {
+        PHOTO_PREFIX
+    } else {
+        PREFIX
+    };
     plan.destination
         .parent()
         .unwrap()
-        .join(format!("{PREFIX}{}", plan.operation))
+        .join(format!("{prefix}{}", plan.operation))
 }
 
 fn normalize_destination(path: &Path) -> Result<PathBuf> {
@@ -386,6 +665,21 @@ fn normalize_destination(path: &Path) -> Result<PathBuf> {
             .is_some_and(|x| x.eq_ignore_ascii_case("xmp")),
         "export requires an explicit .xmp destination"
     );
+    normalize_parent(path)
+}
+
+fn normalize_photo_destination(path: &Path) -> Result<PathBuf> {
+    ensure!(
+        path.extension()
+            .is_some_and(|extension| ["jpg", "jpeg", "png", "tif", "tiff"]
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))),
+        "photo export requires an explicit JPEG, PNG or TIFF destination"
+    );
+    normalize_parent(path)
+}
+
+fn normalize_parent(path: &Path) -> Result<PathBuf> {
     let filename = path.file_name().context("destination has no filename")?;
     let parent = path
         .parent()
@@ -399,13 +693,20 @@ fn normalize_destination(path: &Path) -> Result<PathBuf> {
 }
 
 fn validate_plan(plan: &ExportPlan) -> Result<()> {
-    ensure!(plan.version == 1, "unsupported export plan version");
+    ensure!(
+        matches!(plan.version, 1 | 2),
+        "unsupported export plan version"
+    );
     ensure!(
         uuid::Uuid::parse_str(&plan.operation)?.to_string() == plan.operation,
         "invalid operation identity"
     );
     ensure!(
-        normalize_destination(&plan.destination)? == plan.destination,
+        (if plan.version == 2 {
+            normalize_photo_destination(&plan.destination)?
+        } else {
+            normalize_destination(&plan.destination)?
+        }) == plan.destination,
         "destination parent/path changed since planning"
     );
     ensure!(
@@ -414,6 +715,190 @@ fn validate_plan(plan: &ExportPlan) -> Result<()> {
         "invalid payload digest"
     );
     Ok(())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_snapshot(snapshot: &DestinationSnapshot) -> Result<()> {
+    ensure!(snapshot.version == 1, "unsupported photo snapshot version");
+    ensure!(
+        uuid::Uuid::parse_str(&snapshot.operation)?.to_string() == snapshot.operation,
+        "invalid photo operation identity"
+    );
+    ensure!(
+        normalize_photo_destination(&snapshot.destination)? == snapshot.destination,
+        "photo destination parent/path changed since planning"
+    );
+    if let Some(expected) = &snapshot.expected {
+        ensure!(
+            expected.bytes <= snapshot.max_existing_bytes && valid_digest(&expected.digest),
+            "invalid destination revision/admission"
+        );
+    }
+    Ok(())
+}
+
+fn validate_photo_seal(sealed: &SealedPhotoExport) -> Result<()> {
+    validate_snapshot(&sealed.snapshot)?;
+    ensure!(
+        sealed.version == 1 && valid_digest(&sealed.authority_digest),
+        "invalid photo seal authority/version"
+    );
+    ensure!(
+        sealed.payload.bytes > 0
+            && sealed.payload.bytes <= sealed.max_payload_bytes
+            && valid_digest(&sealed.payload.digest),
+        "invalid sealed photo payload/admission"
+    );
+    Ok(())
+}
+
+fn photo_directory(snapshot: &DestinationSnapshot) -> PathBuf {
+    snapshot
+        .destination
+        .parent()
+        .unwrap()
+        .join(format!("{PHOTO_PREFIX}{}", snapshot.operation))
+}
+
+fn photo_admission_lock(snapshot: &DestinationSnapshot) -> Result<OperationLock> {
+    let path = photo_directory(snapshot).with_extension("admission.lock");
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            sync_file(&file)?;
+            sync_directory(path.parent().unwrap())?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Retain this inode permanently: unlinking a locked file permits a second
+    // process to create and lock a different inode for the same operation.
+    let lock = OperationLock(open_regular(&path)?);
+    lock.0
+        .try_lock_exclusive()
+        .context("photo sealing is already running")?;
+    Ok(lock)
+}
+
+fn read_journal<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let mut bytes = Vec::new();
+    open_regular(path)?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 64 * 1024, "export journal exceeds limit");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_journal(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(value)?;
+    ensure!(bytes.len() <= 64 * 1024, "export journal exceeds limit");
+    write_new(path, &bytes)
+}
+
+fn revision_if_exists_limited(path: &Path, max_bytes: u64) -> Result<Option<FileRevision>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "destination is not an ordinary file (symlinks refused)"
+            );
+            inspect_file_revision(path, max_bytes).map(Some)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn revision_for_plan(path: &Path, plan: &ExportPlan) -> Result<FileRevision> {
+    if plan.version == 2 {
+        inspect_file_revision(
+            path,
+            plan.payload_bytes
+                .max(plan.expected.as_ref().map_or(0, |old| old.bytes)),
+        )
+    } else {
+        revision(path)
+    }
+}
+
+fn revision_if_exists_for_plan(path: &Path, plan: &ExportPlan) -> Result<Option<FileRevision>> {
+    if plan.version == 2 {
+        revision_if_exists_limited(
+            path,
+            plan.payload_bytes
+                .max(plan.expected.as_ref().map_or(0, |old| old.bytes)),
+        )
+    } else {
+        revision_if_exists(path)
+    }
+}
+
+fn stream_revision(
+    path: &Path,
+    max_bytes: u64,
+    checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+    mut sink: Option<&mut File>,
+) -> Result<FileRevision> {
+    checkpoint(0)?;
+    let file = open_regular(path)?;
+    let before = file.metadata()?;
+    ensure!(
+        before.len() <= max_bytes,
+        "file exceeds explicit byte admission"
+    );
+    let file_identity = identity(&file, &before)?;
+    let mut reader = (&file).take(before.len().saturating_add(1));
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hash = blake3::Hasher::new();
+    let mut count = 0u64;
+    loop {
+        checkpoint(count)?;
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        count = count
+            .checked_add(n as u64)
+            .context("file extent overflow")?;
+        ensure!(
+            count <= max_bytes && count <= before.len(),
+            "file grew during bounded read"
+        );
+        checkpoint(count)?;
+        if let Some(output) = sink.as_mut() {
+            output.write_all(&buffer[..n])?;
+        }
+        hash.update(&buffer[..n]);
+    }
+    let after = file.metadata()?;
+    let current = open_regular(path)?;
+    let current_metadata = current.metadata()?;
+    ensure!(
+        count == before.len()
+            && before.len() == after.len()
+            && before.modified()? == after.modified()?
+            && identity(&current, &current_metadata)? == file_identity
+            && current_metadata.len() == before.len()
+            && current_metadata.modified()? == before.modified()?,
+        "file changed during bounded read"
+    );
+    checkpoint(count)?;
+    Ok(FileRevision {
+        bytes: count,
+        digest: hash.finalize().to_hex().to_string(),
+        modified_ns: before
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos(),
+        identity: file_identity,
+    })
 }
 
 fn revision_if_exists(path: &Path) -> Result<Option<FileRevision>> {
