@@ -114,6 +114,83 @@ mod tests {
     }
 
     #[test]
+    fn export_revalidates_original_after_waiting_for_writer() -> Result<()> {
+        use crate::{
+            catalog_edits::VariantKey,
+            catalog_exports::{ExportTarget, MetadataSelection},
+            image_export::{
+                AlphaPolicy, IntegerDepth, OutputFormat, OutputProfile, OutputSize, OutputSpec,
+            },
+            metadata_export,
+            storage_volume::NativePath,
+        };
+        for publish in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("catalog");
+            let original = temp.path().join("original.png");
+            let destination = temp.path().join("export.png");
+            fs::write(&original, b"original fixture bytes")?;
+            let mut catalog = Catalog::open(&root)?;
+            let metadata=serde_json::json!({"format":"PNG","width":100,"height":100,"orientation":1,"camera_make":null,"camera_model":null,"captured_at":null,"preview_source":"fixture"}).to_string();
+            catalog.db.execute("INSERT INTO assets(id,location,path_display,state,metadata,preview_hash,fingerprint) VALUES('source',?1,'original','ready',?2,'fixture',?3)",params![crate::location_bytes(&original),metadata,blake3::hash(b"original fixture bytes").to_hex().to_string()])?;
+            catalog.record_storage_path("source", &NativePath::from_path(&original))?;
+            let job = catalog.begin_photo_export()?;
+            let target = ExportTarget {
+                key: VariantKey::master("source"),
+                expected_revision: 0,
+                destination: destination.clone(),
+                overwrite: false,
+                metadata: MetadataSelection::Omit,
+            };
+            let output = OutputSpec {
+                size: OutputSize::Original,
+                format: OutputFormat::Png {
+                    depth: IntegerDepth::Eight,
+                },
+                profile: OutputProfile::Srgb,
+                alpha: AlphaPolicy::Preserve,
+            };
+            catalog.append_photo_export(&job.id, 0, &target, &output, 1024, 1024)?;
+            catalog.seal_photo_export_job(&job.id, 1)?;
+            let work = catalog.claim_photo_export(&job.id)?.unwrap();
+            let staged = temp.path().join("rendered");
+            fs::write(&staged, b"rendered derivative")?;
+            let seal = metadata_export::seal_photo_export(
+                &work.plan.destination,
+                &staged,
+                1024,
+                &work.authority,
+                |_| Ok(()),
+            )?;
+            if publish {
+                catalog.accept_photo_export_seal(&work, &seal)?;
+            }
+            let gate = catalog.writers.clone();
+            let held = gate.enter(Priority::Background)?;
+            let job_id = job.id.clone();
+            let worker = thread::spawn(move || -> Result<()> {
+                let mut other = Catalog::open(root)?;
+                if publish {
+                    other.publish_photo_export_item(&job_id, 1).map(|_| ())
+                } else {
+                    other.accept_photo_export_seal(&work, &seal)
+                }
+            });
+            queued(&gate, 1, 0);
+            fs::write(&original, b"changed while waiting")?;
+            drop(held);
+            let result = worker.join().expect("export worker panicked");
+            assert!(format!("{:#}", result.unwrap_err()).contains("original changed"));
+            assert!(!destination.exists());
+            assert_eq!(
+                catalog.photo_export_items(&job.id, 0, 1)?[0].state,
+                if publish { "sealed" } else { "rendering" }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn edit_copy_validates_current_dimensions_after_waiting_for_writer() -> Result<()> {
         use crate::{
             catalog_edits::{EditTarget, VariantKey},

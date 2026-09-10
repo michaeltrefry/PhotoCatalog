@@ -452,18 +452,18 @@ impl Catalog {
                 && seal.max_payload_bytes == work.plan.max_payload_bytes,
             "seal does not match export authority"
         );
-        check_original(&self.db, &work.plan)?;
         self.with_edit_transaction(&work.plan.identity,Priority::Foreground,|tx|{
             metadata_current(tx,&work.plan)?;ensure!(job(tx,&work.job)?.state=="queued","export canceled");
+            check_original(tx,&work.plan)?;
             let changed=tx.execute("UPDATE photo_export_items SET state='sealed',seal=?1 WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![serde_json::to_string(seal)?,work.job,work.sequence,work.attempt,work.authority])?;
             ensure!(changed==1,"export attempt changed or canceled");Ok(())
         })?.context("edit/source changed before accepting export")
     }
     pub fn publish_photo_export_item(&mut self, id: &str, sequence: i64) -> Result<ExportReceipt> {
         let (plan, authority) = self.photo_export_plan(id, sequence)?;
-        check_original(&self.db, &plan)?;
         self.with_edit_transaction(&plan.identity,Priority::Foreground,|tx|{
             metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");
+            check_original(tx,&plan)?;
             let encoded:String=tx.query_row("SELECT seal FROM photo_export_items WHERE job=?1 AND sequence=?2 AND state='sealed' AND authority=?3",params![id,sequence,authority],|r|r.get(0))?;
             let sealed:SealedPhotoExport=serde_json::from_str(&encoded)?;
             ensure!(sealed.authority_digest==authority && sealed.snapshot==plan.destination,"stored seal authority mismatch");
