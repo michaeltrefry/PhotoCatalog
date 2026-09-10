@@ -169,3 +169,28 @@ native RDF regression passed; independent source review passed. Two tiny overlap
 cases did not retain a live worker long enough. No overlap or performance result
 is awarded, and a fresh corrective smoke remains required. Failed v3 artifacts
 are preserved under `sc-22843-service-smoke-v3` in private results.
+
+Corrected read-only verification of v3's 22 retained JPEG outputs passed, with
+the original inputs and failed receipts unchanged. Fresh smoke v4 then passed
+seven cases: the two references, warm preview, first-original delivery, the
+22-output export including cleanup, and PNG8/16 selected-metadata preservation.
+Six failures remain retained. `48a2d17` fixes TIFF readback through the held file
+descriptor by providing the Python decoder a display name; the regression failed
+at all three precisions before the fix, then all 18 readback contracts passed.
+Independent source review passed. These results do not yet qualify actual TIFF
+derivative preservation.
+
+JPEG with a large selected XMP packet exposed a product preservation defect:
+the pinned SDK's extended packet loses the named RDF subject. The strict checker
+and importer reject the resulting subject mismatch. Encoder transport correction
+and stale-renderer publication guards are in progress. Two tiny overlap cases
+still lack a sufficiently long-lived natural worker. All v4 known processes are
+absent; no performance award follows from this correctness smoke. Full campaign
+preparation also awaits scalable bounded outer supervision and funded host logs.
+
+S9 supplementary funding control `90a0f1a` passed 12 synthetic tests and parent
+independent source review. It preserves the frozen inspector and adopted evidence
+while checking free space before new commands and at outer observation points.
+It is not a filesystem quota. Its prepared main request remains held and must
+bind the final S8 funding amount before any execution; no further large plan copy
+is needed solely for this control change.
