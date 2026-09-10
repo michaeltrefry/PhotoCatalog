@@ -43,6 +43,18 @@ pub(crate) fn for_catalog(canonical_root: &Path) -> Arc<Writers> {
 }
 
 impl Writers {
+    #[cfg(test)]
+    pub(crate) fn wait_until_queued(&self, foreground: u64, background: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        while state.next[0] - state.serving[0] != foreground
+            || state.next[1] - state.serving[1] != background
+        {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "writer did not reach admission");
+            state = self.changed.wait_timeout(state, left).unwrap().0;
+        }
+    }
     pub(crate) fn enter(self: &Arc<Self>, priority: Priority) -> Result<Permit> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let owner = thread::current().id();
@@ -93,15 +105,7 @@ mod tests {
     use std::{fs, time::Duration};
 
     fn queued(gate: &Writers, foreground: u64, background: u64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut state = gate.state.lock().unwrap();
-        while state.next[0] - state.serving[0] != foreground
-            || state.next[1] - state.serving[1] != background
-        {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(!left.is_zero(), "writer did not reach admission");
-            state = gate.changed.wait_timeout(state, left).unwrap().0;
-        }
+        gate.wait_until_queued(foreground, background);
     }
     fn source() -> Source {
         Source {

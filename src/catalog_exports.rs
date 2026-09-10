@@ -26,8 +26,9 @@ CREATE TABLE photo_export_blobs(hash TEXT PRIMARY KEY,raw_length INTEGER NOT NUL
 CREATE TABLE photo_export_items(job TEXT NOT NULL REFERENCES photo_export_jobs(id),sequence INTEGER NOT NULL,
  destination TEXT NOT NULL,plan TEXT NOT NULL,authority TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('pending','rendering','sealed','published','failed','canceled','restored')),
- attempt TEXT,seal TEXT,receipt TEXT,error TEXT,
+ attempt TEXT,seal TEXT,receipt TEXT,error TEXT,publication TEXT,
  PRIMARY KEY(job,sequence),UNIQUE(job,destination));
+CREATE INDEX photo_export_intents ON photo_export_items(job,sequence) WHERE state='sealed' AND publication IS NOT NULL;
 CREATE INDEX photo_export_rendering ON photo_export_items(job,sequence) WHERE state='rendering';
 CREATE INDEX photo_export_pending ON photo_export_items(job,state,sequence);
 CREATE INDEX storage_export_path ON storage_bindings(native_path);
@@ -116,6 +117,41 @@ pub struct ExportWork {
     pub plan: PhotoExportPlan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhotoExportBoundary {
+    Hashing,
+    OriginalVerified,
+    IntentCommitted,
+    Captured,
+    CaptureVerified,
+    Linked,
+    InstalledVerified,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExportPublicationMetrics {
+    pub original_hash_ms: f64,
+    /// Includes admission/SQLite wait, short validation, action and commit.
+    pub authority_intervals_ms: Vec<f64>,
+    pub publication: metadata_export::PhotoPublicationTimings,
+    pub total_ms: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublicationIntent {
+    version: u32,
+    token: String,
+    authority: String,
+}
+fn parse_intent(encoded: &str, authority: &str) -> Result<PublicationIntent> {
+    let intent: PublicationIntent = serde_json::from_str(encoded)?;
+    ensure!(
+        intent.version == 1
+            && intent.authority == authority
+            && uuid::Uuid::parse_str(&intent.token).is_ok(),
+        "publication intent differs from authority"
+    );
+    Ok(intent)
+}
+
 fn store_blob(db: &Connection, bytes: &[u8]) -> Result<String> {
     ensure!(bytes.len() <= BLOB_LIMIT, "export blob exceeds 16 MiB");
     let hash = blake3::hash(bytes).to_hex().to_string();
@@ -172,15 +208,20 @@ fn checked_plan(bytes: &str, authority: &str) -> Result<PhotoExportPlan> {
     );
     Ok(plan)
 }
-fn check_original(db: &Connection, plan: &PhotoExportPlan) -> Result<()> {
-    let path = plan.original.to_path()?;
-    let current = metadata_export::inspect_file_revision(&path, plan.max_original_bytes)?;
+fn verify_original(
+    plan: &PhotoExportPlan,
+    checkpoint: &mut dyn FnMut(u64) -> std::io::Result<()>,
+) -> Result<metadata_export::VerifiedFile> {
+    let verified = metadata_export::VerifiedFile::read_with_checkpoint(
+        &plan.original.to_path()?,
+        plan.max_original_bytes,
+        checkpoint,
+    )?;
     ensure!(
-        current == plan.original_revision,
+        verified.revision() == &plan.original_revision,
         "original changed since export planning"
     );
-    protect_destination(db, &plan.destination.destination, &path, plan.alias_limits)?;
-    Ok(())
+    Ok(verified)
 }
 fn protect_destination(
     db: &Connection,
@@ -241,6 +282,20 @@ fn metadata_current(db: &Connection, plan: &PhotoExportPlan) -> Result<()> {
         serde_json::from_str::<NativePath>(&original)? == plan.original,
         "original was relinked since export planning"
     );
+    Ok(())
+}
+fn publication_current(
+    db: &Connection,
+    id: &str,
+    sequence: i64,
+    authority: &str,
+    intent: &str,
+    plan: &PhotoExportPlan,
+) -> Result<()> {
+    metadata_current(db, plan)?;
+    ensure!(job(db, id)?.state == "queued", "export canceled");
+    let current:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3 AND publication=?4 AND state='sealed')",params![id,sequence,authority,intent],|r|r.get(0))?;
+    ensure!(current, "publication intent changed");
     Ok(())
 }
 fn finish_item(db: &Connection, job_id: &str) -> Result<()> {
@@ -353,15 +408,13 @@ impl Catalog {
         tx.commit()?;
         Ok(())
     }
-    /// Restore captured destination bytes under the same immutable authority.
-    /// Safe restoration remains available when edits or source bindings change.
+    /// Restore captured destination bytes without restoring stale catalog edits.
+    /// Bulk verification/durability happen outside the writer; namespace restoration
+    /// is guarded by the current alias index and exact accepted operation identity.
     pub fn restore_photo_export_item(&mut self, id: &str, sequence: i64) -> Result<ExportReceipt> {
         let (plan, authority) = self.photo_export_plan(id, sequence)?;
-        let _write = self.writers.enter(Priority::Foreground)?;
-        let tx = self
-            .db
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (state,encoded):(String,Option<String>)=tx.query_row("SELECT state,seal FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3",params![id,sequence,authority],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (state,encoded,intent):(String,Option<String>,Option<String>)=self.db.query_row(
+            "SELECT state,seal,publication FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3",params![id,sequence,authority],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         ensure!(
             state != "rendering",
             "stop and fence the worker before restoration"
@@ -375,24 +428,80 @@ impl Catalog {
             seal.snapshot == plan.destination && seal.authority_digest == authority,
             "restoration seal authority mismatch"
         );
-        // Restoration must also refuse a destination now used by a catalog original.
-        crate::catalog_export_alias::protect_destination(
-            &tx,
-            &plan.destination.destination,
-            plan.alias_limits,
+        let mut session = metadata_export::PhotoPublication::prepare_restore(&seal)?;
+        if session.installed() {
+            let encoded = intent.context("installed output lacks committed publication intent")?;
+            parse_intent(&encoded, &authority)?;
+            let receipt = session.verify_installed()?;
+            self.finalize_photo_publication(
+                id, sequence, &authority, &encoded, &session, &receipt,
+            )?;
+            return Ok(receipt);
+        }
+        let namespace = (|| -> Result<()> {
+            let _write = self.writers.enter(Priority::Foreground)?;
+            let tx = self
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let current:String=tx.query_row("SELECT state FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3",params![id,sequence,authority],|r|r.get(0))?;
+            ensure!(
+                current != "rendering",
+                "worker became active before restoration"
+            );
+            crate::catalog_export_alias::protect_destination(
+                &tx,
+                &plan.destination.destination,
+                plan.alias_limits,
+            )?;
+            session.restore_link()?;
+            tx.commit()?;
+            Ok(())
+        })();
+        let receipt = match namespace {
+            Ok(()) => match session.verify_restored() {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    session.failure_receipt(format!("restoration verification: {error:#}"))
+                }
+            },
+            Err(error) => session.failure_receipt(format!("restoration retained: {error:#}")),
+        };
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: String = tx.query_row(
+            "SELECT state FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3",
+            params![id, sequence, authority],
+            |r| r.get(0),
         )?;
-        let receipt = metadata_export::restore_photo_export(&seal)?;
+        ensure!(
+            current != "rendering",
+            "worker became active during restoration"
+        );
+        if receipt.state == metadata_export::ExportState::Restored {
+            session.recheck_restored()?;
+        }
         let next = if receipt.state == metadata_export::ExportState::Restored {
             "restored"
         } else {
             "failed"
         };
         tx.execute("UPDATE photo_export_items SET state=?1,receipt=?2,error=?3 WHERE job=?4 AND sequence=?5",params![next,serde_json::to_string(&receipt)?,(next=="failed").then(||receipt.detail.clone()),id,sequence])?;
-        if ["pending", "sealed"].contains(&state.as_str()) {
+        if ["pending", "sealed"].contains(&current.as_str()) {
             finish_item(&tx, id)?;
         }
         tx.commit()?;
         Ok(receipt)
+    }
+    /// Bounded recovery queue for intents that may have linked before a crash.
+    pub fn photo_export_publication_intents(&self, limit: usize) -> Result<Vec<(String, i64)>> {
+        ensure!(
+            (1..=200).contains(&limit),
+            "publication recovery page limit"
+        );
+        Ok(self.db.prepare("SELECT job,sequence FROM photo_export_items WHERE state='sealed' AND publication IS NOT NULL ORDER BY job,sequence LIMIT ?1")?
+            .query_map([limit as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn begin_photo_export(&mut self) -> Result<ExportJob> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -673,6 +782,15 @@ impl Catalog {
         work: &ExportWork,
         seal: &SealedPhotoExport,
     ) -> Result<()> {
+        self.accept_photo_export_seal_with_hook(work, seal, |_| Ok(()))
+    }
+    #[doc(hidden)]
+    pub fn accept_photo_export_seal_with_hook(
+        &mut self,
+        work: &ExportWork,
+        seal: &SealedPhotoExport,
+        mut hook: impl FnMut(PhotoExportBoundary) -> Result<()>,
+    ) -> Result<()> {
         checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
         ensure!(
             seal.authority_digest == work.authority
@@ -680,28 +798,218 @@ impl Catalog {
                 && seal.max_payload_bytes == work.plan.max_payload_bytes,
             "seal does not match export authority"
         );
+        let original = verify_original(&work.plan, &mut |_| {
+            hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)
+        })?;
+        // Verify the seal under its operation lease too; acceptance never trusts
+        // a serialized caller's claim about payload bytes.
+        let _publication =
+            metadata_export::PhotoPublication::prepare_with_checkpoint(seal, &mut |_| {
+                hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)
+            })?;
+        hook(PhotoExportBoundary::OriginalVerified)?;
         self.with_edit_transaction(&work.plan.identity,Priority::Foreground,|tx|{
             metadata_current(tx,&work.plan)?;ensure!(job(tx,&work.job)?.state=="queued","export canceled");
-            check_original(tx,&work.plan)?;
-            let changed=tx.execute("UPDATE photo_export_items SET state='sealed',seal=?1 WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![serde_json::to_string(seal)?,work.job,work.sequence,work.attempt,work.authority])?;
-            ensure!(changed==1,"export attempt changed or canceled");Ok(())
+            original.recheck()?;_publication.recheck_payload()?;
+            protect_destination(tx,&work.plan.destination.destination,&work.plan.original.to_path()?,work.plan.alias_limits)?;
+            ensure!(tx.execute("UPDATE photo_export_items SET state='sealed',seal=?1 WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![serde_json::to_string(seal)?,work.job,work.sequence,work.attempt,work.authority])?==1,"export attempt changed or canceled");Ok(())
         })?.context("edit/source changed before accepting export")
     }
     pub fn publish_photo_export_item(&mut self, id: &str, sequence: i64) -> Result<ExportReceipt> {
+        Ok(self.publish_photo_export_item_with_metrics(id, sequence)?.0)
+    }
+    pub fn publish_photo_export_item_with_metrics(
+        &mut self,
+        id: &str,
+        sequence: i64,
+    ) -> Result<(ExportReceipt, ExportPublicationMetrics)> {
+        self.publish_photo_export_item_with_hook(id, sequence, |_| Ok(()))
+    }
+    #[doc(hidden)]
+    pub fn publish_photo_export_item_with_hook(
+        &mut self,
+        id: &str,
+        sequence: i64,
+        mut hook: impl FnMut(PhotoExportBoundary) -> Result<()>,
+    ) -> Result<(ExportReceipt, ExportPublicationMetrics)> {
+        let started = std::time::Instant::now();
+        let mut metrics = ExportPublicationMetrics::default();
         let (plan, authority) = self.photo_export_plan(id, sequence)?;
-        self.with_edit_transaction(&plan.identity,Priority::Foreground,|tx|{
-            metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");
-            check_original(tx,&plan)?;
-            let encoded:String=tx.query_row("SELECT seal FROM photo_export_items WHERE job=?1 AND sequence=?2 AND state='sealed' AND authority=?3",params![id,sequence,authority],|r|r.get(0))?;
-            let sealed:SealedPhotoExport=serde_json::from_str(&encoded)?;
-            ensure!(sealed.authority_digest==authority && sealed.snapshot==plan.destination,"stored seal authority mismatch");
-            protect_destination(tx,&plan.destination.destination,&plan.original.to_path()?,plan.alias_limits)?;
-            let receipt=metadata_export::publish_photo_export(&sealed)?;
-            let state = if receipt.state == metadata_export::ExportState::Published { "published" } else { "failed" };
-            let error = (state == "failed").then(|| format!("publication ended in {:?}", receipt.state));
-            tx.execute("UPDATE photo_export_items SET state=?1,receipt=?2,error=?3 WHERE job=?4 AND sequence=?5",params![state,serde_json::to_string(&receipt)?,error,id,sequence])?;
-            finish_item(tx,id)?;Ok(receipt)
-        })?.context("edit/source changed before export publication")
+        let (state,encoded,previous):(String,String,Option<String>)=self.db.query_row(
+            "SELECT state,seal,publication FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3",params![id,sequence,authority],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        ensure!(
+            ["sealed", "failed", "published"].contains(&state.as_str()),
+            "export is not accepted/sealed"
+        );
+        let sealed: SealedPhotoExport = serde_json::from_str(&encoded)?;
+        ensure!(
+            sealed.authority_digest == authority
+                && sealed.snapshot == plan.destination
+                && sealed.max_payload_bytes == plan.max_payload_bytes,
+            "stored seal authority mismatch"
+        );
+        let mut session =
+            metadata_export::PhotoPublication::prepare_with_checkpoint(&sealed, &mut |_| {
+                hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)
+            })?;
+        // Installed objects are finalized only under a pre-link committed intent.
+        // A later edit/cancellation cannot turn that completed namespace action
+        // into permission to rerender or republish a different object.
+        let intent = if let Some(encoded) = previous {
+            parse_intent(&encoded, &authority)?;
+            encoded
+        } else {
+            serde_json::to_string(&PublicationIntent {
+                version: 1,
+                token: uuid::Uuid::new_v4().to_string(),
+                authority: authority.clone(),
+            })?
+        };
+        if session.installed() {
+            let current: Option<String> = self.db.query_row(
+                "SELECT publication FROM photo_export_items WHERE job=?1 AND sequence=?2",
+                params![id, sequence],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                current.as_deref() == Some(&intent),
+                "installed payload has no committed intent"
+            );
+        } else {
+            let start = std::time::Instant::now();
+            let original = verify_original(&plan, &mut |_| {
+                hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)
+            })?;
+            metrics.original_hash_ms = start.elapsed().as_secs_f64() * 1000.;
+            hook(PhotoExportBoundary::OriginalVerified)?;
+            let start = std::time::Instant::now();
+            self.with_edit_transaction(&plan.identity,Priority::Foreground,|tx|{
+                metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");original.recheck()?;
+                protect_destination(tx,&plan.destination.destination,&plan.original.to_path()?,plan.alias_limits)?;
+                ensure!(tx.execute("UPDATE photo_export_items SET publication=?1 WHERE job=?2 AND sequence=?3 AND authority=?4 AND state='sealed' AND (publication IS NULL OR publication=?1)",params![intent,id,sequence,authority])?==1,"export publication intent changed");Ok(())
+            })?.context("edit/source changed before publication intent")?;
+            metrics
+                .authority_intervals_ms
+                .push(start.elapsed().as_secs_f64() * 1000.);
+            hook(PhotoExportBoundary::IntentCommitted)?;
+            let start = std::time::Instant::now();
+            let capture = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
+                publication_current(tx, id, sequence, &authority, &intent, &plan)?;
+                original.recheck()?;
+                protect_destination(
+                    tx,
+                    &plan.destination.destination,
+                    &plan.original.to_path()?,
+                    plan.alias_limits,
+                )?;
+                session.capture()
+            });
+            metrics
+                .authority_intervals_ms
+                .push(start.elapsed().as_secs_f64() * 1000.);
+            let capture = match capture {
+                Ok(Some(())) => Ok(()),
+                Ok(None) => Err(anyhow::anyhow!("edit/source changed before capture")),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = capture {
+                let receipt = session.failure_receipt(format!("capture retained: {error:#}"));
+                self.record_photo_publication_failure(id, sequence, &authority, &intent, &receipt)?;
+                metrics.publication = session.timings().clone();
+                metrics.total_ms = started.elapsed().as_secs_f64() * 1000.;
+                return Ok((receipt, metrics));
+            }
+            hook(PhotoExportBoundary::Captured)?;
+            session.verify_capture_with_checkpoint(&mut |_| {
+                hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)
+            })?;
+            hook(PhotoExportBoundary::CaptureVerified)?;
+            let start = std::time::Instant::now();
+            let link = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
+                publication_current(tx, id, sequence, &authority, &intent, &plan)?;
+                original.recheck()?;
+                protect_destination(
+                    tx,
+                    &plan.destination.destination,
+                    &plan.original.to_path()?,
+                    plan.alias_limits,
+                )?;
+                session.link()
+            });
+            metrics
+                .authority_intervals_ms
+                .push(start.elapsed().as_secs_f64() * 1000.);
+            match link {
+                Ok(Some(())) => {}
+                Ok(None) => anyhow::bail!("edit/source changed before publication link"),
+                Err(error) => {
+                    let receipt =
+                        session.failure_receipt(format!("publication retained: {error:#}"));
+                    self.record_photo_publication_failure(
+                        id, sequence, &authority, &intent, &receipt,
+                    )?;
+                    metrics.publication = session.timings().clone();
+                    metrics.total_ms = started.elapsed().as_secs_f64() * 1000.;
+                    return Ok((receipt, metrics));
+                }
+            }
+            hook(PhotoExportBoundary::Linked)?;
+        }
+        let receipt = session.verify_installed_with_checkpoint(&mut |_| {
+            hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)
+        })?;
+        hook(PhotoExportBoundary::InstalledVerified)?;
+        let start = std::time::Instant::now();
+        self.finalize_photo_publication(id, sequence, &authority, &intent, &session, &receipt)?;
+        metrics
+            .authority_intervals_ms
+            .push(start.elapsed().as_secs_f64() * 1000.);
+        metrics.publication = session.timings().clone();
+        metrics.total_ms = started.elapsed().as_secs_f64() * 1000.;
+        Ok((receipt, metrics))
+    }
+    fn finalize_photo_publication(
+        &mut self,
+        id: &str,
+        sequence: i64,
+        authority: &str,
+        intent: &str,
+        session: &metadata_export::PhotoPublication,
+        receipt: &ExportReceipt,
+    ) -> Result<()> {
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state:String=tx.query_row("SELECT state FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3 AND publication=?4",params![id,sequence,authority,intent],|r|r.get(0))?;
+        ensure!(
+            ["sealed", "failed", "published"].contains(&state.as_str()),
+            "publication finalization ownership changed"
+        );
+        session.recheck_installed()?;
+        tx.execute("UPDATE photo_export_items SET state='published',receipt=?1,error=NULL WHERE job=?2 AND sequence=?3",params![serde_json::to_string(receipt)?,id,sequence])?;
+        if state == "sealed" {
+            finish_item(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    fn record_photo_publication_failure(
+        &mut self,
+        id: &str,
+        sequence: i64,
+        authority: &str,
+        intent: &str,
+        receipt: &ExportReceipt,
+    ) -> Result<()> {
+        let _write = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(tx.execute("UPDATE photo_export_items SET state='failed',receipt=?1,error=?2 WHERE job=?3 AND sequence=?4 AND authority=?5 AND publication=?6 AND state='sealed'",params![serde_json::to_string(receipt)?,receipt.detail,id,sequence,authority,intent])?==1,"publication failure ownership changed");
+        finish_item(&tx, id)?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn fail_photo_export(&mut self, work: &ExportWork, error: &str) -> Result<()> {
         ensure!(error.len() <= 8192, "export error detail limit");

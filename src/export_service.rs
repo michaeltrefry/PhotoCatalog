@@ -2,7 +2,7 @@
 //! preview launch suspension held until the export process has been reaped.
 use crate::{
     Catalog,
-    catalog_exports::ExportWork,
+    catalog_exports::{ExportPublicationMetrics, ExportWork},
     export_worker::ExportWorkerProcess,
     photo_render::PhotoRenderLimits,
     preview::{ByteBudget, ByteReservation, NativeLaunchPause, PreviewService},
@@ -76,9 +76,35 @@ pub struct ExportRecovery {
     pub fenced: usize,
     pub complete: bool,
 }
+/// Actual successful-worker phase times, including failed later authorization.
+/// Publication details are absent if it failed before returning those details;
+/// publication_elapsed_ms still measures that complete attempted call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportCompletionMetrics {
+    pub job: String,
+    pub sequence: i64,
+    pub attempt: String,
+    pub started_unix_ms: u128,
+    pub finished_unix_ms: u128,
+    /// Owner wall interval from input preparation/spawn through observed child
+    /// completion. Includes polling; render fields carry the child phase timings.
+    pub worker_elapsed_ms: f64,
+    pub render: crate::photo_render::PhotoRenderTimings,
+    pub seal_ms: f64,
+    pub accept_ms: f64,
+    pub publication_elapsed_ms: f64,
+    pub publication: Option<ExportPublicationMetrics>,
+}
+fn unix_ms() -> Result<u128> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis())
+}
 struct Active {
     process: ExportWorkerProcess,
     _reservation: ByteReservation,
+    started: std::time::Instant,
+    started_unix_ms: u128,
 }
 pub struct ExportService {
     catalog: PathBuf,
@@ -90,6 +116,7 @@ pub struct ExportService {
     pause: Option<NativeLaunchPause>,
     _lock: File,
     recovery_complete: bool,
+    completion_metrics: Option<ExportCompletionMetrics>,
 }
 fn detail(error: impl std::fmt::Display) -> String {
     let mut value = error.to_string();
@@ -139,6 +166,7 @@ impl ExportService {
             pause: None,
             _lock: lock,
             recovery_complete: false,
+            completion_metrics: None,
         })
     }
     fn check_catalog(&self, catalog: &Catalog) -> Result<()> {
@@ -186,11 +214,27 @@ impl ExportService {
             catalog.requeue_photo_export_attempt(work)?;
             fenced += 1;
         }
-        self.recovery_complete = page.len() < 200;
+        // Committed pre-link intents can have installed bytes even when their
+        // job was canceled or edited after the crash. Reconcile installed results
+        // by that intent; uninstalled stale results fail and retain captures.
+        let intents = catalog.photo_export_publication_intents(200)?;
+        for (job, sequence) in &intents {
+            if let Err(error) = catalog.publish_photo_export_item(job, *sequence) {
+                catalog.fail_sealed_photo_export(
+                    job,
+                    *sequence,
+                    &detail(format!("publication recovery: {error:#}")),
+                )?;
+            }
+        }
+        self.recovery_complete = page.len() < 200 && intents.len() < 200;
         Ok(ExportRecovery {
             fenced,
             complete: self.recovery_complete,
         })
+    }
+    pub fn take_completion_metrics(&mut self) -> Option<ExportCompletionMetrics> {
+        self.completion_metrics.take()
     }
     pub fn reserved_bytes(&self) -> u64 {
         self.budget.used()
@@ -236,11 +280,28 @@ impl ExportService {
             self.active.as_mut().unwrap().process.stop()?;
             let active = self.active.take().unwrap();
             let cleanup_warning = active.process.retire_transport().err().map(detail);
+            let worker_elapsed_ms = active.started.elapsed().as_secs_f64() * 1000.;
+            let started_unix_ms = active.started_unix_ms;
             drop(active);
             self.pause.take();
             match outcome {
                 Ok(Some(result)) => {
-                    if let Err(error) = catalog.accept_photo_export_seal(&work, &result.sealed) {
+                    let accept_start = std::time::Instant::now();
+                    let accepted = catalog.accept_photo_export_seal(&work, &result.sealed);
+                    self.completion_metrics = Some(ExportCompletionMetrics {
+                        job: work.job.clone(),
+                        sequence: work.sequence,
+                        attempt: work.attempt.clone(),
+                        started_unix_ms,
+                        finished_unix_ms: unix_ms()?,
+                        worker_elapsed_ms,
+                        render: result.rendered.timings.clone(),
+                        seal_ms: result.seal_ms,
+                        accept_ms: accept_start.elapsed().as_secs_f64() * 1000.,
+                        publication_elapsed_ms: 0.,
+                        publication: None,
+                    });
+                    if let Err(error) = accepted {
                         let message = detail(format!("{error:#}"));
                         catalog.fail_photo_export(&work, &message)?;
                         return Ok(ExportEvent::Failed {
@@ -249,8 +310,19 @@ impl ExportService {
                             cleanup_warning,
                         });
                     }
-                    match catalog.publish_photo_export_item(job, work.sequence) {
-                        Ok(receipt)
+                    let publish_start = std::time::Instant::now();
+                    let published =
+                        catalog.publish_photo_export_item_with_metrics(job, work.sequence);
+                    if let Some(metrics) = self.completion_metrics.as_mut() {
+                        metrics.publication_elapsed_ms =
+                            publish_start.elapsed().as_secs_f64() * 1000.;
+                        metrics.finished_unix_ms = unix_ms()?;
+                        if let Ok((_, publication)) = &published {
+                            metrics.publication = Some(publication.clone());
+                        }
+                    }
+                    match published {
+                        Ok((receipt, _))
                             if receipt.state == crate::metadata_export::ExportState::Published =>
                         {
                             Ok(ExportEvent::Published {
@@ -258,7 +330,7 @@ impl ExportService {
                                 cleanup_warning,
                             })
                         }
-                        Ok(receipt) => Ok(ExportEvent::Failed {
+                        Ok((receipt, _)) => Ok(ExportEvent::Failed {
                             sequence: work.sequence,
                             detail: receipt.detail,
                             cleanup_warning,
@@ -337,6 +409,9 @@ impl ExportService {
                 return Ok(ExportEvent::Idle);
             };
             let sequence = work.sequence;
+            let worker_started = std::time::Instant::now();
+            let started_unix_ms = unix_ms()?;
+            self.completion_metrics = None;
             let spawn = (|| -> Result<ExportWorkerProcess> {
                 let (output, xmp) = catalog.photo_export_inputs(&work.plan)?;
                 let mut limits = self.limits.render;
@@ -364,6 +439,8 @@ impl ExportService {
                     self.active = Some(Active {
                         process,
                         _reservation: reservation,
+                        started: worker_started,
+                        started_unix_ms,
                     });
                     Ok(ExportEvent::Started { sequence, pid })
                 }

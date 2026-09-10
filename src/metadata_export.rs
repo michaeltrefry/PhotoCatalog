@@ -13,6 +13,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[path = "metadata_export/photo_phases.rs"]
+mod photo_phases;
+pub(crate) use photo_phases::content_change_stamp;
+/// Stable object identity from the same held handle used for a change stamp.
+pub(crate) fn held_file_identity(file: &File) -> Result<(u64, u64)> {
+    identity(file, &file.metadata()?)
+}
+
+pub use photo_phases::{PhotoPublication, PhotoPublicationTimings, VerifiedFile};
+
 const PREFIX: &str = ".photocatalog-xmp-export-";
 const PHOTO_PREFIX: &str = ".photocatalog-photo-export-";
 

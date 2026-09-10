@@ -207,3 +207,273 @@ fn export_state_seeks_do_not_scan_pending_or_completed_prefixes() -> Result<()> 
     }
     Ok(())
 }
+
+fn accepted_overwrite(
+    c: &mut Catalog,
+    temp: &Path,
+) -> Result<(ExportJob, ExportWork, SealedPhotoExport)> {
+    let destination = temp.join("replacement.png");
+    std::fs::write(&destination, b"old destination bytes")?;
+    let j = c.begin_photo_export()?;
+    let mut target = target(destination);
+    target.overwrite = true;
+    c.append_photo_export(&j.id, 0, &target, &output(), 1024, 1024)?;
+    c.seal_photo_export_job(&j.id, 1)?;
+    let work = c.claim_photo_export(&j.id)?.unwrap();
+    let sealed = seal(temp, &work)?;
+    c.accept_photo_export_seal(&work, &sealed)?;
+    Ok((j, work, sealed))
+}
+
+#[test]
+fn queued_export_rechecks_same_inode_restored_mtime_and_atomic_replacement() -> Result<()> {
+    use std::{fs, sync::mpsc, time::Duration};
+    for publication in [false, true] {
+        for replacement in [false, true] {
+            let (temp, mut c, original) = fixture()?;
+            let destination = temp.path().join("result.png");
+            let (j, w) = queued(&mut c, destination.clone())?;
+            let sealed = seal(temp.path(), &w)?;
+            if publication {
+                c.accept_photo_export_seal(&w, &sealed)?;
+            }
+            let original_bytes = fs::read(&original)?;
+            let modified = fs::metadata(&original)?.modified()?;
+            let mut worker = Catalog::open(&c.root)?;
+            let gate = c.writers.clone();
+            let permit = gate.enter(Priority::Background)?;
+            let (sent, ready) = mpsc::channel();
+            let job = j.id.clone();
+            let child = std::thread::spawn(move || -> Result<()> {
+                let mut signal = Some(sent);
+                let hook = |phase| -> Result<()> {
+                    if phase == PhotoExportBoundary::OriginalVerified {
+                        if let Some(sent) = signal.take() {
+                            sent.send(())?;
+                        }
+                    }
+                    Ok(())
+                };
+                if publication {
+                    worker
+                        .publish_photo_export_item_with_hook(&job, 1, hook)
+                        .map(|_| ())
+                } else {
+                    worker.accept_photo_export_seal_with_hook(&w, &sealed, hook)
+                }
+            });
+            ready.recv_timeout(Duration::from_secs(5))?;
+            gate.wait_until_queued(1, 0);
+            if replacement {
+                fs::rename(&original, temp.path().join("previous-original"))?;
+            }
+            let mut changed = original_bytes.clone();
+            changed[0] ^= 1;
+            fs::write(&original, &changed)?;
+            fs::File::options()
+                .write(true)
+                .open(&original)?
+                .set_times(fs::FileTimes::new().set_modified(modified))?;
+            drop(permit);
+            let error = child
+                .join()
+                .unwrap()
+                .expect_err("stale verified file was authorized");
+            assert!(
+                error.to_string().contains("verified file changed"),
+                "{error:#}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&original)?, changed);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_bulk_hash_checkpoint_allows_an_unrelated_catalog_writer() -> Result<()> {
+    let (temp, mut c, _) = fixture()?;
+    let (j, w, sealed) = accepted_overwrite(&mut c, temp.path())?;
+    let mut unrelated = Catalog::open(&c.root)?;
+    let mut writes = 0;
+    let (receipt, metrics) = c.publish_photo_export_item_with_hook(&j.id, 1, |phase| {
+        if phase == PhotoExportBoundary::Hashing {
+            // Fails with recursive admission/SQLITE_BUSY if any whole-file scan
+            // is moved back inside the global catalog writer transaction.
+            unrelated.begin_photo_export()?;
+            writes += 1;
+        }
+        Ok(())
+    })?;
+    assert_eq!(receipt.state, metadata_export::ExportState::Published);
+    assert!(writes >= 12, "missing bulk verification checkpoints");
+    assert_eq!(metrics.authority_intervals_ms.len(), 4);
+    assert!(metrics.total_ms >= metrics.original_hash_ms);
+    assert_eq!(
+        std::fs::read(w.plan.destination.destination)?,
+        b"completed encoded derivative"
+    );
+    assert_eq!(
+        metadata_export::read_photo_seal(&sealed.snapshot, &sealed.authority_digest)?,
+        sealed
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_capture_preserves_bytes_and_allows_explicit_restore_without_payload()
+-> Result<()> {
+    let (temp, mut c, original) = fixture()?;
+    let source = std::fs::read(&original)?;
+    let (j, w, sealed) = accepted_overwrite(&mut c, temp.path())?;
+    let mut other = Catalog::open(&c.root)?;
+    let result = c.publish_photo_export_item_with_hook(&j.id, 1, |phase| {
+        if phase == PhotoExportBoundary::Captured {
+            other.cancel_photo_export_job(&j.id)?;
+        }
+        Ok(())
+    });
+    assert!(
+        !result
+            .as_ref()
+            .is_ok_and(|r| r.0.state == metadata_export::ExportState::Published)
+    );
+    assert!(!w.plan.destination.destination.exists());
+    assert_eq!(
+        std::fs::read(sealed.recovery_directory().join("original"))?,
+        b"old destination bytes"
+    );
+    // A corrupt/missing payload is not permission to strand intact captured bytes.
+    std::fs::remove_file(sealed.recovery_directory().join("payload"))?;
+    let restored = c.restore_photo_export_item(&j.id, 1)?;
+    assert_eq!(restored.state, metadata_export::ExportState::Restored);
+    assert_eq!(
+        std::fs::read(&w.plan.destination.destination)?,
+        b"old destination bytes"
+    );
+    assert_eq!(std::fs::read(original)?, source);
+    assert_eq!(c.photo_export_job(&j.id)?.state, "canceled");
+    Ok(())
+}
+
+#[test]
+fn namespace_mutation_is_not_excused_as_our_rename_or_hardlink_timestamp() -> Result<()> {
+    use std::fs;
+    for phase in [PhotoExportBoundary::Captured, PhotoExportBoundary::Linked] {
+        let (temp, mut c, _) = fixture()?;
+        let (j, w, sealed) = accepted_overwrite(&mut c, temp.path())?;
+        let altered = if phase == PhotoExportBoundary::Captured {
+            sealed.recovery_directory().join("original")
+        } else {
+            w.plan.destination.destination.clone()
+        };
+        let result = c.publish_photo_export_item_with_hook(&j.id, 1, |at| {
+            if at == phase {
+                let modified = fs::metadata(&altered)?.modified()?;
+                let mut bytes = fs::read(&altered)?;
+                bytes[0] ^= 1;
+                fs::write(&altered, bytes)?;
+                fs::File::options()
+                    .write(true)
+                    .open(&altered)?
+                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+            }
+            Ok(())
+        });
+        assert!(result.is_err(), "mutation was hidden by a refreshed stamp");
+        assert_ne!(c.photo_export_items(&j.id, 0, 1)?[0].state, "published");
+        assert!(altered.exists(), "externally changed bytes were discarded");
+    }
+    Ok(())
+}
+
+#[test]
+fn publication_crash_child() -> Result<()> {
+    let Ok(root) = std::env::var("PHOTOCATALOG_TEST_PUBLICATION_CRASH") else {
+        return Ok(());
+    };
+    let job = std::env::var("PHOTOCATALOG_TEST_PUBLICATION_JOB")?;
+    let mut c = Catalog::open(root)?;
+    c.publish_photo_export_item_with_hook(&job, 1, |phase| {
+        if phase == PhotoExportBoundary::Linked {
+            std::process::exit(73);
+        }
+        Ok(())
+    })?;
+    anyhow::bail!("child never reached linked boundary")
+}
+
+#[test]
+fn actual_crash_after_link_finalizes_committed_intent_despite_later_edit_cancel_and_offline_source()
+-> Result<()> {
+    let (temp, mut c, original) = fixture()?;
+    let (j, w, _) = accepted_overwrite(&mut c, temp.path())?;
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "catalog_exports::tests::publication_crash_child",
+            "--nocapture",
+        ])
+        .env("PHOTOCATALOG_TEST_PUBLICATION_CRASH", &c.root)
+        .env("PHOTOCATALOG_TEST_PUBLICATION_JOB", &j.id)
+        .status()?;
+    assert_eq!(status.code(), Some(73));
+    assert_eq!(c.photo_export_items(&j.id, 0, 1)?[0].state, "sealed");
+    let intent: Option<String> = c.db.query_row(
+        "SELECT publication FROM photo_export_items WHERE job=?1 AND sequence=1",
+        [&j.id],
+        |r| r.get(0),
+    )?;
+    assert!(intent.is_some(), "link happened before durable intent");
+    let linked = std::fs::read(&w.plan.destination.destination)?;
+    c.save_edit_recipe(
+        &w.plan.identity.key,
+        0,
+        &Recipe::V1(RecipeV1 {
+            exposure_ev: 2.,
+            ..Default::default()
+        }),
+    )?;
+    c.cancel_photo_export_job(&j.id)?;
+    std::fs::rename(original, temp.path().join("offline-original"))?;
+    drop(c);
+    let mut c = Catalog::open(temp.path().join("catalog"))?;
+    let receipt = c.publish_photo_export_item(&j.id, 1)?;
+    assert_eq!(receipt.state, metadata_export::ExportState::Published);
+    assert_eq!(std::fs::read(&w.plan.destination.destination)?, linked);
+    assert_eq!(c.photo_export_job(&j.id)?.completed, 1);
+    assert_eq!(c.photo_export_job(&j.id)?.state, "canceled");
+    c.publish_photo_export_item(&j.id, 1)?;
+    assert_eq!(
+        c.photo_export_job(&j.id)?.completed,
+        1,
+        "recovery counted twice"
+    );
+    Ok(())
+}
+
+#[test]
+fn uninstalled_intent_rechecks_stale_recipe_and_never_uses_it_as_publication_permission()
+-> Result<()> {
+    let (temp, mut c, _) = fixture()?;
+    let (j, w, _) = accepted_overwrite(&mut c, temp.path())?;
+    let result = c.publish_photo_export_item_with_hook(&j.id, 1, |phase| {
+        if phase == PhotoExportBoundary::IntentCommitted {
+            anyhow::bail!("simulated interruption before namespace");
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    let before = std::fs::read(&w.plan.destination.destination)?;
+    c.save_edit_recipe(
+        &w.plan.identity.key,
+        0,
+        &Recipe::V1(RecipeV1 {
+            exposure_ev: 1.,
+            ..Default::default()
+        }),
+    )?;
+    assert!(c.publish_photo_export_item(&j.id, 1).is_err());
+    assert_eq!(std::fs::read(&w.plan.destination.destination)?, before);
+    Ok(())
+}
