@@ -1,7 +1,9 @@
 # S6 acceptance ledger
 
 Checkpoint: S6 source integration of merged S7 e68d37500ca87f057d56137376fe5aeab0fc419b.
-Prior f9b2905 source review passed; this integration awaits review and runtime gates. S6 remains **In Progress**. This ledger reconciles the three sc-22841
+Parent and independent source review of integration 8b49038 passed; runtime gates
+remain pending. S7 is Done after exact e68d375 main CI 34418548263 passed all four
+jobs and Shortcut closeout/readback (comment 22955). S6 remains **In Progress**. This ledger reconciles the three sc-22841
 criteria in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md#sc-22841--deliver-compressed-previews-with-bounded-storage-and-responsive-scheduling).
 It does not replace the frozen experiment protocols or historical receipts.
 Confidence: high for the evidence boundaries below; runtime confidence for the
@@ -61,3 +63,13 @@ limits must remain explicit rather than being mistaken for completed coverage:
   original rendering uses a killable child. Navigation must report the observed
   latency under that contract. S12 owns desktop/UI time; the headless components
   cannot satisfy the UI portion of the one-second budget by omission.
+
+
+Final correctness gate is one complete Rust all-target invocation, followed by all
+`scripts/test*.py` and `benchmarks/test_*.py` contracts, package fmt and all-target
+Clippy. It binds a clean source archive and exact environment, forces a package-only
+debug rebuild in this worktree's own target, and preserves private frozen/release
+binaries. Required writer/parser/integrated/actual-CLI tests are verified within
+that full-suite output, not redundantly rerun. The private gate wrapper and every
+step's command/log/timestamps/hash are retained with the receipt; failure stops
+execution for diagnosis. No timing campaign or release build is part of this gate.
