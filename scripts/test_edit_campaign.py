@@ -267,6 +267,50 @@ class ActiveTrackingContracts(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'ancestry'):
                 campaign.descendant_identity(foreign,(1,1.0))
 
+    def test_rediscovered_zombie_has_one_lifetime_and_one_terminal_event(self):
+        from unittest.mock import Mock
+        tracker=self.tracker(max_seen=2)
+        root=Mock(pid=1);root.create_time.return_value=1.;root.status.return_value='running'
+        zombie=Mock(pid=42);zombie.create_time.return_value=10.
+        zombie.status.return_value=campaign.psutil.STATUS_ZOMBIE
+        zombie.parent.return_value=root;zombie.ppid.return_value=1
+        key=(42,10.);tracker.add(key)
+        processes={(1,1.):root,key:zombie}
+        with patch.object(campaign,'owned_process',side_effect=processes.get), \
+             patch.object(campaign,'identity',side_effect=lambda p:(p.pid,p.create_time())), \
+             patch.object(campaign,'same_alive',return_value=True):
+            tracker.sample()
+            for _ in range(1000):
+                found=campaign.descendant_identity(zombie,(1,1.))
+                if found is not None:tracker.add(found)
+                tracker.sample()
+        self.assertEqual((tracker.discovered,tracker.retired),(1,1))
+        self.assertEqual(len(tracker.stream.getvalue().splitlines()),2)
+        self.assertFalse(tracker.active)
+
+    def test_live_candidate_root_or_parent_loss_remains_explicit_uncertainty(self):
+        from unittest.mock import Mock
+        for lost in ('root_terminal','parent_absent','parent_lookup_race'):
+            with self.subTest(lost=lost):
+                root=Mock(pid=1);root.create_time.return_value=1.;root.status.return_value='running'
+                candidate=Mock(pid=42);candidate.create_time.return_value=10.;candidate.status.return_value='running'
+                candidate.parent.return_value=root;candidate.ppid.return_value=1
+                if lost=='parent_lookup_race':candidate.parent.side_effect=campaign.psutil.NoSuchProcess(1)
+                processes={(1,1.):None if lost=='parent_absent' else root,(42,10.):candidate}
+                with patch.object(campaign,'owned_process',side_effect=processes.get), \
+                     patch.object(campaign,'identity',side_effect=lambda p:(p.pid,p.create_time())), \
+                     patch.object(campaign,'same_alive',return_value=lost!='root_terminal'):
+                    with self.assertRaisesRegex(RuntimeError,'live candidate has unproven root ancestry.*42'):
+                        campaign.descendant_identity(candidate,(1,1.))
+                candidate.terminate.assert_not_called();candidate.kill.assert_not_called()
+
+    def test_candidate_disappearing_during_parent_lookup_is_safe_to_skip(self):
+        from unittest.mock import Mock
+        candidate=Mock(pid=42);candidate.create_time.return_value=10.;candidate.status.return_value='running'
+        candidate.parent.side_effect=campaign.psutil.NoSuchProcess(1)
+        with patch.object(campaign,'owned_process',side_effect=[candidate,candidate,None]):
+            self.assertIsNone(campaign.descendant_identity(candidate,(1,1.)))
+
     def test_outer_limits_explicit_and_inner_defaults_preserved(self):
         from edit_disk_budget import outer_owner
         default=campaign.supervision_settings()
@@ -313,6 +357,49 @@ class ActualOuterTrackingContracts(unittest.TestCase):
                                      patches=(patch.object(campaign,'MAX_TELEMETRY',1),))
             self.assertIn('telemetry byte cap',result['error'])
             self.assertLessEqual((folder/'processes.jsonl').stat().st_size,1)
+
+    def test_zero_exit_observed_at_or_after_deadline_is_not_accepted(self):
+        original_poll=subprocess.Popen.poll
+        original_anchor=campaign.anchor
+        for observed in (86401.,86402.):
+            with self.subTest(observed=observed),tempfile.TemporaryDirectory() as root:
+                late={'value':False}
+                def polled(child):
+                    code=original_poll(child)
+                    if code==0:late['value']=True
+                    return code
+                def anchored():
+                    value=original_anchor();value['monotonic_ns']=1_000_000_000;return value
+                def clock():return observed if late['value'] else 0.
+                folder=Path(root)/'attempt'
+                with patch.object(campaign.subprocess.Popen,'poll',polled), \
+                     patch.object(campaign,'anchor',side_effect=anchored), \
+                     patch.object(campaign.time,'monotonic',side_effect=clock):
+                    with self.assertRaisesRegex(RuntimeError,'child failed'):
+                        campaign.invoke([sys.executable,'-c','pass'],folder,
+                            dict(deadline_seconds=86400,process_rss_bytes=256*campaign.MIB,
+                                 group_rss_bytes=512*campaign.MIB,free_reserve_bytes=0),root)
+                result=json.loads((folder/'result.json').read_text())
+                self.assertFalse(result['complete'])
+                self.assertIn('deadline exceeded',result['error'])
+                self.assertEqual(result['ownership']['root_returncode'],0)
+                self.assertTrue(result['ownership']['root_reaped'])
+
+    def test_unproven_live_candidate_blocks_ownership_admission_without_foreign_signal(self):
+        foreign=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])
+        try:
+            process=campaign.psutil.Process(foreign.pid);key=campaign.identity(process)
+            with tempfile.TemporaryDirectory() as root:
+                result,_=self.invoke(root,'import time; time.sleep(30)',expect_failure=True,patches=(
+                    patch.object(campaign.psutil.Process,'children',return_value=[process]),
+                    patch.object(campaign,'descendant_identity',side_effect=campaign.UnprovenIdentity(key)),))
+                self.assertFalse(result['ownership']['known_absent'])
+                self.assertTrue(result['ownership']['root_reaped'])
+                self.assertEqual(result['ownership']['unproven_identities'],[list(key)])
+                self.assertIsNone(foreign.poll(),'unproven identity was signaled')
+        finally:
+            if foreign.poll() is None:foreign.kill()
+            foreign.wait(timeout=5)
 
     def test_deadline_covers_root_inline_work_without_any_native_child(self):
         original=campaign.anchor

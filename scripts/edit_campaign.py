@@ -256,37 +256,65 @@ def supervision_settings(value=None):
     return defaults
 
 
+class UnprovenIdentity(RuntimeError):
+    def __init__(self,key,reason='root ancestry unavailable'):
+        self.key=key
+        super().__init__('live candidate has unproven root ancestry: '+repr(key)+'; '+reason)
+
+
 def descendant_identity(process,root_key):
     """Validate a fresh ancestry chain, not just a PID returned by enumeration."""
-    enumerated=(process.pid,process.create_time())
-    current=owned_process(enumerated)
-    if current is None:
+    try:
+        enumerated=(process.pid,process.create_time())
+    except psutil.NoSuchProcess:
         return None
-    chain=[]
-    for _ in range(64):
-        key=(current.pid,current.create_time())
-        current=owned_process(key)
+    except psutil.AccessDenied as error:
+        raise UnprovenIdentity((process.pid,None),'creation identity unreadable') from error
+
+    def unproven():
+        candidate=owned_process(enumerated)
+        if candidate is None or candidate.status()==psutil.STATUS_ZOMBIE:
+            return None
+        # No signal authority is granted to an unproven candidate. Retain its
+        # identity in the failure, instead of reporting a successful absence.
+        raise UnprovenIdentity(enumerated)
+
+    try:
+        current=owned_process(enumerated)
         if current is None:return None
-        if key==root_key:
-            # Bind both sides of every observed edge again. Reparenting or PID
-            # reuse is uncertainty, never permission to claim the new process.
-            if not same_alive(root_key):
-                return None
-            for child_key,parent_key in chain:
-                child=owned_process(child_key)
-                parent=owned_process(parent_key)
-                if child is None or parent is None:
-                    return None
-                if child.ppid()!=parent_key[0]:
-                    raise RuntimeError('owned ancestry changed during admission')
-            return enumerated
-        parent=current.parent()
-        if parent is None:
-            raise RuntimeError('discovered process lacks current root ancestry')
-        parent_key=identity(parent)
-        chain.append((key,parent_key))
-        current=parent
-    raise RuntimeError('owned ancestry depth admission')
+        chain=[]
+        for _ in range(64):
+            key=(current.pid,current.create_time())
+            current=owned_process(key)
+            if current is None or current.status()==psutil.STATUS_ZOMBIE:
+                return unproven()
+            if key==root_key:
+                # Bind every edge again. Reparenting or PID reuse does not grant
+                # permission to claim the new process or silently forget a live one.
+                if not same_alive(root_key):return unproven()
+                for child_key,parent_key in chain:
+                    child=owned_process(child_key)
+                    parent=owned_process(parent_key)
+                    if child is None or parent is None:return unproven()
+                    if child.status()==psutil.STATUS_ZOMBIE:return unproven()
+                    if child.ppid()!=parent_key[0]:return unproven()
+                return enumerated
+            parent=current.parent()
+            if parent is None:return unproven()
+            parent_key=identity(parent)
+            chain.append((key,parent_key))
+            current=parent
+        return unproven()
+    except psutil.NoSuchProcess:
+        # A vanished intermediate parent is not evidence that the candidate died.
+        try:
+            return unproven()
+        except psutil.NoSuchProcess:
+            return None
+        except psutil.AccessDenied as error:
+            raise UnprovenIdentity(enumerated,'candidate state unreadable') from error
+    except psutil.AccessDenied as error:
+        raise UnprovenIdentity(enumerated,'ancestry state unreadable') from error
 
 
 class ActiveIdentities:
@@ -366,6 +394,7 @@ def invoke(command, folder, limits, disk_root, *, supervision=None):
     errors=[]
     peak=0
     ownership=None
+    unproven=[]
     telemetry_bytes=0
     try:
         with (folder/'processes.jsonl').open('xb') as telemetry, (folder/'identities.jsonl').open('xb') as identities:
@@ -413,14 +442,16 @@ def invoke(command, folder, limits, disk_root, *, supervision=None):
                 if any(capture.failed.is_set() for capture in captures.values()):
                     raise RuntimeError('bounded stdout/stderr capture failed or overflowed')
                 code=child.poll()
+                # The observation must meet its deadline even when the child
+                # already exited successfully between two samples.
+                if time.monotonic()>=deadline:
+                    raise RuntimeError('sampled child deadline exceeded')
                 if code is not None:
                     if any(key!=root_key and same_alive(key) for key in known):
                         raise RuntimeError('root exited with a known unreaped descendant')
                     if code:
                         raise RuntimeError('child returned nonzero status '+str(code))
                     break
-                if time.monotonic()>=deadline:
-                    raise RuntimeError('sampled child deadline exceeded')
                 time.sleep(.1)
             telemetry.flush()
             os.fsync(telemetry.fileno())
@@ -428,10 +459,15 @@ def invoke(command, folder, limits, disk_root, *, supervision=None):
             os.fsync(identities.fileno())
     except BaseException as exc:
         errors.append(f'{type(exc).__name__}: {exc}')
+        if isinstance(exc,UnprovenIdentity):unproven.append(exc.key)
     finally:
         # Evidence writes, telemetry and capture inspection cannot gate cleanup.
         if child is not None:
             ownership=terminate_owned(child,known)
+            if unproven:
+                ownership['known_absent']=False
+                ownership['unproven_identities']=unproven
+                ownership['errors'].append('live/unreadable candidate ancestry requires independent absence review')
         capture_proofs={}
         for name,capture in captures.items():
             try:
