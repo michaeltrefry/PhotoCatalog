@@ -180,6 +180,53 @@ class AggregateContracts(unittest.TestCase):
             for records in ([], [{'id': 'unknown'}], [{'id': key} for key in aggregate.edit_fixtures.FIXTURES][:-1]):
                 with self.assertRaises(ValueError): aggregate.preparation(root, {'preparation_records': records})
 
+    def test_export_cleanup_requires_all_readbacks_retained_hash_and_disposable_roots(self):
+        from blake3 import blake3
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            output = root/'case-output'; output.mkdir()
+            r = dict(phase='export', warmups=2, encoded_extent=1024, output=str(output))
+            record = dict(id='case', cleanup_path=str(root/'case-cleanup.json'),
+                verification_path=str(root/'verification.json'),
+                probe_supervisor_path=str(root/'probe.json'), verify_supervisor_path=str(root/'verify.json'))
+            rows, encoded, files, directories = [], [], [], [str(output/'catalog')]
+            for iteration in range(22):
+                data = ('encoded '+str(iteration)).encode()
+                path = str(output/f'export-{iteration}.image')
+                sha = hashlib.sha256(data).hexdigest()
+                recovery = str(output/f'.photocatalog-photo-export-operation-{iteration}')
+                rows.append(dict(iteration=iteration, path=path, blake3=blake3(data).hexdigest(),
+                                 items=[dict(receipt={'recovery_directory': recovery})]))
+                encoded.append(dict(path=path, sha256=sha))
+                directories.append(recovery)
+                if iteration == 2: Path(path).write_bytes(data)
+                else: files.append(dict(path=path, bytes=len(data), sha256=sha))
+            proof = {'result': {'encoded': encoded}}
+            for name, value in (('verification.json', proof), ('probe.json', {}), ('verify.json', {})):
+                (root/name).write_text(json.dumps(value))
+            retained = dict(path=rows[2]['path'], sha256=encoded[2]['sha256'], blake3=rows[2]['blake3'])
+            start = dict(case_id='case', retained=retained, delete_files=files, delete_directories=directories)
+            for key, value in (('verifier_receipt_sha256', 'verification.json'),
+                               ('probe_supervisor_sha256', 'probe.json'), ('verify_supervisor_sha256', 'verify.json')):
+                start[key] = hashlib.sha256((root/value).read_bytes()).hexdigest()
+            def retain_receipts(plan):
+                data = json.dumps(plan).encode()
+                (root/'case-cleanup-start.json').write_bytes(data)
+                done = dict(complete=True, error=None, retained=retained, start_sha256=hashlib.sha256(data).hexdigest(),
+                            deleted_paths=[f['path'] for f in plan['delete_files']]+plan['delete_directories'])
+                (root/'case-cleanup.json').write_text(json.dumps(done))
+            retain_receipts(start)
+            result = aggregate.cleanup_evidence(root, record, r, proof, rows)
+            self.assertEqual(result['deleted_files'], 21)
+            for mutate in (lambda p: p['delete_directories'].pop(),
+                           lambda p: p['delete_files'][0].update(sha256='f'*64),
+                           lambda p: p['delete_files'].append({'path': str(root/'unrelated'), 'sha256': 'a'*64})):
+                changed = copy.deepcopy(start); mutate(changed); retain_receipts(changed)
+                with self.assertRaises(ValueError): aggregate.cleanup_evidence(root, record, r, proof, rows)
+            retain_receipts(start)
+            Path(retained['path']).write_bytes(b'changed retained output')
+            with self.assertRaises(ValueError): aggregate.cleanup_evidence(root, record, r, proof, rows)
+
 
 if __name__ == '__main__':
     unittest.main()
