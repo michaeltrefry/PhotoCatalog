@@ -11,7 +11,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -40,10 +40,12 @@ fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
         metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= limit,
         "worker artifact size/type"
     );
-    let mut bytes = Vec::new();
-    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    let mut bytes = vec![0; usize::try_from(metadata.len())?];
+    let mut file = File::open(path)?;
+    file.read_exact(&mut bytes)?;
+    let mut extra = [0];
     ensure!(
-        bytes.len() as u64 == metadata.len(),
+        file.read(&mut extra)? == 0,
         "worker artifact changed or exceeded bound"
     );
     Ok(bytes)
@@ -63,6 +65,14 @@ fn blob(root: &Path, name: &str, expected: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn validate(request: &Request) -> Result<()> {
+    validate_persisted(request)?;
+    ensure!(
+        request.work.plan.renderer_identity == photo_render::output_renderer_identity(),
+        "export renderer changed; prepare a new plan"
+    );
+    Ok(())
+}
+fn validate_persisted(request: &Request) -> Result<()> {
     ensure!(
         request.version == 1 && request.work.plan.version == 1,
         "export worker protocol"
@@ -71,10 +81,6 @@ fn validate(request: &Request) -> Result<()> {
     ensure!(
         blake3::hash(&encoded).to_hex().as_str() == request.work.authority,
         "export worker plan binding"
-    );
-    ensure!(
-        request.work.plan.renderer_identity == photo_render::output_renderer_identity(),
-        "export renderer changed; prepare a new plan"
     );
     ensure!(
         request.work.plan.recipe.validate()?.digest() == request.work.plan.identity.recipe_digest,
@@ -159,6 +165,9 @@ impl ExportWorkerProcess {
             .prefix("photo-worker-")
             .tempdir_in(staging_root)?
             .keep();
+        // The owner creates the lease before a child can be canceled or delayed
+        // before startup. Children open it; they never recreate a retired lease.
+        write(&staging.join("active.lock"), b"")?;
         write(&staging.join("request.json"), &bytes)?;
         if let OutputProfile::Icc { bytes } = &output.profile {
             write(&staging.join("profile.icc"), bytes)?;
@@ -260,52 +269,239 @@ impl ExportWorkerProcess {
     /// publication/restore evidence resides in its separately sealed directory.
     pub fn retire_transport(&self) -> Result<()> {
         ensure!(self.exited, "cannot retire a live export worker");
-        let mut lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.staging.join("active.lock"))?;
-        lock.try_lock_exclusive()
-            .context("export worker still owns staging")?;
-        let allowed = [
-            "active.lock",
-            "request.json",
-            "profile.icc",
-            "selected.xmp",
-            "output",
-            "result.json",
-            "error.json",
-        ];
-        let mut paths = Vec::new();
-        for entry in fs::read_dir(&self.staging)? {
-            let entry = entry?;
-            ensure!(
-                paths.len() < allowed.len()
-                    && allowed.iter().any(|name| entry.file_name() == *name),
-                "unrecognized export worker artifact; retained"
-            );
-            ensure!(
-                entry.file_type()?.is_file(),
-                "non-file export worker artifact; retained"
-            );
-            paths.push(entry.path());
+        match fence_transport(&self.staging)? {
+            Inspection::Retired(retired) => {
+                ensure!(same_work(&retired.work, &self.request.work), "transport attempt changed");
+                discard_retired_export_transport(&retired)
+            }
+            Inspection::Cleaned => Ok(()),
+            Inspection::Retained(reason) => bail!("export transport retained: {reason}"),
         }
-        // A pre-opened child handle must observe retirement after acquiring its
-        // lock, including on Windows where handles outlive pathname removal.
-        lock.write_all(&[1])?;
-        lock.sync_all()?;
-        drop(lock);
-        paths.sort_by_key(|path| path.file_name().is_some_and(|name| name == "active.lock"));
-        for path in paths {
-            fs::remove_file(path)?;
-        }
-        fs::remove_dir(&self.staging)?;
-        Ok(())
     }
 }
 impl Drop for ExportWorkerProcess {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+const RETIRED_PREFIX: &str = "photo-retired-";
+const TRANSPORT_FILES: &[&str] = &[
+    "active.lock", "request.json", "profile.icc", "selected.xmp", "output",
+    "result.json", "error.json",
+];
+#[derive(Debug, Serialize)]
+pub struct RetiredExportTransport {
+    pub staging: PathBuf,
+    pub work: ExportWork,
+}
+#[derive(Debug, Serialize)]
+pub struct RetainedExportTransport {
+    pub staging: PathBuf,
+    pub reason: String,
+}
+#[derive(Debug, Default, Serialize)]
+pub struct ExportTransportRecovery {
+    pub scanned: usize,
+    /// Interrupted cleanup of an already fenced, non-launchable directory.
+    pub cleaned: usize,
+    pub retired: Vec<RetiredExportTransport>,
+    pub retained: Vec<RetainedExportTransport>,
+}
+enum Inspection {
+    Retired(RetiredExportTransport),
+    Retained(String),
+    Cleaned,
+}
+fn same_work(a: &ExportWork, b: &ExportWork) -> bool {
+    a.authority == b.authority && a.attempt == b.attempt
+        && a.job == b.job && a.sequence == b.sequence
+}
+fn retired_name(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(RETIRED_PREFIX))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+fn transport_files(path: &Path) -> Result<Vec<PathBuf>> {
+    ensure!(fs::symlink_metadata(path)?.file_type().is_dir(), "transport is not an ordinary directory");
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(path)?.take(TRANSPORT_FILES.len() + 1) {
+        let entry = entry?;
+        ensure!(paths.len() < TRANSPORT_FILES.len()
+            && TRANSPORT_FILES.iter().any(|name| entry.file_name() == *name)
+            && entry.file_type()?.is_file(), "unrecognized export transport artifact");
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+fn open_lease(path: &Path) -> Result<File> {
+    let target = path.join("active.lock");
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => ensure!(metadata.file_type().is_file(), "invalid export lease type"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(OpenOptions::new().read(true).write(true).create(true).truncate(false).open(target)?)
+}
+fn lease_retired(lock: &mut File) -> Result<bool> {
+    ensure!(lock.metadata()?.len() <= 1, "invalid export lease marker");
+    lock.seek(SeekFrom::Start(0))?;
+    let mut byte = [0];
+    let n = lock.read(&mut byte)?;
+    ensure!(n == 0 || byte == [1], "unknown export lease marker");
+    Ok(n != 0)
+}
+fn mark_retired(lock: &mut File) -> Result<()> {
+    lock.seek(SeekFrom::Start(0))?;
+    lock.write_all(&[1])?;
+    lock.sync_all()?;
+    Ok(())
+}
+#[cfg(unix)]
+fn lease_identity(file: &File) -> std::io::Result<(u64, u128)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), u128::from(metadata.ino())))
+}
+#[cfg(windows)]
+fn lease_identity(file: &File) -> std::io::Result<(u64, u128)> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileId { volume: u64, id: [u8; 16] }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(handle: *mut std::ffi::c_void, class: i32,
+            info: *mut std::ffi::c_void, size: u32) -> i32;
+    }
+    let mut value = std::mem::MaybeUninit::<FileId>::uninit();
+    if unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), 18,
+        value.as_mut_ptr().cast(), std::mem::size_of::<FileId>() as u32) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let value = unsafe { value.assume_init() };
+    Ok((value.volume, u128::from_ne_bytes(value.id)))
+}
+fn check_live_lease(path: &Path, lock: &File) -> Result<()> {
+    ensure!(lock.metadata()?.len() == 0, "export worker staging was retired");
+    ensure!(fs::symlink_metadata(path)?.file_type().is_dir()
+        && fs::symlink_metadata(path.join("active.lock"))?.file_type().is_file(),
+        "export staging type changed");
+    // Compare the held handle, not two fresh path lookups (including Windows).
+    ensure!(lease_identity(lock)? == lease_identity(&File::open(path.join("active.lock"))?)?,
+        "export worker staging lock identity changed");
+    Ok(())
+}
+fn discard_files(path: &Path, lock: File, paths: Vec<PathBuf>) -> Result<()> {
+    // The durable marker stays on delayed handles. A retired directory name is
+    // never accepted by a child, even after its lock pathname has been removed.
+    drop(lock);
+    for file in paths.iter().filter(|file| !file.file_name().is_some_and(|name|
+        name == "request.json" || name == "active.lock")) {
+        fs::remove_file(file)?;
+    }
+    // Keep attempt proof until all bulky/optional files have been removed.
+    for name in ["request.json", "active.lock"] {
+        match fs::remove_file(path.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    fs::remove_dir(path)?;
+    Ok(())
+}
+fn fence_transport(path: &Path) -> Result<Inspection> {
+    let paths = transport_files(path)?;
+    let retired = retired_name(path);
+    ensure!(retired || path.file_name().and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("photo-worker-")), "unknown export transport name");
+    if retired && paths.is_empty() {
+        fs::remove_dir(path)?;
+        return Ok(Inspection::Cleaned);
+    }
+    let mut lock = open_lease(path)?;
+    if let Err(error) = lock.try_lock_exclusive() {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            return Ok(Inspection::Retained("worker lease is busy; no relaunch admitted".into()));
+        }
+        return Err(error.into());
+    }
+    let marked = lease_retired(&mut lock)?;
+    ensure!(lease_identity(&lock)? == lease_identity(&File::open(path.join("active.lock"))?)?,
+        "export recovery lease identity changed");
+    if retired {
+        ensure!(marked, "retired transport lacks retirement marker");
+    }
+    let request_path = path.join("request.json");
+    if !request_path.try_exists()? {
+        if retired {
+            // Only discard removes request.json, after the catalog owner has
+            // reconciled the returned retirement proof. No work is fabricated.
+            discard_files(path, lock, paths)?;
+            return Ok(Inspection::Cleaned);
+        }
+        return Ok(Inspection::Retained("partial spawn lacks a request; ownership unknown".into()));
+    }
+    let request: Request = serde_json::from_slice(&read(&request_path, REQUEST_LIMIT)?)?;
+    validate_persisted(&request)?;
+    mark_retired(&mut lock)?;
+    drop(lock);
+    let staging = if retired {
+        path.to_owned()
+    } else {
+        let claimed = path.parent().context("export transport parent")?
+            .join(format!("{RETIRED_PREFIX}{}", uuid::Uuid::new_v4()));
+        // A delayed Windows child may hold its current directory open. Failure
+        // leaves the tombstoned original plus request intact for a later pass.
+        fs::rename(path, &claimed)?;
+        claimed
+    };
+    Ok(Inspection::Retired(RetiredExportTransport { staging, work: request.work }))
+}
+/// The caller must hold the catalog's exclusive export-executor lease and have
+/// no owned active workers. Every retained entry blocks another native launch.
+/// This never kills a PID or accepts/publishes a discovered seal. The bounded
+/// scan reads small requests only; output/profile/XMP contents are not loaded.
+pub fn recover_export_transports(root: &Path, max_directories: usize) -> Result<ExportTransportRecovery> {
+    ensure!(root.is_absolute() && (1..=1024).contains(&max_directories), "export recovery bounds");
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => ensure!(metadata.file_type().is_dir(), "export recovery root type"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExportTransportRecovery::default());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let entries = fs::read_dir(root)?.take(max_directories + 1)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    // Do not fence only a prefix and accidentally imply the remaining directory
+    // set is quiet. The owner must increase its explicit bound or inspect it.
+    ensure!(entries.len() <= max_directories, "export recovery directory bound exceeded");
+    let mut result = ExportTransportRecovery { scanned: entries.len(), ..Default::default() };
+    for entry in entries {
+        let staging = entry.path();
+        match fence_transport(&staging) {
+            Ok(Inspection::Retired(value)) => result.retired.push(value),
+            Ok(Inspection::Cleaned) => result.cleaned += 1,
+            Ok(Inspection::Retained(reason)) => result.retained.push(RetainedExportTransport { staging, reason }),
+            Err(error) => result.retained.push(RetainedExportTransport {
+                staging, reason: format!("{error:#}").chars().take(2048).collect(),
+            }),
+        }
+    }
+    Ok(result)
+}
+/// Call only after the catalog has fenced/reconciled this exact retired attempt.
+/// Its durable destination seal is outside transport and is never removed here.
+pub fn discard_retired_export_transport(retired: &RetiredExportTransport) -> Result<()> {
+    ensure!(retired_name(&retired.staging), "transport was not fenced");
+    let paths = transport_files(&retired.staging)?;
+    let mut lock = open_lease(&retired.staging)?;
+    lock.try_lock_exclusive().context("retired export lease busy")?;
+    ensure!(lease_retired(&mut lock)?, "transport retirement marker missing");
+    let request: Request = serde_json::from_slice(&read(&retired.staging.join("request.json"), REQUEST_LIMIT)?)?;
+    validate_persisted(&request)?;
+    ensure!(same_work(&retired.work, &request.work), "retired export attempt changed");
+    discard_files(&retired.staging, lock, paths)
 }
 
 pub fn export_worker_main() -> Result<()> {
@@ -320,21 +516,9 @@ pub fn export_worker_main() -> Result<()> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true)
         .open(current.join("active.lock"))?;
     lock.try_lock_exclusive()?;
-    ensure!(
-        lock.metadata()?.len() == 0,
-        "export worker staging was retired"
-    );
-    ensure!(
-        crate::storage_volume::object_key(&current.join("active.lock"), &lock.metadata()?)?
-            == crate::storage_volume::object_key(
-                &current.join("active.lock"),
-                &fs::metadata(current.join("active.lock"))?
-            )?,
-        "export worker staging lock identity changed"
-    );
+    check_live_lease(&current, &lock)?;
     let result = (|| -> Result<()> {
         let mut input = std::io::stdin();
         let mut token = [0];
@@ -438,3 +622,7 @@ pub fn export_worker_main() -> Result<()> {
     }
     result
 }
+
+#[cfg(test)]
+#[path = "export_worker/tests.rs"]
+mod tests;
