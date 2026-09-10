@@ -412,7 +412,7 @@ def execute(binding,root):
     exclusive(root/'binding.json',binding)
     if psutil.disk_usage(root).free<binding['minimum_free_bytes']:
         raise ValueError('insufficient fully funded campaign free space')
-    exclusive(root/'host-identity.json',host_identity(root,[a['source'] for a in binding.get('sources',[])]))
+    exclusive(root/'host-identity.json',host_identity(root,[a['path'] for a in binding.get('sources',[])]))
     results=[]
     error=None
     try:
