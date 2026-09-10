@@ -289,3 +289,61 @@ explicit allowance guarded by actual free-space observations, not a forecast of
 compression or immunity to external disk consumption. The final action registry,
 source-copy binding, derivative/service/100-MP verification and aggregate remain
 open; no source-only verification result awards whole-story acceptance.
+
+### Supplemental large-image and final-oracle source revision
+
+The prospective complete registry is now **533 probe cases**, with **seven**
+generated sources (adding an 8000×8000, 64-MP float TIFF). The original thirty
+inputs and every timing cohort/configuration remain unchanged. The four added
+cases are 64-MP admission, 64-MP decode-allocation refusal, and 64/100-MP admitted
+recipe cancellation followed by recovery. Total bounded child accounting is
+7 preparation generators + 533 probes + 533 verifiers + 1 aggregate = **1,074**.
+Preparation has a separately bound sibling root; it is not part of measured action
+roster admission. The frozen source roster is thirty copied originals plus seven
+generated sources, with one separately identified background-import copy.
+
+Large cancellation first decodes the original under its explicit larger allowance.
+A counting cancellation callback trips on the fourth check of the fixed combined
+recipe. In the source bound by this protocol, those checks are render preflight,
+denoise row0, row1, then row2: two rows have completed after input/work/scratch
+allocation. Changed check placement requires requalification. The input's complete
+float-byte digest must remain unchanged; an uncanceled render using that same
+immutable input must match the independently verified admitted combined result.
+This is library cancellation/reuse evidence. Separately tested child termination,
+EOF, retirement and crash recovery retain their actual existing scopes; this does
+not claim a new large-child crash experiment.
+
+The neutral large-image oracle checks every component in eight-row blocks. The
+combined oracle independently evaluates a fixed17×17 grid including output
+boundaries, deriving source neighborhoods, WB, denoise, tone/color, inverse
+geometry and sharpening in float64. It does not claim a full combined-image
+mathematical oracle. All encoded output pixels still undergo independent codec
+readback against the full developed linear artifact. Small fixtures test the
+point evaluator against the existing full-array independent oracle without
+changing declared tolerances.
+
+The derivative metadata expectation is independently constructed from the exact
+controlled selected packet, preserving named RDF subject/unknown structures,
+qualifiers, arrays and multilingual values while applying only the approved
+technical-field replacement policy. Warm/current delivery requires exact encoded
+bytes from the corresponding independently produced linear-proxy recipe reference,
+current revision/source identity, complete actual worker lifecycle, and retained
+actual decoded RGB for both alternating bases. JPEG decoder rounding differences
+are reported separately; no cross-decoder bit-identity promise is invented.
+
+Runtime closure binding now includes every actual file in isolated Python import
+roots, including `.pyc` caches and files absent from distribution RECORD. Added
+import-shadow files therefore invalidate the binding. Both `-I` and `-B` are
+required; `-B` prevents new cache writes while existing caches are still byte-bound.
+Native extension/library bytes, distribution metadata and the executable remain
+included. This collection is preparation work and has not been run in this source
+checkpoint.
+
+Funding includes23 simultaneous encoded extents during export22 (21 earlier
+outputs, current encoded staging and its separate seal copy). After all22 outputs,
+durable job receipts and complete process retirement independently pass, the
+owned disposable per-case catalog and21 unselected destination names may be
+removed using a bounded, symlink-safe, digest-recorded cleanup. First measured
+output, all raw evidence, preview namespaces and source copies remain. Failed
+verification or cleanup stops progression and preserves remaining state; no
+automatic retry or incomplete deletion receipt can count as completed cleanup.

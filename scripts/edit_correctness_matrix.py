@@ -87,6 +87,16 @@ def support_matrix():
     cases.append(dict(id='support-100mp-refused',phase='refusal',fixture_id='support-100mp',
         operation='decode_allocation',recipes=[q.recipe()],outputs=[],warmups=0,repetitions=1,
         limits=refused,deadline_seconds=120))
+    # Explicit supplemental64MP boundary and after-admission cancellation/reuse.
+    admitted64=copy.deepcopy(cases[0])
+    admitted64.update(id='support-64mp-admitted',fixture_id='support-64mp')
+    refused64=copy.deepcopy(cases[1])
+    refused64.update(id='support-64mp-refused',fixture_id='support-64mp')
+    cases.extend([admitted64,refused64])
+    for name in ('support-64mp','support-100mp'):
+        cases.append(dict(id=name+'-cancel-recovery',phase='large_cancellation',fixture_id=name,
+            operation='combined',recipes=[q.recipes()['combined'][0]],outputs=[],warmups=0,repetitions=1,
+            limits=copy.deepcopy(limits),deadline_seconds=3600))
     return cases
 
 

@@ -142,7 +142,7 @@ def plan(manifest):
     return dict(version=1, status="prospective_source_checkpoint_not_admitted",
                 inputs=manifest["inputs"], recipes=r, outputs=o, cases=cases,
                 normal_limits=dict(decode=dict(max_encoded_bytes=512*MIB,
-                    max_intermediate_pixels=32_000_000, max_allocation_bytes=2*GIB),
+                    max_intermediate_pixels=40_000_000, max_allocation_bytes=2*GIB),
                     render=dict(max_pixels=32_000_000, max_allocation_bytes=2*GIB, max_live_bytes=4*GIB),
                     encoded_extent=512*MIB, sampled_worker_rss_stop_bytes=4*GIB,
                     sampled_group_rss_stop_bytes=4*GIB+512*MIB, sampled_interval_seconds=.1),

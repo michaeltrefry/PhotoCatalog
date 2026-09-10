@@ -14,6 +14,8 @@ import edit_reference as ref
 import edit_readback
 import edit_fixtures
 import edit_statistics
+import edit_artifacts
+import edit_large_reference
 
 MAX_JSON=256*1024
 MAX_SAMPLES=16*1024*1024
@@ -194,7 +196,7 @@ def verify_case(root):
         raise ValueError('owned source BLAKE3 differs')
     attempts,values=observations(root)
     per_recipe=request['warmups']+request['repetitions']
-    pixel_phase=request['phase'] in PIXEL_PHASES
+    pixel_phase=request['phase'] in PIXEL_PHASES|{'large_cancellation'}
     sample_coverage(request,attempts,values)
     process_samples=[]
     if request['phase'] in ('overlap_import','overlap_export'):
@@ -204,22 +206,44 @@ def verify_case(root):
         with telemetry.open('rb') as stream:
             process_samples=list(sample_records(stream,total_limit=32*1024*1024))
     overlap=[]
+    large=[]
+    references=[]
+    coverage={'sample_identity','source_hashes'}
     proofs=[]
     numerical=[]
+    canonical=read_json(root/'recipes.json')
+    if len(canonical)!=len(request['recipes']):raise ValueError('canonical recipe coverage')
+    from blake3 import blake3
+    for recipe,entry in zip(request['recipes'],canonical,strict=True):
+        if strict_json(entry['canonical'])!=recipe or blake3(entry['canonical'].encode()).hexdigest()!=entry['digest']:
+            raise ValueError('canonical recipe identity differs')
     for value in values:
         identity=(value.get('recipe_index',0),value['iteration'])
         if value.get('warmup')!=(identity[1]<request['warmups']):
             raise ValueError('warmup marker mismatch')
         if request['phase'] in ('overlap_import','overlap_export'):
             overlap.append(overlap_proof(value,receipt,process_samples))
+            coverage.add('live_overlap')
         if request['phase']=='refusal':
             if not value.get('expected_refusal','').startswith('typed_'):
                 raise ValueError('negative case lacks typed refusal')
+            coverage.add('typed_refusal')
             continue
+        if request['phase'] in ('warm_service','first_raw'):
+            references.append(edit_artifacts.service_artifact(root,request,value))
+            coverage.add('service_artifacts')
+        if request['phase'] in ('export','export_correctness'):
+            proof,dependencies=edit_artifacts.export_artifact(root,request,value)
+            references.extend(dependencies)
+            proofs.append(proof)
+            coverage.update(('export_artifacts','encoded_pixels_metadata'))
         if pixel_phase:
+            if value['recipe_digest']!=canonical[identity[0]]['digest']:
+                raise ValueError('observed recipe digest differs')
             info=value['pixels']
             if info['nonfinite']!=0 or sum(info['alpha_zero_partial_opaque'])!=info['width']*info['height']:
                 raise ValueError('pixel finite/alpha coverage')
+            coverage.add('pixel_finite')
             raw=info.get('raw')
             actual=None
             if raw:
@@ -237,9 +261,35 @@ def verify_case(root):
                 recipe=request['recipes'][identity[0]]
                 expected_pixels=ref.render(source,recipe)
                 proof=ref.compare(actual,expected_pixels,geometry_changed=bool(recipe['settings']['straighten_degrees']))
+                coverage.add('analytic_pixels')
                 numerical.append(dict(recipe_index=identity[0],**proof))
                 if not proof['pass_']:
                     raise ValueError('independent analytic pixel mismatch')
+            if request['phase'] in ('support100mp','large_cancellation'):
+                if actual is None:raise ValueError('100MP reference pixels missing')
+                large.append(edit_large_reference.verify_large(actual,request['recipes'][identity[0]],request['width'],request['height']))
+                coverage.add('large_image_oracle')
+            if request['phase']=='large_cancellation':
+                if (value.get('typed_canceled') is not True or value.get('cancellation_polls')!=4
+                    or value.get('completed_denoise_rows_before_cancel')!=2
+                    or value.get('input_before_blake3')!=value.get('input_after_blake3')):
+                    raise ValueError('large admitted cancellation/reuse proof differs')
+                directory,expected,dependency=edit_artifacts.reference_case(root,request,
+                    request['fixture_id']+'-admitted',request['recipes'][0])
+                if expected['pixels']['rgba_f32le_blake3']!=info['rgba_f32le_blake3']:
+                    raise ValueError('recovery differs from independently admitted combined output')
+                references.append(dependency)
+            if request['phase']=='proxy_reference':
+                from edit_readback import read
+                preview=value['preview_reference']
+                path=owned(root,preview['path'])
+                if digest(path,'blake3',8*1024*1024)!=preview['blake3']:
+                    raise ValueError('proxy JPEG reference identity differs')
+                decoded,descriptor=read(path,max_pixels=1600*1600,max_encoded_bytes=8*1024*1024,
+                                        max_decoded_bytes=1600*1600*4)
+                if descriptor['format']!='jpeg' or decoded.shape[:2]!=(preview['height'],preview['width']):
+                    raise ValueError('proxy reference framing differs')
+                coverage.add('proxy_artifacts')
             for specification,artifact in output_coverage(request,value):
                 path=owned(root,artifact['path'])
                 if digest(path,'blake3',request['encoded_extent'])!=artifact['blake3']:
@@ -247,15 +297,18 @@ def verify_case(root):
                 if actual is None:
                     raise ValueError('export correctness lacks edited linear reference')
                 proof=edit_readback.verify(path,actual,specification,request.get('metadata',{}),
-                                          constant_jpeg=fixture=='analytic-flat')
+                                          constant_jpeg=fixture=='analytic-flat',
+                                          max_encoded_bytes=request['encoded_extent'],
+                                          max_decoded_bytes=request['render']['max_allocation_bytes'])
                 if proof['pixel_pass'] is False:
                     raise ValueError('independent encoded pixel mismatch')
                 proofs.append(proof)
+                coverage.add('encoded_pixels_metadata')
     return dict(version=1,verified=True,whole_story_qualified=False,request_sha256=digest(root/'request.json','sha256',MAX_JSON),
                 receipt_sha256=digest(root/'receipt.json','sha256',MAX_JSON),
                 samples_sha256=digest(root/'samples.jsonl','sha256',MAX_SAMPLES),
-                sample_count=len(values),analytic=numerical,encoded=proofs,overlap=overlap,
-                remaining=['100MP streaming full/point oracle','service/export per-sample artifact oracle'])
+                sample_count=len(values),analytic=numerical,encoded=proofs,overlap=overlap,large=large,
+                coverage=sorted(coverage),reference_cases=references,remaining=[])
 
 
 def main():

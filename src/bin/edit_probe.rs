@@ -40,6 +40,7 @@ enum Phase {
     WarmService,
     Export,
     Support100mp,
+    LargeCancellation,
     Refusal,
     ProxyReference,
     ExportCorrectness,
@@ -480,6 +481,13 @@ fn delivery(request: &Request, samples: &mut File) -> Result<()> {
                 .open(&path)?;
             file.write_all(encoded.bytes())?;
             file.sync_all()?;
+            let mut decoded_file = OpenOptions::new().write(true).create_new(true).open(
+                request
+                    .output
+                    .join(format!("delivery-basis-{iteration}.rgb")),
+            )?;
+            decoded_file.write_all(view.pixels.pixels().pixels())?;
+            decoded_file.sync_all()?;
             Some(path)
         } else {
             None
@@ -841,6 +849,88 @@ fn overlap(request: &Request, samples: &mut File) -> Result<()> {
         Ok(())
     })
 }
+fn linear_digest(pixels: &[[f32; 4]]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = [0u8; 65536];
+    for block in pixels.chunks(4096) {
+        for (pixel, output) in block.iter().zip(bytes.chunks_mut(16)) {
+            for (channel, target) in pixel.iter().zip(output.chunks_mut(4)) {
+                target.copy_from_slice(&channel.to_le_bytes());
+            }
+        }
+        hasher.update(&bytes[..block.len() * 16]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn large_cancellation(request: &Request, samples: &mut File) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct AfterRows(AtomicUsize);
+    impl edit::CancelCheck for AfterRows {
+        fn is_canceled(&self) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed) >= 3
+        }
+    }
+    ensure!(
+        request.recipes.len() == 1 && request.outputs.is_empty(),
+        "large cancellation request shape"
+    );
+    let recipe = request.recipes[0].validate()?;
+    ensure!(
+        recipe.settings().noise_reduction.luminance > 0.
+            && recipe.settings().noise_reduction.chroma > 0.,
+        "fixed cancellation proof requires first-stage denoise"
+    );
+    let original = load_original(request, &request.recipes[0])?;
+    let before = linear_digest(original.pixels());
+    record(
+        samples,
+        json!({"kind":"attempt","iteration":0,"started":stamp()}),
+    )?;
+    let started = stamp();
+    let timer = Instant::now();
+    let cancellation = AfterRows(AtomicUsize::new(0));
+    let failed = edit::render_recipe(
+        &original,
+        &recipe,
+        RenderPurpose::ExportExact,
+        request.render,
+        &cancellation,
+    );
+    ensure!(
+        matches!(failed, Err(edit::RenderError::Canceled)),
+        "expected cancellation inside admitted denoise"
+    );
+    ensure!(
+        cancellation.0.load(Ordering::Relaxed) == 4,
+        "cancellation check placement changed; requalify work proof"
+    );
+    let after = linear_digest(original.pixels());
+    ensure!(before == after, "canceled render mutated prepared original");
+    let recovered = edit::render_recipe(
+        &original,
+        &recipe,
+        RenderPurpose::ExportExact,
+        request.render,
+        &(),
+    )?;
+    let elapsed_ms = timer.elapsed().as_secs_f64() * 1000.;
+    let finished = stamp();
+    let pixels = surface(
+        recovered.as_rendered(),
+        Some(&request.output.join("recovered.rgba.f32")),
+    )?;
+    record(
+        samples,
+        json!({"kind":"observation","iteration":0,"warmup":false,
+        "started":started,"finished":finished,"elapsed_ms":elapsed_ms,"pixels":pixels,
+        "recipe_index":0,"exports":[],"recipe_digest":recipe.digest(),"input_before_blake3":before,"input_after_blake3":after,
+        "typed_canceled":true,"cancellation_polls":4,"completed_denoise_rows_before_cancel":2,
+        "scope":"source-bound row-check placement; full admitted input/work/scratch; library cancellation and same-input recovery"}),
+    )?;
+    Ok(())
+}
+
 fn refusal(request: &Request, samples: &mut File) -> Result<()> {
     use edit::RenderError;
     let recipe = request.recipes[0].validate()?;
@@ -976,6 +1066,7 @@ fn run(request: &Request, samples: &mut File) -> Result<()> {
         Phase::Full | Phase::FirstRaw | Phase::Export => (2, 20),
         Phase::Correctness
         | Phase::Support100mp
+        | Phase::LargeCancellation
         | Phase::Refusal
         | Phase::ProxyReference
         | Phase::ExportCorrectness => (0, 1),
@@ -999,7 +1090,10 @@ fn run(request: &Request, samples: &mut File) -> Result<()> {
     let pixel_count = u64::from(request.width) * u64::from(request.height);
     ensure!(
         pixel_count
-            <= if matches!(request.phase, Phase::Support100mp | Phase::Refusal) {
+            <= if matches!(
+                request.phase,
+                Phase::Support100mp | Phase::LargeCancellation | Phase::Refusal
+            ) {
                 100_000_000
             } else {
                 32_000_000
@@ -1010,6 +1104,11 @@ fn run(request: &Request, samples: &mut File) -> Result<()> {
         fingerprint(&request.source, request.decode.max_encoded_bytes)? == request.source_blake3,
         "source before mismatch"
     );
+    let recipe_proofs = request.recipes.iter().map(|recipe| -> Result<Value> {
+        let validated = recipe.validate()?;
+        Ok(json!({"canonical":std::str::from_utf8(validated.canonical_bytes())?,"digest":validated.digest()}))
+    }).collect::<Result<Vec<_>>>()?;
+    exclusive(&request.output.join("recipes.json"), &recipe_proofs)?;
     match request.phase {
         Phase::Correctness
         | Phase::Kernel
@@ -1019,6 +1118,7 @@ fn run(request: &Request, samples: &mut File) -> Result<()> {
         Phase::FirstRaw | Phase::WarmService => delivery(request, samples)?,
         Phase::Export | Phase::ExportCorrectness => export(request, samples)?,
         Phase::Refusal => refusal(request, samples)?,
+        Phase::LargeCancellation => large_cancellation(request, samples)?,
         Phase::OverlapImport | Phase::OverlapExport => overlap(request, samples)?,
     }
     ensure!(
@@ -1062,4 +1162,25 @@ fn main() -> Result<()> {
         "probe_source_blake3":blake3::hash(include_bytes!("edit_probe.rs")).to_hex().to_string()}),
     )?;
     result
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod kernel_identity_tests {
+    use super::*;
+
+    #[test]
+    fn direct_child_identity_is_not_live_after_reap() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let identity = live_worker_identity(child.id());
+        let killed = child.kill();
+        let waited = child.wait();
+        killed.unwrap();
+        waited.unwrap();
+        let identity = identity.unwrap();
+        assert_eq!(identity.parent_pid, std::process::id());
+        assert!(live_worker_identity(identity.pid).is_err());
+    }
 }

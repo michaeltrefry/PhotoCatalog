@@ -48,6 +48,20 @@ class VerificationAdmission(unittest.TestCase):
         for data in (b'{"n":NaN}',b'{"n":Infinity}',b'{"n":1e9999}',b'{"n":1,"n":2}'):
             with self.assertRaises(ValueError): verify.strict_json(data)
 
+    def test_stale_actor_pid_and_reused_kernel_identity_cannot_prove_overlap(self):
+        identity=dict(pid=42,parent_pid=10,start_seconds=1,start_microseconds=0)
+        value=dict(live_workers_before=[identity],live_workers_after=[identity.copy()],
+                   owned_pids_before=[42],owned_pids_after=[42],
+                   **{name:dict(unix_ns=str(2_000_000_000+i)) for i,name in enumerate(('live_before_at','started','finished','live_after_at'))})
+        receipt=dict(probe_pid=10)
+        telemetry=[dict(at=dict(unix_ns=2_000_000_000),processes=[dict(pid=42,create_time=1.,status='running')])]
+        verify.overlap_proof(value,receipt,telemetry)
+        with self.assertRaises(ValueError):verify.overlap_proof(value,receipt,[])
+        telemetry[0]['processes'][0]['create_time']=.5
+        with self.assertRaises(ValueError):verify.overlap_proof(value,receipt,telemetry)
+        value['live_workers_after'][0]['start_microseconds']=1
+        with self.assertRaises(ValueError):verify.overlap_proof(value,receipt,[])
+
 
 if __name__=='__main__':
     unittest.main()

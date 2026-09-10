@@ -33,7 +33,7 @@ def budget(manifest):
         w,h=dimensions[case['fixture_id']]
         extent=case.get('limits',{}).get('encoded_extent',case.get('encoded_extent',normal_extent))
         count=len(case['recipes'])
-        if phase in ('correctness','support100mp'):
+        if phase in ('correctness','support100mp','large_cancellation'):
             raw_needed=(case['operation']=='combined' or w*h<=512*512)
             if raw_needed:
                 retained_raw+=w*h*16*count
@@ -52,9 +52,10 @@ def budget(manifest):
             files+=per_namespace_entries
             if phase=='export':
                 # Keep first measured complete output; additional21 successful
-                # objects exist simultaneously until the whole child is verified.
+                # destinations plus an additional sealed copy can coexist with current staging;
+                # all are funded until independent verification and cleanup.
                 retained_encoded+=extent
-                active_extra=max(active_extra,(case['warmups']+case['repetitions']-1)*extent)
+                active_extra=max(active_extra,(case['warmups']+case['repetitions'])*extent)
                 files+=1
             elif phase=='export_correctness':
                 retained_encoded+=extent
@@ -64,8 +65,10 @@ def budget(manifest):
                 files+=1
             elif phase in ('warm_service','first_raw'):
                 retained_encoded+=len(case['recipes'])*8*q.MIB
+                retained_raw+=len(case['recipes'])*1600*1600*3
                 files+=len(case['recipes'])
-    # Two children per probe (probe+independent verification), six generators,
+                files+=len(case['recipes'])
+    # Two children per probe (probe+independent verification), seven generators,
     # then one aggregate. This must be revised if actual actions change.
     children=2*len(cases)+len(edit_fixtures.FIXTURES)+1
     stream_allowance=children*40*q.MIB  # 32MiB telemetry +4MiB each stdout/stderr
@@ -74,7 +77,7 @@ def budget(manifest):
     allocation_overhead=(files+children*8)*4096
     retained=retained_raw+retained_encoded+retained_proxy_reference+namespace_allowance+stream_allowance+request_receipt_allowance+allocation_overhead
     # Owned originals use declared encoded ceilings, never expected compression.
-    copies=len(manifest['inputs'])*normal_extent+2*q.GIB+16*q.MIB+normal_extent
+    copies=len(manifest['inputs'])*normal_extent+4*q.GIB+16*q.MIB+normal_extent
     active=active_extra+32*q.MIB # native staging reservation, beyond retained basis
     reserve=16*q.GIB
     funded=retained+active+copies+reserve

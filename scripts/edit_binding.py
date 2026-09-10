@@ -17,6 +17,7 @@ import runpy
 import sys
 
 HELPERS=(
+    'edit_aggregate','edit_artifacts','edit_derivative','edit_large_reference','edit_request','edit_build_plan',
     'edit_binding','edit_campaign','edit_correctness_matrix','edit_disk_budget',
     'edit_fixtures','edit_qualification','edit_readback','edit_reference',
     'edit_statistics','edit_verify','preview_host',
@@ -94,10 +95,6 @@ def distribution_files(name):
     root=Path(sys.prefix).resolve(strict=True)
     result={}
     for item in distribution.files or ():
-        # Bytecode is derived and import may create it; canonical source and native
-        # extensions, metadata/RECORD and data are all bound instead.
-        if '__pycache__' in item.parts or str(item).endswith('.pyc'):
-            continue
         path=Path(distribution.locate_file(item)).resolve(strict=True)
         if root not in path.parents:
             raise ValueError('dependency file outside selected environment')
@@ -110,38 +107,59 @@ def distribution_files(name):
     return dict(version=distribution.version,files=result)
 
 
+def import_closure():
+    # RECORD is insufficient: Python can execute cached or newly added modules.
+    # Bind every actual file under every isolated import root, including pyc,
+    # zip packages and unrecorded files. Missing standard zip roots are bound too.
+    roots={}
+    total=0
+    helper=Path(__file__).resolve().parent
+    for entry in sys.path:
+        if not entry:raise ValueError('current-directory import path is not admitted')
+        root=Path(entry).absolute()
+        if root.resolve()==helper:continue # separately sealed helper package
+        if not root.exists():
+            roots[str(root)]={'absent':True}
+            continue
+        files={}
+        pending=[root]
+        while pending:
+            path=pending.pop()
+            if path.is_symlink():
+                if path.is_dir():raise ValueError('runtime import directory symlink requires an explicit private copy')
+                target=path.resolve(strict=True)
+                files[str(path.relative_to(root.parent if root.is_file() else root))]=dict(symlink=os.readlink(path),target=str(target),sha256=file_hash(target))
+                total+=1
+            elif path.is_dir():
+                with os.scandir(path) as entries:
+                    for item in entries:
+                        if len(pending)+total>=MAX_FILES:raise ValueError('runtime import file-count admission')
+                        pending.append(Path(item.path))
+            elif path.is_file():
+                files[str(path.relative_to(root.parent if root.is_file() else root))]=dict(sha256=file_hash(path))
+                total+=1
+            else:raise ValueError('non-ordinary runtime import entry')
+            if total>MAX_FILES:raise ValueError('runtime import file-count admission')
+        roots[str(root)]={'files':files}
+    return roots
+
+
 def runtime_identity():
-    # Includes the executable bytes behind a venv symlink, exact Python build,
-    # every installed dependency source/native/data file, and actual loaded
-    # standard-library modules. Distribution collection precedes this snapshot.
     distributions={name:distribution_files(name) for name in DISTRIBUTIONS}
-    standard={}
-    stdlib=Path(sys.base_prefix).resolve(strict=True)
-    for module in tuple(sys.modules.values()):
-        origin=getattr(module,'__file__',None)
-        if not origin: continue
-        path=Path(origin).resolve(strict=True)
-        if path.suffix=='.pyc' and path.with_suffix('.py').is_file():
-            path=path.with_suffix('.py')
-        if stdlib in path.parents and Path(sys.prefix).resolve() not in path.parents:
-            standard[str(path)]=file_hash(path)
     return dict(executable=str(Path(sys.executable).resolve(strict=True)),
                 executable_sha256=file_hash(Path(sys.executable).resolve(strict=True)),
-                prefix=str(Path(sys.prefix).resolve()),base_prefix=str(stdlib),
+                prefix=str(Path(sys.prefix).resolve()),base_prefix=str(Path(sys.base_prefix).resolve()),
                 version=sys.version,cache_tag=sys.implementation.cache_tag,
-                platform=sys.platform,distributions=distributions,stdlib=standard)
+                platform=sys.platform,distributions=distributions,import_closure=import_closure())
 
 
 def validate_runtime(expected):
     # Compare exact distribution manifests independently of how many modules this
     # launcher happens to have imported; check every recorded stdlib file too.
     actual=runtime_identity()
-    for field in ('executable','executable_sha256','prefix','base_prefix','version','cache_tag','platform','distributions'):
+    for field in ('executable','executable_sha256','prefix','base_prefix','version','cache_tag','platform','distributions','import_closure'):
         if actual[field]!=expected[field]:
             raise ValueError('runtime binding mismatch: '+field)
-    for path,digest in expected['stdlib'].items():
-        if file_hash(path)!=digest:
-            raise ValueError('standard-library identity changed')
 
 
 def freeze_package(source,destination):
@@ -187,8 +205,8 @@ def admit_imports(package):
 
 
 def verify_case_registry(expected,cases):
-    if len(cases)!=529 or len({case['id'] for case in cases})!=529:
-        raise ValueError('exact 529-case registry coverage required')
+    if len(cases)!=533 or len({case['id'] for case in cases})!=533:
+        raise ValueError('exact 533-case registry coverage required')
     canonical=json.dumps(cases,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
     digest=hashlib.sha256(canonical).hexdigest()
     if expected!=digest:
@@ -199,16 +217,19 @@ def verify_case_registry(expected,cases):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--binding',type=Path,required=True)
-    parser.add_argument('--entry',choices=('edit_campaign','edit_verify','edit_fixtures'),required=True)
+    parser.add_argument('--binding-sha256',required=True)
+    parser.add_argument('--entry',choices=('edit_campaign','edit_verify','edit_fixtures','edit_aggregate'),required=True)
     parser.add_argument('arguments',nargs=argparse.REMAINDER)
     args=parser.parse_args()
-    if not sys.flags.isolated:
-        raise ValueError('frozen launcher requires Python -I')
+    if not sys.flags.isolated or not sys.flags.dont_write_bytecode:
+        raise ValueError('frozen launcher requires Python -I -B')
     if args.binding.stat().st_size>16*1024*1024:
         raise ValueError('binding JSON byte admission')
     with args.binding.open('rb') as stream:
         data=stream.read(16*1024*1024+1)
     if len(data)>16*1024*1024: raise ValueError('binding JSON grew')
+    if hashlib.sha256(data).hexdigest()!=args.binding_sha256:
+        raise ValueError('runtime/package binding digest mismatch')
     value=json.loads(data)
     validate_runtime(value['python_runtime'])
     root=admit_imports(value['helper_package'])

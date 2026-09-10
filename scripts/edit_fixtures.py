@@ -13,7 +13,7 @@ import edit_reference as ref
 
 FIXTURES = {'analytic-signed-alpha': (16,12), 'analytic-impulse': (16,12),
             'analytic-noise': (32,24), 'analytic-flat': (48,32), 'analytic-metadata': (48,32),
-            'support-100mp': (10000,10000)}
+            'support-100mp': (10000,10000), 'support-64mp': (8000,8000)}
 
 
 def row(name, y):
@@ -43,8 +43,8 @@ def row(name, y):
 
 
 def pixels(name):
-    if name == 'support-100mp':
-        raise ValueError('100MP source must stream, not stack')
+    if name in ('support-100mp','support-64mp'):
+        raise ValueError('large source must stream, not stack')
     np = ref.np_module()
     return np.stack([row(name,y) for y in range(FIXTURES[name][1])]).astype(np.float64)
 
@@ -67,9 +67,13 @@ def generate(name, path):
                          extratags=tags)
         stream.flush()
         os.fsync(stream.fileno())
+    from blake3 import blake3
+    sha=hashlib.sha256(); b3=blake3()
     with path.open('rb') as stream:
-        digest = hashlib.file_digest(stream,'sha256').hexdigest()
-    return dict(id=name,path=str(path.resolve()),width=w,height=h,sha256=digest,
+        while part:=stream.read(65536):
+            sha.update(part);b3.update(part)
+    digest=sha.hexdigest()
+    return dict(id=name,path=str(path.resolve()),width=w,height=h,sha256=digest,blake3=b3.hexdigest(),
                 bytes=path.stat().st_size,construction='edit_fixtures.row/v1',
                 icc_sha256=hashlib.sha256(ref.matrix_profile()).hexdigest())
 

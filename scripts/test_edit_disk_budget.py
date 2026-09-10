@@ -10,12 +10,12 @@ def manifest():
 class DiskContracts(unittest.TestCase):
     def test_all_cases_and_entire_peak_are_funded(self):
         value=disk.budget(manifest())
-        self.assertEqual(value['proposed_probe_count'],529)
-        self.assertEqual(value['proposed_total_children'],1065)
+        self.assertEqual(value['proposed_probe_count'],533)
+        self.assertEqual(value['proposed_total_children'],1074)
         peak=sum(value[k] for k in ('retained_bound_bytes','active_bound_bytes','copies_bound_bytes','free_reserve_bytes'))
         self.assertGreaterEqual(value['minimum_free_bytes'],peak)
         self.assertEqual(value['minimum_free_bytes']%q.GIB,0)
-        self.assertGreaterEqual(value['active_bound_bytes'],21*512*q.MIB)
+        self.assertGreaterEqual(value['active_bound_bytes'],22*512*q.MIB)
 
     def test_bigger_source_grows_funding_without_reducing_other_terms(self):
         small=manifest()
