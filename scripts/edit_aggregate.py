@@ -11,6 +11,8 @@ import math
 import os
 from pathlib import Path
 import edit_disk_budget
+import edit_fixtures
+import edit_qualification
 import edit_statistics
 import edit_verify
 
@@ -20,7 +22,8 @@ MAX_REPORT = 64*MIB
 PHASE_COVERAGE = {
     'correctness': {'pixel_finite'}, 'kernel': {'pixel_finite'},
     'full': {'pixel_finite'}, 'proxy_reference': {'pixel_finite', 'proxy_artifacts'},
-    'support100mp': {'pixel_finite', '100mp_oracle', 'encoded_pixels_metadata'},
+    'support100mp': {'pixel_finite', 'large_image_oracle'},
+    'large_cancellation': {'pixel_finite', 'large_image_oracle'},
     'refusal': {'typed_refusal'}, 'warm_service': {'service_artifacts'},
     'first_raw': {'service_artifacts'}, 'export': {'export_artifacts'},
     'export_correctness': {'export_artifacts', 'encoded_pixels_metadata'},
@@ -92,6 +95,11 @@ def supervisor(root, folder, reference, command, limits, expected_pid=None):
     if expected_pid is not None and positive_integer(spawn['pid']) != positive_integer(expected_pid):
         raise ValueError('probe receipt PID differs from actually launched child')
     count = positive_integer(result['samples'])
+    spawn_identity = (positive_integer(spawn['pid']), edit_statistics.nonnegative(spawn['create_time']))
+    begin = positive_integer(start['started']['monotonic_ns'])
+    finish = positive_integer(result['finished']['monotonic_ns'])
+    if finish < begin or finish-begin > (limits['deadline_seconds']+30)*1_000_000_000:
+        raise ValueError('supervisor elapsed/deadline evidence differs')
     if count > 36002:
         raise ValueError('supervisor sample count exceeds fixed maximum')
     peak = edit_statistics.nonnegative(result['sampled_peak_group_rss'])
@@ -105,12 +113,15 @@ def supervisor(root, folder, reference, command, limits, expected_pid=None):
     observed = 0
     actual_peak = 0
     previous = None
+    observed_root = False
     with telemetry_path.open('rb') as stream:
         for value in edit_verify.sample_records(stream, total_limit=32*MIB):
             observed += 1
             now = positive_integer(value['at']['monotonic_ns'])
             if previous is not None and now < previous:
                 raise ValueError('supervisor clock moved backwards')
+            if not begin <= now <= finish:
+                raise ValueError('supervisor sample outside actual launch interval')
             previous = now
             processes = value['processes']
             if not isinstance(processes, list) or len(processes) > 4:
@@ -122,6 +133,7 @@ def supervisor(root, folder, reference, command, limits, expected_pid=None):
                 if key in identities or process['status'] in ('zombie', 'dead'):
                     raise ValueError('invalid live process observation')
                 identities.add(key)
+                observed_root |= key == spawn_identity
                 rss = process['rss']
                 if type(rss) is not int or not 0 <= rss <= limits['process_rss_bytes']:
                     raise ValueError('sampled per-process RSS admission exceeded')
@@ -131,8 +143,8 @@ def supervisor(root, folder, reference, command, limits, expected_pid=None):
             if type(value['free_bytes']) is not int or value['free_bytes'] < limits['free_reserve_bytes']:
                 raise ValueError('sampled disk reserve exhausted')
             actual_peak = max(actual_peak, total)
-    if observed != count or actual_peak != peak:
-        raise ValueError('sample count or peak does not reconcile')
+    if observed != count or actual_peak != peak or not observed_root:
+        raise ValueError('sample count/peak/root identity does not reconcile')
     for name in ('stdout.log', 'stderr.log'):
         capture = result['captures'][name]
         artifact = result[name]
@@ -145,16 +157,12 @@ def supervisor(root, folder, reference, command, limits, expected_pid=None):
         path = bound_path(root, folder/name)
         if path.stat().st_size != artifact['bytes'] or edit_verify.digest(path, 'sha256', 4*MIB) != artifact['sha256']:
             raise ValueError('supervisor evidence stream changed')
-    begin = positive_integer(start['started']['monotonic_ns'])
-    finish = positive_integer(result['finished']['monotonic_ns'])
-    if finish < begin or finish-begin > (limits['deadline_seconds']+30)*1_000_000_000:
-        raise ValueError('supervisor elapsed/deadline evidence differs')
     return dict(samples=count, sampled_peak_group_rss=actual_peak, root_reaped=True)
 
 
 def registry(manifest, binding, records):
     expected = edit_disk_budget.complete_cases(manifest)
-    if len(expected) != 529 or not same(binding['cases'], expected):
+    if len({case['id'] for case in expected}) != len(expected) or not same(binding['cases'], expected):
         raise ValueError('frozen registry differs from the entire prospective matrix')
     if hashlib.sha256(canonical(expected)).hexdigest() != binding['cases_sha256']:
         raise ValueError('frozen matrix digest differs')
@@ -166,12 +174,67 @@ def registry(manifest, binding, records):
 
 def required_coverage(request):
     required = PHASE_COVERAGE[request['phase']] | {'sample_identity', 'source_hashes'}
-    if request['phase'] == 'correctness':
+    if request['phase'] in ('correctness', 'support100mp'):
         if request['fixture_id'].startswith('analytic-'):
             required |= {'analytic_pixels'}
         if request['outputs']:
             required |= {'encoded_pixels_metadata'}
     return required
+
+
+EXIF_FIELDS = ('make', 'model', 'lens', 'date_time_original', 'artist', 'copyright',
+               'description', 'exposure_time', 'f_number', 'iso', 'focal_length')
+
+
+def normalized_metadata(value):
+    if not isinstance(value, dict) or set(value)-{'xmp', 'exif'}:
+        raise ValueError('unexpected metadata request field')
+    exif = value.get('exif', {})
+    if not isinstance(exif, dict) or set(exif)-set(EXIF_FIELDS):
+        raise ValueError('unexpected safe EXIF request field')
+    return {'xmp': value.get('xmp'), 'exif': {key: exif.get(key) for key in EXIF_FIELDS}}
+
+
+def case_semantics(case, request, normal_limits):
+    for field in ('phase', 'fixture_id', 'operation', 'recipes', 'outputs', 'warmups', 'repetitions'):
+        if not same(request[field], case[field]):
+            raise ValueError('request changed prospective case: '+field)
+    if not same(normalized_metadata(request['metadata']), normalized_metadata(case.get('metadata', {}))):
+        raise ValueError('request changed selected XMP or EXIF metadata')
+    if not same(request['resolve_embedded'], case.get('resolve_embedded', False)):
+        raise ValueError('request changed embedded metadata resolution')
+    explicit = case.get('limits', {})
+    for key in ('decode', 'render'):
+        if not same(request[key], explicit.get(key, normal_limits[key])):
+            raise ValueError('request changed prospective resource admission: '+key)
+    extent = explicit.get('encoded_extent', case.get('encoded_extent', normal_limits['encoded_extent']))
+    if not same(request['encoded_extent'], extent):
+        raise ValueError('request changed encoded output extent')
+
+
+def preparation(root, binding):
+    records = binding['preparation_records']
+    if (not isinstance(records, list) or len(records) != len(edit_fixtures.FIXTURES)
+            or {r['id'] for r in records} != set(edit_fixtures.FIXTURES)):
+        raise ValueError('missing, duplicate or substituted fixture preparation')
+    proofs = {}
+    for record in records:
+        # Preparation happens before final request hashes exist. Its exact
+        # process and generated-source receipts are then frozen in the binding.
+        folder = Path(record['supervisor_path']).parent
+        proof = supervisor(root, folder, record['supervisor_path'], record['command'], record['limits'])
+        receipt_path = admitted_file(root, record['receipt_path'], MIB)
+        receipt = edit_verify.read_json(receipt_path, MIB)
+        if (receipt['id'] != record['id'] or receipt['path'] != record['output']
+                or (receipt['width'], receipt['height']) != edit_fixtures.FIXTURES[record['id']]
+                or receipt.get('construction') != 'edit_fixtures.row/v1'):
+            raise ValueError('fixture generation identity differs')
+        path = bound_path(root, record['output'])
+        if path.stat().st_size != receipt['bytes'] or edit_verify.digest(path, 'sha256', 2*1024**3) != receipt['sha256']:
+            raise ValueError('generated fixture changed after preparation')
+        proofs[record['id']] = dict(receipt=receipt, supervisor=proof,
+            receipt_sha256=edit_verify.digest(receipt_path, 'sha256', MIB))
+    return proofs
 
 
 def case_result(request, receipt, verification, attempts, values):
@@ -236,6 +299,11 @@ def aggregate(root, binding):
     if edit_verify.digest(manifest_path, 'sha256', MIB) != binding['manifest']['sha256']:
         raise ValueError('source cohort manifest changed')
     manifest = edit_verify.read_json(manifest_path, MIB)
+    normal_limits = edit_qualification.plan(manifest)['normal_limits']
+    if not same(binding['normal_limits'], normal_limits):
+        raise ValueError('normal resource configuration differs from prospective plan')
+    prepared = preparation(root, binding)
+    cohort = {item['id']: item for item in manifest['inputs']}
     records = binding['case_records']
     cases = registry(manifest, binding, records)
     summaries, raw_cases, references, supervisors = [], [], {}, []
@@ -255,9 +323,11 @@ def aggregate(root, binding):
         request = edit_verify.read_json(request_path)
         if not same(request, record['request']) or not same(request, actions[case_id]['request']):
             raise ValueError('executed request differs from frozen request')
-        for field in ('phase', 'fixture_id', 'operation', 'recipes', 'outputs', 'warmups', 'repetitions'):
-            if not same(request[field], case[field]):
-                raise ValueError('request changed prospective case: '+field)
+        case_semantics(case, request, normal_limits)
+        input_proof = cohort.get(request['fixture_id']) or prepared[request['fixture_id']]['receipt']
+        if (request['source_sha256'] != input_proof['sha256']
+                or not same([request['width'], request['height']], [input_proof['width'], input_proof['height']])):
+            raise ValueError('request differs from independent cohort source hash/dimensions')
         receipt = edit_verify.read_json(output/'receipt.json')
         verification_path = admitted_file(root, record['verification_path'], MAX_REPORT)
         if verification_path != root/('verify-'+case_id+'-verification.json'):
@@ -324,6 +394,7 @@ def aggregate(root, binding):
                 summaries=summaries, missed_latency_targets=missed, deterministic_repeats=repeat,
                 sources=source_proofs, supervisor_count=len(supervisors),
                 sampled_peak_group_rss=max(s['sampled_peak_group_rss'] for s in supervisors),
+                generated_preparations=prepared,
                 caveat='Sampled RSS and disk checks are not hard allocation limits; platform/UI delivery remains separate.')
 
 

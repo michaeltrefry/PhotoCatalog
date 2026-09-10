@@ -25,7 +25,7 @@ class AggregateContracts(unittest.TestCase):
         cases = edit_disk_budget.complete_cases(cohort)
         binding = {'cases': cases, 'cases_sha256': hashlib.sha256(aggregate.canonical(cases)).hexdigest()}
         records = [{'id': case['id']} for case in cases]
-        self.assertEqual(len(aggregate.registry(cohort, binding, records)), 529)
+        self.assertEqual(len(aggregate.registry(cohort, binding, records)), len(cases))
         for altered in (records[:-1], list(reversed(records)), records[:-1]+[records[0]]):
             with self.assertRaises(ValueError): aggregate.registry(cohort, binding, altered)
         bad = copy.deepcopy(binding)
@@ -131,6 +131,54 @@ class AggregateContracts(unittest.TestCase):
             alias = owned/'alias'; alias.symlink_to(outside)
             for path in (outside, alias):
                 with self.assertRaises(ValueError): aggregate.admitted_file(owned, path, 100)
+
+    def test_metadata_resolution_and_resource_requests_cannot_silently_change(self):
+        import edit_correctness_matrix as matrix
+        normal = q.plan(manifest())['normal_limits']
+        cases = (matrix.output_matrix()[0], matrix.durable_metadata_cases()[0], matrix.support_matrix()[0])
+        for case in cases:
+            with self.subTest(case=case['id']):
+                r = {k: copy.deepcopy(case[k]) for k in ('phase', 'fixture_id', 'operation', 'recipes', 'outputs', 'warmups', 'repetitions')}
+                limits = case.get('limits', {})
+                r.update(metadata=aggregate.normalized_metadata(case.get('metadata', {})),
+                         resolve_embedded=case.get('resolve_embedded', False),
+                         decode=copy.deepcopy(limits.get('decode', normal['decode'])),
+                         render=copy.deepcopy(limits.get('render', normal['render'])),
+                         encoded_extent=limits.get('encoded_extent', case.get('encoded_extent', normal['encoded_extent'])))
+                aggregate.case_semantics(case, r, normal)
+                changes = [lambda v: v.update(resolve_embedded=not v['resolve_embedded']),
+                           lambda v: v['decode'].update(max_allocation_bytes=1),
+                           lambda v: v['render'].update(max_live_bytes=1),
+                           lambda v: v.update(encoded_extent=v['encoded_extent']+1)]
+                if case.get('metadata'):
+                    changes.append(lambda v: v.update(metadata={}))
+                for mutate in changes:
+                    changed = copy.deepcopy(r); mutate(changed)
+                    with self.assertRaises(ValueError): aggregate.case_semantics(case, changed, normal)
+
+    def test_empty_foreign_or_out_of_interval_telemetry_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            folder, original, command, limits = self.supervisor_fixture(root)
+            for change in ('empty', 'foreign', 'old', 'late'):
+                result = copy.deepcopy(original)
+                row = dict(at={'monotonic_ns': 150}, processes=[dict(pid=123, create_time=100.25, rss=80, status='running')], total_rss=80, free_bytes=100)
+                if change == 'empty':
+                    row.update(processes=[], total_rss=0); result['sampled_peak_group_rss'] = 0
+                elif change == 'foreign': row['processes'][0]['create_time'] = 100.5
+                elif change == 'old': row['at']['monotonic_ns'] = 99
+                else: row['at']['monotonic_ns'] = 201
+                data = (json.dumps(row)+'\n').encode()
+                (folder/'processes.jsonl').write_bytes(data)
+                result['processes.jsonl'] = dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+                (folder/'result.json').write_text(json.dumps(result))
+                with self.assertRaises(ValueError): aggregate.supervisor(root, folder, str(folder/'result.json'), command, limits, 123)
+
+    def test_generated_preparation_cannot_enter_measured_roster_or_be_omitted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for records in ([], [{'id': 'unknown'}], [{'id': key} for key in aggregate.edit_fixtures.FIXTURES][:-1]):
+                with self.assertRaises(ValueError): aggregate.preparation(root, {'preparation_records': records})
 
 
 if __name__ == '__main__':

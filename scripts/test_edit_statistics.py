@@ -74,5 +74,11 @@ class FixedTimingContracts(unittest.TestCase):
         r=request('refusal');value=samples(r)[0];del value['elapsed_ms']
         self.assertEqual(stats.summarize_case(r,[value])['configurations'],[])
 
+    def test_large_recovered_render_has_no_32mp_timing_award(self):
+        r=request('large_cancellation');r.update(width=10000,height=10000)
+        result=stats.summarize_case(r,samples(r))
+        self.assertIsNone(result['configurations'][0]['p95_target_ms'])
+        self.assertIsNone(result['configurations'][0]['numeric_target_met'])
+
 
 if __name__=='__main__':unittest.main()

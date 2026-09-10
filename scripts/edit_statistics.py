@@ -12,8 +12,9 @@ COUNTS = {
     'overlap_import': (0, 100), 'overlap_export': (0, 100),
     'correctness': (0, 1), 'support100mp': (0, 1), 'refusal': (0, 1),
     'proxy_reference': (0, 1), 'export_correctness': (0, 1),
+    'large_cancellation': (0, 1),
 }
-PIXEL_PHASES = {'correctness', 'kernel', 'full', 'support100mp', 'proxy_reference'}
+PIXEL_PHASES = {'correctness', 'kernel', 'full', 'support100mp', 'proxy_reference', 'large_cancellation'}
 TARGET_MS = {'kernel': 100, 'warm_service': 250, 'full': 5000,
              'first_raw': 20000, 'overlap_import': 100, 'overlap_export': 100}
 EXPORT_MS = {'jpeg': 25000, 'png': 40000, 'tiff': 30000}
