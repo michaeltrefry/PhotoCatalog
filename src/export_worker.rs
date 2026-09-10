@@ -385,43 +385,8 @@ fn mark_retired(lock: &mut File) -> Result<()> {
     lock.sync_all()?;
     Ok(())
 }
-#[cfg(unix)]
 fn lease_identity(file: &File) -> std::io::Result<(u64, u128)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata()?;
-    Ok((metadata.dev(), u128::from(metadata.ino())))
-}
-#[cfg(windows)]
-fn lease_identity(file: &File) -> std::io::Result<(u64, u128)> {
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    struct FileId {
-        volume: u64,
-        id: [u8; 16],
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(
-            handle: *mut std::ffi::c_void,
-            class: i32,
-            info: *mut std::ffi::c_void,
-            size: u32,
-        ) -> i32;
-    }
-    let mut value = std::mem::MaybeUninit::<FileId>::uninit();
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            18,
-            value.as_mut_ptr().cast(),
-            std::mem::size_of::<FileId>() as u32,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    let value = unsafe { value.assume_init() };
-    Ok((value.volume, u128::from_ne_bytes(value.id)))
+    crate::storage_volume::held_object_key(file)
 }
 fn check_live_lease(path: &Path, lock: &File) -> Result<()> {
     ensure!(

@@ -411,6 +411,20 @@ fn existing_ancestor(path: &Path) -> Option<ExistingAncestor> {
     }
     None
 }
+/// Identity of the exact held object; does not reopen a potentially replaced path.
+/// Windows keeps the full128-bit file ID used by storage bindings.
+pub(crate) fn held_object_key(file: &fs::File) -> io::Result<(u64, u128)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok((metadata.dev(), u128::from(metadata.ino())))
+    }
+    #[cfg(windows)]
+    {
+        platform::held_object_key(file)
+    }
+}
 pub(crate) fn object_key(_path: &Path, metadata: &fs::Metadata) -> io::Result<(u64, u128)> {
     #[cfg(unix)]
     {
@@ -1146,7 +1160,9 @@ mod platform {
             .open(path)
     }
     pub fn object_key(path: &Path) -> io::Result<(u64, u128)> {
-        let file = metadata_handle(path)?;
+        held_object_key(&metadata_handle(path)?)
+    }
+    pub fn held_object_key(file: &fs::File) -> io::Result<(u64, u128)> {
         let mut value = MaybeUninit::<FileIdInfo>::uninit();
         if unsafe {
             GetFileInformationByHandleEx(

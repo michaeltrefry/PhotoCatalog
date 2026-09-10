@@ -52,8 +52,7 @@ impl SourceInstance {
             metadata.file_type().is_file(),
             "prepared input source is not an ordinary file"
         );
-        let (device, object) = crate::metadata_export::held_file_identity(&file)?;
-        let object = u128::from(object);
+        let (device, object) = crate::storage_volume::held_object_key(&file)?;
         let native_change_stamp = Some(crate::metadata_export::content_change_stamp(&file)?);
         #[cfg(unix)]
         let changed = {
