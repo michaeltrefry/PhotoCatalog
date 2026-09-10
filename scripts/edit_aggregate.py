@@ -237,6 +237,26 @@ def preparation(root, binding):
     return proofs
 
 
+def background_source(root, binding, cohort):
+    value = binding['background_source']
+    directory = bound_path(root, value['directory'])
+    path = bound_path(root, value['path'])
+    if path.parent != directory or value['fixture_id'] not in cohort:
+        raise ValueError('background source identity or directory differs')
+    with os.scandir(directory) as entries:
+        names = []
+        for entry in entries:
+            if names or not entry.is_file(follow_symlinks=False) or entry.path != str(path):
+                raise ValueError('background input must contain exactly one ordinary source')
+            names.append(entry.name)
+    if len(names) != 1 or value['sha256'] != cohort[value['fixture_id']]['sha256']:
+        raise ValueError('background source does not match independent cohort')
+    for algorithm in ('sha256', 'blake3'):
+        if edit_verify.digest(path, algorithm, 512*MIB) != value[algorithm]:
+            raise ValueError('background original changed')
+    return value
+
+
 def case_result(request, receipt, verification, attempts, values):
     if verification.get('complete') is not True or verification.get('error') is not None:
         raise ValueError('independent case verifier failed')
@@ -309,6 +329,7 @@ def aggregate(root, binding):
         raise ValueError('explicit separate owned preparation sibling required')
     prepared = preparation(preparation_root, binding)
     cohort = {item['id']: item for item in manifest['inputs']}
+    background = background_source(preparation_root, binding, cohort)
     records = binding['case_records']
     cases = registry(manifest, binding, records)
     summaries, raw_cases, references, supervisors = [], [], {}, []
@@ -329,6 +350,11 @@ def aggregate(root, binding):
         if not same(request, record['request']) or not same(request, actions[case_id]['request']):
             raise ValueError('executed request differs from frozen request')
         case_semantics(case, request, normal_limits)
+        if request['phase'] == 'overlap_import':
+            if request['background_source'] != background['directory'] or request['fixture_id'] != background['fixture_id']:
+                raise ValueError('foreground/import request used a different background source')
+        elif request['background_source'] is not None:
+            raise ValueError('unexpected background input for non-import case')
         input_proof = cohort.get(request['fixture_id']) or prepared[request['fixture_id']]['receipt']
         if (request['source_sha256'] != input_proof['sha256']
                 or not same([request['width'], request['height']], [input_proof['width'], input_proof['height']])):
