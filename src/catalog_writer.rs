@@ -102,7 +102,7 @@ mod tests {
     use super::*;
     use crate::{Catalog, catalog_metadata::Source, organization::Operation, xmp_packets};
     use rusqlite::params;
-    use std::{fs, time::Duration};
+    use std::fs;
 
     fn queued(gate: &Writers, foreground: u64, background: u64) {
         gate.wait_until_queued(foreground, background);

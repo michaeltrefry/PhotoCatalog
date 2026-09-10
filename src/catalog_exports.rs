@@ -810,7 +810,7 @@ impl Catalog {
         hook(PhotoExportBoundary::OriginalVerified)?;
         self.with_edit_transaction(&work.plan.identity,Priority::Foreground,|tx|{
             metadata_current(tx,&work.plan)?;ensure!(job(tx,&work.job)?.state=="queued","export canceled");
-            original.recheck()?;_publication.recheck_payload()?;
+            original.recheck().context("original changed while waiting for export authority")?;_publication.recheck_payload()?;
             protect_destination(tx,&work.plan.destination.destination,&work.plan.original.to_path()?,work.plan.alias_limits)?;
             ensure!(tx.execute("UPDATE photo_export_items SET state='sealed',seal=?1 WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![serde_json::to_string(seal)?,work.job,work.sequence,work.attempt,work.authority])?==1,"export attempt changed or canceled");Ok(())
         })?.context("edit/source changed before accepting export")
@@ -884,7 +884,7 @@ impl Catalog {
             hook(PhotoExportBoundary::OriginalVerified)?;
             let start = std::time::Instant::now();
             self.with_edit_transaction(&plan.identity,Priority::Foreground,|tx|{
-                metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");original.recheck()?;
+                metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");original.recheck().context("original changed while waiting for export authority")?;
                 protect_destination(tx,&plan.destination.destination,&plan.original.to_path()?,plan.alias_limits)?;
                 ensure!(tx.execute("UPDATE photo_export_items SET publication=?1 WHERE job=?2 AND sequence=?3 AND authority=?4 AND state='sealed' AND (publication IS NULL OR publication=?1)",params![intent,id,sequence,authority])?==1,"export publication intent changed");Ok(())
             })?.context("edit/source changed before publication intent")?;
@@ -895,7 +895,9 @@ impl Catalog {
             let start = std::time::Instant::now();
             let capture = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
                 publication_current(tx, id, sequence, &authority, &intent, &plan)?;
-                original.recheck()?;
+                original
+                    .recheck()
+                    .context("original changed while waiting for export authority")?;
                 protect_destination(
                     tx,
                     &plan.destination.destination,
@@ -927,7 +929,9 @@ impl Catalog {
             let start = std::time::Instant::now();
             let link = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
                 publication_current(tx, id, sequence, &authority, &intent, &plan)?;
-                original.recheck()?;
+                original
+                    .recheck()
+                    .context("original changed while waiting for export authority")?;
                 protect_destination(
                     tx,
                     &plan.destination.destination,

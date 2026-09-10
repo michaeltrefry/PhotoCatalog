@@ -280,7 +280,7 @@ fn queued_export_rechecks_same_inode_restored_mtime_and_atomic_replacement() -> 
                 .unwrap()
                 .expect_err("stale verified file was authorized");
             assert!(
-                error.to_string().contains("verified file changed"),
+                format!("{error:#}").contains("verified file changed"),
                 "{error:#}"
             );
             assert!(!destination.exists());
