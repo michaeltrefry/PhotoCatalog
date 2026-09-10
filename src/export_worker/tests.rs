@@ -132,6 +132,15 @@ fn busy_worker_is_retained_and_delayed_open_cannot_cross_retirement() {
     assert_eq!(recovery.retained.len(), 1);
     assert!(recovery.retired.is_empty());
     assert_eq!(live.metadata().unwrap().len(), 0);
+    let contender = open_lease(&path).unwrap();
+    assert!(
+        contender.try_lock_exclusive().is_err(),
+        "failed recovery must not unlock the active owner"
+    );
+    drop(contender);
+    // The simulated worker has completed. Release its authority even if a
+    // concurrently spawned test child inherited this description before exec.
+    FileExt::unlock(&live).unwrap();
     drop(live);
     // Hold the exact pre-opened handle a delayed child would later lock.
     let delayed = open_lease(&path).unwrap();
@@ -139,6 +148,7 @@ fn busy_worker_is_retained_and_delayed_open_cannot_cross_retirement() {
     delayed.try_lock_exclusive().unwrap();
     assert_eq!(delayed.metadata().unwrap().len(), 1);
     assert!(check_live_lease(&path, &delayed).is_err());
+    FileExt::unlock(&delayed).unwrap();
     drop(delayed);
     // Windows may retain a tombstoned path while the delayed handle is open.
     let recovered = if recovered.retired.is_empty() {
@@ -148,6 +158,63 @@ fn busy_worker_is_retained_and_delayed_open_cannot_cross_retirement() {
     };
     assert_eq!(recovered.retired.len(), 1);
     discard_retired_export_transport(&recovered.retired[0]).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn completed_recovery_releases_duplicate_description() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = request(temp.path());
+    let path = stage(temp.path(), &request, true);
+    let lease = open_lease(&path).unwrap();
+    lease.try_lock_exclusive().unwrap();
+    let mut lease = AcquiredLease(lease);
+    // dup retains the same open-file description as fork before CLOEXEC runs.
+    // No process timing, sleep or unsafe fork is needed to preserve that owner.
+    let inherited = lease.0.try_clone().unwrap();
+    let delayed = open_lease(&path).unwrap();
+    assert!(delayed.try_lock_exclusive().is_err());
+    mark_retired(&mut lease.0).unwrap();
+    drop(lease);
+    delayed.try_lock_exclusive().unwrap();
+    assert!(check_live_lease(&path, &delayed).is_err());
+    assert_eq!(inherited.metadata().unwrap().len(), 1);
+    drop(inherited);
+    let contender = open_lease(&path).unwrap();
+    assert!(
+        contender.try_lock_exclusive().is_err(),
+        "closing the old description must not release the new owner"
+    );
+    FileExt::unlock(&delayed).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn recovery_error_and_unwind_release_inherited_description() {
+    for unwind in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request(temp.path());
+        let path = stage(temp.path(), &request, true);
+        let mut inherited = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            let file = open_lease(&path)?;
+            file.try_lock_exclusive()?;
+            let _lease = AcquiredLease(file);
+            inherited = Some(_lease.0.try_clone()?);
+            if unwind {
+                panic!("injected recovery unwind");
+            }
+            bail!("injected recovery validation failure")
+        }));
+        if unwind {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().is_err());
+        }
+        let contender = open_lease(&path).unwrap();
+        contender.try_lock_exclusive().unwrap();
+        assert_eq!(contender.metadata().unwrap().len(), 0);
+        FileExt::unlock(&contender).unwrap();
+        drop(inherited);
+    }
 }
 #[test]
 fn partial_unknown_and_wrong_authority_transports_are_never_fenced() {
