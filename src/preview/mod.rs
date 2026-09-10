@@ -24,17 +24,18 @@ pub use store::{
     RelocationProgress, RenderRecord, StoreConfig, StoreUsage, Tier,
 };
 
+mod prepared_cache;
 mod worker;
 pub use worker::{
-    ProducedPreview, RenderWork, RenderedPreviewBatch, WorkerFailure, WorkerProcess,
+    EditWork, ProducedPreview, RenderWork, RenderedPreviewBatch, WorkerFailure, WorkerProcess,
     recover_worker_staging, worker_main,
 };
 
 mod service;
 pub use service::{
-    CacheReadMetrics, EncodedPreview, JobState, JobView, PreviewPolicy, PreviewService,
-    PreviewView, ReadCompletion, ReadOutcome, ReadQueueUsage, ReadTicket, ServiceCompletion,
-    ServiceEvent, ServiceLimits, TierPolicy,
+    CacheReadMetrics, EncodedPreview, JobState, JobView, NativeLaunchPause, PreviewPolicy,
+    PreviewService, PreviewView, ReadCompletion, ReadOutcome, ReadQueueUsage, ReadTicket,
+    ServiceCompletion, ServiceEvent, ServiceLimits, TierPolicy,
 };
 
 mod config;

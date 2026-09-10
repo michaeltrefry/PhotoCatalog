@@ -105,6 +105,7 @@ fn run(args: WorkerArgs) -> Result<()> {
             })
             .collect();
         let request = RenderWork {
+            edit: None,
             source: NativePath::from_path(&args.source),
             keys,
             encoded_limit: 8 * 1024 * 1024,

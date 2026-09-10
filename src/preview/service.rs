@@ -3,7 +3,12 @@
 #[path = "read_queue.rs"]
 mod read_queue;
 use super::*;
-use crate::{Catalog, catalog_metadata::RenderIdentity, storage_volume::NativePath};
+use crate::{
+    Catalog,
+    catalog_edits::{EditRenderIdentity, MASTER, VariantKey},
+    catalog_metadata::RenderIdentity,
+    storage_volume::NativePath,
+};
 use anyhow::{Context, Result, ensure};
 pub use read_queue::{ReadCompletion, ReadOutcome, ReadQueueUsage, ReadTicket};
 use serde::{Deserialize, Serialize};
@@ -56,6 +61,16 @@ pub struct ServiceLimits {
     pub decoded_cache_bytes: u64,
     pub decoded_live_bytes: u64,
     pub decoded_entries: usize,
+    #[serde(default = "default_prepared_bytes")]
+    pub prepared_cache_bytes: u64,
+    #[serde(default = "default_prepared_entries")]
+    pub prepared_cache_entries: usize,
+}
+fn default_prepared_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_prepared_entries() -> usize {
+    16
 }
 impl Default for ServiceLimits {
     fn default() -> Self {
@@ -74,6 +89,8 @@ impl Default for ServiceLimits {
             decoded_cache_bytes: 256 * 1024 * 1024,
             decoded_live_bytes: 256 * 1024 * 1024,
             decoded_entries: 400,
+            prepared_cache_bytes: default_prepared_bytes(),
+            prepared_cache_entries: default_prepared_entries(),
         }
     }
 }
@@ -81,6 +98,8 @@ impl Default for ServiceLimits {
 struct SavedJob {
     request: RenderWork,
     expected: RenderIdentity,
+    #[serde(default)]
+    edit: Option<EditRenderIdentity>,
     import: bool,
     state: JobState,
 }
@@ -171,8 +190,19 @@ fn measured<T>(
     result
 }
 type ServiceObserver = Box<dyn FnMut(ServiceEvent) -> Result<()> + Send>;
+/// Holds native launch admission while another owned worker (for example an
+/// export) runs. The owner must join that worker before dropping the token.
+/// Existing workers are not stopped automatically: cancel/drain them first.
+pub struct NativeLaunchPause(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for NativeLaunchPause {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 pub struct PreviewService {
+    launch_pauses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     reads: read_queue::ReadQueue,
+    prepared: super::prepared_cache::PreparedCache,
     observer: std::cell::RefCell<Option<ServiceObserver>>,
     store: PreviewStore,
     decoded: DecodedCache,
@@ -192,6 +222,76 @@ fn same_pixels(a: &RenderIdentity, b: &RenderIdentity) -> bool {
         && a.generation == b.generation
         && a.fingerprint == b.fingerprint
         && a.state == b.state
+}
+fn same_edit(a: &EditRenderIdentity, b: &EditRenderIdentity) -> bool {
+    same_pixels(&a.source, &b.source)
+        && a.key == b.key
+        && a.revision == b.revision
+        && a.recipe_digest == b.recipe_digest
+}
+impl SavedJob {
+    fn validate(&self) -> Result<()> {
+        self.request.validate()?;
+        ensure!(
+            self.request
+                .keys
+                .iter()
+                .all(|key| key.asset_id == self.expected.asset_id
+                    && key.generation == self.expected.generation as u64),
+            "mixed job source identity"
+        );
+        if let Some(edit) = &self.edit {
+            ensure!(
+                !self.import
+                    && same_pixels(&edit.source, &self.expected)
+                    && self
+                        .request
+                        .keys
+                        .iter()
+                        .all(|key| key.variant_id == edit.key.variant_id
+                            && key.edit_revision == edit.revision as u64),
+                "mixed job edit identity"
+            );
+            if let Some(work) = &self.request.edit {
+                ensure!(
+                    work.recipe_digest == edit.recipe_digest,
+                    "job recipe authority differs"
+                );
+            } else {
+                ensure!(
+                    edit.key.variant_id == MASTER && edit.revision == 0,
+                    "missing job recipe"
+                );
+            }
+        } else {
+            ensure!(self.request.edit.is_none(), "missing job edit authority");
+        }
+        Ok(())
+    }
+    fn current(&self, catalog: &Catalog) -> Result<bool> {
+        if let Some(edit) = &self.edit {
+            Ok(same_edit(edit, &catalog.edit_render_identity(&edit.key)?))
+        } else {
+            ensure!(
+                self.request.edit.is_none()
+                    && self
+                        .request
+                        .keys
+                        .iter()
+                        .all(|key| key.variant_id == MASTER && key.edit_revision == 0),
+                "missing edit authority"
+            );
+            let current = catalog.render_identity(&self.expected.asset_id)?;
+            if !same_pixels(&current, &self.expected) {
+                return Ok(false);
+            }
+            Ok(self.import
+                || catalog
+                    .edit_render_identity(&VariantKey::master(&self.expected.asset_id))?
+                    .revision
+                    == 0)
+        }
+    }
 }
 impl PreviewService {
     pub fn open(
@@ -223,7 +323,14 @@ impl PreviewService {
         let store = PreviewStore::open(config, original_roots)?;
         let staging = store.configuration().manifest_root.join("workers");
         recover_worker_staging(&staging, 128)?;
+        let prepared = super::prepared_cache::PreparedCache::open(
+            store.configuration().manifest_root.join("prepared"),
+            limits.prepared_cache_bytes,
+            limits.prepared_cache_entries,
+        )?;
         Ok(Self {
+            launch_pauses: Default::default(),
+            prepared,
             reads: read_queue::ReadQueue::default(),
             observer: std::cell::RefCell::new(None),
             store,
@@ -287,6 +394,51 @@ impl PreviewService {
         key.validate()?;
         Ok(key)
     }
+    pub fn variant_key(&self, identity: &EditRenderIdentity, tier: Tier) -> Result<PreviewKey> {
+        let mut key = self.key(
+            &identity.source,
+            tier,
+            identity
+                .source
+                .fingerprint
+                .as_deref()
+                .unwrap_or(&"0".repeat(64)),
+        )?;
+        key.variant_id = identity.key.variant_id.clone();
+        key.edit_revision = u64::try_from(identity.revision)?;
+        if identity.key.variant_id != MASTER || identity.revision != 0 {
+            key.renderer_version = super::worker::edited_renderer(false);
+        }
+        key.validate()?;
+        Ok(key)
+    }
+    pub fn interactive_key(&self, identity: &EditRenderIdentity, tier: Tier) -> Result<PreviewKey> {
+        let mut key = self.variant_key(identity, tier)?;
+        ensure!(
+            key.edge <= super::prepared_cache::PROXY_EDGE,
+            "interactive preview exceeds1600 source proxy"
+        );
+        key.renderer_version = super::worker::edited_renderer(true);
+        Ok(key)
+    }
+    pub fn cached_interactive(
+        &mut self,
+        catalog: &Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        allow_stale: bool,
+    ) -> Result<Option<PreviewView>> {
+        self.cached_inner(catalog, variant, tier, allow_stale, true, None)
+    }
+    pub fn cached_variant(
+        &mut self,
+        catalog: &Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        allow_stale: bool,
+    ) -> Result<Option<PreviewView>> {
+        self.cached_inner(catalog, variant, tier, allow_stale, false, None)
+    }
     pub fn cached(
         &mut self,
         catalog: &Catalog,
@@ -294,7 +446,14 @@ impl PreviewService {
         tier: Tier,
         allow_stale: bool,
     ) -> Result<Option<PreviewView>> {
-        self.cached_inner(catalog, asset, tier, allow_stale, None)
+        self.cached_inner(
+            catalog,
+            &VariantKey::master(asset),
+            tier,
+            allow_stale,
+            false,
+            None,
+        )
     }
     /// Same production path with opt-in phase clocks. Timings remain available
     /// on errors/misses; instrumentation overhead is included, never subtracted.
@@ -306,10 +465,33 @@ impl PreviewService {
         allow_stale: bool,
         metrics: &mut CacheReadMetrics,
     ) -> Result<Option<PreviewView>> {
+        self.cached_variant_with_metrics(
+            catalog,
+            &VariantKey::master(asset),
+            tier,
+            allow_stale,
+            metrics,
+        )
+    }
+    pub fn cached_variant_with_metrics(
+        &mut self,
+        catalog: &Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        allow_stale: bool,
+        metrics: &mut CacheReadMetrics,
+    ) -> Result<Option<PreviewView>> {
         *metrics = CacheReadMetrics::default();
         let before = self.decoded.access_counts();
         let start = Instant::now();
-        let result = self.cached_inner(catalog, asset, tier, allow_stale, Some(&mut *metrics));
+        let result = self.cached_inner(
+            catalog,
+            variant,
+            tier,
+            allow_stale,
+            false,
+            Some(&mut *metrics),
+        );
         metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
         let after = self.decoded.access_counts();
         metrics.decoded_hits = after.0.saturating_sub(before.0);
@@ -320,19 +502,20 @@ impl PreviewService {
     fn cached_inner(
         &mut self,
         catalog: &Catalog,
-        asset: &str,
+        variant: &VariantKey,
         tier: Tier,
         allow_stale: bool,
+        interactive: bool,
         mut metrics: Option<&mut CacheReadMetrics>,
     ) -> Result<Option<PreviewView>> {
         let identity = measured(&mut metrics, ReadPhase::Identity, || {
-            catalog.render_identity(asset)
+            catalog.edit_render_identity(variant)
         })?;
-        let key = self.key(
-            &identity,
-            tier,
-            identity.fingerprint.as_deref().unwrap_or(&"0".repeat(64)),
-        )?;
+        let key = if interactive {
+            self.interactive_key(&identity, tier)?
+        } else {
+            self.variant_key(&identity, tier)?
+        };
         let allowance = self.limits.encoded_staging_bytes - self.encoded.used();
         let _reservation = self
             .encoded
@@ -343,9 +526,10 @@ impl PreviewService {
         })?
         else {
             if allow_stale
+                && variant.variant_id == MASTER
                 && tier == Tier::Thumbnail
                 && let Some((hash, bytes)) = measured(&mut metrics, ReadPhase::Store, || {
-                    catalog.retained_legacy_preview(asset, allowance)
+                    catalog.retained_legacy_preview(&variant.asset_id, allowance)
                 })?
             {
                 let pixels = measured(&mut metrics, ReadPhase::Decode, || {
@@ -400,9 +584,10 @@ impl PreviewService {
             }
         };
         let current = measured(&mut metrics, ReadPhase::Identity, || {
-            catalog.render_identity(asset)
+            catalog.edit_render_identity(variant)
         })?;
-        let stale = cached.stale || !same_pixels(&identity, &current) || current.state != "ready";
+        let stale =
+            cached.stale || !same_edit(&identity, &current) || current.source.state != "ready";
         if stale && !(allow_stale && tier == Tier::Thumbnail) {
             return Ok(None);
         }
@@ -423,7 +608,28 @@ impl PreviewService {
         tier: Tier,
         allow_stale: bool,
     ) -> Result<Option<EncodedPreview>> {
-        let Some(view) = self.cached(catalog, asset, tier, allow_stale)? else {
+        self.encoded_cached_variant(
+            catalog,
+            &VariantKey::master(asset),
+            tier,
+            allow_stale,
+            false,
+        )
+    }
+    pub fn encoded_cached_variant(
+        &mut self,
+        catalog: &Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        allow_stale: bool,
+        interactive: bool,
+    ) -> Result<Option<EncodedPreview>> {
+        let view = if interactive {
+            self.cached_interactive(catalog, variant, tier, allow_stale)?
+        } else {
+            self.cached_variant(catalog, variant, tier, allow_stale)?
+        };
+        let Some(view) = view else {
             return Ok(None);
         };
         let allowance = self.limits.encoded_staging_bytes - self.encoded.used();
@@ -438,7 +644,7 @@ impl PreviewService {
                 .bytes
         } else {
             catalog
-                .retained_legacy_preview(asset, allowance)?
+                .retained_legacy_preview(&variant.asset_id, allowance)?
                 .context("legacy preview changed during export")?
                 .1
         };
@@ -470,12 +676,14 @@ impl PreviewService {
             catalog,
             SavedJob {
                 request: RenderWork {
+                    edit: None,
                     source: NativePath::from_path(source),
                     keys: vec![key],
                     encoded_limit: self.limits.per_worker_encoded_bytes,
                     decode_limits: self.limits.decode_limits,
                 },
                 expected,
+                edit: None,
                 import: true,
                 state: JobState::Queued,
             },
@@ -489,17 +697,69 @@ impl PreviewService {
         tier: Tier,
         priority: Priority,
     ) -> Result<Consumer> {
-        let expected = catalog.render_identity(asset)?;
+        self.request_variant(catalog, &VariantKey::master(asset), tier, priority)
+    }
+    pub fn request_variant(
+        &mut self,
+        catalog: &mut Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        priority: Priority,
+    ) -> Result<Consumer> {
+        self.request_variant_mode(catalog, variant, tier, priority, false)
+    }
+    pub fn request_interactive(
+        &mut self,
+        catalog: &mut Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        priority: Priority,
+    ) -> Result<Consumer> {
+        self.request_variant_mode(catalog, variant, tier, priority, true)
+    }
+    fn request_variant_mode(
+        &mut self,
+        catalog: &mut Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        priority: Priority,
+        interactive: bool,
+    ) -> Result<Consumer> {
+        let expected = catalog.edit_render_identity(variant)?;
+        ensure!(expected.source.state == "ready", "original is not ready");
         ensure!(
-            expected.state == "ready",
-            "original is awaiting import completion"
+            expected.source.fingerprint.is_some(),
+            "original fingerprint missing"
         );
-        let fingerprint = expected
-            .fingerprint
-            .as_deref()
-            .context("original revision unavailable")?;
-        let key = self.key(&expected, tier, fingerprint)?;
-        let source = catalog.preview_original_path(asset)?;
+        let view = catalog.edit_variant(variant)?;
+        ensure!(
+            view.revision == expected.revision && view.recipe_digest == expected.recipe_digest,
+            "edit changed during request preparation"
+        );
+        let key = if interactive {
+            self.interactive_key(&expected, tier)?
+        } else {
+            self.variant_key(&expected, tier)?
+        };
+        let edit = if !interactive && variant.variant_id == MASTER && expected.revision == 0 {
+            None
+        } else {
+            Some(super::worker::EditWork {
+                recipe: view.recipe,
+                recipe_digest: expected.recipe_digest.clone(),
+                limits: self.edit_limits(),
+                interactive,
+                prepared_bytes: if self.limits.prepared_cache_entries == 0
+                    || self.limits.prepared_cache_bytes < super::prepared_cache::MAX_PROXY_BYTES
+                {
+                    0
+                } else {
+                    super::prepared_cache::MAX_PROXY_BYTES
+                },
+                prepared: None,
+            })
+        };
+        let source = catalog.preview_original_path(&variant.asset_id)?;
         self.submit(
             catalog,
             SavedJob {
@@ -508,13 +768,22 @@ impl PreviewService {
                     keys: vec![key],
                     encoded_limit: self.limits.per_worker_encoded_bytes,
                     decode_limits: self.limits.decode_limits,
+                    edit,
                 },
-                expected,
+                expected: expected.source.clone(),
+                edit: Some(expected),
                 import: false,
                 state: JobState::Queued,
             },
             priority,
         )
+    }
+    fn edit_limits(&self) -> crate::edit::RenderLimits {
+        crate::edit::RenderLimits {
+            max_pixels: self.limits.decode_limits.max_intermediate_pixels,
+            max_allocation_bytes: self.limits.decode_limits.max_allocation_bytes,
+            max_live_bytes: self.limits.per_worker_bytes,
+        }
     }
     fn submit(
         &mut self,
@@ -522,6 +791,7 @@ impl PreviewService {
         job: SavedJob,
         priority: Priority,
     ) -> Result<Consumer> {
+        job.validate()?;
         self.ensure_original_separate(&job.request.source.to_path()?)?;
         ensure!(self.available_request_slots() > 0, "preview consumer limit");
         let id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
@@ -532,14 +802,18 @@ impl PreviewService {
             Priority::Foreground => crate::catalog_writer::Priority::Foreground,
             Priority::Background => crate::catalog_writer::Priority::Background,
         };
-        let admitted =
-            catalog.with_render_identity_priority(&job.expected, writer_priority, || {
-                self.store.save_job(&id, &stored, self.limits.requests)?;
-                for key in &job.request.keys {
-                    self.store.desire(key, || Ok(true))?;
-                }
-                Ok(())
-            })?;
+        let persist = || {
+            self.store.save_job(&id, &stored, self.limits.requests)?;
+            for key in &job.request.keys {
+                self.store.desire(key, || Ok(true))?;
+            }
+            Ok(())
+        };
+        let admitted = if let Some(edit) = &job.edit {
+            catalog.with_edit_transaction(edit, writer_priority, |_| persist())?
+        } else {
+            catalog.with_render_identity_priority(&job.expected, writer_priority, persist)?
+        };
         ensure!(admitted.is_some(), "stale preview request");
         let consumer =
             self.scheduler
@@ -566,6 +840,18 @@ impl PreviewService {
     pub fn tick(&mut self, catalog: &mut Catalog) -> Result<()> {
         let active_ids = self.active.keys().copied().collect::<Vec<_>>();
         for lease_id in active_ids {
+            let active = &self.active[&lease_id];
+            let current = self
+                .jobs
+                .get(&active.lease.key)
+                .context("active job missing")?
+                .current(catalog)?;
+            if !current {
+                active
+                    .lease
+                    .canceled
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             let result = {
                 let active = self.active.get_mut(&lease_id).unwrap();
                 active.worker.poll(&active.lease.canceled)
@@ -584,11 +870,18 @@ impl PreviewService {
                 .get(&id)
                 .context("active preview job missing")?
                 .clone();
-            let publication = if canceled {
+            let publication = if !current {
+                Ok(ServiceCompletion::Stale)
+            } else if canceled {
                 Ok(ServiceCompletion::Canceled)
             } else {
                 result.and_then(|batch| {
-                    self.publish_batch(catalog, &job, batch.context("missing worker result")?)
+                    let batch = batch.context("missing worker result")?;
+                    if let Some(prepared) = &batch.prepared {
+                        self.prepared
+                            .adopt(job.request.keys[0].generation, prepared)?;
+                    }
+                    self.publish_batch(catalog, &job, batch)
                 })
             };
             // Drop confirms process exit and releases encoded staging only after
@@ -620,7 +913,12 @@ impl PreviewService {
                 self.completed.insert(consumer, status.clone());
             }
         }
-        if self.store.relocation_pending()? {
+        if self.store.relocation_pending()?
+            || self
+                .launch_pauses
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        {
             return Ok(());
         }
         while self
@@ -638,8 +936,7 @@ impl PreviewService {
                 .get(&id)
                 .context("queued preview job missing")?
                 .clone();
-            let current = catalog.render_identity(&job.expected.asset_id)?;
-            if !same_pixels(&current, &job.expected) {
+            if !job.current(catalog)? {
                 let completion = self.scheduler.finished(lease.id, WorkerOutcome::Failed)?;
                 self.store.finish_job(&id)?;
                 self.jobs.remove(&id);
@@ -653,8 +950,20 @@ impl PreviewService {
                 .try_reserve(self.limits.per_worker_encoded_bytes)
                 .ok_or(EncodedBudgetExceeded)?;
             let launch = (|| {
-                self.ensure_original_separate(&job.request.source.to_path()?)?;
-                WorkerProcess::spawn(&self.executable, &self.staging, job.request.clone())
+                let source = job.request.source.to_path()?;
+                self.ensure_original_separate(&source)?;
+                let mut request = job.request.clone();
+                if let Some(edit) = &mut request.edit
+                    && edit.interactive
+                {
+                    edit.prepared = self.prepared.lookup(
+                        &source,
+                        request.keys[0].generation,
+                        &request.keys[0].fingerprint,
+                        &edit.recipe.validate()?.settings().white_balance,
+                    )?;
+                }
+                WorkerProcess::spawn(&self.executable, &self.staging, request)
             })();
             match launch {
                 Ok(worker) => {
@@ -717,8 +1026,17 @@ impl PreviewService {
                                 },
                                 || self.observe(ServiceEvent::BeforeCatalogCommit),
                             )?
+                        } else if let Some(edit) = &job.edit {
+                            catalog.with_edit_identity(edit, attach)?
                         } else {
-                            catalog.with_render_identity(&job.expected, attach)?
+                            let edit = catalog.edit_render_identity(&VariantKey::master(
+                                &job.expected.asset_id,
+                            ))?;
+                            if edit.revision != 0 || !same_pixels(&edit.source, &job.expected) {
+                                None
+                            } else {
+                                catalog.with_edit_identity(&edit, attach)?
+                            }
                         };
                         if job.import && result.is_some() {
                             self.observe(ServiceEvent::CatalogCommitted)?;
@@ -820,6 +1138,7 @@ impl PreviewService {
                     continue;
                 }
                 let mut job: SavedJob = serde_json::from_str(&descriptor)?;
+                job.validate()?;
                 let current = catalog.render_identity(&job.expected.asset_id)?;
                 let key = &job.request.keys[0];
                 // Crash after catalog commit but before journal deletion.
@@ -831,7 +1150,7 @@ impl PreviewService {
                     self.store.finish_job(&id)?;
                     continue;
                 }
-                if !same_pixels(&current, &job.expected) {
+                if !job.current(catalog)? {
                     self.store.finish_job(&id)?;
                     continue;
                 }
@@ -861,10 +1180,36 @@ impl PreviewService {
                     .request
                     .keys
                     .iter()
-                    .map(|key| self.key(&current, key.tier, &fingerprint))
+                    .map(|key| {
+                        if let Some(edit) = &job.edit {
+                            if job
+                                .request
+                                .edit
+                                .as_ref()
+                                .is_some_and(|work| work.interactive)
+                            {
+                                self.interactive_key(edit, key.tier)
+                            } else {
+                                self.variant_key(edit, key.tier)
+                            }
+                        } else {
+                            self.key(&current, key.tier, &fingerprint)
+                        }
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 job.request.source = catalog.preview_original_path(&job.expected.asset_id)?;
                 job.request.decode_limits = self.limits.decode_limits;
+                if let Some(edit) = &mut job.request.edit {
+                    edit.limits = self.edit_limits();
+                    edit.prepared_bytes = if self.limits.prepared_cache_entries == 0
+                        || self.limits.prepared_cache_bytes < super::prepared_cache::MAX_PROXY_BYTES
+                    {
+                        0
+                    } else {
+                        super::prepared_cache::MAX_PROXY_BYTES
+                    };
+                    edit.prepared = None;
+                }
                 job.request.encoded_limit = self.limits.per_worker_encoded_bytes;
                 job.state = JobState::Queued;
                 let new_id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
@@ -941,6 +1286,21 @@ impl PreviewService {
         self.limits
             .requests
             .saturating_sub(self.consumers.len() + self.reads.len())
+    }
+    pub fn pause_native_launches(&self) -> Result<NativeLaunchPause> {
+        self.launch_pauses
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_add(1),
+            )
+            .map_err(|_| anyhow::anyhow!("native pause counter overflow"))?;
+        Ok(NativeLaunchPause(self.launch_pauses.clone()))
+    }
+    /// Queued descriptors may remain while paused; only active children and
+    /// their reservations must drain before the owner admits an external worker.
+    pub fn native_work_drained(&self) -> bool {
+        self.active.is_empty() && self.scheduler.usage().reserved_bytes == 0
     }
     pub fn scheduler_usage(&self) -> SchedulerUsage {
         self.scheduler.usage()

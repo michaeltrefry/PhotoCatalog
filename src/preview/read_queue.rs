@@ -25,7 +25,8 @@ pub struct ReadCompletion {
     pub metrics: CacheReadMetrics,
 }
 struct PendingRead {
-    expected: RenderIdentity,
+    expected: EditRenderIdentity,
+    interactive: bool,
     tier: Tier,
     allow_stale: bool,
     priority: Priority,
@@ -54,16 +55,34 @@ impl PreviewService {
         allow_stale: bool,
         priority: Priority,
     ) -> Result<ReadTicket> {
+        self.queue_read_variant(
+            catalog,
+            &VariantKey::master(asset),
+            tier,
+            allow_stale,
+            priority,
+            false,
+        )
+    }
+    pub fn queue_read_variant(
+        &mut self,
+        catalog: &Catalog,
+        variant: &VariantKey,
+        tier: Tier,
+        allow_stale: bool,
+        priority: Priority,
+        interactive: bool,
+    ) -> Result<ReadTicket> {
         ensure!(
             self.available_request_slots() > 0,
             "preview request allowance exhausted"
         );
-        let expected = catalog.render_identity(asset)?;
-        self.key(
-            &expected,
-            tier,
-            expected.fingerprint.as_deref().unwrap_or(&"0".repeat(64)),
-        )?;
+        let expected = catalog.edit_render_identity(variant)?;
+        if interactive {
+            self.interactive_key(&expected, tier)?;
+        } else {
+            self.variant_key(&expected, tier)?;
+        }
         let next = self
             .reads
             .next
@@ -75,6 +94,7 @@ impl PreviewService {
             ticket,
             PendingRead {
                 expected,
+                interactive,
                 tier,
                 allow_stale,
                 priority,
@@ -106,22 +126,29 @@ impl PreviewService {
         let owner_started = Instant::now();
         let mut metrics = CacheReadMetrics::default();
         let result = (|| -> Result<ReadOutcome> {
-            let current = catalog.render_identity(&read.expected.asset_id)?;
-            if !same_pixels(&current, &read.expected) {
+            let current = catalog.edit_render_identity(&read.expected.key)?;
+            if !same_edit(&current, &read.expected) {
                 return Ok(ReadOutcome::Stale);
             }
-            Ok(
-                match self.cached_with_metrics(
-                    catalog,
-                    &read.expected.asset_id,
-                    read.tier,
-                    read.allow_stale,
-                    &mut metrics,
-                )? {
-                    Some(view) => ReadOutcome::Ready(Box::new(view)),
-                    None => ReadOutcome::Missing,
-                },
-            )
+            let before = self.decoded.access_counts();
+            let start = Instant::now();
+            let result = self.cached_inner(
+                catalog,
+                &read.expected.key,
+                read.tier,
+                read.allow_stale,
+                read.interactive,
+                Some(&mut metrics),
+            );
+            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let after = self.decoded.access_counts();
+            metrics.decoded_hits = after.0.saturating_sub(before.0);
+            metrics.decoded_misses = after.1.saturating_sub(before.1);
+            metrics.returned_pixels = matches!(&result, Ok(Some(_)));
+            Ok(match result? {
+                Some(view) => ReadOutcome::Ready(Box::new(view)),
+                None => ReadOutcome::Missing,
+            })
         })();
         let outcome = result.unwrap_or_else(|error| ReadOutcome::Failed {
             resource_limit: error.downcast_ref::<DecodedBudgetExceeded>().is_some()

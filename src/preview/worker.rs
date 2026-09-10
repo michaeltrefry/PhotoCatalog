@@ -18,16 +18,42 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-const RECEIPT_LIMIT: u64 = 64 * 1024;
+const RECEIPT_LIMIT: u64 = 192 * 1024;
+use super::prepared_cache::{
+    MAX_PROXY_BYTES, PROXY_EDGE, PreparedReference, ProducedPrepared, SourceInstance,
+};
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditWork {
+    pub recipe: crate::edit::Recipe,
+    pub recipe_digest: String,
+    pub limits: crate::edit::RenderLimits,
+    pub interactive: bool,
+    pub prepared_bytes: u64,
+    #[serde(default)]
+    pub(crate) prepared: Option<PreparedReference>,
+}
+pub(crate) fn edited_renderer(interactive: bool) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(crate::edit::renderer_identity().as_bytes());
+    hash.update(include_bytes!("worker.rs"));
+    hash.update(include_bytes!("../edit/prepared.rs"));
+    format!(
+        "photocatalog-edit-preview-1:{}:{}",
+        hash.finalize().to_hex(),
+        if interactive { "proxy1600" } else { "original" }
+    )
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderWork {
     pub source: NativePath,
     pub keys: Vec<PreviewKey>,
     pub encoded_limit: u64,
     pub decode_limits: DecodeLimits,
+    #[serde(default)]
+    pub edit: Option<EditWork>,
 }
 impl RenderWork {
-    fn validate(&self) -> Result<PathBuf> {
+    pub(crate) fn validate(&self) -> Result<PathBuf> {
         self.decode_limits.validate()?;
         ensure!((1..=2).contains(&self.keys.len()), "worker tier count");
         ensure!(
@@ -35,14 +61,38 @@ impl RenderWork {
             "worker encoded allowance"
         );
         let first = &self.keys[0];
-        ensure!(
-            first.edit_revision == 0,
-            "pixel recipe requires an implemented editor renderer"
-        );
+        let renderer = if let Some(edit) = &self.edit {
+            ensure!(
+                edit.prepared_bytes <= MAX_PROXY_BYTES,
+                "worker prepared staging allowance"
+            );
+            let recipe = edit.recipe.validate()?;
+            ensure!(
+                recipe.digest() == edit.recipe_digest,
+                "worker recipe digest mismatch"
+            );
+            ensure!(
+                edit.limits.max_live_bytes > 0
+                    && edit.limits.max_allocation_bytes > 0
+                    && edit.limits.max_pixels > 0,
+                "worker edit resource allowance"
+            );
+            ensure!(
+                !edit.interactive || self.keys.iter().all(|key| key.edge <= PROXY_EDGE),
+                "interactive key exceeds prepared source edge"
+            );
+            edited_renderer(edit.interactive)
+        } else {
+            ensure!(
+                first.edit_revision == 0 && first.variant_id == "master",
+                "worker missing edit recipe"
+            );
+            renderer_identity().into()
+        };
         for key in &self.keys {
             key.validate()?;
             ensure!(
-                key.renderer_version == renderer_identity(),
+                key.renderer_version == renderer,
                 "worker renderer identity mismatch"
             );
             ensure!(
@@ -98,6 +148,7 @@ struct RenderReceipt {
     metadata: Metadata,
     provenance: RenderProvenance,
     objects: Vec<ObjectReceipt>,
+    prepared: Option<(crate::edit::PreparedProxyReceipt, SourceInstance)>,
 }
 pub struct ProducedPreview {
     pub key: PreviewKey,
@@ -110,6 +161,7 @@ pub struct RenderedPreviewBatch {
     pub metadata: Metadata,
     pub provenance: RenderProvenance,
     pub objects: Vec<ProducedPreview>,
+    pub(crate) prepared: Option<ProducedPrepared>,
 }
 /// A worker's encoded receipt is not sufficient image-validity evidence. Complete
 /// production decoding is required before attachment, under its worker allowance.
@@ -254,6 +306,11 @@ impl WorkerProcess {
             metadata: receipt.metadata,
             provenance: receipt.provenance,
             objects,
+            prepared: receipt.prepared.map(|(receipt, source)| ProducedPrepared {
+                path: self.staging.join("prepared.linear"),
+                receipt,
+                source,
+            }),
         }))
     }
     /// The worker holds a decoded source under its reservation until a subsequent
@@ -349,6 +406,7 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         "decoded.pending",
         "0.preview",
         "1.preview",
+        "prepared.linear",
     ];
     let mut names = Vec::new();
     for entry in fs::read_dir(path)?.take(allowed.len() + 1) {
@@ -502,6 +560,16 @@ pub fn worker_main() -> Result<()> {
             decode_status: error
                 .downcast_ref::<DecodeError>()
                 .map(|e| e.status)
+                .or_else(|| match error.downcast_ref::<crate::edit::RenderError>() {
+                    Some(crate::edit::RenderError::ResourceLimit { .. }) => {
+                        Some(DecodeStatus::ResourceLimit)
+                    }
+                    Some(
+                        crate::edit::RenderError::SourceMissing | crate::edit::RenderError::Io(_),
+                    ) => Some(DecodeStatus::Io),
+                    Some(crate::edit::RenderError::Decode(error)) => Some(error.status),
+                    _ => None,
+                })
                 .or_else(|| {
                     error
                         .downcast_ref::<std::io::Error>()
@@ -571,11 +639,104 @@ fn run_worker() -> Result<()> {
             }
             std::process::exit(74);
         })?;
-    ensure!(
-        crate::fingerprint(&source)? == request.keys[0].fingerprint,
-        "original changed before rendering"
-    );
-    let rendered = crate::media::decode_full_limited(&source, request.decode_limits)?;
+    let instance = SourceInstance::read(&source)?;
+    let mut prepared_receipt = None;
+    let mut prepared_reused = false;
+    let mut rendered = if let Some(edit) = &request.edit {
+        let recipe = edit.recipe.validate()?;
+        let cached = if edit.interactive {
+            edit.prepared
+                .as_ref()
+                .filter(|reference| reference.source == instance)
+                .and_then(|reference| {
+                    let path = reference.path.to_path().ok()?;
+                    let metadata = fs::symlink_metadata(&path).ok()?;
+                    if !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || metadata.len() != reference.receipt.bytes
+                    {
+                        return None;
+                    }
+                    let mut file = File::open(path).ok()?;
+                    crate::edit::read_prepared_proxy(
+                        &mut file,
+                        crate::edit::PreparedProxyExpectation {
+                            source_fingerprint: &request.keys[0].fingerprint,
+                            white_balance: &recipe.settings().white_balance,
+                            longest_edge: PROXY_EDGE,
+                            original_dimensions: reference.receipt.identity.original_dimensions,
+                            blake3: &reference.receipt.blake3,
+                        },
+                        MAX_PROXY_BYTES,
+                        edit.limits,
+                        &(),
+                    )
+                    .ok()
+                })
+        } else {
+            None
+        };
+        let input = match cached {
+            Some(input) => {
+                prepared_reused = true;
+                input
+            }
+            None => {
+                let original = crate::edit::decode_original(
+                    crate::edit::OriginalRequest {
+                        path: &source,
+                        expected_fingerprint: &request.keys[0].fingerprint,
+                        white_balance: &recipe.settings().white_balance,
+                    },
+                    request.decode_limits,
+                    &(),
+                )?;
+                if edit.interactive {
+                    let proxy =
+                        crate::edit::prepare_linear_proxy(&original, PROXY_EDGE, edit.limits, &())?;
+                    drop(original);
+                    if edit.prepared_bytes > 0 {
+                        let mut file = OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .open("prepared.linear")?;
+                        let receipt = crate::edit::write_prepared_proxy(
+                            &proxy,
+                            PROXY_EDGE,
+                            &mut file,
+                            edit.prepared_bytes,
+                            &(),
+                        )?;
+                        file.sync_all()?;
+                        prepared_receipt = Some((receipt, instance.clone()));
+                    }
+                    proxy
+                } else {
+                    original
+                }
+            }
+        };
+        let edge = request.keys.iter().map(|key| key.edge).max().unwrap();
+        crate::edit::render_recipe(
+            &input,
+            &recipe,
+            crate::edit::RenderPurpose::InteractiveProxy { longest_edge: edge },
+            edit.limits,
+            &(),
+        )?
+        .image
+    } else {
+        ensure!(
+            crate::fingerprint(&source)? == request.keys[0].fingerprint,
+            "original changed before rendering"
+        );
+        crate::media::decode_full_limited(&source, request.decode_limits)?
+    };
+    if let Some(edit) = &request.edit {
+        rendered.provenance.notes.push(format!("Preview source: {}; prepared cache reused={}; output={}x{}. Interactive source-edge1600 crops/spatial filters are approximate, without upscaling.",
+            if edit.interactive { "interactive linear proxy" } else { "refined original development" },
+            prepared_reused, rendered.width, rendered.height));
+    }
     write_exclusive(Path::new("decoded.pending"), b"decoded")?;
     fs::rename("decoded.pending", "decoded.ready")?;
     admitted.recv().context("owner encode admission ended")?;
@@ -601,9 +762,15 @@ fn run_worker() -> Result<()> {
         });
     }
     ensure!(
-        crate::fingerprint(&source)? == request.keys[0].fingerprint,
-        "original changed during rendering"
+        SourceInstance::read(&source)? == instance,
+        "original file instance changed during rendering"
     );
+    if request.edit.is_none() {
+        ensure!(
+            crate::fingerprint(&source)? == request.keys[0].fingerprint,
+            "original changed during rendering"
+        );
+    }
     // This covers source decode, both tier preparations/encodes and final
     // source verification. Only the bounded 64 KiB receipt write follows.
     let (peak_resident_bytes, peak_method) = peak_resident_memory();
@@ -613,6 +780,7 @@ fn run_worker() -> Result<()> {
         metadata: rendered.metadata,
         provenance: rendered.provenance,
         objects,
+        prepared: prepared_receipt,
     })?;
     ensure!(
         receipt.len() as u64 <= RECEIPT_LIMIT,
@@ -687,6 +855,7 @@ mod tests {
             .unwrap();
         let lease = child.stdin.take();
         let request = RenderWork {
+            edit: None,
             source: NativePath::from_path(&root.path().join("original")),
             keys: vec![key()],
             encoded_limit: 1024,
