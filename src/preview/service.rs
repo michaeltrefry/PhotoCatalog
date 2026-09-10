@@ -231,7 +231,7 @@ fn same_edit(a: &EditRenderIdentity, b: &EditRenderIdentity) -> bool {
 }
 impl SavedJob {
     fn validate(&self) -> Result<()> {
-        self.request.validate()?;
+        self.request.validate_persisted()?;
         ensure!(
             self.request
                 .keys
@@ -792,6 +792,7 @@ impl PreviewService {
         priority: Priority,
     ) -> Result<Consumer> {
         job.validate()?;
+        job.request.validate()?;
         self.ensure_original_separate(&job.request.source.to_path()?)?;
         ensure!(self.available_request_slots() > 0, "preview consumer limit");
         let id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
@@ -1328,3 +1329,7 @@ impl Drop for PreviewService {
         self.active.clear();
     }
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;

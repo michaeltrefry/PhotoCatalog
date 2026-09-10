@@ -54,6 +54,21 @@ pub struct RenderWork {
 }
 impl RenderWork {
     pub(crate) fn validate(&self) -> Result<PathBuf> {
+        let path = self.validate_persisted()?;
+        let renderer = self.edit.as_ref().map_or_else(
+            || renderer_identity().to_owned(),
+            |edit| edited_renderer(edit.interactive),
+        );
+        ensure!(
+            self.keys.iter().all(|key| key.renderer_version == renderer),
+            "worker renderer identity mismatch"
+        );
+        Ok(path)
+    }
+    /// Recovery must validate the old descriptor before inspecting its old
+    /// attachment proof. Only a newly admitted launch requires this binary's
+    /// renderer; resume rebuilds keys after checking durable catalog authority.
+    pub(crate) fn validate_persisted(&self) -> Result<PathBuf> {
         self.decode_limits.validate()?;
         ensure!((1..=2).contains(&self.keys.len()), "worker tier count");
         ensure!(
@@ -61,7 +76,7 @@ impl RenderWork {
             "worker encoded allowance"
         );
         let first = &self.keys[0];
-        let renderer = if let Some(edit) = &self.edit {
+        if let Some(edit) = &self.edit {
             ensure!(
                 edit.prepared_bytes <= MAX_PROXY_BYTES,
                 "worker prepared staging allowance"
@@ -81,19 +96,19 @@ impl RenderWork {
                 !edit.interactive || self.keys.iter().all(|key| key.edge <= PROXY_EDGE),
                 "interactive key exceeds prepared source edge"
             );
-            edited_renderer(edit.interactive)
         } else {
             ensure!(
                 first.edit_revision == 0 && first.variant_id == "master",
                 "worker missing edit recipe"
             );
-            renderer_identity().into()
-        };
+        }
         for key in &self.keys {
             key.validate()?;
             ensure!(
-                key.renderer_version == renderer,
-                "worker renderer identity mismatch"
+                key.renderer_version == first.renderer_version
+                    && key.renderer_version.ends_with(":proxy1600")
+                        == self.edit.as_ref().is_some_and(|edit| edit.interactive),
+                "worker mixed renderer channels"
             );
             ensure!(
                 key.asset_id == first.asset_id

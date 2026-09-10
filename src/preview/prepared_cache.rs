@@ -27,6 +27,7 @@ pub(crate) struct SourceInstance {
     created: Option<SystemTime>,
     changed: Option<(i64, i64)>,
 }
+
 impl SourceInstance {
     pub(crate) fn read(path: &Path) -> Result<Self> {
         let canonical = fs::canonicalize(path)?;
@@ -186,9 +187,8 @@ impl PreparedCache {
             &receipt.identity.source_fingerprint,
             &receipt.identity.white_balance,
         )?;
-        if let Some(old) = self.entries.remove(&key) {
-            self.bytes -= old.value.receipt.bytes;
-            fs::remove_file(old.value.path.to_path()?)?;
+        if self.entries.contains_key(&key) {
+            self.remove_entry(&key, |path| fs::remove_file(path))?;
         }
         while self.entries.len() >= self.count || self.bytes + receipt.bytes > self.limit {
             let oldest = self
@@ -197,13 +197,12 @@ impl PreparedCache {
                 .min_by_key(|(_, e)| e.used)
                 .map(|(k, _)| k.clone())
                 .context("prepared eviction")?;
-            let old = self.entries.remove(&oldest).unwrap();
-            self.bytes -= old.value.receipt.bytes;
-            fs::remove_file(old.value.path.to_path()?)?;
+            self.remove_entry(&oldest, |path| fs::remove_file(path))?;
         }
         let path = self.root.join(format!("{key}.linear"));
+        let clock = self.clock.checked_add(1).context("prepared LRU overflow")?;
         fs::hard_link(&produced.path, &path)?;
-        self.clock = self.clock.checked_add(1).context("prepared LRU overflow")?;
+        self.clock = clock;
         self.bytes += receipt.bytes;
         self.entries.insert(
             key,
@@ -217,5 +216,103 @@ impl PreparedCache {
             },
         );
         Ok(())
+    }
+    fn remove_entry(
+        &mut self,
+        key: &str,
+        remove: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let old = self.entries.get(key).context("prepared entry missing")?;
+        match remove(&old.value.path.to_path()?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // A failed unlink must retain both the entry and its disk charge.
+        let old = self.entries.remove(key).unwrap();
+        self.bytes -= old.value.receipt.bytes;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edit::PreparedProxyIdentity;
+
+    fn produced(root: &Path) -> ProducedPrepared {
+        let path = root.join("worker-output.linear");
+        // Storage accounting fixture; container decoding has separate tests.
+        let bytes = b"bounded proxy storage fixture";
+        fs::write(&path, bytes).unwrap();
+        ProducedPrepared {
+            source: SourceInstance::read(&path).unwrap(),
+            path,
+            receipt: PreparedProxyReceipt {
+                bytes: bytes.len() as u64,
+                blake3: blake3::hash(bytes).to_hex().to_string(),
+                identity: PreparedProxyIdentity {
+                    source_fingerprint: "a".repeat(64),
+                    white_balance: WhiteBalance::AsShot,
+                    renderer_identity: crate::edit::renderer_identity().into(),
+                    original_dimensions: (1, 1),
+                    longest_edge: PROXY_EDGE,
+                    width: 1,
+                    height: 1,
+                },
+            },
+        }
+    }
+    #[test]
+    fn failed_unlink_keeps_disk_charge_and_entry_until_replacement_or_eviction_retries() {
+        for next_generation in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let produced = produced(root.path());
+            let mut cache = PreparedCache::open(
+                root.path().join("cache"),
+                produced.receipt.bytes,
+                1,
+            )
+            .unwrap();
+            cache.adopt(1, &produced).unwrap();
+            let key = identity(1, &"a".repeat(64), &WhiteBalance::AsShot).unwrap();
+            let old_path = cache.entries[&key].value.path.to_path().unwrap();
+            let error = cache
+                .remove_entry(&key, |_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected unlink refusal",
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(cache.bytes, produced.receipt.bytes);
+            assert_eq!(cache.entries.len(), 1);
+            assert!(cache.entries.contains_key(&key));
+            assert!(old_path.is_file());
+            cache.adopt(next_generation, &produced).unwrap();
+            assert_eq!(cache.bytes, produced.receipt.bytes);
+            assert_eq!(cache.entries.len(), 1);
+            let next_key = identity(next_generation, &"a".repeat(64), &WhiteBalance::AsShot).unwrap();
+            assert!(cache.entries.contains_key(&next_key));
+            assert_eq!(fs::read_dir(&cache.root).unwrap().count(), 1);
+        }
+    }
+    #[test]
+    fn missing_cache_file_releases_its_charge_and_allows_readmission() {
+        let root = tempfile::tempdir().unwrap();
+        let produced = produced(root.path());
+        let mut cache =
+            PreparedCache::open(root.path().join("cache"), produced.receipt.bytes, 1).unwrap();
+        cache.adopt(1, &produced).unwrap();
+        let key = identity(1, &"a".repeat(64), &WhiteBalance::AsShot).unwrap();
+        fs::remove_file(cache.entries[&key].value.path.to_path().unwrap()).unwrap();
+        cache.adopt(1, &produced).unwrap();
+        assert_eq!(cache.bytes, produced.receipt.bytes);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(fs::read_dir(&cache.root).unwrap().count(), 1);
     }
 }
