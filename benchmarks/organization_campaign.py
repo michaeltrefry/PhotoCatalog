@@ -23,7 +23,24 @@ PROTOCOL = 2  # Current native receipt; synthetic fixture row marker stays 1.
 FIXTURE_PROTOCOL = 1
 DRIVER_PROTOCOL = 5
 CURRENT_SCHEMA = 6
-EDIT_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
+SCHEMA6_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "export_alias_directories", "export_alias_dirty", "export_alias_paths", "export_alias_state", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
+
+
+def schema6_initial_rows(tables):
+    """Derived migration rows; no filesystem projection runs in preparation."""
+    counts = dict(tables)
+    assets, bound = counts.get("assets"), counts.get("storage_bindings")
+    if type(assets) is not int or type(bound) is not int or not 0 <= bound <= assets:
+        raise ValueError("binding cardinality required for schema6 alias initialization")
+    return [[name, 1 if name == "export_alias_state" else bound if name == "export_alias_dirty" else 0]
+            for name in SCHEMA6_TABLES]
+
+
+def schema6_alias_state(tables):
+    schema6_initial_rows(tables)
+    counts = dict(tables)
+    return {"unbound": counts["assets"] - counts["storage_bindings"], "dirty": counts["storage_bindings"]}
+
 TEXT_LIMITS = {"document_bytes": 1024**2, "page_bytes": 8 * 1024**2}
 LOCAL_TEXT_CASES = {"filename-reverse", "mixed", "text-capture"}
 DIAGNOSTIC_CASES = ["filename-reverse", "text", "text-capture", "date-camera"]
@@ -443,7 +460,7 @@ def preserve_current_ancestry(args, old_manifest_path, fixture):
     assert proof["owned_copy_before_sha256"] == fixture["source_main_sha256"]
     assert (proof["owned_copy_before_sha256"] == proof["owned_copy_after_sha256"]) == (proof["schema_before"] == CURRENT_SCHEMA)
     assert proof["observer"]["exit_code"] == 0 and proof["observer"]["error"] is None
-    for field in ("logical_before","logical_after","table_counts_before","table_counts_after","identity_scope","added_tables","index_sql"):
+    for field in ("logical_before","logical_after","table_counts_before","table_counts_after","identity_scope","added_tables","alias_initial_state","index_sql"):
         assert proof[field] == native[field]
     directory=args.root/f"schema6-ancestry-{fixture['count']}";directory.mkdir()
     for name,payload in (("proof",proof_bytes),("native",native_bytes)):
@@ -519,12 +536,15 @@ def validate_current_migration(native, count, source_schema):
     assert tables and tables == native["table_counts_after"] and len(dict(tables)) == len(tables)
     assert all(isinstance(name, str) and type(n) is int and n >= 0 for name,n in tables)
     assert all(dict(tables).get(name) == count for name in ("assets", "organization_assets", "organization_text"))
-    expected_added = [[name, 0] for name in EDIT_TABLES] if source_schema < CURRENT_SCHEMA else []
+    expected_added = schema6_initial_rows(tables) if source_schema < CURRENT_SCHEMA else []
     assert native["added_tables"] == expected_added
+    assert all(type(n) is int for _,n in native["added_tables"])
+    assert all(type(native["alias_initial_state"].get(key)) is int for key in ("unbound", "dirty"))
+    assert native["alias_initial_state"] == schema6_alias_state(tables)
     if source_schema < CURRENT_SCHEMA:
-        assert not set(EDIT_TABLES).intersection(dict(tables))
+        assert not set(SCHEMA6_TABLES).intersection(dict(tables))
     else:
-        assert all(dict(tables).get(name) == 0 for name in EDIT_TABLES), "reused fixture has edit state"
+        assert all(dict(tables).get(name) == n for name,n in schema6_initial_rows(tables)), "reused fixture has non-initial edit/export/alias state"
     assert native["index_sql"] == "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
 
 
@@ -546,7 +566,7 @@ def migrate_reused_fixture(args, fixture):
         assert native["logical_before"] == ancestor["logical_identity"] and native["table_counts_before"] == ancestor["table_counts"], "schema5 content differs from ancestor"
     if native["schema_before"] == CURRENT_SCHEMA:
         assert before == after, "current-schema verification changed physical bytes"
-    proof = {"identity_scope":native["identity_scope"],"added_tables":native["added_tables"],"owned_copy_before_sha256":before,"owned_copy_after_sha256":after,
+    proof = {"identity_scope":native["identity_scope"],"added_tables":native["added_tables"],"alias_initial_state":native["alias_initial_state"],"owned_copy_before_sha256":before,"owned_copy_after_sha256":after,
              "kind":"schema6_verification" if native["schema_before"] == CURRENT_SCHEMA else f"schema{native['schema_before']}_to_6_migration",
              "schema_before":native["schema_before"],"schema_after":CURRENT_SCHEMA,"native_receipt":str(receipt),
              "native_receipt_sha256":sha(receipt),"observer":observer,

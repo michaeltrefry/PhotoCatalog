@@ -2,28 +2,44 @@
 //! Projection is filesystem-free; existing-file admission additionally resolves
 //! current parent directories, so a replaced inode or redirected parent is not
 //! vouched for by historical storage_bindings.file_key evidence.
+//!
+//! Migration creates one state row and dirties every known binding without
+//! filesystem I/O. Reconcile in bounded admitted transactions before export.
+//! New destinations use indexed conservative spelling candidates; overwrites
+//! additionally validate distinct currently reachable parents up to the explicit
+//! directory limit. Unknown, foreign or excessive scope is refused, not guessed.
+//! These checks do not freeze external filesystem changes after admission;
+//! callers retain destination revision/no-clobber publication and source guards.
 use crate::storage_volume::{self, NativePath};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+// Derived rows reference assets: REPLACE may skip binding DELETE triggers when
+// recursive_triggers is OFF. Keeping the old dirty/projection row lets INSERT
+// distinguish replacement from first binding, and marks the projection stale.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE export_alias_state(id INTEGER PRIMARY KEY CHECK(id=1),unbound INTEGER NOT NULL CHECK(unbound>=0));
 INSERT INTO export_alias_state SELECT 1,COUNT(*) FROM assets a LEFT JOIN storage_bindings b ON b.asset_id=a.id WHERE b.asset_id IS NULL;
 CREATE TRIGGER export_alias_asset_added AFTER INSERT ON assets BEGIN UPDATE export_alias_state SET unbound=unbound+1 WHERE id=1; END;
 CREATE TRIGGER export_alias_asset_removed BEFORE DELETE ON assets WHEN NOT EXISTS(SELECT 1 FROM storage_bindings WHERE asset_id=old.id) BEGIN UPDATE export_alias_state SET unbound=unbound-1 WHERE id=1; END;
-CREATE TRIGGER export_alias_binding_removed AFTER DELETE ON storage_bindings WHEN EXISTS(SELECT 1 FROM assets WHERE id=old.asset_id) BEGIN UPDATE export_alias_state SET unbound=unbound+1 WHERE id=1; END;
 CREATE TABLE export_alias_directories(id INTEGER PRIMARY KEY,native_path TEXT NOT NULL UNIQUE,members INTEGER NOT NULL DEFAULT 0 CHECK(members>=0));
 CREATE INDEX export_alias_active_directories ON export_alias_directories(id) WHERE members>0;
-CREATE TABLE export_alias_paths(asset_id TEXT PRIMARY KEY REFERENCES storage_bindings(asset_id) ON DELETE CASCADE,parent INTEGER NOT NULL REFERENCES export_alias_directories(id),ascii_path TEXT,prefix TEXT NOT NULL,filename TEXT);
+CREATE TABLE export_alias_paths(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,parent INTEGER NOT NULL REFERENCES export_alias_directories(id),ascii_path TEXT,prefix TEXT NOT NULL,filename TEXT);
 CREATE INDEX export_alias_ascii ON export_alias_paths(ascii_path,asset_id) WHERE ascii_path IS NOT NULL;
 CREATE INDEX export_alias_prefix ON export_alias_paths(prefix,asset_id);
 CREATE INDEX export_alias_unicode_prefix ON export_alias_paths(prefix,asset_id) WHERE ascii_path IS NULL;
 CREATE INDEX export_alias_filename ON export_alias_paths(parent,filename,asset_id);
-CREATE TABLE export_alias_dirty(asset_id TEXT PRIMARY KEY REFERENCES storage_bindings(asset_id) ON DELETE CASCADE);
+CREATE TABLE export_alias_dirty(asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE);
 INSERT INTO export_alias_dirty SELECT asset_id FROM storage_bindings;
-CREATE TRIGGER export_alias_binding_added AFTER INSERT ON storage_bindings BEGIN INSERT OR IGNORE INTO export_alias_dirty VALUES(new.asset_id); UPDATE export_alias_state SET unbound=unbound-1 WHERE id=1; END;
+CREATE TRIGGER export_alias_binding_added AFTER INSERT ON storage_bindings BEGIN
+UPDATE export_alias_state SET unbound=unbound-(NOT EXISTS(SELECT 1 FROM export_alias_dirty WHERE asset_id=new.asset_id) AND NOT EXISTS(SELECT 1 FROM export_alias_paths WHERE asset_id=new.asset_id)) WHERE id=1;
+INSERT OR IGNORE INTO export_alias_dirty VALUES(new.asset_id); END;
+CREATE TRIGGER export_alias_binding_removed AFTER DELETE ON storage_bindings WHEN EXISTS(SELECT 1 FROM assets WHERE id=old.asset_id) BEGIN
+UPDATE export_alias_state SET unbound=unbound+1 WHERE id=1;
+DELETE FROM export_alias_paths WHERE asset_id=old.asset_id;
+DELETE FROM export_alias_dirty WHERE asset_id=old.asset_id; END;
 CREATE TRIGGER export_alias_binding_changed AFTER UPDATE OF native_path ON storage_bindings WHEN old.native_path!=new.native_path BEGIN INSERT OR IGNORE INTO export_alias_dirty VALUES(new.asset_id); END;
 CREATE TRIGGER export_alias_path_added AFTER INSERT ON export_alias_paths BEGIN UPDATE export_alias_directories SET members=members+1 WHERE id=new.parent; END;
 CREATE TRIGGER export_alias_path_deleted AFTER DELETE ON export_alias_paths BEGIN UPDATE export_alias_directories SET members=members-1 WHERE id=old.parent; END;
@@ -775,6 +791,88 @@ mod tests {
             0
         );
         assert!(guard(&db, &folder.join("new.jpg"), AliasLimits::default()).is_ok());
+    }
+    #[test]
+    fn binding_replace_preserves_counter_and_marks_old_projection_dirty_in_both_trigger_modes() {
+        for recursive in [false, true] {
+            for projected in [false, true] {
+                let db = database();
+                db.pragma_update(None, "recursive_triggers", recursive)
+                    .unwrap();
+                let root = tempfile::tempdir().unwrap();
+                let folder = fs::canonicalize(root.path()).unwrap();
+                bind(&db, "one", &folder.join("old.jpg"), None);
+                if projected {
+                    reconcile(&db);
+                }
+                let new = folder.join("nested/new.jpg");
+                let encoded = serde_json::to_string(&NativePath::from_path(&new)).unwrap();
+                db.execute(
+                    "INSERT OR REPLACE INTO storage_bindings VALUES('one',?1,NULL)",
+                    [&encoded],
+                )
+                .unwrap();
+                assert_eq!(
+                    db.query_row("SELECT unbound FROM export_alias_state", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert!(guard(&db, &folder.join("export.jpg"), AliasLimits::default()).is_err());
+                reconcile(&db);
+                assert!(guard(&db, &new, AliasLimits::default()).is_err());
+                assert!(guard(&db, &folder.join("old.jpg"), AliasLimits::default()).is_ok());
+                assert_eq!(
+                    db.query_row(
+                        "SELECT sum(members) FROM export_alias_directories",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+                // The ordinary UPSERT path must likewise dirty without changing
+                // binding cardinality; rollback leaves the original proof intact.
+                let tx = db.unchecked_transaction().unwrap();
+                tx.execute("INSERT INTO storage_bindings VALUES('one',?1,NULL) ON CONFLICT(asset_id) DO UPDATE SET native_path=excluded.native_path", [serde_json::to_string(&NativePath::from_path(&folder.join("third.jpg"))).unwrap()]).unwrap();
+                assert_eq!(
+                    tx.query_row("SELECT unbound FROM export_alias_state", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                tx.rollback().unwrap();
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM export_alias_dirty", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert!(guard(&db, &new, AliasLimits::default()).is_err());
+                db.execute("DELETE FROM assets WHERE id='one'", []).unwrap();
+                assert_eq!(
+                    db.query_row("SELECT unbound FROM export_alias_state", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM export_alias_paths", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT sum(members) FROM export_alias_directories",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+        }
     }
     #[test]
     fn ascii_heavy_folders_do_not_expand_unicode_candidate_index_work() {

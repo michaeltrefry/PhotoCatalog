@@ -145,7 +145,7 @@ class CampaignTests(unittest.TestCase):
         schema4=fixture['main_sha256']
         header=bytearray(main.read_bytes());header[60:64]=(5).to_bytes(4,'big');main.write_bytes(header)
         fixture.update(schema=5,source_main_sha256=schema4,main_sha256=campaign.sha(main))
-        tables=[['assets',1000],['organization_assets',1000],['organization_text',1000],['organization_text_idx',12]]
+        tables=[['assets',1000],['organization_assets',1000],['organization_text',1000],['organization_text_idx',12],['storage_bindings',0]]
         native=dict(protocol=1,complete=True,mode='migrate_fixture',count=1000,engine_version='3.51.1',schema_before=4,schema_after=5,
                     logical_before='a'*64,logical_after='a'*64,table_counts_before=tables,table_counts_after=tables,
                     index_sql='CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)')
@@ -165,7 +165,7 @@ class CampaignTests(unittest.TestCase):
             ancestor=copied['prior_migration']
             self.assertEqual(pathlib.Path(ancestor['proof']).read_bytes(),pathlib.Path(fixture['migration_proof']).read_bytes())
             self.assertEqual(campaign.sha(ancestor['native']),ancestor['native_sha256'])
-            native.update(protocol=2,catalog_schema=6,schema_before=5,schema_after=6,identity_scope="pre_existing_tables",added_tables=[[name,0] for name in campaign.EDIT_TABLES])
+            native.update(protocol=2,catalog_schema=6,schema_before=5,schema_after=6,identity_scope="pre_existing_tables",added_tables=campaign.schema6_initial_rows(native["table_counts_before"]),alias_initial_state=campaign.schema6_alias_state(native["table_counts_before"]))
             def child(binary,catalog,output,argv,timeout):
                 self.assertEqual(argv,['migrate-fixture']);campaign.save(output,native)
                 target=catalog/'catalog.sqlite3';header=bytearray(target.read_bytes());header[60:64]=(6).to_bytes(4,'big');target.write_bytes(header)
@@ -185,7 +185,7 @@ class CampaignTests(unittest.TestCase):
             args,fixture,main,native=self.schema5_reusable(pathlib.Path(directory))
             header=bytearray(main.read_bytes());header[60:64]=(6).to_bytes(4,"big");main.write_bytes(header)
             fixture.update(schema=6,main_sha256=campaign.sha(main),source_main_sha256="b"*64)
-            native.update(protocol=2,catalog_schema=6,schema_before=5,schema_after=6,identity_scope="pre_existing_tables",added_tables=[[name,0] for name in campaign.EDIT_TABLES])
+            native.update(protocol=2,catalog_schema=6,schema_before=5,schema_after=6,identity_scope="pre_existing_tables",added_tables=campaign.schema6_initial_rows(native["table_counts_before"]),alias_initial_state=campaign.schema6_alias_state(native["table_counts_before"]))
             native_path=args.reuse_prepared.parent/"schema6-native.json";campaign.save(native_path,native)
             proof={**native,"native_receipt":str(native_path),"native_receipt_sha256":campaign.sha(native_path),"owned_copy_before_sha256":"b"*64,"owned_copy_after_sha256":fixture["main_sha256"],"observer":{"exit_code":0,"error":None}}
             proof_path=args.reuse_prepared.parent/"schema6-proof.json";campaign.save(proof_path,proof)
@@ -288,17 +288,20 @@ class CampaignTests(unittest.TestCase):
 
 class CurrentSchemaContracts(unittest.TestCase):
     def test_migration_scope_additions_and_old_protocol_reject(self):
-        tables=[["assets",1000],["organization_assets",1000],["organization_text",1000]]
+        tables=[["assets",1000],["organization_assets",1000],["organization_text",1000],["storage_bindings",7]]
         native=dict(protocol=2,catalog_schema=6,complete=True,mode="migrate_fixture",count=1000,
                     schema_before=5,schema_after=6,identity_scope="pre_existing_tables",
                     logical_before="a"*64,logical_after="a"*64,table_counts_before=tables,table_counts_after=tables,
-                    added_tables=[[name,0] for name in campaign.EDIT_TABLES],
+                    added_tables=campaign.schema6_initial_rows(tables),alias_initial_state={"unbound":993,"dirty":7},
                     index_sql="CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)")
+        self.assertEqual(dict(native["added_tables"])["export_alias_state"],1)
+        self.assertEqual(dict(native["added_tables"])["export_alias_dirty"],7)
+        self.assertEqual(dict(native["added_tables"])["export_alias_paths"],0)
         campaign.validate_current_migration(native,1000,5)
-        for field,value in [("protocol",1),("catalog_schema",5),("schema_after",5),("identity_scope","all_tables"),("logical_after","b"*64),("added_tables",[]),("added_tables",[[name,1] for name in campaign.EDIT_TABLES])]:
+        for field,value in [("protocol",1),("catalog_schema",5),("schema_after",5),("identity_scope","all_tables"),("logical_after","b"*64),("added_tables",[]),("added_tables",[[name,0] for name in campaign.SCHEMA6_TABLES]),("alias_initial_state",{"unbound":1000,"dirty":0})]:
             with self.subTest(field=field), self.assertRaises(AssertionError):
                 campaign.validate_current_migration({**native,field:value},1000,5)
-        current={**native,"schema_before":6,"added_tables":[],"table_counts_before":tables+[[name,0] for name in campaign.EDIT_TABLES],"table_counts_after":tables+[[name,0] for name in campaign.EDIT_TABLES]}
+        current={**native,"schema_before":6,"added_tables":[],"table_counts_before":tables+campaign.schema6_initial_rows(tables),"table_counts_after":tables+campaign.schema6_initial_rows(tables)}
         campaign.validate_current_migration(current,1000,6)
         with self.assertRaises(AssertionError):
             campaign.validate_current_migration({**current,"added_tables":native["added_tables"]},1000,6)

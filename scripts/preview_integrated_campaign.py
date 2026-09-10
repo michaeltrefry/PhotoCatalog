@@ -19,7 +19,24 @@ from preview_navigation_campaign import anchor, read_json, expected_trials, vali
 
 CURRENT_SCHEMA = 6
 PROTOCOL = 3
-EDIT_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
+SCHEMA6_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "export_alias_directories", "export_alias_dirty", "export_alias_paths", "export_alias_state", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
+
+
+def schema6_initial_rows(tables):
+    """Derived migration rows; no filesystem projection runs in preparation."""
+    counts = dict(tables)
+    assets, bound = counts.get("assets"), counts.get("storage_bindings")
+    if type(assets) is not int or type(bound) is not int or not 0 <= bound <= assets:
+        raise ValueError("binding cardinality required for schema6 alias initialization")
+    return [[name, 1 if name == "export_alias_state" else bound if name == "export_alias_dirty" else 0]
+            for name in SCHEMA6_TABLES]
+
+
+def schema6_alias_state(tables):
+    schema6_initial_rows(tables)
+    counts = dict(tables)
+    return {"unbound": counts["assets"] - counts["storage_bindings"], "dirty": counts["storage_bindings"]}
+
 
 SUFFIXES = ("", "-wal", "-shm", "-journal")
 INDEX_SQL = "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
@@ -68,11 +85,13 @@ def ancestry_evidence(source):
         if current.get("protocol") != 2 or current.get("catalog_schema") != CURRENT_SCHEMA or current.get("complete") is not True or current.get("mode") != "migrate_fixture" or current.get("count") != 10000000 or current.get("engine_version") != "3.51.1":
             raise ValueError("schema6 native identity differs")
         for item in (newer, current):
-            if item.get("schema_before") != 5 or item.get("schema_after") != CURRENT_SCHEMA or item.get("identity_scope") != "pre_existing_tables" or item.get("added_tables") != [[name,0] for name in EDIT_TABLES]:
-                raise ValueError("schema6 migration must report new empty edit tables separately")
+            if not isinstance(item.get("alias_initial_state"), dict) or any(type(item["alias_initial_state"].get(key)) is not int for key in ("unbound", "dirty")) or any(type(n) is not int for _,n in item.get("added_tables", [])):
+                raise ValueError("schema6 alias initialization requires integer counts")
+            if item.get("schema_before") != 5 or item.get("schema_after") != CURRENT_SCHEMA or item.get("identity_scope") != "pre_existing_tables" or item.get("added_tables") != schema6_initial_rows(tables) or item.get("alias_initial_state") != schema6_alias_state(tables):
+                raise ValueError("schema6 migration must report edit/export and derived alias initial rows separately")
             if any(item.get(f) != logical for f in ("logical_before", "logical_after")) or any(item.get(f) != tables for f in ("table_counts_before", "table_counts_after")) or item.get("index_sql") != INDEX_SQL:
                 raise ValueError("schema6 migration changed pre-existing typed rows/index")
-        if set(EDIT_TABLES).intersection(dict(tables)) or newer.get("observer", {}).get("exit_code") != 0 or newer.get("observer", {}).get("error") is not None:
+        if set(SCHEMA6_TABLES).intersection(dict(tables)) or newer.get("observer", {}).get("exit_code") != 0 or newer.get("observer", {}).get("error") is not None:
             raise ValueError("schema6 legacy table set or observer failed")
         payloads.update({"schema6_"+key:value for key,value in upgrade_payloads.items()})
     return payloads

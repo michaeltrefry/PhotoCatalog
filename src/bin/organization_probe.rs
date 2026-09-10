@@ -69,13 +69,17 @@ enum Case {
 const PROTOCOL: u32 = 2;
 // Row formulas/fixture marker remain compatible with frozen S7 inputs.
 const FIXTURE_PROTOCOL: u32 = 1;
-const EDIT_TABLES: [&str; 9] = [
+const SCHEMA6_TABLES: [&str; 13] = [
     "edit_changes",
     "edit_copy_items",
     "edit_copy_jobs",
     "edit_recipe_nodes",
     "edit_redo_nodes",
     "edit_variants",
+    "export_alias_directories",
+    "export_alias_dirty",
+    "export_alias_paths",
+    "export_alias_state",
     "photo_export_blobs",
     "photo_export_items",
     "photo_export_jobs",
@@ -317,16 +321,16 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         ensure!(
             !tables_before
                 .iter()
-                .any(|t| EDIT_TABLES.contains(&t.as_str())),
-            "legacy schema contains unexpected edit tables"
+                .any(|t| SCHEMA6_TABLES.contains(&t.as_str())),
+            "legacy schema contains unexpected schema6 tables"
         );
     }
     if before_schema == CURRENT_SCHEMA_VERSION {
         ensure!(
-            EDIT_TABLES
+            SCHEMA6_TABLES
                 .iter()
                 .all(|t| tables_before.iter().any(|name| name.as_str() == *t)),
-            "current schema missing edit tables"
+            "current schema missing schema6 tables"
         );
     }
     let before = fixture_data_identity(&db, &tables_before)?;
@@ -344,7 +348,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         .cloned()
         .collect();
     let expected_added: Vec<String> = if before_schema < CURRENT_SCHEMA_VERSION {
-        EDIT_TABLES.iter().map(|s| s.to_string()).collect()
+        SCHEMA6_TABLES.iter().map(|s| s.to_string()).collect()
     } else {
         Vec::new()
     };
@@ -353,10 +357,40 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         "unexpected migration table additions"
     );
     let added_identity = fixture_data_identity(&db, &added)?;
+    // This is a pristine query fixture, not an export-projection benchmark.
+    // Migration creates a state row and one dirty row per existing binding;
+    // those rows must be verified, not incorrectly classified as empty tables.
+    let bound: i64 = db.query_row("SELECT count(*) FROM storage_bindings", [], |r| r.get(0))?;
+    let unbound: i64 = db.query_row("SELECT count(*) FROM assets a WHERE NOT EXISTS(SELECT 1 FROM storage_bindings b WHERE b.asset_id=a.id)", [], |r| r.get(0))?;
+    let state: (i64, i64) = db.query_row("SELECT id,unbound FROM export_alias_state", [], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })?;
     ensure!(
-        added_identity.1.iter().all(|(_, count)| *count == 0),
-        "new edit tables are not empty"
+        state == (1, unbound) && unbound + bound == count,
+        "incorrect alias initial state"
     );
+    let dirty_mismatch: bool = db.query_row("SELECT EXISTS(SELECT asset_id FROM storage_bindings EXCEPT SELECT asset_id FROM export_alias_dirty) OR EXISTS(SELECT asset_id FROM export_alias_dirty EXCEPT SELECT asset_id FROM storage_bindings)", [], |r| r.get(0))?;
+    ensure!(
+        !dirty_mismatch,
+        "alias dirty membership differs from bindings"
+    );
+    let all_initial = fixture_data_identity(
+        &db,
+        &SCHEMA6_TABLES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    ensure!(
+        all_initial.1.iter().all(|(name, n)| *n
+            == match name.as_str() {
+                "export_alias_state" => 1,
+                "export_alias_dirty" => bound,
+                _ => 0,
+            }),
+        "schema6 fixture has non-initial edit/export/alias rows"
+    );
+    let alias_initial_state = json!({"unbound":unbound,"dirty":bound});
     let after = fixture_data_identity(&db, &tables_before)?;
     let after_schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let index: String = db.query_row(
@@ -373,7 +407,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     ensure!(index == expected, "unexpected capture index definition");
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(
-        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"mode":"migrate_fixture","complete":true,"count":count,"schema_before":before_schema,"schema_after":after_schema,"identity_scope":"pre_existing_tables","added_tables":added_identity.1,"logical_before":before.0,"logical_after":after.0,"table_counts_before":before.1,"table_counts_after":after.1,"index_sql":index,"engine_version":rusqlite::version(),"provenance":"Explicit owned-copy schema/index migration; streamed typed logical identity covers every pre-existing table, FTS shadow table and row identity; new empty edit tables are reported separately. Not timed query work."}),
+        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"mode":"migrate_fixture","complete":true,"count":count,"schema_before":before_schema,"schema_after":after_schema,"identity_scope":"pre_existing_tables","added_tables":added_identity.1,"alias_initial_state":alias_initial_state,"logical_before":before.0,"logical_after":after.0,"table_counts_before":before.1,"table_counts_after":after.1,"index_sql":index,"engine_version":rusqlite::version(),"provenance":"Explicit owned-copy schema/index migration; streamed typed logical identity covers every pre-existing table, FTS shadow table and row identity; new edit/export tables and derived alias initial rows are reported separately. Not timed query work."}),
     )
 }
 

@@ -12,16 +12,23 @@ no schema migration belongs to a timed query. `prepare` creates schema 6 directl
 For reused owned copies, run `migrate-fixture` explicitly during preparation.
 Migration receipts identify `identity_scope=pre_existing_tables`: the before/after
 typed hash and table counts cover exactly that old table set, including FTS and
-row identities. Six newly introduced `edit_*` tables are separately named in
-`added_tables` with zero counts; this is not a claim that the entire schema-6
-hash equals the old schema-5 hash. A 6-to-6 verification reports no additions.
+row identities. `added_tables` separately names the nine initially empty
+edit/export tables and four derived alias tables. Alias directories/paths start
+empty; alias state has one row, and dirty membership contains every existing
+storage binding. `alias_initial_state` reports the exact unbound-asset and dirty
+counts, checked against existing assets/bindings and exact dirty membership.
+This is not a claim that the entire schema-6 hash equals the old schema-5 hash.
+A pristine 6-to-6 verification reports no additions and validates that same
+initial state. Projection reconciliation is not timed query work.
 
 The driver preserves the original native-protocol-1 4-to-5 proof bytes, then records
 a distinct 5-to-6 migration and changed physical main hash. A copied schema-6
 fixture instead requires current producer evidence or a bound predecessor
 migration receipt, retains predecessor proof bytes/manifest identity, and records
 a separate 6-to-6 verification with unchanged physical bytes. Old-schema test
-fixtures remove edit tables rather than merely relabeling a current database.
+fixtures remove all schema-6 tables, indexes and attached alias triggers rather
+than merely relabeling a current database. Existing frozen 4-to-5 proof bytes
+and their native-protocol-1 interpretation remain unchanged.
 
 This experiment is separate from S2 backend selection. SQLite remains the selected
 backend; no alternative backend/profile or threshold search is performed here.

@@ -72,10 +72,10 @@ class CopyContract(unittest.TestCase):
                 ancestry_evidence(source)
 
     def test_schema6_requires_separate_bound_upgrade_without_rewriting_legacy(self):
-        from preview_integrated_campaign import EDIT_TABLES
+        from preview_integrated_campaign import SCHEMA6_TABLES, schema6_initial_rows
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
-            tables=[["assets",10000000],["organization_assets",10000000],["organization_text",10000000]]
+            tables=[["assets",10000000],["organization_assets",10000000],["organization_text",10000000],["storage_bindings",3]]
             native=dict(protocol=1,complete=True,mode="migrate_fixture",count=10000000,engine_version="3.51.1",schema_before=4,schema_after=5,
                         logical_before="a"*64,logical_after="a"*64,table_counts_before=tables,table_counts_after=tables,index_sql=INDEX_SQL)
             def write(name,value):
@@ -86,7 +86,7 @@ class CopyContract(unittest.TestCase):
             source={"schema_version":6,"files":{"":{"sha256":"d"*64}},"migration_ancestry":{"proof":old_proof,"native":old_native}}
             with self.assertRaisesRegex(ValueError,"separate schema5-to-6"):
                 ancestry_evidence(source)
-            current={**native,"protocol":2,"catalog_schema":6,"schema_before":5,"schema_after":6,"identity_scope":"pre_existing_tables","added_tables":[[name,0] for name in EDIT_TABLES]}
+            current={**native,"protocol":2,"catalog_schema":6,"schema_before":5,"schema_after":6,"identity_scope":"pre_existing_tables","added_tables":schema6_initial_rows(tables),"alias_initial_state":{"unbound":9999997,"dirty":3}}
             current_native=write("new-native.json",current)
             upgraded={**current,"native_receipt_sha256":current_native["sha256"],"owned_copy_before_sha256":"c"*64,"owned_copy_after_sha256":"d"*64,"observer":{"exit_code":0,"error":None}}
             current_proof=write("new-proof.json",upgraded)
@@ -95,7 +95,7 @@ class CopyContract(unittest.TestCase):
             self.assertEqual(set(result),{"proof","native","schema6_proof","schema6_native"})
             self.assertEqual(json.loads(result["native"])["schema_after"],5)
             self.assertEqual(json.loads(result["schema6_native"])["schema_after"],6)
-            for field,value in [("schema_after",5),("identity_scope","all_tables"),("added_tables",[]),("logical_after","f"*64),("owned_copy_before_sha256","e"*64),("owned_copy_after_sha256","c"*64)]:
+            for field,value in [("schema_after",5),("identity_scope","all_tables"),("added_tables",[]),("added_tables",[[name,0] for name in SCHEMA6_TABLES]),("alias_initial_state",{"unbound":10000000,"dirty":0}),("logical_after","f"*64),("owned_copy_before_sha256","e"*64),("owned_copy_after_sha256","c"*64)]:
                 bad=copy.deepcopy(source)
                 bad["schema6_migration"]["proof"]=write("bad-proof.json",{**upgraded,field:value})
                 with self.subTest(field=field),self.assertRaises(ValueError):

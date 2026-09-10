@@ -3,6 +3,7 @@
 pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 pub mod catalog_edits;
+pub mod catalog_export_alias;
 pub mod catalog_exports;
 pub mod catalog_metadata;
 pub mod catalog_storage;
@@ -289,6 +290,7 @@ impl Catalog {
             if version < 6 {
                 tx.execute_batch(catalog_edits::SCHEMA)?;
                 tx.execute_batch(catalog_exports::SCHEMA)?;
+                tx.execute_batch(catalog_export_alias::SCHEMA)?;
                 tx.pragma_update(None, "user_version", 6)?;
             }
             tx.commit()?;

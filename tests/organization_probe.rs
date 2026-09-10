@@ -119,6 +119,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
     let root = temp.path();
     ensure!(run(root, "prepare-migration", &["prepare", "--count", "1000"])?.0);
     let conn = rusqlite::Connection::open(root.join("catalog/catalog.sqlite3"))?;
+    remove_alias_schema(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
     let (okay, receipt) = run(root, "migration", &["migrate-fixture"])?;
@@ -128,12 +129,12 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 9
+            && receipt["added_tables"].as_array().unwrap().len() == 13
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|row| row[1] == 0)
+                .all(|row| row[1] == if row[0] == "export_alias_state" { 1 } else { 0 })
     );
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
@@ -183,7 +184,12 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(run(root, "prepare-six", &["prepare", "--count", "1000"])?.0);
     let main = root.join("catalog/catalog.sqlite3");
     let conn = rusqlite::Connection::open(&main)?;
+    remove_alias_schema(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    // Existing bindings initialize dirty membership even though projections
+    // are deliberately not resolved during schema migration.
+    conn.execute("INSERT INTO storage_bindings(asset_id,reference,native_path) VALUES('fixture-000000000001','retained-reference','retained-path')", [])?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
     let before = fs::read(&main)?;
     let (okay, refusal) = run(
@@ -210,13 +216,19 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     );
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 9);
+    ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 13);
     ensure!(
         migrated["added_tables"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|row| row[1] == 0)
+            .all(|row| row[1]
+                == if row[0] == "export_alias_state" || row[0] == "export_alias_dirty" {
+                    1
+                } else {
+                    0
+                })
     );
     ensure!(
         migrated["table_counts_before"]
@@ -239,5 +251,41 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
             == 6
     );
     ensure!(verified["logical_before"] == verified["logical_after"] && fs::read(&main)? == after);
+    // Same dirty row count with the wrong member is not equivalent evidence.
+    let conn = rusqlite::Connection::open(&main)?;
+    conn.execute_batch("DELETE FROM export_alias_dirty; INSERT INTO export_alias_dirty VALUES('fixture-000000000002'); PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    let corrupt = fs::read(&main)?;
+    let (okay, rejected) = run(root, "wrong-dirty-membership", &["migrate-fixture"])?;
+    ensure!(
+        !okay
+            && rejected["error"]
+                .as_str()
+                .unwrap()
+                .contains("dirty membership")
+    );
+    ensure!(
+        fs::read(&main)? == corrupt,
+        "failed verification rewrote the fixture"
+    );
+    Ok(())
+}
+
+// Reconstruct a genuine pre-schema6 fixture; dropping only tables would leave
+// alias triggers attached to pre-existing assets/storage_bindings.
+fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
+    let triggers = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'export_alias_*'",
+        )?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for trigger in triggers {
+        conn.execute_batch(&format!(
+            "DROP TRIGGER \"{}\"",
+            trigger.replace('"', "\"\"")
+        ))?;
+    }
+    conn.execute_batch("DROP TABLE export_alias_paths; DROP TABLE export_alias_dirty; DROP TABLE export_alias_directories; DROP TABLE export_alias_state")?;
     Ok(())
 }
