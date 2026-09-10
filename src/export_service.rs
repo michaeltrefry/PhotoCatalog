@@ -89,6 +89,9 @@ pub struct ExportCompletionMetrics {
     /// Owner wall interval from input preparation/spawn through observed child
     /// completion. Includes polling; render fields carry the child phase timings.
     pub worker_elapsed_ms: f64,
+    pub worker_pid: u32,
+    pub worker_peak_resident_bytes: Option<u64>,
+    pub worker_peak_method: String,
     pub render: crate::photo_render::PhotoRenderTimings,
     pub seal_ms: f64,
     pub accept_ms: f64,
@@ -279,6 +282,7 @@ impl ExportService {
             // admission or preview suspension. Failed stop leaves ownership held.
             self.active.as_mut().unwrap().process.stop()?;
             let active = self.active.take().unwrap();
+            let worker_pid = active.process.pid();
             let cleanup_warning = active.process.retire_transport().err().map(detail);
             let worker_elapsed_ms = active.started.elapsed().as_secs_f64() * 1000.;
             let started_unix_ms = active.started_unix_ms;
@@ -295,6 +299,9 @@ impl ExportService {
                         started_unix_ms,
                         finished_unix_ms: unix_ms()?,
                         worker_elapsed_ms,
+                        worker_pid,
+                        worker_peak_resident_bytes: result.peak_resident_bytes,
+                        worker_peak_method: result.peak_method.clone(),
                         render: result.rendered.timings.clone(),
                         seal_ms: result.seal_ms,
                         accept_ms: accept_start.elapsed().as_secs_f64() * 1000.,

@@ -187,6 +187,17 @@ fn exact_batch_formats_publish_edited_originals_and_survive_reopen() -> anyhow::
             assert!(image.to_rgb8().get_pixel(0, 0).0[0] > 75);
         }
         assert_eq!(c.photo_export_items(&job, 0, 1)?[0].state, "published");
+        let metrics = service.take_completion_metrics().unwrap();
+        assert_eq!(metrics.job, job);
+        assert_ne!(metrics.worker_pid, std::process::id());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(
+            metrics
+                .worker_peak_resident_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(!metrics.worker_peak_method.is_empty());
+        assert!(service.take_completion_metrics().is_none());
     }
     assert_eq!(std::fs::read(original)?, original_bytes);
     drop(service);

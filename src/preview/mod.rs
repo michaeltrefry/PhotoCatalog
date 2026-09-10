@@ -26,6 +26,7 @@ pub use store::{
 
 mod prepared_cache;
 mod worker;
+pub(crate) use worker::peak_resident_memory;
 pub use worker::{
     EditWork, ProducedPreview, RenderWork, RenderedPreviewBatch, WorkerFailure, WorkerProcess,
     recover_worker_staging, worker_main,
@@ -35,7 +36,7 @@ mod service;
 pub use service::{
     CacheReadMetrics, EncodedPreview, JobState, JobView, NativeLaunchPause, PreviewPolicy,
     PreviewService, PreviewView, ReadCompletion, ReadOutcome, ReadQueueUsage, ReadTicket,
-    ServiceCompletion, ServiceEvent, ServiceLimits, TierPolicy,
+    ServiceCompletion, ServiceEvent, ServiceLimits, TierPolicy, WorkerResourceMetrics,
 };
 
 mod config;

@@ -621,7 +621,7 @@ pub fn worker_main() -> Result<()> {
     }
     result
 }
-fn peak_resident_memory() -> (Option<u64>, String) {
+pub(crate) fn peak_resident_memory() -> (Option<u64>, String) {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };

@@ -82,6 +82,23 @@ fn edited_variants_and_proxy_refinement_coexist_without_mutating_originals() {
         finish(&mut previews, &mut catalog, original_ticket),
         ServiceCompletion::Ready
     ));
+    let metrics = previews.take_worker_metrics().unwrap();
+    assert_ne!(metrics.pid, std::process::id());
+    assert!(
+        metrics
+            .keys
+            .iter()
+            .all(|key| key.asset_id == master.asset_id)
+    );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert!(metrics.peak_resident_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(!metrics.peak_method.is_empty());
+    assert!(previews.take_worker_metrics().is_none());
+    previews
+        .cached(&catalog, &master.asset_id, Tier::Thumbnail, false)
+        .unwrap()
+        .unwrap();
+    assert!(previews.take_worker_metrics().is_none());
     let proxy = previews
         .request_interactive(
             &mut catalog,

@@ -34,6 +34,8 @@ pub struct CompletedExport {
     pub sealed: SealedPhotoExport,
     pub rendered: StagedPhoto,
     pub seal_ms: f64,
+    pub peak_resident_bytes: Option<u64>,
+    pub peak_method: String,
 }
 fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
@@ -656,12 +658,15 @@ pub fn export_worker_main() -> Result<()> {
                 |_| Ok(()),
             )?
         };
+        let (peak_resident_bytes, peak_method) = crate::preview::peak_resident_memory();
         let receipt = CompletedExport {
             authority: request.work.authority,
             attempt: request.work.attempt,
             sealed,
             rendered,
             seal_ms: seal_started.elapsed().as_secs_f64() * 1000.,
+            peak_resident_bytes,
+            peak_method,
         };
         let bytes = serde_json::to_vec(&receipt)?;
         ensure!(

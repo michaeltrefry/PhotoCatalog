@@ -199,6 +199,15 @@ impl Drop for NativeLaunchPause {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
+/// Diagnostic receipt for the most recently consumed successful worker result.
+/// Keys identify the producer; a later cache hit is not a new worker measurement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerResourceMetrics {
+    pub pid: u32,
+    pub keys: Vec<PreviewKey>,
+    pub peak_resident_bytes: Option<u64>,
+    pub peak_method: String,
+}
 pub struct PreviewService {
     launch_pauses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     reads: read_queue::ReadQueue,
@@ -216,6 +225,7 @@ pub struct PreviewService {
     active: HashMap<u64, ActiveJob>,
     consumers: HashMap<Consumer, String>,
     completed: HashMap<Consumer, ServiceCompletion>,
+    worker_metrics: Option<WorkerResourceMetrics>,
 }
 fn same_pixels(a: &RenderIdentity, b: &RenderIdentity) -> bool {
     a.asset_id == b.asset_id
@@ -353,6 +363,7 @@ impl PreviewService {
             active: HashMap::new(),
             consumers: HashMap::new(),
             completed: HashMap::new(),
+            worker_metrics: None,
         })
     }
     /// Optional short diagnostics callback. Recovery probes can stop an actual
@@ -362,6 +373,11 @@ impl PreviewService {
         observer: impl FnMut(ServiceEvent) -> Result<()> + Send + 'static,
     ) {
         self.observer.replace(Some(Box::new(observer)));
+    }
+    /// Bounded latest-result diagnostics, consumed once. Multiple workers may
+    /// replace an earlier result within one tick; this is not an audit log.
+    pub fn take_worker_metrics(&mut self) -> Option<WorkerResourceMetrics> {
+        self.worker_metrics.take()
     }
     fn observe(&self, event: ServiceEvent) -> Result<()> {
         if let Some(observer) = self.observer.borrow_mut().as_mut() {
@@ -878,6 +894,12 @@ impl PreviewService {
             } else {
                 result.and_then(|batch| {
                     let batch = batch.context("missing worker result")?;
+                    self.worker_metrics = Some(WorkerResourceMetrics {
+                        pid: active.worker.pid(),
+                        keys: job.request.keys.clone(),
+                        peak_resident_bytes: batch.peak_resident_bytes,
+                        peak_method: batch.peak_method.clone(),
+                    });
                     if let Some(prepared) = &batch.prepared {
                         self.prepared
                             .adopt(job.request.keys[0].generation, prepared)?;
