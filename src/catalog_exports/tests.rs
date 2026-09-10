@@ -569,7 +569,7 @@ fn namespace_mutation_is_not_excused_as_our_rename_or_hardlink_timestamp() -> Re
                 let modified = fs::metadata(&altered)?.modified()?;
                 let mut bytes = fs::read(&altered)?;
                 bytes[0] ^= 1;
-                if cfg!(windows) {
+                if cfg!(windows) && phase == PhotoExportBoundary::Linked {
                     let unchanged = fs::read(&altered)?;
                     let error =
                         fs::write(&altered, bytes).expect_err("held proof allowed mutation");
@@ -585,7 +585,7 @@ fn namespace_mutation_is_not_excused_as_our_rename_or_hardlink_timestamp() -> Re
             }
             Ok(())
         });
-        if cfg!(windows) {
+        if cfg!(windows) && phase == PhotoExportBoundary::Linked {
             assert_eq!(result?.0.state, metadata_export::ExportState::Published);
             assert_eq!(c.photo_export_items(&j.id, 0, 1)?[0].state, "published");
             assert_eq!(

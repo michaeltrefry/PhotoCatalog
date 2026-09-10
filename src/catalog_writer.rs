@@ -181,15 +181,36 @@ mod tests {
                 }
             });
             queued(&gate, 1, 0);
-            fs::write(&original, b"changed while waiting")?;
+            let mutation = fs::write(&original, b"changed while waiting");
+            // Even a refused Windows write must release the gate and join.
             drop(held);
             let result = worker.join().expect("export worker panicked");
-            assert!(format!("{:#}", result.unwrap_err()).contains("original changed"));
-            assert!(!destination.exists());
-            assert_eq!(
-                catalog.photo_export_items(&job.id, 0, 1)?[0].state,
-                if publish { "sealed" } else { "rendering" }
-            );
+            if cfg!(windows) {
+                assert_eq!(
+                    mutation
+                        .expect_err("held proof allowed a write")
+                        .raw_os_error(),
+                    Some(32)
+                );
+                result?;
+                assert_eq!(fs::read(&original)?, b"original fixture bytes");
+                assert_eq!(destination.exists(), publish);
+                if publish {
+                    assert_eq!(fs::read(&destination)?, b"rendered derivative");
+                }
+                assert_eq!(
+                    catalog.photo_export_items(&job.id, 0, 1)?[0].state,
+                    if publish { "published" } else { "sealed" }
+                );
+            } else {
+                mutation?;
+                assert!(format!("{:#}", result.unwrap_err()).contains("original changed"));
+                assert!(!destination.exists());
+                assert_eq!(
+                    catalog.photo_export_items(&job.id, 0, 1)?[0].state,
+                    if publish { "sealed" } else { "rendering" }
+                );
+            }
         }
         Ok(())
     }
