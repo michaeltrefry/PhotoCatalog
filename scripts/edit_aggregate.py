@@ -302,7 +302,12 @@ def aggregate(root, binding):
     normal_limits = edit_qualification.plan(manifest)['normal_limits']
     if not same(binding['normal_limits'], normal_limits):
         raise ValueError('normal resource configuration differs from prospective plan')
-    prepared = preparation(root, binding)
+    preparation_root = Path(binding['preparation_root'])
+    if (not preparation_root.is_absolute() or preparation_root.is_symlink()
+            or preparation_root.resolve(strict=True) != preparation_root
+            or preparation_root.parent != root.parent or preparation_root == root):
+        raise ValueError('explicit separate owned preparation sibling required')
+    prepared = preparation(preparation_root, binding)
     cohort = {item['id']: item for item in manifest['inputs']}
     records = binding['case_records']
     cases = registry(manifest, binding, records)
@@ -379,14 +384,25 @@ def aggregate(root, binding):
         raise ValueError('incomplete source preservation roster')
     for source in sources:
         request = required_sources[source['id']]
-        path = Path(source['path'])
+        path = bound_path(preparation_root, source['path'])
         if str(path) != request['source'] or source['sha256'] != request['source_sha256'] or source['blake3'] != request['source_blake3']:
             raise ValueError('source roster differs from actual request')
         limit = request['decode']['max_encoded_bytes']
         for algorithm in ('sha256', 'blake3'):
             if edit_verify.digest(path, algorithm, limit) != source[algorithm]:
                 raise ValueError('owned source changed after campaign')
-        source_proofs.append(dict(id=source['id'], sha256=source['sha256'], blake3=source['blake3'], unchanged=True))
+        original = cohort.get(source['id'])
+        if original:
+            if source['original_path'] != original['path'] or edit_verify.digest(original['path'], 'sha256', limit) != original['sha256']:
+                raise ValueError('original cohort file changed after owned copy')
+        else:
+            generated = source['generated_receipt']
+            if (admitted_file(preparation_root, generated['path'], MIB) != Path(next(r['receipt_path'] for r in binding['preparation_records'] if r['id'] == source['id']))
+                    or generated['sha256'] != prepared[source['id']]['receipt_sha256']
+                    or str(path) != prepared[source['id']]['receipt']['path']):
+                raise ValueError('source does not match admitted generated-fixture receipt')
+        source_proofs.append(dict(id=source['id'], sha256=source['sha256'], blake3=source['blake3'], unchanged=True,
+                                 original_unchanged=bool(original), generated=original is None))
     missed = [dict(fixture_id=s['fixture_id'], phase=s['phase'], operation=s['operation'], recipe_index=c['recipe_index'], p95_ms=c['elapsed']['p95_ms'], target_ms=c['p95_target_ms'])
               for s in summaries for c in s['configurations'] if c['numeric_target_met'] is False]
     return dict(version=1, complete=True, headless_campaign_qualified=not missed,
