@@ -98,20 +98,25 @@ The inconsistent decode is rejected while the stable positive control passes.
 The prospective S8 targets remain unchanged. The serial qualification harness
 must freeze exact source/cohort/oracles/settings/resources before execution.
 
-## S9 v5 recovery checkpoint — 2026-09-10
+## S9 inspection resumption checkpoint — 2026-09-10
 
-The failed v4 memory attempt remains preserved. V5 used one verified owned-copy
-adoption retaining5,311,732 rows; sampled Python peak412,172,288 bytes was below
-the unchanged512MiB admission. Three main slices now leave ten completed members
-and6,619,809 rows. The eleventh retains677,581 rows;151 readback pages end at
-cursor6,770,017. Third slice passed988 command receipts and paused at journal2754
-after601.831 seconds. Sampled Python peak484,179,968 bytes and combined494,141,440
-bytes remained inside the unchanged allowances. These samples are not OS high-water
-marks. All265 observed owned processes were checked absent. Fourth main slice is
-separately admitted using an immutable recipe and exact owned pause. No source
-originals/catalogs are modified; no automatic family choice or live migration has
-occurred. Auxiliary, referenced-path and packet work remains to be independently
-admitted after main inspection.
+The seventh v5 inspection attempt stopped after macOS reused the PID of a
+completed inspector for a later command. All 198 observed PIDs are absent and
+the wrapper was reaped. The failed result remains preserved; user Lightroom
+catalogs are unchanged. Commands 5020–5848 succeeded, and read-only row command
+5849 was interrupted. Fourteen completed members retain 9,256,288 rows; the
+fifteenth retains 483,383 rows with 24 successful readback pages. Its failed
+25th page does not establish progress.
+
+The supervisor now identifies owned processes using native birth seconds and
+microseconds. Independent source reviews passed this correction and protocol3
+checkpoint `cda4a65`, which admits the exact failed attempt into a separate v6
+inspection namespace while retaining v5/v4/v2 provenance. Eight supervisor
+fixtures and 60 Lightroom contracts passed; no actual v6 adoption has run yet.
+Receipt: `sc-22844-pid-recovery-gate-cda4a65-v1/result.json` under private results.
+The successful-prefix digest and independently reviewed concrete launch package
+remain required before resuming. Auxiliary, referenced-path, packet and current
+family selection work remains outstanding.
 
 ## S8 qualification preparation checkpoint
 
@@ -127,14 +132,20 @@ passed, including actual subprocess cleanup, evidence failures and the fixed
 per-configuration statistics. Independent statistics review passed. Receipts:
 `sc-22843-core-and-probe-gate-v1/receipt.json` and
 `sc-22843-supervisor-statistics-v1/receipt.json` under private results.
-Later `b14c357` source adds exact sample/output coverage, Mac kernel identity
-checks, and draft immutable helper/runtime and disk accounting; its new tests
-remain unrun. No large editing campaign has started. Final aggregate, durable
+The expanded checker gate at `d38a526` passed 80 tests. Nine actual preview/export
+process tests and strict all-target Clippy passed, including worker high-water
+receipts. Fifteen memory/cleanup checker tests passed at `3539509`. These gates
+exercise checker contracts; they are not actual corpus or timing qualification. No large editing campaign has started. Final aggregate, durable
 metadata/service and 100MP independent checks, binding, campaign, review and
 three-platform delivery remain required.
 
-The fifth v5 Lightroom slice paused cleanly after 602.051 seconds. Its 571 new
-commands and 12 complete outcomes were independently reconciled; all 190
-observed processes were absent. Python sampled peak was 495,927,296 bytes.
-The sixth unchanged 600-second slice is running exclusively; no later slice
-is automatically authorized.
+The first tiny synthetic end-to-end smoke failed because image 0.25.9 silently
+missed the recognized TIFF ICC tag. Commit `9483835` reads that tag through the
+existing TIFF dependency and rejects malformed profiles. The native regression
+reproduced the wrong gamma before the fix; the media suite then passed 19 tests
+with one intentional external-fixture ignore. Independent source review passed.
+Tiny smoke v2 passed all four analytic fixtures with 14 recipes each using the
+unchanged independent oracle and tolerances. Both smoke attempts are retained
+under `sc-22843-tiny-smoke-v1` / `sc-22843-tiny-smoke-v2` in private results.
+This is correctness evidence only; performance and large-image qualification
+remain pending.
