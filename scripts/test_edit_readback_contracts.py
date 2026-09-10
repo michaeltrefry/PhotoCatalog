@@ -222,4 +222,130 @@ class NumericContracts(unittest.TestCase):
             for metadata in ({},{'exif':{'make':'wrong'}}):
                 with self.assertRaisesRegex(ValueError,'safe EXIF'):rb.verify('unused',expected,self.spec('tiff'),metadata)
 
+    def test_verify_bounds_conversion_casts_and_finite_masks_to_eight_rows(self):
+        np=self.np
+        expected=np.zeros((17,3,4))
+        class BoundedCast(np.ndarray):
+            def astype(self,*args,**kwargs):
+                if self.ndim==3 and self.shape[0]>8:
+                    raise AssertionError('whole-image comparison cast')
+                return super().astype(*args,**kwargs)
+        data=np.zeros((17,3,4),dtype=np.uint8).view(BoundedCast)
+        data[7,0,0]=2; data[8,0,0]=3; data[16,0,0]=9
+        output_pixels=ref.output_pixels; isfinite=np.isfinite
+        converted=[]
+        def bounded_output(pixels,spec):
+            self.assertLessEqual(pixels.shape[0],8,'whole-image output conversion')
+            converted.append(pixels.shape[0])
+            return output_pixels(pixels,spec)
+        def bounded_finite(pixels,*args,**kwargs):
+            if getattr(pixels,'ndim',0)==3:
+                self.assertLessEqual(pixels.shape[0],8,'whole-image finite mask')
+            return isfinite(pixels,*args,**kwargs)
+        with patch.object(rb,'read',return_value=(data,self.info(width=3,height=17))), \
+                patch.object(ref,'output_pixels',side_effect=bounded_output), \
+                patch.object(np,'isfinite',side_effect=bounded_finite):
+            result=rb.verify('unused',expected,self.spec(),{})
+        self.assertFalse(result['pixel_pass'])
+        self.assertEqual(result['max_absolute_error'],9)
+        self.assertEqual(converted,[8,8,1])
+
+    def test_integer_tolerance_and_negative_differences_across_row_boundary(self):
+        np=self.np
+        for depth,dtype,maximum,tolerance in [('eight',np.uint8,255,2),('sixteen',np.uint16,65535,4)]:
+            with self.subTest(depth=depth):
+                expected=np.zeros((17,2,4)); expected[16]=1
+                data=np.zeros((17,2,4),dtype=dtype); data[16]=maximum
+                data[7,0,0]=tolerance
+                data[16,0,1]=maximum-tolerance
+                good=rb.compare_output_rows(data,expected,self.spec(depth=depth))
+                self.assertTrue(good['pixel_pass'])
+                self.assertEqual(good['max_absolute_error'],tolerance)
+                data[8,0,0]=tolerance+1
+                bad=rb.compare_output_rows(data,expected,self.spec(depth=depth))
+                self.assertFalse(bad['pixel_pass'])
+                self.assertEqual(bad['max_absolute_error'],tolerance+1)
+
+    def test_float_relative_tolerance_and_global_max_match_full_reference(self):
+        np=self.np
+        expected=np.full((17,2,4),.5); expected[...,0]=100; expected[...,1]=-100
+        spec=self.spec('tiff','float32')
+        target=ref.output_pixels(expected,spec)
+        actual=target.astype(np.float32)
+        actual[7,0,0]+=np.float32(.001) # larger than absolute, within relative bound
+        compare=ref.compare
+        for fails in (False,True):
+            with self.subTest(fails=fails):
+                if fails:
+                    actual[8,0,2]+=np.float32(.00006)
+                    actual[16,0,1]-=np.float32(.003)
+                oracle=compare(actual,target,geometry_changed=True)
+                maximum=float(np.abs(actual.astype(np.float64)-target.astype(np.float64)).max())
+                rows=[]
+                def block_compare(a,b,**kwargs):
+                    self.assertLessEqual(a.shape[0],8)
+                    rows.append(a.shape[0])
+                    return compare(a,b,**kwargs)
+                with patch.object(ref,'compare',side_effect=block_compare):
+                    result=rb.compare_output_rows(actual,expected,spec)
+                self.assertEqual(result['pixel_pass'],not fails)
+                self.assertEqual(result['pixel_pass'],oracle['pass_'])
+                self.assertEqual(result['max_absolute_error'],maximum)
+                self.assertEqual(result['tolerance'],{'absolute':ref.GEOMETRY_ABS_TOL,'relative':ref.REL_TOL})
+                self.assertEqual(rows,[8,8,1])
+
+    def test_nonfinite_expected_or_actual_is_rejected_in_later_blocks(self):
+        np=self.np
+        for row,invalid in ((7,float('nan')),(8,float('inf')),(16,-float('inf'))):
+            with self.subTest(row=row):
+                expected=np.zeros((17,2,4)); expected[row,0,0]=invalid
+                with patch.object(rb,'read') as reader:
+                    with self.assertRaisesRegex(ValueError,'expected reference shape/nonfinite'):
+                        rb.verify('unused',expected,self.spec('tiff','float32'),{})
+                    reader.assert_not_called()
+                expected[row,0,0]=0
+                data=np.zeros((17,2,4),dtype=np.float32); data[0,0,1]=1
+                data[row,0,0]=invalid # Earlier tolerance failure must not skip this block.
+                with patch.object(rb,'read',return_value=(data,self.info('tiff',32,width=2,height=17))):
+                    with self.assertRaisesRegex(ValueError,'nonfinite readback difference'):
+                        rb.verify('unused',expected,self.spec('tiff','float32'),{})
+
+    def test_resize_precedes_blockwise_nonlinear_conversion_without_changing_pixels(self):
+        np=self.np
+        expected=np.empty((17,5,4))
+        for y in range(17):
+            for x in range(5):expected[y,x]=[.1+x/20,.1+y/40,.2+(x+y)/100,.25 if (x+y)%2 else .75]
+        original=expected.copy()
+        for edge in (9,31):
+            with self.subTest(edge=edge):
+                spec=self.spec(depth='sixteen',composite=True)
+                spec['size']={'mode':'fit','width':edge,'height':edge,'allow_upscale':True}
+                spec['profile']={'kind':'icc','bytes':list(ref.matrix_profile(2))}
+                target=ref.output_pixels(expected,spec)
+                height,width=target.shape[:2]
+                info=self.info(bits=16,width=width,height=height,composite=True)
+                info['icc']=ref.matrix_profile(2)
+                with patch.object(rb,'read',return_value=(target,info)):
+                    result=rb.verify('unused',expected,spec,{})
+                self.assertTrue(result['pixel_pass'])
+                self.assertEqual(result['max_absolute_error'],0)
+                self.assertTrue(np.array_equal(expected,original),'readback mutated its linear reference')
+
+    def test_constant_jpeg_threshold_and_general_lossy_scope_are_unchanged(self):
+        np=self.np
+        expected=np.full((17,2,4),.5); expected[...,3]=1
+        spec=self.spec('jpeg',composite=True); spec['format']['quality']=90
+        data=ref.output_pixels(expected,spec)
+        data[7,0,0]+=3
+        self.assertTrue(rb.compare_output_rows(data,expected,spec,constant_jpeg=True)['pixel_pass'])
+        data[8,0,0]+=4
+        result=rb.compare_output_rows(data,expected,spec,constant_jpeg=True)
+        self.assertFalse(result['pixel_pass']); self.assertEqual(result['max_absolute_error'],4)
+        result=rb.compare_output_rows(data,expected,spec)
+        self.assertIsNone(result['pixel_pass']); self.assertIsNone(result['tolerance'])
+        self.assertEqual(result['max_absolute_error'],4)
+        spec['format']['quality']=80
+        with self.assertRaisesRegex(ValueError,'quality90'):
+            rb.compare_output_rows(data,expected,spec,constant_jpeg=True)
+
 if __name__=='__main__':unittest.main()

@@ -432,6 +432,71 @@ def output_stream(path, maximum):
             raise ValueError('output changed during readback')
 
 
+COMPARISON_ROWS=8
+
+
+def finite_rows(pixels):
+    """No whole-image Boolean mask on an admitted large decoded/reference array."""
+    np=ref.np_module()
+    return all(np.isfinite(pixels[y:y+COMPARISON_ROWS]).all()
+               for y in range(0,pixels.shape[0],COMPARISON_ROWS))
+
+
+def compare_output_rows(data, expected, spec, *, constant_jpeg=False):
+    """Preserve output conversion and max/pass math with bounded row temporaries.
+
+    Pointwise profile/alpha/quantization work uses the unchanged reference oracle
+    on eight rows. A genuine resize needs neighboring source rows, so the existing
+    resize oracle runs once before these pointwise operations. Original-size and
+    unchanged-size outputs retain no second full reference or quantized target.
+    """
+    np=ref.np_module()
+    width,height=ref.output_dimensions(expected.shape[1],expected.shape[0],spec['size'])
+    fmt=spec['format']['format']
+    channels=3 if fmt=='jpeg' or spec['alpha']['mode']=='composite' else 4
+    if data.shape!=(height,width,channels):
+        raise ValueError('output shape/channel mismatch')
+    basis=expected if (width,height)==(expected.shape[1],expected.shape[0]) else ref.resize(expected,width,height)
+    pointwise={**spec,'size':{'mode':'original'}}
+    depth=spec['format'].get('depth','eight')
+    if fmt=='jpeg':
+        if constant_jpeg and spec['format']['quality']!=90:
+            raise ValueError('constant JPEG bound requires quality90')
+        passed=True if constant_jpeg else None
+        tolerance=3 if constant_jpeg else None
+    elif depth=='float32':
+        passed=True
+        tolerance=dict(absolute=ref.GEOMETRY_ABS_TOL,relative=ref.REL_TOL)
+    else:
+        passed=True
+        tolerance=4 if depth=='sixteen' else 2
+    maximum=0.0
+    for y in range(0,height,COMPARISON_ROWS):
+        actual=data[y:y+COMPARISON_ROWS]
+        target=ref.output_pixels(basis[y:y+COMPARISON_ROWS],pointwise)
+        if actual.shape!=target.shape:
+            raise ValueError('output shape/channel mismatch')
+        # This is the same float64 difference as the former full-image casts.
+        # Cast only the current actual block, then subtract/abs in place.
+        error=actual.astype(np.float64)
+        np.subtract(error,target,out=error)
+        np.abs(error,out=error)
+        if not np.isfinite(error).all():
+            raise ValueError('nonfinite readback difference')
+        maximum=max(maximum,float(error.max()))
+        if fmt!='jpeg' and depth=='float32':
+            # Keep the reference's original dtype promotion and exact tolerance
+            # expression, independently of float64 reporting above.
+            block_pass=ref.compare(actual,target,geometry_changed=True)['pass_']
+            passed=passed and block_pass
+        elif passed is not None:
+            block_pass=bool((error<=tolerance).all())
+            passed=passed and block_pass
+        # Do not keep a previous block alive while constructing the next one.
+        del error,target,actual
+    return dict(pixel_pass=passed,max_absolute_error=maximum,tolerance=tolerance)
+
+
 def read(path, max_pixels=32_000_000, *, max_encoded_bytes=ENCODED_LIMIT,
          max_decoded_bytes=DECODED_LIMIT, max_metadata_bytes=METADATA_LIMIT):
     import imagecodecs
@@ -496,7 +561,7 @@ def read(path, max_pixels=32_000_000, *, max_encoded_bytes=ENCODED_LIMIT,
             digest.update(chunk); left-=len(chunk)
         if stream.read(1): raise ValueError('output grew while hashing')
         info['sha256']=digest.hexdigest()
-    if data.ndim!=3 or data.shape[2] not in (3,4) or data.shape[0]*data.shape[1]>max_pixels or data.nbytes>max_decoded_bytes or not np.isfinite(data).all():
+    if data.ndim!=3 or data.shape[2] not in (3,4) or data.shape[0]*data.shape[1]>max_pixels or data.nbytes>max_decoded_bytes or not finite_rows(data):
         raise ValueError('decoded shape/allocation/nonfinite')
     return data,info
 
@@ -519,12 +584,11 @@ def verify(path, expected, spec, metadata, *, constant_jpeg=False,
            max_encoded_bytes=ENCODED_LIMIT, max_decoded_bytes=DECODED_LIMIT,
            max_metadata_bytes=METADATA_LIMIT):
     np=ref.np_module()
-    if expected.ndim!=3 or expected.shape[2]!=4 or not np.isfinite(expected).all():
+    if expected.ndim!=3 or expected.shape[2]!=4 or not finite_rows(expected):
         raise ValueError('expected reference shape/nonfinite')
     width,height=ref.output_dimensions(expected.shape[1],expected.shape[0],spec['size'])
     if width*height*4*8>max_decoded_bytes:
         raise ValueError('reference output allocation admission')
-    target=ref.output_pixels(expected,spec)
     data,info=read(path,max_pixels=width*height,max_encoded_bytes=max_encoded_bytes,
                    max_decoded_bytes=max_decoded_bytes,max_metadata_bytes=max_metadata_bytes)
     fmt=spec['format']['format']
@@ -533,23 +597,11 @@ def verify(path, expected, spec, metadata, *, constant_jpeg=False,
     expected_dtype={'eight':np.dtype('uint8'),'sixteen':np.dtype('uint16'),'float32':np.dtype('float32')}[depth]
     if data.dtype.kind!=expected_dtype.kind or data.dtype.itemsize!=expected_dtype.itemsize or info['metadata']['bits']!=expected_dtype.itemsize*8:
         raise ValueError('encoded precision/sample type differs from request')
-    if data.shape!=target.shape: raise ValueError('output shape/channel mismatch')
+    channels=3 if fmt=='jpeg' or spec['alpha']['mode']=='composite' else 4
+    if data.shape!=(height,width,channels): raise ValueError('output shape/channel mismatch')
     if not info['icc']: raise ValueError('required output ICC absent')
     profile=info['icc']; verify_profile(profile,spec['profile'])
-    error=np.abs(data.astype(np.float64)-target.astype(np.float64))
-    if not np.isfinite(error).all(): raise ValueError('nonfinite readback difference')
-    if fmt=='jpeg':
-        if constant_jpeg:
-            if spec['format']['quality']!=90: raise ValueError('constant JPEG bound requires quality90')
-            passed=bool((error<=3).all()); tolerance=3
-        else:
-            passed=None; tolerance=None
-    elif depth=='float32':
-        result=ref.compare(data,target,geometry_changed=True)
-        passed=result['pass_']; tolerance=dict(absolute=ref.GEOMETRY_ABS_TOL,relative=ref.REL_TOL)
-    else:
-        tolerance=4 if depth=='sixteen' else 2
-        passed=bool((error<=tolerance).all())
+    comparison=compare_output_rows(data,expected,spec,constant_jpeg=constant_jpeg)
     facts=xmp_facts(info['packets'],transport_guids=info.get('transport_guids',()))
     if metadata.get('xmp'):
         expected_facts=xmp_facts([metadata['xmp'].encode()])
@@ -580,5 +632,5 @@ def verify(path, expected, spec, metadata, *, constant_jpeg=False,
     return dict(path=str(path),sha256=info['sha256'],format=info['format'],shape=list(data.shape),
                 dtype=str(data.dtype),icc_sha256=hashlib.sha256(profile).hexdigest(),
                 xmp_sha256=[hashlib.sha256(p).hexdigest() for p in info['packets']],
-                pixel_pass=passed,max_absolute_error=float(error.max()),tolerance=tolerance,
+                **comparison,
                 jpeg_scope='constant fixture bound' if constant_jpeg else 'lossy errors reported; no arbitrary pixel threshold')
