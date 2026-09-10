@@ -771,6 +771,17 @@ pub fn rendered_derivative(base: &[u8], fields: &DerivativeFields) -> Result<Vec
                     "PhotometricInterpretation",
                     "Compression",
                     "PlanarConfiguration",
+                    "SampleFormat",
+                    "ExtraSamples",
+                    "StripOffsets",
+                    "StripByteCounts",
+                    "RowsPerStrip",
+                    "TileOffsets",
+                    "TileByteCounts",
+                    "TileWidth",
+                    "TileLength",
+                    "JPEGInterchangeFormat",
+                    "JPEGInterchangeFormatLength",
                 ]
                 .contains(&name))
             || (namespace == EXIF
@@ -780,6 +791,7 @@ pub fn rendered_derivative(base: &[u8], fields: &DerivativeFields) -> Result<Vec
                     "ColorSpace",
                     "ComponentsConfiguration",
                     "CompressedBitsPerPixel",
+                    "MakerNote",
                 ]
                 .contains(&name))
             || (namespace == PHOTOSHOP && name == "ICCProfile")
