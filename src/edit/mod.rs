@@ -19,6 +19,7 @@ pub(crate) mod color;
 mod detail;
 pub(crate) mod geometry;
 mod render;
+pub(crate) use render::verify_original_fingerprint;
 pub use render::{
     EditedLinearImage, OriginalRequest, PreparedLinearInput, RenderPurpose, decode_original,
     prepare_linear_proxy, render_recipe, renderer_identity,

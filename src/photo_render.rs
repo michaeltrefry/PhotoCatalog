@@ -11,8 +11,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{File, OpenOptions},
-    io::Read,
+    fs::OpenOptions,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::Instant,
@@ -79,50 +78,6 @@ pub fn output_renderer_identity() -> &'static str {
         format!("photocatalog-photo-export-1:{}", h.finalize().to_hex())
     })
 }
-fn source_matches(
-    path: &Path,
-    expected: &str,
-    limit: u64,
-    cancel: &dyn CancelCheck,
-) -> Result<(), RenderError> {
-    let mut file = File::open(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            RenderError::SourceMissing
-        } else {
-            e.into()
-        }
-    })?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(RenderError::InvalidInput(
-            "original must be an ordinary file".into(),
-        ));
-    }
-    let mut remaining = metadata.len();
-    if remaining > limit {
-        return Err(RenderError::ResourceLimit {
-            resource: "original bytes",
-            required: remaining,
-            limit,
-        });
-    }
-    let mut hash = blake3::Hasher::new();
-    let mut buffer = [0u8; 65536];
-    while remaining > 0 {
-        cancel.check()?;
-        let n = file.read(&mut buffer[..remaining.min(65536) as usize])?;
-        if n == 0 {
-            return Err(RenderError::SourceChanged);
-        }
-        hash.update(&buffer[..n]);
-        remaining -= n as u64;
-    }
-    let mut extra = [0];
-    if file.read(&mut extra)? != 0 || hash.finalize().to_hex().as_str() != expected {
-        return Err(RenderError::SourceChanged);
-    }
-    cancel.check()
-}
 pub fn render_staged_photo(
     request: PhotoRenderRequest<'_>,
     limits: PhotoRenderLimits,
@@ -161,7 +116,7 @@ pub fn render_staged_photo(
         .max_encoded_bytes
         .min(limits.decode.max_allocation_bytes);
     let phase = Instant::now();
-    source_matches(
+    edit::verify_original_fingerprint(
         request.original,
         request.expected_fingerprint,
         original_limit,
@@ -252,7 +207,7 @@ pub fn render_staged_photo(
     )?;
     let encode_ms = phase.elapsed().as_secs_f64() * 1000.;
     let phase = Instant::now();
-    source_matches(
+    edit::verify_original_fingerprint(
         &original,
         request.expected_fingerprint,
         original_limit,

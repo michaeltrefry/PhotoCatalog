@@ -10,7 +10,12 @@ pub use prepared::{
     write_prepared_proxy,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Read, path::Path, sync::OnceLock};
+use std::{
+    fs::{self, OpenOptions},
+    io::Read,
+    path::Path,
+    sync::OnceLock,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -97,25 +102,79 @@ pub fn renderer_identity() -> &'static str {
         format!("photocatalog-edit-render-1:{}", h.finalize().to_hex())
     })
 }
-fn fingerprint(path: &Path, cancel: &dyn CancelCheck) -> Result<String, RenderError> {
-    let mut f = File::open(path).map_err(|e| {
+fn fingerprint_reader(
+    reader: &mut impl Read,
+    length: u64,
+    cancel: &dyn CancelCheck,
+) -> Result<String, RenderError> {
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = [0u8; 65536];
+    let mut remaining = length;
+    while remaining > 0 {
+        cancel.check()?;
+        let n = reader.read(&mut buffer[..remaining.min(65536) as usize])?;
+        if n == 0 {
+            return Err(RenderError::SourceChanged);
+        }
+        hash.update(&buffer[..n]);
+        remaining -= n as u64;
+    }
+    cancel.check()?;
+    if reader.read(&mut buffer[..1])? != 0 {
+        return Err(RenderError::SourceChanged);
+    }
+    Ok(hash.finalize().to_hex().to_string())
+}
+/// Fixed-buffer verification admits the declared file length before any scan and
+/// reads at most that length plus one byte, even if another process grows it.
+/// Nonblocking/no-follow opens prevent a replaced FIFO or link from hanging.
+pub(crate) fn verify_original_fingerprint(
+    path: &Path,
+    expected: &str,
+    limit: u64,
+    cancel: &dyn CancelCheck,
+) -> Result<(), RenderError> {
+    cancel.check()?;
+    let before = fs::symlink_metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             RenderError::SourceMissing
         } else {
             e.into()
         }
     })?;
-    let mut h = blake3::Hasher::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        cancel.check()?;
-        let n = f.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buffer[..n]);
+    if !before.file_type().is_file() {
+        return Err(RenderError::InvalidInput(
+            "original must be an ordinary file".into(),
+        ));
     }
-    Ok(h.finalize().to_hex().to_string())
+    if before.len() > limit {
+        return Err(RenderError::ResourceLimit {
+            resource: "original bytes",
+            required: before.len(),
+            limit,
+        });
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() || opened.len() != before.len() {
+        return Err(RenderError::SourceChanged);
+    }
+    if fingerprint_reader(&mut file, opened.len(), cancel)? != expected {
+        return Err(RenderError::SourceChanged);
+    }
+    cancel.check()
 }
 pub fn decode_original(
     request: OriginalRequest<'_>,
@@ -127,16 +186,22 @@ pub fn decode_original(
             "absolute original path required".into(),
         ));
     }
-    if fingerprint(request.path, cancel)? != request.expected_fingerprint {
-        return Err(RenderError::SourceChanged);
-    }
+    verify_original_fingerprint(
+        request.path,
+        request.expected_fingerprint,
+        limits.max_encoded_bytes,
+        cancel,
+    )?;
     let xy = color::white_point(request.white_balance)?;
     let image = crate::media::decode_with_white_point(request.path, limits, xy)
         .map_err(RenderError::Decode)?;
     cancel.check()?;
-    if fingerprint(request.path, cancel)? != request.expected_fingerprint {
-        return Err(RenderError::SourceChanged);
-    }
+    verify_original_fingerprint(
+        request.path,
+        request.expected_fingerprint,
+        limits.max_encoded_bytes,
+        cancel,
+    )?;
     let original_dimensions = (image.width, image.height);
     Ok(PreparedLinearInput {
         image,
@@ -559,5 +624,93 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    #[test]
+    fn growing_or_short_sources_stop_at_the_declared_revision() {
+        struct Endless {
+            read: usize,
+        }
+        impl Read for Endless {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                b.fill(1);
+                self.read += b.len();
+                Ok(b.len())
+            }
+        }
+        let mut reader = Endless { read: 0 };
+        assert!(matches!(
+            fingerprint_reader(&mut reader, 17, &()),
+            Err(RenderError::SourceChanged)
+        ));
+        assert_eq!(reader.read, 18);
+        assert!(matches!(
+            fingerprint_reader(&mut &b"short"[..], 20, &()),
+            Err(RenderError::SourceChanged)
+        ));
+        assert_eq!(
+            fingerprint_reader(&mut &b"exact"[..], 5, &()).unwrap(),
+            blake3::hash(b"exact").to_hex().as_str()
+        );
+    }
+    #[test]
+    fn oversized_original_is_refused_before_the_decoder_and_cancel_before_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.png");
+        std::fs::write(&path, b"four").unwrap();
+        let result = decode_original(
+            OriginalRequest {
+                path: &path,
+                expected_fingerprint: &"0".repeat(64),
+                white_balance: &WhiteBalance::AsShot,
+            },
+            DecodeLimits {
+                max_encoded_bytes: 3,
+                ..Default::default()
+            },
+            &(),
+        );
+        assert!(matches!(
+            result,
+            Err(RenderError::ResourceLimit {
+                resource: "original bytes",
+                required: 4,
+                limit: 3
+            })
+        ));
+        assert!(matches!(
+            verify_original_fingerprint(
+                &temp.path().join("missing"),
+                "",
+                1,
+                &std::sync::atomic::AtomicBool::new(true)
+            ),
+            Err(RenderError::Canceled)
+        ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_symlink_originals_are_rejected_without_opening_a_stream() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("fifo.png");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            verify_original_fingerprint(&fifo, "", 100, &()),
+            Err(RenderError::InvalidInput(_))
+        ));
+        let real = temp.path().join("real");
+        std::fs::write(&real, b"bytes").unwrap();
+        let link = temp.path().join("link.png");
+        symlink(real, &link).unwrap();
+        assert!(matches!(
+            verify_original_fingerprint(&link, "", 100, &()),
+            Err(RenderError::InvalidInput(_))
+        ));
     }
 }
