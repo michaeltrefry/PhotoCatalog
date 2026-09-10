@@ -70,7 +70,8 @@ fn count_schema(db: &Connection, total: u64) -> Result<()> {
         "wrong application identity"
     );
     ensure!(
-        db.query_row::<u64, _, _>("SELECT count(*) FROM assets", [], |r| r.get(0))? == total,
+        u64::try_from(db.query_row::<i64, _, _>("SELECT count(*) FROM assets", [], |r| r.get(0))?)?
+            == total,
         "wrong catalog count"
     );
     Ok(())
@@ -132,7 +133,7 @@ fn overlay(
     let epoch: i64 = tx.query_row("SELECT revision FROM storage_epoch WHERE id=1", [], |r| {
         r.get(0)
     })?;
-    let changes: u64 = tx.query_row("SELECT total_changes()", [], |r| r.get(0))?;
+    let changes: i64 = tx.query_row("SELECT total_changes()", [], |r| r.get(0))?;
     let mut expected = before.clone();
     for (row, k) in expected.iter_mut().zip(keys) {
         ensure!(
@@ -154,10 +155,10 @@ fn overlay(
         tx.query_row("SELECT revision FROM storage_epoch WHERE id=1", [], |r| {
             r.get(0)
         })?;
-    let changes_after: u64 = tx.query_row("SELECT total_changes()", [], |r| r.get(0))?;
+    let changes_after: i64 = tx.query_row("SELECT total_changes()", [], |r| r.get(0))?;
     ensure!(
         epoch_after - epoch == i64::from(window)
-            && changes_after - changes == 2 * u64::from(window),
+            && changes_after - changes == 2 * i64::from(window),
         "unexpected DML/trigger effects"
     );
     ensure!(
@@ -331,14 +332,14 @@ mod tests {
     fn only_three_fields_and_expected_trigger_change() {
         let (_dir, mut db, keys, offline) = fixture();
         let tail = rows(&db, 4).unwrap()[2..].to_vec();
-        let dirty: u64 = db
+        let dirty: i64 = db
             .query_row("SELECT count(*) FROM organization_dirty", [], |r| r.get(0))
             .unwrap();
         let receipt = overlay(&mut db, &keys, 4, &offline, |_| Ok(())).unwrap();
         assert_eq!(receipt["connection_total_changes_delta"], 4);
         assert_eq!(rows(&db, 4).unwrap()[2..], tail);
         assert_eq!(
-            db.query_row::<u64, _, _>("SELECT count(*) FROM organization_dirty", [], |r| r.get(0))
+            db.query_row::<i64, _, _>("SELECT count(*) FROM organization_dirty", [], |r| r.get(0))
                 .unwrap(),
             dirty
         );

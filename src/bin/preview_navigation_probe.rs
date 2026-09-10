@@ -504,7 +504,11 @@ fn run(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )?;
             let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            let count: u64 = db.query_row("SELECT count(*) FROM assets", [], |r| r.get(0))?;
+            let count = u64::try_from(db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM assets",
+                [],
+                |r| r.get(0),
+            )?)?;
             ensure!(
                 schema == 5 && count == fixture.catalog_count,
                 "catalog count/schema changed"
