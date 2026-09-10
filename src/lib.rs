@@ -2,8 +2,8 @@
 pub mod catalog_edits;
 pub mod catalog_metadata;
 pub mod catalog_storage;
-pub mod edit;
 mod catalog_writer;
+pub mod edit;
 mod import_storage;
 pub mod media;
 pub mod metadata_export;
@@ -976,7 +976,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            5
+            6
         );
         assert_eq!(
             catalog
