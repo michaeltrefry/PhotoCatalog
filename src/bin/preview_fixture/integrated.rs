@@ -315,7 +315,7 @@ mod tests {
                     generation: 1,
                     fingerprint: "a".repeat(64),
                     edit_revision: 0,
-                    renderer_version: renderer_identity(),
+                    renderer_version: renderer_identity().into(),
                     preparation_version: PREPARATION_VERSION.into(),
                     tier: Tier::Thumbnail,
                     edge: 512,
