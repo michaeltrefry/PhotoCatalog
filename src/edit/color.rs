@@ -111,8 +111,8 @@ mod tests {
             0.25,
         ]];
         adapt_white(&mut p, xy);
-        for c in 0..3 {
-            assert!((p[0][c] - 2.).abs() < 5e-4);
+        for v in &p[0][..3] {
+            assert!((*v - 2.).abs() < 5e-4);
         }
         assert_eq!(p[0][3], 0.25);
     }
