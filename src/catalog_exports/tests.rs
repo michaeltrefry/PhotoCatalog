@@ -8,7 +8,7 @@ fn fixture() -> Result<(tempfile::TempDir, Catalog, PathBuf)> {
     std::fs::write(&original, b"source bytes unchanged")?;
     let mut c = Catalog::open(temp.path().join("catalog"))?;
     let fingerprint = blake3::hash(b"source bytes unchanged").to_hex().to_string();
-    c.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,'original','ready',?2,'fixture','{\"format\":\"PNG\",\"width\":1000,\"height\":1000,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",params![b"original".as_slice(),fingerprint])?;
+    c.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,'original','ready',?2,'fixture','{\"format\":\"PNG\",\"width\":1000,\"height\":1000,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",params![crate::location_bytes(&original),fingerprint])?;
     c.record_storage_path("a", &NativePath::from_path(&original))?;
     Ok((temp, c, original))
 }
