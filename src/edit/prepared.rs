@@ -162,8 +162,8 @@ pub fn write_prepared_proxy<W: Write>(
     let mut buffer = [0u8; 65536];
     for chunk in input.pixels().chunks(4096) {
         cancel.check()?;
-        for (p, out) in chunk.iter().zip(buffer.chunks_exact_mut(16)) {
-            for (v, bytes) in p.iter().zip(out.chunks_exact_mut(4)) {
+        for (p, out) in chunk.iter().zip(buffer.as_chunks_mut::<16>().0.iter_mut()) {
+            for (v, bytes) in p.iter().zip(out.as_chunks_mut::<4>().0.iter_mut()) {
                 bytes.copy_from_slice(&v.to_le_bytes());
             }
         }
@@ -244,9 +244,9 @@ pub fn read_prepared_proxy<R: Read>(
         let b = &mut buffer[..chunk.len() * 16];
         reader.read_exact(b)?;
         hash.update(b);
-        for (p, input) in chunk.iter_mut().zip(b.chunks_exact(16)) {
-            for (v, bytes) in p.iter_mut().zip(input.chunks_exact(4)) {
-                *v = f32::from_le_bytes(bytes.try_into().unwrap());
+        for (p, input) in chunk.iter_mut().zip(b.as_chunks::<16>().0.iter()) {
+            for (v, bytes) in p.iter_mut().zip(input.as_chunks::<4>().0.iter()) {
+                *v = f32::from_le_bytes(*bytes);
             }
             if p.iter().any(|v| !v.is_finite()) || !(0.0..=1.0).contains(&p[3]) {
                 return Err(RenderError::InvalidInput(

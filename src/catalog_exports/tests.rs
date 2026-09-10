@@ -247,10 +247,10 @@ fn queued_export_rechecks_same_inode_restored_mtime_and_atomic_replacement() -> 
             let child = std::thread::spawn(move || -> Result<()> {
                 let mut signal = Some(sent);
                 let hook = |phase| -> Result<()> {
-                    if phase == PhotoExportBoundary::OriginalVerified {
-                        if let Some(sent) = signal.take() {
-                            sent.send(())?;
-                        }
+                    if phase == PhotoExportBoundary::OriginalVerified
+                        && let Some(sent) = signal.take()
+                    {
+                        sent.send(())?;
                     }
                     Ok(())
                 };

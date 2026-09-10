@@ -321,7 +321,7 @@ pub struct ExportTransportRecovery {
     pub retained: Vec<RetainedExportTransport>,
 }
 enum Inspection {
-    Retired(RetiredExportTransport),
+    Retired(Box<RetiredExportTransport>),
     Retained(String),
     Cleaned,
 }
@@ -489,10 +489,10 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         fs::rename(path, &claimed)?;
         claimed
     };
-    Ok(Inspection::Retired(RetiredExportTransport {
+    Ok(Inspection::Retired(Box::new(RetiredExportTransport {
         staging,
         work: request.work,
-    }))
+    })))
 }
 /// The caller must hold the catalog's exclusive export-executor lease and have
 /// no owned active workers. Every retained entry blocks another native launch.
@@ -529,7 +529,7 @@ pub fn recover_export_transports(
     for entry in entries {
         let staging = entry.path();
         match fence_transport(&staging) {
-            Ok(Inspection::Retired(value)) => result.retired.push(value),
+            Ok(Inspection::Retired(value)) => result.retired.push(*value),
             Ok(Inspection::Cleaned) => result.cleaned += 1,
             Ok(Inspection::Retained(reason)) => result
                 .retained

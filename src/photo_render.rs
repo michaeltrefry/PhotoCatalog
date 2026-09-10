@@ -455,9 +455,9 @@ fn capture_date(s: &str) -> Option<String> {
         return None;
     }
     let b = s.as_bytes();
-    if ![b':', b'-'].contains(&b[4])
+    if !b":-".contains(&b[4])
         || b[7] != b[4]
-        || ![b' ', b'T'].contains(&b[10])
+        || !b" T".contains(&b[10])
         || b[13] != b':'
         || b[16] != b':'
     {
@@ -501,7 +501,7 @@ fn capture_date(s: &str) -> Option<String> {
         };
         if tail != "Z"
             && !(tail.len() == 6
-                && [b'+', b'-'].contains(&tail.as_bytes()[0])
+                && b"+-".contains(&tail.as_bytes()[0])
                 && tail.as_bytes()[3] == b':'
                 && tail[1..3].parse::<u32>().is_ok_and(|n| n <= 23)
                 && tail[4..6].parse::<u32>().is_ok_and(|n| n <= 59))
