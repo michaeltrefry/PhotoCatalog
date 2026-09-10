@@ -71,7 +71,9 @@ fn all_lossless_depths_profiles_alpha_and_safe_metadata_read_back() {
             (r.output.width, r.output.height, r.output.channels),
             (3, 2, 4)
         );
-        let decoded = image::load_from_memory(&b).unwrap().into_rgba32f();
+        let decoded = image::load_from_memory(&b)
+            .unwrap_or_else(|e| panic!("{format:?}: {e}"))
+            .into_rgba32f();
         for (actual, expected) in decoded.pixels().zip(i.as_rendered().pixels.iter()) {
             for c in 0..4 {
                 let target = if r.output.floating_point {
@@ -274,10 +276,11 @@ fn caller_profile_roundtrips_and_bad_icc_metadata_are_explicit() {
     let mut decoder = png::Decoder::new(Cursor::new(b)).read_info().unwrap();
     let mut out = vec![0; decoder.output_buffer_size().unwrap()];
     decoder.next_frame(&mut out).unwrap();
-    assert_eq!(
-        &out[2..4],
-        &((0.46135613f32 * 65535.).round() as u16).to_be_bytes()
-    );
+    let green = u16::from_be_bytes(out[2..4].try_into().unwrap());
+    let analytic = (0.46135613f32 * 65535.).round() as u16;
+    // The supplied ICC's tabulated TRC is not the analytic sRGB curve; permit
+    // two 16-bit quanta while independently checking the exact embedded ICC.
+    assert!(green.abs_diff(analytic) <= 2);
     s.profile = OutputProfile::Icc {
         bytes: b"invalid".to_vec(),
     };

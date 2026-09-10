@@ -14,7 +14,7 @@ use tiff::encoder::{
     DirectoryEncoder, TiffEncoder, TiffKindStandard, TiffValue, colortype,
     compression::DeflateLevel,
 };
-use tiff::tags::{Predictor, Tag, Type};
+use tiff::tags::{Tag, Type};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EncodingReport {
     pub output: OutputDescriptor,
@@ -193,7 +193,9 @@ pub fn encode_export<W: Write + Seek>(
             cancel,
         ),
         OutputFormat::Png { .. } => png_image(&mut writer, &mut rows, metadata, &icc, cancel),
-        OutputFormat::Tiff { .. } => tiff_image(&mut writer, &mut rows, metadata, &icc, cancel),
+        OutputFormat::Tiff { .. } => {
+            tiff_image(&mut writer, &mut rows, metadata, &icc, limits, cancel)
+        }
     };
     cancel.check()?;
     if writer.sink.exceeded() {
@@ -454,63 +456,120 @@ fn tiff_image<W: Write + Seek>(
     rows: &mut Rows<'_>,
     m: &ResolvedExportMetadata,
     icc: &[u8],
+    limits: EncodeLimits,
     cancel: &dyn CancelCheck,
 ) -> Result<(), RenderError> {
     let d = rows.descriptor;
-    let mut encoder = TiffEncoder::new(writer)
-        .map_err(codec)?
-        .with_compression(tiff::encoder::Compression::Deflate(DeflateLevel::Balanced))
-        .with_predictor(if d.floating_point {
-            Predictor::None
-        } else {
-            Predictor::Horizontal
-        });
+    let raw_bytes = u64::from(d.width) * u64::from(d.channels) * u64::from(d.bits_per_sample / 8);
+    let compression_bound = raw_bytes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1024))
+        .ok_or_else(|| RenderError::InvalidOutput("TIFF row overflow".into()))?;
+    let table_bytes = u64::from(d.height) * 4;
+    for (resource, required, limit) in [
+        (
+            "TIFF compressed scanline",
+            compression_bound,
+            limits
+                .row_buffer_bytes
+                .min(limits.render.max_allocation_bytes),
+        ),
+        (
+            "TIFF strip table",
+            table_bytes,
+            limits.render.max_allocation_bytes,
+        ),
+    ] {
+        if required > limit {
+            return Err(RenderError::ResourceLimit {
+                resource,
+                required,
+                limit,
+            });
+        }
+    }
+    let mut encoder = TiffEncoder::new(writer).map_err(codec)?;
     let (root, sub) = entries(&m.exif, d);
     let mut exif = encoder.extra_directory().map_err(codec)?;
     tags(&mut exif, sub)?;
     let exif_offset = exif.finish_with_offsets().map_err(codec)?.offset;
-    macro_rules! emit {
-        ($color:ty,$sample:ty,$quant:expr) => {{
-            let mut image = encoder
-                .new_image::<$color>(d.width, d.height)
-                .map_err(codec)?;
-            image.rows_per_strip(1).map_err(codec)?;
-            let dir = image.encoder();
-            tags(dir, root)?;
-            dir.write_tag(Tag::ExifDirectory, exif_offset)
-                .map_err(codec)?;
-            dir.write_tag(Tag::Unknown(34675), icc).map_err(codec)?;
-            if let Some(x) = &m.xmp {
-                dir.write_tag(Tag::Unknown(700), x.as_bytes())
-                    .map_err(codec)?;
-            }
-            if d.channels == 4 {
-                dir.write_tag(Tag::ExtraSamples, 2u16).map_err(codec)?;
-            }
-            let mut samples: Vec<$sample> =
-                Vec::with_capacity(d.width as usize * d.channels as usize);
-            for y in 0..d.height {
-                cancel.check()?;
-                samples.clear();
-                for p in rows.at(y)? {
-                    for v in &p[..d.channels as usize] {
-                        samples.push(($quant)(*v));
+    let mut dir = encoder.image_directory().map_err(codec)?;
+    tags(&mut dir, root)?;
+    dir.write_tag(Tag::ExifDirectory, exif_offset)
+        .map_err(codec)?;
+    dir.write_tag(Tag::Unknown(34675), icc).map_err(codec)?;
+    if let Some(x) = &m.xmp {
+        dir.write_tag(Tag::Unknown(700), x.as_bytes())
+            .map_err(codec)?;
+    }
+    if d.channels == 4 {
+        dir.write_tag(Tag::ExtraSamples, 2u16).map_err(codec)?;
+    }
+    dir.write_tag(
+        Tag::BitsPerSample,
+        vec![u16::from(d.bits_per_sample); d.channels as usize].as_slice(),
+    )
+    .map_err(codec)?;
+    dir.write_tag(
+        Tag::SampleFormat,
+        vec![if d.floating_point { 3u16 } else { 1u16 }; d.channels as usize].as_slice(),
+    )
+    .map_err(codec)?;
+    dir.write_tag(Tag::PhotometricInterpretation, 2u16)
+        .map_err(codec)?;
+    dir.write_tag(Tag::SamplesPerPixel, u16::from(d.channels))
+        .map_err(codec)?;
+    dir.write_tag(Tag::RowsPerStrip, 1u32).map_err(codec)?;
+    dir.write_tag(Tag::PlanarConfiguration, 1u16)
+        .map_err(codec)?;
+    dir.write_tag(Tag::Compression, 8u16).map_err(codec)?;
+    dir.write_tag(Tag::Predictor, if d.floating_point { 1u16 } else { 2u16 })
+        .map_err(codec)?;
+    let mut offsets = Vec::with_capacity(d.height as usize);
+    let mut counts = Vec::with_capacity(d.height as usize);
+    let mut raw = Vec::with_capacity(raw_bytes as usize);
+    for y in 0..d.height {
+        cancel.check()?;
+        raw.clear();
+        let mut previous = [0u16; 4];
+        for p in rows.at(y)? {
+            for c in 0..d.channels as usize {
+                match d.bits_per_sample {
+                    8 => {
+                        let v = q8(p[c]);
+                        raw.push(v.wrapping_sub(previous[c] as u8));
+                        previous[c] = u16::from(v);
                     }
+                    16 => {
+                        let v = q16(p[c]);
+                        raw.extend(v.wrapping_sub(previous[c]).to_ne_bytes());
+                        previous[c] = v;
+                    }
+                    32 => raw.extend(p[c].to_ne_bytes()),
+                    _ => return Err(RenderError::InvalidOutput("unsupported TIFF depth".into())),
                 }
-                image.write_strip(&samples).map_err(codec)?;
             }
-            image.finish().map_err(codec)
-        }};
+        }
+        // tiff 0.10 write_strip does not enable its compressor. Compress this bounded
+        // scanline explicitly, then let the mature directory writer own all offsets.
+        let mut staging = BoundedSeekWriter::new(
+            std::io::Cursor::new(Vec::with_capacity(compression_bound as usize)),
+            compression_bound,
+        )?;
+        {
+            let mut zip =
+                flate2::write::ZlibEncoder::new(&mut staging, flate2::Compression::new(6));
+            zip.write_all(&raw)?;
+            zip.finish()?;
+        }
+        let encoded = staging.into_inner().into_inner();
+        let offset = dir.write_data(encoded.as_slice()).map_err(codec)?;
+        offsets.push(u32::try_from(offset).map_err(codec)?);
+        counts.push(u32::try_from(encoded.len()).map_err(codec)?);
     }
-    match (d.channels, d.bits_per_sample) {
-        (3, 8) => emit!(colortype::RGB8, u8, q8),
-        (4, 8) => emit!(colortype::RGBA8, u8, q8),
-        (3, 16) => emit!(colortype::RGB16, u16, q16),
-        (4, 16) => emit!(colortype::RGBA16, u16, q16),
-        (3, 32) => emit!(colortype::RGB32Float, f32, |x| x),
-        (4, 32) => emit!(colortype::RGBA32Float, f32, |x| x),
-        _ => Err(RenderError::InvalidOutput(
-            "unsupported TIFF channels/depth".into(),
-        )),
-    }
+    dir.write_tag(Tag::StripOffsets, offsets.as_slice())
+        .map_err(codec)?;
+    dir.write_tag(Tag::StripByteCounts, counts.as_slice())
+        .map_err(codec)?;
+    dir.finish().map_err(codec)
 }
