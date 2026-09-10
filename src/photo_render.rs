@@ -15,6 +15,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::Instant,
 };
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,12 +33,27 @@ pub struct PhotoRenderRequest<'a> {
     pub selected_xmp: Option<&'a [u8]>,
     pub staging: &'a Path,
 }
+/// Actual monotonic phase durations. Decode includes its own source verification;
+/// encode includes output resize, profile conversion, compression and embedding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhotoRenderTimings {
+    pub source_verification_before_ms: f64,
+    pub staging_setup_ms: f64,
+    pub decode_ms: f64,
+    pub recipe_ms: f64,
+    pub metadata_ms: f64,
+    pub encode_ms: f64,
+    pub source_verification_after_ms: f64,
+    pub sync_ms: f64,
+    pub total_ms: f64,
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StagedPhoto {
     pub staging: PathBuf,
     pub encoding: EncodingReport,
     pub renderer_identity: String,
     pub metadata_notes: Vec<String>,
+    pub timings: PhotoRenderTimings,
 }
 /// Separate from the developed-proxy identity: changing a codec, metadata policy
 /// or staging adapter invalidates export work without requiring a new RAW proxy.
@@ -112,6 +128,7 @@ pub fn render_staged_photo(
     limits: PhotoRenderLimits,
     cancel: &dyn CancelCheck,
 ) -> Result<StagedPhoto, RenderError> {
+    let started = Instant::now();
     cancel.check()?;
     if !request.original.is_absolute() || !request.staging.is_absolute() {
         return Err(RenderError::InvalidInput(
@@ -143,12 +160,15 @@ pub fn render_staged_photo(
         .decode
         .max_encoded_bytes
         .min(limits.decode.max_allocation_bytes);
+    let phase = Instant::now();
     source_matches(
         request.original,
         request.expected_fingerprint,
         original_limit,
         cancel,
     )?;
+    let source_verification_before_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let phase = Instant::now();
     let original = request.original.canonicalize()?;
     let name = request
         .staging
@@ -173,6 +193,8 @@ pub fn render_staged_photo(
         .create_new(true)
         .open(&staging)?;
     let mut sink = BoundedSeekWriter::new(file, limits.max_encoded_extent)?;
+    let staging_setup_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let phase = Instant::now();
     let input = edit::decode_original(
         OriginalRequest {
             path: &original,
@@ -182,6 +204,8 @@ pub fn render_staged_photo(
         limits.decode,
         cancel,
     )?;
+    let decode_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let phase = Instant::now();
     let edited = edit::render_recipe(
         &input,
         &recipe,
@@ -190,6 +214,8 @@ pub fn render_staged_photo(
         cancel,
     )?;
     drop(input);
+    let recipe_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let phase = Instant::now();
     let descriptor = image_export::describe_output(&edited, request.output)?;
     let mime = match request.output.format {
         OutputFormat::Jpeg { .. } => "image/jpeg",
@@ -214,6 +240,8 @@ pub fn render_staged_photo(
         },
     )?;
     cancel.check()?;
+    let metadata_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let phase = Instant::now();
     let encoding = image_export::encode_export(
         &edited,
         request.output,
@@ -222,19 +250,36 @@ pub fn render_staged_photo(
         limits.encode,
         cancel,
     )?;
+    let encode_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let phase = Instant::now();
     source_matches(
         &original,
         request.expected_fingerprint,
         original_limit,
         cancel,
     )?;
+    let source_verification_after_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let phase = Instant::now();
     sink.into_inner().sync_all()?;
     cancel.check()?;
+    let sync_ms = phase.elapsed().as_secs_f64() * 1000.;
+    let timings = PhotoRenderTimings {
+        source_verification_before_ms,
+        staging_setup_ms,
+        decode_ms,
+        recipe_ms,
+        metadata_ms,
+        encode_ms,
+        source_verification_after_ms,
+        sync_ms,
+        total_ms: started.elapsed().as_secs_f64() * 1000.,
+    };
     Ok(StagedPhoto {
         staging,
         encoding,
         renderer_identity: output_renderer_identity().into(),
         metadata_notes,
+        timings,
     })
 }
 fn metadata_error(e: impl std::fmt::Display) -> RenderError {

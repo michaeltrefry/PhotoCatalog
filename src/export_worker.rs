@@ -33,6 +33,7 @@ pub struct CompletedExport {
     pub attempt: String,
     pub sealed: SealedPhotoExport,
     pub rendered: StagedPhoto,
+    pub seal_ms: f64,
 }
 fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
@@ -659,6 +660,7 @@ pub fn export_worker_main() -> Result<()> {
             request.limits,
             &(),
         )?;
+        let seal_started = std::time::Instant::now();
         let prior_directory = plan
             .destination
             .destination
@@ -694,6 +696,7 @@ pub fn export_worker_main() -> Result<()> {
             attempt: request.work.attempt,
             sealed,
             rendered,
+            seal_ms: seal_started.elapsed().as_secs_f64() * 1000.,
         };
         let bytes = serde_json::to_vec(&receipt)?;
         ensure!(
