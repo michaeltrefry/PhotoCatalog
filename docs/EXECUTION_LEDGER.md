@@ -15,8 +15,8 @@ sc-22836–sc-22842 are verified Done. S8 editing/export implementation and qual
 | sc-22840 | Done | [PR #6](https://github.com/michaeltrefry/PhotoCatalog/pull/6), merged 60fc33c | Controlled APFS detach/remount/reorganization/replacement/undo; Linux bind mount and Windows volume GUID/junction proof; PR CI 34394610454 and main CI 34395883109 all four jobs SUCCESS; Shortcut Done read-back | Complete |
 | sc-22841 | Done | [PR #8](https://github.com/michaeltrefry/PhotoCatalog/pull/8), merged789a39d | Reviewed preview defaults and full30-file memory/quality, layout, navigation and integrated10M evidence; PR CI34430709720 and main CI34432335579 SUCCESS; Shortcut Done read-back | Complete |
 | sc-22842 | Done | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7), mergede68d375 | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md); reviewed scale/actual-overlap evidence; main CI34418548263 SUCCESS; Shortcut Done read-back | Complete |
-| sc-22843 | In Progress | codex/sc-22843-edits; persistent recipes/variants, copy jobs, edited previews, exact batch export |107 library tests; actual six-format/depth export, cancellation/restart/preemption/undo-ABA and orphan-seal recovery; four edited-preview process tests. These are focused correctness evidence only | Complete writer-lock responsiveness repair, full corpus/100MP/performance qualification, independent review and batched PR/three-platform CI/merge |
-| sc-22844 | In Progress | codex/sc-22844-page-memory; frozen v5 main inspection | Recovery adoption and first main slice independently verified: eight completed members/5,311,732 rows; ninth550,000 retained/pending;978 command results pass and observed processes reaped | Continue bounded main slices; independently admit auxiliary/path/packet phases and current-family ambiguity review before migration |
+| sc-22843 | In Progress | codex/sc-22843-edits; persistent recipes/variants, copy jobs, edited previews, exact batch export |134 focused tests passed at7a97b8b (120 library,14 integration); actual crash/restoration/cache-hit evidence; strict all-target Clippy at8f8bc58. These are correctness evidence only | Complete retained decode-source guard, full corpus/100MP/performance qualification, independent review and batched PR/three-platform CI/merge |
+| sc-22844 | In Progress | codex/sc-22844-page-memory; frozen v5 main inspection | Recovery adoption and three main slices independently verified: ten completed members/6,619,809 rows; eleventh677,581 retained/readback partial; latest988 command results pass and observed processes reaped | Continue bounded main slices; independently admit auxiliary/path/packet phases and current-family ambiguity review before migration |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
 | sc-22847 | To Do | Desktop UI | Prerequisites sc-22840/sc-22841/sc-22842/sc-22843/sc-22845/sc-22846 | Dependency-bound |
@@ -80,30 +80,35 @@ cancel/reap, preview preemption, undo ABA rejection and owner restart. An orphan
 seal is never published just because it exists: a resumed worker rerenders the
 original and requires full byte equality before reuse.
 
-Integrated library107 tests passed. Actual export4 and edited-preview4 tests,
-organization migration/probe3 tests, an additional state-seek VM-work regression,
-and the three-mode actual-child orphan-seal crash test passed. Logs preserve the
-initial unsigned-SQL conversion failure and macOS physical staging-path mismatch,
-then the corrected outcomes. Worker phase timing fields were added afterward and
-still require the next integrated gate. No S8 performance or three-platform
-qualification has been claimed.
+The focused gate at `7a97b8b` passed 120 library tests and 14 integration tests
+(organization3, actual export service5, publication2, edited previews4).
+Strict all-target Clippy passed at `8f8bc58`. Preserved logs include the earlier
+error-context assertion, private fixture-helper compile error and lint failures.
+These results establish focused correctness, not S8 performance or platform
+qualification.
 
-Independent review identified long file scans under the global writer as a
-responsiveness defect. The active repair moves full verification outside writer
-admission, uses fresh content-change stamps inside short namespace operations,
-and records publication intent before a possible install. Qualification remains
-blocked on this repair and its adversarial tests, not on user permission. The
-prospective S8 operation/resource targets remain in the epic; the new serial
-qualification harness must freeze exact source/cohort/settings before execution.
+Publication now performs full verification outside the catalog writer, retains
+held-file identities/change stamps for short guarded namespace steps, and commits
+intent before capture/link. Tests cover interrupted and repeated restoration,
+actual crash after publication, cancellation and later offline originals. Warm
+preview records identify the actual checksum-validated prepared input consumed;
+corruption is an explicit cache miss. An independent review identified a further
+source-consistency gap across native export decode (temporary rewrite followed by
+restored original bytes); a retained identity/change-stamp guard is being added.
+The prospective S8 targets remain unchanged. The serial qualification harness
+must freeze exact source/cohort/oracles/settings/resources before execution.
 
 ## S9 v5 recovery checkpoint — 2026-09-10
 
 The failed v4 memory attempt remains preserved. V5 used one verified owned-copy
 adoption retaining5,311,732 rows; sampled Python peak412,172,288 bytes was below
-the unchanged512MiB admission. First v5 main slice passed978 command receipts,
-completed the eighth member, and paused at journal979 after601.839 seconds.
-Python sampled peak362,971,136 bytes was below the same bound. These samples are
-not OS high-water marks. Known observed processes were checked absent; no global
-process-absence claim was made. Second main slice is separately admitted using
-an immutable recipe and exact owned pause. No source originals/catalogs are
-modified; no automatic family choice or live migration has occurred.
+the unchanged512MiB admission. Three main slices now leave ten completed members
+and6,619,809 rows. The eleventh retains677,581 rows;151 readback pages end at
+cursor6,770,017. Third slice passed988 command receipts and paused at journal2754
+after601.831 seconds. Sampled Python peak484,179,968 bytes and combined494,141,440
+bytes remained inside the unchanged allowances. These samples are not OS high-water
+marks. All265 observed owned processes were checked absent. Fourth main slice is
+separately admitted using an immutable recipe and exact owned pause. No source
+originals/catalogs are modified; no automatic family choice or live migration has
+occurred. Auxiliary, referenced-path and packet work remains to be independently
+admitted after main inspection.
