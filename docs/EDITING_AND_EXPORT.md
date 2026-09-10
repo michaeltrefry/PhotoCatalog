@@ -1,8 +1,9 @@
 # Editing and photo export
 
-The UI-independent Rust APIs and CLI are implemented on the S8 branch. This is an
-implementation guide, not a completed qualification report. Full corpus, large-image,
-performance and three-platform gates remain open in [sc-22843](https://app.shortcut.com/trefry/story/22843).
+The UI-independent Rust APIs and CLI are implemented on the S8 branch. The
+[reference-Mac qualification](EDIT_QUALIFICATION_RESULTS.md) passed the full corpus,
+large-image and fixed performance gates. Three-platform CI and merged delivery
+remain open in [sc-22843](https://app.shortcut.com/trefry/story/22843).
 The desktop interface is a later dependent slice of the same epic.
 
 ## Recipes and variants
@@ -69,7 +70,8 @@ and then resumes preview launches. Cached preview reads can continue. Completion
 verification and durability are blocking filesystem work and belong on an executor
 thread. Full file verification and durability barriers occur outside catalog writer
 authority. Short guarded capture/link steps recheck held file identities and content
-change stamps. Performance qualification must still establish responsiveness.
+change stamps. The measured editing profile uses one native worker and a 4 GiB
+reservation; the results report records its limits and observed responsiveness.
 
 ## Batch export
 
@@ -129,10 +131,10 @@ with equal bytes but a different object identity does not authorize clobbering i
 
 ## Evidence boundary
 
-Focused tests currently cover persistent variants/copy history, source and edit
+Focused tests cover persistent variants/copy history, source and edit
 races, six format/depth exports, actual process cancellation/restart/preemption,
 queued preview recovery, and orphan-seal refusal/reuse. Original hashes are checked
-on disposable fixtures. The qualification harness must additionally prove all 30
-reference inputs, 100 MP support, independent pixel/color/metadata comparisons, and
-the epic's fixed operation and memory targets on frozen source. Tauri frame latency
-requires the later desktop readiness gate.
+on disposable fixtures. The frozen 533-case campaign additionally passed all 30
+reference inputs, 64/100 MP support, independent pixel/color/metadata checks, and
+the fixed headless operation targets. See the results report for all distributions,
+memory calibration and limitations. Tauri frame latency requires the desktop gate.
