@@ -323,7 +323,7 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let lock = match OpenOptions::new()
+    let mut lock = match OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -363,9 +363,13 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         );
         names.push(entry.file_name());
     }
-    // Claim the whole directory before releasing ownership. A child which opened
-    // the old lock before this claim must revalidate its absolute startup path
-    // after locking; it cannot enter a claimed/replaced working directory.
+    // Windows cannot reliably rename this directory while our own child-file
+    // handle is open. Publish retirement through the exclusively locked handle
+    // first; every worker checks that same handle after acquiring its lease.
+    // A delayed opener can acquire the old lease after this close, but cannot
+    // enter native work, even if another open handle prevents the rename.
+    retire_staging_lease(&mut lock)?;
+    drop(lock);
     let claimed = if path
         .file_name()
         .and_then(|n| n.to_str())
@@ -394,11 +398,9 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
     {
         fs::remove_file(claimed.join(name))?;
     }
-    // Rust file handles permit delete sharing on Windows. Keep the lock owned
-    // while unlinking it, then close its pending-delete handle before removing
-    // the directory. A recovered claimed directory is never a launch location.
+    // Retirement persists on delayed handles even after unlink. Claimed names
+    // are never launch locations; deletion can finish after delayed handles close.
     fs::remove_file(claimed.join("active.lock"))?;
-    drop(lock);
     match fs::remove_dir(claimed) {
         Ok(()) => Ok(true),
         // An old, delayed Windows handle can retain an already-unlinked lock.
@@ -408,7 +410,34 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         Err(error) => Err(error.into()),
     }
 }
-fn validate_staging_identity(expected: &Path) -> Result<()> {
+// A single byte has no partially written nonempty prefix to misclassify: any
+// nonempty lease rejects startup, and only this owned retirement value is cleaned.
+const RETIRED_LEASE: &[u8] = b"\x01";
+
+fn retire_staging_lease(lock: &mut File) -> Result<()> {
+    match lock.metadata()?.len() {
+        0 => lock.write_all(RETIRED_LEASE)?,
+        length if length == RETIRED_LEASE.len() as u64 => {
+            let mut marker = [0; RETIRED_LEASE.len()];
+            lock.read_exact(&mut marker)?;
+            ensure!(
+                marker.as_slice() == RETIRED_LEASE,
+                "unrecognized worker lease state"
+            );
+        }
+        _ => bail!("unrecognized worker lease state"),
+    }
+    lock.sync_all()?;
+    Ok(())
+}
+
+fn validate_staging_identity(expected: &Path, lock: &File) -> Result<()> {
+    // Inspect the acquired handle, not a second open: Windows byte-range locks
+    // deny other handles, and a delayed opener may refer to an unlinked inode.
+    ensure!(
+        lock.metadata()?.len() == 0,
+        "worker staging lease was retired"
+    );
     ensure!(
         expected.is_dir() && std::env::current_dir()? == expected,
         "worker staging was claimed for recovery"
@@ -458,7 +487,7 @@ pub fn worker_main() -> Result<()> {
         .write(true)
         .open(current.join("active.lock"))?;
     lock.try_lock_exclusive().context("worker staging lease")?;
-    validate_staging_identity(&current)?;
+    validate_staging_identity(&current, &lock)?;
     let result = run_worker();
     if let Err(error) = &result {
         let mut message = format!("{error:#}");
@@ -702,15 +731,70 @@ mod tests {
         // A platform may deny locking an already-unlinked handle; if it permits
         // locking, the mandatory post-lock startup identity check still rejects.
         if delayed.try_lock_exclusive().is_ok() {
-            assert!(validate_staging_identity(&stage).is_err());
+            assert!(
+                validate_staging_identity(&stage, &delayed)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retired")
+            );
         }
-        assert!(!stage.exists());
+        // A delayed Windows handle may also prevent renaming the directory.
+        // Retirement must reject it regardless of whether the old path remains.
+        assert!(delayed.metadata().unwrap().len() > 0);
+        if removed {
+            assert!(!stage.exists());
+        }
         drop(delayed);
         if !removed {
             assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 1);
         }
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
+    #[test]
+    fn retired_lease_rejects_delayed_startup_before_directory_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("worker-retired");
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("0.preview"), b"partial").unwrap();
+        let mut recovery = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(stage.join("active.lock"))
+            .unwrap();
+        let delayed = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(stage.join("active.lock"))
+            .unwrap();
+        recovery.try_lock_exclusive().unwrap();
+        retire_staging_lease(&mut recovery).unwrap();
+        drop(recovery); // Crash boundary: retired, but original path still exists.
+        delayed.try_lock_exclusive().unwrap();
+        assert!(stage.is_dir());
+        let error = validate_staging_identity(&stage, &delayed).unwrap_err();
+        assert!(error.to_string().contains("retired"));
+        assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 0);
+        assert_eq!(fs::read(stage.join("0.preview")).unwrap(), b"partial");
+        drop(delayed);
+        assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 1);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unrecognized_lease_state_is_preserved_for_inspection() {
+        for marker in [b"\x02".as_slice(), b"unexpected".as_slice()] {
+            let root = tempfile::tempdir().unwrap();
+            let stage = root.path().join("worker-unknown");
+            fs::create_dir(&stage).unwrap();
+            fs::write(stage.join("active.lock"), marker).unwrap();
+            fs::write(stage.join("0.preview"), b"partial").unwrap();
+            assert!(recover_worker_staging(root.path(), 1).is_err());
+            assert_eq!(fs::read(stage.join("active.lock")).unwrap(), marker);
+            assert_eq!(fs::read(stage.join("0.preview")).unwrap(), b"partial");
+        }
+    }
+
     #[test]
     fn interrupted_claim_cleanup_is_resumable() {
         let root = tempfile::tempdir().unwrap();

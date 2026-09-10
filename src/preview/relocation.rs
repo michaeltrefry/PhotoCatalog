@@ -483,8 +483,18 @@ mod tests {
         };
         let destination = root.path().join("destination");
         let mut store = PreviewStore::open(config.clone(), &[]).unwrap();
-        let source_identity =
-            fs::read(config.thumbnail_root.join(".photocatalog-preview-owner")).unwrap();
+        fn owner_bytes(store: &PreviewStore) -> Vec<u8> {
+            use std::io::Seek;
+            // Windows excludes reads through a second handle while this marker
+            // is byte-range locked. Inspect the actual owning handle instead.
+            let mut owner = &store._tier_locks[0];
+            owner.rewind().unwrap();
+            let mut bytes = Vec::new();
+            owner.take(257).read_to_end(&mut bytes).unwrap();
+            assert!(bytes.len() <= 256);
+            bytes
+        }
+        let source_identity = owner_bytes(&store);
         assert!(
             store
                 .begin_relocation_inner(Tier::Thumbnail, &destination, &[], || {
@@ -509,10 +519,7 @@ mod tests {
             .begin_relocation(Tier::Thumbnail, &destination, &[])
             .unwrap();
         assert!(store.relocation_pending().unwrap());
-        assert_eq!(
-            fs::read(config.thumbnail_root.join(".photocatalog-preview-owner")).unwrap(),
-            source_identity
-        );
+        assert_eq!(owner_bytes(&store), source_identity);
         drop(store);
         let mut store = PreviewStore::open(config.clone(), &[]).unwrap();
         while !store
