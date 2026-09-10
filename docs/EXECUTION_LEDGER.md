@@ -112,11 +112,19 @@ The supervisor now identifies owned processes using native birth seconds and
 microseconds. Independent source reviews passed this correction and protocol3
 checkpoint `cda4a65`, which admits the exact failed attempt into a separate v6
 inspection namespace while retaining v5/v4/v2 provenance. Eight supervisor
-fixtures and 60 Lightroom contracts passed; no actual v6 adoption has run yet.
+fixtures and 60 Lightroom contracts passed.
 Receipt: `sc-22844-pid-recovery-gate-cda4a65-v1/result.json` under private results.
-The successful-prefix digest and independently reviewed concrete launch package
-remain required before resuming. Auxiliary, referenced-path, packet and current
-family selection work remains outstanding.
+The actual v6 init/adopt phases subsequently exited successfully. Independent
+review reconciled 13 typed tables, 1,774 descriptors, 9,739,671 retained rows,
+15 captures and 14 completed member outcomes. The active member retains 24
+successful pages through cursor 9,280,288; failed command 5849 adds no progress.
+Known processes are absent and v6 main has not started. Evidence is
+`sc-22844-generation-request-v6-cda4a65/independent-adoption-review.json`
+under private results. Adoption finished before the tiny editing smoke began.
+The next main request is held: its existing growth allowance plus protected S8
+qualification funding exceeds currently available space. Continuous protection
+of that funding is required before further inspection growth. Auxiliary,
+referenced-path, packet and current family selection work remains outstanding.
 
 ## S8 qualification preparation checkpoint
 
@@ -149,3 +157,15 @@ unchanged independent oracle and tolerances. Both smoke attempts are retained
 under `sc-22843-tiny-smoke-v1` / `sc-22843-tiny-smoke-v2` in private results.
 This is correctness evidence only; performance and large-image qualification
 remain pending.
+
+Tiny production-path smoke v3 passed two references, warm previews (2+100) and
+first-original lifecycle on TIFF (2+20), and retained nine failures. Six metadata
+cases exposed invalid RDF in the controlled fixture; `3473220` preserves its
+intended nested qualifier in valid explicit RDF syntax. Twenty-two JPEG exports
+completed, but the checker incorrectly expected no XMP despite the service's
+regenerated technical metadata. `26d38cc` corrects that expectation while keeping
+direct-codec omission checks strict. All 98 Python contracts and the focused
+native RDF regression passed; independent source review passed. Two tiny overlap
+cases did not retain a live worker long enough. No overlap or performance result
+is awarded, and a fresh corrective smoke remains required. Failed v3 artifacts
+are preserved under `sc-22843-service-smoke-v3` in private results.
