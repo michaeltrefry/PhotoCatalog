@@ -25,7 +25,12 @@ REMOVED={
 def expected_metadata(selected,width,height,spec):
     width,height=reference.output_dimensions(width,height,spec['size'])
     result=copy.deepcopy(selected)
-    root=ET.fromstring(result['xmp'])
+    if result.get('xmp') is None:
+        root=ET.Element('{adobe:ns:meta/}xmpmeta')
+        rdf=ET.SubElement(root,'{'+RDF+'}RDF')
+        ET.SubElement(rdf,'{'+RDF+'}Description',{'{'+RDF+'}about':''})
+    else:
+        root=ET.fromstring(result['xmp'])
     descriptions=root.findall('.//{'+RDF+'}RDF/{'+RDF+'}Description')
     if len(descriptions)!=1:
         raise ValueError('controlled derivative requires one explicitly selected subject')

@@ -109,7 +109,7 @@ def export_artifact(root,request,value):
     else:
         directory,expected,proof=reference_case(root,request,'correctness-'+request['fixture_id']+'-combined',recipe)
         linear=linear_reference(directory,expected)
-        metadata={}
+        metadata=edit_derivative.expected_metadata({},linear.shape[1],linear.shape[0],request['outputs'][0])
         dependencies=[proof]
     result=readback.verify(path,linear,request['outputs'][0],metadata,
                            constant_jpeg=request['phase']=='export_correctness',

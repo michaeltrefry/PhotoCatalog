@@ -6,6 +6,22 @@ import edit_qualification as qualification
 
 
 class DerivativeExpectations(unittest.TestCase):
+    def test_unselected_source_still_has_regenerated_technical_metadata(self):
+        for selected in ({},{'xmp':None}):
+            with self.subTest(selected=selected):
+                before=selected.copy()
+                expected=derivative.expected_metadata(selected,48,32,qualification.outputs()['jpeg8'])
+                root=ET.fromstring(expected['xmp'])
+                description=root.find('.//{'+derivative.RDF+'}Description')
+                self.assertEqual(description.get('{'+derivative.RDF+'}about'),'')
+                self.assertEqual(root.find('.//{'+derivative.TIFF+'}ImageWidth').text,'48')
+                self.assertEqual(root.find('.//{'+derivative.EXIF+'}PixelYDimension').text,'32')
+                self.assertEqual(root.find('.//{'+derivative.XMP+'}CreatorTool').text,'PhotoCatalog')
+                self.assertEqual(root.find('.//{'+derivative.DC+'}format').text,'image/jpeg')
+                self.assertEqual(len(list(description)),12)
+                self.assertNotIn('preserve this user text',expected['xmp'])
+                self.assertEqual(selected,before)
+
     def test_preserves_subject_qualifiers_unknown_arrays_and_user_comment(self):
         selected=matrix.metadata(True)
         expected=derivative.expected_metadata(selected,48,32,qualification.outputs()['png16'])
