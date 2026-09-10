@@ -1,0 +1,177 @@
+use super::*;
+use crate::edit::RecipeV1;
+use crate::image_export::IntegerDepth;
+
+fn fixture() -> Result<(tempfile::TempDir, Catalog, PathBuf)> {
+    let temp = tempfile::tempdir()?;
+    let original = temp.path().join("original.png");
+    std::fs::write(&original, b"source bytes unchanged")?;
+    let mut c = Catalog::open(temp.path().join("catalog"))?;
+    let fingerprint = blake3::hash(b"source bytes unchanged").to_hex().to_string();
+    c.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint) VALUES('a',?1,'original','ready',?2)",params![b"original".as_slice(),fingerprint])?;
+    c.record_storage_path("a", &NativePath::from_path(&original))?;
+    Ok((temp, c, original))
+}
+fn output() -> OutputSpec {
+    OutputSpec {
+        size: OutputSize::Original,
+        format: OutputFormat::Png {
+            depth: IntegerDepth::Sixteen,
+        },
+        profile: OutputProfile::Srgb,
+        alpha: AlphaPolicy::Preserve,
+    }
+}
+fn target(path: PathBuf) -> ExportTarget {
+    ExportTarget {
+        key: VariantKey::master("a"),
+        expected_revision: 0,
+        destination: path,
+        overwrite: false,
+        metadata: MetadataSelection::Omit,
+    }
+}
+fn queued(c: &mut Catalog, path: PathBuf) -> Result<(ExportJob, ExportWork)> {
+    let j = c.begin_photo_export()?;
+    c.append_photo_export(&j.id, 0, &target(path), &output(), 1024, 1024)?;
+    c.seal_photo_export_job(&j.id, 1)?;
+    let w = c.claim_photo_export(&j.id)?.unwrap();
+    Ok((j, w))
+}
+fn seal(temp: &Path, w: &ExportWork) -> Result<SealedPhotoExport> {
+    let stage = temp.join(format!("{}.stage", w.attempt));
+    std::fs::write(&stage, b"completed encoded derivative")?;
+    metadata_export::seal_photo_export(&w.plan.destination, &stage, 1024, &w.authority, |_| Ok(()))
+}
+#[test]
+fn frozen_job_survives_restart_and_only_accepted_seal_publishes() -> Result<()> {
+    let (temp, mut c, original) = fixture()?;
+    let destination = temp.path().join("export.png");
+    let (j, w) = queued(&mut c, destination.clone())?;
+    let sealed = seal(temp.path(), &w)?;
+    assert!(c.publish_photo_export_item(&j.id, 1).is_err());
+    assert!(!destination.exists());
+    c.accept_photo_export_seal(&w, &sealed)?;
+    drop(c);
+    let mut c = Catalog::open(temp.path().join("catalog"))?;
+    let r = c.publish_photo_export_item(&j.id, 1)?;
+    assert_eq!(r.state, metadata_export::ExportState::Published);
+    assert_eq!(c.photo_export_job(&j.id)?.state, "complete");
+    assert_eq!(c.photo_export_job(&j.id)?.completed, 1);
+    assert_eq!(std::fs::read(destination)?, b"completed encoded derivative");
+    assert_eq!(std::fs::read(original)?, b"source bytes unchanged");
+    Ok(())
+}
+#[test]
+fn cancel_blocks_orphan_and_accepted_seal_without_publishing() -> Result<()> {
+    for accepted in [false, true] {
+        let (temp, mut c, _) = fixture()?;
+        let destination = temp.path().join("export.png");
+        let (j, w) = queued(&mut c, destination.clone())?;
+        let sealed = seal(temp.path(), &w)?;
+        if accepted {
+            c.accept_photo_export_seal(&w, &sealed)?;
+        }
+        c.cancel_photo_export_job(&j.id)?;
+        assert!(c.accept_photo_export_seal(&w, &sealed).is_err());
+        assert!(c.publish_photo_export_item(&j.id, 1).is_err());
+        assert!(!destination.exists());
+        assert_eq!(
+            metadata_export::read_photo_seal(&w.plan.destination, &w.authority)?,
+            sealed
+        );
+    }
+    Ok(())
+}
+#[test]
+fn edit_undo_aba_changed_original_and_forged_work_cannot_accept() -> Result<()> {
+    for change in ["undo", "source", "forged"] {
+        let (temp, mut c, original) = fixture()?;
+        let (j, mut w) = queued(&mut c, temp.path().join("export.png"))?;
+        let sealed = seal(temp.path(), &w)?;
+        match change {
+            "undo" => {
+                c.save_edit_recipe(
+                    &w.plan.identity.key,
+                    0,
+                    &Recipe::V1(RecipeV1 {
+                        exposure_ev: 1.,
+                        ..RecipeV1::default()
+                    }),
+                )?;
+                c.undo_edit(&w.plan.identity.key, 1)?;
+            }
+            "source" => std::fs::write(original, b"external changed bytes")?,
+            _ => {
+                w.plan.metadata = MetadataSelection::Resolved {
+                    expected_revision: 0,
+                    base_model: None,
+                }
+            }
+        }
+        assert!(c.accept_photo_export_seal(&w, &sealed).is_err());
+        assert_eq!(c.photo_export_items(&j.id, 0, 1)?[0].state, "rendering");
+    }
+    Ok(())
+}
+#[test]
+fn batch_cas_collision_overwrite_and_original_alias_are_rejected_atomically() -> Result<()> {
+    let (temp, mut c, original) = fixture()?;
+    let j = c.begin_photo_export()?;
+    let dest = temp.path().join("export.png");
+    c.append_photo_export(&j.id, 0, &target(dest.clone()), &output(), 1024, 1024)?;
+    assert!(
+        c.append_photo_export(
+            &j.id,
+            0,
+            &target(temp.path().join("other.png")),
+            &output(),
+            1024,
+            1024
+        )
+        .is_err()
+    );
+    assert!(
+        c.append_photo_export(&j.id, 1, &target(dest), &output(), 1024, 1024)
+            .is_err()
+    );
+    let mut t = target(original.clone());
+    t.overwrite = true;
+    assert!(
+        c.append_photo_export(&j.id, 1, &t, &output(), 1024, 1024)
+            .is_err()
+    );
+    let alias = temp.path().join("alias.png");
+    std::fs::hard_link(&original, &alias)?;
+    t.destination = alias;
+    assert!(
+        c.append_photo_export(&j.id, 1, &t, &output(), 1024, 1024)
+            .is_err()
+    );
+    t.destination = temp.path().join("existing.png");
+    std::fs::write(&t.destination, b"old")?;
+    t.overwrite = false;
+    assert!(
+        c.append_photo_export(&j.id, 1, &t, &output(), 1024, 1024)
+            .is_err()
+    );
+    assert_eq!(c.photo_export_job(&j.id)?.total, 1);
+    assert_eq!(c.photo_export_items(&j.id, 0, 200)?.len(), 1);
+    Ok(())
+}
+#[test]
+fn publication_conflict_is_not_reported_as_published() -> Result<()> {
+    let (temp, mut c, _) = fixture()?;
+    let dest = temp.path().join("export.png");
+    let (j, w) = queued(&mut c, dest.clone())?;
+    let sealed = seal(temp.path(), &w)?;
+    c.accept_photo_export_seal(&w, &sealed)?;
+    std::fs::write(&dest, b"external file")?;
+    let receipt = c.publish_photo_export_item(&j.id, 1)?;
+    assert_eq!(receipt.state, metadata_export::ExportState::Conflict);
+    let items = c.photo_export_items(&j.id, 0, 1)?;
+    assert_eq!(items[0].state, "failed");
+    assert!(items[0].error.is_some());
+    assert_eq!(std::fs::read(dest)?, b"external file");
+    Ok(())
+}

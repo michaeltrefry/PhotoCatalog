@@ -123,11 +123,12 @@ fn store_blob(db: &Connection, bytes: &[u8]) -> Result<String> {
     Ok(hash)
 }
 fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
-    let (length, compressed): (usize, Vec<u8>) = db.query_row(
+    let (length, compressed): (i64, Vec<u8>) = db.query_row(
         "SELECT raw_length,compressed FROM photo_export_blobs WHERE hash=?1",
         [hash],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let length = usize::try_from(length).context("negative export blob length")?;
     ensure!(length <= BLOB_LIMIT, "export blob length limit");
     let mut bytes = Vec::new();
     ZlibDecoder::new(compressed.as_slice())
@@ -284,6 +285,10 @@ impl Catalog {
         let destination =
             metadata_export::snapshot_photo_destination(&target.destination, max_payload_bytes)?;
         ensure!(
+            !destination.destination.starts_with(&self.root),
+            "export destination is inside the catalog"
+        );
+        ensure!(
             target.overwrite || destination.expected.is_none(),
             "destination exists; explicit overwrite required"
         );
@@ -439,6 +444,7 @@ impl Catalog {
         work: &ExportWork,
         seal: &SealedPhotoExport,
     ) -> Result<()> {
+        checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
         ensure!(
             seal.authority_digest == work.authority
                 && seal.snapshot == work.plan.destination
@@ -462,7 +468,9 @@ impl Catalog {
             ensure!(sealed.authority_digest==authority && sealed.snapshot==plan.destination,"stored seal authority mismatch");
             protect_destination(tx,&plan.destination.destination,&plan.original.to_path()?)?;
             let receipt=metadata_export::publish_photo_export(&sealed)?;
-            tx.execute("UPDATE photo_export_items SET state='published',receipt=?1 WHERE job=?2 AND sequence=?3",params![serde_json::to_string(&receipt)?,id,sequence])?;
+            let state = if receipt.state == metadata_export::ExportState::Published { "published" } else { "failed" };
+            let error = (state == "failed").then(|| format!("publication ended in {:?}", receipt.state));
+            tx.execute("UPDATE photo_export_items SET state=?1,receipt=?2,error=?3 WHERE job=?4 AND sequence=?5",params![state,serde_json::to_string(&receipt)?,error,id,sequence])?;
             finish_item(tx,id)?;Ok(receipt)
         })?.context("edit/source changed before export publication")
     }
@@ -499,3 +507,7 @@ impl Catalog {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+#[path = "catalog_exports/tests.rs"]
+mod tests;
