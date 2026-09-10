@@ -187,7 +187,16 @@ impl PhotoPublication {
         );
         let start = Instant::now();
         let payload = if restore {
-            None
+            // A missing/damaged payload cannot prevent restoring the capture.
+            // Retain a valid live payload, however, so installed-output recovery
+            // never confuses a reused historical file ID with current ownership.
+            VerifiedFile::read_with_checkpoint(
+                &directory.join("payload"),
+                seal.max_payload_bytes,
+                checkpoint,
+            )
+            .ok()
+            .filter(|verified| verified.revision() == &seal.payload)
         } else {
             let verified = VerifiedFile::read_with_checkpoint(
                 &directory.join("payload"),
@@ -235,13 +244,24 @@ impl PhotoPublication {
     pub fn timings(&self) -> &PhotoPublicationTimings {
         &self.timings
     }
+    /// No catalog writer may be held: after a failed namespace operation acquire
+    /// fresh bounded byte proofs. A successful link changes the payload's ctime,
+    /// so the pre-link proof cannot establish ownership here.
     pub fn failure_receipt(&self, detail: String) -> ExportReceipt {
         let state = match fs::symlink_metadata(&self.seal.snapshot.destination) {
-            Ok(metadata) => {
-                let owned = open_regular(&self.seal.snapshot.destination)
-                    .ok()
-                    .and_then(|file| identity(&file, &metadata).ok())
-                    == Some(self.seal.payload.identity);
+            Ok(_) => {
+                let owned = (|| -> Result<bool> {
+                    let payload = VerifiedFile::read(
+                        &self.directory.join("payload"),
+                        self.seal.max_payload_bytes,
+                    )?;
+                    let destination = VerifiedFile::read(
+                        &self.seal.snapshot.destination,
+                        self.seal.max_payload_bytes,
+                    )?;
+                    Ok(self.owns_installed_pair(&payload, &destination))
+                })()
+                .unwrap_or(false);
                 if owned {
                     ExportState::Recoverable
                 } else {
@@ -254,11 +274,17 @@ impl PhotoPublication {
     }
 
     pub fn installed(&self) -> bool {
-        self.destination.as_ref().is_some_and(|file| {
-            file.revision().identity == self.seal.payload.identity
-                && file.revision().digest == self.seal.payload.digest
-                && file.revision().bytes == self.seal.payload.bytes
-        })
+        self.payload
+            .as_ref()
+            .zip(self.destination.as_ref())
+            .is_some_and(|(payload, destination)| self.owns_installed_pair(payload, destination))
+    }
+    fn owns_installed_pair(&self, payload: &VerifiedFile, destination: &VerifiedFile) -> bool {
+        payload.revision() == &self.seal.payload
+            && destination.revision() == &self.seal.payload
+            && payload.stamp.object == destination.stamp.object
+            && payload.recheck().is_ok()
+            && destination.recheck().is_ok()
     }
     /// Called under current catalog/source/job authority, after intent commit.
     /// Namespace only; capture is fully rehashed by verify_capture after release.
@@ -389,17 +415,7 @@ impl PhotoPublication {
     }
     pub fn recheck_installed(&self) -> Result<()> {
         ensure!(self.installed(), "owned payload is not installed");
-        self.recheck_payload()?;
-        let payload = self.payload.as_ref().context("payload is not verified")?;
-        let destination = self
-            .destination
-            .as_ref()
-            .context("destination is not verified")?;
-        ensure!(
-            payload.stamp.object == destination.stamp.object,
-            "installed full file identity differs"
-        );
-        destination.recheck()
+        Ok(())
     }
     /// Restoration only: capture may contain externally changed bytes; preserve
     /// them rather than overwriting/removing any independently created destination.
@@ -493,5 +509,108 @@ fn optional_verified(
         Ok(_) => VerifiedFile::read_with_checkpoint(path, maximum, checkpoint).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn fixture(existing: bool) -> Result<(tempfile::TempDir, SealedPhotoExport)> {
+        let root = tempfile::tempdir()?;
+        let destination = root.path().join("output.jpg");
+        if existing {
+            fs::write(&destination, b"original bytes")?;
+        }
+        let input = root.path().join("encoded");
+        fs::write(&input, b"encoded bytes")?;
+        let snapshot = snapshot_photo_destination(&destination, 1024)?;
+        let authority = blake3::hash(b"ownership regression").to_hex().to_string();
+        let seal = seal_photo_export(&snapshot, &input, 1024, &authority, |_| Ok(()))?;
+        Ok((root, seal))
+    }
+
+    #[test]
+    fn historical_payload_identity_without_live_payload_is_not_ownership() -> Result<()> {
+        let (_root, seal) = fixture(false)?;
+        fs::remove_file(seal.recovery_directory().join("payload"))?;
+        fs::write(&seal.snapshot.destination, b"encoded bytes")?;
+        let mut publication = PhotoPublication::prepare_restore(&seal)?;
+        // Deterministically emulate a filesystem reusing the deleted payload's
+        // ID for this foreign object. Matching bytes do not convey ownership.
+        publication.seal.payload.identity =
+            publication.destination.as_ref().unwrap().revision.identity;
+        assert!(!publication.installed());
+        assert_eq!(
+            publication
+                .failure_receipt("foreign replacement".into())
+                .state,
+            ExportState::Conflict
+        );
+        assert_eq!(fs::read(&seal.snapshot.destination)?, b"encoded bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn live_payload_does_not_authorize_a_different_destination_object() -> Result<()> {
+        let (_root, seal) = fixture(false)?;
+        fs::write(&seal.snapshot.destination, b"encoded bytes")?;
+        let mut publication = PhotoPublication::prepare(&seal)?;
+        // Also exercise classification when a valid payload is retained, but
+        // the historical serialized ID happens to name a different object.
+        publication.seal.payload.identity =
+            publication.destination.as_ref().unwrap().revision.identity;
+        assert_eq!(
+            publication
+                .failure_receipt("foreign replacement".into())
+                .state,
+            ExportState::Conflict
+        );
+        assert!(!publication.installed());
+        Ok(())
+    }
+
+    #[test]
+    fn installed_link_can_be_verified_and_finalized_after_restart() -> Result<()> {
+        let (_root, seal) = fixture(false)?;
+        let mut publication = PhotoPublication::prepare(&seal)?;
+        publication.link()?;
+        // Linking changes ctime: classification must acquire fresh evidence,
+        // rather than treating the pre-link payload stamp as unchanged.
+        assert_eq!(
+            publication
+                .failure_receipt("interrupted after link".into())
+                .state,
+            ExportState::Recoverable
+        );
+        drop(publication);
+        let mut restarted = PhotoPublication::prepare_restore(&seal)?;
+        assert!(restarted.installed());
+        assert_eq!(restarted.verify_installed()?.state, ExportState::Published);
+        restarted.recheck_installed()?;
+        Ok(())
+    }
+
+    #[test]
+    fn original_restore_survives_missing_or_corrupt_payload() -> Result<()> {
+        for missing in [true, false] {
+            let (_root, seal) = fixture(true)?;
+            let mut publication = PhotoPublication::prepare(&seal)?;
+            publication.capture()?;
+            publication.verify_capture()?;
+            drop(publication);
+            let payload = seal.recovery_directory().join("payload");
+            if missing {
+                fs::remove_file(payload)?;
+            } else {
+                fs::write(payload, b"damaged bytes")?;
+            }
+            let mut restore = PhotoPublication::prepare_restore(&seal)?;
+            assert!(!restore.installed());
+            restore.restore_link()?;
+            assert_eq!(restore.verify_restored()?.state, ExportState::Restored);
+            assert_eq!(fs::read(&seal.snapshot.destination)?, b"original bytes");
+        }
+        Ok(())
     }
 }

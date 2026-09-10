@@ -128,6 +128,14 @@ possible install, so crash recovery can distinguish an installed result from sta
 unfinished work. Safe restoration retains captured bytes and supports retry after
 interruption, including when the staged new payload is missing. A replacement file
 with equal bytes but a different object identity does not authorize clobbering it.
+Installed-output recovery requires a live verified payload and destination naming
+the same full native file identity, with both revisions matching the seal. A
+historical payload ID alone is insufficient because a filesystem can reuse it
+after payload deletion. Failure classification rehashes this pair outside the
+catalog writer; missing or damaged payloads still permit no-clobber restoration
+of the retained original. Ordinary successful publication keeps its existing
+bounded hashes and two held-file rechecks; this correction adds bulk reads only
+to restoration and error classification, not rendering or encoding.
 
 ## Evidence boundary
 
