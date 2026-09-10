@@ -1,7 +1,8 @@
 //! Isolated full-image work. The owner keeps a stdin lease open; EOF terminates
 //! native work after an owner crash, and cancellation kills and waits for exit.
 use super::{
-    Codec, PreparedRgb, PreviewKey, decode, encode, encoded_dimensions, prepare, renderer_identity,
+    Codec, EditInputProvenance, PreparedRgb, PreviewKey, decode, encode, encoded_dimensions,
+    prepare, renderer_identity,
 };
 use crate::{
     media::{DecodeError, DecodeLimits, DecodeStatus, Metadata, RenderProvenance},
@@ -158,6 +159,7 @@ struct ObjectReceipt {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct RenderReceipt {
+    edit_input: Option<EditInputProvenance>,
     peak_resident_bytes: Option<u64>,
     peak_method: String,
     metadata: Metadata,
@@ -171,6 +173,7 @@ pub struct ProducedPreview {
     pub encoded: Vec<u8>,
 }
 pub struct RenderedPreviewBatch {
+    pub edit_input: Option<EditInputProvenance>,
     pub peak_resident_bytes: Option<u64>,
     pub peak_method: String,
     pub metadata: Metadata,
@@ -291,6 +294,25 @@ impl WorkerProcess {
             receipt.objects.len() == self.request.keys.len(),
             "incomplete worker tier set"
         );
+        match (&self.request.edit, &receipt.edit_input) {
+            (None, None) | (Some(_), Some(EditInputProvenance::OriginalDecoded)) => {}
+            (
+                Some(edit),
+                Some(EditInputProvenance::PreparedProxy {
+                    receipt,
+                    source_instance_digest,
+                }),
+            ) => {
+                let expected = edit.prepared.as_ref().context("unrequested prepared hit")?;
+                ensure!(
+                    edit.interactive
+                        && *receipt == expected.receipt
+                        && *source_instance_digest == expected.source.digest()?,
+                    "prepared hit differs from admitted request"
+                );
+            }
+            _ => bail!("worker edit input evidence differs from request"),
+        }
         let mut total = 0u64;
         let mut objects = Vec::new();
         for (index, object) in receipt.objects.into_iter().enumerate() {
@@ -316,6 +338,7 @@ impl WorkerProcess {
             });
         }
         Ok(Some(RenderedPreviewBatch {
+            edit_input: receipt.edit_input,
             peak_resident_bytes: receipt.peak_resident_bytes,
             peak_method: receipt.peak_method,
             metadata: receipt.metadata,
@@ -657,6 +680,7 @@ fn run_worker() -> Result<()> {
     let instance = SourceInstance::read(&source)?;
     let mut prepared_receipt = None;
     let mut prepared_reused = false;
+    let mut edit_input = None;
     let mut rendered = if let Some(edit) = &request.edit {
         let recipe = edit.recipe.validate()?;
         let cached = if edit.interactive {
@@ -694,6 +718,14 @@ fn run_worker() -> Result<()> {
         let input = match cached {
             Some(input) => {
                 prepared_reused = true;
+                let reference = edit
+                    .prepared
+                    .as_ref()
+                    .context("missing consumed preparation")?;
+                edit_input = Some(EditInputProvenance::PreparedProxy {
+                    receipt: reference.receipt.clone(),
+                    source_instance_digest: instance.digest()?,
+                });
                 input
             }
             None => {
@@ -706,6 +738,7 @@ fn run_worker() -> Result<()> {
                     request.decode_limits,
                     &(),
                 )?;
+                edit_input = Some(EditInputProvenance::OriginalDecoded);
                 if edit.interactive {
                     let proxy =
                         crate::edit::prepare_linear_proxy(&original, PROXY_EDGE, edit.limits, &())?;
@@ -790,6 +823,7 @@ fn run_worker() -> Result<()> {
     // source verification. Only the bounded 64 KiB receipt write follows.
     let (peak_resident_bytes, peak_method) = peak_resident_memory();
     let receipt = serde_json::to_vec(&RenderReceipt {
+        edit_input,
         peak_resident_bytes,
         peak_method,
         metadata: rendered.metadata,

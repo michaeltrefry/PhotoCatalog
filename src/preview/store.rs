@@ -98,8 +98,22 @@ pub struct StoreConfig {
 }
 /// The metadata/provenance belong to these pixels, including an explicitly stale
 /// retained fallback. General catalog metadata can independently be newer.
+/// Observed input used by the successful editing worker, bound to its preview key.
+/// A prepared hit is recorded only after the complete proxy checksum and identity
+/// have been validated. Older cached records have no such evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum EditInputProvenance {
+    OriginalDecoded,
+    PreparedProxy {
+        receipt: crate::edit::PreparedProxyReceipt,
+        source_instance_digest: String,
+    },
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderRecord {
+    #[serde(default)]
+    pub edit_input: Option<EditInputProvenance>,
     pub width: u32,
     pub height: u32,
     pub metadata: crate::media::Metadata,
@@ -1144,6 +1158,7 @@ mod tests {
     }
     fn record(label: &str) -> RenderRecord {
         RenderRecord {
+            edit_input: None,
             width: 2,
             height: 1,
             metadata: crate::media::Metadata {

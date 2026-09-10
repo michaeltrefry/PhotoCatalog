@@ -32,6 +32,11 @@ pub(crate) struct SourceInstance {
 }
 
 impl SourceInstance {
+    pub(crate) fn digest(&self) -> Result<String> {
+        Ok(blake3::hash(&serde_json::to_vec(self)?)
+            .to_hex()
+            .to_string())
+    }
     pub(crate) fn read(path: &Path) -> Result<Self> {
         let canonical = fs::canonicalize(path)?;
         let mut options = fs::OpenOptions::new();

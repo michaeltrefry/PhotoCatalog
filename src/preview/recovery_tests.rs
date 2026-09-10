@@ -176,6 +176,7 @@ fn old_renderer_attached_import_recovers_before_rekey_and_cleans_committed_journ
         let decoded = crate::media::decode_full(&source).unwrap();
         let bytes = decoded.srgb_preview(512).unwrap();
         let record = RenderRecord {
+            edit_input: None,
             width: decoded.width,
             height: decoded.height,
             metadata: decoded.metadata,

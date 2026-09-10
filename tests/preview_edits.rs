@@ -230,6 +230,37 @@ fn prepared_cache_reuses_only_same_source_instance_and_recovers_corruption_as_mi
             finish(&mut previews, &mut catalog, request),
             ServiceCompletion::Ready
         ));
+        let observed = previews
+            .cached_interactive(&catalog, &key, Tier::Thumbnail, false)
+            .unwrap()
+            .unwrap()
+            .record
+            .unwrap()
+            .edit_input
+            .unwrap();
+        if revision == 0 {
+            assert_eq!(observed, EditInputProvenance::OriginalDecoded);
+        } else {
+            let EditInputProvenance::PreparedProxy {
+                receipt,
+                source_instance_digest,
+            } = observed
+            else {
+                panic!("warm request unexpectedly decoded the original");
+            };
+            assert_eq!(
+                receipt.identity.source_fingerprint,
+                photocatalog::fingerprint(&originals.join("pixel.png")).unwrap()
+            );
+            assert_eq!(receipt.identity.longest_edge, 1600);
+            assert_eq!(receipt.identity.original_dimensions, (24, 16));
+            assert_eq!(
+                receipt.identity.renderer_identity,
+                photocatalog::edit::renderer_identity()
+            );
+            assert_eq!(source_instance_digest.len(), 64);
+            assert_eq!(receipt.blake3.len(), 64);
+        }
     }
     let files = std::fs::read_dir(cache.join("manifest/prepared"))
         .unwrap()
@@ -272,6 +303,16 @@ fn prepared_cache_reuses_only_same_source_instance_and_recovers_corruption_as_mi
         ServiceCompletion::Ready
     ));
     assert!(std::fs::metadata(&path).unwrap().len() > 100);
+    assert_eq!(
+        previews
+            .cached_interactive(&catalog, &key, Tier::Thumbnail, false)
+            .unwrap()
+            .unwrap()
+            .record
+            .unwrap()
+            .edit_input,
+        Some(EditInputProvenance::OriginalDecoded)
+    );
     // Same path, dimensions and mtime with a different physical file must miss.
     let source = originals.join("pixel.png");
     let changed = originals.join("replacement.png");

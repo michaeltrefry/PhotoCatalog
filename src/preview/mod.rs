@@ -20,8 +20,8 @@ pub use scheduler::{
     WorkerOutcome,
 };
 pub use store::{
-    CacheQuotaExceeded, CachedPreview, Layout, PreviewKey, PreviewStore, Publication,
-    RelocationProgress, RenderRecord, StoreConfig, StoreUsage, Tier,
+    CacheQuotaExceeded, CachedPreview, EditInputProvenance, Layout, PreviewKey, PreviewStore,
+    Publication, RelocationProgress, RenderRecord, StoreConfig, StoreUsage, Tier,
 };
 
 mod prepared_cache;

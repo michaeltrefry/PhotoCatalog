@@ -166,6 +166,7 @@ fn prepare(campaign: &Path, output: &Path, count: u32, layout: LayoutArg) -> Res
                 width: w,
                 height: h,
                 record: RenderRecord {
+                    edit_input: None,
                     width: w,
                     height: h,
                     metadata: serde_json::from_value(child["result"]["metadata"].clone())?,

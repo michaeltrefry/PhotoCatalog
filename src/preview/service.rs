@@ -1003,6 +1003,7 @@ impl PreviewService {
         let mut stale = false;
         for object in &batch.objects {
             let record = RenderRecord {
+                edit_input: batch.edit_input.clone(),
                 width: object.pixels.width(),
                 height: object.pixels.height(),
                 metadata: batch.metadata.clone(),
