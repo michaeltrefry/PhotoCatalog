@@ -1,0 +1,137 @@
+"""Aggregate acceptance fixtures, no source photographs or native workloads."""
+import copy
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+import edit_aggregate as aggregate
+import edit_disk_budget
+import edit_qualification as q
+import edit_statistics as stats
+from test_edit_qualification import manifest
+from test_edit_statistics import request, samples
+
+
+class AggregateContracts(unittest.TestCase):
+    def test_semantic_numbers_cannot_turn_boolean_into_configuration(self):
+        self.assertTrue(aggregate.same({'kelvin': 4300}, {'kelvin': 4300.0}))
+        for left, right in ((True, 1), (False, 0), ({'x': True}, {'x': 1}),
+                            ([1], [1, 2]), (float('nan'), float('nan'))):
+            self.assertFalse(aggregate.same(left, right))
+
+    def test_whole_registry_rejects_missing_reordered_or_changed_case(self):
+        cohort = manifest()
+        cases = edit_disk_budget.complete_cases(cohort)
+        binding = {'cases': cases, 'cases_sha256': hashlib.sha256(aggregate.canonical(cases)).hexdigest()}
+        records = [{'id': case['id']} for case in cases]
+        self.assertEqual(len(aggregate.registry(cohort, binding, records)), 529)
+        for altered in (records[:-1], list(reversed(records)), records[:-1]+[records[0]]):
+            with self.assertRaises(ValueError): aggregate.registry(cohort, binding, altered)
+        bad = copy.deepcopy(binding)
+        bad['cases'][0]['recipes'][0]['settings']['exposure_ev'] = 9.0
+        bad['cases_sha256'] = hashlib.sha256(aggregate.canonical(bad['cases'])).hexdigest()
+        with self.assertRaises(ValueError): aggregate.registry(cohort, bad, records)
+
+    def case(self):
+        r = request()
+        r['source_blake3'] = 'b'*64
+        values = samples(r)
+        attempts = [dict(recipe_index=v['recipe_index'], iteration=v['iteration']) for v in values]
+        receipt = {k: r[k] for k in ('phase', 'fixture_id', 'operation', 'source_sha256', 'source_blake3')}
+        receipt.update(probe_complete=True, qualification_complete=False, error=None)
+        verifier = dict(complete=True, error=None, result=dict(verified=True, whole_story_qualified=False,
+            sample_count=len(values), coverage=sorted(aggregate.required_coverage(r))))
+        return r, receipt, verifier, attempts, values
+
+    def test_partial_or_overclaiming_verifier_cannot_award_case(self):
+        r, receipt, verifier, attempts, values = self.case()
+        aggregate.case_result(r, receipt, verifier, attempts, values)
+        for mutate in (lambda p: p.update(complete=False),
+                       lambda p: p['result'].update(whole_story_qualified=True),
+                       lambda p: p['result'].update(remaining=['unverified pixels']),
+                       lambda p: p['result'].update(coverage=['sample_identity', 'source_hashes']),
+                       lambda p: p['result'].update(sample_count=101)):
+            bad = copy.deepcopy(verifier); mutate(bad)
+            with self.assertRaises(ValueError): aggregate.case_result(r, receipt, bad, attempts, values)
+
+    def test_slow_valid_case_keeps_failure_and_tail_in_distribution(self):
+        r, receipt, verifier, attempts, values = self.case()
+        for value in values[-6:]: value['elapsed_ms'] = 1234
+        result = aggregate.case_result(r, receipt, verifier, attempts, values)
+        self.assertFalse(result['configurations'][0]['numeric_target_met'])
+        self.assertEqual(result['configurations'][0]['elapsed']['p95_ms'], 1234)
+        self.assertFalse(result['whole_story_qualified'])
+
+    def repeats(self):
+        results = []
+        for fixture in q.IDS:
+            for operation in ('all-0', 'all-1'):
+                r = request('correctness')
+                r.update(fixture_id=fixture, operation=operation)
+                value = samples(r)[0]
+                value['pixels'] = dict(width=1, height=1, rgba_f32le_blake3='c'*64,
+                    minimum=[0, 0, 0, 1], maximum=[0, 0, 0, 1], alpha_zero_partial_opaque=[0, 0, 1], nonfinite=0)
+                results.append((r, [value]))
+        return results
+
+    def test_repeated_pixel_changes_or_missing_camera_are_not_pooled_away(self):
+        values = self.repeats()
+        self.assertEqual(len(aggregate.deterministic_pairs(values)), 30)
+        with self.assertRaises(ValueError): aggregate.deterministic_pairs(values[:-1])
+        values[-1][1][0]['pixels']['rgba_f32le_blake3'] = 'd'*64
+        with self.assertRaisesRegex(ValueError, 'repeated pixel observations differ'):
+            aggregate.deterministic_pairs(values)
+
+    def supervisor_fixture(self, root):
+        folder = root/'action'; folder.mkdir()
+        limits = dict(deadline_seconds=10, process_rss_bytes=100, group_rss_bytes=200, free_reserve_bytes=50)
+        command = ['/fixed/probe', '--request', '/fixed/request']
+        def write(name, value): (folder/name).write_text(json.dumps(value)+'\n')
+        write('start.json', dict(command=command, limits=limits, started={'monotonic_ns': 100}))
+        write('spawn.json', dict(pid=123, create_time=100.25))
+        telemetry = dict(at={'monotonic_ns': 150}, processes=[dict(pid=123, create_time=100.25, rss=80, status='running')], total_rss=80, free_bytes=100)
+        write('processes.jsonl', telemetry)
+        result = dict(complete=True, error=None, samples=1, sampled_peak_group_rss=80,
+                      finished={'monotonic_ns': 200}, captures={},
+                      ownership=dict(known_absent=True, root_reaped=True, root_returncode=0, remaining=[], errors=[]))
+        for name in ('stdout.log', 'stderr.log', 'processes.jsonl'):
+            if name.endswith('.log'): (folder/name).write_bytes(b'')
+            data = (folder/name).read_bytes()
+            result[name] = dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+            if name.endswith('.log'):
+                result['captures'][name] = dict(reader_joined=True, eof=True, truncated=False, errors=[],
+                    limit_bytes=4*aggregate.MIB, observed_bytes=len(data), retained_bytes=len(data))
+        write('result.json', result)
+        return folder, result, command, limits
+
+    def test_supervisor_launch_cleanup_pid_and_stream_hash_are_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            folder, result, command, limits = self.supervisor_fixture(root)
+            aggregate.supervisor(root, folder, str(folder/'result.json'), command, limits, 123)
+            with self.assertRaises(ValueError): aggregate.supervisor(root, folder, str(folder/'result.json'), command, limits, 124)
+            for mutate in (lambda r: r['ownership'].update(root_reaped=False),
+                           lambda r: r['ownership'].update(root_returncode=True),
+                           lambda r: r.update(samples=2),
+                           lambda r: r.update(sampled_peak_group_rss=79),
+                           lambda r: r['captures']['stdout.log'].update(eof=False)):
+                bad = copy.deepcopy(result); mutate(bad)
+                (folder/'result.json').write_text(json.dumps(bad))
+                with self.assertRaises(ValueError): aggregate.supervisor(root, folder, str(folder/'result.json'), command, limits)
+            (folder/'result.json').write_text(json.dumps(result))
+            (folder/'stdout.log').write_bytes(b'unbound output')
+            with self.assertRaises(ValueError): aggregate.supervisor(root, folder, str(folder/'result.json'), command, limits)
+
+    def test_owned_artifact_symlink_and_path_escape_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            owned = root/'owned'; owned.mkdir()
+            outside = root/'outside'; outside.write_text('private')
+            alias = owned/'alias'; alias.symlink_to(outside)
+            for path in (outside, alias):
+                with self.assertRaises(ValueError): aggregate.admitted_file(owned, path, 100)
+
+
+if __name__ == '__main__':
+    unittest.main()
