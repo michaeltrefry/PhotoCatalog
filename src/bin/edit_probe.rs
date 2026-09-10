@@ -51,6 +51,8 @@ struct Request {
     decode: DecodeLimits,
     render: RenderLimits,
     encoded_extent: u64,
+    #[serde(default)]
+    metadata: ResolvedExportMetadata,
     warmups: usize,
     repetitions: usize,
 }
@@ -169,7 +171,7 @@ fn pixels(request: &Request, samples: &mut File) -> Result<()> {
                     let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
                     let mut sink = BoundedSeekWriter::new(file, request.encoded_extent)?;
                     let encoded = image_export::encode_export(&edited, output,
-                        &ResolvedExportMetadata { xmp: None, exif: Default::default() }, &mut sink,
+                        &request.metadata, &mut sink,
                         EncodeLimits { render: request.render, ..Default::default() }, &())?;
                     drop(sink);
                     exports.push(json!({"path":path,"report":encoded,
@@ -249,7 +251,12 @@ fn export(request: &Request, samples: &mut File) -> Result<()> {
     })?;
     ensure!(exports.recover(&mut catalog, 128)?.complete, "fresh export recovery incomplete");
     for iteration in 0..request.warmups + request.repetitions {
-        let destination = request.output.join(format!("export-{iteration}.image"));
+        let extension = match request.outputs[0].format {
+            image_export::OutputFormat::Jpeg { .. } => "jpg",
+            image_export::OutputFormat::Png { .. } => "png",
+            image_export::OutputFormat::Tiff { .. } => "tiff",
+        };
+        let destination = request.output.join(format!("export-{iteration}.{extension}"));
         let started = stamp();
         let start = Instant::now();
         let job = catalog.begin_photo_export()?;

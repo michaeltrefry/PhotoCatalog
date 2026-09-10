@@ -158,3 +158,47 @@ Before execution admission, the next harness checkpoint must implement and freez
 
 The first source checkpoint and its tests are **UNRUN**. These gates remain within
 S8; this document neither defers them to another story nor awards completion.
+
+## Second-checkpoint oracle design (source only, not admitted)
+
+`edit_reference.py` independently evaluates the specified equations with float64
+linear algebra and direct 2D neighborhood sums. It does not call product code or
+LCMS. The initial generated sources use a known matrix ICC profile and float32
+TIFF, with signed/HDR channels and straight alpha. `edit_fixtures.py` emits bounded
+scanline buffers, including a separately admitted 10000×10000 source. The 100-MP
+fixture's pixel payload is exactly 1,600,000,000 bytes, plus TIFF/ICC/strip metadata;
+its generation does not allocate that payload as one Python array.
+
+The proposed small-fixture comparison bound is `2e-5 + 2e-5*abs(expected)` per
+component, or `4e-5 + 2e-5*abs(expected)` when geometry changes. These are declared
+before results, to accommodate float32 operation accumulation, fixed-point ICC
+matrix quantization and nonlinear propagation; they are not measured tolerances.
+Masks/dimensions/channel declarations additionally have exact structural checks.
+The analytic implementation uses the published Robertson brackets for the two
+fixed WB temperatures and a float64 Bradford solve. It is not a general CCT oracle.
+Raw-camera WB still needs its separately defined camera-space fixture/reference.
+
+Independent readback uses imagecodecs (libjpeg/libpng) and tifffile, not the product
+codec path. Header parsers verify ICC fragmentation, PNG metadata CRCs, extended
+XMP byte coverage/GUID, and offset-safe EXIF reconstruction. Lossless integer
+comparisons propose maximum 2 LSB at 8-bit and 4 LSB at 16-bit, including transfer
+rounding; float output uses the geometry tolerance above. JPEG's constant analytic
+patch has a prospective 3-LSB DC/YCbCr bound at quality 90. General photographs'
+lossy differences are reported without inventing a whole-image JPEG pixel limit.
+These checks require actual execution and independent source review.
+
+Scientific dependencies currently available in the prior private reference
+validation environment are NumPy 2.5.3, tifffile 2026.8.23 and imagecodecs 2026.8.16.
+The final execution binding must pin and report those actual versions; ordinary
+stdlib CI can exercise scalar contracts, but skipped scientific tests confer no
+acceptance. Neither fixture generation nor any oracle has been executed here.
+
+The preliminary disk figures above are superseded as an unresolved admission
+proposal: 96 GiB cannot fund a 128 GiB cap. The final coordinator must calculate
+copies + retained artifacts + largest active child + emergency reserve, and require
+that entire amount free. Approved retention direction is to independently verify
+all 22 exports of each successful timing child, retain its first measured output
+plus every sample/hash/readback receipt, and remove only other verified successful
+outputs. Retain every failure and partial artifact. All camera correctness outputs
+remain retained. Exact arithmetic and the live-free-space stop remain mandatory
+before an execution request can be admitted; no disk cleanup has run.
