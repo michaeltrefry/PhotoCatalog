@@ -241,14 +241,126 @@ class BoundedCapture:
                         eof=self.eof,reader_joined=not self.thread.is_alive(),errors=list(self.errors))
 
 
-def invoke(command, folder, limits, disk_root):
+def supervision_settings(value=None):
+    defaults=dict(max_active=MAX_ACTIVE,max_seen=MAX_SEEN,max_telemetry_bytes=MAX_TELEMETRY,
+                  max_sample_bytes=8192,max_identity_bytes=256*1024,max_identity_event_bytes=512)
+    if value is not None:
+        if set(value)!=set(defaults):
+            raise ValueError('complete explicit supervision settings required')
+        defaults=dict(value)
+    maxima=dict(max_active=8,max_seen=131072,max_telemetry_bytes=8*1024**3,
+                max_sample_bytes=8192,max_identity_bytes=128*MIB,max_identity_event_bytes=512)
+    for key,value in defaults.items():
+        if type(value) is not int or not 0<value<=maxima[key]:
+            raise ValueError('supervision admission: '+key)
+    return defaults
+
+
+def descendant_identity(process,root_key):
+    """Validate a fresh ancestry chain, not just a PID returned by enumeration."""
+    enumerated=(process.pid,process.create_time())
+    current=owned_process(enumerated)
+    if current is None:
+        return None
+    chain=[]
+    for _ in range(64):
+        key=(current.pid,current.create_time())
+        current=owned_process(key)
+        if current is None:return None
+        if key==root_key:
+            # Bind both sides of every observed edge again. Reparenting or PID
+            # reuse is uncertainty, never permission to claim the new process.
+            if not same_alive(root_key):
+                return None
+            for child_key,parent_key in chain:
+                child=owned_process(child_key)
+                parent=owned_process(parent_key)
+                if child is None or parent is None:
+                    return None
+                if child.ppid()!=parent_key[0]:
+                    raise RuntimeError('owned ancestry changed during admission')
+            return enumerated
+        parent=current.parent()
+        if parent is None:
+            raise RuntimeError('discovered process lacks current root ancestry')
+        parent_key=identity(parent)
+        chain.append((key,parent_key))
+        current=parent
+    raise RuntimeError('owned ancestry depth admission')
+
+
+class ActiveIdentities:
+    """Only unresolved identities are scanned. Terminal proofs remain on disk."""
+    def __init__(self,stream,settings):
+        self.stream=stream
+        self.settings=settings
+        self.active={}
+        self.discovered=0
+        self.retired=0
+        self.bytes=0
+
+    def event(self,key,kind,reason=None):
+        value=dict(kind=kind,pid=key[0],create_time=key[1],at=anchor())
+        if reason is not None:value['reason']=reason
+        line=(json.dumps(value,allow_nan=False,separators=(',',':'))+'\n').encode()
+        if len(line)>self.settings['max_identity_event_bytes'] or self.bytes+len(line)>self.settings['max_identity_bytes']:
+            raise RuntimeError('identity evidence byte admission exceeded')
+        if self.stream.write(line)!=len(line):
+            raise OSError('identity evidence write made no progress')
+        self.stream.flush()
+        self.bytes+=len(line)
+
+    def add(self,key):
+        if key in self.active:return
+        # Keep the just-discovered identity for cleanup even if admission or its
+        # evidence write fails. At most one overflow identity is added.
+        self.active[key]=True
+        self.discovered+=1
+        if self.discovered>self.settings['max_seen'] or len(self.active)>self.settings['max_active']:
+            raise RuntimeError('owned process-count admission exceeded')
+        self.event(key,'discovered')
+
+    def retire(self,key,reason):
+        self.event(key,'retired',reason)
+        del self.active[key]
+        self.retired+=1
+
+    def sample(self):
+        records=[]
+        for key in tuple(self.active):
+            try:
+                process=owned_process(key)
+                if process is None:
+                    self.retire(key,'absent_or_replaced')
+                    continue
+                status=process.status()
+                if status==psutil.STATUS_ZOMBIE:
+                    self.retire(key,'zombie')
+                    continue
+                memory=process.memory_info()
+                cpu=process.cpu_times()
+                # ASCII escaping makes the encoded name bound deterministic.
+                records.append(dict(pid=key[0],create_time=key[1],name=process.name()[:64],status=status,
+                                    rss=memory.rss,cpu_seconds=cpu.user+cpu.system))
+            except psutil.NoSuchProcess:
+                self.retire(key,'absent_during_sample')
+        return records
+
+
+def invoke(command, folder, limits, disk_root, *, supervision=None):
+    settings=supervision_settings(supervision)
+    timeout=limits.get('deadline_seconds')
+    if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=86400:
+        raise ValueError('positive finite at-most-24-hour owner deadline required')
     folder=Path(folder)
     folder.mkdir()
     started=anchor()
+    deadline=started["monotonic_ns"]/1e9+limits["deadline_seconds"]
     exclusive(folder/'start.json',dict(command=command,limits=limits,started=started,
-                                      stdout='stdout.log',stderr='stderr.log'))
+                                      stdout='stdout.log',stderr='stderr.log',supervision=settings))
     child=None
     known={}
+    tracker=None
     captures={}
     samples=0
     errors=[]
@@ -256,7 +368,9 @@ def invoke(command, folder, limits, disk_root):
     ownership=None
     telemetry_bytes=0
     try:
-        with (folder/'processes.jsonl').open('xb') as telemetry:
+        with (folder/'processes.jsonl').open('xb') as telemetry, (folder/'identities.jsonl').open('xb') as identities:
+            tracker=ActiveIdentities(identities,settings)
+            known=tracker.active
             child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                    bufsize=0,start_new_session=os.name=='posix',
                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name=='nt' else 0)
@@ -264,47 +378,33 @@ def invoke(command, folder, limits, disk_root):
                 captures[name]=BoundedCapture(pipe,folder/name,MAX_STDIO)
             root=psutil.Process(child.pid)
             root_key=identity(root)
-            known[root_key]=True
+            tracker.add(root_key)
             exclusive(folder/'spawn.json',dict(pid=child.pid,create_time=root_key[1],at=anchor()))
-            deadline=time.monotonic()+limits['deadline_seconds']
             while True:
                 at=anchor()
-                records=[]
+                # Retire completed work before admitting a new generation. Old
+                # numeric PIDs therefore never bloat or block active sampling.
+                tracker.sample()
                 try:
                     if same_alive(root_key):
-                        found=[root]+psutil.Process(child.pid).children(recursive=True)
-                        for process in found:
-                            key=identity(process)
-                            known[key]=True
-                            if len(known)>MAX_SEEN:
-                                raise RuntimeError('owned process-count admission exceeded')
+                        for process in psutil.Process(child.pid).children(recursive=True):
+                            key=descendant_identity(process,root_key)
+                            if key is not None:
+                                tracker.add(key)
                 except psutil.NoSuchProcess:
                     pass
-                for key in known:
-                    try:
-                        process=owned_process(key)
-                        if process is None:
-                            continue
-                        status=process.status()
-                        if status==psutil.STATUS_ZOMBIE:
-                            continue
-                        memory=process.memory_info()
-                        cpu=process.cpu_times()
-                        records.append(dict(pid=key[0],create_time=key[1],name=process.name(),status=status,
-                                            rss=memory.rss,cpu_seconds=cpu.user+cpu.system))
-                    except psutil.NoSuchProcess:
-                        pass
+                records=tracker.sample()
                 total=sum(p['rss'] for p in records)
                 peak=max(peak,total)
                 free=psutil.disk_usage(disk_root).free
-                line=(json.dumps(dict(at=at,processes=records,total_rss=total,free_bytes=free))+'\n').encode()
-                if telemetry_bytes+len(line)>MAX_TELEMETRY:
+                line=(json.dumps(dict(at=at,processes=records,total_rss=total,free_bytes=free),allow_nan=False)+'\n').encode()
+                if len(line)>settings['max_sample_bytes'] or telemetry_bytes+len(line)>settings['max_telemetry_bytes']:
                     raise RuntimeError('process telemetry byte cap exceeded')
                 telemetry.write(line)
                 telemetry.flush()
                 telemetry_bytes+=len(line)
                 samples+=1
-                if len(records)>MAX_ACTIVE:
+                if len(records)>settings['max_active']:
                     raise RuntimeError('owned process-count admission exceeded')
                 if total>limits['group_rss_bytes'] or any(p['rss']>limits['process_rss_bytes'] for p in records):
                     raise RuntimeError('sampled RSS admission exceeded')
@@ -324,6 +424,8 @@ def invoke(command, folder, limits, disk_root):
                 time.sleep(.1)
             telemetry.flush()
             os.fsync(telemetry.fileno())
+            identities.flush()
+            os.fsync(identities.fileno())
     except BaseException as exc:
         errors.append(f'{type(exc).__name__}: {exc}')
     finally:
@@ -345,11 +447,11 @@ def invoke(command, folder, limits, disk_root):
                 if name not in captures and pipe is not None:
                     pipe.close()
     artifacts={}
-    for name,limit in (('stdout.log',MAX_STDIO),('stderr.log',MAX_STDIO),('processes.jsonl',MAX_TELEMETRY)):
+    for name,limit in (('stdout.log',MAX_STDIO),('stderr.log',MAX_STDIO),('processes.jsonl',settings['max_telemetry_bytes']),('identities.jsonl',settings['max_identity_bytes'])):
         path=folder/name
         try:
             if path.exists():
-                if name=='processes.jsonl':
+                if name in ('processes.jsonl','identities.jsonl'):
                     # Flush already-written failure telemetry too; success-only
                     # fsync above does not cover interrupted sampling.
                     with path.open('r+b') as retained:
@@ -363,6 +465,8 @@ def invoke(command, folder, limits, disk_root):
     result=dict(complete=not errors and ownership is not None and ownership['known_absent'],
                 started=started,finished=anchor(),error='; '.join(errors) if errors else None,
                 ownership=ownership,captures=capture_proofs,sampled_peak_group_rss=peak,samples=samples,
+                supervision=settings,identity_counts=None if tracker is None else dict(
+                    discovered=tracker.discovered,retired=tracker.retired,cleanup_candidates=list(tracker.active)),
                 caveat='0.1 second sampled RSS/deadline guards are not hard allocation enforcement; streams retain bounded prefixes',
                 **artifacts)
     exclusive(folder/'result.json',result)
@@ -416,8 +520,9 @@ def execute(binding,root):
     results=[]
     error=None
     try:
-        with HostObservation(root):
+        with HostObservation(root,**binding['outer_owner']['host_logs']) as host:
             for action in binding['actions']:
+                if host.error is not None:raise RuntimeError('bounded host evidence failed: '+host.error)
                 folder=root/action['id']
                 kind=action['kind']
                 if kind=='probe':
@@ -445,6 +550,7 @@ def execute(binding,root):
                 if command!=action['command']:
                     raise ValueError('actual command differs from frozen argv')
                 observed=invoke(command,folder,limits,root)
+                if host.error is not None:raise RuntimeError('bounded host evidence failed: '+host.error)
                 if kind=='probe':
                     proof=read_json(expected/'receipt.json')
                     if proof.get('probe_complete') is not True:

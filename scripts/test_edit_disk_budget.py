@@ -25,5 +25,25 @@ class DiskContracts(unittest.TestCase):
         self.assertGreater(b['components']['raw'],a['components']['raw'])
         self.assertGreaterEqual(b['minimum_free_bytes'],a['minimum_free_bytes'])
 
+    def test_outer_and_host_funding_is_additive_and_exact(self):
+        value=disk.budget(manifest());outer=value['outer_owner']
+        self.assertEqual(value['components']['outer_and_host'],16*q.GIB+137*q.MIB)
+        self.assertEqual(value['components']['evidence_streams'],1074*(40*q.MIB+256*1024))
+        self.assertEqual(outer['supervision']['max_seen'],131072)
+        self.assertEqual(outer['host_logs'],dict(max_bytes=8*q.GIB,max_record_bytes=q.MIB))
+        self.assertEqual(sum(value['components'].values()),value['retained_bound_bytes'])
+
+    def test_fixed_registry_deadlines_and_child_lifetimes(self):
+        cases=disk.complete_cases(manifest())
+        self.assertEqual(sum(c['deadline_seconds'] for c in cases),367800)
+        phases={}
+        for case in cases:phases.setdefault(case['phase'],[]).append(case)
+        request_workers=sum(c['warmups']+c['repetitions'] for p in ('warm_service','first_raw','export','export_correctness') for c in phases[p])
+        setups=sum(len(phases[p]) for p in ('warm_service','first_raw','export','export_correctness','overlap_import','overlap_export'))
+        self.assertEqual((request_workers,setups),(11120,135))
+        self.assertEqual(2*len(cases)+request_workers+setups+2+1+1+86401,98726)
+        self.assertLess(864002*8192,8*q.GIB)
+        self.assertEqual(2*131072*512,128*q.MIB)
+
 if __name__=='__main__':
     unittest.main()

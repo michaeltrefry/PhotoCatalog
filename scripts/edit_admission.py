@@ -25,6 +25,16 @@ def validate_record_paths(record,root,case):
         raise ValueError('case receipt/cleanup path differs from its owned namespace')
 
 
+def validate_funding(binding,funding):
+    if not edit_aggregate.same(binding.get('funding'),funding):
+        raise ValueError('funded peak differs from complete registry')
+    for name in ('retained_bound_bytes','active_bound_bytes','copies_bound_bytes','free_reserve_bytes','minimum_free_bytes'):
+        if type(binding.get(name)) is not int or binding[name]!=funding[name]:
+            raise ValueError('top-level funding differs')
+    if not edit_aggregate.same(binding.get('outer_owner'),funding['outer_owner']):
+        raise ValueError('outer owner/host evidence admission differs')
+
+
 def validate_execution(binding):
     if not sys.flags.isolated or not sys.flags.dont_write_bytecode:
         raise ValueError('qualification coordinator requires isolated no-bytecode-write launcher')
@@ -43,9 +53,7 @@ def validate_execution(binding):
     edit_binding.verify_case_registry(binding['cases_sha256'],cases)
     if not edit_aggregate.same(binding['cases'],cases):raise ValueError('frozen case contents differ')
     funding=edit_disk_budget.budget(manifest)
-    if not edit_aggregate.same(binding['funding'],funding):raise ValueError('funded peak differs from complete registry')
-    for name in ('retained_bound_bytes','active_bound_bytes','copies_bound_bytes','free_reserve_bytes','minimum_free_bytes'):
-        if type(binding[name]) is not int or binding[name]!=funding[name]:raise ValueError('top-level funding differs')
+    validate_funding(binding,funding)
     normal=edit_qualification.plan(manifest)['normal_limits']
     if not edit_aggregate.same(binding['normal_limits'],normal):raise ValueError('normal resource profile differs')
     expected=set(edit_qualification.IDS)|set(edit_fixtures.FIXTURES)

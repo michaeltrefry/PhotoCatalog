@@ -57,7 +57,13 @@ def host_identity(output, sources):
 
 class HostObservation:
     """Every sample uses the reviewed observer: no args, environment or serials."""
-    def __init__(self, output):
+    def __init__(self, output, *, max_bytes=None, max_record_bytes=None):
+        for value in (max_bytes,max_record_bytes):
+            if value is not None and (type(value) is not int or value<=0):
+                raise ValueError('positive host evidence bounds required')
+        self.max_bytes=max_bytes
+        self.max_record_bytes=max_record_bytes
+        self.written_bytes=0
         self.output = Path(output)
         self.stop = threading.Event()
         self.error = None
@@ -68,20 +74,35 @@ class HostObservation:
         self.stream = None
 
     def write(self, value):
-        self.stream.write(json.dumps(value, allow_nan=False) + "\n")
+        # Construct at most one bounded record; never retain or silently truncate
+        # an oversized sample. Existing non-editing callers retain prior defaults.
+        encoded=bytearray()
+        for part in json.JSONEncoder(allow_nan=False).iterencode(value):
+            data=part.encode('utf-8')
+            if self.max_record_bytes is not None and len(encoded)+len(data)+1>self.max_record_bytes:
+                self.error='host record byte admission exceeded'
+                raise RuntimeError(self.error)
+            encoded.extend(data)
+        encoded.extend(b'\n')
+        if self.max_bytes is not None and self.written_bytes+len(encoded)>self.max_bytes:
+            self.error='host total byte admission exceeded'
+            raise RuntimeError(self.error)
+        self.stream.write(encoded.decode('utf-8'))
         self.stream.flush()
+        self.written_bytes+=len(encoded)
 
     def __enter__(self):
-        self.stream = (self.output / "host.jsonl").open("x", encoding="utf-8")
-        self.write({"kind": "start", **observer.stamp(), "interval_seconds": 1,
-                    "observer_sha256": sha(OBSERVER), "auxiliary_telemetry_only": True})
-        self.sampler = observer.HostSampler()
-        # A real sample is persisted before the first measured child is admitted.
+        self.stream = (self.output / "host.jsonl").open("x", encoding="utf-8", newline="\n")
         try:
+            self.write({"kind": "start", **observer.stamp(), "interval_seconds": 1,
+                        "observer_sha256": sha(OBSERVER), "auxiliary_telemetry_only": True})
+            self.sampler = observer.HostSampler()
+            # A real sample is persisted before measured work is admitted.
             self.write(self.sampler.sample())
             self.samples += 1
-        except BaseException:
-            self.stream.close()
+        except BaseException as error:
+            self.error=type(error).__name__+': '+str(error)[:256]
+            self.finish()
             raise
         self.thread = threading.Thread(target=self.collect, name="preview-host-observer", daemon=True)
         self.thread.start()
@@ -93,7 +114,7 @@ class HostObservation:
                 self.write(self.sampler.sample())
                 self.samples += 1
         except Exception as error:
-            self.error = type(error).__name__
+            self.error = type(error).__name__+': '+str(error)[:256]
 
     def finish(self):
         if self.finished is not None:
@@ -103,21 +124,30 @@ class HostObservation:
             self.thread.join(timeout=10)
             if self.thread.is_alive():
                 raise RuntimeError("host observation failed to stop; campaign is incomplete")
-        self.write({"kind": "final", **observer.stamp(), "samples": self.samples,
-                    "error": self.error, "elapsed_seconds": time.monotonic() - self.started})
-        self.stream.flush()
-        os.fsync(self.stream.fileno())
-        self.stream.close()
+        try:
+            self.write({"kind": "final", **observer.stamp(), "samples": self.samples,
+                        "error": self.error, "elapsed_seconds": time.monotonic() - self.started})
+        except Exception as error:
+            self.error=self.error or type(error).__name__+': '+str(error)[:256]
+        try:
+            self.stream.flush()
+            os.fsync(self.stream.fileno())
+        finally:
+            self.stream.close()
         self.finished = {"complete": self.error is None and self.samples > 0,
                          "samples": self.samples, "error": self.error,
                          "sha256": sha(self.output / "host.jsonl"),
+                         "bytes":self.written_bytes,"max_bytes":self.max_bytes,
+                         "max_record_bytes":self.max_record_bytes,
                          "observer_sha256": sha(OBSERVER), "binding_sha256": sha(__file__),
                          "quietness": "not evaluated; unavailable fields never mean idle"}
-        with (self.output / "host-receipt.json").open("x", encoding="utf-8") as stream:
+        with (self.output / "host-receipt.json").open("x", encoding="utf-8", newline="\n") as stream:
             json.dump(self.finished, stream, indent=2, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
         return self.finished
 
     def __exit__(self, *_args):
-        self.finish()
+        result=self.finish()
+        if (self.max_bytes is not None or self.max_record_bytes is not None) and not result['complete']:
+            raise RuntimeError('bounded host evidence incomplete; failure retained')

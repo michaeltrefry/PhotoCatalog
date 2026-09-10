@@ -26,5 +26,27 @@ class HostBindingTests(unittest.TestCase):
                     self.fail('overwrote host evidence')
 
 
+    def test_oversized_initial_host_sample_is_not_written_and_retains_failure(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(preview_host.observer.HostSampler,'sample',return_value={'payload':'x'*4096}):
+            with self.assertRaisesRegex(RuntimeError,'record byte'):
+                with preview_host.HostObservation(root,max_bytes=2048,max_record_bytes=1024):pass
+            result=json.loads((Path(root)/'host-receipt.json').read_text())
+            self.assertFalse(result['complete'])
+            self.assertLessEqual((Path(root)/'host.jsonl').stat().st_size,2048)
+            self.assertNotIn('x'*1024,(Path(root)/'host.jsonl').read_text())
+
+    def test_host_total_cap_retains_failure_and_never_truncates_records(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(preview_host.observer.HostSampler,'sample',return_value={'kind':'sample'}):
+            observation=preview_host.HostObservation(root,max_bytes=1024,max_record_bytes=1024)
+            observation.__enter__()
+            try:
+                with self.assertRaisesRegex(RuntimeError,'total byte'):
+                    observation.write({'payload':'x'*900})
+            finally:result=observation.finish()
+            self.assertFalse(result['complete'])
+            data=(Path(root)/'host.jsonl').read_bytes()
+            self.assertLessEqual(len(data),1024)
+            for line in data.splitlines():json.loads(line)
+
 if __name__ == '__main__':
     unittest.main()

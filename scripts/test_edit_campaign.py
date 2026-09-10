@@ -218,5 +218,111 @@ class ActualChildSupervisorContracts(unittest.TestCase):
                 self.assertTrue(proof['eof'] and proof['reader_joined'])
                 self.assertEqual(proof['errors'],[])
 
+
+class ActiveTrackingContracts(unittest.TestCase):
+    def tracker(self,**changes):
+        import io
+        settings=campaign.supervision_settings()
+        settings.update(changes)
+        return campaign.ActiveIdentities(io.BytesIO(),settings)
+
+    def test_retired_lifetimes_do_not_increase_tick_work_and_pid_reuse_is_distinct(self):
+        tracker=self.tracker(max_seen=2000,max_identity_bytes=2*campaign.MIB)
+        with patch.object(campaign,'owned_process',return_value=None) as lookup:
+            for generation in range(1000):
+                tracker.add((42,float(generation)))
+                self.assertEqual(tracker.sample(),[])
+                self.assertEqual(len(tracker.active),0)
+            self.assertEqual(lookup.call_count,1000)
+        rows=[json.loads(line) for line in tracker.stream.getvalue().splitlines()]
+        self.assertEqual((tracker.discovered,tracker.retired,len(rows)),(1000,1000,2000))
+        self.assertEqual(len({r['create_time'] for r in rows}),1000)
+        self.assertEqual([r['kind'] for r in rows],['discovered','retired']*1000)
+
+    def test_unknown_and_evidence_write_failure_do_not_retire_cleanup_authority(self):
+        tracker=self.tracker();key=(42,10.0);tracker.add(key)
+        with patch.object(campaign,'owned_process',side_effect=campaign.psutil.AccessDenied(42)):
+            with self.assertRaises(campaign.psutil.AccessDenied):tracker.sample()
+        self.assertIn(key,tracker.active)
+        with patch.object(tracker.stream,'write',side_effect=OSError('disk full')):
+            with patch.object(campaign,'owned_process',return_value=None):
+                with self.assertRaises(OSError):tracker.sample()
+        self.assertIn(key,tracker.active)
+
+    def test_count_and_ledger_caps_keep_overflow_identity_for_cleanup(self):
+        for settings in (dict(max_seen=1),dict(max_identity_bytes=1)):
+            tracker=self.tracker(**settings)
+            if settings.get('max_seen')==1:tracker.add((1,1.0))
+            with self.assertRaisesRegex(RuntimeError,'admission'):tracker.add((2,2.0))
+            self.assertIn((2,2.0),tracker.active)
+            self.assertLessEqual(len(tracker.stream.getvalue()),tracker.settings['max_identity_bytes'])
+
+    def test_stale_enumeration_never_admits_foreign_reused_pid(self):
+        from unittest.mock import Mock
+        stale=Mock(pid=42);stale.create_time.return_value=10.0
+        with patch.object(campaign,'owned_process',return_value=None):
+            self.assertIsNone(campaign.descendant_identity(stale,(1,1.0)))
+        foreign=Mock(pid=42);foreign.create_time.return_value=11.0;foreign.parent.return_value=None
+        with patch.object(campaign,'owned_process',return_value=foreign):
+            with self.assertRaisesRegex(RuntimeError,'ancestry'):
+                campaign.descendant_identity(foreign,(1,1.0))
+
+    def test_outer_limits_explicit_and_inner_defaults_preserved(self):
+        from edit_disk_budget import outer_owner
+        default=campaign.supervision_settings()
+        self.assertEqual((default['max_active'],default['max_seen'],default['max_telemetry_bytes']),(4,256,32*campaign.MIB))
+        outer=outer_owner();self.assertEqual(outer['deadline_seconds'],86400)
+        self.assertEqual(campaign.supervision_settings(outer['supervision']),outer['supervision'])
+        for key in outer['supervision']:
+            for invalid in (0,True,float('nan'),outer['supervision'][key]+1):
+                value=dict(outer['supervision'],**{key:invalid})
+                with self.assertRaises(ValueError):campaign.supervision_settings(value)
+
+
+class ActualOuterTrackingContracts(unittest.TestCase):
+    invoke=ActualChildSupervisorContracts.invoke
+    def test_identity_disk_failure_reaps_actual_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            result,_=self.invoke(root,'import time; time.sleep(30)',expect_failure=True,patches=(
+                patch.object(campaign.ActiveIdentities,'event',side_effect=OSError('identity disk fault')),))
+            self.assertIn('identity disk fault',result['error'])
+            self.assertTrue(result['ownership']['root_reaped'])
+            self.assertEqual(len(result['identity_counts']['cleanup_candidates']),1)
+
+    def test_sequential_actual_children_record_retirements(self):
+        with tempfile.TemporaryDirectory() as root:
+            code='import subprocess,sys; [subprocess.run([sys.executable,"-c","import time; time.sleep(.16)"],check=True) for _ in range(4)]'
+            result,folder=self.invoke(root,code,expect_failure=False)
+            events=[json.loads(line) for line in (folder/'identities.jsonl').read_text().splitlines()]
+            births=[r for r in events if r['kind']=='discovered']
+            self.assertGreaterEqual(len(births),3,'controlled long-lived children were not observed')
+            self.assertGreaterEqual(result['identity_counts']['retired'],2)
+            self.assertEqual(result['identities.jsonl']['sha256'],hashlib.sha256((folder/'identities.jsonl').read_bytes()).hexdigest())
+
+    @unittest.skipUnless(os.name=='posix','orphan process fixture uses POSIX')
+    def test_known_orphan_is_reaped_after_root_exit(self):
+        with tempfile.TemporaryDirectory() as root:
+            code='import subprocess,sys,time; subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"]); time.sleep(.5)'
+            result,_=self.invoke(root,code,expect_failure=True)
+            self.assertIn('known unreaped descendant',result['error'])
+            self.assertTrue(result['ownership']['known_absent'])
+
+    def test_telemetry_cap_failure_retains_root_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            result,folder=self.invoke(root,'import time; time.sleep(30)',expect_failure=True,
+                                     patches=(patch.object(campaign,'MAX_TELEMETRY',1),))
+            self.assertIn('telemetry byte cap',result['error'])
+            self.assertLessEqual((folder/'processes.jsonl').stat().st_size,1)
+
+    def test_deadline_covers_root_inline_work_without_any_native_child(self):
+        original=campaign.anchor
+        def expired():
+            value=original();value['monotonic_ns']-=11_000_000_000;return value
+        with tempfile.TemporaryDirectory() as root:
+            result,_=self.invoke(root,'import time; time.sleep(30)',expect_failure=True,
+                                patches=(patch.object(campaign,'anchor',side_effect=expired),))
+            self.assertIn('deadline exceeded',result['error'])
+            self.assertTrue(result['ownership']['root_reaped'])
+
 if __name__=='__main__':
     unittest.main()
