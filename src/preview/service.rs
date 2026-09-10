@@ -1304,6 +1304,13 @@ impl PreviewService {
     pub fn native_work_drained(&self) -> bool {
         self.active.is_empty() && self.scheduler.usage().reserved_bytes == 0
     }
+    /// Bounded by configured workers. These are owned, not-yet-reaped process
+    /// IDs; callers must observe OS liveness separately and account for PID reuse.
+    pub fn active_worker_pids(&self) -> Vec<u32> {
+        let mut pids: Vec<_> = self.active.values().map(|job| job.worker.pid()).collect();
+        pids.sort_unstable();
+        pids
+    }
     pub fn scheduler_usage(&self) -> SchedulerUsage {
         self.scheduler.usage()
     }
