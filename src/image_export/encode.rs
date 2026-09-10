@@ -229,7 +229,7 @@ fn jpeg_headers(metadata: &ResolvedExportMetadata) -> Result<Vec<u8>, RenderErro
     let mut headers = Vec::new();
     if let Some(x) = &metadata.xmp {
         let x = x.parse::<xmp_toolkit::XmpMeta>().map_err(codec)?;
-        let (standard, extended, digest) = x.package_for_jpeg().map_err(codec)?;
+        let (standard, extended, digest) = package_jpeg_xmp(&x)?;
         let mut app = |payload: &[u8]| -> Result<(), RenderError> {
             if payload.len() > 65533 {
                 return Err(RenderError::InvalidMetadata(
@@ -264,6 +264,50 @@ fn jpeg_headers(metadata: &ResolvedExportMetadata) -> Result<Vec<u8>, RenderErro
         }
     }
     Ok(headers)
+}
+
+fn package_jpeg_xmp(
+    original: &xmp_toolkit::XmpMeta,
+) -> Result<(String, String, String), RenderError> {
+    let (standard, extended, digest) = original.package_for_jpeg().map_err(codec)?;
+    if extended.is_empty() || original.name().is_empty() {
+        return Ok((standard, extended, digest));
+    }
+    // Adobe PackageForJPEG moves properties into a new extended object but does
+    // not copy its RDF subject. Preserve that identity before hashing the actual
+    // extension bytes; the standard link and every chunk must use this digest.
+    let mut main = standard.parse::<xmp_toolkit::XmpMeta>().map_err(codec)?;
+    let mut extension = extended.parse::<xmp_toolkit::XmpMeta>().map_err(codec)?;
+    let subject = original.name();
+    if main.name() != subject || (!extension.name().is_empty() && extension.name() != subject) {
+        return Err(RenderError::InvalidMetadata(
+            "JPEG packaging changed RDF subject".into(),
+        ));
+    }
+    extension.set_name(&subject).map_err(codec)?;
+    let options = xmp_toolkit::ToStringOptions::default()
+        .use_compact_format()
+        .omit_all_formatting();
+    let extended = extension
+        .to_string_with_options(options.omit_packet_wrapper())
+        .map_err(codec)?;
+    let digest = format!("{:X}", md5::compute(extended.as_bytes()));
+    main.set_property(
+        "http://ns.adobe.com/xmp/note/",
+        "HasExtendedXMP",
+        &xmp_toolkit::XmpValue::new(digest.clone()),
+    )
+    .map_err(codec)?;
+    let standard = main
+        .to_string_with_options(
+            xmp_toolkit::ToStringOptions::default()
+                .use_compact_format()
+                .omit_all_formatting()
+                .set_padding(1),
+        )
+        .map_err(codec)?;
+    // jpeg_headers enforces the APP1 size after serialization, including prefix.
+    Ok((standard, extended, digest))
 }
 /// Insert XMP only after verifying the encoder's SOI, without buffering its file.
 struct JpegMux<W> {

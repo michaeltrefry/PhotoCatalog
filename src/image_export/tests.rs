@@ -194,6 +194,96 @@ fn jpeg_extended_xmp_preserves_full_selected_packet_and_composites() {
     assert!(joined.contains("retained"));
 }
 #[test]
+fn jpeg_named_subject_extended_xmp_roundtrips_through_catalog_without_semantic_loss() {
+    let large = "opaque 雪 &amp; value ".repeat(8000);
+    let selected = format!(
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="urn:photocatalog:selected:subject" xmlns:q="https://example.invalid/opaque/">
+<q:payload>{large}</q:payload>
+<q:qualified rdf:parseType="Resource"><rdf:value xml:lang="en">retained</rdf:value><q:confidence>exact</q:confidence></q:qualified>
+<q:structure rdf:parseType="Resource"><q:child rdf:parseType="Resource"><rdf:value>value</rdf:value><q:flag>yes</q:flag></q:child></q:structure>
+<q:ordered><rdf:Seq><rdf:li>one</rdf:li><rdf:li>two</rdf:li></rdf:Seq></q:ordered>
+<q:localized><rdf:Alt><rdf:li xml:lang="x-default">original</rdf:li><rdf:li xml:lang="fr">préservé</rdf:li></rdf:Alt></q:localized>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+    );
+    let mut metadata = metadata();
+    metadata.xmp = Some(selected.clone());
+    let spec = OutputSpec {
+        format: OutputFormat::Jpeg { quality: 95 },
+        alpha: AlphaPolicy::Composite {
+            linear_rgb: [1.; 3],
+        },
+        profile: OutputProfile::Srgb,
+        size: OutputSize::Original,
+    };
+    let (encoded, _) = bytes(&image(), &spec, &metadata);
+    let temp = tempfile::tempdir().unwrap();
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    let path = originals.join("export.jpg");
+    std::fs::write(&path, &encoded).unwrap();
+    let inspection = crate::xmp_packets::inspect(&path, &Default::default()).unwrap();
+    assert_eq!(inspection.status, crate::xmp_packets::Status::Complete);
+    let main = inspection
+        .parse_inputs
+        .iter()
+        .find(|p| {
+            p.packet_indices.iter().any(|i| {
+                inspection.packets[*i].container == crate::xmp_packets::Container::JpegMain
+            })
+        })
+        .unwrap();
+    let extension = inspection
+        .parse_inputs
+        .iter()
+        .find(|p| {
+            p.transformation == crate::xmp_packets::Transformation::JpegExtendedReassembled
+        })
+        .unwrap();
+    assert!(extension.bytes.len() > 65535);
+    let main_meta = crate::xmp::parse(&main.bytes).unwrap();
+    let mut extension_meta = crate::xmp::parse(&extension.bytes).unwrap();
+    assert_eq!(main_meta.name(), "urn:photocatalog:selected:subject");
+    assert_eq!(extension_meta.name(), main_meta.name());
+    assert_eq!(
+        main_meta
+            .property("http://ns.adobe.com/xmp/note/", "HasExtendedXMP")
+            .unwrap()
+            .value,
+        format!("{:X}", md5::compute(&extension.bytes))
+    );
+    let merged = crate::xmp::merge_jpeg(&main.bytes, &extension.bytes).unwrap();
+    crate::xmp_rdf::assert_equivalent(&selected, std::str::from_utf8(&merged).unwrap()).unwrap();
+
+    // Actual import must expose exactly one valid full base, not two fragments
+    // whose concatenated strings merely contain the requested values.
+    let mut catalog = crate::Catalog::open(temp.path().join("catalog")).unwrap();
+    assert_eq!(
+        catalog.import(&originals, None, |_| Ok(())).unwrap().imported,
+        1
+    );
+    let asset = catalog.browse(0, 1).unwrap().remove(0);
+    let history = catalog.metadata_history(&asset.id, 0, 100).unwrap();
+    let valid = history
+        .iter()
+        .flat_map(|o| &o.models)
+        .filter(|m| m.error.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(valid.len(), 1);
+    let restored = catalog.metadata_model(&asset.id, valid[0].id).unwrap();
+    crate::xmp_rdf::assert_equivalent(&selected, std::str::from_utf8(&restored).unwrap()).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), encoded);
+
+    // A genuine conflicting subject remains a hard error, even with valid XML.
+    extension_meta
+        .set_name("urn:photocatalog:another:subject")
+        .unwrap();
+    let tampered = extension_meta
+        .to_string_with_options(xmp_toolkit::ToStringOptions::default().omit_packet_wrapper())
+        .unwrap();
+    let error = crate::xmp::merge_jpeg(&main.bytes, tampered.as_bytes()).unwrap_err();
+    assert!(error.to_string().contains("RDF subjects differ"));
+}
+#[test]
 fn output_description_is_deterministic_and_rejects_unsafe_choices() {
     let i = image();
     let s = spec(OutputFormat::Tiff {
