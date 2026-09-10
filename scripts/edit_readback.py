@@ -521,7 +521,9 @@ def read(path, max_pixels=32_000_000, *, max_encoded_bytes=ENCODED_LIMIT,
             if scalar(262)!=2 or scalar(284,1)!=1 or width*height*samples*(bits[0]//8)>max_decoded_bytes:
                 raise ValueError('TIFF RGB/layout/allocation admission')
             stream.seek(0)
-            with tifffile.TiffFile(stream) as tf:
+            # fdopen exposes an integer .name. Supply a display name while the
+            # codec continues reading the same held descriptor, never reopening.
+            with tifffile.TiffFile(stream,name=path.name) as tf:
                 page=tf.pages[0]
                 if tuple(page.shape)!=(height,width,samples) or page.dtype.itemsize!=bits[0]//8:
                     raise ValueError('TIFF independent descriptor mismatch')

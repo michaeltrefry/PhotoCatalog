@@ -150,6 +150,21 @@ class NumericContracts(unittest.TestCase):
         try:cls.np=ref.np_module()
         except ImportError:raise unittest.SkipTest('scientific environment unavailable; not acceptance')
 
+    def test_tiff_reads_held_descriptor_at_each_supported_precision(self):
+        import tifffile
+        np=self.np
+        for dtype in (np.uint8,np.uint16,np.float32):
+            with self.subTest(dtype=dtype),tempfile.TemporaryDirectory() as root:
+                path=Path(root)/'output.tiff'
+                expected=np.arange(24,dtype=dtype).reshape(2,3,4)
+                tifffile.imwrite(path,expected,photometric='rgb',extrasamples='unassalpha',metadata=None)
+                before=path.read_bytes()
+                actual,info=rb.read(path,max_pixels=6,max_decoded_bytes=expected.nbytes)
+                np.testing.assert_array_equal(actual,expected)
+                self.assertEqual(actual.dtype,expected.dtype)
+                self.assertEqual(info['metadata']['bits'],expected.dtype.itemsize*8)
+                self.assertEqual(path.read_bytes(),before)
+
     def test_expected_nonfinite_cannot_pass_reference_comparison(self):
         np=self.np
         for invalid in (float('nan'),float('inf'),-float('inf')):
