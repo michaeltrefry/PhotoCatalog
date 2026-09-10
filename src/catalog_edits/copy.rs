@@ -193,51 +193,6 @@ impl Catalog {
                 .into_iter()
                 .next()
                 .context("copy item missing")?;
-            let exists: bool = if item.target.key.variant_id == MASTER {
-                self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
-                    [&item.target.key.asset_id],
-                    |r| r.get(0),
-                )?
-            } else {
-                self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM edit_variants WHERE asset_id=?1 AND id=?2)",
-                    params![item.target.key.asset_id, item.target.key.variant_id],
-                    |r| r.get(0),
-                )?
-            };
-            let prepared: std::result::Result<(Vec<u8>, String), (&str, String)> = if !exists {
-                Err(("incompatible", "asset or variant unavailable".into()))
-            } else {
-                let target = self.edit_variant(&item.target.key)?;
-                if target.revision != item.target.expected_revision {
-                    Err(("conflict", "edit revision changed".into()))
-                } else {
-                    match target.recipe.copy_groups_from(&recipe, &groups) {
-                        Err(error) => Err(("incompatible", error.to_string())),
-                        Ok(merged) => {
-                            let dimensions =
-                                self.get(&item.target.key.asset_id)?.metadata.map(|m| {
-                                    if (5..=8).contains(&m.orientation) {
-                                        (m.height, m.width)
-                                    } else {
-                                        (m.width, m.height)
-                                    }
-                                });
-                            let checked = dimensions
-                                .map(|(w, h)| merged.validate_dimensions(w, h))
-                                .transpose();
-                            match checked {
-                                Err(error) => Err(("incompatible", error.to_string())),
-                                Ok(_) => Ok((
-                                    merged.canonical_bytes().to_vec(),
-                                    merged.digest().to_owned(),
-                                )),
-                            }
-                        }
-                    }
-                }
-            };
             let _write = self.writers.enter(Priority::Foreground)?;
             let tx = self
                 .db
@@ -255,6 +210,44 @@ impl Catalog {
                 tx.commit()?;
                 continue;
             }
+            let exists: bool = if item.target.key.variant_id == MASTER {
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
+                    [&item.target.key.asset_id],
+                    |r| r.get(0),
+                )?
+            } else {
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM edit_variants WHERE asset_id=?1 AND id=?2)",
+                    params![item.target.key.asset_id, item.target.key.variant_id],
+                    |r| r.get(0),
+                )?
+            };
+            let prepared: std::result::Result<(Vec<u8>, String), (&str, String)> = if !exists {
+                Err(("incompatible", "asset or variant unavailable".into()))
+            } else {
+                let target = view(&tx, &item.target.key)?;
+                if target.revision != item.target.expected_revision {
+                    Err(("conflict", "edit revision changed".into()))
+                } else {
+                    match target.recipe.copy_groups_from(&recipe, &groups) {
+                        Err(error) => Err(("incompatible", error.to_string())),
+                        Ok(merged) => {
+                            let dimensions = known_dimensions(&tx, &item.target.key.asset_id)?;
+                            let checked = dimensions
+                                .map(|(w, h)| merged.validate_dimensions(w, h))
+                                .transpose();
+                            match checked {
+                                Err(error) => Err(("incompatible", error.to_string())),
+                                Ok(_) => Ok((
+                                    merged.canonical_bytes().to_vec(),
+                                    merged.digest().to_owned(),
+                                )),
+                            }
+                        }
+                    }
+                }
+            };
             let result = match prepared {
                 Ok((bytes, digest)) => {
                     let current = view(&tx, &item.target.key)?;

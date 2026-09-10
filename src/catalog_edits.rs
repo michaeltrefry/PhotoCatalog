@@ -168,6 +168,25 @@ fn asset_exists(db: &Connection, asset: &str) -> Result<()> {
     Ok(())
 }
 
+fn known_dimensions(db: &Connection, asset: &str) -> Result<Option<(u32, u32)>> {
+    let raw: Option<String> =
+        db.query_row("SELECT metadata FROM assets WHERE id=?1", [asset], |r| {
+            r.get(0)
+        })?;
+    let Some(raw) = raw else { return Ok(None) };
+    ensure!(raw.len() <= 1024 * 1024, "asset metadata document limit");
+    let metadata: crate::media::Metadata = serde_json::from_str(&raw)?;
+    ensure!(
+        (1..=8).contains(&metadata.orientation),
+        "invalid source orientation"
+    );
+    Ok(Some(if (5..=8).contains(&metadata.orientation) {
+        (metadata.height, metadata.width)
+    } else {
+        (metadata.width, metadata.height)
+    }))
+}
+
 fn view(db: &Connection, key: &VariantKey) -> Result<VariantView> {
     let Some(value) = stored(db, key)? else {
         ensure!(key.variant_id == MASTER, "variant does not exist");
@@ -374,6 +393,9 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((width, height)) = known_dimensions(&tx, &key.asset_id)? {
+            recipe.validate()?.validate_dimensions(width, height)?;
+        }
         let result = save(
             &tx,
             key,

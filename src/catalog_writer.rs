@@ -112,6 +112,67 @@ mod tests {
             provenance: serde_json::json!({"test":true}),
         }
     }
+
+    #[test]
+    fn edit_copy_validates_current_dimensions_after_waiting_for_writer() -> Result<()> {
+        use crate::{
+            catalog_edits::{EditTarget, VariantKey},
+            edit::{AdjustmentGroup, NormalizedRect, Recipe, RecipeV1},
+        };
+        for (before, after, expected) in [(1000, 2, "incompatible"), (2, 1000, "applied")] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("catalog");
+            let mut catalog = Catalog::open(&root)?;
+            let metadata = |size| {
+                serde_json::json!({"format":"PNG","width":size,"height":size,"orientation":1,"camera_make":null,"camera_model":null,"captured_at":null,"preview_source":"fixture"}).to_string()
+            };
+            for (asset, size) in [("source", 1000), ("target", before)] {
+                catalog.db.execute("INSERT INTO assets(id,location,path_display,state,metadata) VALUES(?1,?2,?1,'pending',?3)",params![asset,asset.as_bytes(),metadata(size)])?;
+            }
+            let source = VariantKey::master("source");
+            let target = VariantKey::master("target");
+            let recipe = Recipe::V1(RecipeV1 {
+                crop: Some(NormalizedRect {
+                    left: 0.1,
+                    top: 0.0,
+                    right: 0.11,
+                    bottom: 1.0,
+                }),
+                ..RecipeV1::default()
+            });
+            catalog.save_edit_recipe(&source, 0, &recipe)?;
+            let job = catalog.begin_edit_copy(&source, 1, &[AdjustmentGroup::Geometry])?;
+            catalog.append_edit_copy(
+                &job.id,
+                0,
+                &[EditTarget {
+                    key: target.clone(),
+                    expected_revision: 0,
+                }],
+            )?;
+            catalog.seal_edit_copy(&job.id, 1)?;
+            let gate = catalog.writers.clone();
+            let held = gate.enter(Priority::Background)?;
+            let job_id = job.id.clone();
+            let worker = thread::spawn(move || -> Result<()> {
+                let mut other = Catalog::open(root)?;
+                other.apply_edit_copy_step(&job_id, 1)?;
+                Ok(())
+            });
+            queued(&gate, 1, 0);
+            // Model the import transaction holding this writer permit: its new
+            // dimensions become authoritative before the waiting copy is admitted.
+            catalog.db.execute("UPDATE assets SET metadata=?1,render_generation=render_generation+1 WHERE id='target'",[metadata(after)])?;
+            drop(held);
+            worker.join().expect("copy worker panicked")?;
+            assert_eq!(catalog.edit_copy_items(&job.id, 0, 1)?[0].state, expected);
+            assert_eq!(
+                catalog.edit_variant(&target)?.revision,
+                i64::from(expected == "applied")
+            );
+        }
+        Ok(())
+    }
     fn fixture() -> Result<(tempfile::TempDir, Catalog, PathBuf)> {
         let temp = tempfile::tempdir()?;
         let mut cat = Catalog::open(temp.path().join("catalog"))?;

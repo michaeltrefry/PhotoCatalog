@@ -204,6 +204,15 @@ fn incompatible_crop_and_cancellation_are_explicit() -> Result<()> {
         ..RecipeV1::default()
     });
     catalog.save_edit_recipe(&source, 0, &recipe)?;
+    assert!(
+        catalog
+            .save_edit_recipe(&VariantKey::master("tiny"), 0, &recipe)
+            .is_err()
+    );
+    assert_eq!(
+        catalog.edit_variant(&VariantKey::master("tiny"))?.revision,
+        0
+    );
     let job = catalog.begin_edit_copy(&source, 1, &[AdjustmentGroup::Geometry])?;
     catalog.append_edit_copy(
         &job.id,
