@@ -133,3 +133,29 @@ Local delivery gates also passed: 377 native tests across 34 suites, three
 intentional ignored fixtures; 122 Python contracts; strict all-target Clippy;
 package formatting; debug and release builds. Applicable PR and merged-main CI
 on Linux, macOS and Windows are still required before sc-22843 closes.
+
+## Subsequent platform corrections
+
+The first PR #9 CI run, `34532778141`, passed macOS and benchmark contracts but
+exposed Linux recovery ownership and Windows source-change detection defects.
+Linux could reuse a deleted payload's historical inode for a foreign destination;
+recovery now requires a verified live payload and matching full destination
+identity. Missing or damaged payloads still permit restoration of the captured
+original. Windows now holds write exclusion through source verification/use and
+checks a bounded source digest in the admitted preview worker before reusing
+prepared pixels. Foreground cache lookup selects candidates using metadata only.
+Legacy Windows cache records without a digest miss safely. Windows durability
+flushes run before reacquiring final proofs, outside catalog writer authority.
+
+These corrections were integrated at `6147307`. The frozen campaign and its
+binaries above remain unchanged. Pixel operations, encoders and the Mac
+`SourceInstance` serialized fields are unchanged; the new bounded recovery reads
+occur on restoration or failure paths. Windows worker-side hashing adds source-read cost, which this
+Mac campaign does not measure. Focused corrective checks and hosted platform CI
+provide separate evidence; the old measurements are not measurements of a rebuilt
+binary.
+
+Renderer keys include source-file identities, so this code update invalidates old
+edited-preview cache keys on every platform. The first request can rebuild its
+preview; the table above describes the frozen campaign's declared warm and first
+decode cases, not cache survival across an application upgrade.
