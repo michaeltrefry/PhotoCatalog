@@ -1,8 +1,14 @@
+#[path = "prepared.rs"]
+mod prepared;
 use super::{
     CancelCheck, RecipeError, RenderError, RenderLimits, ValidatedRecipe, WhiteBalance, color,
     detail, geometry,
 };
 use crate::media::{DecodeLimits, RenderedImage};
+pub use prepared::{
+    PreparedProxyExpectation, PreparedProxyIdentity, PreparedProxyReceipt, read_prepared_proxy,
+    write_prepared_proxy,
+};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Read, path::Path, sync::OnceLock};
 
@@ -83,6 +89,7 @@ pub fn renderer_identity() -> &'static str {
             include_bytes!("color.rs").as_slice(),
             include_bytes!("geometry.rs").as_slice(),
             include_bytes!("detail.rs").as_slice(),
+            include_bytes!("prepared.rs").as_slice(),
             crate::preview::renderer_identity().as_bytes(),
         ] {
             h.update(bytes);

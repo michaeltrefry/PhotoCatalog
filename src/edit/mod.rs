@@ -143,3 +143,8 @@ pub(crate) fn buffer(count: usize, limits: RenderLimits) -> Result<Vec<[f32; 4]>
 }
 #[cfg(test)]
 pub(crate) use render::fixture;
+
+pub use render::{
+    PreparedProxyExpectation, PreparedProxyIdentity, PreparedProxyReceipt, read_prepared_proxy,
+    write_prepared_proxy,
+};
