@@ -547,6 +547,35 @@ pub fn decode_with_white_point(
             if format == image::ImageFormat::Png && icc.is_none() {
                 icc = png_profile(&bytes)?;
             }
+            if format == image::ImageFormat::Tiff && icc.is_none() {
+                // image 0.25.9 uses Unknown(34675), which does not match the
+                // recognized IccProfile key in tiff 0.10.3. Read that tag directly
+                // until the image decoder is upgraded; a malformed tag is not sRGB.
+                let tag_error = |err: tiff::TiffError| {
+                    error(
+                        if matches!(err, tiff::TiffError::LimitsExceeded) {
+                            DecodeStatus::ResourceLimit
+                        } else {
+                            DecodeStatus::Corrupt
+                        },
+                        err,
+                    )
+                };
+                let mut tag_limits = tiff::decoder::Limits::default();
+                tag_limits.decoding_buffer_size = tag_limits
+                    .decoding_buffer_size
+                    .min(usize::try_from(limits.max_allocation_bytes).unwrap_or(usize::MAX));
+                tag_limits.ifd_value_size = 16 * 1024 * 1024;
+                let mut tags = tiff::decoder::Decoder::new(Cursor::new(&bytes))
+                    .map_err(tag_error)?
+                    .with_limits(tag_limits);
+                icc = tags
+                    .find_tag(tiff::tags::Tag::IccProfile)
+                    .map_err(tag_error)?
+                    .map(|value| value.into_u8_vec())
+                    .transpose()
+                    .map_err(tag_error)?;
+            }
             let orientation = exif_orientation
                 .unwrap_or(decoder.orientation().map_err(image_error)?.to_exif() as u32);
             let color = decoder.original_color_type();
