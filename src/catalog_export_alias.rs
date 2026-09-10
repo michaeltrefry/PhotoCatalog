@@ -19,6 +19,8 @@ use std::{fs, path::Path};
 // Derived rows reference assets: REPLACE may skip binding DELETE triggers when
 // recursive_triggers is OFF. Keeping the old dirty/projection row lets INSERT
 // distinguish replacement from first binding, and marks the projection stale.
+// Conditional insertion also survives an outer UPSERT/OR conflict policy: its
+// UPDATE arm can override a trigger's OR IGNORE when a binding is already dirty.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE export_alias_state(id INTEGER PRIMARY KEY CHECK(id=1),unbound INTEGER NOT NULL CHECK(unbound>=0));
 INSERT INTO export_alias_state SELECT 1,COUNT(*) FROM assets a LEFT JOIN storage_bindings b ON b.asset_id=a.id WHERE b.asset_id IS NULL;
@@ -35,12 +37,12 @@ CREATE TABLE export_alias_dirty(asset_id TEXT PRIMARY KEY REFERENCES assets(id) 
 INSERT INTO export_alias_dirty SELECT asset_id FROM storage_bindings;
 CREATE TRIGGER export_alias_binding_added AFTER INSERT ON storage_bindings BEGIN
 UPDATE export_alias_state SET unbound=unbound-(NOT EXISTS(SELECT 1 FROM export_alias_dirty WHERE asset_id=new.asset_id) AND NOT EXISTS(SELECT 1 FROM export_alias_paths WHERE asset_id=new.asset_id)) WHERE id=1;
-INSERT OR IGNORE INTO export_alias_dirty VALUES(new.asset_id); END;
+INSERT INTO export_alias_dirty SELECT new.asset_id WHERE NOT EXISTS(SELECT 1 FROM export_alias_dirty WHERE asset_id=new.asset_id); END;
 CREATE TRIGGER export_alias_binding_removed AFTER DELETE ON storage_bindings WHEN EXISTS(SELECT 1 FROM assets WHERE id=old.asset_id) BEGIN
 UPDATE export_alias_state SET unbound=unbound+1 WHERE id=1;
 DELETE FROM export_alias_paths WHERE asset_id=old.asset_id;
 DELETE FROM export_alias_dirty WHERE asset_id=old.asset_id; END;
-CREATE TRIGGER export_alias_binding_changed AFTER UPDATE OF native_path ON storage_bindings WHEN old.native_path!=new.native_path BEGIN INSERT OR IGNORE INTO export_alias_dirty VALUES(new.asset_id); END;
+CREATE TRIGGER export_alias_binding_changed AFTER UPDATE OF native_path ON storage_bindings WHEN old.native_path!=new.native_path BEGIN INSERT INTO export_alias_dirty SELECT new.asset_id WHERE NOT EXISTS(SELECT 1 FROM export_alias_dirty WHERE asset_id=new.asset_id); END;
 CREATE TRIGGER export_alias_path_added AFTER INSERT ON export_alias_paths BEGIN UPDATE export_alias_directories SET members=members+1 WHERE id=new.parent; END;
 CREATE TRIGGER export_alias_path_deleted AFTER DELETE ON export_alias_paths BEGIN UPDATE export_alias_directories SET members=members-1 WHERE id=old.parent; END;
 CREATE TRIGGER export_alias_path_parent AFTER UPDATE OF parent ON export_alias_paths WHEN old.parent!=new.parent BEGIN UPDATE export_alias_directories SET members=members-1 WHERE id=old.parent; UPDATE export_alias_directories SET members=members+1 WHERE id=new.parent; END;
@@ -791,6 +793,41 @@ mod tests {
             0
         );
         assert!(guard(&db, &folder.join("new.jpg"), AliasLimits::default()).is_ok());
+    }
+    #[test]
+    fn repeated_binding_changes_keep_one_dirty_row_under_outer_conflict_policies() {
+        for recursive in [false, true] {
+            let db = database();
+            db.pragma_update(None, "recursive_triggers", recursive)
+                .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let folder = fs::canonicalize(root.path()).unwrap();
+            bind(&db, "one", &folder.join("original.jpg"), None);
+            for (index, statement) in [
+                "INSERT INTO storage_bindings VALUES('one',?1,NULL) ON CONFLICT(asset_id) DO UPDATE SET native_path=excluded.native_path",
+                "INSERT INTO storage_bindings VALUES('one',?1,NULL) ON CONFLICT(asset_id) DO UPDATE SET native_path=excluded.native_path",
+                "UPDATE OR ABORT storage_bindings SET native_path=?1 WHERE asset_id='one'",
+                "UPDATE OR FAIL storage_bindings SET native_path=?1 WHERE asset_id='one'",
+                "INSERT OR REPLACE INTO storage_bindings VALUES('one',?1,NULL)",
+            ].into_iter().enumerate() {
+                let encoded = serde_json::to_string(&NativePath::from_path(&folder.join(format!("{index}.jpg")))).unwrap();
+                db.execute(statement, [encoded]).unwrap();
+                assert_eq!(db.query_row("SELECT count(*) FROM export_alias_dirty", [], |r|r.get::<_,i64>(0)).unwrap(),1);
+                assert_eq!(db.query_row("SELECT unbound FROM export_alias_state", [], |r|r.get::<_,i64>(0)).unwrap(),0);
+                assert!(guard(&db, &folder.join("export.jpg"), AliasLimits::default()).is_err());
+            }
+            reconcile(&db);
+            assert!(guard(&db, &folder.join("4.jpg"), AliasLimits::default()).is_err());
+            assert_eq!(
+                db.query_row(
+                    "SELECT sum(members) FROM export_alias_directories",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
     }
     #[test]
     fn binding_replace_preserves_counter_and_marks_old_projection_dirty_in_both_trigger_modes() {
