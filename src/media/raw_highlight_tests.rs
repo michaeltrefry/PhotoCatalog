@@ -270,5 +270,5 @@ fn custom_raw_white_uses_camera_response_before_development() {
     let p = &pixels[(32 * out.width as usize + 96) * 4..][..3];
     assert!((f64::from(p[0] / p[1]) - rgb[1] / rgb[0]).abs() < 0.015);
     assert!((f64::from(p[2] / p[1]) - rgb[1] / rgb[2]).abs() < 0.03);
-    unsafe { super::pc_image_free(&mut out) };
+    drop(out);
 }
