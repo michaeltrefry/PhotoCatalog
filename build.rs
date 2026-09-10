@@ -2,12 +2,39 @@ fn main() {
     println!("cargo:rerun-if-changed=native/decode.cpp");
     println!("cargo:rerun-if-changed=native/decode.h");
     println!("cargo:rerun-if-changed=native/dng.cpp");
+    println!("cargo:rerun-if-changed=native/preview.cpp");
+    println!("cargo:rerun-if-changed=native/preview.h");
     println!("cargo:rerun-if-env-changed=PHOTOCATALOG_DNG_SDK");
     let sdk = std::path::PathBuf::from(
         std::env::var_os("PHOTOCATALOG_DNG_SDK")
             .expect("run scripts/fetch_dng_sdk.py and set PHOTOCATALOG_DNG_SDK"),
     );
     let source = sdk.join("dng_sdk/source");
+    // Bind the actual SDK sources and headers used by this build, including local
+    // changes. The download pin alone cannot identify a modified dependency cache.
+    let mut sdk_files = std::fs::read_dir(&source)
+        .expect("DNG SDK source directory")
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "cpp" || ext == "h")
+        })
+        .collect::<Vec<_>>();
+    sdk_files.sort();
+    let mut sdk_hash = blake3::Hasher::new();
+    for path in sdk_files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let name = path.file_name().unwrap().to_str().unwrap().as_bytes();
+        let contents = std::fs::read(&path).expect("DNG source identity");
+        sdk_hash.update(&(name.len() as u64).to_le_bytes());
+        sdk_hash.update(name);
+        sdk_hash.update(&(contents.len() as u64).to_le_bytes());
+        sdk_hash.update(&contents);
+    }
+    println!(
+        "cargo:rustc-env=PHOTOCATALOG_DNG_SOURCE_BLAKE3={}",
+        sdk_hash.finalize().to_hex()
+    );
     let mut build = cc::Build::new();
     let platform = match std::env::var("CARGO_CFG_TARGET_OS").unwrap().as_str() {
         "macos" => "qMacOS",
@@ -21,6 +48,7 @@ fn main() {
         .cpp(true)
         .file("native/decode.cpp")
         .file("native/dng.cpp")
+        .file("native/preview.cpp")
         .std("c++17")
         .include(&source)
         .define("qDNGUseXMP", "0")
@@ -72,7 +100,14 @@ fn main() {
     sources.sort();
     build.files(sources).warnings(false);
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        for name in ["libraw", "libavif", "libjxl", "libjpeg-turbo", "zlib"] {
+        for name in [
+            "libraw",
+            "libavif",
+            "libjxl",
+            "libjpeg-turbo",
+            "libwebp",
+            "zlib",
+        ] {
             let lib = vcpkg::Config::new()
                 .find_package(name)
                 .expect("install libraw and libavif with vcpkg (x64-windows-static-md)");
@@ -84,6 +119,7 @@ fn main() {
         for (name, version) in [
             ("libraw", "0.21"),
             ("libavif", "1.0"),
+            ("libwebp", "1.2"),
             ("libjxl", "0.11"),
             ("libjxl_threads", "0.11"),
             ("libjpeg", "2"),

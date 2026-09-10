@@ -1,0 +1,45 @@
+{
+  "store": {
+    "manifest_root": "/REPLACE/WITH/WRITABLE/preview-manifest",
+    "layout": "flat",
+    "thumbnail_root": "/REPLACE/WITH/WRITABLE/retained-thumbnails",
+    "large_root": "/REPLACE/WITH/WRITABLE/large-preview-cache",
+    "thumbnail_bytes": 68719476736,
+    "large_bytes": 17179869184
+  },
+  "policy": {
+    "thumbnail": {
+      "edge": 512,
+      "encoding": {
+        "codec": "jpeg",
+        "quality": 80
+      }
+    },
+    "large": {
+      "edge": 1600,
+      "encoding": {
+        "codec": "jpeg",
+        "quality": 80
+      }
+    }
+  },
+  "limits": {
+    "requests": 400,
+    "workers": 1,
+    "working_bytes": 3221225472,
+    "per_worker_bytes": 2269118464,
+    "decode_limits": {
+      "max_encoded_bytes": 268435456,
+      "max_intermediate_pixels": 32000000,
+      "max_allocation_bytes": 805306368
+    },
+    "encoded_staging_bytes": 33554432,
+    "per_worker_encoded_bytes": 8388608,
+    "decoded_cache_bytes": 268435456,
+    "decoded_live_bytes": 268435456,
+    "decoded_entries": 400
+  },
+  "original_roots": [
+    "/REPLACE/WITH/ORIGINALS"
+  ]
+}

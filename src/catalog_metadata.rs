@@ -586,9 +586,27 @@ impl Catalog {
         expected: &RenderIdentity,
         attach: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
-        let _write = self
-            .writers
-            .enter(crate::catalog_writer::Priority::Foreground)?;
+        self.with_render_identity_priority(
+            expected,
+            crate::catalog_writer::Priority::Foreground,
+            attach,
+        )
+    }
+    pub(crate) fn with_render_identity_priority<T>(
+        &mut self,
+        expected: &RenderIdentity,
+        priority: crate::catalog_writer::Priority,
+        attach: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.with_render_transaction(expected, priority, |_| attach())
+    }
+    pub(crate) fn with_render_transaction<T>(
+        &mut self,
+        expected: &RenderIdentity,
+        priority: crate::catalog_writer::Priority,
+        attach: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let _write = self.writers.enter(priority)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -601,7 +619,7 @@ impl Catalog {
         }) {
             return Ok(None);
         }
-        let result = attach()?;
+        let result = attach(&tx)?;
         tx.commit()?;
         drop(_write);
         Ok(Some(result))

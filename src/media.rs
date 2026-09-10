@@ -1,8 +1,8 @@
 mod full;
 mod psd;
 pub use full::{
-    ColorCalibration, DecodeError, DecodeStatus, RenderProvenance, RenderedImage, decode_full,
-    decoder_versions,
+    ColorCalibration, DecodeError, DecodeLimits, DecodeStatus, RenderProvenance, RenderedImage,
+    decode_full, decode_full_limited, decoder_versions,
 };
 
 use anyhow::{Context, Result, bail, ensure};

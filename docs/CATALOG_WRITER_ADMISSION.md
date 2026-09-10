@@ -74,3 +74,13 @@ schema5-to-5 with unchanged physical bytes and the same logical/table identities
 The new proof is explicitly labeled schema5 verification; it never replaces or
 relabels the original migration evidence. Source catalogs/companions stay untouched,
 and no query samples, fixture formulas or indexes are regenerated.
+
+
+S6 integration retains one admission inside `with_render_transaction` rather than
+wrapping both public identity and transaction helpers. Public final preview
+identity authority remains Foreground. Import-ready publication and attached-output
+recovery use Background; request submission maps actual foreground/background
+priority explicitly. Staging/native decoding remain outside admission and manifest
+journals remain until catalog commit. Retried/failed imports keep their previous
+preview reference. The added source-ready regression queues an actual import-ready
+commit behind a foreground generation-authority call and checks handoff order.

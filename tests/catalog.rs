@@ -208,15 +208,41 @@ fn symlinks_not_followed_and_non_utf8_locations_are_distinct() -> Result<()> {
     assert_eq!(catalog.browse(0, 10)?.len(), 2);
     Ok(())
 }
+fn preview_settings(db: &Path, src: &Path) -> Result<std::path::PathBuf> {
+    let settings_path = db.with_extension("preview-settings.json");
+    let settings = photocatalog::preview::PreviewConfiguration {
+        store: photocatalog::preview::StoreConfig {
+            manifest_root: db.join("preview-manifest"),
+            thumbnail_root: db.join("thumbnails"),
+            large_root: db.join("large"),
+            layout: photocatalog::preview::Layout::HashPrefix,
+            thumbnail_bytes: 4 * 1024 * 1024,
+            large_bytes: 4 * 1024 * 1024,
+        },
+        policy: Default::default(),
+        limits: Default::default(),
+        original_roots: vec![src.to_path_buf()],
+    };
+    fs::write(&settings_path, serde_json::to_vec(&settings)?)?;
+    Ok(settings_path)
+}
 #[test]
 fn cli_runs_in_separate_processes_and_never_overwrites_output() -> Result<()> {
     let (_tmp, src, db) = setup();
     jpeg(&src.join("a.jpg"), 1);
-    synthetic_cr2(&src.join("b.CR2"));
+    // The application service develops real pixels, so the old embedded-JPEG-
+    // only fake CR2 belongs only to the compatibility importer tests.
+    fs::write(
+        src.join("b.dng"),
+        include_bytes!("fixtures/generated-linear-mask.dng"),
+    )?;
+    let settings_path = preview_settings(&db, &src)?;
     let binary = assert_cmd::cargo::cargo_bin!("photocatalog");
     assert_cmd::Command::new(binary)
         .arg("--catalog")
         .arg(&db)
+        .arg("--preview-config")
+        .arg(&settings_path)
         .arg("import")
         .arg(&src)
         .assert()
@@ -224,6 +250,8 @@ fn cli_runs_in_separate_processes_and_never_overwrites_output() -> Result<()> {
     let output = assert_cmd::Command::new(binary)
         .arg("--catalog")
         .arg(&db)
+        .arg("--preview-config")
+        .arg(&settings_path)
         .args(["browse", "--limit", "1"])
         .output()?;
     assert!(output.status.success());
@@ -234,6 +262,8 @@ fn cli_runs_in_separate_processes_and_never_overwrites_output() -> Result<()> {
     assert_cmd::Command::new(binary)
         .arg("--catalog")
         .arg(&db)
+        .arg("--preview-config")
+        .arg(&settings_path)
         .args(["preview", id])
         .arg(&destination)
         .assert()
@@ -241,6 +271,8 @@ fn cli_runs_in_separate_processes_and_never_overwrites_output() -> Result<()> {
     assert_cmd::Command::new(binary)
         .arg("--catalog")
         .arg(&db)
+        .arg("--preview-config")
+        .arg(&settings_path)
         .args(["preview", id])
         .arg(&destination)
         .assert()
@@ -403,11 +435,14 @@ fn cli_resolves_symlink_overlap_before_any_mutation() -> Result<()> {
 fn cli_normalizes_nonexistent_parent_components_without_incidental_source_writes() -> Result<()> {
     let (tmp, src, db) = setup();
     jpeg(&src.join("a.jpg"), 1);
+    let settings_path = preview_settings(&db, &src)?;
     let before = tree_snapshot(&src)?;
     let catalog = src.join("not-created/../../catalog");
     assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("photocatalog"))
         .arg("--catalog")
         .arg(catalog)
+        .arg("--preview-config")
+        .arg(settings_path)
         .arg("import")
         .arg(&src)
         .assert()

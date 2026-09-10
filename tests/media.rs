@@ -133,6 +133,15 @@ fn psd_rgb_composite_precision_and_corrupt_bounds() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("composite.psd");
     std::fs::write(&path, &bytes).unwrap();
+    let refusal = photocatalog::media::decode_full_limited(
+        &path,
+        photocatalog::media::DecodeLimits {
+            max_intermediate_pixels: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(refusal.err().unwrap().status, DecodeStatus::ResourceLimit);
+
     let rendered = decode_full(&path).unwrap();
     assert_eq!(rendered.provenance.source_bits_per_channel, 16);
     assert_eq!((rendered.width, rendered.height), (2, 1));
@@ -455,4 +464,196 @@ fn psd_source_exif_strings_and_orientation_are_retained() {
     );
     assert_eq!((image.width, image.height), (1, 2));
     assert_eq!(image.metadata.orientation, 6);
+}
+
+#[test]
+fn decode_admission_refuses_then_accepts_the_same_supported_sources() {
+    use photocatalog::media::{DecodeLimits, decode_full_limited};
+    let root = tempfile::tempdir().unwrap();
+    let rgb = image::RgbImage::from_pixel(8, 6, image::Rgb([31, 89, 173]));
+    let mut paths = Vec::new();
+    for (extension, format) in [
+        ("jpg", ImageFormat::Jpeg),
+        ("png", ImageFormat::Png),
+        ("webp", ImageFormat::WebP),
+        ("bmp", ImageFormat::Bmp),
+        ("tiff", ImageFormat::Tiff),
+    ] {
+        let path = root.path().join(format!("raster.{extension}"));
+        rgb.save_with_format(&path, format).unwrap();
+        paths.push(path);
+    }
+    for (name, bytes) in [
+        (
+            "mask.dng",
+            include_bytes!("fixtures/generated-linear-mask.dng").as_slice(),
+        ),
+        (
+            "swatch.avif",
+            include_bytes!("fixtures/generated-swatches-10bit.avif").as_slice(),
+        ),
+    ] {
+        let path = root.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        paths.push(path);
+    }
+    for path in paths {
+        let source = std::fs::read(&path).unwrap();
+        let refused = decode_full_limited(
+            &path,
+            DecodeLimits {
+                max_intermediate_pixels: 1,
+                ..DecodeLimits::default()
+            },
+        );
+        assert_eq!(
+            refused.err().unwrap().status,
+            DecodeStatus::ResourceLimit,
+            "{}",
+            path.display()
+        );
+        let admitted = decode_full_limited(&path, DecodeLimits::default()).unwrap();
+        assert!(admitted.pixels.len() > 1);
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+    }
+}
+
+#[test]
+fn encoded_admission_happens_before_codec_identification() {
+    use photocatalog::media::{DecodeLimits, decode_full_limited};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("not-an-image");
+    std::fs::write(&path, [0; 1024]).unwrap();
+    let refused = decode_full_limited(
+        &path,
+        DecodeLimits {
+            max_encoded_bytes: 128,
+            ..DecodeLimits::default()
+        },
+    );
+    assert_eq!(refused.err().unwrap().status, DecodeStatus::ResourceLimit);
+    assert_eq!(
+        decode_full(&path).err().unwrap().status,
+        DecodeStatus::Unsupported
+    );
+}
+
+#[test]
+fn psd_surface_admission_precedes_missing_plane_payload() {
+    let mut header = b"8BPS\0\x01\0\0\0\0\0\0".to_vec();
+    header.extend(3u16.to_be_bytes());
+    header.extend(1000u32.to_be_bytes());
+    header.extend(1000u32.to_be_bytes());
+    header.extend(16u16.to_be_bytes());
+    header.extend(3u16.to_be_bytes());
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("header-only.psd");
+    std::fs::write(&path, header).unwrap();
+    let refused = photocatalog::media::decode_full_limited(
+        &path,
+        photocatalog::media::DecodeLimits {
+            max_intermediate_pixels: 100,
+            ..Default::default()
+        },
+    );
+    assert_eq!(refused.err().unwrap().status, DecodeStatus::ResourceLimit);
+    assert_eq!(
+        decode_full(&path).err().unwrap().status,
+        DecodeStatus::Corrupt
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned public Panasonic RAW fixture via PHOTOCATALOG_RESOURCE_RAW"]
+fn public_panasonic_raw_admission_retry() {
+    use photocatalog::media::{DecodeLimits, decode_full_limited};
+    let path = std::path::PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_RESOURCE_RAW").expect("public RAW fixture path"),
+    );
+    let original = std::fs::read(&path).unwrap();
+    let refused = decode_full_limited(
+        &path,
+        DecodeLimits {
+            max_intermediate_pixels: 1,
+            ..Default::default()
+        },
+    );
+    let error = refused.err().unwrap();
+    assert_eq!(error.status, DecodeStatus::ResourceLimit);
+    assert!(error.message.contains("RAW sensor/development"));
+    let image = decode_full_limited(&path, DecodeLimits::default()).unwrap();
+    assert_eq!((image.width, image.height), (4592, 3448));
+    assert_eq!(image.provenance.source_bits_per_channel, 12);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn psd_rle_narrow_many_channel_table_stays_in_encoded_buffer() {
+    use photocatalog::media::{DecodeLimits, decode_full_limited};
+    let mut bytes = psd_test_header(1, 1000, 56, 8, 1);
+    for _ in 0..56_000 {
+        bytes.extend(2u16.to_be_bytes());
+    }
+    for _ in 0..56_000 {
+        bytes.extend([0, 128]);
+    }
+    assert_eq!(bytes.len(), 224040);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("narrow.psd");
+    std::fs::write(&path, &bytes).unwrap();
+    let image = decode_full_limited(
+        &path,
+        DecodeLimits {
+            max_encoded_bytes: 256 * 1024,
+            max_intermediate_pixels: 1000,
+            max_allocation_bytes: 256 * 1024,
+        },
+    )
+    .unwrap();
+    assert_eq!((image.width, image.height), (1, 1000));
+    assert!(
+        image
+            .pixels
+            .iter()
+            .all(|p| (p[0] - 0.2158605).abs() < 1e-6 && p[3] == 1.0)
+    );
+}
+fn psd_test_header(
+    width: u32,
+    height: u32,
+    channels: u16,
+    depth: u16,
+    compression: u16,
+) -> Vec<u8> {
+    let mut bytes = b"8BPS\0\x01\0\0\0\0\0\0".to_vec();
+    bytes.extend(channels.to_be_bytes());
+    bytes.extend(height.to_be_bytes());
+    bytes.extend(width.to_be_bytes());
+    bytes.extend(depth.to_be_bytes());
+    bytes.extend(3u16.to_be_bytes());
+    for _ in 0..3 {
+        bytes.extend(0u32.to_be_bytes());
+    }
+    bytes.extend(compression.to_be_bytes());
+    bytes
+}
+#[test]
+fn psd_zip_exact_output_rejects_short_and_excess_planes() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("zip.psd");
+    for size in [23, 24, 25] {
+        let mut bytes = psd_test_header(4, 2, 3, 8, 2);
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![128; size]).unwrap();
+        bytes.extend(encoder.finish().unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        let result = decode_full(&path);
+        if size == 24 {
+            assert_eq!(result.unwrap().pixels.len(), 8);
+        } else {
+            assert_eq!(result.err().unwrap().status, DecodeStatus::Corrupt);
+        }
+    }
 }

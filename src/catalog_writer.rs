@@ -239,4 +239,67 @@ mod tests {
         drop(hold);
         Ok(())
     }
+    #[test]
+    fn preview_import_commit_yields_to_foreground_generation_authority() -> Result<()> {
+        let (_temp, cat, _path) = fixture()?;
+        let gate = cat.writers.clone();
+        let held = gate.enter(Priority::Foreground)?;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let root = cat.root.clone();
+        let background_order = order.clone();
+        let background = thread::spawn(move || -> Result<()> {
+            let mut other = Catalog::open(root)?;
+            let identity = other.render_identity("background1")?;
+            let metadata = crate::Metadata {
+                format: "JPEG".into(),
+                width: 1,
+                height: 1,
+                orientation: 1,
+                camera_make: None,
+                camera_model: None,
+                captured_at: None,
+                lens: None,
+                preview_source: "integration fixture".into(),
+            };
+            assert!(
+                other
+                    .commit_preview_import(
+                        &identity,
+                        &"a".repeat(64),
+                        &metadata,
+                        &"b".repeat(64),
+                        || {
+                            background_order.lock().unwrap().push("background");
+                            Ok(())
+                        },
+                        || Ok(())
+                    )?
+                    .is_some()
+            );
+            Ok(())
+        });
+        queued(&gate, 0, 1);
+        let root = cat.root.clone();
+        let foreground_order = order.clone();
+        let foreground = thread::spawn(move || -> Result<()> {
+            let mut other = Catalog::open(root)?;
+            let identity = other.render_identity("foreground1")?;
+            assert!(
+                other
+                    .with_render_identity(&identity, || {
+                        foreground_order.lock().unwrap().push("foreground");
+                        Ok(())
+                    })?
+                    .is_some()
+            );
+            Ok(())
+        });
+        queued(&gate, 1, 1);
+        drop(held);
+        foreground.join().expect("foreground panicked")?;
+        background.join().expect("background panicked")?;
+        assert_eq!(*order.lock().unwrap(), ["foreground", "background"]);
+        assert_eq!(cat.render_identity("background1")?.state, "ready");
+        Ok(())
+    }
 }

@@ -25,6 +25,7 @@ roxmltree = "=0.21.1"
 libc = "0.2"
 
 [build-dependencies]
+blake3 = "1"
 cc = "1"
 pkg-config = "0.3"
 vcpkg = "0.2"
