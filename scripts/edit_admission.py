@@ -31,8 +31,9 @@ def validate_funding(binding,funding):
     for name in ('retained_bound_bytes','active_bound_bytes','copies_bound_bytes','free_reserve_bytes','minimum_free_bytes'):
         if type(binding.get(name)) is not int or binding[name]!=funding[name]:
             raise ValueError('top-level funding differs')
-    if not edit_aggregate.same(binding.get('outer_owner'),funding['outer_owner']):
-        raise ValueError('outer owner/host evidence admission differs')
+    for owner in ('outer_owner','preparation_owner'):
+        if not edit_aggregate.same(binding.get(owner),funding[owner]):
+            raise ValueError(owner+' evidence admission differs')
 
 
 def validate_execution(binding):

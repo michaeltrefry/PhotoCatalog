@@ -31,6 +31,12 @@ class DiskContracts(unittest.TestCase):
         self.assertEqual(value['components']['evidence_streams'],1074*(40*q.MIB+256*1024))
         self.assertEqual(outer['supervision']['max_seen'],131072)
         self.assertEqual(outer['host_logs'],dict(max_bytes=8*q.GIB,max_record_bytes=q.MIB))
+        self.assertEqual(value['components']['preparation_outer_and_host'],657*q.MIB)
+        preparation=value['preparation_owner']
+        self.assertEqual(preparation['deadline_seconds'],3900)
+        self.assertEqual(preparation['supervision'],dict(max_active=4,max_seen=8192,max_telemetry_bytes=128*q.MIB,
+            max_sample_bytes=8192,max_identity_bytes=8*q.MIB,max_identity_event_bytes=512))
+        self.assertEqual(preparation['host_logs'],dict(max_bytes=512*q.MIB,max_record_bytes=q.MIB))
         self.assertEqual(sum(value['components'].values()),value['retained_bound_bytes'])
 
     def test_fixed_registry_deadlines_and_child_lifetimes(self):

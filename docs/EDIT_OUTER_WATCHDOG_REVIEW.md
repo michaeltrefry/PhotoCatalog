@@ -111,3 +111,23 @@ identities were observed terminal, not necessarily reaped by this supervisor;
 the Popen root and active-identity cleanup have their separate explicit receipts.
 The source, package, resulting funding, actual outer wrapper and preparation must
 be frozen and independently reviewed before any full campaign run.
+
+## Separate preparation owner
+
+Preparation has its own bound preset, distinct from the full campaign:
+3,900-second outer failure stop, four active / 8,192 observed identities,
+128 MiB process frames, 8 MiB lifetime events, 4 MiB per stdout/stderr,
+and host logs capped at 512 MiB total / 1 MiB per record. Its private outer
+launcher consumes `funding["preparation_owner"]`; `edit_prepare.prepare` consumes
+those exact host settings. The existing 3,600-second preparation deadline,
+600-second generator deadline, generator memory admission, and held-original
+copy policy are unchanged. Observer errors are checked before/after each source
+copy, the separate background copy and every generator. Completed tiny-copy
+proofs remain in a failed receipt, and no further copy/generator launches after
+a known observer error.
+
+Funding adds a separate 657 MiB preparation owner/host/receipt allowance and
+16 additional 4 KiB filesystem allocation units, over the full-campaign owner
+allowances. The new plan and admission also bind `preparation_owner`; no earlier
+funded amount silently covers these additional bytes. Preparation failure
+retains its new namespace and does not authorize resume, retry or campaign work.

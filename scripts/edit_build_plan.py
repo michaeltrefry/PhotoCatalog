@@ -40,6 +40,8 @@ def build_plan(preparation,build,manifest,output):
     by_id={item['id']:item for item in sources}
     cases=edit_disk_budget.complete_cases(manifest)
     funding=edit_disk_budget.budget(manifest)
+    if qualification.canonical(preparation.get('preparation_owner'))!=qualification.canonical(funding['preparation_owner']):
+        raise ValueError('preparation lacks the exact bounded owner/host contract')
     normal=qualification.plan(manifest)['normal_limits']
     package=Path(build['helper_package']['root'])
     actions=[]
@@ -72,7 +74,7 @@ def build_plan(preparation,build,manifest,output):
             path=preparation['background_copy']['path'],fixture_id=preparation['background_copy']['fixture_id'],
             sha256=preparation['background_copy']['sha256'],blake3=preparation['background_copy']['blake3']),
         cases=cases,cases_sha256=hashlib.sha256(qualification.canonical(cases)).hexdigest(),
-        normal_limits=normal,outer_owner=funding["outer_owner"],actions=actions,case_records=records,funding=funding,
+        normal_limits=normal,outer_owner=funding["outer_owner"],preparation_owner=funding["preparation_owner"],actions=actions,case_records=records,funding=funding,
         **{name:funding[name] for name in ('retained_bound_bytes','active_bound_bytes','copies_bound_bytes',
                                           'free_reserve_bytes','minimum_free_bytes')})
     value['verifier']=dict(path=str(package/'scripts/edit_verify.py'),sha256=build['helper_package']['files']['scripts/edit_verify.py'])

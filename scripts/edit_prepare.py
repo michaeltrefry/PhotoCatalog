@@ -60,6 +60,11 @@ def source_copy(original,target,limit,expected_sha,free_reserve,deadline):
                 original_after={name:getattr(after,name) for name in fields})
 
 
+def require_host_evidence(host):
+    if host.error is not None:
+        raise RuntimeError('bounded preparation host evidence failed: '+host.error)
+
+
 def prepare(manifest_descriptor,build,root):
     root=Path(root)
     edit_binding.admit_imports(build['helper_package'])
@@ -71,7 +76,7 @@ def prepare(manifest_descriptor,build,root):
     funding=edit_disk_budget.budget(manifest)
     root.mkdir() # no resume/overwrite of a partial preparation
     exclusive(root/'start.json',dict(manifest=manifest_descriptor,build=build,funding=funding,
-                                    deadline_seconds=3600,started=edit_campaign.anchor()))
+                                    deadline_seconds=3600,preparation_owner=funding['preparation_owner'],started=edit_campaign.anchor()))
     sources=[];copies=[];records=[];background=None;error=None
     deadline=time.monotonic()+3600
     try:
@@ -79,20 +84,25 @@ def prepare(manifest_descriptor,build,root):
             raise ValueError('preparation lacks the full final-campaign funding')
         (root/'sources').mkdir()
         exclusive(root/'host-identity.json',host_identity(root,[item['path'] for item in manifest['inputs']]))
-        with HostObservation(root):
+        with HostObservation(root,**funding['preparation_owner']['host_logs']) as host:
             for item in manifest['inputs']:
+                require_host_evidence(host)
                 directory=root/'sources'/item['id'];directory.mkdir()
                 target=directory/('source'+Path(item['path']).suffix)
                 copied=source_copy(item['path'],target,512*qualification.MIB,item['sha256'],funding['free_reserve_bytes'],deadline)
                 copies.append(dict(id=item['id'],**copied))
                 sources.append(dict(id=item['id'],width=item['width'],height=item['height'],**copied))
+                require_host_evidence(host)
             # An actual second path forces a genuine new import job in overlap.
+            require_host_evidence(host)
             item=next(item for item in manifest['inputs'] if item['id']=='private-X-T3-RAW')
             directory=root/'background-import';directory.mkdir()
             copied=source_copy(item['path'],directory/('source'+Path(item['path']).suffix),512*qualification.MIB,
                                item['sha256'],funding['free_reserve_bytes'],deadline)
             background=dict(fixture_id=item['id'],**copied)
+            require_host_evidence(host)
             for fixture,(width,height) in edit_fixtures.FIXTURES.items():
+                require_host_evidence(host)
                 if time.monotonic()>deadline:raise ValueError('preparation total deadline')
                 directory=root/'sources'/fixture;directory.mkdir()
                 target=directory/'source.tiff'
@@ -103,6 +113,7 @@ def prepare(manifest_descriptor,build,root):
                             group_rss_bytes=qualification.GIB,free_reserve_bytes=funding['free_reserve_bytes'])
                 supervisor=root/('generate-'+fixture)
                 edit_campaign.invoke(command,supervisor,limits,root)
+                require_host_evidence(host)
                 value=read_json(receipt)
                 if value['id']!=fixture or value['path']!=str(target.resolve()) or (value['width'],value['height'])!=(width,height):
                     raise ValueError('generated fixture identity differs')
@@ -112,10 +123,11 @@ def prepare(manifest_descriptor,build,root):
                 sources.append(dict(**value,generated_receipt=descriptor))
                 records.append(dict(id=fixture,supervisor_path=str(supervisor/'result.json'),command=command,
                                     limits=limits,receipt_path=str(receipt),output=str(target)))
+            require_host_evidence(host)
             exclusive(root/'copy-ledger.json',dict(complete=True,copies=copies,background=background,
                                                   source_write_policy='read-only held originals; create_new independent copies'))
     except BaseException as exc:error=f'{type(exc).__name__}: {exc}'
-    result=dict(version=1,complete=error is None,error=error,root=str(root.resolve()),manifest=manifest_descriptor,
+    result=dict(version=1,preparation_owner=funding['preparation_owner'],complete=error is None,error=error,root=str(root.resolve()),manifest=manifest_descriptor,
                 sources=sources,preparation_records=records,background_copy=background,
                 copies_observed=copies,finished=edit_campaign.anchor())
     if error is None:

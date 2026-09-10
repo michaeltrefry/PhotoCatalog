@@ -24,6 +24,15 @@ def outer_owner():
         caveat='24-hour overall failure stop, below summed action ceilings; no automatic retry or qualification')
 
 
+def preparation_owner():
+    return dict(deadline_seconds=3900,
+        supervision=dict(max_active=4,max_seen=8192,max_telemetry_bytes=128*q.MIB,
+                         max_sample_bytes=8192,max_identity_bytes=8*q.MIB,max_identity_event_bytes=512),
+        host_logs=dict(max_bytes=512*q.MIB,max_record_bytes=q.MIB),
+        stdout_bytes=4*q.MIB,stderr_bytes=4*q.MIB,
+        caveat='Untimed preparation outer failure stop; source-copy and generator limits unchanged')
+
+
 def budget(manifest):
     cases=complete_cases(manifest)
     dimensions={i['id']:(i['width'],i['height']) for i in manifest['inputs']}
@@ -85,19 +94,22 @@ def budget(manifest):
     outer=outer_owner()
     outer_allowance=(outer["supervision"]["max_telemetry_bytes"]+outer["supervision"]["max_identity_bytes"]
                      +outer["host_logs"]["max_bytes"]+outer["stdout_bytes"]+outer["stderr_bytes"]+q.MIB)
+    preparation=preparation_owner()
+    preparation_allowance=(preparation['supervision']['max_telemetry_bytes']+preparation['supervision']['max_identity_bytes']
+                           +preparation['host_logs']['max_bytes']+preparation['stdout_bytes']+preparation['stderr_bytes']+q.MIB)
     request_receipt_allowance=len(cases)*20*q.MIB
     namespace_allowance=namespace_count*(per_namespace_payload+per_namespace_sql_allowance)
-    allocation_overhead=(files+children*9+16)*4096
-    retained=retained_raw+retained_encoded+retained_proxy_reference+namespace_allowance+stream_allowance+request_receipt_allowance+allocation_overhead+outer_allowance
+    allocation_overhead=(files+children*9+32)*4096
+    retained=retained_raw+retained_encoded+retained_proxy_reference+namespace_allowance+stream_allowance+request_receipt_allowance+allocation_overhead+outer_allowance+preparation_allowance
     # Owned originals use declared encoded ceilings, never expected compression.
     copies=len(manifest['inputs'])*normal_extent+4*q.GIB+16*q.MIB+normal_extent
     active=active_extra+32*q.MIB # native staging reservation, beyond retained basis
     reserve=16*q.GIB
     funded=retained+active+copies+reserve
     minimum=math.ceil(funded/q.GIB)*q.GIB
-    return dict(version=2,outer_owner=outer,proposed_probe_count=len(cases),proposed_total_children=children,
+    return dict(version=2,outer_owner=outer,preparation_owner=preparation,proposed_probe_count=len(cases),proposed_total_children=children,
         components=dict(raw=retained_raw,encoded=retained_encoded,proxy_jpeg=retained_proxy_reference,
-                        service_namespaces=namespace_allowance,evidence_streams=stream_allowance,outer_and_host=outer_allowance,
+                        service_namespaces=namespace_allowance,evidence_streams=stream_allowance,outer_and_host=outer_allowance,preparation_outer_and_host=preparation_allowance,
                         requests_receipts=request_receipt_allowance,allocation_overhead=allocation_overhead),
         retained_bound_bytes=retained,active_bound_bytes=active,copies_bound_bytes=copies,
         free_reserve_bytes=reserve,minimum_free_bytes=minimum,
