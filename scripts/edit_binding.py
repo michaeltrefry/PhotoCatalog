@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import runpy
 import sys
+import sysconfig
 
 HELPERS=(
     'edit_aggregate','edit_artifacts','edit_derivative','edit_large_reference','edit_request','edit_build_plan','edit_cleanup','edit_admission','edit_prepare','edit_memory',
@@ -145,6 +146,26 @@ def import_closure():
     return roots
 
 
+def framework_identity():
+    # A macOS framework launcher is not the interpreter implementation. Bind
+    # its framework library and app executable under this running interpreter's
+    # actual base prefix, not the build-time Homebrew prefix in sysconfig.
+    if sys.platform!='darwin':
+        return None
+    framework=sysconfig.get_config_var('PYTHONFRAMEWORK')
+    if not framework:
+        return None
+    if not isinstance(framework,str) or framework in ('.','..') or Path(framework).name!=framework:
+        raise ValueError('invalid Python framework name')
+    base=Path(sys.base_prefix).resolve(strict=True)
+    paths={'library':framework,'app_executable':'Resources/Python.app/Contents/MacOS/Python'}
+    artifacts={}
+    for name,relative in paths.items():
+        path=regular_under(base,relative)
+        artifacts[name]=dict(path=str(path),sha256=file_hash(path))
+    return dict(name=framework,base_prefix=str(base),**artifacts)
+
+
 def runtime_identity():
     if any(os.environ.get(name)!=value for name,value in THREAD_ENV.items()):
         raise ValueError('explicit fixed qualification thread environment required')
@@ -153,14 +174,15 @@ def runtime_identity():
                 executable_sha256=file_hash(Path(sys.executable).resolve(strict=True)),
                 prefix=str(Path(sys.prefix).resolve()),base_prefix=str(Path(sys.base_prefix).resolve()),
                 version=sys.version,cache_tag=sys.implementation.cache_tag,
-                platform=sys.platform,environment=THREAD_ENV,distributions=distributions,import_closure=import_closure())
+                platform=sys.platform,environment=THREAD_ENV,distributions=distributions,
+                import_closure=import_closure(),framework=framework_identity())
 
 
 def validate_runtime(expected):
     # Compare exact distribution manifests independently of how many modules this
     # launcher happens to have imported; check every recorded stdlib file too.
     actual=runtime_identity()
-    for field in ('executable','executable_sha256','prefix','base_prefix','version','cache_tag','platform','environment','distributions','import_closure'):
+    for field in ('executable','executable_sha256','prefix','base_prefix','version','cache_tag','platform','environment','distributions','import_closure','framework'):
         if actual[field]!=expected[field]:
             raise ValueError('runtime binding mismatch: '+field)
 

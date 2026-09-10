@@ -49,7 +49,7 @@ class FrozenPackageContracts(unittest.TestCase):
 
     def test_runtime_dependency_bytes_not_only_versions_are_bound(self):
         original=dict(executable='/python',executable_sha256='a',prefix='/env',base_prefix='/base',
-                      version='v',cache_tag='tag',platform='x',environment={},distributions={'numpy':{'files':{'extension.so':'old'}}},import_closure={})
+                      version='v',cache_tag='tag',platform='x',environment={},distributions={'numpy':{'files':{'extension.so':'old'}}},import_closure={},framework=None)
         changed={**original,'distributions':{'numpy':{'files':{'extension.so':'new'}}}}
         with patch.object(binding,'runtime_identity',return_value=changed):
             with self.assertRaises(ValueError): binding.validate_runtime(original)
@@ -73,6 +73,44 @@ class FrozenPackageContracts(unittest.TestCase):
                 first=binding.import_closure()
                 (root/'unexpected.py').write_text('raise RuntimeError("unbound")\n')
                 self.assertNotEqual(binding.import_closure(),first)
+
+    def test_framework_library_and_app_bytes_are_bound_under_actual_base(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder).resolve()
+            library=base/'Python';library.write_bytes(b'framework-v1')
+            app=base/'Resources/Python.app/Contents/MacOS/Python'
+            app.parent.mkdir(parents=True);app.write_bytes(b'app-v1')
+            with patch.object(binding.sys,'platform','darwin'), \
+                 patch.object(binding.sys,'base_prefix',str(base)), \
+                 patch.object(binding.sysconfig,'get_config_var',return_value='Python'):
+                first=binding.framework_identity()
+                self.assertEqual(first['library']['path'],str(library))
+                self.assertEqual(first['app_executable']['path'],str(app))
+                original=dict(executable='/launcher',executable_sha256='same',prefix='/env',base_prefix=str(base),
+                    version='v',cache_tag='tag',platform='darwin',environment={},distributions={},import_closure={},framework=first)
+                for artifact in (library,app):
+                    previous=artifact.read_bytes();artifact.write_bytes(previous+b'-modified')
+                    changed={**original,'framework':binding.framework_identity()}
+                    with patch.object(binding,'runtime_identity',return_value=changed):
+                        with self.assertRaisesRegex(ValueError,'framework'):
+                            binding.validate_runtime(original)
+                    artifact.write_bytes(previous)
+
+    def test_framework_missing_app_refuses_before_runtime_admission(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder).resolve();(base/'Python').write_bytes(b'framework')
+            with patch.object(binding.sys,'platform','darwin'), \
+                 patch.object(binding.sys,'base_prefix',str(base)), \
+                 patch.object(binding.sysconfig,'get_config_var',return_value='Python'):
+                with self.assertRaises(FileNotFoundError):binding.framework_identity()
+
+    def test_nonframework_runtime_does_not_inspect_framework_paths(self):
+        with patch.object(binding,'file_hash',side_effect=AssertionError('unexpected framework read')):
+            with patch.object(binding.sys,'platform','linux'):
+                self.assertIsNone(binding.framework_identity())
+            with patch.object(binding.sys,'platform','darwin'), \
+                 patch.object(binding.sysconfig,'get_config_var',return_value=''):
+                self.assertIsNone(binding.framework_identity())
 
 
 if __name__=='__main__':
