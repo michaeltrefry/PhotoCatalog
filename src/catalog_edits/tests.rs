@@ -276,7 +276,7 @@ fn schema_five_upgrade_is_lazy_and_keeps_existing_assets() -> Result<()> {
     let before: i64 = catalog
         .db
         .query_row("SELECT count(*) FROM assets", [], |r| r.get(0))?;
-    catalog.db.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5;")?;
+    catalog.db.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5;")?;
     drop(catalog);
     let catalog = Catalog::open(temp.path().join("catalog"))?;
     assert_eq!(
