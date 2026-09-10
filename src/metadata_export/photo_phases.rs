@@ -414,6 +414,17 @@ impl PhotoPublication {
             .as_ref()
             .context("no captured original to restore")?;
         captured.recheck()?;
+        if let Some(destination) = &self.destination {
+            // A prior restore may have linked successfully before its owner
+            // crashed. Only the exact held captured object can make this a
+            // no-op; equal bytes in a different object still conflict.
+            destination.recheck()?;
+            if destination.stamp.object == captured.stamp.object
+                && destination.revision() == captured.revision()
+            {
+                return Ok(());
+            }
+        }
         let start = Instant::now();
         publish_noclobber(
             &self.directory.join("original"),
@@ -458,14 +469,19 @@ impl PhotoPublication {
         ))
     }
     pub fn recheck_restored(&self) -> Result<()> {
-        self.captured
+        let captured = self.captured.as_ref().context("missing capture")?;
+        let destination = self
+            .destination
             .as_ref()
-            .context("missing capture")?
-            .recheck()?;
-        self.destination
-            .as_ref()
-            .context("missing restored destination")?
-            .recheck()
+            .context("missing restored destination")?;
+        captured.recheck()?;
+        destination.recheck()?;
+        ensure!(
+            captured.stamp.object == destination.stamp.object
+                && captured.revision() == destination.revision(),
+            "restored full file identity differs"
+        );
+        Ok(())
     }
 }
 fn optional_verified(

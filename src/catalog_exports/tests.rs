@@ -477,3 +477,57 @@ fn uninstalled_intent_rechecks_stale_recipe_and_never_uses_it_as_publication_per
     assert_eq!(std::fs::read(&w.plan.destination.destination)?, before);
     Ok(())
 }
+
+#[test]
+fn interrupted_restore_and_repeated_restore_converge_without_clobber_or_double_count() -> Result<()>
+{
+    let (temp, mut c, original) = fixture()?;
+    let (j, w, sealed) = accepted_overwrite(&mut c, temp.path())?;
+    let mut other = Catalog::open(&c.root)?;
+    let result = c.publish_photo_export_item_with_hook(&j.id, 1, |phase| {
+        if phase == PhotoExportBoundary::Captured {
+            other.cancel_photo_export_job(&j.id)?;
+        }
+        Ok(())
+    });
+    assert!(
+        !result
+            .as_ref()
+            .is_ok_and(|r| r.0.state == metadata_export::ExportState::Published)
+    );
+    // Inject loss of the executor after the no-clobber restore link, before
+    // durability/final catalog publication. No cleanup or receipt is performed.
+    {
+        let mut interrupted = metadata_export::PhotoPublication::prepare_restore(&sealed)?;
+        interrupted.restore_link()?;
+    }
+    assert_eq!(c.photo_export_items(&j.id, 0, 1)?[0].state, "failed");
+    std::fs::remove_file(sealed.recovery_directory().join("payload"))?;
+    drop(other);
+    drop(c);
+    let mut c = Catalog::open(temp.path().join("catalog"))?;
+    for _ in 0..2 {
+        let receipt = c.restore_photo_export_item(&j.id, 1)?;
+        assert_eq!(receipt.state, metadata_export::ExportState::Restored);
+        assert_eq!(c.photo_export_items(&j.id, 0, 1)?[0].state, "restored");
+        assert_eq!(c.photo_export_job(&j.id)?.completed, 1);
+        assert_eq!(
+            std::fs::read(&w.plan.destination.destination)?,
+            b"old destination bytes"
+        );
+    }
+    // Equal bytes from a replacement inode are not evidence of our restored link.
+    std::fs::rename(
+        &w.plan.destination.destination,
+        temp.path().join("restored-owned"),
+    )?;
+    std::fs::write(&w.plan.destination.destination, b"old destination bytes")?;
+    let receipt = c.restore_photo_export_item(&j.id, 1)?;
+    assert_eq!(receipt.state, metadata_export::ExportState::Conflict);
+    assert_eq!(
+        std::fs::read(&w.plan.destination.destination)?,
+        b"old destination bytes"
+    );
+    assert_eq!(std::fs::read(original)?, b"source bytes unchanged");
+    Ok(())
+}
