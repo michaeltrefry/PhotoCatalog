@@ -65,9 +65,8 @@ fn qualification_nested_qualified_fixture_has_a_valid_full_base() {
     let model = photocatalog::xmp::parse(explicit.as_bytes()).unwrap();
     let serialized = photocatalog::xmp::canonical(&model).unwrap();
     assert_equivalent(&explicit, &serialized).unwrap();
-    let lost_qualifier = packet(
-        "<u:structure rdf:parseType='Resource'><u:child>value</u:child></u:structure>",
-    );
+    let lost_qualifier =
+        packet("<u:structure rdf:parseType='Resource'><u:child>value</u:child></u:structure>");
     assert!(assert_equivalent(&lost_qualifier, &serialized).is_err());
 }
 

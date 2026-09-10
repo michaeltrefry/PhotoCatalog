@@ -235,9 +235,7 @@ fn jpeg_named_subject_extended_xmp_roundtrips_through_catalog_without_semantic_l
     let extension = inspection
         .parse_inputs
         .iter()
-        .find(|p| {
-            p.transformation == crate::xmp_packets::Transformation::JpegExtendedReassembled
-        })
+        .find(|p| p.transformation == crate::xmp_packets::Transformation::JpegExtendedReassembled)
         .unwrap();
     assert!(extension.bytes.len() > 65535);
     let main_meta = crate::xmp::parse(&main.bytes).unwrap();
@@ -258,7 +256,10 @@ fn jpeg_named_subject_extended_xmp_roundtrips_through_catalog_without_semantic_l
     // whose concatenated strings merely contain the requested values.
     let mut catalog = crate::Catalog::open(temp.path().join("catalog")).unwrap();
     assert_eq!(
-        catalog.import(&originals, None, |_| Ok(())).unwrap().imported,
+        catalog
+            .import(&originals, None, |_| Ok(()))
+            .unwrap()
+            .imported,
         1
     );
     let asset = catalog.browse(0, 1).unwrap().remove(0);
