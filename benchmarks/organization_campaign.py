@@ -22,7 +22,7 @@ import stat
 PROTOCOL = 2  # Current native receipt; synthetic fixture row marker stays 1.
 DRIVER_PROTOCOL = 5
 CURRENT_SCHEMA = 6
-EDIT_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants"]
+EDIT_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
 TEXT_LIMITS = {"document_bytes": 1024**2, "page_bytes": 8 * 1024**2}
 LOCAL_TEXT_CASES = {"filename-reverse", "mixed", "text-capture"}
 DIAGNOSTIC_CASES = ["filename-reverse", "text", "text-capture", "date-camera"]

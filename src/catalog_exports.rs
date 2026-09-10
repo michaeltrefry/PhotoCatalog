@@ -73,6 +73,7 @@ pub struct StoredOutput {
 #[serde(deny_unknown_fields)]
 pub struct PhotoExportPlan {
     pub version: u32,
+    pub renderer_identity: String,
     pub identity: EditRenderIdentity,
     pub original: NativePath,
     pub original_revision: FileRevision,
@@ -338,7 +339,7 @@ impl Catalog {
             protect_destination(tx,&destination.destination,&path)?;
             let profile=match &output.profile {OutputProfile::Srgb=>StoredProfile::Srgb,OutputProfile::LinearSrgb=>StoredProfile::LinearSrgb,OutputProfile::Icc{bytes}=>StoredProfile::Icc{blob:store_blob(tx,bytes)?}};
             let xmp_blob=packet.as_deref().map(|b|store_blob(tx,b)).transpose()?;
-            let plan=PhotoExportPlan{version:1,identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes};
+            let plan=PhotoExportPlan{version:1,renderer_identity:crate::photo_render::output_renderer_identity().to_owned(),identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes};
             metadata_current(tx,&plan)?;
             let encoded=serde_json::to_string(&plan)?;ensure!(encoded.len()<=PLAN_LIMIT,"export plan limit");
             let authority=blake3::hash(encoded.as_bytes()).to_hex().to_string();let sequence=j.total.checked_add(1).context("export job exhausted")?;

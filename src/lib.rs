@@ -14,6 +14,7 @@ pub mod media;
 pub mod metadata_export;
 pub mod organization;
 pub mod organization_search;
+pub mod photo_render;
 pub mod preview;
 pub mod storage_volume;
 pub mod xmp;

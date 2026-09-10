@@ -19,7 +19,7 @@ from preview_navigation_campaign import anchor, read_json, expected_trials, vali
 
 CURRENT_SCHEMA = 6
 PROTOCOL = 3
-EDIT_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants"]
+EDIT_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
 
 SUFFIXES = ("", "-wal", "-shm", "-journal")
 INDEX_SQL = "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"

@@ -31,7 +31,7 @@ labeled 5-to-5 `verification`. New `schema6_migration` contains distinct
 The new proof binds the old schema-5 main to the actual schema-6 donor hash,
 requires successful native/observer results, and compares every pre-existing
 typed table/row identity with the original ancestry. `identity_scope` must be
-`pre_existing_tables`. `added_tables` separately lists the six new edit tables
+`pre_existing_tables`. `added_tables` separately lists the nine new edit/export tables
 with zero rows; no whole-schema hash equivalence is claimed. The lens/capture
 index remains exact. Copy both generations' original receipt bytes into the new
 bundle, named `proof`/`native` and `schema6_proof`/`schema6_native`; never rewrite
