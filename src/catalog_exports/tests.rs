@@ -440,21 +440,42 @@ fn queued_export_rechecks_same_inode_restored_mtime_and_atomic_replacement() -> 
             });
             ready.recv_timeout(Duration::from_secs(5))?;
             gate.wait_until_queued(1, 0);
-            if replacement {
-                fs::rename(&original, temp.path().join("previous-original"))?;
-            }
             let mut changed = original_bytes.clone();
             changed[0] ^= 1;
-            fs::write(&original, &changed)?;
-            fs::File::options()
-                .write(true)
-                .open(&original)?
-                .set_times(fs::FileTimes::new().set_modified(modified))?;
+            let mutation = (|| -> Result<()> {
+                if replacement {
+                    fs::rename(&original, temp.path().join("previous-original"))?;
+                }
+                fs::write(&original, &changed)?;
+                fs::File::options()
+                    .write(true)
+                    .open(&original)?
+                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+                Ok(())
+            })();
+            // Always release and join, including an expected Windows sharing
+            // refusal: returning early would strand the worker behind our gate.
             drop(permit);
-            let error = child
-                .join()
-                .unwrap()
-                .expect_err("stale verified file was authorized");
+            let outcome = child.join().unwrap();
+            if cfg!(windows) && !replacement {
+                let error = mutation.expect_err("held Windows proof allowed an in-place write");
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(32)
+                );
+                outcome?; // unchanged, fully verified bytes remain publishable
+                assert_eq!(fs::read(&original)?, original_bytes);
+                assert_eq!(destination.exists(), publication);
+                if publication {
+                    assert_eq!(fs::read(&destination)?, b"completed encoded derivative");
+                }
+                continue;
+            }
+            mutation?;
+            let error = outcome.expect_err("stale verified file was authorized");
             assert!(
                 format!("{error:#}").contains("verified file changed"),
                 "{error:#}"
@@ -548,17 +569,38 @@ fn namespace_mutation_is_not_excused_as_our_rename_or_hardlink_timestamp() -> Re
                 let modified = fs::metadata(&altered)?.modified()?;
                 let mut bytes = fs::read(&altered)?;
                 bytes[0] ^= 1;
-                fs::write(&altered, bytes)?;
-                fs::File::options()
-                    .write(true)
-                    .open(&altered)?
-                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+                if cfg!(windows) {
+                    let unchanged = fs::read(&altered)?;
+                    let error =
+                        fs::write(&altered, bytes).expect_err("held proof allowed mutation");
+                    assert_eq!(error.raw_os_error(), Some(32));
+                    assert_eq!(fs::read(&altered)?, unchanged);
+                } else {
+                    fs::write(&altered, bytes)?;
+                    fs::File::options()
+                        .write(true)
+                        .open(&altered)?
+                        .set_times(fs::FileTimes::new().set_modified(modified))?;
+                }
             }
             Ok(())
         });
-        assert!(result.is_err(), "mutation was hidden by a refreshed stamp");
-        assert_ne!(c.photo_export_items(&j.id, 0, 1)?[0].state, "published");
-        assert!(altered.exists(), "externally changed bytes were discarded");
+        if cfg!(windows) {
+            assert_eq!(result?.0.state, metadata_export::ExportState::Published);
+            assert_eq!(c.photo_export_items(&j.id, 0, 1)?[0].state, "published");
+            assert_eq!(
+                fs::read(&w.plan.destination.destination)?,
+                b"completed encoded derivative"
+            );
+            assert_eq!(
+                fs::read(sealed.recovery_directory().join("original"))?,
+                b"old destination bytes"
+            );
+        } else {
+            assert!(result.is_err(), "mutation was hidden by a refreshed stamp");
+            assert_ne!(c.photo_export_items(&j.id, 0, 1)?[0].state, "published");
+            assert!(altered.exists(), "externally changed bytes were discarded");
+        }
     }
     Ok(())
 }
