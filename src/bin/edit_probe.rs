@@ -372,6 +372,7 @@ fn delivery(request: &Request, samples: &mut File) -> Result<()> {
     let mut revision = 0;
     let mut prepared_digests: Vec<Option<String>> = vec![None; request.recipes.len()];
     for iteration in 0..request.warmups + request.repetitions {
+        let _ = previews.take_worker_metrics(); // Exclude setup/previous producer evidence.
         let recipe = &request.recipes[iteration % request.recipes.len()];
         let saved = catalog.save_edit_recipe(&variant, revision, recipe)?;
         ensure!(
@@ -463,6 +464,17 @@ fn delivery(request: &Request, samples: &mut File) -> Result<()> {
             key.edit_revision == revision as u64 && key.variant_id == variant.variant_id,
             "stale delivery"
         );
+        let worker_metrics = previews
+            .take_worker_metrics()
+            .context("new preview worker HWM receipt missing")?;
+        ensure!(
+            worker_metrics.keys.contains(&key)
+                && observed_workers.contains(&worker_metrics.pid)
+                && worker_metrics
+                    .peak_resident_bytes
+                    .is_some_and(|bytes| bytes > 0),
+            "preview memory receipt does not describe the actual current producer"
+        );
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let finished = stamp();
         // Artifact reads/copies are after the completed delivery timer. Every
@@ -499,7 +511,7 @@ fn delivery(request: &Request, samples: &mut File) -> Result<()> {
             "started":started,"finished":finished,"elapsed_ms":elapsed_ms,"key":key,
             "encoded_blake3":encoded_hash,"retained_encoded":retained,
             "decoded_blake3":view.pixels.pixels().digest(),"record":view.record,"observed_worker_pids":observed_workers,
-            "native_drained":previews.native_work_drained()}),
+            "native_drained":previews.native_work_drained(),"worker_metrics":worker_metrics}),
         )?;
     }
     Ok(())
@@ -702,14 +714,18 @@ fn overlap(request: &Request, samples: &mut File) -> Result<()> {
     use std::sync::{Mutex, atomic::Ordering};
     let (mut catalog, mut previews, master) = service(request)?;
     let foreground = catalog.create_edit_variant(&master, 0, "foreground qualification")?;
+    let _ = previews.take_worker_metrics(); // Drop the untimed setup producer.
     let catalog_root = request.output.join("catalog");
     let state = Mutex::new(OverlapState::default());
     let stop = AtomicBool::new(false);
     let background_start = stamp();
+    let background_events = Mutex::new(Vec::<Value>::new());
+    let background_metrics = Mutex::new(Vec::<Value>::new());
     std::thread::scope(|scope| -> Result<()> {
-        let background = scope.spawn(|| -> Result<Vec<Value>> {
+        let background = scope.spawn(|| -> Result<()> {
             let mut background_catalog = Catalog::open(&catalog_root)?;
-            let mut events = Vec::new();
+            let mut events = background_events.lock().unwrap();
+            let mut metrics = background_metrics.lock().unwrap();
             let start = Instant::now();
             if request.phase == Phase::OverlapImport {
                 let source = request.background_source.as_ref().context("owned background source directory required")?;
@@ -724,6 +740,9 @@ fn overlap(request: &Request, samples: &mut File) -> Result<()> {
                         consumer = advanced.consumer;
                     }
                     previews.tick(&mut background_catalog)?;
+                    if let Some(measured) = previews.take_worker_metrics() {
+                        metrics.push(serde_json::to_value(measured)?);
+                    }
                     let pids = previews.active_worker_pids();
                     {
                         let mut shared = state.lock().unwrap();
@@ -760,7 +779,10 @@ fn overlap(request: &Request, samples: &mut File) -> Result<()> {
                         events.push(json!({"at":stamp(),"event":event}));
                     } else if matches!(event,ExportEvent::Published { .. }) {
                         state.lock().unwrap().pids.clear();
-                        events.push(json!({"at":stamp(),"event":event,"phases":exports.take_completion_metrics()}));
+                        let phases=exports.take_completion_metrics().context("background export metrics absent")?;
+                        metrics.push(json!({"pid":phases.worker_pid,"peak_resident_bytes":phases.worker_peak_resident_bytes,
+                            "peak_method":phases.worker_peak_method,"job":phases.job,"attempt":phases.attempt}));
+                        events.push(json!({"at":stamp(),"event":event,"phases":phases}));
                         break;
                     } else if matches!(event,ExportEvent::Failed { .. } | ExportEvent::Yielded { .. }) {
                         anyhow::bail!("background export failed: {event:?}");
@@ -774,7 +796,7 @@ fn overlap(request: &Request, samples: &mut File) -> Result<()> {
             let mut shared=state.lock().unwrap();
             shared.pids.clear();
             shared.done=true;
-            Ok(events)
+            Ok(())
         });
         let foreground_result = (|| -> Result<()> {
             let wait = Instant::now();
@@ -836,14 +858,17 @@ fn overlap(request: &Request, samples: &mut File) -> Result<()> {
         }
         let background_result = background
             .join()
-            .map_err(|_| anyhow::anyhow!("background thread panicked"))?;
-        // Keep lifecycle events even if foreground acceptance fails.
-        if let Ok(events) = &background_result {
-            exclusive(
-                &request.output.join("background.json"),
-                &json!({"started":background_start,"finished":stamp(),"events":events}),
-            )?;
-        }
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("background thread panicked")));
+        // Retain completed observations even when either foreground/background
+        // fails; no partial lifecycle evidence is silently discarded.
+        exclusive(
+            &request.output.join("background.json"),
+            &json!({"started":background_start,"finished":stamp(),
+                "events":&*background_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                "worker_metrics":&*background_metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                "background_complete":background_result.is_ok(),
+                "background_error":background_result.as_ref().err().map(|error|format!("{error:#}"))}),
+        )?;
         foreground_result?;
         background_result?;
         Ok(())

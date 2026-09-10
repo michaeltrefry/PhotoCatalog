@@ -17,13 +17,14 @@ import runpy
 import sys
 
 HELPERS=(
-    'edit_aggregate','edit_artifacts','edit_derivative','edit_large_reference','edit_request','edit_build_plan',
+    'edit_aggregate','edit_artifacts','edit_derivative','edit_large_reference','edit_request','edit_build_plan','edit_cleanup','edit_admission','edit_prepare','edit_memory',
     'edit_binding','edit_campaign','edit_correctness_matrix','edit_disk_budget',
     'edit_fixtures','edit_qualification','edit_readback','edit_reference',
     'edit_statistics','edit_verify','preview_host',
 )
 DISTRIBUTIONS={'numpy':'2.5.3','tifffile':'2026.8.23','imagecodecs':'2026.8.16',
                'blake3':'1.0.9','psutil':'7.2.2'}
+THREAD_ENV={name:'1' for name in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','VECLIB_MAXIMUM_THREADS')}
 MAX_FILES=50000
 MAX_FILE_BYTES=512*1024*1024
 
@@ -145,19 +146,21 @@ def import_closure():
 
 
 def runtime_identity():
+    if any(os.environ.get(name)!=value for name,value in THREAD_ENV.items()):
+        raise ValueError('explicit fixed qualification thread environment required')
     distributions={name:distribution_files(name) for name in DISTRIBUTIONS}
     return dict(executable=str(Path(sys.executable).resolve(strict=True)),
                 executable_sha256=file_hash(Path(sys.executable).resolve(strict=True)),
                 prefix=str(Path(sys.prefix).resolve()),base_prefix=str(Path(sys.base_prefix).resolve()),
                 version=sys.version,cache_tag=sys.implementation.cache_tag,
-                platform=sys.platform,distributions=distributions,import_closure=import_closure())
+                platform=sys.platform,environment=THREAD_ENV,distributions=distributions,import_closure=import_closure())
 
 
 def validate_runtime(expected):
     # Compare exact distribution manifests independently of how many modules this
     # launcher happens to have imported; check every recorded stdlib file too.
     actual=runtime_identity()
-    for field in ('executable','executable_sha256','prefix','base_prefix','version','cache_tag','platform','distributions','import_closure'):
+    for field in ('executable','executable_sha256','prefix','base_prefix','version','cache_tag','platform','environment','distributions','import_closure'):
         if actual[field]!=expected[field]:
             raise ValueError('runtime binding mismatch: '+field)
 
@@ -218,7 +221,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--binding',type=Path,required=True)
     parser.add_argument('--binding-sha256',required=True)
-    parser.add_argument('--entry',choices=('edit_campaign','edit_verify','edit_fixtures','edit_aggregate'),required=True)
+    parser.add_argument('--entry',choices=('edit_campaign','edit_verify','edit_fixtures','edit_aggregate','edit_prepare','edit_build_plan'),required=True)
     parser.add_argument('arguments',nargs=argparse.REMAINDER)
     args=parser.parse_args()
     if not sys.flags.isolated or not sys.flags.dont_write_bytecode:

@@ -95,8 +95,10 @@ def main():
     if digest(manifest_path,'sha256',qualification.MIB)!=preparation['manifest']['sha256']:
         raise ValueError('original cohort manifest bytes differ')
     result=build_plan(preparation,build,read_json(manifest_path,qualification.MIB),args.campaign_root)
+    encoded=json.dumps(result,indent=2,allow_nan=False)+'\n'
+    if len(encoded.encode())>16*qualification.MIB:
+        raise ValueError('resolved binding exceeds16MiB; revise preparation before any campaign')
     with args.output.open('x') as stream:
-        json.dump(result,stream,indent=2,allow_nan=False)
-        stream.write('\n')
+        stream.write(encoded)
 
 if __name__=='__main__':main()

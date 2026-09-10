@@ -18,6 +18,8 @@ import time
 import threading
 from pathlib import Path
 import psutil
+import edit_admission
+import edit_cleanup
 from preview_host import HostObservation, host_identity
 from edit_verify import digest, read_json
 
@@ -370,6 +372,7 @@ def invoke(command, folder, limits, disk_root):
 
 
 def validate_binding(binding):
+    edit_admission.validate_execution(binding)
     if binding.get('version')!=2 or binding.get('pending_execution_gates')!=[]:
         raise ValueError('final reviewed protocol and resolved execution gates required')
     if binding.get('automatic_retries')!=0 or not binding.get('actions'):
@@ -378,7 +381,7 @@ def validate_binding(binding):
         raise ValueError('campaign child bound')
     for key in ('python','probe','worker','verifier','fixture_generator'):
         item=binding[key]
-        if not Path(item['path']).is_absolute() or digest(item['path'],'sha256',512*MIB)!=item['sha256']:
+        if not Path(item['path']).is_absolute() or digest(Path(item['path']).resolve(strict=True) if key=='python' else item['path'],'sha256',512*MIB)!=item['sha256']:
             raise ValueError('executable/script identity: '+key)
     if binding['minimum_free_bytes']<binding['retained_bound_bytes']+binding['active_bound_bytes']+binding['copies_bound_bytes']+binding['free_reserve_bytes']:
         raise ValueError('minimum free space does not fund bounded peak and reserve')
@@ -393,7 +396,7 @@ def validate_binding(binding):
             raise ValueError('action deadline/process memory bound')
     for name in ('source_archive','build_reference','protocol'):
         item=binding[name]
-        if digest(item['path'],'sha256',512*MIB)!=item['sha256']:
+        if digest(Path(item['path']).resolve(strict=True) if key=='python' else item['path'],'sha256',512*MIB)!=item['sha256']:
             raise ValueError('build/protocol evidence identity: '+name)
     if re.fullmatch('[0-9a-f]{40}',binding.get('source_commit','')) is None:
         raise ValueError('full source revision required')
@@ -429,8 +432,7 @@ def execute(binding,root):
                     target=root/action['probe_output']
                     if root.resolve() not in target.resolve().parents:
                         raise ValueError('verifier target outside campaign')
-                    command=[binding['python']['path'],binding['verifier']['path'],'--root',str(target),
-                             '--output',str(root/(action['id']+'-verification.json'))]
+                    command=action['command']
                 elif kind=='generate':
                     command=[binding['python']['path'],binding['fixture_generator']['path'],'--admitted',
                              '--fixture',action['fixture'],'--output',str(root/(action['id']+'.tiff')),
@@ -440,6 +442,8 @@ def execute(binding,root):
                 limits=dict(deadline_seconds=action['deadline_seconds'],
                             process_rss_bytes=action['process_rss_bytes'],group_rss_bytes=action['group_rss_bytes'],
                             free_reserve_bytes=binding['free_reserve_bytes'])
+                if command!=action['command']:
+                    raise ValueError('actual command differs from frozen argv')
                 observed=invoke(command,folder,limits,root)
                 if kind=='probe':
                     proof=read_json(expected/'receipt.json')
@@ -454,6 +458,10 @@ def execute(binding,root):
                     if proof.get('id')!=action['fixture'] or digest(root/(action['id']+'.tiff'),'sha256',2*1024**3)!=proof.get('sha256'):
                         raise ValueError('generated source receipt/bytes disagree')
                 results.append(dict(id=action['id'],result=observed,proof=proof))
+                if kind=='verify':
+                    record=next(item for item in binding['case_records'] if item['id']==action['id'][7:])
+                    if record['cleanup_path'] is not None:
+                        edit_cleanup.cleanup_export(root,record)
     except BaseException as exc:
         error=f'{type(exc).__name__}: {exc}'
     exclusive(root/'campaign.json',dict(version=2,complete=error is None,error=error,results=results,

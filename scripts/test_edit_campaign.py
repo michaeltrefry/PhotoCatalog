@@ -18,17 +18,19 @@ import edit_correctness_matrix as matrix
 
 def binding():
     file=dict(path='/private/frozen',sha256='a'*64)
-    return dict(version=2,pending_execution_gates=[],automatic_retries=0,
+    value=dict(version=2,pending_execution_gates=[],automatic_retries=0,
                 actions=[dict(id='one',kind='probe',deadline_seconds=60,process_rss_bytes=100,group_rss_bytes=200)],
                 **{key:file.copy() for key in ('python','probe','worker','verifier','fixture_generator',
                                               'source_archive','build_reference','protocol')},
                 source_commit='b'*40,minimum_free_bytes=1000,retained_bound_bytes=300,
                 active_bound_bytes=200,copies_bound_bytes=100,free_reserve_bytes=400)
+    value['python']['path']=sys.executable
+    return value
 
 
 class BindingContracts(unittest.TestCase):
     def check(self,value):
-        with patch.object(campaign,'digest',return_value='a'*64):
+        with patch.object(campaign,'digest',return_value='a'*64), patch.object(campaign.edit_admission,'validate_execution'):
             campaign.validate_binding(value)
 
     def test_funded_complete_binding_and_pending_rejection(self):

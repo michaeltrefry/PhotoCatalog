@@ -8,8 +8,9 @@ import edit_fixtures
 
 def complete_cases(manifest):
     base=q.plan(manifest)['cases']
-    return (base+supplementary.analytic_matrix()+supplementary.output_matrix()
-            +supplementary.proxy_references()+supplementary.support_matrix()
+    # Current-delivery verifiers consume these full reference cases immediately.
+    return (supplementary.proxy_references()+base+supplementary.analytic_matrix()+supplementary.output_matrix()
+            +supplementary.support_matrix()
             +supplementary.failures()+supplementary.durable_metadata_cases()
             +supplementary.overlap_cases())
 

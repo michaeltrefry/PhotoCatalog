@@ -16,6 +16,7 @@ import edit_fixtures
 import edit_statistics
 import edit_artifacts
 import edit_large_reference
+import edit_memory
 
 MAX_JSON=256*1024
 MAX_SAMPLES=16*1024*1024
@@ -94,6 +95,7 @@ def sample_records(stream, total_limit=MAX_SAMPLES, line_limit=MAX_JSON):
         used+=len(line)
         if used>total_limit or len(line)>line_limit:
             raise ValueError('sample byte admission exceeded')
+        if not line.endswith(b'\n'):raise ValueError('unterminated sample frame')
         yield strict_json(line)
 
 
@@ -292,6 +294,11 @@ def verify_case(root):
                 coverage.add('proxy_artifacts')
             for specification,artifact in output_coverage(request,value):
                 path=owned(root,artifact['path'])
+                report=artifact['report']
+                if (report['source_fingerprint']!=request['source_blake3']
+                    or report['recipe_digest']!=canonical[identity[0]]['digest']
+                    or report['encoded_extent']!=path.stat().st_size):
+                    raise ValueError('encoder report source/recipe/extent differs')
                 if digest(path,'blake3',request['encoded_extent'])!=artifact['blake3']:
                     raise ValueError('encoded artifact identity')
                 if actual is None:
@@ -304,11 +311,19 @@ def verify_case(root):
                     raise ValueError('independent encoded pixel mismatch')
                 proofs.append(proof)
                 coverage.add('encoded_pixels_metadata')
+    background=None
+    background_sha256=None
+    if request['phase'] in ('overlap_import','overlap_export'):
+        background=read_json(root/'background.json',16*1024*1024)
+        if background.get('background_complete') is not True:
+            raise ValueError('background did not complete successfully')
+        background_sha256=digest(root/'background.json','sha256',16*1024*1024)
+    memory=edit_memory.evidence(request,receipt,values,background=background)
     return dict(version=1,verified=True,whole_story_qualified=False,request_sha256=digest(root/'request.json','sha256',MAX_JSON),
                 receipt_sha256=digest(root/'receipt.json','sha256',MAX_JSON),
                 samples_sha256=digest(root/'samples.jsonl','sha256',MAX_SAMPLES),
                 sample_count=len(values),analytic=numerical,encoded=proofs,overlap=overlap,large=large,
-                coverage=sorted(coverage),reference_cases=references,remaining=[])
+                coverage=sorted(coverage),reference_cases=references,memory=memory,background_sha256=background_sha256,remaining=[])
 
 
 def main():

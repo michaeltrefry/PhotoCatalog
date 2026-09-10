@@ -347,3 +347,44 @@ removed using a bounded, symlink-safe, digest-recorded cleanup. First measured
 output, all raw evidence, preview namespaces and source copies remain. Failed
 verification or cleanup stops progression and preserves remaining state; no
 automatic retry or incomplete deletion receipt can count as completed cleanup.
+
+### Executable preparation, admission and cleanup wiring
+
+`edit_prepare.py` is an explicit untimed preparation entry point under the frozen
+`-I -B` launcher. It has a 3,600-second total preparation deadline and uses seven
+serial generator children, each with a600-second deadline and1GiB sampled process
+and group ceilings. Every original is opened read-only/nonblocking/no-follow,
+admitted as an ordinary file, copied with64KiB buffers to an exclusive destination,
+and checked by SHA256/BLAKE3 and held-file/path identity. Partial copies and failed
+receipts remain. There is no resume or automatic retry. The copied background
+original occupies a distinct one-file directory so the overlap import does real
+new work. All preparation needs a separate parent admission and outer owned-process
+supervisor; no preparation has been run from this source checkpoint.
+
+The resolved builder reads only small preparation/build receipts and emits every
+full normalized Rust Request, explicit resource defaults/overrides and exact child
+argv. Its immutable manifest lists all533 case records and37 sources. Eight proxy
+reference cases run first, before immediate warm/first-RAW verifiers need them.
+Generation receipts are recorded separately under the explicit preparation root.
+The measurement coordinator admits the complete helper/runtime closure, exact
+registry order, source copies and calculated funding before children. It cannot
+use worktree imports or arbitrary substituted source copies. The fixed environment
+records OMP_NUM_THREADS, OPENBLAS_NUM_THREADS, MKL_NUM_THREADS and
+VECLIB_MAXIMUM_THREADS as1.
+
+Cleanup derives all22 recovery roots from authoritative published item receipts:
+these are siblings of destinations, not inside the catalog. Each must match its
+photo-seal snapshot/authority and exact operation directory. It removes those
+roots, the disposable catalog and21 unselected destinations only after successful
+verification and complete owned-process retirement. Digest-recorded deletion lists
+are retained before changes; first measured destination and every evidence file
+remain. Removing one owned hardlink changes inode ctime, so later deletion checks
+reconcile identity/size/mtime and full content again rather than incorrectly
+rejecting our own earlier unlink. No unknown prefix sweep is performed.
+
+Delivery observations now include transient producer-bound `worker_metrics` and
+background completion receipts retain their worker peaks even on later failure.
+The per-case verifier combines positive available probe/worker high-water receipts
+with the separately sampled group telemetry. A successful100ms sampler observation
+alone cannot award memory acceptance. Final peak-plus-margin decisions remain
+prospective until the complete admitted campaign and independent aggregate pass.

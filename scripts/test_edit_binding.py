@@ -49,7 +49,7 @@ class FrozenPackageContracts(unittest.TestCase):
 
     def test_runtime_dependency_bytes_not_only_versions_are_bound(self):
         original=dict(executable='/python',executable_sha256='a',prefix='/env',base_prefix='/base',
-                      version='v',cache_tag='tag',platform='x',distributions={'numpy':{'files':{'extension.so':'old'}}},import_closure={})
+                      version='v',cache_tag='tag',platform='x',environment={},distributions={'numpy':{'files':{'extension.so':'old'}}},import_closure={})
         changed={**original,'distributions':{'numpy':{'files':{'extension.so':'new'}}}}
         with patch.object(binding,'runtime_identity',return_value=changed):
             with self.assertRaises(ValueError): binding.validate_runtime(original)
