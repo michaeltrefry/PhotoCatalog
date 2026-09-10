@@ -276,11 +276,11 @@ pub fn reconcile_paths(db: &Connection, limit: usize) -> Result<AliasProgress> {
     Ok(AliasProgress {
         projected: batch.len(),
         pending: pending(db)?,
-        unbound: db.query_row(
+        unbound: u64::try_from(db.query_row(
             "SELECT unbound FROM export_alias_state WHERE id=1",
             [],
-            |r| r.get(0),
-        )?,
+            |r| r.get::<_, i64>(0),
+        )?)?,
     })
 }
 struct Admission<'a> {

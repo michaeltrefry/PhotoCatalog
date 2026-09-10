@@ -320,3 +320,81 @@ fn undo_aba_invalidates_active_export_before_any_destination_publication() -> an
     assert_eq!(service.reserved_bytes(), 0);
     Ok(())
 }
+
+#[test]
+fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan()
+-> anyhow::Result<()> {
+    for mode in ["resume", "canceled", "stale"] {
+        let root = tempfile::tempdir()?;
+        let (mut c, key, mut p, _) = setup(root.path())?;
+        let path = root.path().join("output.png");
+        let job = enqueue(
+            &mut c,
+            &key,
+            &path,
+            OutputFormat::Png {
+                depth: IntegerDepth::Eight,
+            },
+        )?;
+        let mut service = ExportService::open(&c, &executable(), limits())?;
+        service.recover(&mut c, 32)?;
+        let work = c.claim_photo_export(&job)?.unwrap();
+        let (output, xmp) = c.photo_export_inputs(&work.plan)?;
+        let mut worker = photocatalog::export_worker::ExportWorkerProcess::spawn(
+            &executable(),
+            &root.path().join("catalog/photo-export-workers"),
+            work.clone(),
+            &output,
+            xmp.as_deref(),
+            limits().render,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let result = loop {
+            if let Some(result) = worker.poll(&AtomicBool::new(false))? {
+                break result;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        // This is the crash boundary: the process completed and sealed bytes, but
+        // no catalog acceptance or destination publication happened.
+        assert!(!path.exists());
+        assert!(result.sealed.recovery_directory().is_dir());
+        drop(worker);
+        drop(service);
+        if mode == "canceled" {
+            c.cancel_photo_export_job(&job)?;
+        }
+        if mode == "stale" {
+            c.save_edit_recipe(
+                &key,
+                0,
+                &Recipe::V1(RecipeV1 {
+                    exposure_ev: 2.0,
+                    ..Default::default()
+                }),
+            )?;
+        }
+        let mut service = ExportService::open(&c, &executable(), limits())?;
+        assert!(service.recover(&mut c, 32)?.complete);
+        if mode == "resume" {
+            finish(&mut service, &mut c, &mut p, &job)?;
+            assert!(path.exists());
+            assert_eq!(
+                photocatalog::metadata_export::inspect_file_revision(&path, 8 * 1024 * 1024)?
+                    .digest,
+                result.sealed.payload.digest
+            );
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while c.photo_export_job(&job)?.state == "queued" {
+                service.tick(&mut c, &mut p, &job, &AtomicBool::new(false))?;
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!path.exists());
+            assert!(result.sealed.recovery_directory().is_dir());
+        }
+    }
+    Ok(())
+}

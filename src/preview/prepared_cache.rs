@@ -268,12 +268,8 @@ mod tests {
         for next_generation in [1, 2] {
             let root = tempfile::tempdir().unwrap();
             let produced = produced(root.path());
-            let mut cache = PreparedCache::open(
-                root.path().join("cache"),
-                produced.receipt.bytes,
-                1,
-            )
-            .unwrap();
+            let mut cache =
+                PreparedCache::open(root.path().join("cache"), produced.receipt.bytes, 1).unwrap();
             cache.adopt(1, &produced).unwrap();
             let key = identity(1, &"a".repeat(64), &WhiteBalance::AsShot).unwrap();
             let old_path = cache.entries[&key].value.path.to_path().unwrap();
@@ -296,7 +292,8 @@ mod tests {
             cache.adopt(next_generation, &produced).unwrap();
             assert_eq!(cache.bytes, produced.receipt.bytes);
             assert_eq!(cache.entries.len(), 1);
-            let next_key = identity(next_generation, &"a".repeat(64), &WhiteBalance::AsShot).unwrap();
+            let next_key =
+                identity(next_generation, &"a".repeat(64), &WhiteBalance::AsShot).unwrap();
             assert!(cache.entries.contains_key(&next_key));
             assert_eq!(fs::read_dir(&cache.root).unwrap().count(), 1);
         }

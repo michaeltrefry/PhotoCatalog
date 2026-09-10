@@ -175,3 +175,35 @@ fn publication_conflict_is_not_reported_as_published() -> Result<()> {
     assert_eq!(std::fs::read(dest)?, b"external file");
     Ok(())
 }
+
+#[test]
+fn export_state_seeks_do_not_scan_pending_or_completed_prefixes() -> Result<()> {
+    for count in [100, 5000] {
+        let (_temp, mut c, _) = fixture()?;
+        let job = c.begin_photo_export()?;
+        let tx = c.db.transaction()?;
+        for sequence in 1..=count {
+            tx.execute("INSERT INTO photo_export_items(job,sequence,destination,plan,authority,state) VALUES(?1,?2,?3,'{}','fixture',?4)",params![job.id,sequence,sequence.to_string(),if sequence%2==0{"pending"}else{"published"}])?;
+        }
+        tx.commit()?;
+        assert_eq!(c.next_sealed_photo_export(&job.id)?, None);
+        let mut query = c.db.prepare(NEXT_SEALED)?;
+        assert!(query.query([&job.id])?.next()?.is_none());
+        assert!(query.get_status(rusqlite::StatementStatus::VmStep) < 50);
+        assert_eq!(query.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+        c.db.execute(
+            "UPDATE photo_export_items SET state='published' WHERE job=?1",
+            [&job.id],
+        )?;
+        c.db.execute(
+            "UPDATE photo_export_items SET state='pending' WHERE job=?1 AND sequence=?2",
+            params![job.id, count],
+        )?;
+        let mut query = c.db.prepare(NEXT_PENDING)?;
+        assert_eq!(query.query_row([&job.id], |r| r.get::<_, i64>(0))?, count);
+        assert!(query.get_status(rusqlite::StatementStatus::VmStep) < 50);
+        assert_eq!(query.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+        assert_eq!(query.get_status(rusqlite::StatementStatus::Sort), 0);
+    }
+    Ok(())
+}

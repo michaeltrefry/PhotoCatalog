@@ -19,43 +19,79 @@ fn request(root: &Path) -> Request {
         renderer_identity: "prior-export-renderer".into(),
         identity: EditRenderIdentity {
             source: RenderIdentity {
-                asset_id: "a".into(), generation: 1, fingerprint: Some(fingerprint.clone()),
-                state: "ready".into(), metadata_revision: 0,
+                asset_id: "a".into(),
+                generation: 1,
+                fingerprint: Some(fingerprint.clone()),
+                state: "ready".into(),
+                metadata_revision: 0,
             },
-            key: VariantKey::master("a"), revision: 2,
+            key: VariantKey::master("a"),
+            revision: 2,
             recipe_digest: recipe.validate().unwrap().digest().into(),
         },
         original: NativePath::from_path(&root.join("original.png")),
-        original_revision: FileRevision { bytes: 10, digest: fingerprint, modified_ns: 1, identity: (1, 2) },
+        original_revision: FileRevision {
+            bytes: 10,
+            digest: fingerprint,
+            modified_ns: 1,
+            identity: (1, 2),
+        },
         recipe,
         output: StoredOutput {
-            size: OutputSize::Original, format: OutputFormat::Png { depth: IntegerDepth::Eight },
-            profile: StoredProfile::Srgb, alpha: AlphaPolicy::Preserve,
+            size: OutputSize::Original,
+            format: OutputFormat::Png {
+                depth: IntegerDepth::Eight,
+            },
+            profile: StoredProfile::Srgb,
+            alpha: AlphaPolicy::Preserve,
         },
         metadata: MetadataSelection::Omit,
         xmp_blob: None,
         destination: DestinationSnapshot {
-            version: 1, operation: uuid::Uuid::new_v4().to_string(),
-            destination: root.join("destination.png"), expected: None, max_existing_bytes: 1024,
+            version: 1,
+            operation: uuid::Uuid::new_v4().to_string(),
+            destination: root.join("destination.png"),
+            expected: None,
+            max_existing_bytes: 1024,
         },
         max_original_bytes: 1024,
         max_payload_bytes: 1024,
+        alias_limits: Default::default(),
     };
-    let authority = blake3::hash(&serde_json::to_vec(&plan).unwrap()).to_hex().to_string();
+    let authority = blake3::hash(&serde_json::to_vec(&plan).unwrap())
+        .to_hex()
+        .to_string();
     Request {
         version: 1,
-        work: ExportWork { job: "job".into(), sequence: 1, attempt: uuid::Uuid::new_v4().to_string(), authority, plan },
+        work: ExportWork {
+            job: "job".into(),
+            sequence: 1,
+            attempt: uuid::Uuid::new_v4().to_string(),
+            authority,
+            plan,
+        },
         limits: PhotoRenderLimits {
-            decode: DecodeLimits { max_encoded_bytes: 1024, ..DecodeLimits::default() },
-            render: RenderLimits::default(), encode: EncodeLimits::default(), max_encoded_extent: 1024,
+            decode: DecodeLimits {
+                max_encoded_bytes: 1024,
+                ..DecodeLimits::default()
+            },
+            render: RenderLimits::default(),
+            encode: EncodeLimits::default(),
+            max_encoded_extent: 1024,
         },
     }
 }
 fn stage(root: &Path, request: &Request, with_lock: bool) -> PathBuf {
     let path = root.join(format!("photo-worker-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&path).unwrap();
-    write(&path.join("request.json"), &serde_json::to_vec(request).unwrap()).unwrap();
-    if with_lock { write(&path.join("active.lock"), b"").unwrap(); }
+    write(
+        &path.join("request.json"),
+        &serde_json::to_vec(request).unwrap(),
+    )
+    .unwrap();
+    if with_lock {
+        write(&path.join("active.lock"), b"").unwrap();
+    }
     path
 }
 #[test]
@@ -107,7 +143,9 @@ fn busy_worker_is_retained_and_delayed_open_cannot_cross_retirement() {
     // Windows may retain a tombstoned path while the delayed handle is open.
     let recovered = if recovered.retired.is_empty() {
         recover_export_transports(temp.path(), 2).unwrap()
-    } else { recovered };
+    } else {
+        recovered
+    };
     assert_eq!(recovered.retired.len(), 1);
     discard_retired_export_transport(&recovered.retired[0]).unwrap();
 }
@@ -116,10 +154,16 @@ fn partial_unknown_and_wrong_authority_transports_are_never_fenced() {
     for kind in ["missing-request", "unknown-file", "bad-authority"] {
         let temp = tempfile::tempdir().unwrap();
         let mut request = request(temp.path());
-        if kind == "bad-authority" { request.work.authority = "b".repeat(64); }
+        if kind == "bad-authority" {
+            request.work.authority = "b".repeat(64);
+        }
         let path = stage(temp.path(), &request, true);
-        if kind == "missing-request" { fs::remove_file(path.join("request.json")).unwrap(); }
-        if kind == "unknown-file" { write(&path.join("user-file"), b"preserve").unwrap(); }
+        if kind == "missing-request" {
+            fs::remove_file(path.join("request.json")).unwrap();
+        }
+        if kind == "unknown-file" {
+            write(&path.join("user-file"), b"preserve").unwrap();
+        }
         let result = recover_export_transports(temp.path(), 1).unwrap();
         assert_eq!(result.retained.len(), 1);
         assert!(result.retired.is_empty());
@@ -141,7 +185,9 @@ fn recovery_bound_and_interrupted_discard_never_invent_work() {
     // lock removal. Both paths remain non-launchable by their retired names.
     for (index, retired) in result.retired.iter().enumerate() {
         fs::remove_file(retired.staging.join("request.json")).unwrap();
-        if index == 1 { fs::remove_file(retired.staging.join("active.lock")).unwrap(); }
+        if index == 1 {
+            fs::remove_file(retired.staging.join("active.lock")).unwrap();
+        }
     }
     let resumed = recover_export_transports(temp.path(), 2).unwrap();
     assert_eq!(resumed.cleaned, 2);
@@ -158,7 +204,9 @@ fn transport_read_admits_exact_length_and_rejects_excess() {
 
 #[test]
 fn pre_admission_child_entry() {
-    let Some(ready) = std::env::var_os("PHOTOCATALOG_EXPORT_TEST_READY") else { return; };
+    let Some(ready) = std::env::var_os("PHOTOCATALOG_EXPORT_TEST_READY") else {
+        return;
+    };
     fs::write(ready, b"ready").unwrap();
     let mut token = [0];
     let _ = std::io::stdin().read(&mut token);
@@ -174,13 +222,25 @@ fn cancellation_reaps_actual_pre_admission_child_and_retires_missing_lease() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "export_worker::tests::pre_admission_child_entry"])
         .env("PHOTOCATALOG_EXPORT_TEST_READY", &ready)
-        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
     let lease = child.stdin.take();
-    let mut process = ExportWorkerProcess { child, lease, staging: staging.clone(), request, exited: false };
+    let mut process = ExportWorkerProcess {
+        child,
+        lease,
+        staging: staging.clone(),
+        request,
+        exited: false,
+    };
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !ready.exists() {
-        assert!(std::time::Instant::now() < until, "test child admission timeout");
+        assert!(
+            std::time::Instant::now() < until,
+            "test child admission timeout"
+        );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     assert!(process.poll(&AtomicBool::new(true)).is_err());
@@ -188,5 +248,10 @@ fn cancellation_reaps_actual_pre_admission_child_and_retires_missing_lease() {
     assert!(process.child.try_wait().unwrap().is_some());
     process.retire_transport().unwrap();
     assert!(!staging.exists());
-    assert!(recover_export_transports(&root, 2).unwrap().retired.is_empty());
+    assert!(
+        recover_export_transports(&root, 2)
+            .unwrap()
+            .retired
+            .is_empty()
+    );
 }

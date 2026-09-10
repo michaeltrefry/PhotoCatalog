@@ -31,7 +31,10 @@ fn setup(root: &Path) -> (Catalog, PreviewService, String, PathBuf) {
 }
 fn persist(previews: &PreviewService, job: &SavedJob) -> String {
     job.validate().unwrap();
-    assert!(job.request.validate().is_err(), "old renderer cannot launch");
+    assert!(
+        job.request.validate().is_err(),
+        "old renderer cannot launch"
+    );
     let id = blake3::hash(&serde_json::to_vec(&job.request.keys).unwrap())
         .to_hex()
         .to_string();

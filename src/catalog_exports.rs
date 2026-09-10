@@ -29,12 +29,14 @@ CREATE TABLE photo_export_items(job TEXT NOT NULL REFERENCES photo_export_jobs(i
  attempt TEXT,seal TEXT,receipt TEXT,error TEXT,
  PRIMARY KEY(job,sequence),UNIQUE(job,destination));
 CREATE INDEX photo_export_rendering ON photo_export_items(job,sequence) WHERE state='rendering';
-CREATE INDEX photo_export_pending ON photo_export_items(job,sequence) WHERE state IN ('pending','sealed');
+CREATE INDEX photo_export_pending ON photo_export_items(job,state,sequence);
 CREATE INDEX storage_export_path ON storage_bindings(native_path);
 CREATE INDEX storage_export_object ON storage_bindings(file_key) WHERE file_key IS NOT NULL;
 ";
 const BLOB_LIMIT: usize = 16 * 1024 * 1024;
 const PLAN_LIMIT: usize = 128 * 1024;
+const NEXT_SEALED: &str = "SELECT sequence FROM photo_export_items WHERE job=?1 AND state='sealed' ORDER BY sequence LIMIT 1";
+const NEXT_PENDING: &str = "SELECT sequence,plan,authority FROM photo_export_items WHERE job=?1 AND state='pending' ORDER BY sequence LIMIT 1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -290,7 +292,10 @@ impl Catalog {
     }
     /// One accepted result ready for guarded publication, including after restart.
     pub fn next_sealed_photo_export(&self, id: &str) -> Result<Option<i64>> {
-        Ok(self.db.query_row("SELECT sequence FROM photo_export_items WHERE job=?1 AND state='sealed' ORDER BY sequence LIMIT 1",[id],|r|r.get(0)).optional()?)
+        Ok(self
+            .db
+            .query_row(NEXT_SEALED, [id], |r| r.get(0))
+            .optional()?)
     }
     /// Recover a single stored rendering authority. An executor must hold the
     /// catalog export lease and retire/reap its transport before fencing it.
@@ -641,7 +646,11 @@ impl Catalog {
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(job(&tx, id)?.state == "queued", "export job is not queued");
-        let row:Option<(i64,String,String)>=tx.query_row("SELECT sequence,plan,authority FROM photo_export_items WHERE job=?1 AND state='pending' ORDER BY sequence LIMIT 1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let row: Option<(i64, String, String)> = tx
+            .query_row(NEXT_PENDING, [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
         let Some((sequence, encoded, authority)) = row else {
             return Ok(None);
         };
