@@ -182,10 +182,10 @@ Type: `feature`
 Depends on: sc-22840, sc-22842, sc-22843, sc-22844  
 Inherits epic requirements: E4, E5, E6, E7, E9, E10, E11
 
-Execute the approved dry-run selection of one current catalog per family into PhotoCatalog, retaining distinct source records and virtual copies while resolving shared originals and path mappings. Older catalog backups are not merged into the imported history. Translate only settings whose semantics are validated; preserve every remaining selected-source payload and expose the compatibility result.
+Execute the approved dry-run selection of one current catalog per family into ONE consolidated destination PhotoCatalog catalog/library, retaining distinct source records and virtual copies while resolving shared originals and path mappings. Older catalog backups are not merged into the imported history. Translate only settings whose semantics are validated; preserve every remaining selected-source payload and expose the compatibility result.
 
 Acceptance (story-local):
-- Selected source counts and relationships reconcile after import: files, metadata, keywords, collections and virtual copies remain accounted for; preserved smart-collection/stack/history constructs are explicitly classified where native behavior differs.
+- All selected source catalogs import into the same destination catalog, displaying the existing filesystem folder hierarchy across every year and preserving source provenance without silently moving originals. Selected source counts and relationships reconcile after import: files, metadata, keywords, collections and virtual copies remain accounted for; preserved smart-collection/stack/history constructs are explicitly classified where native behavior differs.
 - Reimport or resume is idempotent; excluded backups produce no imported records, and overlap or conflicting variants among the selected current catalogs are handled by stable source identities and explicit decisions.
 - Each imported variant exposes original Adobe settings/history and a compatibility status; validated settings are rendered through native recipes, with unsupported settings and appearance differences clearly reported.
 

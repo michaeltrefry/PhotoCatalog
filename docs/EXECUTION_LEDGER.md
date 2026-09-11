@@ -397,3 +397,7 @@ Merged-main CI34653984699 now all4 SUCCESS at b411ab5b. Tiny proof session1880 r
 
 sc-23137 | Done (read back; comment23145) | PR13 merged b411ab5b, PR/main all4 CIgreen; qualified9aa/e85 S9 native | direct108-command comparison and actual33-command selected pause/resume/replay PASS, independent aedce5f7; all sessions reaped | no remaining bug work.
 sc-22844 | In Progress | draftPR11 published003770e, all4 CI34654732967 SUCCESS; local closeout docs ahead | selected2/excluded1 fixture final8ac44056, sources/prerequisites/replay preserved; native-generated renderer proof47348bfe | pending actual user catalog selection, then production-specific profile/funding/admission, selected XMP, final dry run and delivery. Real FULL/PATHS/sidecar scans remain completed; no real packet phase or migration started.
+
+User clarification: proposed16 source catalogs are approved for TEST/dry-run use; intended destination is ONE consolidated PhotoCatalog library with nested folders such as year/month/date. Epic E7/E10 and S10 updated/read back, S9 comment23147. Current Rust physical-folder hierarchy and recursive queries verified directly. Approval does not authorize final migration, backup ingestion or filesystem reorganization. Source message bca24810 retained privately; next test manifest/profile must bind this limited scope.
+
+User follow-up confirms the folder display should mirror the filesystem, with every year in the same catalog. E7 and S10 now state that directly.
