@@ -779,6 +779,12 @@ class PhaseContracts(unittest.TestCase):
         # The standalone reviewed helper uses the same concrete default without
         # importing the driver's module globals or executing any module code.
         node.args.defaults = [ast.Constant(16*W.MIB)]
+        class StandaloneConstants(ast.NodeTransformer):
+            def visit_Name(self, value):
+                if value.id == 'MIB':
+                    return ast.copy_location(ast.Constant(W.MIB), value)
+                return value
+        node = StandaloneConstants().visit(node)
         helper = Path(profile['helper']['path'])
         helper.write_text(helper.read_text()+ast.unparse(node)+'\n')
         profile.update(protocol=2, kind='canonical_hash_and_replay_json_override',

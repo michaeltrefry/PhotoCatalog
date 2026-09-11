@@ -140,7 +140,23 @@ def file_sha(path):
 
 def read_json(path, cap=16*MIB):
     with open(path, "rb") as handle:
-        raw = handle.read(cap+1)
+        # BufferedReader.read(n) can allocate n bytes even for a tiny file.
+        # Keep admitted reads small without assuming a stable file size.
+        if type(cap) is not int or not 0 <= cap <= 64*MIB:
+            raw = handle.read(cap+1)
+        else:
+            chunks = []
+            remaining = cap+1
+            while remaining:
+                chunk = handle.read(min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if not remaining:
+                raise ValueError(f"JSON admission limit exceeded: {path}")
+            raw = b"".join(chunks)
+            del chunks, chunk
     if len(raw) > cap:
         raise ValueError(f"JSON admission limit exceeded: {path}")
     text = raw.decode(json.detect_encoding(raw), "surrogatepass")

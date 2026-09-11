@@ -4,7 +4,9 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-Current S9 execution is stopped after seventeenth attempt
+Current production execution is stopped after attempt 18, `2bacecf2-06d6-4341-bb56-4f6a83c42a91`, exceeded the unchanged 512 MiB sampled Python RSS limit at 539,197,440 bytes during saved-row replay. Session 91297 exited and was reaped; all observed owned processes were reaped. Only fresh discovery 10238 was added; journal next is 10239. Result SHA256 `2854b115c33d7765c0460ed89c33c0e8aae8e436368f8270eba8b1aa25afdddd` remains failed. The diagnostic below requested file-sized buffers while production requested cap-sized buffers, so its memory result did not establish production allocation behavior. The bounded-read correction passed all 129 Lightroom Python tests and independent review. Corrected read-only diagnostic v3 reached the exact next unrecorded command in 197.2 seconds at 253,100,032 bytes peak RSS, with 10,221 saved commands replayed and no native dispatch. Actual JSON requests were at most 65,536 bytes; hash reads retained their original 1 MiB requests. Session 4846 and child 33755 were reaped; failed evidence was unchanged. This is saved-prefix qualification, with production continuation still subject to independent failure review and separate admission. Current pushed source is `17033fa`, with all four jobs in CI `34616365521` passing. The older snapshots below are historical.
+
+Historical S9 stop after seventeenth attempt
 `e1ddf030-f29f-440c-84d1-dd0421b079a3` exceeded the 512 MiB Python sampled RSS
 limit during saved-page JSON replay (537,378,816 bytes observed). Actual session
 `88833` exited and was reaped; cleanup recorded no remaining observed processes.
@@ -47,6 +49,12 @@ sc-22836–sc-22843 are verified Done. S8 PR #10 merged as `6ff4487`, with ident
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
 | sc-22847 | To Do | Desktop UI | Prerequisites sc-22840/sc-22841/sc-22842/sc-22843/sc-22845/sc-22846 | Dependency-bound |
 | sc-22848 | To Do | Integrated readiness | Prerequisite sc-22847 | Terminal proof only after integration |
+
+## Bounded JSON read correction
+
+Production requested the configured JSON cap even for small files. The earlier diagnostic substituted file-sized reads and therefore did not reproduce that allocation behavior. The corrected reader uses at most 64 KiB per read for admitted caps, joins fixed chunks, and releases the input buffers before decoding objects. It preserves byte encoding, JSON errors and cap overflow behavior. Public source and tests passed independent review `d1e2f62b62ea57ff0ed31c3ffa180f94b2d2b194e34c0e8f12ef6fd9dfdc6a95`; all 129 Lightroom Python tests passed. The initial synthetic standalone-helper fixture error and rejected bytearray prototype remain retained evidence.
+
+Private helper `209b8a54…` and profile `5ccb6aea…` bind equivalence review `9f1134f6…`. The corrected diagnostic retains production buffered read sizes, the real JSON implementation, and frozen hashing/page processing. Its receipts are under `sc-22844-readonly-replay-diagnostic-v3/execution-root-01`. Synthetic small-file temporary allocation improved substantially; near-page chunk joining used more memory than the original reader, so the result is not a blanket memory or throughput claim. Controller `0ac64b39…` and auditors `0f8e97c6…` / `4a62e753…` passed independent source review and preserve both failed intervals. No failed attempt is relabeled as a clean checkpoint. Actual production and S9 acceptance remain pending.
 
 ## Resource and authorization ledger
 

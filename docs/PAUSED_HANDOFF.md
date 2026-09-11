@@ -1,6 +1,8 @@
 # Current handoff — 2026-09-11
 
-Current execution is stopped after seventeenth attempt
+Current production execution is stopped after attempt 18, `2bacecf2-06d6-4341-bb56-4f6a83c42a91`, exceeded the unchanged 512 MiB sampled Python RSS limit at 539,197,440 bytes during saved-row replay. Session 91297 exited and was reaped; all observed owned processes were reaped. Only fresh discovery 10238 was added; journal next is 10239. Result SHA256 `2854b115c33d7765c0460ed89c33c0e8aae8e436368f8270eba8b1aa25afdddd` remains failed. The diagnostic below requested file-sized buffers while production requested cap-sized buffers, so its memory result did not establish production allocation behavior. The bounded-read correction passed all 129 Lightroom Python tests and independent review. Corrected read-only diagnostic v3 reached the exact next unrecorded command in 197.2 seconds at 253,100,032 bytes peak RSS, with 10,221 saved commands replayed and no native dispatch. Actual JSON requests were at most 65,536 bytes; hash reads retained their original 1 MiB requests. Session 4846 and child 33755 were reaped; failed evidence was unchanged. This is saved-prefix qualification, with production continuation still subject to independent failure review and separate admission. Current pushed source is `17033fa`, with all four jobs in CI `34616365521` passing. The older snapshots below are historical.
+
+Historical stop after seventeenth attempt
 `e1ddf030-f29f-440c-84d1-dd0421b079a3` exceeded the 512 MiB Python sampled RSS
 limit during saved-page JSON replay (537,378,816 bytes observed). Actual session
 `88833` exited and was reaped; cleanup recorded no remaining observed processes.

@@ -1,5 +1,6 @@
 """JSON input compatibility and release before object-tree construction."""
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -63,9 +64,13 @@ class JsonMemoryTests(unittest.TestCase):
             def __del__(self):
                 released.append(True)
         class Input:
+            read_once = False
             def __enter__(self): return self
             def __exit__(self, *args): return False
-            def read(self, count): return Buffer(b'{"x":1}')
+            def read(self, count):
+                if self.read_once: return b""
+                self.read_once = True
+                return Buffer(b'{"x":1}')
         decode = json.JSONDecoder.decode
         def checked(decoder, text):
             self.assertEqual(released, [True])
@@ -75,6 +80,45 @@ class JsonMemoryTests(unittest.TestCase):
 
     def test_near_page_limit_string(self):
         self.compare(b'"'+b"x"*(8*1024**2-2)+b'"')
+
+    def test_admitted_caps_bound_read_requests_and_consume_short_reads(self):
+        raw = b'{"value":42}'
+        for cap in [len(raw), 8*1024**2, 16*1024**2, 64*1024**2]:
+            requests = []
+            class Input(io.BytesIO):
+                def read(self, count):
+                    requests.append(count)
+                    return super().read(min(count, 3))
+            with self.subTest(cap=cap), patch.object(RUN, "open", return_value=Input(raw), create=True):
+                self.assertEqual(RUN.read_json("fixture", cap), {"value":42})
+                self.assertLessEqual(max(requests), 65536)
+
+    def test_cap_boundary_stops_before_reading_the_remaining_file(self):
+        requests = []
+        class Input(io.BytesIO):
+            def read(self, count):
+                value = super().read(count)
+                requests.append(len(value))
+                return value
+        with patch.object(RUN, "open", return_value=Input(b" "*1000), create=True):
+            with self.assertRaisesRegex(ValueError, "JSON admission limit exceeded"):
+                RUN.read_json("fixture", 12)
+        self.assertEqual(sum(requests), 13)
+
+    def test_unusual_caps_preserve_original_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"input.json"
+            path.write_bytes(b"[1]")
+            for cap in [-2, -1, True, 1.5, "invalid", 2**100]:
+                def original():
+                    with open(path, "rb") as handle: raw = handle.read(cap+1)
+                    if len(raw) > cap: raise ValueError(f"JSON admission limit exceeded: {path}")
+                    return json.loads(raw)
+                def error_of(function):
+                    try: return function()
+                    except Exception as error: return type(error), error.args
+                with self.subTest(cap=cap):
+                    self.assertEqual(error_of(original), error_of(lambda: RUN.read_json(path, cap)))
 
 
 if __name__ == "__main__":
