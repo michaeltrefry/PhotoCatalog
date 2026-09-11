@@ -112,7 +112,9 @@ fn writer_tree_stamps(root: &Path) -> Vec<(PathBuf, u64, u64, u64)> {
     // not read the bytes protected by SQLite's mandatory Windows range locks.
     for entry in fs::read_dir(root).unwrap() {
         let entry = entry.unwrap();
-        let m = entry.metadata().unwrap();
+        // Directory enumeration can return stale NTFS attributes for a file
+        // still open by the writer. Query the file handle, not WIN32_FIND_DATA.
+        let m = fs::File::open(entry.path()).unwrap().metadata().unwrap();
         assert!(m.is_file());
         out.push((
             entry.file_name().into(),
@@ -192,7 +194,15 @@ fn retains_typed_rows_virtual_copies_opaque_instructions_and_resumes_after_resta
             .any(|i| i.code == "required_auxiliary_missing")
     );
     assert_eq!(plan.check_paths(&revision, 10, false).unwrap(), 1);
+    // This retained fixture root is explicitly Unix; do not reinterpret it as
+    // a Windows current-drive path just to perform a missing-file check.
+    #[cfg(unix)]
     assert_eq!(plan.paths(&revision, 0, 10).unwrap()[0]["state"], "missing");
+    #[cfg(windows)]
+    assert_eq!(
+        plan.paths(&revision, 0, 10).unwrap()[0]["state"],
+        "foreign_path"
+    );
     assert_eq!(before, tree(&originals));
 }
 #[test]
@@ -516,6 +526,13 @@ fn sidecar_survives_missing_original_and_conflicts_with_retained_catalog_facts()
     );
     let prior_packets = plan.packets(&revision, 0, 100).unwrap();
     let prior_paths = plan.paths(&revision, 0, 100).unwrap();
+    assert_eq!(prior_paths[0]["state"], "missing");
+    assert!(
+        prior_paths[0]["original"]
+            .as_str()
+            .unwrap()
+            .ends_with("2022/source.CR2")
+    );
     let owned = Connection::open(temp.path().join("plan/inspection.sqlite3")).unwrap();
     owned.execute_batch("CREATE TRIGGER fail_evidence_revision BEFORE UPDATE OF evidence_revision ON captures BEGIN SELECT RAISE(ABORT,'fixture publication failure'); END;").unwrap();
     drop(owned);

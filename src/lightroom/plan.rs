@@ -1699,7 +1699,14 @@ fn original_path(db: &Connection, revision: &str, file: &Fields) -> Result<(Stri
         name
     );
     let path = if windows {
-        NativePath::WindowsWide(original.encode_utf16().collect())
+        // Adobe folder components may use '/'. Windows' verbatim namespace
+        // disables slash normalization, so construct native separators for I/O
+        // while retaining the exact composed locator in `original` below.
+        #[cfg(windows)]
+        let native = original.replace('/', "\\");
+        #[cfg(not(windows))]
+        let native = &original;
+        NativePath::WindowsWide(native.encode_utf16().collect())
     } else {
         ensure!(root.starts_with('/'), "root is not an absolute path");
         NativePath::UnixBytes(original.as_bytes().into())
@@ -2480,6 +2487,69 @@ fn bounded_values(
 #[cfg(test)]
 mod bounded_plan_tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn windows_inspection_locator_normalizes_separators_without_retyping_foreign_paths() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE entities(revision,table_name,local_key,fields_json);")
+            .unwrap();
+        let key = relationship_key(&Cell::Integer(1)).unwrap();
+        let folder = Fields::from([
+            ("rootFolder".into(), Cell::Integer(1)),
+            ("pathFromRoot".into(), Cell::Text(b"2022/sub/".to_vec())),
+        ]);
+        db.execute(
+            "INSERT INTO entities VALUES('r','AgLibraryFolder',?,?)",
+            params![key, serde_json::to_string(&folder).unwrap()],
+        )
+        .unwrap();
+        let file = Fields::from([
+            ("folder".into(), Cell::Integer(1)),
+            ("idx_filename".into(), Cell::Text(b"source.CR2".to_vec())),
+        ]);
+        for root in [
+            r"C:\photos",
+            r"\\?\C:\photos",
+            r"\\?\UNC\server\share\photos",
+            r"\\server\share\photos",
+            "/foreign/photos",
+        ] {
+            db.execute(
+                "DELETE FROM entities WHERE table_name='AgLibraryRootFolder'",
+                [],
+            )
+            .unwrap();
+            let fields =
+                Fields::from([("absolutePath".into(), Cell::Text(root.as_bytes().to_vec()))]);
+            let retained = serde_json::to_string(&fields).unwrap();
+            db.execute(
+                "INSERT INTO entities VALUES('r','AgLibraryRootFolder',?,?)",
+                params![key, retained],
+            )
+            .unwrap();
+            let (reported, inspected) = original_path(&db, "r", &file).unwrap();
+            if root.starts_with('/') {
+                assert_eq!(reported, "/foreign/photos/2022/sub/source.CR2");
+                assert_eq!(
+                    inspected,
+                    NativePath::UnixBytes(reported.as_bytes().to_vec())
+                );
+                assert!(inspected.to_path().is_err());
+            } else {
+                assert_eq!(reported, format!("{root}\\2022/sub/source.CR2"));
+                let expected = format!("{root}\\2022\\sub\\source.CR2");
+                assert_eq!(
+                    inspected,
+                    NativePath::WindowsWide(expected.encode_utf16().collect())
+                );
+                assert_eq!(inspected.to_path().unwrap(), PathBuf::from(expected));
+            }
+            assert_eq!(
+                entity_fields(&db, "r", "AgLibraryRootFolder", &Cell::Integer(1)).unwrap(),
+                fields
+            );
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn immutable_uri_preserves_extended_native_path_and_read_only_semantics() {
