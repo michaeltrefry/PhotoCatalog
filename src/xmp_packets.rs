@@ -274,7 +274,7 @@ fn qualified_unix_file(_file: &File) -> bool {
         let Some(end) = name.iter().position(|&c| c == 0) else {
             return false;
         };
-        return qualified_apfs_mount(&name[..end], info.f_flags & libc::MNT_LOCAL != 0);
+        return qualified_apfs_mount(&name[..end], info.f_flags & libc::MNT_LOCAL as u32 != 0);
     }
     #[cfg(not(target_os = "macos"))]
     false
