@@ -8,6 +8,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -53,7 +54,7 @@ def command_evidence(W, C, recipe, ctx, binding, number):
     process = C.document(C.reference(directory/'process.json'))
     require(process.get('argv') == record['argv'] and type(process.get('pid')) is int and process['pid'] > 1
             and process.get('process_group') == process['pid']
-            and record['started_unix'] <= process['started_unix'] <= record['finished_unix'], 'native process identity')
+            and finite_time(record['started_unix']) <= finite_time(process['started_unix']) <= finite_time(record['finished_unix']), 'native process identity')
     for name in ['stdout','stderr']:
         desc = record[name]; path = C.absolute(str(Path(recipe['run'])/desc['path']))
         require(path == directory/name, 'native stream namespace')
@@ -62,6 +63,35 @@ def command_evidence(W, C, recipe, ctx, binding, number):
                 and stat.S_ISREG(meta.st_mode) and meta.st_size == desc['bytes']
                 and isinstance(desc['sha256'], str) and len(desc['sha256']) == 64, 'native stream extent')
     return record
+
+
+def finite_time(value):
+    require(type(value) in (int,float) and math.isfinite(value), 'nonfinite/invalid receipt time')
+    return value
+
+
+def owner_evidence(W,C,recipe,result,request,attempt,run,binding):
+    process=C.document(C.reference(attempt/'process.json'))
+    started=C.document(C.reference(attempt/'started.json'))
+    begin=finite_time(result['started_unix']); finish=finite_time(result['finished_unix'])
+    require(begin <= finish and finite_time(process['started_unix']) == begin
+            and finite_time(started['started_unix']) <= begin, 'owner times differ')
+    expected=[recipe['code']['python']['path'],'-I','-B',recipe['code']['controller']['path'],
+              '--child',request['recipe']['path'],request['recipe']['sha256']]
+    require(process.get('argv') == expected and type(process.get('pid')) is int and process['pid'] > 1, 'owner child identity differs')
+    require(started.get('binding') == recipe['binding'] and started.get('phase') == 'packets'
+            and started.get('input') == recipe['input']
+            and started.get('funding') == C.funding(recipe['funding'],'packets',recipe['input']['sha256']), 'owner start/funding proof differs')
+    require(any(p.get('pid') == process['pid'] and p.get('group') == process['pid']
+                for p in result['observed_process_lifetimes']), 'observed root lifetime missing')
+    path=C.absolute(result['phase']['path'])
+    require(path.parent == run/'reports' and path.name.startswith('phase-'), 'phase namespace')
+    phase=C.document(result['phase'])
+    require(phase.get('binding') == binding and phase.get('phase') == 'packets'
+            and phase.get('input') == recipe['input']['path']
+            and result.get('phase_name') == 'packets' and result.get('phase_input') == recipe['input'], 'phase provenance differs')
+    require(begin <= finite_time(phase['started_unix']) <= finite_time(phase['finished_unix']) <= finish, 'phase outside owner interval')
+    return phase
 
 
 def audit(W, C, request):
@@ -103,6 +133,8 @@ def audit(W, C, request):
             require(not os.path.lexists(run/'commands'/f"{result['next_command']:09d}"), 'next command reserved')
             W.validate_selected_previous_history(recipe)
             W.validate_execution_profile(recipe, attempt, result); W.validate_native_execution(recipe, attempt, result)
+            phase=owner_evidence(W,C,recipe,result,request,attempt,run,binding)
+            previous_finish=phase['started_unix']
             first = C.integer(recipe['expected_next_command'], 1); end = C.integer(result['next_command'], first)
             require(end-first <= W.MAX_COMMANDS, 'command count cap')
             digest = hashlib.sha256(); record_bytes = 0
@@ -113,16 +145,10 @@ def audit(W, C, request):
                 record = command_evidence(W,C,recipe,ctx,binding,number)
                 require(type(record.get('exit_code')) is int and record['exit_code'] == 0
                         and record.get('failure') is None and record.get('log_errors') == [], 'failed native command')
+                require(previous_finish <= finite_time(record['started_unix']) <= finite_time(record['finished_unix'])
+                        <= phase['finished_unix'], 'native command outside serial phase interval')
+                previous_finish=record['finished_unix']
                 digest.update(C.encoded({'sequence':number,'result':C.reference(path)}))
-            phase_path=C.absolute(result['phase']['path'])
-            require(phase_path.parent == run/'reports' and phase_path.name.startswith('phase-'), 'phase namespace')
-            process=C.document(C.reference(attempt/'process.json'))
-            expected_argv=[recipe['code']['python']['path'],'-I','-B',recipe['code']['controller']['path'],
-                           '--child',request['recipe']['path'],request['recipe']['sha256']]
-            require(process.get('argv') == expected_argv, 'owner child argv differs')
-            phase = C.document(result['phase'])
-            require(phase.get('binding') == binding and phase.get('phase') == 'packets'
-                    and phase.get('input') == recipe['input']['path'], 'phase provenance differs')
             if result['status'] == 'paused_at_command_boundary':
                 require(result['exit_code'] == 1 and phase.get('status') == 'paused'
                         and result.get('pause') == C.reference(run/'pause-request'), 'pause classification')
@@ -147,9 +173,19 @@ def audit(W, C, request):
                                'Unselected backup external packets remain unassessed; all prerequisite evidence is retained.']}
 
 
+def validate_path_identity(prior,current):
+    # Extraction updates evidence/state, never the retained source/path roster.
+    for value in [prior,current]:
+        require(all(type(value[k]) is int and value[k] >= 0 for k in ['rows','last_sequence']), 'invalid path identity counters')
+        digest=value['identity_sha256']
+        require(isinstance(digest,str) and len(digest)==64 and all(c in '0123456789abcdef' for c in digest), 'invalid path identity digest')
+    require(all(current[k] == prior[k] for k in ['rows','last_sequence','identity_sha256']), 'selected path identity differs from PATHS')
+
+
 def validate_output_commands(W,C,recipe,ctx,binding,output,end):
     """Exact selected report/page provenance, including omitted terminal empties."""
     run = Path(recipe['run'])
+    prior_paths={r['revision']:r['pages']['paths'] for r in C.document(ctx['paths_input'])['outcomes']}
     def value(record):
         require(record['exit_code'] == 0 and record.get('failure') is None and record.get('log_errors') == [], 'failed output command')
         return C.document({'path':str(run/record['stdout']['path']),'sha256':record['stdout']['sha256']})
@@ -160,6 +196,8 @@ def validate_output_commands(W,C,recipe,ctx,binding,output,end):
         require(record['key'] == key, 'output command key differs')
         return record
     for row in output['outcomes']:
+        prior=prior_paths[row['revision']]; current=row['pages']['paths']
+        validate_path_identity(prior,current)
         # A native zero ending is required; another report is not proof that the
         # preceding inspection completed. Read only these small command outputs.
         for index in range(C.document(recipe['config'])['maximum_calls_per_revision']):

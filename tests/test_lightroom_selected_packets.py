@@ -363,20 +363,28 @@ class SelectedPackets(unittest.TestCase):
         return record
 
     def audit_fixture(self, terminal):
+        scalar=self.put(self.root/'synthetic-funding-basis.json',{'bytes':1000})
+        term={'basis':[{'reference':scalar,'pointer':['bytes']}],'numerator':1,'denominator':1,'reason':'tiny synthetic estimate'}
+        self.recipe['funding']=self.put(self.root/'synthetic-funding.json',{'protocol':1,'phase':'packets','input_sha256':self.full_ref['sha256'],
+            'categories':{k:term for k in C.CATEGORIES['packets']},'single_command_headroom':term,'protected_bytes':0,'reserve_bytes':C.RESERVE})
         self.recipe['grant']=self.put(self.root/'synthetic-grant.json',{'status':'EXECUTION_GRANTED',
             'recipe_body_sha256':C.sha(C.encoded(self.recipe)),'scope':'packets','attempt_id':self.recipe['attempt_id']})
         ctx=self.context();self.execution_files();recipe_ref=C.reference(self.attempt/'recipe.json')
-        self.put(self.attempt/'process.json',{'pid':345,'argv':[self.recipe['code']['python']['path'],'-I','-B',
+        self.put(self.attempt/'process.json',{'pid':345,'started_unix':0.5,'argv':[self.recipe['code']['python']['path'],'-I','-B',
             self.recipe['code']['controller']['path'],'--child',recipe_ref['path'],recipe_ref['sha256']]})
         ep=self.put(self.attempt/'execution-profile.json',W.execution_profile_value(self.recipe,self.attempt))
         ec=self.put(self.attempt/'execution-profile-consumed.json',{'execution_profile':ep,
             'helper':C.document(self.recipe['canonical_hash_profile'])['helper'],'pid':345})
         np=C.reference(self.attempt/'native-execution.json')
         nc=self.put(self.attempt/'native-execution-consumed.json',{'execution':np,'profile':self.recipe['native_execution_profile'],'pid':345})
-        phase={'phase':'packets','input':self.full_ref['path'],'binding':self.binding,'status':'paused'}
+        budget=C.funding(self.recipe['funding'],'packets',self.full_ref['sha256'])
+        self.put(self.attempt/'started.json',{'binding':self.recipe['binding'],'phase':'packets','input':self.full_ref,
+            'started_unix':0.25,'funding':budget,'available_bytes':budget['initial_minimum_bytes']})
+        phase={'phase':'packets','input':self.full_ref['path'],'binding':self.binding,'status':'paused','started_unix':1.0,'finished_unix':1.5}
         result={'status':'paused_at_command_boundary','root_reaped':True,'ownership_status':'observed_owned_processes_reaped',
                 'cleanup':None,'new_command_failures':[],'exit_code':1,'phase_name':'packets','phase_input':self.full_ref,
-                'execution_profile':ep,'execution_profile_consumed':ec,'native_execution':np,'native_execution_consumed':nc,'logs':{}}
+                'execution_profile':ep,'execution_profile_consumed':ec,'native_execution':np,'native_execution_consumed':nc,'logs':{},
+                'started_unix':0.5,'finished_unix':20.0,'observed_process_lifetimes':[{'pid':345,'group':345}]}
         for name in ['stdout','stderr']:
             p=self.attempt/(name+'.log');p.write_bytes(b'')
             result['logs'][name]={'complete':True,'error':None,'truncated':False,'observed_bytes':0,'retained_bytes':0,'reference':C.reference(p)}
@@ -404,7 +412,7 @@ class SelectedPackets(unittest.TestCase):
                     'automatic_selection':False,'migration_executed':False}
             result['output']=self.put(Path(ctx['output']),output)
             result.update(status='review_returned_not_acceptance',exit_code=0)
-            phase.update(status='review_artifact_returned_not_acceptance',output=ctx['output'])
+            phase.update(status='review_artifact_returned_not_acceptance',output=ctx['output'],finished_unix=19.0)
         else:result['pause']=self.put(self.run/'pause-request',{'owner':'synthetic held pause'})
         result['phase']=self.put(self.run/'reports/phase-audit.json',phase)
         result['journal']=self.put(self.run/'journal.json',{'next_command':number});result['next_command']=number
@@ -456,9 +464,49 @@ class SelectedPackets(unittest.TestCase):
     def test_auditor_pending_states_and_count_mismatch_fail(self):
         self.audit_fixture(True);ctx=self.context();out=C.document(self.audit_result['output'])
         out['outcomes'][0]['pages']['paths'].update(rows=1,counts={'pending':1})
-        with self.assertRaisesRegex(ValueError,'report/path states'):A.validate_output_commands(W,C,self.recipe,ctx,self.binding,out,17)
+        with self.assertRaisesRegex(ValueError,'path identity'):A.validate_output_commands(W,C,self.recipe,ctx,self.binding,out,17)
         out['outcomes'][0]['pages']['paths'].update(rows=2)
-        with self.assertRaisesRegex(ValueError,'count reconciliation'):A.validate_output_commands(W,C,self.recipe,ctx,self.binding,out,17)
+        with self.assertRaisesRegex(ValueError,'path identity'):A.validate_output_commands(W,C,self.recipe,ctx,self.binding,out,17)
+    def test_auditor_nonzero_paths_baseline_cannot_disappear_or_reidentify(self):
+        self.audit_fixture(True);ctx=self.context();out=C.document(self.audit_result['output'])
+        baseline=C.document(self.paths_ref);prior=baseline['outcomes'][0]['pages']['paths']
+        prior.update(rows=2,last_sequence=19,identity_sha256='a'*64,counts={'available_packets_uninspected':2})
+        ctx['paths_input']=self.put(self.root/'nonzero-paths-baseline.json',baseline)
+        with self.assertRaisesRegex(ValueError,'path identity'):
+            A.validate_output_commands(W,C,self.recipe,ctx,self.binding,out,17)
+        for field,value in [('rows',1),('last_sequence',18),('identity_sha256','b'*64)]:
+            changed=copy.deepcopy(prior);changed[field]=value
+            with self.assertRaisesRegex(ValueError,'path identity'):A.validate_path_identity(prior,changed)
+        enriched=copy.deepcopy(prior);enriched.update(content_sha256='c'*64,counts={'available':2})
+        A.validate_path_identity(prior,enriched)
+    def test_auditor_rejects_reused_phase_and_missing_root_lifetime(self):
+        request=self.audit_fixture(True);path=Path(self.audit_result['phase']['path']);phase=C.document(self.audit_result['phase'])
+        phase.update(started_unix=-2,finished_unix=-1)
+        self.audit_result['phase']=self.put(path,phase);self.rebind_audit_result()
+        with self.assertRaisesRegex(ValueError,'phase outside owner interval'):A.audit(W,C,request)
+        phase.update(started_unix=1,finished_unix=19);self.audit_result['phase']=self.put(path,phase)
+        self.audit_result['observed_process_lifetimes']=[];self.rebind_audit_result()
+        with self.assertRaisesRegex(ValueError,'root lifetime missing'):A.audit(W,C,request)
+    def test_auditor_binds_owner_start_funding_and_finite_serial_times(self):
+        request=self.audit_fixture(True);path=self.attempt/'started.json';started=json.loads(path.read_bytes())
+        for key,change in [('binding',self.full_ref),('input',self.paths_ref),('phase','full'),('funding',{})]:
+            bad=copy.deepcopy(started);bad[key]=change;self.put(path,bad)
+            with self.assertRaisesRegex(ValueError,'start/funding'):A.audit(W,C,request)
+        self.put(path,started);self.audit_result['started_unix']=float('nan')
+        # Deliberately malformed untrusted JSON bypasses the valid-fixture writer.
+        (self.attempt/'result.json').write_text(json.dumps(self.audit_result))
+        request['result']=C.reference(self.attempt/'result.json')
+        association=C.document(request['terminal_association']);association['result']=request['result']
+        request['terminal_association']=self.put(self.root/'nan-association.json',association)
+        with self.assertRaisesRegex(ValueError,'receipt time'):A.audit(W,C,request)
+        self.audit_result['started_unix']=0.5;self.rebind_audit_result()
+        process=self.attempt/'process.json';proc=json.loads(process.read_bytes());proc['started_unix']=0.6;self.put(process,proc)
+        with self.assertRaisesRegex(ValueError,'owner times'):A.audit(W,C,request)
+        proc['started_unix']=0.5;self.put(process,proc)
+        phase=C.document(self.audit_result['phase']);phase['finished_unix']=15.0
+        self.audit_result['phase']=self.put(Path(self.audit_result['phase']['path']),phase);self.rebind_audit_result()
+        with self.assertRaisesRegex(ValueError,'serial phase interval'):A.audit(W,C,request)
+
     def test_audit_budget_clamps_growth_read_and_restores_contract(self):
         original=C.raw;caps=[]
         def fake(path,cap):caps.append(cap);return b'x'*cap

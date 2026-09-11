@@ -134,9 +134,11 @@ inner terminal review is exit 0. Neither is an acceptance award.
 
 The auditor holds existing owner/runner locks and checks current checkpoint,
 absence of reservation, native command/step/started/process/stream identities,
-complete owner logs, phase/output identity, selected-only output roster and both
+complete owner logs, owner start/funding and observed root lifetime, finite ordered
+owner/phase/native-command intervals, phase/output identity, selected-only output roster and both
 execution profiles. At terminal it also checks per-member native zero endings,
-report/page state reconciliation, terminal empty pages, family evidence and
+report/page state reconciliation, unchanged PATHS row count/last sequence/identity
+digest (allowing updated content and states), terminal empty pages, family evidence and
 fresh/ending inventory against FULL. It reads bounded metadata, not PAGE or
 packet/source bodies; content/identity digests remain attributed native claims.
 It allows 128 MiB cumulative metadata, 16 MiB individual metadata, 16 MiB new
