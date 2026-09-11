@@ -124,7 +124,7 @@ pub fn inspect_sidecar(path: &Path, limits: &Limits) -> io::Result<Inspection> {
 fn digest(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
-fn hash_file(file: &mut File, length: u64) -> io::Result<(String, bool)> {
+fn hash_file(file: &mut (impl Read + Seek), length: u64) -> io::Result<(String, bool)> {
     file.seek(SeekFrom::Start(0))?;
     let mut hash = blake3::Hasher::new();
     let mut buffer = [0u8; 65536];
@@ -194,31 +194,183 @@ fn open_regular(path: &Path, expected: &fs::Metadata) -> io::Result<File> {
     }
     Ok(file)
 }
+/// Actual bytes returned by reads, excluding seeks and EOF probes that return zero.
+/// A failed proof query retains conservative whole-file rehashing. No source is
+/// cached across calls. These counts are not RSS or filesystem physical-I/O claims.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReadWork {
+    pub verification: String,
+    pub whole_file_hash_passes: u32,
+    pub hash_bytes: u64,
+    pub metadata_bytes: u64,
+}
+struct Counted<'a> {
+    file: &'a mut File,
+    bytes: &'a mut u64,
+}
+impl Read for Counted<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buffer)?;
+        *self.bytes += n as u64;
+        Ok(n)
+    }
+}
+impl Seek for Counted<'_> {
+    fn seek(&mut self, offset: SeekFrom) -> io::Result<u64> {
+        self.file.seek(offset)
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+struct StabilityStamp {
+    object: (u64, u128),
+    bytes: u64,
+    modified: std::time::SystemTime,
+    changed: i128,
+}
+fn stability_stamp(file: &File) -> io::Result<StabilityStamp> {
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(io::Error::other("stability handle is not a regular file"));
+    }
+    #[cfg(unix)]
+    let (object, changed) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            (meta.dev(), u128::from(meta.ino())),
+            i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+        )
+    };
+    #[cfg(windows)]
+    let (object, changed) = {
+        // The deny-write handle supplies content stability; Windows ChangeTime
+        // alone is not a reliable substitute for that lease.
+        (crate::storage_volume::held_object_key(file)?, 0)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let (object, changed) = return Err(io::Error::other("held stability unsupported"));
+    Ok(StabilityStamp {
+        object,
+        bytes: meta.len(),
+        modified: meta.modified()?,
+        changed,
+    })
+}
+fn open_stable(
+    path: &Path,
+    expected: &fs::Metadata,
+    conservative: bool,
+) -> io::Result<(File, bool)> {
+    #[cfg(windows)]
+    if !conservative {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Same sharing contract as VerifiedFile: hold through hash, parser and
+        // final pathname verification. A conflicting writer uses old rehashing.
+        // CreateFile documents that excluding FILE_SHARE_WRITE also rejects an
+        // existing writable mapping, even after its creator handle is closed:
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+        if let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 4)
+            .custom_flags(0x0020_0000)
+            .open(path)
+        {
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || meta.file_type().is_symlink()
+                || meta.len() != expected.len()
+                || modified(&meta) != modified(expected)
+            {
+                return Err(io::Error::other(
+                    "source changed while acquiring stability lease",
+                ));
+            }
+            return Ok((file, true));
+        }
+    }
+    Ok((open_regular(path, expected)?, cfg!(unix) && !conservative))
+}
+/// Inspect with observable verification cost; extraction and revision values are
+/// identical to `inspect`. Unix relies on filesystem-maintained precise ctime,
+/// not an atomic snapshot; Windows uses a held deny-write lease and full file ID.
+pub fn inspect_with_work(path: &Path, limits: &Limits) -> io::Result<(Inspection, ReadWork)> {
+    inspect_observed(path, limits, false, false, &mut |_| Ok(()))
+}
+pub fn inspect_sidecar_with_work(
+    path: &Path,
+    limits: &Limits,
+) -> io::Result<(Inspection, ReadWork)> {
+    inspect_observed(path, limits, true, false, &mut |_| Ok(()))
+}
 fn inspect_file(path: &Path, limits: &Limits, sidecar: bool) -> io::Result<Inspection> {
+    if sidecar {
+        inspect_sidecar_with_work(path, limits)
+    } else {
+        inspect_with_work(path, limits)
+    }
+    .map(|(inspection, _)| inspection)
+}
+fn inspect_observed(
+    path: &Path,
+    limits: &Limits,
+    sidecar: bool,
+    conservative: bool,
+    checkpoint: &mut impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<(Inspection, ReadWork)> {
     let path_before = fs::symlink_metadata(path)?;
-    let mut file = open_regular(path, &path_before)?;
+    let (mut file, eligible) = open_stable(path, &path_before, conservative)?;
     let before = file.metadata()?;
+    let proof = if eligible {
+        stability_stamp(&file).ok()
+    } else {
+        None
+    };
+    let mut work = ReadWork::default();
     let mut revision = SourceRevision {
         length: before.len(),
         blake3: String::new(),
         modified_unix_ns: modified(&before),
     };
     if before.len() > limits.max_source_bytes {
-        return Ok(Inspection {
-            revision,
-            status: Status::ResourceLimit,
-            packets: vec![],
-            parse_inputs: vec![],
-            issues: vec![Issue {
+        work.verification = "not_attempted_source_limit".into();
+        return Ok((
+            Inspection {
+                revision,
                 status: Status::ResourceLimit,
-                offset: None,
-                message: "source byte limit exceeded; digest not computed".into(),
-            }],
-        });
+                packets: vec![],
+                parse_inputs: vec![],
+                issues: vec![Issue {
+                    status: Status::ResourceLimit,
+                    offset: None,
+                    message: "source byte limit exceeded; digest not computed".into(),
+                }],
+            },
+            work,
+        ));
     }
-    let (initial_hash, initial_length_matches) = hash_file(&mut file, before.len())?;
+    work.whole_file_hash_passes += 1;
+    let (initial_hash, initial_length_matches) = hash_file(
+        &mut Counted {
+            file: &mut file,
+            bytes: &mut work.hash_bytes,
+        },
+        before.len(),
+    )?;
     revision.blake3 = initial_hash;
-    let mut parser = Parser::new(&mut file, before.len(), limits);
+    checkpoint("after_hash")?;
+    let hash_stamp = if proof.is_some() {
+        stability_stamp(&file).ok()
+    } else {
+        None
+    };
+    let mut changed = proof
+        .as_ref()
+        .zip(hash_stamp.as_ref())
+        .is_some_and(|(a, b)| a != b);
+    let mut counted = Counted {
+        file: &mut file,
+        bytes: &mut work.metadata_bytes,
+    };
+    let mut parser = Parser::new(&mut counted, before.len(), limits);
     let parsed = if sidecar {
         parser.sidecar()
     } else {
@@ -228,10 +380,57 @@ fn inspect_file(path: &Path, limits: &Limits, sidecar: bool) -> io::Result<Inspe
         parser.record(failure);
     }
     let (packets, parse_inputs, mut issues) = (parser.packets, parser.inputs, parser.issues);
-    let (after_hash, final_length_matches) = hash_file(&mut file, before.len())?;
-    let after = file.metadata()?;
+    checkpoint("after_parse")?;
+    let after_stamp = if proof.is_some() {
+        stability_stamp(&file).ok()
+    } else {
+        None
+    };
     let current = fs::symlink_metadata(path)?;
-    let mut same = initial_length_matches
+    let path_stamp = if proof.is_some() {
+        open_regular(path, &current)
+            .and_then(|f| stability_stamp(&f))
+            .ok()
+    } else {
+        None
+    };
+    changed |= proof
+        .as_ref()
+        .zip(after_stamp.as_ref())
+        .is_some_and(|(a, b)| a != b)
+        || proof
+            .as_ref()
+            .zip(path_stamp.as_ref())
+            .is_some_and(|(a, b)| a != b);
+    let established =
+        proof.is_some() && hash_stamp.is_some() && after_stamp.is_some() && path_stamp.is_some();
+    let (after_hash, final_length_matches) = if established {
+        work.verification = if cfg!(windows) {
+            "held_deny_write_file_id"
+        } else {
+            "held_object_unix_change_stamp"
+        }
+        .into();
+        (revision.blake3.clone(), true)
+    } else {
+        work.verification = "conservative_full_rehash".into();
+        work.whole_file_hash_passes += 1;
+        hash_file(
+            &mut Counted {
+                file: &mut file,
+                bytes: &mut work.hash_bytes,
+            },
+            before.len(),
+        )?
+    };
+    if !established {
+        checkpoint("after_fallback_hash")?;
+    }
+    let after = file.metadata()?;
+    // The conservative path must sample the pathname after its final hash too.
+    let current = fs::symlink_metadata(path)?;
+    let mut same = !changed
+        && initial_length_matches
         && final_length_matches
         && !current.file_type().is_symlink()
         && path_before.len() == before.len()
@@ -250,13 +449,17 @@ fn inspect_file(path: &Path, limits: &Limits, sidecar: bool) -> io::Result<Inspe
             && before.ino() == path_before.ino();
     }
     #[cfg(not(unix))]
-    {
-        // Portable path replacement verification when no stable file-id API is exposed.
-        if same {
-            let (path_hash, length_matches) =
-                hash_file(&mut open_regular(path, &current)?, before.len())?;
-            same &= length_matches && path_hash == after_hash;
-        }
+    if same && !established {
+        let mut current_file = open_regular(path, &current)?;
+        work.whole_file_hash_passes += 1;
+        let (path_hash, length_matches) = hash_file(
+            &mut Counted {
+                file: &mut current_file,
+                bytes: &mut work.hash_bytes,
+            },
+            before.len(),
+        )?;
+        same &= length_matches && path_hash == after_hash;
     }
     if !same {
         issues.push(Issue {
@@ -279,13 +482,16 @@ fn inspect_file(path: &Path, limits: &Limits, sidecar: bool) -> io::Result<Inspe
     } else {
         Status::Complete
     });
-    Ok(Inspection {
-        revision,
-        status,
-        packets,
-        parse_inputs,
-        issues,
-    })
+    Ok((
+        Inspection {
+            revision,
+            status,
+            packets,
+            parse_inputs,
+            issues,
+        },
+        work,
+    ))
 }
 
 #[derive(Debug)]
@@ -1665,5 +1871,296 @@ mod bounded_hash_tests {
                 "replacement accepted"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stability_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tiff(packet: bool) -> Vec<u8> {
+        let xml = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>";
+        let mut bytes = b"II*\0\x08\0\0\0".to_vec();
+        bytes.extend(u16::from(packet).to_le_bytes());
+        if packet {
+            bytes.extend(700u16.to_le_bytes());
+            bytes.extend(1u16.to_le_bytes());
+            bytes.extend((xml.len() as u32).to_le_bytes());
+            bytes.extend(26u32.to_le_bytes());
+        }
+        bytes.extend(0u32.to_le_bytes());
+        if packet {
+            bytes.extend(xml);
+        }
+        bytes.resize(8 * 1024 * 1024, 42);
+        bytes
+    }
+
+    #[test]
+    fn one_digest_and_bounded_metadata_reads_match_conservative_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        for (bytes, sidecar, expected) in [
+            (tiff(true), false, Status::Complete),
+            (tiff(false), false, Status::Absent),
+            (vec![b'?'; 8 * 1024 * 1024], false, Status::Unsupported),
+            (b"opaque sidecar\xff".to_vec(), true, Status::Complete),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            let limits = Limits {
+                max_metadata_read_bytes: 4096,
+                ..Limits::default()
+            };
+            let (fast, work) =
+                inspect_observed(&path, &limits, sidecar, false, &mut |_| Ok(())).unwrap();
+            let (old, fallback) =
+                inspect_observed(&path, &limits, sidecar, true, &mut |_| Ok(())).unwrap();
+            assert_eq!(fast.status, expected);
+            assert_eq!(
+                serde_json::to_value(&fast).unwrap(),
+                serde_json::to_value(&old).unwrap()
+            );
+            assert_eq!(fast.revision.blake3, digest(&bytes));
+            assert_eq!(work.whole_file_hash_passes, 1);
+            assert_eq!(work.hash_bytes, bytes.len() as u64);
+            assert!(work.metadata_bytes <= 4096);
+            assert!(work.verification.starts_with("held_"));
+            assert_eq!(
+                fallback.whole_file_hash_passes,
+                if cfg!(unix) { 2 } else { 3 }
+            );
+            assert_eq!(
+                fallback.hash_bytes,
+                fallback.whole_file_hash_passes as u64 * bytes.len() as u64
+            );
+            println!("packet work: {}", serde_json::to_string(&work).unwrap());
+        }
+        fs::write(&path, tiff(true)).unwrap();
+        let limits = Limits {
+            max_source_bytes: 1,
+            ..Limits::default()
+        };
+        let (limited, work) = inspect_with_work(&path, &limits).unwrap();
+        assert_eq!(limited.status, Status::ResourceLimit);
+        assert!(limited.revision.blake3.is_empty());
+        assert_eq!(work.hash_bytes, 0);
+        assert_eq!(work.metadata_bytes, 0);
+        let limits = Limits {
+            max_metadata_read_bytes: 1,
+            ..Limits::default()
+        };
+        let (limited, work) = inspect_with_work(&path, &limits).unwrap();
+        assert_eq!(limited.status, Status::ResourceLimit);
+        assert_eq!(work.whole_file_hash_passes, 1);
+        assert_eq!(work.metadata_bytes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_mtime_writes_and_transient_rewrites_reject_committed_revision() {
+        for checkpoint in ["after_hash", "after_parse"] {
+            for restore_bytes in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("sidecar");
+                let bytes = b"<old/>";
+                fs::write(&path, bytes).unwrap();
+                let held = File::open(&path).unwrap();
+                let stamp = stability_stamp(&held).unwrap();
+                let mut mutated = false;
+                let (result, work) =
+                    inspect_observed(&path, &Limits::default(), true, false, &mut |at| {
+                        if at == checkpoint {
+                            let mut writer = File::options().write(true).open(&path)?;
+                            writer.write_all(b"<new/>")?;
+                            if restore_bytes {
+                                writer.seek(SeekFrom::Start(0))?;
+                                writer.write_all(bytes)?;
+                            }
+                            writer.set_times(fs::FileTimes::new().set_modified(stamp.modified))?;
+                            let current = stability_stamp(&held)?;
+                            assert_eq!(current.modified, stamp.modified);
+                            assert_eq!(current.bytes, stamp.bytes);
+                            assert_ne!(
+                                current.changed, stamp.changed,
+                                "fixture must exercise actual ctime change"
+                            );
+                            mutated = true;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(mutated);
+                assert_eq!(result.status, Status::SourceChanged);
+                assert!(
+                    !result.packets.is_empty(),
+                    "retain uncommitted packets with explicit changed status"
+                );
+                assert_eq!(work.whole_file_hash_passes, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_same_bytes_and_mtime_path_is_not_the_held_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        fs::write(&path, b"<x/>").unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let (result, _) = inspect_observed(&path, &Limits::default(), true, false, &mut |at| {
+            if at == "after_parse" {
+                fs::rename(&path, temp.path().join("old-retained"))?;
+                fs::write(&path, b"<x/>")?;
+                File::options()
+                    .write(true)
+                    .open(&path)?
+                    .set_times(fs::FileTimes::new().set_modified(mtime))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.status, Status::SourceChanged);
+        assert_eq!(result.packets[0].bytes, b"<x/>");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_writer_falls_back_and_held_lease_denies_new_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        fs::write(&path, b"<old/>").unwrap();
+        let mut writer = File::options().write(true).open(&path).unwrap();
+        let (result, work) = inspect_observed(&path, &Limits::default(), true, false, &mut |at| {
+            if at == "after_hash" {
+                writer.write_all(b"<new/>")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.status, Status::SourceChanged);
+        assert_eq!(work.verification, "conservative_full_rehash");
+        assert!(work.whole_file_hash_passes >= 2);
+        drop(writer);
+        let (result, work) = inspect_observed(&path, &Limits::default(), true, false, &mut |_| {
+            assert!(File::options().write(true).open(&path).is_err());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.status, Status::Complete);
+        assert_eq!(work.whole_file_hash_passes, 1);
+        assert!(File::options().write(true).open(path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conservative_rehash_samples_path_after_final_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        fs::write(&path, b"<x/>").unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let (result, work) = inspect_observed(&path, &Limits::default(), true, true, &mut |at| {
+            if at == "after_fallback_hash" {
+                fs::rename(&path, temp.path().join("old-retained"))?;
+                fs::write(&path, b"<x/>")?;
+                File::options()
+                    .write(true)
+                    .open(&path)?
+                    .set_times(fs::FileTimes::new().set_modified(mtime))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.status, Status::SourceChanged);
+        assert_eq!(work.whole_file_hash_passes, 2);
+        assert_eq!(result.packets[0].bytes, b"<x/>");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writable_mapping_survives_creator_and_forces_conservative_validation() {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileMappingW(
+                file: *mut c_void,
+                attributes: *mut c_void,
+                protect: u32,
+                high: u32,
+                low: u32,
+                name: *const u16,
+            ) -> *mut c_void;
+            fn MapViewOfFile(
+                mapping: *mut c_void,
+                access: u32,
+                high: u32,
+                low: u32,
+                bytes: usize,
+            ) -> *mut c_void;
+            fn UnmapViewOfFile(view: *const c_void) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        struct Mapping {
+            handle: *mut c_void,
+            view: *mut c_void,
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.view.is_null() {
+                        UnmapViewOfFile(self.view);
+                    }
+                    if !self.handle.is_null() {
+                        CloseHandle(self.handle);
+                    }
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mapped");
+        fs::write(&path, b"<old/>").unwrap();
+        let creator = File::options().read(true).write(true).open(&path).unwrap();
+        let mut mapping = Mapping {
+            handle: unsafe {
+                CreateFileMappingW(
+                    creator.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    4,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            },
+            view: std::ptr::null_mut(),
+        };
+        assert!(!mapping.handle.is_null(), "{}", io::Error::last_os_error());
+        mapping.view = unsafe { MapViewOfFile(mapping.handle, 2, 0, 0, 6) };
+        assert!(!mapping.view.is_null(), "{}", io::Error::last_os_error());
+        drop(creator);
+        // A live writable mapping must not qualify as a held deny-write proof.
+        // See CreateFileW's FILE_SHARE_WRITE contract linked at open_stable.
+        let expected = fs::symlink_metadata(&path).unwrap();
+        let (lease, eligible) = open_stable(&path, &expected, false).unwrap();
+        assert!(
+            !eligible,
+            "writable mapping was incorrectly admitted as a write exclusion lease"
+        );
+        drop(lease);
+        let (result, work) = inspect_observed(&path, &Limits::default(), true, false, &mut |at| {
+            if at == "after_hash" {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b"<new/>".as_ptr(), mapping.view.cast::<u8>(), 6);
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.status, Status::SourceChanged);
+        assert_eq!(work.verification, "conservative_full_rehash");
+        assert!(work.whole_file_hash_passes >= 2);
+        drop(mapping);
+        let (result, work) = inspect_sidecar_with_work(&path, &Limits::default()).unwrap();
+        assert_eq!(result.status, Status::Complete);
+        assert_eq!(work.whole_file_hash_passes, 1);
     }
 }
