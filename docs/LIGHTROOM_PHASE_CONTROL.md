@@ -36,7 +36,12 @@ exist. The recipe has these exact top-level fields:
 - `pause: {kind: absent}` or `{kind: owned, reference, owner, identity}`. Identity
   is `[device, inode, bytes, mtime_ns, ctime_ns]`. An admitted owned pause is captured
   by rename, verified, and retained. A mismatch restores without clobber or keeps
-  both entries. The controller never unlinks a raced-in replacement.
+  both entries. The controller never unlinks a raced-in replacement. When run and
+  control devices differ, the capture lives in an exclusively created
+  `RUN/.pause-capture-ATTEMPT_UUID/pause-captured` directory, so the atomic rename
+  remains on the run's filesystem. Preexisting directories/links are rejected.
+  The local attempt receipt references that retained capture; the capture parent,
+  run directory and local attempt directory are synced before successful admission.
 - `memory` explicitly supplies positive `python_process_rss_bytes`,
   `native_process_rss_bytes`, `combined_owned_rss_bytes`; no new machine capacity
   or measured bound is inferred. For full, `paths_review` is `{kind:not_applicable}`;

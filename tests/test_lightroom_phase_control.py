@@ -1,5 +1,6 @@
 """Small synthetic contracts only; no native inspector, SQLite, or source photos."""
 import importlib.util
+import errno
 import json
 import os
 import signal
@@ -192,6 +193,70 @@ class PhaseContracts(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'raced'): W.remove_pause(self.recipe, attempt)
         self.assertEqual(path.read_bytes(), b'foreign replacement')
         self.assertEqual(C.sha((attempt/'pause-captured').read_bytes()), ref['sha256'])
+
+    def cross_device_pause(self):
+        path = self.run/'pause-request'; ref = self.put(path, {'owner': 'old-owner'})
+        m = path.stat(); self.recipe['pause'] = {'kind': 'owned', 'reference': ref, 'owner': 'old-owner',
+            'identity': [m.st_dev, m.st_ino, m.st_size, m.st_mtime_ns, m.st_ctime_ns]}
+        actual_stat = Path.stat
+        def device(path, *args, **kwargs):
+            if path == self.attempt: return types.SimpleNamespace(st_dev=m.st_dev+1)
+            return actual_stat(path, *args, **kwargs)
+        return path, ref, mock.patch.object(Path, 'stat', device)
+
+    def test_cross_device_pause_capture_stays_on_run_volume_with_local_receipt(self):
+        path, ref, devices = self.cross_device_pause(); rename = os.rename
+        def same_device_only(source, destination):
+            if destination.parent == self.attempt: raise OSError(errno.EXDEV, 'simulated cross-device rename')
+            self.assertEqual(destination.parent.parent, self.run)
+            rename(source, destination)
+        with devices, mock.patch.object(W.os, 'rename', side_effect=same_device_only), mock.patch.object(W, 'sync', wraps=W.sync) as sync:
+            W.remove_pause(self.recipe, self.attempt)
+        receipt = C.document(C.reference(self.attempt/'pause-capture.json'))
+        captured = Path(receipt['captured']['path'])
+        self.assertFalse(path.exists()); self.assertEqual(C.reference(captured), receipt['captured'])
+        self.assertEqual(receipt['captured']['sha256'], ref['sha256'])
+        self.assertEqual(captured.stat().st_ino, self.recipe['pause']['identity'][1])
+        self.assertEqual(captured.parent.stat().st_mode & 0o777, 0o700)
+        for directory in [captured.parent, self.run, self.attempt]:
+            self.assertIn(mock.call(directory), sync.call_args_list)
+
+    def test_cross_device_pause_rejects_preexisting_directory_and_symlink(self):
+        path, ref, devices = self.cross_device_pause()
+        destination = self.run/('.pause-capture-'+self.recipe['attempt_id'])
+        destination.mkdir()
+        with devices:
+            with self.assertRaises(FileExistsError): W.remove_pause(self.recipe, self.attempt)
+        self.assertEqual(C.reference(path), ref)
+        destination.rmdir(); destination.symlink_to(self.root, target_is_directory=True)
+        (self.attempt/'pause-before.json').unlink()  # Separate disposable test attempt.
+        with devices:
+            with self.assertRaises(FileExistsError): W.remove_pause(self.recipe, self.attempt)
+        self.assertEqual(C.reference(path), ref); self.assertTrue(destination.is_symlink())
+
+    def test_cross_device_pause_race_retains_both_and_mismatch_restores_without_clobber(self):
+        path, ref, devices = self.cross_device_pause(); rename = os.rename
+        captured = self.run/('.pause-capture-'+self.recipe['attempt_id'])/'pause-captured'
+        def race(source, destination):
+            rename(source, destination); path.write_bytes(b'foreign replacement')
+        with devices, mock.patch.object(W.os, 'rename', side_effect=race):
+            with self.assertRaisesRegex(ValueError, 'raced'): W.remove_pause(self.recipe, self.attempt)
+        self.assertEqual(path.read_bytes(), b'foreign replacement')
+        self.assertEqual(C.sha(captured.read_bytes()), ref['sha256'])
+        self.assertFalse((self.attempt/'pause-capture.json').exists())
+
+    def test_cross_device_pause_failed_verification_restores_original(self):
+        path, ref, devices = self.cross_device_pause(); raw = C.raw
+        captured = self.run/('.pause-capture-'+self.recipe['attempt_id'])/'pause-captured'
+        def fail_read(p, *args):
+            if p == captured: raise OSError('controlled verification read failure')
+            return raw(p, *args)
+        with devices, mock.patch.object(C, 'raw', side_effect=fail_read):
+            with self.assertRaisesRegex(OSError, 'controlled'): W.remove_pause(self.recipe, self.attempt)
+        self.assertEqual(C.reference(path), ref)
+        self.assertEqual(C.reference(captured)['sha256'], ref['sha256'])
+        self.assertEqual(path.stat().st_ino, captured.stat().st_ino)
+        self.assertFalse((self.attempt/'pause-capture.json').exists())
 
     def test_failed_or_orphan_current_pointer_blocks_resume(self):
         result_path = self.control/'attempts'/'old'/'result.json'; result_path.parent.mkdir(parents=True)

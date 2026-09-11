@@ -345,8 +345,16 @@ def remove_pause(recipe, attempt):
     identity = [meta.st_dev, meta.st_ino, meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns]
     if value.get('owner') != pause['owner'] or identity != pause['identity']:
         raise ValueError('changed/foreign pause')
-    captured = attempt/'pause-captured'
     save(attempt/'pause-before.json', pause)
+    capture_parent = attempt
+    if path.parent.stat().st_dev != attempt.stat().st_dev:
+        capture_parent = path.parent/('.pause-capture-'+str(uuid.UUID(recipe['attempt_id'])))
+        capture_parent.mkdir(mode=0o700)  # Exclusive; existing directories/links fail.
+        sync(path.parent)
+    C.absolute(capture_parent)
+    captured = capture_parent/'pause-captured'
+    if os.path.lexists(captured):
+        raise ValueError('pause capture destination already exists')
     os.rename(path, captured)
     try:
         after = captured.lstat()
@@ -357,9 +365,9 @@ def remove_pause(recipe, attempt):
         with contextlib.suppress(OSError): os.link(captured, path, follow_symlinks=False)
         # Keep both captured and any independently installed pause; never unlink
         # a raced pathname to make this attempt appear admissible.
-        sync(path.parent); sync(attempt)
+        sync(capture_parent); sync(path.parent); sync(attempt)
         raise
-    sync(path.parent); sync(attempt)
+    sync(capture_parent); sync(path.parent); sync(attempt)
     save(attempt/'pause-capture.json', {'original': pause, 'captured': C.reference(captured)})
 
 
