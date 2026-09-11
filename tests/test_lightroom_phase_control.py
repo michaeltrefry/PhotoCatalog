@@ -395,6 +395,98 @@ class PhaseContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'hash'): W.module({'path': str(code), 'sha256': '0'*64}, 'untrusted')
         self.assertFalse(marker.exists())
 
+    def temp_storage(self):
+        directory = self.root/'sqlite-temp'; directory.mkdir()
+        meta = directory.stat()
+        storage = {'directory': str(directory), 'device': meta.st_dev, 'inode': meta.st_ino,
+                   'environment': {k: str(directory) for k in ['SQLITE_TMPDIR', 'TMPDIR']}}
+        self.recipe['temp_storage'] = storage
+        return directory, storage
+
+    def test_temp_storage_optional_exact_environment_and_changing_contents(self):
+        W.validate_temp_storage(self.recipe)  # Existing recipes remain compatible.
+        directory, storage = self.temp_storage()
+        with mock.patch.dict(os.environ, storage['environment']):
+            W.validate_temp_storage(self.recipe)
+            (directory/'ordinary-temp-file').write_bytes(b'temp')
+            W.validate_temp_storage(self.recipe)  # Directory mtime is not identity.
+
+    def test_temp_storage_unset_mismatched_and_unbound_environment_rejected(self):
+        directory, storage = self.temp_storage()
+        for key in storage['environment']:
+            for value in [None, str(self.root)]:
+                with self.subTest(key=key, value=value), mock.patch.dict(os.environ, storage['environment']):
+                    if value is None: os.environ.pop(key, None)
+                    else: os.environ[key] = value
+                    with self.assertRaisesRegex(ValueError, 'environment'): W.validate_temp_storage(self.recipe)
+        with mock.patch.dict(os.environ, storage['environment']):
+            storage['environment'] = {'SQLITE_TMPDIR': str(directory)}
+            with self.assertRaisesRegex(ValueError, 'environment'): W.validate_temp_storage(self.recipe)
+
+    def test_temp_storage_replacement_missing_symlink_and_special_rejected(self):
+        directory, storage = self.temp_storage()
+        retained = self.root/'retained-temp'
+        with mock.patch.dict(os.environ, storage['environment']):
+            directory.rename(retained)  # Retains the original inode, avoiding reuse.
+            with self.assertRaises(FileNotFoundError): W.validate_temp_storage(self.recipe)
+            directory.mkdir()
+            with self.assertRaisesRegex(ValueError, 'identity'): W.validate_temp_storage(self.recipe)
+            directory.rmdir(); directory.symlink_to(retained, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'symlink'): W.validate_temp_storage(self.recipe)
+            directory.unlink(); directory.write_bytes(b'not a directory')
+            storage['inode'] = directory.stat().st_ino
+            with self.assertRaisesRegex(ValueError, 'type'): W.validate_temp_storage(self.recipe)
+
+    def test_temp_storage_device_and_access_checks(self):
+        directory, storage = self.temp_storage()
+        with mock.patch.dict(os.environ, storage['environment']):
+            storage['device'] += 1
+            with self.assertRaisesRegex(ValueError, 'identity'): W.validate_temp_storage(self.recipe)
+            storage['device'] -= 1
+            with mock.patch.object(W.os, 'access', return_value=False):
+                with self.assertRaisesRegex(ValueError, 'access'): W.validate_temp_storage(self.recipe)
+            actual_stat = Path.stat
+            def different_run_device(path, *args, **kwargs):
+                if path == self.run: return types.SimpleNamespace(st_dev=storage['device']+1)
+                return actual_stat(path, *args, **kwargs)
+            with mock.patch.object(Path, 'stat', different_run_device):
+                with self.assertRaisesRegex(ValueError, 'share a device'): W.validate_temp_storage(self.recipe)
+
+    def test_temp_storage_command_and_space_check_before_frozen_work(self):
+        directory, storage = self.temp_storage(); touched = []
+        class Runner:
+            def __init__(self, root): pass
+            def call(self, *args): touched.append('call')
+            def space(self, *args): touched.append('space')
+        frozen = types.SimpleNamespace(Runner=Runner, PauseRequested=RuntimeError)
+        monitor = types.SimpleNamespace(finish=lambda: None)
+        guard = types.SimpleNamespace(FundingMonitor=lambda *args: monitor, guarded_type=lambda base, *args: base)
+        def main():
+            runner = frozen.Runner(self.run)
+            os.environ.pop('SQLITE_TMPDIR')
+            for operation in [lambda: runner.call(['fixture'], ['rows']), runner.space]:
+                with self.assertRaisesRegex(ValueError, 'environment'): operation()
+        frozen.main = main
+        self.recipe['code'] = {'runner': {'path': 'fixture-runner'}, 'funding_guard': {}}
+        self.recipe['journal'] = C.reference(self.run/'journal.json')
+        self.put(self.control/'current.json', {'attempt_id': self.recipe['attempt_id']})
+        self.put(self.attempt/'started.json', {'binding': self.recipe['binding']})
+        with mock.patch.dict(os.environ, storage['environment']), \
+                mock.patch.object(W, 'validate_recipe', return_value=(self.ctx(), {}, self.binding, self.config)), \
+                mock.patch.object(W, 'module', side_effect=[frozen, guard]):
+            W.child_main(self.recipe)
+        self.assertEqual(touched, [])
+        self.assertEqual(C.document(self.recipe['journal']), {'next_command': 1})
+
+    def test_temp_storage_outer_replacement_reaps_actual_child(self):
+        directory, storage = self.temp_storage()
+        def replace_after_launch(*args):
+            directory.rename(self.root/'retained-temp'); directory.mkdir()
+            return {}
+        with mock.patch.dict(os.environ, storage['environment']):
+            value = self.real_child_failure(replace_after_launch)
+        self.assertIn('temp_storage directory identity', value['failure'])
+
     def test_real_child_output_is_capped_and_root_reaped(self):
         child = subprocess.Popen([sys.executable, '-I', '-B', '-c', 'import sys;sys.stdout.buffer.write(b"x"*200000)'], stdout=subprocess.PIPE)
         try:
@@ -424,6 +516,7 @@ class PhaseContracts(unittest.TestCase):
         value = W.supervise(self.recipe, attempt, self.ctx(), {}, self.binding, supervisor, guard)
         self.assertEqual(value['status'], 'failed_or_unknown'); self.assertEqual(value['ownership_status'], 'unknown_requires_review')
         self.assertTrue(value['root_reaped']); self.assertEqual(len(owned), 1); self.assertIsNotNone(owned[0].returncode)
+        return value
 
     def test_real_child_observer_failure_still_stops_and_reaps(self):
         self.real_child_failure(PermissionError('controlled observer failure'))

@@ -41,6 +41,12 @@ exist. The recipe has these exact top-level fields:
   `native_process_rss_bytes`, `combined_owned_rss_bytes`; no new machine capacity
   or measured bound is inferred. For full, `paths_review` is `{kind:not_applicable}`;
   for paths it is the same sentinel; packets requires an actual paths-review ref.
+- Optional `temp_storage` is `{directory, device, inode, environment}`. `directory`
+  is an absolute non-symlink directory; `device` and `inode` bind its stable identity
+  (not modification time). `environment` must contain exactly `SQLITE_TMPDIR` and
+  `TMPDIR`, both equal to `directory`. The directory must be writable/searchable
+  and on the same device as `run`, so existing free-space observations cover both
+  plan growth and SQLite temporary files. Omission preserves existing recipes.
 
 The separate grant is exactly `{status: EXECUTION_GRANTED, scope: PHASE,
 attempt_id: UUID, recipe_body_sha256: SHA}`. The hash covers canonical sorted ASCII
@@ -51,6 +57,23 @@ resource and source review. Launch uses a frozen private copy, never worktree im
 ```text
 PINNED_PYTHON -I -B FROZEN_CONTROL.py RECIPE.json RECIPE_SHA256
 ```
+
+For a bound temporary directory, launch that same command with both environment
+variables explicitly set, for example `/usr/bin/env SQLITE_TMPDIR=ABSOLUTE_TEMP
+TMPDIR=ABSOLUTE_TEMP PINNED_PYTHON ...`. Set them before the controller starts;
+the controller and native subprocesses inherit them. The recipe (including these
+values and directory identity) is covered by the existing separate grant hash.
+Keep `control` and its receipts on the local evidence disk when `run` and temporary
+files use external scratch, so external-volume failure can still be recorded.
+
+Parent and child admission, the immediate parent launch, every runner call/space
+boundary and the outer observation loop validate the temporary destination and
+environment. A mismatch fails the attempt and uses the existing owned-process
+cleanup; it is not a resumable successful pause. This is sampled detection, not
+hard confinement: SQLite can fall back to local directories if the destination
+becomes unusable between checks. Environment routing does not move explicitly
+named capture/plan files or their adjacent journals. No allocation quota or strict
+latency guarantee is implied.
 
 ## Phase input, output and replay
 

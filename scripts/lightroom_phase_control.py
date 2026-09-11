@@ -80,15 +80,38 @@ def read(path):
     return json.loads(C.raw(path))
 
 
+def validate_temp_storage(recipe):
+    """Sample the bound temp destination; this is not filesystem confinement."""
+    if 'temp_storage' not in recipe:
+        return
+    storage = recipe['temp_storage']
+    if not isinstance(storage, dict) or set(storage) != {'directory', 'device', 'inode', 'environment'}:
+        raise ValueError('invalid temp_storage descriptor')
+    directory = C.absolute(storage['directory'])
+    if str(directory) != storage['directory']:
+        raise ValueError('canonical temp_storage directory required')
+    expected = {name: str(directory) for name in ['SQLITE_TMPDIR', 'TMPDIR']}
+    if storage['environment'] != expected or any(os.environ.get(k) != v for k, v in expected.items()):
+        raise ValueError('temp_storage environment missing or different')
+    C.integer(storage['device'], 0); C.integer(storage['inode'], 1)
+    meta = directory.lstat()
+    if (not stat.S_ISDIR(meta.st_mode) or (meta.st_dev, meta.st_ino) != (storage['device'], storage['inode'])
+            or not os.access(directory, os.W_OK | os.X_OK)):
+        raise ValueError('temp_storage directory identity/type/access changed')
+    if C.absolute(recipe['run']).stat().st_dev != meta.st_dev:
+        raise ValueError('temp_storage and run must share a device')
+
+
 def validate_recipe(recipe):
     fields = {'protocol', 'phase', 'run', 'control', 'attempt_id', 'input', 'baseline', 'paths_review',
               'code', 'config', 'binding', 'journal', 'expected_next_command', 'previous', 'pause',
               'funding', 'memory', 'grant'}
-    if set(recipe) != fields or recipe['protocol'] != 1 or any(v is None for v in recipe.values()):
+    if set(recipe) not in (fields, fields | {'temp_storage'}) or recipe['protocol'] != 1 or any(v is None for v in recipe.values()):
         raise ValueError('unresolved/unknown recipe fields')
     if str(uuid.UUID(recipe['attempt_id'])) != recipe['attempt_id']:
         raise ValueError('invalid attempt UUID')
     for name in ['run', 'control']: C.absolute(recipe[name])
+    validate_temp_storage(recipe)
     C.integer(recipe['expected_next_command'], 1)
     if set(recipe['memory']) != {'python_process_rss_bytes', 'native_process_rss_bytes', 'combined_owned_rss_bytes'}:
         raise ValueError('explicit sampled memory ceilings required')
@@ -536,12 +559,14 @@ def supervise(recipe, attempt, ctx, budget, binding, supervisor, funding_module)
         raise InterruptedError('phase owner received SIGTERM')
     signal.signal(signal.SIGTERM, interrupted)
     try:
+        validate_temp_storage(recipe)
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         save(attempt/'process.json', {'pid': child.pid, 'argv': argv, 'started_unix': started})
         for stream, name in [(child.stdout, 'stdout'), (child.stderr, 'stderr')]:
             drain = Drain(stream, attempt/name); drains.append(drain); drain.thread.start()
         while True:
             live = supervisor.observe(child, known, peaks)
+            validate_temp_storage(recipe)
             if len(known) > MAX_KNOWN or len(live) > MAX_ACTIVE: raise RuntimeError('observed process admission bound')
             combined = sum(x['rss_bytes'] for x in live.values()); maximum = max(maximum, combined)
             elapsed = time.monotonic()-tick
@@ -616,10 +641,14 @@ def child_main(recipe):
             fresh_full_admission(self, recipe, ctx, attempt, frozen.PauseRequested)
             return super().full_phase(request_path)
         def space(self, minimum=None):
+            validate_temp_storage(recipe)
             if read(Path(recipe['run'])/'journal.json')['next_command'] >= recipe['expected_next_command']+MAX_COMMANDS:
                 monitor.pause('new command metadata count admission')
                 raise frozen.PauseRequested('bounded command count reached')
             return super().space(minimum)
+        def call(self, key, arguments):
+            validate_temp_storage(recipe)
+            return super().call(key, arguments)
     frozen.Runner = AdmittedRunner
     previous = sys.argv
     try:
