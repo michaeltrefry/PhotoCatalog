@@ -1,0 +1,87 @@
+--- main_resume.py
++++ main_resume.py
+@@ -71,10 +71,28 @@
+     return module
+ 
+ 
++def load_funding(recipe):
++    policy = evidence(recipe['funding_policy'])
++    code = raw(policy['adapter']['path'])
++    if sha(code) != policy['adapter']['sha256']:
++        raise ValueError('funding adapter changed')
++    # Execute only the exact SHA-bound adapter source, with no main dispatch.
++    import types
++    module = types.ModuleType('reviewed_funding_guard')
++    module.__file__ = policy['adapter']['path']
++    exec(compile(code, module.__file__, 'exec'), module.__dict__)
++    checked, _ = module.load_policy(recipe['funding_policy']['path'], recipe['funding_policy']['sha256'])
++    if (checked['run'] != recipe['run'] or checked['runner']['path'] != recipe['runner']
++            or checked['initial_minimum_bytes'] != recipe['minimum_free_bytes']
++            or checked['attempt'] != str(Path(recipe['control'])/'attempts'/recipe['attempt_id'])):
++        raise ValueError('funding recipe identity differs')
++    return module, checked
++
++
+ def validate_recipe(recipe):
+     required = {'protocol', 'attempt_id', 'run', 'control', 'runner', 'binding', 'adoption',
+                 'adoption_review', 'journal', 'expected_next_command', 'admission_before',
+-                'previous', 'pause', 'authorization', 'minimum_free_bytes', 'memory_admission'}
++                'previous', 'pause', 'authorization', 'minimum_free_bytes', 'memory_admission', 'funding_policy'}
+     if set(recipe) != required or any(value is None for value in recipe.values()):
+         raise ValueError('unresolved or unexpected main recipe field')
+     if recipe['protocol'] != 1 or str(uuid.UUID(recipe['attempt_id'])) != recipe['attempt_id']:
+@@ -322,22 +340,26 @@
+             'new_command_failures': failures, 'main_outcome_counts': counts, 'pause': pause_ref}
+ 
+ 
+-def supervise(recipe, attempt, binding, supervisor):
++def supervise(recipe, attempt, binding, supervisor, funding):
+     run = Path(recipe['run']); start = recipe['expected_next_command']
+     before_phases = phase_paths(run)
+     started = time.time(); tick = time.monotonic(); known = {}; peaks = {}; combined_peak = 0
+     process = None; pause_ref = None; cleanup = None
+     result = {'status': 'failed_or_unknown', 'started_unix': started}
+     cleanup_review = {'interrupt_grace_seconds': 30, 'kill_grace_seconds': 10}
+-    command = [PYTHON, recipe['runner'], 'main', str(run)]
++    funding_module, funding_policy = funding
++    monitor = funding_module.FundingMonitor(funding_policy, 'outer')
++    command = [PYTHON, funding_policy['adapter']['path'], recipe['funding_policy']['path'], recipe['funding_policy']['sha256']]
+     with (attempt/'stdout').open('xb') as stdout, (attempt/'stderr').open('xb') as stderr:
+         try:
++            monitor.outer()
+             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+             supervisor.save(attempt/'process.json', {'pid': process.pid, 'argv': command, 'started_unix': started})
+             while True:
+                 live = supervisor.observe(process, known, peaks)
+                 combined = sum(v['rss_bytes'] for v in live.values()); combined_peak = max(combined_peak, combined)
+                 elapsed = time.monotonic()-tick
++                monitor.outer()
+                 pause_path = run/'pause-request'
+                 if pause_ref is None and (elapsed >= 600 or os.path.lexists(pause_path)):
+                     if not os.path.lexists(pause_path):
+@@ -390,6 +412,8 @@
+                 result['ownership_note'] = 'Abnormal supervisor exit: earlier native failure/descendant ownership has not been fully audited; successful serial tail is insufficient.'
+         finally:
+             stdout.flush(); stderr.flush(); os.fsync(stdout.fileno()); os.fsync(stderr.fileno())
++    monitor.finish()
++    result.update(funding_policy=recipe['funding_policy'], funding_observation=reference(attempt/'funding-outer-result.json'))
+     result.update(finished_unix=time.time(), exit_code=None if process is None else process.poll(), cleanup=cleanup,
+                   observed_process_lifetimes=list(known.values()),
+                   sampled_observed_peak_rss_per_pid=peaks, sampled_observed_peak_combined_rss_bytes=combined_peak,
+@@ -420,6 +444,7 @@
+         raise ValueError('independent adoption review not bound/passed')
+     if recipe['adoption']['path'] != str(run_root/'reports/generation-adoption.json') or adopted['source_binding'] != binding or adopted['after_logical_state_equal'] is not True:
+         raise ValueError('adoption not qualified')
++    funding = load_funding(recipe)
+     control.mkdir(mode=0o700, exist_ok=True)
+     with (control/'wrapper.lock').open('a+b') as guard:
+         fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+@@ -452,7 +477,7 @@
+                 os.close(descriptor)
+             # Any later failure leaves started/current persistent; no automatic retry.
+             admit_pause(run_root, recipe, attempt, supervisor)
+-        result = supervise(recipe, attempt, binding, supervisor)
++        result = supervise(recipe, attempt, binding, supervisor, funding)
+         supervisor.save(attempt/'result.json', result)
+         print(json.dumps({'status':result['status'],'receipt':str(attempt/'result.json')}),flush=True)
+         return 0 if result['status'] in {'paused_at_command_boundary','main_review_returned_not_acceptance'} and result['ownership_status']=='observed_owned_processes_reaped' else 1
