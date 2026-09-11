@@ -409,6 +409,14 @@ pub fn recover_worker_staging(root: &Path, limit: usize) -> Result<usize> {
     }
     Ok(removed)
 }
+// Created only after a successful lock. A duplicated/inherited descriptor must
+// not extend completed recovery or worker authority beyond this lexical scope.
+struct AcquiredLease(File);
+impl Drop for AcquiredLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 fn clean_staging_directory(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path.join("active.lock")) {
         Ok(metadata) => ensure!(
@@ -418,7 +426,7 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut lock = match OpenOptions::new()
+    let lock = match OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -436,6 +444,7 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
         }
         return Err(error.into());
     }
+    let mut lock = AcquiredLease(lock);
     let allowed = [
         "active.lock",
         "result.json",
@@ -464,7 +473,7 @@ fn clean_staging_directory(path: &Path) -> Result<bool> {
     // first; every worker checks that same handle after acquiring its lease.
     // A delayed opener can acquire the old lease after this close, but cannot
     // enter native work, even if another open handle prevents the rename.
-    retire_staging_lease(&mut lock)?;
+    retire_staging_lease(&mut lock.0)?;
     drop(lock);
     let claimed = if path
         .file_name()
@@ -583,7 +592,8 @@ pub fn worker_main() -> Result<()> {
         .write(true)
         .open(current.join("active.lock"))?;
     lock.try_lock_exclusive().context("worker staging lease")?;
-    validate_staging_identity(&current, &lock)?;
+    let lock = AcquiredLease(lock);
+    validate_staging_identity(&current, &lock.0)?;
     let result = run_worker();
     if let Err(error) = &result {
         let mut message = format!("{error:#}");
@@ -884,7 +894,18 @@ mod tests {
             .unwrap();
         lease.try_lock_exclusive().unwrap();
         assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 0);
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(stage.join("active.lock"))
+            .unwrap();
+        assert!(
+            contender.try_lock_exclusive().is_err(),
+            "failed recovery must not unlock the active owner"
+        );
+        drop(contender);
         assert!(stage.join("0.preview").exists());
+        FileExt::unlock(&lease).unwrap();
         drop(lease);
         assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 1);
         assert!(!stage.exists());
@@ -956,6 +977,7 @@ mod tests {
                     .to_string()
                     .contains("retired")
             );
+            FileExt::unlock(&delayed).unwrap();
         }
         // A delayed Windows handle may also prevent renaming the directory.
         // Retirement must reject it regardless of whether the old path remains.
@@ -988,16 +1010,93 @@ mod tests {
             .unwrap();
         recovery.try_lock_exclusive().unwrap();
         retire_staging_lease(&mut recovery).unwrap();
-        drop(recovery); // Crash boundary: retired, but original path still exists.
+        FileExt::unlock(&recovery).unwrap();
+        drop(recovery); // Completed retirement before directory claim.
         delayed.try_lock_exclusive().unwrap();
         assert!(stage.is_dir());
         let error = validate_staging_identity(&stage, &delayed).unwrap_err();
         assert!(error.to_string().contains("retired"));
         assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 0);
         assert_eq!(fs::read(stage.join("0.preview")).unwrap(), b"partial");
+        FileExt::unlock(&delayed).unwrap();
         drop(delayed);
         assert_eq!(recover_worker_staging(root.path(), 1).unwrap(), 1);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_recovery_releases_duplicate_description() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("worker-duplicate-description");
+        fs::create_dir(&stage).unwrap();
+        let lease = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(stage.join("active.lock"))
+            .unwrap();
+        lease.try_lock_exclusive().unwrap();
+        let mut lease = AcquiredLease(lease);
+        let inherited = lease.0.try_clone().unwrap();
+        let delayed = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(stage.join("active.lock"))
+            .unwrap();
+        assert!(delayed.try_lock_exclusive().is_err());
+        retire_staging_lease(&mut lease.0).unwrap();
+        drop(lease);
+        delayed.try_lock_exclusive().unwrap();
+        assert!(validate_staging_identity(&stage, &delayed).is_err());
+        assert_eq!(inherited.metadata().unwrap().len(), 1);
+        drop(inherited);
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(stage.join("active.lock"))
+            .unwrap();
+        assert!(
+            contender.try_lock_exclusive().is_err(),
+            "closing the old description must not release the new owner"
+        );
+        FileExt::unlock(&delayed).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_error_and_unwind_release_inherited_description() {
+        for unwind in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("active.lock");
+            fs::write(&path, []).unwrap();
+            let mut inherited = None;
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+                    file.try_lock_exclusive()?;
+                    let _lease = AcquiredLease(file);
+                    inherited = Some(_lease.0.try_clone()?);
+                    if unwind {
+                        panic!("injected recovery unwind");
+                    }
+                    bail!("injected recovery validation failure")
+                }));
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            let contender = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            contender.try_lock_exclusive().unwrap();
+            assert_eq!(contender.metadata().unwrap().len(), 0);
+            FileExt::unlock(&contender).unwrap();
+            drop(inherited);
+        }
     }
 
     #[test]

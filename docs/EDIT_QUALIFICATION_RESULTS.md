@@ -159,3 +159,24 @@ Renderer keys include source-file identities, so this code update invalidates ol
 edited-preview cache keys on every platform. The first request can rebuild its
 preview; the table above describes the frozen campaign's declared warm and first
 decode cases, not cache survival across an application upgrade.
+
+PR #9's corrected head `679e31c` passed hosted Linux, macOS and Windows CI
+`34535465873` and merged as the identical tree `f6d19dc`. Merged-main CI then
+exposed a separate worker-lock lifetime defect on Linux: closing an operation's
+descriptor did not release its lock while a duplicated or briefly inherited
+descriptor remained open. Deterministic export and preview regressions reproduce
+that failure. The correction explicitly unlocks successfully acquired leases at
+their existing operation boundary, including error/unwind paths, while retaining
+retirement markers and active-worker exclusion. This does not change pixels,
+codecs or bulk-I/O work; corrective source/test review and platform CI remain
+separate from the frozen campaign above.
+
+The worker-lease correction at `62d9f0f` (identical production/test changes in
+`fe1473b`) passed independent source review, 19 worker tests, five actual export
+service tests, four actual edited-preview tests, package formatting and strict
+all-target Clippy. The private gate receipt is
+`fc1cffedf82a32404aa03c10ac8926d29d66d950ce045e1f785059939c5085ec`.
+Two deterministic duplicate-descriptor cases fail on the original behavior;
+the corrected tests also cover error/unwind release and new-owner isolation.
+The original CI log cannot identify which concurrent fork retained the
+descriptor, so that exact event is not claimed as reconstructed.

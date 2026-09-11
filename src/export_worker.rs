@@ -373,6 +373,15 @@ fn open_lease(path: &Path) -> Result<File> {
         .truncate(false)
         .open(target)?)
 }
+// Construct only after successful acquisition. Closing one descriptor does not
+// release flock while a concurrent fork/dup retains its open-file description.
+// Explicit unlock ends this authority on every return/error before file close.
+struct AcquiredLease(File);
+impl Drop for AcquiredLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 fn lease_retired(lock: &mut File) -> Result<bool> {
     ensure!(lock.metadata()?.len() <= 1, "invalid export lease marker");
     lock.seek(SeekFrom::Start(0))?;
@@ -409,7 +418,7 @@ fn check_live_lease(path: &Path, lock: &File) -> Result<()> {
     );
     Ok(())
 }
-fn discard_files(path: &Path, lock: File, paths: Vec<PathBuf>) -> Result<()> {
+fn discard_files(path: &Path, lock: AcquiredLease, paths: Vec<PathBuf>) -> Result<()> {
     // The durable marker stays on delayed handles. A retired directory name is
     // never accepted by a child, even after its lock pathname has been removed.
     drop(lock);
@@ -446,7 +455,7 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         fs::remove_dir(path)?;
         return Ok(Inspection::Cleaned);
     }
-    let mut lock = open_lease(path)?;
+    let lock = open_lease(path)?;
     if let Err(error) = lock.try_lock_exclusive() {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
             return Ok(Inspection::Retained(
@@ -455,9 +464,10 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         }
         return Err(error.into());
     }
-    let marked = lease_retired(&mut lock)?;
+    let mut lock = AcquiredLease(lock);
+    let marked = lease_retired(&mut lock.0)?;
     ensure!(
-        lease_identity(&lock)? == lease_identity(&File::open(path.join("active.lock"))?)?,
+        lease_identity(&lock.0)? == lease_identity(&File::open(path.join("active.lock"))?)?,
         "export recovery lease identity changed"
     );
     if retired {
@@ -477,7 +487,7 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
     }
     let request: Request = serde_json::from_slice(&read(&request_path, REQUEST_LIMIT)?)?;
     validate_persisted(&request)?;
-    mark_retired(&mut lock)?;
+    mark_retired(&mut lock.0)?;
     drop(lock);
     let staging = if retired {
         path.to_owned()
@@ -549,11 +559,12 @@ pub fn recover_export_transports(
 pub fn discard_retired_export_transport(retired: &RetiredExportTransport) -> Result<()> {
     ensure!(retired_name(&retired.staging), "transport was not fenced");
     let paths = transport_files(&retired.staging)?;
-    let mut lock = open_lease(&retired.staging)?;
+    let lock = open_lease(&retired.staging)?;
     lock.try_lock_exclusive()
         .context("retired export lease busy")?;
+    let mut lock = AcquiredLease(lock);
     ensure!(
-        lease_retired(&mut lock)?,
+        lease_retired(&mut lock.0)?,
         "transport retirement marker missing"
     );
     let request: Request =
@@ -580,7 +591,8 @@ pub fn export_worker_main() -> Result<()> {
         .write(true)
         .open(current.join("active.lock"))?;
     lock.try_lock_exclusive()?;
-    check_live_lease(&current, &lock)?;
+    let lock = AcquiredLease(lock);
+    check_live_lease(&current, &lock.0)?;
     let result = (|| -> Result<()> {
         let mut input = std::io::stdin();
         let mut token = [0];
