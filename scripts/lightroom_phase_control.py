@@ -185,6 +185,8 @@ def admit_canonical_previous(recipe, result, review):
         return
     old_attempt = Path(recipe['previous']['result']['path']).parent
     old_recipe_ref = C.reference(old_attempt/'recipe.json'); old_recipe = C.document(old_recipe_ref)
+    if 'packet_selection' in recipe or 'packet_selection' in old_recipe:
+        return admit_selected_previous(recipe, old_recipe, old_recipe_ref, result, review)
     old_fixed = canonical_invariants(old_recipe); new_fixed = canonical_invariants(recipe)
     if old_recipe.get('canonical_hash_profile') is not None and old_recipe['phase'] != recipe['phase']:
         # Existing admit_previous verifies the exact successful phase/output;
@@ -261,11 +263,241 @@ def install_canonical_profile(recipe, attempt, frozen):
     save(attempt/'execution-profile-consumed.json', {'execution_profile': ref, 'helper': profile['helper'], 'pid': os.getpid()})
 
 
+def selected_native_profile(recipe, verify_binary=False):
+    """Explicit successor attribution; the historical run binding is immutable."""
+    if 'packet_selection' not in recipe:
+        if 'native_execution_profile' in recipe or 'packet_transition' in recipe:
+            raise ValueError('native successor requires selected PACKETS')
+        return None
+    if (recipe['phase'] != 'packets' or 'canonical_hash_profile' not in recipe
+            or 'native_execution_profile' not in recipe):
+        raise ValueError('selected successor requires PACKETS and bound Python profile')
+    profile = C.document(recipe['native_execution_profile'])
+    if (set(profile) != {'protocol', 'kind', 'base_binding', 'base_driver', 'native', 'build', 'qualification'}
+            or type(profile['protocol']) is not int or profile['protocol'] != 1
+            or profile['kind'] != 'qualified_selected_packets_native'
+            or profile['base_binding'] != recipe['binding'] or profile['base_driver'] != recipe['code']['runner']):
+        raise ValueError('native execution profile differs')
+    native = profile['native']
+    if (set(native) != {'path', 'sha256', 'bytes', 'source'} or not isinstance(native['source'], str)
+            or len(native['source']) != 40 or any(c not in '0123456789abcdef' for c in native['source'])
+            or not isinstance(native['sha256'], str) or len(native['sha256']) != 64
+            or any(c not in '0123456789abcdef' for c in native['sha256'])
+            or not 1 <= C.integer(native['bytes'], 1) <= 256*MIB
+            or C.absolute(native['path']) == Path(recipe['run'])/'lightroom_inspect'):
+        raise ValueError('distinct bounded successor executable required')
+    build = C.document(profile['build']); review = C.document(profile['qualification'])
+    if (build.get('native') != native or build.get('status') != 'BUILT'
+            or review.get('status') != 'PASS' or review.get('native') != native
+            or review.get('base_binding') != recipe['binding'] or review.get('base_driver') != recipe['code']['runner']
+            or review.get('build') != profile['build'] or review.get('schema_version') != 3
+            or not isinstance(review.get('reviewer'), str) or not review['reviewer'].strip()
+            or review.get('assertions') != {'cli_schema_compatible': True, 'unchanged_packet_values': True,
+                'stability_and_fallback_verified': True, 'source_preservation_verified': True}
+            or not isinstance(review.get('evidence'), list) or not 1 <= len(review['evidence']) <= 16):
+        raise ValueError('independent native qualification/build required')
+    for ref in review['evidence']: C.checked(ref)
+    if verify_binary:
+        path = C.absolute(native['path']); digest = hashlib.sha256()
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size != native['bytes']:
+                raise ValueError('native executable type/size differs')
+            remaining = native['bytes']+1
+            while remaining:
+                data = stream.read(min(65536, remaining))
+                if not data: break
+                remaining -= len(data); digest.update(data)
+            after = os.fstat(stream.fileno())
+        fields = lambda m: (m.st_dev,m.st_ino,m.st_size,m.st_mtime_ns,m.st_ctime_ns)
+        if (remaining != 1 or digest.hexdigest() != native['sha256']
+                or fields(before) != fields(after) or fields(after) != fields(path.lstat())):
+            raise ValueError('native executable changed/digest differs')
+    return profile
+
+
+def native_context(recipe, ctx, binding, profile=None):
+    if 'packet_selection' not in recipe: return ctx
+    profile = profile or selected_native_profile(recipe)
+    native = profile['native']
+    effective = dict(binding, source=native['source'], binary_sha256=native['sha256'], binary_bytes=native['bytes'],
+                     base_binding_sha256=recipe['binding']['sha256'], native_execution_profile=recipe['native_execution_profile'])
+    return dict(ctx, native_profile=profile, native_path=native['path'], effective_binding=effective)
+
+
+def packet_transition_invariants(recipe):
+    value = canonical_invariants(recipe)
+    for key in ['phase', 'input', 'baseline', 'paths_review', 'funding', 'packet_selection',
+                'native_execution_profile', 'packet_transition']:
+        value.pop(key, None)
+    value['code'] = {k:v for k,v in value['code'].items() if k != 'contract'}
+    return value
+
+
+def packet_transition_expected(recipe, old_ref):
+    return {'status':'PASS', 'kind':'terminal_paths_to_selected_packets_native',
+            'previous':recipe['previous'], 'previous_recipe':old_ref, 'base_binding':recipe['binding'],
+            'selection':recipe['packet_selection'], 'native_execution_profile':recipe['native_execution_profile'],
+            'controller':recipe['code']['controller'], 'contract':recipe['code']['contract'],
+            'canonical_hash_profile':recipe['canonical_hash_profile'], 'journal':recipe['journal'],
+            'first_command':recipe['expected_next_command'],
+            'invariants_sha256':C.sha(C.encoded(packet_transition_invariants(recipe)))}
+
+
+def admit_selected_previous(recipe, old_recipe, old_ref, result, review, *, check_namespace=True):
+    if (result.get('ownership_status') != 'observed_owned_processes_reaped'
+            or result.get('root_reaped') is not True or result.get('cleanup') is not None
+            or result.get('new_command_failures') != [] or type(result.get('exit_code')) is not int
+            or (result.get('status'), result.get('exit_code')) not in {('paused_at_command_boundary',1),('review_returned_not_acceptance',0)}
+            or any(k in result for k in ['failure','pipe_failure','funding_receipt_error'])
+            or review.get('status') != 'PASS' or review.get('result') != recipe['previous']['result']
+            or review.get('binding') != recipe['binding']):
+        raise ValueError('selected predecessor is failed or unreviewed')
+    if ('packet_selection' not in recipe or 'canonical_hash_transition' in recipe
+            or recipe['canonical_hash_profile'] != old_recipe.get('canonical_hash_profile')):
+        raise ValueError('selected/Python execution profile cannot change or disappear')
+    if 'packet_selection' in old_recipe:
+        old = canonical_invariants(old_recipe); new = canonical_invariants(recipe)
+        old.pop('packet_transition', None); new.pop('packet_transition', None)
+        if (old != new or 'packet_transition' in recipe or old_recipe['code'] != recipe['code']
+                or old_recipe['phase'] != 'packets'):
+            raise ValueError('selected continuation scope/controller differs')
+        validate_native_execution(old_recipe, Path(old_ref['path']).parent, result)
+        if (review.get('packet_selection') != recipe['packet_selection']
+                or review.get('native_execution_profile') != recipe['native_execution_profile']
+                or any(review.get(k) != result.get(k) for k in ['native_execution','native_execution_consumed'])):
+            raise ValueError('prior native execution review missing')
+    else:
+        if (old_recipe['phase'] != 'paths' or result.get('status') != 'review_returned_not_acceptance'
+                or result.get('exit_code') != 0 or result.get('cleanup') is not None
+                or result.get('root_reaped') is not True or result.get('new_command_failures') != []
+                or result.get('output') != recipe['paths_review'] or review.get('output') != recipe['paths_review']
+                or any(k in result for k in ['failure','pipe_failure','funding_receipt_error'])
+                or packet_transition_invariants(recipe) != packet_transition_invariants(old_recipe)):
+            raise ValueError('native transition requires unchanged clean terminal PATHS')
+        if C.document(recipe['packet_transition']) != packet_transition_expected(recipe, old_ref):
+            raise ValueError('independent exact packet/native transition required')
+        ctx = C.context(recipe)
+        # No prior packet work may be relabeled by this first boundary.
+        if check_namespace and os.path.lexists(ctx['output']): raise ValueError('selected output already exists at transition')
+        first_key = [ctx['tag'], next(iter(ctx['requested'].values()))['inspection']['revision'], 'check', 0]
+        if check_namespace and os.path.lexists(Path(recipe['run'])/'steps'/(C.sha(C.encoded(first_key))+'.json')):
+            raise ValueError('selected packet namespace already started')
+    proof = result.get('execution_profile')
+    if proof is None or review.get('execution_profile') != proof:
+        raise ValueError('prior Python execution review missing')
+    validate_execution_profile(old_recipe, Path(old_ref['path']).parent, result)
+
+
+def validate_selected_previous_history(recipe):
+    """Immutable predecessor proof; no old current/journal/PID revalidation."""
+    old_ref = C.reference(Path(recipe['previous']['result']['path']).parent/'recipe.json')
+    old = C.document(old_ref); result = C.document(recipe['previous']['result'])
+    review = C.document(recipe['previous']['review'])
+    phase = C.document(result['phase'])
+    if (phase['binding'] != C.document(recipe['binding']) or phase['phase'] != old['phase']
+            or result.get('phase_input') != old['input'] or result.get('phase_name') != old['phase']
+            or result['journal'] != recipe['journal'] or result['next_command'] != recipe['expected_next_command']
+            or old['binding'] != recipe['binding']):
+        raise ValueError('archived predecessor interval/phase differs')
+    if result['status'] == 'paused_at_command_boundary':
+        if phase.get('status') != 'paused' or old['phase'] != 'packets':
+            raise ValueError('archived selected pause differs')
+    elif (phase.get('status') != 'review_artifact_returned_not_acceptance'
+          or phase.get('output') != result.get('output', {}).get('path')
+          or review.get('output') != result.get('output')):
+        raise ValueError('archived selected terminal differs')
+    admit_selected_previous(recipe, old, old_ref, result, review, check_namespace=False)
+
+
+def native_execution_value(recipe, attempt):
+    return {'protocol':1, 'kind':'effective_selected_packets_native', 'status':'AUTHORIZED_BEFORE_DISPATCH',
+            'base_binding':recipe['binding'], 'profile':recipe['native_execution_profile'],
+            'selection':recipe['packet_selection'], 'recipe':C.reference(attempt/'recipe.json'),
+            'first_command':recipe['expected_next_command'], 'previous':recipe['previous']}
+
+
+def validate_native_execution(recipe, attempt, result=None):
+    ref = C.reference(attempt/'native-execution.json')
+    if C.document(ref) != native_execution_value(recipe, attempt):
+        raise ValueError('native execution authorization differs')
+    if result is not None:
+        consumed_ref = C.reference(attempt/'native-execution-consumed.json')
+        process = read(attempt/'process.json')
+        if (result.get('native_execution') != ref or result.get('native_execution_consumed') != consumed_ref
+                or C.document(consumed_ref) != {'execution':ref, 'profile':recipe['native_execution_profile'], 'pid':process['pid']}):
+            raise ValueError('native consumption/PID/result differs')
+    return ref
+
+
+def selected_path_phase(runner, full_path, recipe, ctx, frozen):
+    if str(full_path) != recipe['input']['path']:
+        raise ValueError('selected phase input differs')
+    baseline = runner.command_document(ctx['input']['ending_inventory_command'], 'discover')
+    invocation = uuid.uuid4().hex; key = ctx['tag']
+    fresh = runner.require([key, invocation, 'discover-admission'], ['discover', runner.config['catalog_root']])
+    delta = frozen.inventory_delta(baseline, fresh['value'])
+    runner.summary('packets-selected-admission-'+ctx['id']+'-'+ctx['selection']['sha256']+'-'+invocation,
+                   {'selection':ctx['selection'], 'inventory_delta':delta, 'admitted':frozen.unchanged_inventory(delta),
+                    'baseline_inventory_command':ctx['input']['ending_inventory_command'],
+                    'fresh_inventory_command':fresh['record']['sequence']})
+    if not frozen.unchanged_inventory(delta): raise ValueError('selected fresh inventory changed')
+    completed = Path(ctx['output'])
+    if completed.exists():
+        C.validate_output(frozen.read_json(completed), ctx); return completed
+    outcomes = []
+    for key_id, candidate in ctx['requested'].items():
+        revision = candidate['inspection']['revision']; item = {'key':key_id, 'revision':revision}
+        try:
+            for index in range(runner.config['maximum_calls_per_revision']):
+                checked = runner.require([key,revision,'check',index],
+                    ['check-paths',ctx['plan'],revision,'--limit',runner.config['page_limit'],'--packets'])
+                if checked['value']['checked'] == 0: break
+            else: raise RuntimeError('selected path-call admission exhausted')
+            item['pages'] = {name:runner.pages(ctx['plan'],revision,name,key)
+                            for name in ['paths','packets','metadata-conflicts','issues']}
+            item['report'] = runner.require([key,revision,'report'], ['report',ctx['plan'],revision])['value']
+        except (frozen.InterruptedOperation, frozen.PauseRequested):
+            raise
+        except Exception as error:
+            item['error'] = repr(error)
+        outcomes.append(item)
+    ending = runner.require([key,invocation,'discover-end'], ['discover',runner.config['catalog_root']])
+    families = runner.require([key,'families'], ['families',ctx['plan']])['value']
+    value = {'full_review_sha256':ctx['id'], 'paths_review':ctx['paths_input'], 'packet_selection':ctx['selection'],
+             'native_execution_profile':recipe['native_execution_profile'],
+             'scope':'user_selected_current_catalogs_external_packets', 'prerequisite_members':len(ctx['all_requested']),
+             'excluded':ctx['excluded'], 'external_unselected_assessed':False,
+             'starting_inventory_command':fresh['record']['sequence'], 'ending_inventory_command':ending['record']['sequence'],
+             'inventory_delta':frozen.inventory_delta(fresh['value'],ending['value']),
+             'outcome_counts':{'requested_members':len(outcomes),'failures':sum('error' in x for x in outcomes)},
+             'outcomes':outcomes, 'families':families, 'automatic_selection':False,
+             'application_consistency':'unverified', 'migration_executed':False}
+    return runner.summary(completed.stem, value)
+
+
+class NewCommandBudget:
+    """Reviewed cadence headroom; terminal16MiB/20k checks remain authoritative."""
+    def __init__(self, run, first, monitor):
+        self.run=Path(run); self.first=first; self.last=first-1; self.bytes=0; self.monitor=monitor; self.requested=False
+    def completed(self, record):
+        sequence=C.integer(record['sequence'],1)
+        if sequence <= self.last: return
+        if sequence != self.last+1: raise ValueError('new-command accounting sequence gap')
+        meta=(self.run/'commands'/f'{sequence:09d}'/'result.json').lstat()
+        if not stat.S_ISREG(meta.st_mode): raise ValueError('nonregular new command result')
+        self.bytes+=meta.st_size; self.last=sequence
+        if not self.requested and (self.bytes>=12*MIB or self.last-self.first+1>=18000):
+            self.monitor.pause('cooperative new-command metadata/count headroom'); self.requested=True
+
+
 def validate_recipe(recipe):
     fields = {'protocol', 'phase', 'run', 'control', 'attempt_id', 'input', 'baseline', 'paths_review',
               'code', 'config', 'binding', 'journal', 'expected_next_command', 'previous', 'pause',
               'funding', 'memory', 'grant'}
-    optional = {'temp_storage', 'canonical_hash_profile', 'canonical_hash_transition'}
+    optional = {'temp_storage', 'canonical_hash_profile', 'canonical_hash_transition',
+                'packet_selection', 'native_execution_profile', 'packet_transition'}
     if not fields <= set(recipe) or set(recipe)-fields-optional or recipe['protocol'] != 1 or any(v is None for v in recipe.values()):
         raise ValueError('unresolved/unknown recipe fields')
     if str(uuid.UUID(recipe['attempt_id'])) != recipe['attempt_id']:
@@ -295,12 +527,13 @@ def validate_recipe(recipe):
             or binding['config_sha256'] != C.sha(C.encoded(config))
             or binding['source'] != config['source_commit'] or binding['binary_sha256'] != config['tested_binary_sha256']):
         raise ValueError('frozen config/native/source binding differs')
-    # Native bytes are validated by the frozen Runner before any command. This
-    # control never copies/substitutes that executable or guesses a new identity.
+    # The frozen Runner validates its original executable. Selected PACKETS
+    # additionally admits a distinct qualified executable without replacing it.
     if recipe['journal']['path'] != str(run/'journal.json'):
         raise ValueError('wrong journal path')
     canonical_hash_profile(recipe)
-    ctx = C.context(recipe)
+    profile = selected_native_profile(recipe, verify_binary=True)
+    ctx = native_context(recipe, C.context(recipe), binding, profile)
     budget = C.funding(recipe['funding'], recipe['phase'], recipe['input']['sha256'])
     grant = C.document(recipe['grant'])
     unsigned = {k: v for k, v in recipe.items() if k != 'grant'}
@@ -604,8 +837,12 @@ def validate_full_admission(recipe, ctx, binding, end, paused):
 def command_record(recipe, ctx, number, binding):
     run = Path(recipe['run']); path = run/'commands'/f'{number:09d}'/'result.json'
     record = json.loads(C.raw(path, 65536)); args = record['requested_arguments']; key = record['key']
-    if (record['sequence'] != number or record['source_binding'] != binding or not args
-            or record['argv'] != [str(run/'lightroom_inspect'), *[str(run/'captures'/f'{number:09d}') if x == '@CAPTURE@' else x for x in args]]):
+    if 'selection' in ctx:
+        C.validate_selected_command(ctx, key, args, C.document(recipe['config']))
+    expected_binding = ctx.get('effective_binding', binding)
+    expected_binary = ctx.get('native_path', str(run/'lightroom_inspect'))
+    if (record['sequence'] != number or record['source_binding'] != expected_binding or not args
+            or record['argv'] != [expected_binary, *[str(run/'captures'/f'{number:09d}') if x == '@CAPTURE@' else x for x in args]]):
         raise ValueError('native command identity differs')
     step = run/'steps'/(C.sha(C.encoded(key))+'.json')
     if read(step) != {'sequence': number, 'record': str(path.relative_to(run))}:
@@ -706,6 +943,10 @@ def canonical_result_fields(recipe):
     fields = {'execution_profile': C.reference(attempt/'execution-profile.json'),
               'execution_profile_consumed': C.reference(attempt/'execution-profile-consumed.json')}
     validate_execution_profile(recipe, attempt, dict(fields, next_command=read(Path(recipe['run'])/'journal.json')['next_command']))
+    if 'packet_selection' in recipe:
+        fields.update(native_execution=C.reference(attempt/'native-execution.json'),
+                      native_execution_consumed=C.reference(attempt/'native-execution-consumed.json'))
+        validate_native_execution(recipe, attempt, fields)
     return fields
 
 
@@ -759,8 +1000,8 @@ def supervise(recipe, attempt, ctx, budget, binding, supervisor, funding_module)
                 raise RuntimeError('sampled RSS admission exceeded')
             if any(x.excess.is_set() for x in drains): raise RuntimeError('bounded output overflow/write failure')
             monitor.outer()
-            if elapsed >= 600 and not os.path.lexists(run/'pause-request'):
-                try: save(run/'pause-request', {'owner': str(attempt), 'reason': '600s cooperative phase slice', 'requested_unix': time.time()})
+            if elapsed >= (3600 if 'packet_selection' in recipe else 600) and not os.path.lexists(run/'pause-request'):
+                try: save(run/'pause-request', {'owner': str(attempt), 'reason': 'cooperative phase slice', 'requested_unix': time.time()})
                 except FileExistsError: pass
             if pause is None and os.path.lexists(run/'pause-request'):
                 pause = C.reference(run/'pause-request')
@@ -798,12 +1039,60 @@ def supervise(recipe, attempt, ctx, budget, binding, supervisor, funding_module)
                   root_reaped=child is not None and child.poll() is not None, observed_process_lifetimes=list(known.values()),
                   sampled_observed_peak_rss_per_pid=peaks, sampled_observed_peak_combined_rss_bytes=maximum,
                   rss_meaning='one-second ps samples, native microsecond birth ownership; not HWM/quota or all-descendant coverage',
-                  soft_slice_seconds=600, sampled_emergency_seconds=4800,
+                  soft_slice_seconds=3600 if 'packet_selection' in recipe else 600, sampled_emergency_seconds=4800,
                   logs={x.path.name: {'observed_bytes': x.seen, 'retained_bytes': x.kept, 'truncated': x.seen > x.kept,
                                      'error': x.error, 'complete': not x.thread.is_alive(),
                                      'reference': C.reference(x.path) if x.path.exists() and not x.thread.is_alive() else None} for x in drains})
     signal.signal(signal.SIGTERM, previous_term)
     return result
+
+
+def admitted_runner_type(base, recipe, ctx, attempt, frozen, monitor):
+    command_budget = NewCommandBudget(recipe['run'],recipe['expected_next_command'],monitor) if 'selection' in ctx else None
+    class AdmittedRunner(base):
+        def __init__(self, root):
+            super().__init__(root)
+            if C.document(recipe['journal']) != {'next_command': recipe['expected_next_command']}:
+                self.close(); raise ValueError('journal changed before child acquired runner lock')
+            if 'selection' in ctx:
+                try:
+                    selected_native_profile(recipe, verify_binary=True)
+                    ref = validate_native_execution(recipe, attempt)
+                    self.binary = Path(ctx['native_path'])
+                    self.binary_revision = frozen.revision(self.binary.lstat())
+                    save(attempt/'native-execution-consumed.json', {'execution':ref, 'profile':recipe['native_execution_profile'], 'pid':os.getpid()})
+                except BaseException:
+                    self.close(); raise
+        def full_phase(self, request_path):
+            fresh_full_admission(self, recipe, ctx, attempt, frozen.PauseRequested)
+            return super().full_phase(request_path)
+        def path_phase(self, input_path, packets):
+            if 'selection' in ctx:
+                if not packets: raise ValueError('selected native cannot run PATHS')
+                return selected_path_phase(self, input_path, recipe, ctx, frozen)
+            return super().path_phase(input_path, packets)
+        def space(self, minimum=None):
+            validate_temp_storage(recipe)
+            if read(Path(recipe['run'])/'journal.json')['next_command'] >= recipe['expected_next_command']+MAX_COMMANDS:
+                monitor.pause('new command metadata count admission')
+                raise frozen.PauseRequested('bounded command count reached')
+            return super().space(minimum)
+        def call(self, key, arguments):
+            validate_temp_storage(recipe)
+            if 'selection' not in ctx: return super().call(key, arguments)
+            args = [str(x) for x in arguments]
+            C.validate_selected_command(ctx, key, args, self.config)
+            historical = self.binding
+            try:
+                self.binding = ctx['effective_binding']
+                result = super().call(key, arguments)
+            finally:
+                self.binding = historical
+            if result['record'].get('source_binding') != ctx['effective_binding']:
+                raise ValueError('replayed selected native identity differs')
+            command_budget.completed(result['record'])
+            return result
+    return AdmittedRunner
 
 
 def child_main(recipe):
@@ -816,24 +1105,7 @@ def child_main(recipe):
     funding_module = module(recipe['code']['funding_guard'], 'bound_funding')
     monitor = funding_module.FundingMonitor(dict(budget, run=recipe['run'], attempt=str(attempt)), 'adapter')
     base = funding_module.guarded_type(frozen.Runner, monitor, frozen.PauseRequested)
-    class AdmittedRunner(base):
-        def __init__(self, root):
-            super().__init__(root)
-            if C.document(recipe['journal']) != {'next_command': recipe['expected_next_command']}:
-                self.close(); raise ValueError('journal changed before child acquired runner lock')
-        def full_phase(self, request_path):
-            fresh_full_admission(self, recipe, ctx, attempt, frozen.PauseRequested)
-            return super().full_phase(request_path)
-        def space(self, minimum=None):
-            validate_temp_storage(recipe)
-            if read(Path(recipe['run'])/'journal.json')['next_command'] >= recipe['expected_next_command']+MAX_COMMANDS:
-                monitor.pause('new command metadata count admission')
-                raise frozen.PauseRequested('bounded command count reached')
-            return super().space(minimum)
-        def call(self, key, arguments):
-            validate_temp_storage(recipe)
-            return super().call(key, arguments)
-    frozen.Runner = AdmittedRunner
+    frozen.Runner = admitted_runner_type(base, recipe, ctx, attempt, frozen, monitor)
     previous = sys.argv
     try:
         sys.argv = [recipe['code']['runner']['path'], recipe['phase'], recipe['run'], recipe['input']['path']]
@@ -864,6 +1136,8 @@ def run(recipe):
                     save(control/'current.json', {'attempt_id': recipe['attempt_id']}, replace=True)
                     if 'canonical_hash_profile' in recipe:
                         save(attempt/'execution-profile.json', execution_profile_value(recipe, attempt))
+                    if 'packet_selection' in recipe:
+                        save(attempt/'native-execution.json', native_execution_value(recipe, attempt))
                     remove_pause(recipe, attempt)
                 finally: fcntl.flock(runner_lock, fcntl.LOCK_UN)
             result = supervise(recipe, attempt, ctx, budget, binding,

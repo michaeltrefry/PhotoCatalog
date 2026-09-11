@@ -148,6 +148,8 @@ def funding(ref, phase, input_sha):
 
 def context(recipe):
     phase = recipe['phase']; run = absolute(recipe['run']); value = document(recipe['input'])
+    if 'packet_selection' in recipe and phase != 'packets':
+        raise ValueError('selection is only valid for PACKETS')
     if phase not in PHASES:
         raise ValueError('unsupported phase')
     if phase == 'full':
@@ -221,8 +223,9 @@ def context(recipe):
     elif recipe['paths_review'] != {'kind': 'not_applicable'}:
         raise ValueError('unexpected packet prerequisite')
     key = recipe['input']['sha256']
-    return {'phase': phase, 'tag': [phase, key], 'id': key, 'plan': value['plan'],
-            'output': str(run/'reports'/(phase+'-review-'+key+'.json')), 'requested': requested, 'input': value}
+    ctx = {'phase': phase, 'tag': [phase, key], 'id': key, 'plan': value['plan'],
+           'output': str(run/'reports'/(phase+'-review-'+key+'.json')), 'requested': requested, 'input': value}
+    return selected_context(recipe, ctx, prior) if 'packet_selection' in recipe else ctx
 
 
 def validate_path_result(value, requested, full_sha):
@@ -243,6 +246,8 @@ def validate_path_result(value, requested, full_sha):
 
 def validate_output(value, ctx):
     no_award(value)
+    if 'selection' in ctx:
+        validate_selected_output(value, ctx); return
     if ctx['phase'] != 'full':
         validate_path_result(value, ctx['requested'], ctx['id']); return
     if (value.get('request') != ctx['input'] or value.get('request_id') != ctx['id'] or value.get('plan') != ctx['plan']
@@ -271,3 +276,129 @@ def validate_output(value, ctx):
     if counts != {'candidates': len(outcomes), 'full_requested': len(requested), 'full_capture_failures': 0,
                   'inspection_failures': 0, 'main_only_members': len(outcomes)-len(requested)}:
         raise ValueError('full counts differ')
+
+
+def packet_selection(recipe, requested, paths):
+    """Validate user evidence before filtering the already complete FULL roster."""
+    value = document(recipe['packet_selection'])
+    fields = {'protocol', 'kind', 'full', 'paths', 'paths_review', 'proposal',
+              'authorization', 'selected', 'excluded'}
+    if (set(value) != fields or type(value['protocol']) is not int or value['protocol'] != 1
+            or value['kind'] != 'selected_current_catalog_packets'
+            or value['full'] != recipe['input'] or value['paths'] != recipe['paths_review']):
+        raise ValueError('selected packet input identity differs')
+    checked(value['proposal'])  # Retain the reviewed proposal; never re-run its heuristic.
+    review = document(value['paths_review'])
+    if (review.get('status') != 'PASS' or review.get('output') != recipe['paths_review']
+            or review.get('binding') != recipe['binding']
+            or review.get('full_anchor', {}).get('output') != recipe['input']):
+        raise ValueError('independent PATHS prerequisite review missing')
+    families = paths['families']['families']
+    if not 1 <= len(families) <= 256 or len({f['id'] for f in families}) != len(families):
+        raise ValueError('bounded unique family roster required')
+    members = {f['id']: {m['revision_id'] for m in f['members']} for f in families}
+    evidence = {f['id']: f['evidence_digest'] for f in families}
+    revisions = {k: v['inspection']['revision'] for k, v in requested.items()}
+    eligible_families = {f for f, rows in members.items() if rows & set(revisions.values())}
+    if (type(value['selected']) is not list or type(value['excluded']) is not list
+            or not 1 <= len(value['selected']) <= len(requested)
+            or len(value['excluded']) > len(requested)):
+        raise ValueError('bounded selection partition required')
+    selected = {}; chosen_families = set(); excluded = {}
+    for row in value['selected']:
+        if (set(row) != {'family_id', 'family_evidence_digest', 'candidate_key', 'revision', 'reason'}
+                or not isinstance(row['reason'], str) or not row['reason'].strip()
+                or not 1 <= len(row['reason'].encode()) <= 4096):
+            raise ValueError('explicit selected family/reason required')
+        family = row['family_id']; key = row['candidate_key']
+        if (family in chosen_families or key in selected or family not in members
+                or evidence[family] != row['family_evidence_digest']
+                or revisions.get(key) != row['revision'] or row['revision'] not in members[family]):
+            raise ValueError('duplicate, foreign or stale selected member')
+        chosen_families.add(family); selected[key] = row['revision']
+    if chosen_families != eligible_families or len(set(selected.values())) != len(selected):
+        raise ValueError('one explicit current choice per eligible family required')
+    for row in value['excluded']:
+        if (set(row) != {'candidate_key', 'revision', 'disposition'}
+                or row['disposition'] != 'external_packets_not_selected'
+                or row['candidate_key'] in excluded or row['candidate_key'] in selected
+                or revisions.get(row['candidate_key']) != row['revision']):
+            raise ValueError('invalid excluded member')
+        excluded[row['candidate_key']] = row['revision']
+    if set(selected) | set(excluded) != set(requested):
+        raise ValueError('selection must partition every FULL-requested capture')
+    authorization = document(value['authorization'])
+    unsigned = {k: v for k, v in value.items() if k != 'authorization'}
+    if (set(authorization) != {'status', 'selection_body_sha256', 'source_message', 'quote', 'reviewer'}
+            or authorization['status'] != 'USER_AUTHORIZED'
+            or authorization['selection_body_sha256'] != sha(encoded(unsigned))
+            or not isinstance(authorization['reviewer'], str) or not authorization['reviewer'].strip()):
+        raise ValueError('actual user authorization of exact choices required')
+    message = document(authorization['source_message'])
+    if (message.get('role') != 'user' or not isinstance(message.get('message_id'), str)
+            or not message['message_id'] or not isinstance(message.get('text'), str)
+            or not isinstance(authorization['quote'], str) or not authorization['quote'].strip()
+            or authorization['quote'] not in message['text']):
+        raise ValueError('original user message evidence/quote required')
+    # Authorization is a separately reviewed association to the original message;
+    # no algorithm here interprets natural-language intent or invents a choice.
+    ordered = {k: v for k, v in requested.items() if k in selected}
+    exclusions = [{'candidate_key': k, 'revision': revisions[k],
+                   'disposition': 'external_packets_not_selected'} for k in requested if k in excluded]
+    return value, ordered, exclusions
+
+
+def selected_context(recipe, ctx, paths):
+    value, selected, excluded = packet_selection(recipe, ctx['requested'], paths)
+    digest = recipe['packet_selection']['sha256']
+    return dict(ctx, tag=['packets-selected', ctx['id'], digest],
+                output=str(Path(recipe['run'])/'reports'/('packets-selected-review-'+ctx['id']+'-'+digest+'.json')),
+                requested=selected, all_requested=ctx['requested'], selection=recipe['packet_selection'],
+                selection_value=value, excluded=excluded, paths_input=recipe['paths_review'],
+                native_profile_ref=recipe['native_execution_profile'])
+
+
+def validate_selected_output(value, ctx):
+    validate_path_result(value, ctx['requested'], ctx['id'])
+    if (value.get('native_execution_profile') != ctx['native_profile_ref']
+            or value.get('packet_selection') != ctx['selection'] or value.get('paths_review') != ctx['paths_input']
+            or value.get('excluded') != ctx['excluded']
+            or value.get('scope') != 'user_selected_current_catalogs_external_packets'
+            or value.get('prerequisite_members') != len(ctx['all_requested'])
+            or value.get('external_unselected_assessed') is not False
+            or [r['key'] for r in value['outcomes']] != list(ctx['requested'])):
+        raise ValueError('selected packet output scope/partition differs')
+
+
+def validate_selected_command(ctx, key, args, config):
+    """Pre-reservation and audit use the same closed selected command surface."""
+    if not isinstance(key, list) or not key or key[0] != ctx['tag'] or not args:
+        raise ValueError('selected command scope differs')
+    command = args[0]
+    if command == 'discover':
+        if (len(key) != 3 or not isinstance(key[1], str) or len(key[1]) != 32
+                or key[2] not in {'discover-admission', 'discover-end'}
+                or args != ['discover', config['catalog_root']]):
+            raise ValueError('selected discovery differs')
+    elif command == 'families':
+        if key != [ctx['tag'], 'families'] or args != ['families', ctx['plan']]:
+            raise ValueError('selected families differs')
+    else:
+        revisions = {v['inspection']['revision'] for v in ctx['requested'].values()}
+        if len(args) < 3 or args[1] != ctx['plan'] or args[2] not in revisions or len(key) < 3 or key[1] != args[2]:
+            raise ValueError('unselected command revision/plan')
+        if command == 'check-paths':
+            if (len(key) != 4 or key[2] != 'check'
+                    or args != ['check-paths', ctx['plan'], args[2], '--limit', str(config['page_limit']), '--packets']):
+                raise ValueError('selected check differs')
+            integer(key[3])
+        elif command == 'report':
+            if key != [ctx['tag'], args[2], 'report'] or len(args) != 3:
+                raise ValueError('selected report differs')
+        elif command in {'paths', 'packets', 'issues', 'metadata-conflicts'}:
+            if (len(key) != 4 or key[2] != command or len(args) != 7 or args[3] != '--after'
+                    or not args[4].isdecimal() or args[5:] != ['--limit', str(config['page_limit'])]):
+                raise ValueError('selected page differs')
+            integer(key[3])
+        else:
+            raise ValueError('prohibited selected command')
