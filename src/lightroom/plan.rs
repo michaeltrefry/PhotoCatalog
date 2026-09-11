@@ -206,8 +206,11 @@ fn uri(path: &Path) -> Result<String> {
     let bytes = path
         .to_str()
         .context("SQLite URI cannot represent an unpaired Windows surrogate")?
-        .replace('\\', "/")
-        .into_bytes();
+        // Preserve the native namespace (including \\?\ and UNC). SQLite checks
+        // URI authority before percent decoding; converting these backslashes
+        // to slashes would turn the namespace prefix into an invalid authority.
+        .as_bytes()
+        .to_vec();
     let escaped: String = bytes
         .iter()
         .map(|b| {
@@ -2477,6 +2480,57 @@ fn bounded_values(
 #[cfg(test)]
 mod bounded_plan_tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn immutable_uri_preserves_extended_native_path_and_read_only_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut directory = fs::canonicalize(temp.path()).unwrap();
+        // Exercise the actual extended-length namespace, not just a mock prefix.
+        for _ in 0..6 {
+            directory = directory.join("a_directory_long_enough_to_require_native_extended_paths");
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("catalog #100% café.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE evidence(v); INSERT INTO evidence VALUES(17913);")
+            .unwrap();
+        drop(db);
+        let before = fs::read(&path).unwrap();
+        let encoded = uri(&path).unwrap();
+        assert!(encoded.starts_with("file:%5C%5C%3F%5C"), "{encoded}");
+        assert!(encoded.contains("%23100%25%20caf%C3%A9.sqlite3"));
+        let db = Connection::open_with_flags(
+            &encoded,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_row("SELECT v FROM evidence", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            17913
+        );
+        assert!(db.execute("INSERT INTO evidence VALUES(2)", []).is_err());
+        drop(db);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn immutable_uri_rejects_unpaired_windows_surrogate_without_lossy_alias() {
+        use std::os::windows::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = fs::canonicalize(temp.path())
+            .unwrap()
+            .join(std::ffi::OsString::from_wide(&[b'x' as u16, 0xd800]));
+        fs::write(&path, b"retained").unwrap();
+        assert!(
+            uri(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("unpaired Windows surrogate")
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"retained");
+    }
     #[test]
     fn schema_admission_bounds_objects_text_and_native_names() {
         let db = Connection::open_in_memory().unwrap();

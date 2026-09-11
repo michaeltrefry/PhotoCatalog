@@ -104,6 +104,26 @@ fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     out.sort();
     out
 }
+#[cfg(windows)]
+fn writer_tree_stamps(root: &Path) -> Vec<(PathBuf, u64, u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let mut out = vec![];
+    // This fixture has only sibling database/journal files. Metadata queries do
+    // not read the bytes protected by SQLite's mandatory Windows range locks.
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let m = entry.metadata().unwrap();
+        assert!(m.is_file());
+        out.push((
+            entry.file_name().into(),
+            m.file_size(),
+            m.creation_time(),
+            m.last_write_time(),
+        ));
+    }
+    out.sort();
+    out
+}
 struct ChildGuard(std::process::Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -183,6 +203,13 @@ fn active_rollback_and_wal_writers_are_rejected_without_changing_sources() {
         fs::create_dir(&originals).unwrap();
         let source = originals.join("test.lrcat");
         drop(fixture(&source, "1300000", 10.0));
+        #[cfg(windows)]
+        let before_transaction = {
+            let db = Connection::open(&source).unwrap();
+            db.pragma_update(None, "journal_mode", mode).unwrap();
+            drop(db);
+            tree(&originals)
+        };
         let ready = temp.path().join("ready");
         let mut child = ChildGuard(
             std::process::Command::new(std::env::current_exe().unwrap())
@@ -206,16 +233,24 @@ fn active_rollback_and_wal_writers_are_rejected_without_changing_sources() {
             assert!(child.0.try_wait().unwrap().is_none());
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        #[cfg(unix)]
         let before = tree(&originals);
+        #[cfg(windows)]
+        let before = writer_tree_stamps(&originals);
         let manifest = capture_file(&source, &temp.path().join("capture"));
         assert_eq!(manifest.state, "failed", "{mode}: {manifest:?}");
         assert!(
             manifest.issues.iter().any(|i| i.detail.contains("lock")),
             "{manifest:?}"
         );
+        #[cfg(unix)]
         assert_eq!(before, tree(&originals));
+        #[cfg(windows)]
+        assert_eq!(before, writer_tree_stamps(&originals));
         child.0.stdin.take().unwrap().write_all(&[1]).unwrap();
         assert!(child.0.wait().unwrap().success());
+        #[cfg(windows)]
+        assert_eq!(before_transaction, tree(&originals));
     }
 }
 #[test]

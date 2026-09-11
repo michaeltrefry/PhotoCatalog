@@ -88,7 +88,10 @@ impl Source {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(0x0020_0000);
+            // Match SQLite's Windows sharing policy: readers/writers may open,
+            // but a pathname cannot be deleted/replaced while captured. The DMS
+            // byte lock prevents SHM truncation, not winShmPurge's deletion.
+            options.custom_flags(0x0020_0000).share_mode(0x1 | 0x2);
         }
         let file = options.open(path)?;
         let before = revision(&file)?;
@@ -446,8 +449,20 @@ mod tests {
         drop(source);
         fs::write(&path, b"start").unwrap();
         let source = Source::open(&path, 10).unwrap();
-        fs::rename(&path, temp.path().join("previous")).unwrap();
-        fs::write(&path, b"start").unwrap();
-        assert!(source.verify().is_err());
+        #[cfg(unix)]
+        {
+            fs::rename(&path, temp.path().join("previous")).unwrap();
+            fs::write(&path, b"start").unwrap();
+            assert!(source.verify().is_err());
+        }
+        #[cfg(windows)]
+        {
+            assert!(fs::rename(&path, temp.path().join("previous")).is_err());
+            assert!(fs::remove_file(&path).is_err());
+            source.verify().unwrap();
+            drop(source);
+            fs::rename(&path, temp.path().join("previous")).unwrap();
+            fs::write(&path, b"start").unwrap();
+        }
     }
 }
