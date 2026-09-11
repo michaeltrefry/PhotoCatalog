@@ -109,6 +109,14 @@ struct Active {
     started: std::time::Instant,
     started_unix_ms: u128,
 }
+// Construct only after successful acquisition; a failed contender must not unlock.
+struct AcquiredExecutorLock(File);
+impl Drop for AcquiredExecutorLock {
+    fn drop(&mut self) {
+        // A duplicated or fork-inherited descriptor may outlive this owner.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 pub struct ExportService {
     catalog: PathBuf,
     executable: PathBuf,
@@ -117,7 +125,7 @@ pub struct ExportService {
     budget: ByteBudget,
     active: Option<Active>,
     pause: Option<NativeLaunchPause>,
-    _lock: File,
+    _lock: AcquiredExecutorLock,
     recovery_complete: bool,
     completion_metrics: Option<ExportCompletionMetrics>,
 }
@@ -151,6 +159,7 @@ impl ExportService {
             .open(root.join("photo-export.lock"))?;
         lock.try_lock_exclusive()
             .context("another export executor owns this catalog")?;
+        let lock = AcquiredExecutorLock(lock);
         let staging = root.join("photo-export-workers");
         std::fs::create_dir_all(&staging)?;
         ensure!(
@@ -492,5 +501,102 @@ impl Drop for ExportService {
         }
         self.active.take();
         self.pause.take();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+
+    fn limits() -> ExportServiceLimits {
+        let render = crate::edit::RenderLimits {
+            max_pixels: 1_000_000,
+            max_allocation_bytes: 64 * 1024 * 1024,
+            max_live_bytes: 128 * 1024 * 1024,
+        };
+        ExportServiceLimits {
+            worker_bytes: 256 * 1024 * 1024,
+            working_bytes: 256 * 1024 * 1024,
+            render: PhotoRenderLimits {
+                decode: crate::media::DecodeLimits {
+                    max_encoded_bytes: 8 * 1024 * 1024,
+                    max_intermediate_pixels: 1_000_000,
+                    max_allocation_bytes: 64 * 1024 * 1024,
+                },
+                render,
+                encode: crate::image_export::EncodeLimits {
+                    render,
+                    ..Default::default()
+                },
+                max_encoded_extent: 8 * 1024 * 1024,
+            },
+        }
+    }
+
+    #[test]
+    fn service_drop_releases_duplicated_executor_lock() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let catalog = Catalog::open(root.path())?;
+        let executable = std::env::current_exe()?;
+        let service = ExportService::open(&catalog, &executable, limits())?;
+        // A fork can retain this same open-file description until exec.
+        let inherited = service._lock.0.try_clone()?;
+        assert!(ExportService::open(&catalog, &executable, limits()).is_err());
+        assert!(ExportService::open(&catalog, &executable, limits()).is_err());
+        drop(service);
+        let next = ExportService::open(&catalog, &executable, limits())?;
+        drop(inherited);
+        // Closing the old duplicate must not unlock a new independent owner.
+        assert!(ExportService::open(&catalog, &executable, limits()).is_err());
+        drop(next);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_or_unwinding_service_releases_duplicated_executor_lock() -> Result<()> {
+        for unwind in [false, true] {
+            let root = tempfile::tempdir()?;
+            let catalog = Catalog::open(root.path())?;
+            let executable = std::env::current_exe()?;
+            let mut inherited = None;
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let service = ExportService::open(&catalog, &executable, limits())?;
+                    inherited = Some(service._lock.0.try_clone()?);
+                    if unwind {
+                        panic!("controlled executor unwind");
+                    }
+                    anyhow::bail!("controlled executor failure")
+                }));
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            let next = ExportService::open(&catalog, &executable, limits())?;
+            drop(inherited);
+            assert!(ExportService::open(&catalog, &executable, limits()).is_err());
+            drop(next);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_constructor_releases_executor_lock() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let catalog = Catalog::open(root.path())?;
+        let executable = std::env::current_exe()?;
+        let staging = root.path().join("photo-export-workers");
+        std::fs::write(&staging, b"occupied")?;
+        let error = ExportService::open(&catalog, &executable, limits())
+            .err()
+            .unwrap();
+        assert!(!error.to_string().contains("another export executor"));
+        assert_eq!(std::fs::read(&staging)?, b"occupied");
+        std::fs::remove_file(staging)?;
+        let service = ExportService::open(&catalog, &executable, limits())?;
+        assert!(ExportService::open(&catalog, &executable, limits()).is_err());
+        drop(service);
+        Ok(())
     }
 }
