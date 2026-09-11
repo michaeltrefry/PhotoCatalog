@@ -343,13 +343,96 @@ class ActualOuterTrackingContracts(unittest.TestCase):
             self.assertGreaterEqual(result['identity_counts']['retired'],2)
             self.assertEqual(result['identities.jsonl']['sha256'],hashlib.sha256((folder/'identities.jsonl').read_bytes()).hexdigest())
 
+    def known_orphan(self,observation_delay):
+        import textwrap
+        with tempfile.TemporaryDirectory() as root:
+            acknowledgement=Path(root)/'identity-recorded.fifo'
+            os.mkfifo(acknowledgement)
+            # The root can exit only after the observer records this exact child.
+            # Opening both FIFO ends here prevents blocking the observer's writer.
+            code=textwrap.dedent("""
+                import json,os,select,signal,subprocess,sys
+                def interrupted(*_):raise SystemExit(2)
+                signal.signal(signal.SIGTERM,interrupted)
+                fd=os.open(sys.argv[1],os.O_RDWR|os.O_NONBLOCK)
+                child=None
+                released=False
+                try:
+                    child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])
+                    if not select.select([fd],[],[],5)[0]:raise RuntimeError('identity acknowledgement timed out')
+                    key=json.loads(os.read(fd,4096))
+                    import psutil
+                    if key!=[child.pid,psutil.Process(child.pid).create_time()]:raise RuntimeError('wrong identity acknowledgement')
+                    released=True
+                finally:
+                    os.close(fd)
+                    if child is not None and not released:
+                        child.kill()
+                        child.wait(timeout=5)
+            """)
+            code='import sys; sys.argv='+repr(['fixture',str(acknowledgement)])+'; exec('+repr(code)+')'
+            original_identity=campaign.descendant_identity
+            original_add=campaign.ActiveIdentities.add
+            observed=[]
+            acknowledged=[]
+            root_identity=[]
+            def identify(process,root_key):
+                root_identity[:]=[root_key]
+                if not observed:
+                    # Exercise a scheduler delay longer than the removed .5s
+                    # assumption. The condition, never elapsed time, releases root.
+                    time.sleep(observation_delay)
+                key=original_identity(process,root_key)
+                if key is not None and key not in observed:observed.append(key)
+                return key
+            def registered(tracker,key):
+                original_add(tracker,key)
+                if key in observed and not acknowledged:
+                    self.assertIn(key,tracker.active)
+                    os.fsync(tracker.stream.fileno())
+                    payload=json.dumps(key).encode()
+                    # Fail closed if root already exited: no blocking FIFO open.
+                    fd=os.open(acknowledgement,os.O_WRONLY|os.O_NONBLOCK)
+                    try:self.assertEqual(os.write(fd,payload),len(payload))
+                    finally:os.close(fd)
+                    acknowledged.append(key)
+                    # Complete the coordinated root exit before the next ancestry
+                    # enumeration; this fixture targets cleanup of a KNOWN orphan.
+                    deadline=time.monotonic()+3
+                    while campaign.same_alive(root_identity[0]):
+                        if time.monotonic()>=deadline:raise RuntimeError('fixture root did not exit after acknowledgement')
+                        time.sleep(.01)
+            try:
+                result,folder=self.invoke(root,code,expect_failure=True,patches=(
+                    patch.object(campaign,'descendant_identity',side_effect=identify),
+                    patch.object(campaign.ActiveIdentities,'add',registered)))
+                self.assertEqual(len(acknowledged),1)
+                events=[json.loads(line) for line in (folder/'identities.jsonl').read_text().splitlines()]
+                self.assertTrue(any(e['kind']=='discovered' and (e['pid'],e['create_time'])==acknowledged[0] for e in events))
+                self.assertEqual(result['error'],'RuntimeError: root exited with a known unreaped descendant')
+                self.assertTrue(result['ownership']['known_absent'])
+                self.assertTrue(result['ownership']['root_reaped'])
+                self.assertEqual(result['ownership']['root_returncode'],0)
+                self.assertFalse(any(campaign.same_alive(key) for key in observed))
+            finally:
+                # Independent test authority survives failed assertions/observers;
+                # never signal a numeric PID without its recorded birth identity.
+                for key in observed:
+                    process=campaign.owned_process(key)
+                    if process is not None and campaign.same_alive(key):process.kill()
+                deadline=time.monotonic()+3
+                while any(campaign.same_alive(key) for key in observed):
+                    if time.monotonic()>=deadline:raise RuntimeError('fixture descendant cleanup failed')
+                    time.sleep(.01)
+                print('orphan fixture cleanup:',json.dumps(dict(observed=observed,remaining_live=[])))
+
     @unittest.skipUnless(os.name=='posix','orphan process fixture uses POSIX')
     def test_known_orphan_is_reaped_after_root_exit(self):
-        with tempfile.TemporaryDirectory() as root:
-            code='import subprocess,sys,time; subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"]); time.sleep(.5)'
-            result,_=self.invoke(root,code,expect_failure=True)
-            self.assertIn('known unreaped descendant',result['error'])
-            self.assertTrue(result['ownership']['known_absent'])
+        self.known_orphan(0)
+
+    @unittest.skipUnless(os.name=='posix','orphan process fixture uses POSIX')
+    def test_known_orphan_waits_for_delayed_identity_observation(self):
+        self.known_orphan(.65)
 
     def test_telemetry_cap_failure_retains_root_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
