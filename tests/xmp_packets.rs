@@ -1,3 +1,7 @@
+#[cfg(windows)]
+#[path = "../src/storage_volume.rs"]
+#[allow(dead_code)]
+mod storage_volume;
 #[path = "../src/xmp_packets.rs"]
 mod xmp_packets;
 use std::io::Write;
