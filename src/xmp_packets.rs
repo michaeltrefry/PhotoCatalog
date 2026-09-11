@@ -255,6 +255,30 @@ fn stability_stamp(file: &File) -> io::Result<StabilityStamp> {
         changed,
     })
 }
+// A nanosecond-shaped stat field alone does not establish update precision.
+// Linux may stamp once per jiffy; unknown and network filesystems keep rehashing.
+#[cfg(target_os = "macos")]
+fn qualified_apfs_mount(name: &[u8], local: bool) -> bool {
+    local && name == b"apfs"
+}
+fn qualified_unix_file(_file: &File) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if unsafe { libc::fstatfs(_file.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let info = unsafe { info.assume_init() };
+        let name: Vec<u8> = info.f_fstypename.iter().map(|&c| c as u8).collect();
+        let Some(end) = name.iter().position(|&c| c == 0) else {
+            return false;
+        };
+        return qualified_apfs_mount(&name[..end], info.f_flags & libc::MNT_LOCAL != 0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
 fn open_stable(
     path: &Path,
     expected: &fs::Metadata,
@@ -287,10 +311,12 @@ fn open_stable(
             return Ok((file, true));
         }
     }
-    Ok((open_regular(path, expected)?, cfg!(unix) && !conservative))
+    let file = open_regular(path, expected)?;
+    let eligible = !conservative && qualified_unix_file(&file);
+    Ok((file, eligible))
 }
 /// Inspect with observable verification cost; extraction and revision values are
-/// identical to `inspect`. Unix relies on filesystem-maintained precise ctime,
+/// identical to `inspect`. Local macOS APFS relies on its precise ctime,
 /// not an atomic snapshot; Windows uses a held deny-write lease and full file ID.
 pub fn inspect_with_work(path: &Path, limits: &Limits) -> io::Result<(Inspection, ReadWork)> {
     inspect_observed(path, limits, false, false, &mut |_| Ok(()))
@@ -319,11 +345,7 @@ fn inspect_observed(
     let path_before = fs::symlink_metadata(path)?;
     let (mut file, eligible) = open_stable(path, &path_before, conservative)?;
     let before = file.metadata()?;
-    let proof = if eligible {
-        stability_stamp(&file).ok()
-    } else {
-        None
-    };
+    let proof = stability_stamp(&file).ok();
     let mut work = ReadWork::default();
     let mut revision = SourceRevision {
         length: before.len(),
@@ -402,13 +424,16 @@ fn inspect_observed(
             .as_ref()
             .zip(path_stamp.as_ref())
             .is_some_and(|(a, b)| a != b);
-    let established =
-        proof.is_some() && hash_stamp.is_some() && after_stamp.is_some() && path_stamp.is_some();
+    let established = eligible
+        && proof.is_some()
+        && hash_stamp.is_some()
+        && after_stamp.is_some()
+        && path_stamp.is_some();
     let (after_hash, final_length_matches) = if established {
         work.verification = if cfg!(windows) {
             "held_deny_write_file_id"
         } else {
-            "held_object_unix_change_stamp"
+            "held_object_local_apfs_change_stamp"
         }
         .into();
         (revision.blake3.clone(), true)
@@ -429,6 +454,21 @@ fn inspect_observed(
     let after = file.metadata()?;
     // The conservative path must sample the pathname after its final hash too.
     let current = fs::symlink_metadata(path)?;
+    if !established {
+        // Preserve any known change evidence through the entire fallback scan.
+        let final_stamp = stability_stamp(&file).ok();
+        let final_path_stamp = open_regular(path, &current)
+            .and_then(|f| stability_stamp(&f))
+            .ok();
+        changed |= proof
+            .as_ref()
+            .zip(final_stamp.as_ref())
+            .is_some_and(|(a, b)| a != b)
+            || proof
+                .as_ref()
+                .zip(final_path_stamp.as_ref())
+                .is_some_and(|(a, b)| a != b);
+    }
     let mut same = !changed
         && initial_length_matches
         && final_length_matches
@@ -1922,10 +1962,20 @@ mod stability_tests {
                 serde_json::to_value(&old).unwrap()
             );
             assert_eq!(fast.revision.blake3, digest(&bytes));
-            assert_eq!(work.whole_file_hash_passes, 1);
-            assert_eq!(work.hash_bytes, bytes.len() as u64);
+            let eligible = open_stable(&path, &fs::symlink_metadata(&path).unwrap(), false)
+                .unwrap()
+                .1;
+            let passes = if eligible {
+                1
+            } else if cfg!(unix) {
+                2
+            } else {
+                3
+            };
+            assert_eq!(work.whole_file_hash_passes, passes);
+            assert_eq!(work.hash_bytes, bytes.len() as u64 * u64::from(passes));
             assert!(work.metadata_bytes <= 4096);
-            assert!(work.verification.starts_with("held_"));
+            assert_eq!(work.verification.starts_with("held_"), eligible);
             assert_eq!(
                 fallback.whole_file_hash_passes,
                 if cfg!(unix) { 2 } else { 3 }
@@ -1952,11 +2002,23 @@ mod stability_tests {
         };
         let (limited, work) = inspect_with_work(&path, &limits).unwrap();
         assert_eq!(limited.status, Status::ResourceLimit);
-        assert_eq!(work.whole_file_hash_passes, 1);
+        assert_eq!(
+            work.whole_file_hash_passes,
+            if open_stable(&path, &fs::symlink_metadata(&path).unwrap(), false)
+                .unwrap()
+                .1
+            {
+                1
+            } else if cfg!(unix) {
+                2
+            } else {
+                3
+            }
+        );
         assert_eq!(work.metadata_bytes, 0);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn restored_mtime_writes_and_transient_rewrites_reject_committed_revision() {
         for checkpoint in ["after_hash", "after_parse"] {
@@ -1966,6 +2028,10 @@ mod stability_tests {
                 let bytes = b"<old/>";
                 fs::write(&path, bytes).unwrap();
                 let held = File::open(&path).unwrap();
+                assert!(
+                    qualified_unix_file(&held),
+                    "this precision regression requires local APFS"
+                );
                 let stamp = stability_stamp(&held).unwrap();
                 let mut mutated = false;
                 let (result, work) =
@@ -2162,5 +2228,25 @@ mod stability_tests {
         let (result, work) = inspect_sidecar_with_work(&path, &Limits::default()).unwrap();
         assert_eq!(result.status, Status::Complete);
         assert_eq!(work.whole_file_hash_passes, 1);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_known_local_apfs_qualifies_for_timestamp_proof() {
+        assert!(qualified_apfs_mount(b"apfs", true));
+        for (name, local) in [
+            (b"hfs".as_slice(), true),
+            (b"exfat", true),
+            (b"apfs", false),
+            (b"", true),
+            (b"apfs-extra", true),
+        ] {
+            assert!(!qualified_apfs_mount(name, local));
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn other_unix_files_use_conservative_hash_verification() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(!qualified_unix_file(&file));
     }
 }
