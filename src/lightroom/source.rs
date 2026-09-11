@@ -346,12 +346,40 @@ mod tests {
             std::env::var_os("PHOTOCATALOG_LR_TEST_LOCK_PATH").expect("isolated worker path");
         let ready =
             std::env::var_os("PHOTOCATALOG_LR_TEST_READY").expect("isolated readiness path");
+        let main = std::env::var_os("PHOTOCATALOG_LR_TEST_MAIN_PATH")
+            .expect("isolated main database path");
+        // Match capture's complete lock protocol. Without the main shared lock,
+        // sqlite3WalClose obtains main EXCLUSIVE and bypasses every WAL lock
+        // during its final checkpoint (walLockExclusive's exclusiveMode path).
+        let mut main = Source::open(Path::new(&main), 1024 * 1024).unwrap();
+        main.lock(0x4000_0000, 512).unwrap();
         let mut source = Source::open(Path::new(&path), 1024 * 1024).unwrap();
         source.lock(128, 1).unwrap();
         source.lock(120, 8).unwrap();
         fs::write(ready, b"locked").unwrap();
         let mut byte = [0];
         std::io::stdin().read_exact(&mut byte).unwrap();
+    }
+    fn assert_unchanged(path: &Path, expected: &[u8], boundary: &str) {
+        let actual = fs::read(path).unwrap();
+        if actual != expected {
+            let differences: Vec<_> = actual
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .filter(|(_, (actual, expected))| actual != expected)
+                .take(16)
+                .map(|(offset, (actual, expected))| (offset, *expected, *actual))
+                .collect();
+            panic!(
+                "{boundary}: {} changed; expected/actual bytes={}/{} blake3={}/{}; first differences (offset,before,after)={differences:?}",
+                path.display(),
+                expected.len(),
+                actual.len(),
+                blake3::hash(expected),
+                blake3::hash(&actual),
+            );
+        }
     }
     fn fixture(root: &Path) {
         fs::create_dir(root).unwrap();
@@ -375,7 +403,7 @@ mod tests {
         shm.write_all(b"DMS!").unwrap();
     }
     #[test]
-    fn deadman_lock_prevents_fresh_sqlite_opener_from_resetting_quiescent_shm() {
+    fn capture_locks_prevent_fresh_opener_reset_and_close_checkpoint() {
         let temp = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let control = temp.path().join("control");
         let guarded = temp.path().join("guarded");
@@ -397,7 +425,11 @@ mod tests {
         );
         drop(db);
         let ready = temp.path().join("ready");
+        let main = guarded.join("catalog.sqlite3");
+        let wal = guarded.join("catalog.sqlite3-wal");
         let shm = guarded.join("catalog.sqlite3-shm");
+        let main_before = fs::read(&main).unwrap();
+        let wal_before = fs::read(&wal).unwrap();
         let before = fs::read(&shm).unwrap();
         let mut child = Worker(
             Command::new(std::env::current_exe().unwrap())
@@ -408,6 +440,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("PHOTOCATALOG_LR_TEST_LOCK_PATH", &shm)
+                .env("PHOTOCATALOG_LR_TEST_MAIN_PATH", &main)
                 .env("PHOTOCATALOG_LR_TEST_READY", &ready)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -427,9 +460,13 @@ mod tests {
         if let Ok(value) = value {
             assert_eq!(value, 7);
         }
-        assert_eq!(fs::read(&shm).unwrap(), before);
+        assert_unchanged(&main, &main_before, "before opener close");
+        assert_unchanged(&wal, &wal_before, "before opener close");
+        assert_unchanged(&shm, &before, "before opener close");
         drop(db);
-        assert_eq!(fs::read(&shm).unwrap(), before);
+        assert_unchanged(&main, &main_before, "after opener close");
+        assert_unchanged(&wal, &wal_before, "after opener close");
+        assert_unchanged(&shm, &before, "after opener close");
         child.0.stdin.take().unwrap().write_all(&[1]).unwrap();
         assert!(child.0.wait().unwrap().success());
     }
