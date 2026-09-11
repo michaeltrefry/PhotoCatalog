@@ -1917,6 +1917,7 @@ mod bounded_hash_tests {
 #[cfg(test)]
 mod stability_tests {
     use super::*;
+    #[cfg(any(target_os = "macos", windows))]
     use std::io::Write;
 
     fn tiff(packet: bool) -> Vec<u8> {
