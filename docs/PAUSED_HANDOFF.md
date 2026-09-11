@@ -1,40 +1,67 @@
 # Current handoff — 2026-09-11
 
+Current execution is stopped after seventeenth attempt
+`e1ddf030-f29f-440c-84d1-dd0421b079a3` exceeded the 512 MiB Python sampled RSS
+limit during saved-page JSON replay (537,378,816 bytes observed). Actual session
+`88833` exited and was reaped; cleanup recorded no remaining observed processes.
+Its result remains `failed_or_unknown`, SHA256
+`2c71d45e486bfbd3472897565d93e9c9b87a4b702bc606cb4275b2697e2990d9`.
+Journal next command is 10238; this attempt completed only fresh discovery 10237.
+Do not resume from an older clean checkpoint or relabel this failure. The reader
+now releases encoded bytes before constructing JSON objects while preserving
+encoding and error behavior. One read-only diagnostic reached the first unrecorded
+command after 10,221 saved records in 203 seconds, at 343,457,792 bytes peak RSS
+under the unchanged 512 MiB limit. It executed no native commands and verified
+the failed evidence unchanged. Session 9436 and its owned child were reaped.
+Evidence is under `sc-22844-readonly-replay-diagnostic-v2/execution-20260911-root-01`.
+Actual recovery still requires its independent incident review and separate grant;
+the diagnostic does not establish production or S9 acceptance. The clean
+checkpoint and earlier active snapshot below are historical; check current control.
+
 The user resumed and authorized dedicated RAID scratch. S8 is verified Done.
-Earlier published head `e7ca0e4` passed all four jobs in CI `34590817567`; check
-PR #11 for current-head CI. It remains draft, not merged. Legacy MAIN completed 48 outcomes / 19,872,102 source
+Current delivery head `70f5284` passed all four jobs in CI `34604737271`
+(receipt `sc-22844-canonical-runtime-profile-v1/ci-70f5284-terminal.json`).
+PR #11 remains draft, not merged. Legacy MAIN completed 48 outcomes / 19,872,102 source
 rows / 5,740 table descriptors. Its known schema-2 relationship defect means
 those derived links are not corrected S9 acceptance.
 
-Corrected schema-3 FULL has 47 independently verified full captures. Seven full
-rebuild/readback sequences were complete at last observation; all-48 FULL
-outcomes remain incomplete. Second slice
+Corrected schema-3 FULL has 47 independently verified full captures. Native
+progress at command 8857 showed 12 successful adds, 11 reports and 7,297,390
+retained rows, with no observed native failures or stage warnings. This does not
+prove completed Python inspections; the driver can catch errors until final FULL.
+All-48 FULL outcomes remain unqualified. Second slice
 `c6bf42d7-cea0-4ed1-baf5-415cfe0e7c12` paused cleanly before command 655 after
 599 successful new commands; result SHA256
 `df98edc1966c18aab0c071ead6e30ac7dbf0208fd8d7c41108d3823dbab98529`,
 independent review SHA256
 `d268a04b3567081bb0c0a8f4835f94c779e9a3e94bc0e8e3d467e12d855d2fb0`.
 
-Twelfth FULL attempt `8df05a37-4c2d-4f44-aaaf-262426ea0082`, session `86615`,
-paused cleanly and was reaped at next command 7240 after 725 successful new
-commands and no failures. Result SHA256
-`0e22ff05e06005ff3059b8d0c2a53a70c022a9c2bb26d02307ce0751678dc451`;
-PASS review `sc-22844-raid-full-twelfth-slice-review-v1/paused-review.json`, SHA256
-`7eec2df2e80118afd7b5ae6ebec4f2198868135a91fabc036cb99317bd736e66`.
+Fifteenth FULL attempt `bd23129e-1876-442c-b4a8-a0b6576b935e`, session `91609`,
+paused cleanly and was reaped at next command 9528 after 711 successful new
+commands from 8817 and no failures. Result SHA256
+`26d7c7313f0abe76653ba85a765bbdf0771ed973d075263f68906df9a74e607f`;
+PASS review `sc-22844-raid-full-fifteenth-slice-review-v1/paused-review.json`, SHA256
+`4784b3b3e11f78fb5ee39d762e1686f0b66aa905116f8f92ed96aaba0a810b85`.
 This is a clean checkpoint, not FULL completion.
 
-Thirteenth slice `a588ba5b-8084-4123-be1e-569ebf90d219`, session `84418`,
-is active from command 7240 with the explicitly reviewed canonical hash profile.
+Sixteenth slice `d74d191c-661d-481b-9f35-11a2897df6fa`, session `51299`,
+paused cleanly and was reaped at next command 10237 after 709 successful commands.
+Its result SHA256 is
+`349efeeb58b1e528c8059fea8d2675260f9f88da0c369256c5798604d1d02cb6`;
+independent PASS review SHA256 is
+`5cae56a9af819b0e7f4842121b8eb87b8750836e1eacda5c466cd9faeb71e3ae`.
 Its recipe SHA256 is
-`07e6e4db9aee08885349750099dd2e8db81f7a72ebc0a8b68680ee5ee4104f23`.
-The current control pointer and actual terminal receipt must be checked before
-resuming or starting competing native work.
+`e32d27c2fe995490044795e23ad235256ffbe3e44424f7855d79af30deb65844`.
+This snapshot can become stale while execution continues. Before resuming or
+starting competing native work, read the actual `current.json` in
+`sc-22844-raid-full-control-v1` and that attempt's result and terminal tool receipt;
+do not treat this document as current process ownership proof.
 
 - Scratch run: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911/inspection/schema3-run`.
 - SQLite temp: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911/sqlite-temp`;
   both `SQLITE_TMPDIR` and `TMPDIR` are explicitly bound to this directory.
 - Local control: `/Users/michael/PhotoCatalog-private-results/sc-22844-raid-full-control-v1`.
-- Current recipe: `sc-22844-canonical-continuations/a588ba5b-8084-4123-be1e-569ebf90d219-final/recipe.json`
+- Failed current recipe: `sc-22844-canonical-continuations/e1ddf030-f29f-440c-84d1-dd0421b079a3-final/recipe.json`
   under private results. Native source `ccae8ad` and base driver `af2c5e1d…`
   remain unchanged; controller `28c84319…` installs reviewed profile `243ccfff…`.
   This changes effective Python execution; complete hashes and gates are in the ledger.
@@ -44,6 +71,13 @@ resuming or starting competing native work.
   and a grant; it never grants, launches or removes a pause. Keep the same profile
   on continuation and use the reviewed profile-aware checkpoint auditor.
   Root owns review/grant/launch; failed or unknown attempts cannot silently retry.
+
+The recovery controller (`518a7f1d…`) and updated pause/terminal auditors
+(`b296d6c3…` / `7793a33c…`) passed independent source review. They retain the
+failed interval in history. Public source includes reusable protocol 2 helper
+binding; the private incident bridge is not a generic public retry route.
+Actual terminal qualification remains pending. Paths and packets use
+the existing phase controller after successful FULL and separate funding review.
 
 All-48 corrected FULL completion, paths, packets, family decisions, PR merge and
 terminal merged-state acceptance remain outstanding. Original catalogs/photos

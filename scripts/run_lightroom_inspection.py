@@ -143,7 +143,10 @@ def read_json(path, cap=16*MIB):
         raw = handle.read(cap+1)
     if len(raw) > cap:
         raise ValueError(f"JSON admission limit exceeded: {path}")
-    return json.loads(raw)
+    text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    del raw
+    # Decode directly: loads(str) adds a BOM check absent from loads(bytes).
+    return json.JSONDecoder().decode(text)
 
 
 def durable_json(path, value, replace=False):

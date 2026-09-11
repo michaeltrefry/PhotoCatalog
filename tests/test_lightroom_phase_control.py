@@ -771,4 +771,79 @@ class PhaseContracts(unittest.TestCase):
             self.attempt=self.control/'attempts'/self.recipe['attempt_id'];self.attempt.mkdir()
 
 
+    def replay_profile_setup(self):
+        import ast
+        profile = PhaseContracts.canonical_setup(self)
+        source = (ROOT/'scripts/run_lightroom_inspection.py').read_text()
+        node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == 'read_json')
+        # The standalone reviewed helper uses the same concrete default without
+        # importing the driver's module globals or executing any module code.
+        node.args.defaults = [ast.Constant(16*W.MIB)]
+        helper = Path(profile['helper']['path'])
+        helper.write_text(helper.read_text()+ast.unparse(node)+'\n')
+        profile.update(protocol=2, kind='canonical_hash_and_replay_json_override',
+                       functions=W.REPLAY_FUNCTIONS, helper=C.reference(helper))
+        review = C.document(profile['equivalence_review'])
+        review['helper'] = profile['helper']
+        review['assertions'].update(read_json_equivalent=True, raw_bytes_released_before_parse=True)
+        profile['equivalence_review'] = self.put(self.root/'replay-equivalence.json', review)
+        self.recipe['canonical_hash_profile'] = self.put(self.root/'replay-profile.json', profile)
+        return profile
+
+    def test_replay_profile_dispatch_binds_reader_without_changing_base_encoding(self):
+        import hashlib
+        self.replay_profile_setup()
+        self.recipe.update(previous={'synthetic_unexecuted_predecessor':True},
+                           journal=C.reference(self.run/'journal.json'))
+        self.put(self.attempt/'recipe.json', self.recipe)
+        self.put(self.attempt/'process.json', {'pid':os.getpid()})
+        W.save(self.attempt/'execution-profile.json', W.execution_profile_value(self.recipe,self.attempt))
+        frozen = types.SimpleNamespace(encoded=lambda x: json.dumps(x,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()+b'\n', read_json=None)
+        original = frozen.encoded
+        W.install_canonical_profile(self.recipe,self.attempt,frozen)
+        self.assertIs(frozen.encoded, original)
+        path = self.root/'utf16.json'; path.write_bytes('{"key":"é"}'.encode('utf-16'))
+        self.assertEqual(frozen.read_json(path), {'key':'é'})
+        with self.assertRaisesRegex(ValueError,'JSON admission'): frozen.read_json(path,1)
+        data = {'nested':[1,-0.0,'\ud800']}; digest = hashlib.sha256()
+        frozen.update_canonical_hash(digest,data)
+        self.assertEqual(digest.digest(),hashlib.sha256(original(data)).digest())
+        consumed = C.document(W.canonical_result_fields(self.recipe)['execution_profile_consumed'])
+        self.assertEqual(consumed['pid'],os.getpid())
+        self.assertEqual(consumed['helper'],C.document(self.recipe['canonical_hash_profile'])['helper'])
+
+    def test_replay_profile_requires_reader_equivalence_and_complete_function_roster(self):
+        profile = self.replay_profile_setup(); original = json.loads(json.dumps(profile))
+        for key in ['read_json_equivalent','raw_bytes_released_before_parse']:
+            review = C.document(original['equivalence_review']); review['assertions'].pop(key)
+            profile = dict(original,equivalence_review=self.put(self.root/('missing-'+key+'.json'),review))
+            self.recipe['canonical_hash_profile'] = self.put(self.root/'invalid-profile.json',profile)
+            with self.assertRaisesRegex(ValueError,'review'): W.canonical_hash_profile(self.recipe)
+        profile = dict(original,functions=W.CANONICAL_FUNCTIONS)
+        self.recipe['canonical_hash_profile'] = self.put(self.root/'incomplete-profile.json',profile)
+        with self.assertRaisesRegex(ValueError,'identity'): W.canonical_hash_profile(self.recipe)
+        source = Path(original['helper']['path']).read_text()
+        with self.assertRaisesRegex(ValueError,'unapproved module'):
+            W.canonical_functions(source+'\nraise RuntimeError("must not execute")\n','synthetic',W.REPLAY_FUNCTIONS)
+        with self.assertRaisesRegex(ValueError,'unapproved module'):
+            W.canonical_functions(source,'synthetic',W.CANONICAL_FUNCTIONS)
+
+    def test_replay_profile_same_profile_full_paths_packets_remains_guarded(self):
+        # Same-profile continuation is reusable. A private corrective execution
+        # owner is not made into a public failed-predecessor admission route.
+        with mock.patch.object(self,'canonical_setup',side_effect=self.replay_profile_setup):
+            self.test_canonical_same_profile_full_paths_packets_and_changed_profile_rejected()
+
+    def test_replay_profile_does_not_authorize_legacy_transition_or_failed_retry(self):
+        with mock.patch.object(self,'canonical_setup',side_effect=self.replay_profile_setup):
+            self.canonical_previous()
+        with self.assertRaisesRegex(ValueError,'legacy transition admits only protocol1'):
+            W.admit_previous(self.recipe,self.ctx())
+        old = C.document(self.recipe['previous']['result']); old.update(status='failed_or_unknown',ownership_status='unknown_requires_review')
+        self.recipe['previous']['result'] = self.put(Path(self.recipe['previous']['result']['path']),old)
+        review = C.document(self.recipe['previous']['review']);review['result']=self.recipe['previous']['result']
+        self.recipe['previous']['review'] = self.put(Path(self.recipe['previous']['review']['path']),review)
+        with self.assertRaisesRegex(ValueError,'failed/unknown'): W.admit_previous(self.recipe,self.ctx())
+
+
 if __name__ == '__main__': unittest.main()

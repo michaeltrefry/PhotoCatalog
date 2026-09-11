@@ -104,6 +104,7 @@ def validate_temp_storage(recipe):
 
 
 CANONICAL_FUNCTIONS = ['_small_canonical_budget', 'update_canonical_hash']
+REPLAY_FUNCTIONS = CANONICAL_FUNCTIONS + ['read_json']
 LEGACY_FULL_CONTROLLER_SHA = '969eeaadb4e4693ddb12a6dbcd03c36c0d38991e7697a1994cd7210d38a865bd'
 
 
@@ -118,25 +119,32 @@ def canonical_hash_profile(recipe):
         raise ValueError('canonical profile phase unsupported')
     profile = C.document(ref)
     fields = {'protocol', 'kind', 'base_driver', 'helper', 'functions', 'equivalence_review', 'runtime'}
-    if (set(profile) != fields or profile['protocol'] != 1 or profile['kind'] != 'canonical_hash_override'
+    expected_functions = CANONICAL_FUNCTIONS if profile.get('protocol') == 1 else REPLAY_FUNCTIONS
+    expected_kind = 'canonical_hash_override' if profile.get('protocol') == 1 else 'canonical_hash_and_replay_json_override'
+    if (set(profile) != fields or type(profile['protocol']) is not int or profile['protocol'] not in {1,2} or profile['kind'] != expected_kind
             or profile['base_driver'] != recipe['code']['runner'] or profile['runtime'] != recipe['code']['python']
-            or profile['functions'] != CANONICAL_FUNCTIONS):
+            or profile['functions'] != expected_functions):
         raise ValueError('canonical hash profile identity differs')
     raw = bootstrap(profile['helper'])
     if len(raw) > 128*1024:
         raise ValueError('canonical helper source bound')
     review = C.document(profile['equivalence_review'])
+    assertions = {'canonical_bytes_equal': True, 'bounded_fast_path': True, 'fallback_preserved': True}
+    if profile['protocol'] == 2:
+        assertions.update(read_json_equivalent=True, raw_bytes_released_before_parse=True)
     if (review.get('status') != 'PASS' or review.get('base_driver') != profile['base_driver']
             or review.get('helper') != profile['helper'] or review.get('runtime') != profile['runtime']
-            or review.get('assertions') != {'canonical_bytes_equal': True, 'bounded_fast_path': True, 'fallback_preserved': True}
+            or review.get('assertions') != assertions
             or not isinstance(review.get('author'), str) or not 1 <= len(review['author'].encode()) <= 256):
         raise ValueError('canonical helper equivalence/resource review missing or mismatched')
-    canonical_functions(raw, profile['helper']['path'])  # Reject executable module scaffolding before admission.
+    canonical_functions(raw, profile['helper']['path'], expected_functions)  # Reject executable module scaffolding before admission.
     return profile
 
 
-def canonical_functions(raw, filename):
-    """Compile only the two reviewed pure definitions with explicit json globals."""
+def canonical_functions(raw, filename, expected_functions=None):
+    """Compile only the reviewed function roster with explicit json globals."""
+    if expected_functions is None: expected_functions = CANONICAL_FUNCTIONS
+    if expected_functions not in (CANONICAL_FUNCTIONS, REPLAY_FUNCTIONS): raise ValueError('unreviewed helper roster')
     tree = ast.parse(raw, filename)
     definitions = []
     for node in tree.body:
@@ -144,7 +152,7 @@ def canonical_functions(raw, filename):
             continue
         if isinstance(node, ast.Import) and len(node.names) == 1 and node.names[0].name == 'json' and node.names[0].asname is None:
             continue
-        if not isinstance(node, ast.FunctionDef) or node.name not in CANONICAL_FUNCTIONS or node.decorator_list:
+        if not isinstance(node, ast.FunctionDef) or node.name not in expected_functions or node.decorator_list:
             raise ValueError('canonical helper contains unapproved module statements')
         for value in [*node.args.defaults, *[v for v in node.args.kw_defaults if v is not None]]:
             try: ast.literal_eval(value)
@@ -152,7 +160,7 @@ def canonical_functions(raw, filename):
         if node.returns is not None or any(v.annotation is not None for v in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs, *([node.args.vararg] if node.args.vararg else []), *([node.args.kwarg] if node.args.kwarg else [])]):
             raise ValueError('canonical helper annotations are not admitted')
         definitions.append(node)
-    if sorted(n.name for n in definitions) != sorted(CANONICAL_FUNCTIONS):
+    if sorted(n.name for n in definitions) != sorted(expected_functions):
         raise ValueError('canonical helper definition roster differs')
     scope = {'json': json}
     exec(compile(ast.Module(body=definitions, type_ignores=[]), filename, 'exec'), scope)
@@ -199,6 +207,8 @@ def admit_canonical_previous(recipe, result, review):
                 or old_recipe['code']['controller']['sha256'] != LEGACY_FULL_CONTROLLER_SHA
                 or result['status'] != 'paused_at_command_boundary' or result.get('cleanup') is not None):
             raise ValueError('canonical transition requires exact clean legacy FULL pause')
+        if profile['protocol'] != 1:
+            raise ValueError('legacy transition admits only protocol1; protocol2 requires a separately reviewed execution owner')
         transition = C.document(recipe['canonical_hash_transition'])
         expected = {'status': 'PASS', 'kind': 'legacy_full_pause_to_canonical_hash_profile',
                     'profile': recipe['canonical_hash_profile'], 'previous': recipe['previous'],
@@ -244,8 +254,10 @@ def install_canonical_profile(recipe, attempt, frozen):
     ref = validate_execution_profile(recipe, attempt)
     # Keep frozen.__file__, encoded(), Runner and all native/replay guards intact.
     # New behavior is explicitly attributed by the separate effective profile.
-    scope = canonical_functions(bootstrap(profile['helper']), profile['helper']['path'])
+    scope = canonical_functions(bootstrap(profile['helper']), profile['helper']['path'], profile['functions'])
     frozen.update_canonical_hash = scope['update_canonical_hash']
+    if profile['protocol'] == 2:
+        frozen.read_json = scope['read_json']
     save(attempt/'execution-profile-consumed.json', {'execution_profile': ref, 'helper': profile['helper'], 'pid': os.getpid()})
 
 
