@@ -593,4 +593,182 @@ class PhaseContracts(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGTERM), prior)
 
 
+    def canonical_setup(self):
+        import ast
+        # Extract the repository candidate's two actual pure definitions, not a
+        # mocked optimized encoder. No driver module or native binary executes.
+        source = (ROOT/'scripts/run_lightroom_inspection.py').read_text()
+        tree = ast.parse(source)
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in W.CANONICAL_FUNCTIONS]
+        helper = self.root/'canonical.py'
+        helper.write_text('import json\n'+ '\n'.join(ast.get_source_segment(source,n) for n in nodes)+'\n')
+        base = self.root/'base.py'; base.write_text('def unchanged_base(): pass\n')
+        runtime = self.root/'runtime'; runtime.write_text('synthetic runtime identity; never executed\n')
+        controller = self.root/'controller.py'; controller.write_text('synthetic controller identity\n')
+        self.recipe['code'] = {'runner':C.reference(base),'python':C.reference(runtime),'controller':C.reference(controller)}
+        review = {'status':'PASS','author':'synthetic test reviewer', 'base_driver':C.reference(base),
+                  'helper':C.reference(helper),'runtime':C.reference(runtime),
+                  'assertions':{'canonical_bytes_equal':True,'bounded_fast_path':True,'fallback_preserved':True}}
+        profile = {'protocol':1,'kind':'canonical_hash_override','base_driver':C.reference(base),'helper':C.reference(helper),
+                   'runtime':C.reference(runtime),'functions':W.CANONICAL_FUNCTIONS,
+                   'equivalence_review':self.put(self.root/'equivalence.json',review)}
+        self.recipe['canonical_hash_profile'] = self.put(self.root/'profile.json',profile)
+        return profile
+
+    def canonical_previous(self):
+        self.canonical_setup()
+        old_id = '00000000-0000-4000-8000-000000000002'
+        old_attempt = self.control/'attempts'/old_id; old_attempt.mkdir()
+        old_recipe = json.loads(json.dumps(self.recipe)); old_recipe.pop('canonical_hash_profile')
+        old_recipe['attempt_id'] = old_id; old_recipe['code']['controller']['sha256'] = W.LEGACY_FULL_CONTROLLER_SHA
+        old_recipe_ref = self.put(old_attempt/'recipe.json',old_recipe)
+        self.recipe['journal'] = C.reference(self.run/'journal.json')
+        phase = self.put(self.run/'reports/phase-old.json', {'phase':'full','binding':self.binding,'status':'paused'})
+        old = {'status':'paused_at_command_boundary','ownership_status':'observed_owned_processes_reaped','root_reaped':True,
+               'new_command_failures':[],'exit_code':1,'cleanup':None,'journal':self.recipe['journal'],'next_command':1,
+               'phase':phase,'phase_name':'full','phase_input':self.recipe['input']}
+        old_ref = self.put(old_attempt/'result.json',old)
+        review = {'status':'PASS','result':old_ref,'binding':self.recipe['binding']}
+        review_ref = self.put(self.root/'old-review.json',review)
+        self.recipe['previous'] = {'result':old_ref,'review':review_ref}
+        self.put(self.control/'current.json',{'attempt_id':old_id})
+        transition = {'status':'PASS','kind':'legacy_full_pause_to_canonical_hash_profile','profile':self.recipe['canonical_hash_profile'],
+                      'previous':self.recipe['previous'],'previous_recipe':old_recipe_ref,'base_binding':self.recipe['binding'],
+                      'journal':self.recipe['journal'],'expected_next_command':1,
+                      'invariants_sha256':C.sha(C.encoded(W.canonical_invariants(self.recipe)))}
+        self.recipe['canonical_hash_transition'] = self.put(self.root/'transition.json',transition)
+        return old,review,old_attempt
+
+    def test_canonical_transition_and_real_encoder_replay_preserve_bytes(self):
+        import hashlib
+        self.canonical_previous(); W.admit_previous(self.recipe,self.ctx())
+        self.put(self.attempt/'recipe.json',self.recipe)
+        W.save(self.attempt/'execution-profile.json',W.execution_profile_value(self.recipe,self.attempt))
+        frozen = types.SimpleNamespace(encoded=lambda x: json.dumps(x,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()+b'\n')
+        original_encoded = frozen.encoded
+        self.put(self.attempt/'process.json',{'pid':os.getpid()})
+        W.install_canonical_profile(self.recipe,self.attempt,frozen)
+        self.assertIs(frozen.encoded,original_encoded)
+        values = [{'z':[1,-0.0,None,True], 'unicode':'é😀\ud800'}, {'large':'x'*70000}, [1,2,3]]
+        old_digest = hashlib.sha256(); new_digest = hashlib.sha256()
+        for value in values:
+            old_digest.update(original_encoded(value)); frozen.update_canonical_hash(new_digest,value)
+        self.assertEqual(old_digest.digest(),new_digest.digest())
+        fields = W.canonical_result_fields(self.recipe)
+        self.assertEqual(C.document(fields['execution_profile'])['first_command'],1)
+        self.assertEqual(C.document(fields['execution_profile_consumed'])['pid'],os.getpid())
+        # Execute the actual current Runner.call replay branch with a completed
+        # synthetic native receipt. Any fresh launch/reservation is an error.
+        driver = load('canonical_replay_fixture','run_lightroom_inspection.py')
+        key = ['full',self.ctx()['id'],'capture']; args=['capture','never-read','@CAPTURE@']
+        record = self.record(args,key)
+        stdout = self.put(self.run/'commands/000000001/stdout',{'state':'captured','revision_id':'fixed'})
+        record['stdout']={'path':'commands/000000001/stdout','sha256':stdout['sha256']}
+        record['stdout_cap']=1024
+        self.put(self.run/'commands/000000001/result.json',record)
+        runner=driver.Runner.__new__(driver.Runner); runner.root=self.run
+        before = (self.run/'journal.json').read_bytes()
+        with mock.patch.object(driver.subprocess,'Popen',side_effect=AssertionError('native replayed twice')):
+            result=runner.call(key,args)
+        self.assertTrue(result['ok']); self.assertEqual(result['value']['revision_id'],'fixed')
+        self.assertEqual((self.run/'journal.json').read_bytes(),before)
+
+    def test_canonical_wrong_equivalence_source_and_top_level_execution_rejected(self):
+        profile=self.canonical_setup(); W.canonical_hash_profile(self.recipe)
+        original=json.loads(json.dumps(profile)); review=C.document(profile['equivalence_review'])
+        review['assertions']['canonical_bytes_equal']=False
+        profile['equivalence_review']=self.put(self.root/'bad-review.json',review)
+        self.recipe['canonical_hash_profile']=self.put(self.root/'bad-profile.json',profile)
+        with self.assertRaisesRegex(ValueError,'review'): W.canonical_hash_profile(self.recipe)
+        self.recipe['canonical_hash_profile']=self.put(self.root/'profile.json',original)
+        Path(original['helper']['path']).write_text('raise RuntimeError("must never execute")\n')
+        with self.assertRaisesRegex(ValueError,'hash'): W.canonical_hash_profile(self.recipe)
+        for source in ['raise RuntimeError("never")', 'def update_canonical_hash(d,v=print("never")): pass',
+                       'import os\ndef update_canonical_hash(d,v): pass',
+                       'def update_canonical_hash(d,v)->print("never"): pass']:
+            with self.subTest(source=source), self.assertRaises(ValueError): W.canonical_functions(source,'synthetic')
+
+    def test_canonical_transition_rejects_scope_drift_missing_proof_and_failed_orphan(self):
+        self.canonical_previous()
+        original=json.loads(json.dumps(self.recipe))
+        for mutate in [lambda r:r.pop('canonical_hash_transition'),lambda r:r.update(funding={'changed':True}),
+                       lambda r:r.update(temp_storage={'changed':True}),lambda r:r.update(expected_next_command=2)]:
+            self.recipe=json.loads(json.dumps(original));mutate(self.recipe)
+            with self.assertRaises((ValueError,KeyError)):W.admit_previous(self.recipe,self.ctx())
+        self.recipe=original
+        self.put(self.control/'current.json',{'attempt_id':'orphan'})
+        with self.assertRaisesRegex(ValueError,'bypassed'):W.admit_previous(self.recipe,self.ctx())
+        old=C.document(self.recipe['previous']['result']);old['new_command_failures']=[1]
+        self.recipe['previous']['result']=self.put(Path(self.recipe['previous']['result']['path']),old)
+        review=C.document(self.recipe['previous']['review']);review['result']=self.recipe['previous']['result']
+        self.recipe['previous']['review']=self.put(Path(self.recipe['previous']['review']['path']),review)
+        with self.assertRaisesRegex(ValueError,'failed/unknown'):W.admit_previous(self.recipe,self.ctx())
+
+    def test_canonical_same_profile_continuation_and_downgrade_rejected(self):
+        old,review,old_attempt=self.canonical_previous()
+        old_recipe=json.loads(json.dumps(self.recipe));old_recipe['attempt_id']=old_attempt.name
+        self.put(old_attempt/'recipe.json',old_recipe)
+        self.put(old_attempt/'process.json',{'pid':os.getpid()})
+        W.save(old_attempt/'execution-profile.json',W.execution_profile_value(old_recipe,old_attempt))
+        W.install_canonical_profile(old_recipe,old_attempt,types.SimpleNamespace())
+        old.update(execution_profile=C.reference(old_attempt/'execution-profile.json'),
+                   execution_profile_consumed=C.reference(old_attempt/'execution-profile-consumed.json'))
+        self.recipe['previous']['result']=self.put(old_attempt/'result.json',old)
+        review.update(result=self.recipe['previous']['result'],execution_profile=old['execution_profile'])
+        self.recipe['previous']['review']=self.put(self.root/'new-review.json',review)
+        self.recipe.pop('canonical_hash_transition')
+        W.admit_previous(self.recipe,self.ctx())
+        self.recipe.pop('canonical_hash_profile')
+        with self.assertRaisesRegex(ValueError,'removed'):W.admit_previous(self.recipe,self.ctx())
+
+    def test_canonical_dispatch_requires_durable_authority_and_consumed_identity(self):
+        self.canonical_previous();self.put(self.attempt/'recipe.json',self.recipe)
+        with self.assertRaises(FileNotFoundError): W.install_canonical_profile(self.recipe,self.attempt,types.SimpleNamespace())
+        W.save(self.attempt/'execution-profile.json',W.execution_profile_value(self.recipe,self.attempt))
+        W.install_canonical_profile(self.recipe,self.attempt,types.SimpleNamespace())
+        self.put(self.attempt/'process.json',{'pid':os.getpid()+1})
+        with self.assertRaisesRegex(ValueError,'consumption'):W.canonical_result_fields(self.recipe)
+        self.put(self.attempt/'process.json',{'pid':os.getpid()})
+        with self.assertRaises(FileExistsError):W.install_canonical_profile(self.recipe,self.attempt,types.SimpleNamespace())
+
+
+    def test_canonical_same_profile_full_paths_packets_and_changed_profile_rejected(self):
+        self.canonical_previous()
+        # Construct two successful, explicitly profiled synthetic predecessors.
+        # The ordinary output/phase checks are exercised, not patched away.
+        for next_phase in ['paths','packets']:
+            current = json.loads(json.dumps(self.recipe)); old_attempt=self.attempt
+            current['attempt_id']=old_attempt.name
+            self.put(old_attempt/'recipe.json',current)
+            self.put(old_attempt/'process.json',{'pid':os.getpid()})
+            W.save(old_attempt/'execution-profile.json',W.execution_profile_value(current,old_attempt))
+            W.install_canonical_profile(current,old_attempt,types.SimpleNamespace())
+            ctx=self.ctx()
+            if current['phase']=='full':
+                output=self.put(Path(ctx['output']),self.full_output())
+            else:
+                value=C.document(self.recipe['input']);output=self.put(Path(ctx['output']),self.path_output(value,self.recipe['input']))
+            phase=self.put(self.run/'reports'/('phase-'+current['phase']+'.json'),
+                           {'phase':current['phase'],'status':'review_artifact_returned_not_acceptance','output':output['path'],'binding':self.binding})
+            prior={'status':'review_returned_not_acceptance','phase':phase,'phase_name':current['phase'],'phase_input':current['input'],
+                   'output':output,'journal':self.recipe['journal'],'next_command':1,'exit_code':0,'root_reaped':True,
+                   'ownership_status':'observed_owned_processes_reaped','new_command_failures':[],
+                   'execution_profile':C.reference(old_attempt/'execution-profile.json'),
+                   'execution_profile_consumed':C.reference(old_attempt/'execution-profile-consumed.json')}
+            prior_ref=self.put(old_attempt/'result.json',prior)
+            review_ref=self.put(self.root/('review-'+current['phase']+'.json'),
+                                {'status':'PASS','result':prior_ref,'binding':self.recipe['binding'],'output':output,'execution_profile':prior['execution_profile']})
+            self.put(self.control/'current.json',{'attempt_id':old_attempt.name})
+            self.recipe.pop('canonical_hash_transition',None)
+            self.recipe.update(phase=next_phase,previous={'result':prior_ref,'review':review_ref},attempt_id=str(__import__('uuid').uuid4()))
+            if next_phase=='paths':self.recipe.update(input=output,baseline=output)
+            else:self.recipe['paths_review']=output
+            W.admit_previous(self.recipe,self.ctx())
+            original=self.recipe['canonical_hash_profile']
+            self.recipe['canonical_hash_profile']=self.put(self.root/('different-'+next_phase+'.json'),C.document(original))
+            with self.assertRaisesRegex(ValueError,'profile/controller differs'):W.admit_previous(self.recipe,self.ctx())
+            self.recipe['canonical_hash_profile']=original
+            self.attempt=self.control/'attempts'/self.recipe['attempt_id'];self.attempt.mkdir()
+
+
 if __name__ == '__main__': unittest.main()

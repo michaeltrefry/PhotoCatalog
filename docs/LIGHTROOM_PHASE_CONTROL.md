@@ -52,6 +52,9 @@ exist. The recipe has these exact top-level fields:
   `TMPDIR`, both equal to `directory`. The directory must be writable/searchable
   and on the same device as `run`, so existing free-space observations cover both
   plan growth and SQLite temporary files. Omission preserves existing recipes.
+- Optional `canonical_hash_profile` binds a reviewed pure hashing helper, base
+  driver, Python launcher and equivalence review. The first transition also needs
+  `canonical_hash_transition`; later continuations retain the exact profile.
 
 The separate grant is exactly `{status: EXECUTION_GRANTED, scope: PHASE,
 attempt_id: UUID, recipe_body_sha256: SHA}`. The hash covers canonical sorted ASCII
@@ -79,6 +82,29 @@ hard confinement: SQLite can fall back to local directories if the destination
 becomes unusable between checks. Environment routing does not move explicitly
 named capture/plan files or their adjacent journals. No allocation quota or strict
 latency guarantee is implied.
+
+## Explicit canonical hashing profile
+
+An existing clean FULL pause from the pinned legacy controller can transition to
+a separately reviewed canonical hashing helper. The transition binds the exact
+previous result/review/recipe, checkpoint, base binding and invariant scope. It
+does not rewrite the frozen driver or old command evidence. Only the two named
+pure functions are loaded from reviewed source; native dispatch and saved-output
+verification remain unchanged.
+
+The controller writes `execution-profile.json` before dispatch and records the
+child's installation in `execution-profile-consumed.json`. Results and independent
+checkpoint reviews must bind those receipts: the base driver/native binding alone
+no longer describes effective Python execution. Removing or changing a profile is
+rejected. The same profile can follow the normal FULL → paths → packets sequence,
+with each phase's existing prerequisites and separate funding still required.
+
+The optimized helper admits at most 2,048 builtin nodes, depth 16 and 65,535 bytes
+of conservative ASCII output before using the C encoder. Larger values, integers
+outside 64 bits and unsupported types retain the streaming path. Exact canonical
+bytes and failure prefixes are preserved; this bound is not a process RSS quota.
+The disposable native transition/replay gate and source tests are recorded in the
+execution ledger; whole-corpus completion is a separate requirement.
 
 ## Phase input, output and replay
 

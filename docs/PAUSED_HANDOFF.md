@@ -1,4 +1,57 @@
-# Resumed after the user pause
+# Current handoff — 2026-09-11
+
+The user resumed and authorized dedicated RAID scratch. S8 is verified Done.
+Earlier published head `e7ca0e4` passed all four jobs in CI `34590817567`; check
+PR #11 for current-head CI. It remains draft, not merged. Legacy MAIN completed 48 outcomes / 19,872,102 source
+rows / 5,740 table descriptors. Its known schema-2 relationship defect means
+those derived links are not corrected S9 acceptance.
+
+Corrected schema-3 FULL has 47 independently verified full captures. Seven full
+rebuild/readback sequences were complete at last observation; all-48 FULL
+outcomes remain incomplete. Second slice
+`c6bf42d7-cea0-4ed1-baf5-415cfe0e7c12` paused cleanly before command 655 after
+599 successful new commands; result SHA256
+`df98edc1966c18aab0c071ead6e30ac7dbf0208fd8d7c41108d3823dbab98529`,
+independent review SHA256
+`d268a04b3567081bb0c0a8f4835f94c779e9a3e94bc0e8e3d467e12d855d2fb0`.
+
+Twelfth FULL attempt `8df05a37-4c2d-4f44-aaaf-262426ea0082`, session `86615`,
+paused cleanly and was reaped at next command 7240 after 725 successful new
+commands and no failures. Result SHA256
+`0e22ff05e06005ff3059b8d0c2a53a70c022a9c2bb26d02307ce0751678dc451`;
+PASS review `sc-22844-raid-full-twelfth-slice-review-v1/paused-review.json`, SHA256
+`7eec2df2e80118afd7b5ae6ebec4f2198868135a91fabc036cb99317bd736e66`.
+This is a clean checkpoint, not FULL completion.
+
+Thirteenth slice `a588ba5b-8084-4123-be1e-569ebf90d219`, session `84418`,
+is active from command 7240 with the explicitly reviewed canonical hash profile.
+Its recipe SHA256 is
+`07e6e4db9aee08885349750099dd2e8db81f7a72ebc0a8b68680ee5ee4104f23`.
+The current control pointer and actual terminal receipt must be checked before
+resuming or starting competing native work.
+
+- Scratch run: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911/inspection/schema3-run`.
+- SQLite temp: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911/sqlite-temp`;
+  both `SQLITE_TMPDIR` and `TMPDIR` are explicitly bound to this directory.
+- Local control: `/Users/michael/PhotoCatalog-private-results/sc-22844-raid-full-control-v1`.
+- Current recipe: `sc-22844-canonical-continuations/a588ba5b-8084-4123-be1e-569ebf90d219-final/recipe.json`
+  under private results. Native source `ccae8ad` and base driver `af2c5e1d…`
+  remain unchanged; controller `28c84319…` installs reviewed profile `243ccfff…`.
+  This changes effective Python execution; complete hashes and gates are in the ledger.
+- After a verified clean pause, use its actual result/PASS review and unchanged
+  funding/limits to prepare a fresh UUID continuation. The private
+  `sc-22844-canonical-continuation-preparer-source-v2` requires external reviews
+  and a grant; it never grants, launches or removes a pause. Keep the same profile
+  on continuation and use the reviewed profile-aware checkpoint auditor.
+  Root owns review/grant/launch; failed or unknown attempts cannot silently retry.
+
+All-48 corrected FULL completion, paths, packets, family decisions, PR merge and
+terminal merged-state acceptance remain outstanding. Original catalogs/photos
+are read-only; only dedicated scratch is writable. Preserve frozen evidence and
+the historical handoff below. See [execution ledger](EXECUTION_LEDGER.md) for the
+exact resource bounds and proof paths.
+
+# Historical resumption after the user pause
 
 The user explicitly resumed on 2026-09-10 local time. The external RAID is connected.
 The prior result, all 546 command receipts, journal, phase, admission and owned

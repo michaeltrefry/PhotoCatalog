@@ -4,7 +4,7 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
-sc-22836–sc-22843 are verified Done. S8 PR #10 merged as `6ff4487`, with identical reviewed/merged trees and all four PR/main CI jobs passing; Shortcut closeout was read back. S9 main inspection has resumed after the user reconnected the RAID. The latest completed-candidate checkpoint contains 22 outcomes and 14,167,725 retained source rows, not distinct photos. The REAL/INTEGER relationship correction is integrated and passes its native gate; old false-dangling reports remain historical evidence. A disposable actual-CLI check passed the transition from legacy main evidence to a fresh schema-3 plan, then companion capture, paths, packets and replay. Draft PR #11 is open. Its first CI run passed Linux/macOS/evidence contracts and exposed Windows URI/sharing defects, corrected in `9da1b98` with independent source review. Actual catalog main inspection remains incomplete; real companion/path/packet acceptance and current-family review are outstanding. Live Shortcut remains authoritative. Sections below retain historical evidence.
+sc-22836–sc-22843 are verified Done. S8 PR #10 merged as `6ff4487`, with identical reviewed/merged trees and all four PR/main CI jobs passing; Shortcut closeout was read back. S9 legacy MAIN is complete: 48 outcomes, 19,872,102 retained source rows and 5,740 source-table descriptors, not distinct photos. Its schema-2 numeric relationship defect prevents treating derived links as S9 acceptance. Corrected schema-3 FULL is rebuilding all 48 members; all 47 requested full captures are independently verified complete. Draft PR #11 remains open at `e7ca0e4`; CI `34590817567` has terminal SUCCESS in all four jobs, including Windows. Earlier CI failures remain historical evidence. Actual FULL completion, paths, packets, family decisions and merged-state acceptance remain outstanding. Live Shortcut remains authoritative.
 
 | Story | State | Work surface / artifact | Evidence | Next action |
 | --- | --- | --- | --- | --- |
@@ -16,7 +16,7 @@ sc-22836–sc-22843 are verified Done. S8 PR #10 merged as `6ff4487`, with ident
 | sc-22841 | Done | [PR #8](https://github.com/michaeltrefry/PhotoCatalog/pull/8), merged789a39d | Reviewed preview defaults and full30-file memory/quality, layout, navigation and integrated10M evidence; PR CI34430709720 and main CI34432335579 SUCCESS; Shortcut Done read-back | Complete |
 | sc-22842 | Done | [PR #7](https://github.com/michaeltrefry/PhotoCatalog/pull/7), mergede68d375 | [Mac qualification report](ORGANIZATION_PERFORMANCE_RESULTS.md); reviewed scale/actual-overlap evidence; main CI34418548263 SUCCESS; Shortcut Done read-back | Complete |
 | sc-22843 | Done | [PR #9](https://github.com/michaeltrefry/PhotoCatalog/pull/9), merged f6d19dc; corrective [PR #10](https://github.com/michaeltrefry/PhotoCatalog/pull/10), merged 6ff4487; [qualification report](EDIT_QUALIFICATION_RESULTS.md) | Reviewed 533 cases/249 numerical configurations PASS; PR CI34538492535 and main CI34550127979 all four jobs SUCCESS; exact tree and closeout evidence verified; Shortcut Done read-back | Complete |
-| sc-22844 | In Progress | [Draft PR #11](https://github.com/michaeltrefry/PhotoCatalog/pull/11); frozen v6 main; corrected schema-3 final-plan profile | Numeric gate: 4 focused, 18 Lightroom library and 22 integration tests pass. Controller: 22 contracts and disposable actual CLI integration/replay pass. Complete Windows correction reviewed and focused Mac checks pass; hosted Windows remains pending. Main resumed from 7076; latest completed-outcome checkpoint is 23 candidates / 15,063,505 source rows | Verify Windows correction in CI; finish main, separately funded full/path/packet stages, current-family decisions and merged-state acceptance |
+| sc-22844 | In Progress | [Draft PR #11](https://github.com/michaeltrefry/PhotoCatalog/pull/11); complete frozen v6 MAIN; active corrected schema-3 FULL | All four CI jobs SUCCESS at `e7ca0e4` in `34590817567`. Legacy MAIN: 48 outcomes / 19,872,102 rows / 5,740 table descriptors, with known schema-2 relationship defect. FULL: 47 captures verified; seven full rebuild/readback sequences complete at last observation. Twelfth slice paused/reaped at next 7240 after 725 successful commands; checkpoint reviewed; thirteenth slice active from 7240 with reviewed canonical profile | Finish all-48 corrected FULL, independently funded paths/packets, family decisions, PR merge and terminal merged CI |
 | sc-22845 | To Do | Lightroom migration | Prerequisites sc-22840/sc-22842/sc-22843/sc-22844 | Dependency-bound |
 | sc-22846 | To Do | Backup and restore | Prerequisites sc-22843/sc-22845 | Dependency-bound |
 | sc-22847 | To Do | Desktop UI | Prerequisites sc-22840/sc-22841/sc-22842/sc-22843/sc-22845/sc-22846 | Dependency-bound |
@@ -26,6 +26,7 @@ sc-22836–sc-22843 are verified Done. S8 PR #10 merged as `6ff4487`, with ident
 
 - User authorized epic delivery and ordinary PR/CI/merge. The user changed michaeltrefry/PhotoCatalog to public because private-repository Actions consumed the monthly allowance; preserve public visibility and batch validated changes before CI. The user released the reference Mac on 2026-09-09.
 - Originals and Lightroom sources on the RAID remain read-only. Private fixtures and evidence remain outside Git. No live migration or original mutation has occurred.
+- User authorized a dedicated RAID scratch folder for S9: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911`. Inspection output is under `inspection/schema3-run`; SQLite temporary files use `sqlite-temp`. Local control/evidence remains under `/Users/michael/PhotoCatalog-private-results/sc-22844-raid-full-control-v1`. Scratch authorization does not permit writes to source catalogs or photos.
 - All S2 measurement sessions are complete. Local builds/renders were paused during timing. The owned passive observer PID 30547/session 93348 was stopped afterward and exited successfully; its final receipt at 2026-09-09T14:00:27Z records SIGTERM and 6,472 samples. No outstanding S2 process needs resuming.
 - S4 and S6 use isolated worktrees. Parent owns catalog schema/model integration; packet extraction and explicit export own separate modules. S6 owns preview adapters/store/scheduler; its rebuildable manifest has separate schema ownership. Heavy Cargo and timed measurements are serialized.
 - Bound Cargo builds to four jobs and serialize heavy measurement/render lanes. Native Windows/Linux behavior requires hosted CI; local Mac tests alone do not establish it.
@@ -98,7 +99,95 @@ The inconsistent decode is rejected while the stable positive control passes.
 The prospective S8 targets remain unchanged. The serial qualification harness
 must freeze exact source/cohort/oracles/settings/resources before execution.
 
-## S9 inspection resumption checkpoint — 2026-09-10
+## S9 current FULL checkpoint — 2026-09-11
+
+Legacy MAIN output is `sc-22844-current-families-v6/reports/main-review.json`
+(SHA256 `5942e4dfea9ab05c1677bb7d1844ef68431e9ef080eb795878f781fd97026b44`).
+The source remains preserved; corrected FULL creates a fresh schema-3 plan rather
+than rewriting the old relationship evidence. No family is automatically chosen.
+
+Execution binds native source `ccae8ad` (binary SHA256
+`eb541139f7f7888ee5eec58975ad9f36008c65500ee553fa4030d4507c47602f`),
+and base driver SHA256 `af2c5e1dcb939713f8296998cc908e87b8e6658a4208b6e6cb12fe3b60132288`,
+using new controller SHA256
+`28c84319a05f10bfc4d7eb82efbf3d5ab147ea6f9a452fb482ed160b6cd21590`
+and canonical hash profile `sc-22844-canonical-runtime-profile-v1/profile.json`,
+SHA256 `243ccfff25670add20fa9f4c1b5511e426da637f99637dc17456b312eeff0d2b`.
+The profile installs a reviewed byte-equivalent hashing helper: effective Python
+execution changed, while native and base driver files/bindings remain preserved.
+Prior slices used controller `969eeaad…`; their artifacts are not relabelled.
+
+The independently reviewed first slice completed all 47 requested captures.
+Second attempt `c6bf42d7-cea0-4ed1-baf5-415cfe0e7c12` is cleanly paused/reaped,
+with 599 successful new commands and next command 655. Its local result SHA256 is
+`df98edc1966c18aab0c071ead6e30ac7dbf0208fd8d7c41108d3823dbab98529`;
+independent review `sc-22844-raid-full-second-slice-review-v1/paused-review.json`
+has SHA256 `d268a04b3567081bb0c0a8f4835f94c779e9a3e94bc0e8e3d467e12d855d2fb0`.
+Seven full rebuild/readback sequences were complete at last observation.
+This does not establish all-48 FULL completion.
+
+Twelfth FULL attempt `8df05a37-4c2d-4f44-aaaf-262426ea0082`, session `86615`,
+paused cleanly and was reaped at next command 7240 after 725 successful new
+commands and no failures. Result SHA256
+`0e22ff05e06005ff3059b8d0c2a53a70c022a9c2bb26d02307ce0751678dc451`;
+PASS review `sc-22844-raid-full-twelfth-slice-review-v1/paused-review.json`, SHA256
+`7eec2df2e80118afd7b5ae6ebec4f2198868135a91fabc036cb99317bd736e66`.
+This is a clean checkpoint, not FULL completion.
+
+Thirteenth slice `a588ba5b-8084-4123-be1e-569ebf90d219`, session `84418`,
+is active from command 7240 with the explicitly reviewed canonical hash profile.
+Its recipe SHA256 is
+`07e6e4db9aee08885349750099dd2e8db81f7a72ebc0a8b68680ee5ee4104f23`.
+The current control pointer and actual terminal receipt must be checked before
+resuming or starting competing native work.
+
+Funding and limits are unchanged: zero additional capture copies backed by all-47
+completion, full remaining plan/page/temp/metadata allowances without partial
+credit, separate headroom and 32 GiB operating reserve; 600-second cooperative
+slices, 4,800-second sampled emergency stop, 512 MiB Python / 1 GiB native /
+1.5 GiB combined sampled RSS limits. Exact scratch environment/identity checks
+and fresh inventory/free-space admission remain required. Recent recorded free
+space was 3,812,635,889,664 bytes against the unchanged 474,549,846,911-byte
+minimum; this observation does not replace fresh admission.
+
+The exact old-to-profile transition PASS is
+`sc-22844-canonical-transition-review-gtGRGbi4/transition-pass.json`, SHA256
+`92443376288e43ffc5e5367adb50e957a016fa183fd4c366d62fcbb824558c25`.
+The current attempt records authorization before dispatch (`execution-profile.json`,
+SHA256 `fe890c4aef5cd2bb03b5e92490b2b074786b7dd971f8e1f3eae0bd69b4810ce1`)
+and actual child installation (`execution-profile-consumed.json`, SHA256
+`2490f16a3daf7766f0b2f6ca426265ccefb7d10ee8b2a09841bcf565fa771240`).
+These receipts augment the base source identity; they do not assert a runtime gain.
+
+The actual local native/controller transition gate passed in 12 seconds: 52 commands,
+one total capture, eight hash comparisons, five negative cases and all 11 CLI
+children reaped. Receipt `sc-22844-canonical-transition-smoke-execution-v2/smoke-result.json`
+has SHA256 `2c97975bfaadcf77d3390509391fbd479bfc0cb6215088878e4cfe086dabcce8`.
+All 116 Lightroom Python tests passed in 5.18 seconds; root tool receipts are under
+`sc-22844-canonical-runtime-profile-v1`. These gates establish transition correctness,
+not real-corpus speed or all-48 FULL completion.
+
+The profile-aware metadata auditor `sc-22844-checkpoint-audit-profile-source-v1/audit_pause.py`
+has SHA256 `92cc53471f3457be1448977f456328f786db6c99026b6c5773e5f1a8739bba7d`.
+Its independent review and 20 synthetic checks passed; review SHA256
+`d2d6f223465434598876f737ec6114cbdf7d138d5031556edd8658e95482b36a`.
+The previous e7-only auditor remains preserved for historical checkpoints.
+The canonical preparer source `bd91429a4cfe4e14c0aa26ed6100a7708b86c11cf6a4e6034e08a039c763c8fb`
+passed independent review `2e38b2d6994f6c4a9ff383b7145923d3b182017f35046596c913ba427a1fe27d`;
+actual read-only draft and externally granted final preparation both passed.
+
+For subsequent clean pauses, preserve the actual result/review, current control,
+journal, exact owned pause and source/funding bindings. The private
+`sc-22844-canonical-continuation-preparer-source-v2` prepares packages only,
+requiring independent transition review and external grant; root reviews and launches.
+Later continuations must retain the same profile and use its profile-aware audit.
+No re-adoption, automatic retry, family choice or migration is authorized by a prepared recipe. Paths/packets require successful FULL output
+and separately reviewed funding; see `LIGHTROOM_PHASE_CONTROL.md`.
+
+## Historical S9 inspection resumption checkpoint — 2026-09-10
+
+The following records the earlier failure/adoption state, superseded by the current
+MAIN/FULL checkpoint above; its failed and successful artifacts remain preserved.
 
 The seventh v5 inspection attempt stopped after macOS reused the PID of a
 completed inspector for a later command. All 198 observed PIDs are absent and

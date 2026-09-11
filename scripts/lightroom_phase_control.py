@@ -5,6 +5,7 @@ initialization, adoption, failed retry, or pixel work. macOS ownership primitive
 are loaded only from their exact independently reviewed source bytes.
 """
 import argparse
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -102,11 +103,158 @@ def validate_temp_storage(recipe):
         raise ValueError('temp_storage and run must share a device')
 
 
+CANONICAL_FUNCTIONS = ['_small_canonical_budget', 'update_canonical_hash']
+LEGACY_FULL_CONTROLLER_SHA = '969eeaadb4e4693ddb12a6dbcd03c36c0d38991e7697a1994cd7210d38a865bd'
+
+
+def canonical_hash_profile(recipe):
+    """Validate a separately reviewed optimization, never change the base binding."""
+    ref = recipe.get('canonical_hash_profile')
+    if ref is None:
+        if 'canonical_hash_profile' in recipe or 'canonical_hash_transition' in recipe:
+            raise ValueError('unresolved canonical profile/transition')
+        return None
+    if recipe['phase'] not in {'full', 'paths', 'packets'}:
+        raise ValueError('canonical profile phase unsupported')
+    profile = C.document(ref)
+    fields = {'protocol', 'kind', 'base_driver', 'helper', 'functions', 'equivalence_review', 'runtime'}
+    if (set(profile) != fields or profile['protocol'] != 1 or profile['kind'] != 'canonical_hash_override'
+            or profile['base_driver'] != recipe['code']['runner'] or profile['runtime'] != recipe['code']['python']
+            or profile['functions'] != CANONICAL_FUNCTIONS):
+        raise ValueError('canonical hash profile identity differs')
+    raw = bootstrap(profile['helper'])
+    if len(raw) > 128*1024:
+        raise ValueError('canonical helper source bound')
+    review = C.document(profile['equivalence_review'])
+    if (review.get('status') != 'PASS' or review.get('base_driver') != profile['base_driver']
+            or review.get('helper') != profile['helper'] or review.get('runtime') != profile['runtime']
+            or review.get('assertions') != {'canonical_bytes_equal': True, 'bounded_fast_path': True, 'fallback_preserved': True}
+            or not isinstance(review.get('author'), str) or not 1 <= len(review['author'].encode()) <= 256):
+        raise ValueError('canonical helper equivalence/resource review missing or mismatched')
+    canonical_functions(raw, profile['helper']['path'])  # Reject executable module scaffolding before admission.
+    return profile
+
+
+def canonical_functions(raw, filename):
+    """Compile only the two reviewed pure definitions with explicit json globals."""
+    tree = ast.parse(raw, filename)
+    definitions = []
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if isinstance(node, ast.Import) and len(node.names) == 1 and node.names[0].name == 'json' and node.names[0].asname is None:
+            continue
+        if not isinstance(node, ast.FunctionDef) or node.name not in CANONICAL_FUNCTIONS or node.decorator_list:
+            raise ValueError('canonical helper contains unapproved module statements')
+        for value in [*node.args.defaults, *[v for v in node.args.kw_defaults if v is not None]]:
+            try: ast.literal_eval(value)
+            except (ValueError, TypeError): raise ValueError('canonical helper executable default') from None
+        if node.returns is not None or any(v.annotation is not None for v in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs, *([node.args.vararg] if node.args.vararg else []), *([node.args.kwarg] if node.args.kwarg else [])]):
+            raise ValueError('canonical helper annotations are not admitted')
+        definitions.append(node)
+    if sorted(n.name for n in definitions) != sorted(CANONICAL_FUNCTIONS):
+        raise ValueError('canonical helper definition roster differs')
+    scope = {'json': json}
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), filename, 'exec'), scope)
+    return scope
+
+
+def canonical_invariants(recipe):
+    # The only source change permitted at the first transition is the controller
+    # plus its separately attributed pure encoder profile. Everything else stays.
+    omitted = {'attempt_id', 'previous', 'journal', 'expected_next_command', 'pause', 'grant',
+               'canonical_hash_profile', 'canonical_hash_transition'}
+    value = {k: v for k, v in recipe.items() if k not in omitted}
+    value['code'] = {k: v for k, v in recipe['code'].items() if k != 'controller'}
+    return value
+
+
+def admit_canonical_previous(recipe, result, review):
+    profile = canonical_hash_profile(recipe)
+    if profile is None:
+        if 'execution_profile' in result or 'execution_profile' in review:
+            raise ValueError('canonical execution profile cannot be silently removed')
+        return
+    old_attempt = Path(recipe['previous']['result']['path']).parent
+    old_recipe_ref = C.reference(old_attempt/'recipe.json'); old_recipe = C.document(old_recipe_ref)
+    old_fixed = canonical_invariants(old_recipe); new_fixed = canonical_invariants(recipe)
+    if old_recipe.get('canonical_hash_profile') is not None and old_recipe['phase'] != recipe['phase']:
+        # Existing admit_previous verifies the exact successful phase/output;
+        # validate_recipe separately checks new phase inputs and funding.
+        for key in ['phase', 'input', 'baseline', 'paths_review', 'funding']:
+            old_fixed.pop(key, None); new_fixed.pop(key, None)
+    if old_fixed != new_fixed:
+        raise ValueError('canonical transition changed fixed input/funding/runtime/temp scope')
+    if old_recipe.get('canonical_hash_profile') is not None:
+        if ('canonical_hash_transition' in recipe or old_recipe['canonical_hash_profile'] != recipe['canonical_hash_profile']
+                or old_recipe['code']['controller'] != recipe['code']['controller']):
+            raise ValueError('canonical continuation profile/controller differs')
+        proof_ref = result.get('execution_profile')
+        if proof_ref is None or review.get('execution_profile') != proof_ref:
+            raise ValueError('prior canonical execution profile review missing')
+        validate_execution_profile(old_recipe, old_attempt, result)
+    else:
+        if (recipe['phase'] != 'full' or old_recipe['phase'] != 'full'
+                or 'canonical_hash_profile' in old_recipe or 'execution_profile' in result or 'execution_profile' in review
+                or old_recipe['code']['controller']['sha256'] != LEGACY_FULL_CONTROLLER_SHA
+                or result['status'] != 'paused_at_command_boundary' or result.get('cleanup') is not None):
+            raise ValueError('canonical transition requires exact clean legacy FULL pause')
+        transition = C.document(recipe['canonical_hash_transition'])
+        expected = {'status': 'PASS', 'kind': 'legacy_full_pause_to_canonical_hash_profile',
+                    'profile': recipe['canonical_hash_profile'], 'previous': recipe['previous'],
+                    'previous_recipe': old_recipe_ref, 'base_binding': recipe['binding'],
+                    'journal': recipe['journal'], 'expected_next_command': recipe['expected_next_command'],
+                    'invariants_sha256': C.sha(C.encoded(canonical_invariants(recipe)))}
+        if transition != expected:
+            raise ValueError('exact independent canonical transition review required')
+
+
+def execution_profile_value(recipe, attempt):
+    return {'protocol': 1, 'status': 'AUTHORIZED_BEFORE_DISPATCH', 'kind': 'effective_python_execution',
+            'base_binding': recipe['binding'], 'base_driver': recipe['code']['runner'],
+            'canonical_hash_profile': recipe['canonical_hash_profile'], 'controller': recipe['code']['controller'],
+            'runtime': recipe['code']['python'], 'recipe': C.reference(attempt/'recipe.json'),
+            'previous': recipe['previous'], 'phase': recipe['phase'], 'input': recipe['input'],
+            'baseline': recipe['baseline'], 'first_command': recipe['expected_next_command'],
+            'attempt_id': recipe['attempt_id']}
+
+
+def validate_execution_profile(recipe, attempt, result=None):
+    profile = canonical_hash_profile(recipe)
+    if profile is None:
+        return None
+    expected = execution_profile_value(recipe, attempt)
+    ref = C.reference(attempt/'execution-profile.json')
+    if C.document(ref) != expected:
+        raise ValueError('effective execution authorization differs')
+    if result is not None:
+        consumed_ref = C.reference(attempt/'execution-profile-consumed.json')
+        consumed = C.document(consumed_ref); process = read(attempt/'process.json')
+        if (result.get('execution_profile') != ref or result.get('execution_profile_consumed') != consumed_ref
+                or consumed != {'execution_profile': ref, 'helper': profile['helper'], 'pid': process['pid']}
+                or result.get('next_command', 0) < recipe['expected_next_command']):
+            raise ValueError('effective execution consumption/result differs')
+    return ref
+
+
+def install_canonical_profile(recipe, attempt, frozen):
+    profile = canonical_hash_profile(recipe)
+    if profile is None:
+        return
+    ref = validate_execution_profile(recipe, attempt)
+    # Keep frozen.__file__, encoded(), Runner and all native/replay guards intact.
+    # New behavior is explicitly attributed by the separate effective profile.
+    scope = canonical_functions(bootstrap(profile['helper']), profile['helper']['path'])
+    frozen.update_canonical_hash = scope['update_canonical_hash']
+    save(attempt/'execution-profile-consumed.json', {'execution_profile': ref, 'helper': profile['helper'], 'pid': os.getpid()})
+
+
 def validate_recipe(recipe):
     fields = {'protocol', 'phase', 'run', 'control', 'attempt_id', 'input', 'baseline', 'paths_review',
               'code', 'config', 'binding', 'journal', 'expected_next_command', 'previous', 'pause',
               'funding', 'memory', 'grant'}
-    if set(recipe) not in (fields, fields | {'temp_storage'}) or recipe['protocol'] != 1 or any(v is None for v in recipe.values()):
+    optional = {'temp_storage', 'canonical_hash_profile', 'canonical_hash_transition'}
+    if not fields <= set(recipe) or set(recipe)-fields-optional or recipe['protocol'] != 1 or any(v is None for v in recipe.values()):
         raise ValueError('unresolved/unknown recipe fields')
     if str(uuid.UUID(recipe['attempt_id'])) != recipe['attempt_id']:
         raise ValueError('invalid attempt UUID')
@@ -139,6 +287,7 @@ def validate_recipe(recipe):
     # control never copies/substitutes that executable or guesses a new identity.
     if recipe['journal']['path'] != str(run/'journal.json'):
         raise ValueError('wrong journal path')
+    canonical_hash_profile(recipe)
     ctx = C.context(recipe)
     budget = C.funding(recipe['funding'], recipe['phase'], recipe['input']['sha256'])
     grant = C.document(recipe['grant'])
@@ -292,6 +441,8 @@ def admit_imported_main(recipe, ctx):
 def admit_previous(recipe, ctx):
     run = Path(recipe['run']); control = Path(recipe['control']); prev = recipe['previous']
     if prev.get('kind') == 'imported_main':
+        if 'canonical_hash_profile' in recipe:
+            raise ValueError('canonical profile requires an existing clean FULL pause')
         return admit_imported_main(recipe, ctx)
     if set(prev) != {'result', 'review'}:
         raise ValueError('completed predecessor and independent review required')
@@ -332,6 +483,7 @@ def admit_previous(recipe, ctx):
         C.checked(expected_output)
     if C.document(recipe['journal']) != {'next_command': recipe['expected_next_command']}:
         raise ValueError('journal changed before admission')
+    admit_canonical_previous(recipe, result, review)
 
 
 def remove_pause(recipe, attempt):
@@ -531,7 +683,18 @@ def classify(recipe, ctx, binding, before, started, code, pause):
         raise ValueError('exit/phase/output classification differs')
     return {'status': status, 'phase': C.reference(phase_path), 'phase_name': recipe['phase'], 'phase_input': recipe['input'],
             'output': output, 'journal': C.reference(run/'journal.json'), 'next_command': tail['next_command'],
-            'new_command_failures': failures, 'pause': pause, 'fresh_full_inventory': fresh, 'ownership_status': 'observed_owned_processes_reaped'}
+            'new_command_failures': failures, 'pause': pause, 'fresh_full_inventory': fresh, 'ownership_status': 'observed_owned_processes_reaped',
+            **canonical_result_fields(recipe)}
+
+
+def canonical_result_fields(recipe):
+    if 'canonical_hash_profile' not in recipe:
+        return {}
+    attempt = Path(recipe['control'])/'attempts'/recipe['attempt_id']
+    fields = {'execution_profile': C.reference(attempt/'execution-profile.json'),
+              'execution_profile_consumed': C.reference(attempt/'execution-profile-consumed.json')}
+    validate_execution_profile(recipe, attempt, dict(fields, next_command=read(Path(recipe['run'])/'journal.json')['next_command']))
+    return fields
 
 
 class Drain:
@@ -637,6 +800,7 @@ def child_main(recipe):
     if read(Path(recipe['control'])/'current.json') != {'attempt_id': recipe['attempt_id']} or read(attempt/'started.json')['binding'] != recipe['binding']:
         raise ValueError('child has no persistent owning attempt')
     frozen = module(recipe['code']['runner'], 'bound_frozen_phase_runner')
+    install_canonical_profile(recipe, attempt, frozen)
     funding_module = module(recipe['code']['funding_guard'], 'bound_funding')
     monitor = funding_module.FundingMonitor(dict(budget, run=recipe['run'], attempt=str(attempt)), 'adapter')
     base = funding_module.guarded_type(frozen.Runner, monitor, frozen.PauseRequested)
@@ -686,6 +850,8 @@ def run(recipe):
                     save(attempt/'recipe.json', recipe)
                     save(attempt/'started.json', {'binding': recipe['binding'], 'phase': recipe['phase'], 'input': recipe['input'], 'started_unix': time.time(), 'available_bytes': free, 'funding': budget})
                     save(control/'current.json', {'attempt_id': recipe['attempt_id']}, replace=True)
+                    if 'canonical_hash_profile' in recipe:
+                        save(attempt/'execution-profile.json', execution_profile_value(recipe, attempt))
                     remove_pause(recipe, attempt)
                 finally: fcntl.flock(runner_lock, fcntl.LOCK_UN)
             result = supervise(recipe, attempt, ctx, budget, binding,

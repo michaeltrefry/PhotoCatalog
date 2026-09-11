@@ -53,9 +53,68 @@ def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()+b"\n"
 
 
+def _small_canonical_budget(value, budget=65535, nodes=2048, depth=16):
+    """Bound ASCII output without encoding or copying containers; None means stream.
+
+    Exact builtin types avoid running subclass hooks during admission. Twelve
+    bytes per code point covers escaped surrogate pairs; bit_length()+2 exceeds
+    integer decimal length including sign. Container allowances include commas,
+    colons and brackets. The caller reserves one additional byte for the LF.
+    """
+    if nodes < 1 or depth < 0:
+        return None
+    nodes -= 1
+    kind = type(value)
+    if kind is str:
+        budget -= 2 + 12*len(value)
+    elif kind is int:
+        # Native integer cells/cursors fit 64 bits. Larger Python integers may
+        # hit the runtime decimal-conversion limit; stream to preserve even the
+        # partial digest and error behavior rather than raising before a prefix.
+        if value.bit_length() > 64:
+            return None
+        budget -= value.bit_length()+2
+    elif kind is float:
+        budget -= 32  # All builtin binary64 reprs, including signed zero/NaN/Inf.
+    elif value is None or kind is bool:
+        budget -= 5
+    elif kind is dict:
+        budget -= 2 + 2*len(value)
+        if budget < 0 or 2*len(value) > nodes:
+            return None
+        for key, child in value.items():
+            if type(key) is not str:
+                return None
+            for item in (key, child):
+                result = _small_canonical_budget(item, budget, nodes, depth-1)
+                if result is None:
+                    return None
+                budget, nodes = result
+    elif kind is list or kind is tuple:
+        budget -= 2 + len(value)
+        if budget < 0 or len(value) > nodes:
+            return None
+        for child in value:
+            result = _small_canonical_budget(child, budget, nodes, depth-1)
+            if result is None:
+                return None
+            budget, nodes = result
+    else:
+        return None
+    return (budget, nodes) if budget >= 0 else None
+
+
 def update_canonical_hash(digest, value):
-    """Hash the exact encoded() byte stream without a whole-row str/bytes pair."""
+    """Hash encoded() bytes, using the C encoder only for bounded small values."""
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if _small_canonical_budget(value) is not None:
+        # encode() uses the stdlib C encoder; its ASCII result is at most 65535
+        # bytes. Bound the temporary byte copy too, rather than duplicating it.
+        text = encoder.encode(value)
+        for start in range(0, len(text), 16384):
+            digest.update(text[start:start+16384].encode())
+        digest.update(b"\n")
+        return
     for chunk in encoder.iterencode(value):
         # A single escaped string can itself fill a page. Bound its byte copy;
         # tiny numeric chunks can go directly to hashlib without buffering.
