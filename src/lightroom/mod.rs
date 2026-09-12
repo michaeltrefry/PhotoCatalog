@@ -1,5 +1,6 @@
 //! Lightroom evidence capture and inspection. This module never imports assets
 //! into the application catalog or executes Adobe develop/plug-in instructions.
+pub mod adobe;
 pub mod capture;
 pub mod discovery;
 pub mod plan;
