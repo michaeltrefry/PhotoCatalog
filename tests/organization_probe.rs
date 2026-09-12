@@ -136,7 +136,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
                 .unwrap()
                 .iter()
                 .all(|row| row[1]
-                    == if row[0] == "export_alias_state" {
+                    == if row[0] == "export_alias_state" || row[0] == "migration_mapping_epoch" {
                         1
                     } else if row[0] == "catalog_images" || row[0] == "image_shared_state" {
                         1000
@@ -233,7 +233,10 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
             .unwrap()
             .iter()
             .all(|row| row[1]
-                == if row[0] == "export_alias_state" || row[0] == "export_alias_dirty" {
+                == if row[0] == "export_alias_state"
+                    || row[0] == "export_alias_dirty"
+                    || row[0] == "migration_mapping_epoch"
+                {
                     1
                 } else if row[0] == "catalog_images" || row[0] == "image_shared_state" {
                     1000

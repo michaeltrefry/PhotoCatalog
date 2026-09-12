@@ -466,10 +466,20 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         image_initial.1.iter().all(|(name, n)| *n
             == if matches!(name.as_str(), "catalog_images" | "image_shared_state") {
                 count
+            } else if name == "migration_mapping_epoch" {
+                1
             } else {
                 0
             }),
         "schema7 fixture has non-initial image/import rows"
+    );
+    ensure!(
+        db.query_row::<bool, _, _>(
+            "SELECT count(*)=1 AND min(id)=1 AND min(epoch)=0 FROM migration_mapping_epoch",
+            [],
+            |r| r.get(0)
+        )?,
+        "migration mapping epoch is not initial"
     );
     ensure!(db.query_row::<bool,_,_>("SELECT NOT EXISTS(SELECT 1 FROM assets a LEFT JOIN catalog_images i ON i.id=a.id WHERE i.id IS NULL OR i.sequence!=a.sequence OR i.asset_id!=a.id OR i.variant_id!='master' OR i.role!='master' OR i.origin!='native' OR i.translation_state!='native' OR i.master_sequence IS NOT NULL OR i.copied_from_sequence IS NOT NULL OR i.pixel_generation!=0 OR i.applied_shared_epoch!=0 OR a.physical_generation!=a.render_generation) AND NOT EXISTS(SELECT 1 FROM image_shared_state WHERE epoch!=0)",[],|r|r.get(0))?, "image migration identities/generations changed");
     let alias_initial_state = json!({"unbound":unbound,"dirty":bound});
