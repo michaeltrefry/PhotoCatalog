@@ -10,35 +10,44 @@ into one scratch catalog and preserves the existing filesystem folder hierarchy.
 The 32 excluded catalog candidates remain excluded. Canonical-library migration
 has not been authorized.
 
-PR #14 remains draft. Its published head `fb7bb43715d51068be5e8818807b2cdecc8e20e4`
-passed all four applicable CI jobs: macOS, Windows, Linux, and benchmark contracts.
-The qualified production worker is `d0c5f3c`; debug and optimized all-target gates
-each passed 586 test instances, with zero failures and five existing ignored tests.
-Those gates do not substitute for actual TEST acceptance.
+PR #14 remains draft. Published head `e7614d7` passed all four applicable CI
+jobs: macOS, Windows, Linux, and benchmark contracts. Later source changes still
+require their own remote checks and actual TEST acceptance.
 
 The actual TEST has completed selected-source record preservation: 14,025,415
 records across all 16 selected catalogs, matching the frozen source total. File,
-master-role and virtual-role walks have completed. The same run checkpointed
-cleanly at 664,003 processed rows during embedded metadata, with native exit 0
-and no forced cleanup. All progress is retained in the one scratch catalog;
+master-role, virtual-role, embedded/sidecar metadata, catalog-XMP and current
+Adobe-settings walks have completed. Progress remains in one scratch catalog;
 originals and source catalogs remain read-only.
 
-A remaining-stage review identified two metadata mapping queries using only a
-prefix of the existing composite index. Repair `e615b076` supplies the full known
-identity and passes independent source review plus a 20,000-row bounded-work
-regression. Its complete optimized gate passed 587 test instances, with zero failures and
-five existing ignored tests; strict Clippy and formatting passed. The successor
-worker has resumed from the clean checkpoint with unchanged inputs and destination.
-Previous worker receipts remain attributed to their original source revision.
+Repair `e615b076` supplied the complete composite key for two metadata mapping
+queries and passed independent review plus a 20,000-row bounded-work regression.
+The resumed worker completed both affected metadata stages. A subsequent external
+RSS-probe timeout and a later native rating-conflict failure are preserved as
+separate failed intervals, each with its durable checkpoint.
+
+Repair `30f8cd40` retains conflicted ratings and labels as image-local metadata
+candidates without selecting source precedence. Keywords accumulate a source-owned
+set, with explicit unresolved and resource-limit results. Independent source review,
+13 focused regressions, all 594 optimized all-target test instances, strict all-target
+Clippy and formatting passed; five existing tests remain ignored. The original
+interactive conflict guard and successful component receipts remain intact.
+
+The same TEST has resumed with the qualified successor. A bounded read-only check
+proved recovery of the exact failing row: its rating candidate is retained, ambiguity
+is still visible, prior rating sources and choices are unchanged, and the saved flag
+and label receipts are identical. The checkpoint had advanced beyond 2,149,840
+processed rows. This is a successful repair/resume observation, not terminal import
+acceptance. Earlier native receipts remain attributed to their original source.
 
 Remaining native projections, raw artifact custody, independent selected counts
 and relationships, final acceptance review, merge and terminal merged-head CI
-are required for S10. The combined independent verifier passes source review
-and 29 synthetic tests, including missing projection receipts, incorrect file-XMP
-associations, and actual JSON-encoded checkpoint stages. Its successor source
-binding passes focused qualification and root review; actual execution remains
-pending native completion and a quiescent, explicitly pinned observation. S11 backup/restore and S12 Tauri
-interface retain their S10 dependencies; S13 integrated readiness follows both.
+are required for S10. The successor independent verifier passes 41 synthetic tests,
+including candidate source/image/value bindings, missing receipts, wrong file-XMP
+associations and broken keyword accumulation histories. Independent source review
+passed; actual execution remains held until native completion and a
+quiescent, explicitly pinned observation. S11 backup/restore and S12 Tauri interface
+retain their S10 dependencies; S13 integrated readiness follows both.
 Fieldbook remains a design reference, not the product name.
 
 ## Historical checkpoint before S9 closeout
