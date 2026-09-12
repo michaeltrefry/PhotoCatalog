@@ -4,7 +4,7 @@ use super::{
     images,
     lookup::{Lookup, LookupCursor},
     organization::SourceRecord,
-    originals::{OriginalDecision, OriginalRequest},
+    originals::{OriginalDecision, OriginalRequest, SourceKey},
     retention,
     walk::{LinkResolution, Walk},
 };
@@ -860,6 +860,23 @@ fn image(
     )?;
     Ok(RowResult::Applied(Outcome::Image(result.outcome)))
 }
+// Match the complete import identity so metadata walks use a point lookup,
+// rather than scanning all images belonging to the import owner.
+const MAPPED_IMAGE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM image_import_map WHERE import_source=?1 AND capture_revision=?2 AND source_table=?3 AND source_id=?4)";
+
+fn has_mapped_image(db: &Connection, owner: &str, source: &SourceKey) -> Result<bool> {
+    Ok(db.query_row(
+        MAPPED_IMAGE_EXISTS_SQL,
+        params![
+            owner,
+            source.capture_revision,
+            source.table,
+            source.identity()?
+        ],
+        |r| r.get(0),
+    )?)
+}
+
 fn metadata(
     catalog: &mut Catalog,
     source: &MigrationSource,
@@ -870,11 +887,7 @@ fn metadata(
     use super::metadata::{CatalogXmp, CurrentDevelop};
     let walk = Walk::new(catalog, source, &origin.source.capture_revision)?;
     if stage == Stage::CurrentDevelop {
-        let mapped: bool = catalog.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM image_import_map WHERE source_id=?1 AND import_source=?2)",
-            params![origin.source.identity()?, policy.import_source],
-            |r| r.get(0),
-        )?;
+        let mapped = has_mapped_image(&catalog.db, &policy.import_source, &origin.source)?;
         if !mapped {
             return Ok(retained(
                 "Current settings have no mapped image; source evidence retained",
@@ -905,11 +918,7 @@ fn metadata(
             LinkResolution::Unique(v) => v,
             other => return Ok(retained(format!("Catalog XMP image relation: {other:?}"))),
         };
-        let mapped: bool = catalog.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM image_import_map WHERE source_id=?1 AND import_source=?2)",
-            params![image.target.source.identity()?, policy.import_source],
-            |r| r.get(0),
-        )?;
+        let mapped = has_mapped_image(&catalog.db, &policy.import_source, &image.target.source)?;
         if !mapped {
             return Ok(retained(
                 "Catalog XMP has no mapped image; original packet retained",
@@ -1112,4 +1121,88 @@ fn prepared_origin(
         Some(Walk::new(catalog, source, revision)?.source_record(sequence)?),
         None,
     ))
+}
+
+#[cfg(test)]
+mod mapping_query_tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    #[test]
+    fn metadata_mapping_uses_bounded_complete_identity_lookup() -> Result<()> {
+        // Use the installed product table/index DDL, not a simplified test index.
+        // Only this isolated in-memory copy omits referenced image records.
+        let root = tempfile::tempdir()?;
+        let catalog = Catalog::open(root.path())?;
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch("PRAGMA foreign_keys=OFF")?;
+        let mut ddl = catalog.db.prepare(
+            "SELECT sql FROM sqlite_schema WHERE tbl_name='image_import_map' AND type IN ('table','index') AND sql IS NOT NULL ORDER BY type DESC",
+        )?;
+        for sql in ddl.query_map([], |r| r.get::<_, String>(0))? {
+            db.execute_batch(&sql?)?;
+        }
+        let source = |key| SourceKey {
+            capture_revision: "a".repeat(64),
+            table: "Adobe_images".into(),
+            key: vec![Cell::Integer(key)],
+        };
+        let tx = db.transaction()?;
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO image_import_map VALUES(?1,?2,?3,?4,'input','fixture',?5)")?;
+            for key in 0..20_000 {
+                let row = source(key);
+                insert.execute(params![
+                    "owner",
+                    row.capture_revision,
+                    row.table,
+                    row.identity()?,
+                    format!("image-{key}")
+                ])?;
+            }
+        }
+        tx.commit()?;
+
+        let matched = source(19_999);
+        let missing = source(20_000);
+        let mut other_capture = matched.clone();
+        other_capture.capture_revision = "b".repeat(64);
+        let mut other_table = matched.clone();
+        other_table.table = "AgLibraryFile".into();
+        let mut other_typed_key = matched.clone();
+        other_typed_key.key = vec![Cell::Text(b"19999".to_vec())];
+        for (owner, row, expected) in [
+            ("owner", &matched, true),
+            ("owner", &missing, false),
+            ("other-owner", &matched, false),
+            ("owner", &other_capture, false),
+            ("owner", &other_table, false),
+            ("owner", &other_typed_key, false),
+        ] {
+            assert_eq!(has_mapped_image(&db, owner, row)?, expected);
+            let mut statement = db.prepare(MAPPED_IMAGE_EXISTS_SQL)?;
+            let found: bool = statement.query_row(
+                params![owner, row.capture_revision, row.table, row.identity()?],
+                |r| r.get(0),
+            )?;
+            assert_eq!(found, expected);
+            let work = statement.get_status(StatementStatus::VmStep);
+            assert!(
+                (1..=100).contains(&work),
+                "mapping lookup used {work} VM steps"
+            );
+        }
+        // Control: the previous production predicate must fail the same work
+        // bound on a miss, regardless of the ordering of hashed source IDs.
+        let mut legacy = db.prepare(
+            "SELECT EXISTS(SELECT 1 FROM image_import_map WHERE source_id=?1 AND import_source=?2)",
+        )?;
+        assert!(
+            !legacy.query_row(params![missing.identity()?, "owner"], |r| r
+                .get::<_, bool>(0))?
+        );
+        assert!(legacy.get_status(StatementStatus::VmStep) > 20_000);
+        Ok(())
+    }
 }
