@@ -117,6 +117,52 @@ pub fn retain_image_relation(
     db.execute("INSERT INTO organization_image_relations(source_key,kind,from_image,to_image,position,provenance) VALUES(?1,?2,?3,?4,?5,?6)",params![source_key,kind,a,b,position,evidence])?;
     Ok(db.last_insert_rowid())
 }
+/// Retain ordered membership in the caller's checkpoint transaction.
+pub(crate) fn set_image_collection_membership(
+    db: &Connection,
+    expected: &ImageMetadataIdentity,
+    collection: &str,
+    position: i64,
+    evidence: &serde_json::Value,
+) -> Result<i64> {
+    ensure!(!db.is_autocommit(), "membership requires a transaction");
+    small(collection)?;
+    ensure!(position >= 0, "negative membership order");
+    let evidence = provenance(evidence)?;
+    require_image_metadata_identity(db, expected)?;
+    let seq: i64 = db.query_row(
+        "SELECT sequence FROM catalog_images WHERE id=?",
+        [&expected.image_id],
+        |r| r.get(0),
+    )?;
+    db.execute("INSERT INTO organization_collection_members VALUES(?1,?2,?3) ON CONFLICT(collection,sequence) DO UPDATE SET provenance=excluded.provenance",params![collection,seq,evidence])?;
+    db.execute("INSERT INTO organization_collection_order VALUES(?1,?2,?3) ON CONFLICT(collection,image_sequence) DO UPDATE SET position=excluded.position",params![collection,seq,position])?;
+    let revision = crate::catalog_metadata::advance(
+        db,
+        &expected.image_id,
+        "collection_membership",
+        &serde_json::json!({"collection":collection,"position":position}),
+        false,
+    )?;
+    db.execute(
+        "UPDATE organization_collections SET revision=revision+1 WHERE id=?",
+        [collection],
+    )?;
+    Ok(revision)
+}
+/// Retain dictionary synonyms in the caller's checkpoint transaction.
+pub(crate) fn add_keyword_synonym(
+    db: &Connection,
+    keyword: i64,
+    synonym: &str,
+    evidence: &serde_json::Value,
+) -> Result<()> {
+    ensure!(!db.is_autocommit(), "synonym requires a transaction");
+    small(synonym)?;
+    let evidence = provenance(evidence)?;
+    db.execute("INSERT INTO organization_keyword_synonyms VALUES(?1,?2,?3) ON CONFLICT(keyword,synonym) DO UPDATE SET provenance=excluded.provenance", params![keyword,synonym,evidence])?;
+    Ok(())
+}
 impl Catalog {
     pub fn place_collection(&mut self, placement: &CollectionPlacement) -> Result<()> {
         let _w = self.writers.enter(Priority::Foreground)?;
@@ -137,32 +183,12 @@ impl Catalog {
         position: i64,
         evidence: &serde_json::Value,
     ) -> Result<i64> {
-        small(collection)?;
-        ensure!(position >= 0, "negative membership order");
-        let evidence = provenance(evidence)?;
         let _w = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        require_image_metadata_identity(&tx, expected)?;
-        let seq: i64 = tx.query_row(
-            "SELECT sequence FROM catalog_images WHERE id=?",
-            [&expected.image_id],
-            |r| r.get(0),
-        )?;
-        tx.execute("INSERT INTO organization_collection_members VALUES(?1,?2,?3) ON CONFLICT(collection,sequence) DO UPDATE SET provenance=excluded.provenance",params![collection,seq,evidence])?;
-        tx.execute("INSERT INTO organization_collection_order VALUES(?1,?2,?3) ON CONFLICT(collection,image_sequence) DO UPDATE SET position=excluded.position",params![collection,seq,position])?;
-        let revision = crate::catalog_metadata::advance(
-            &tx,
-            &expected.image_id,
-            "collection_membership",
-            &serde_json::json!({"collection":collection,"position":position}),
-            false,
-        )?;
-        tx.execute(
-            "UPDATE organization_collections SET revision=revision+1 WHERE id=?",
-            [collection],
-        )?;
+        let revision =
+            set_image_collection_membership(&tx, expected, collection, position, evidence)?;
         tx.commit()?;
         Ok(revision)
     }
@@ -183,10 +209,12 @@ impl Catalog {
         synonym: &str,
         evidence: &serde_json::Value,
     ) -> Result<()> {
-        small(synonym)?;
-        let evidence = provenance(evidence)?;
         let _w = self.writers.enter(Priority::Foreground)?;
-        self.db.execute("INSERT INTO organization_keyword_synonyms VALUES(?1,?2,?3) ON CONFLICT(keyword,synonym) DO UPDATE SET provenance=excluded.provenance",params![keyword,synonym,evidence])?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        add_keyword_synonym(&tx, keyword, synonym, evidence)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn keyword_synonyms(
@@ -229,3 +257,7 @@ impl Catalog {
         self.db.prepare("SELECT r.sequence,r.kind,t.asset_id,t.variant_id,r.position,r.provenance FROM organization_image_relations r JOIN catalog_images t ON t.id=r.to_image WHERE r.from_image=?1 AND r.sequence>?2 ORDER BY r.sequence LIMIT ?3")?.query_map(params![image,after,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?)))?.map(|r|{let(seq,k,a,v,p,e)=r?;Ok(ImageRelation{sequence:seq,kind:k,from:from.clone(),to:VariantKey{asset_id:a,variant_id:v},position:p,provenance:serde_json::from_str(&e)?})}).collect()
     }
 }
+
+#[cfg(test)]
+#[path = "organization_tests.rs"]
+mod tests;

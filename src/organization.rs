@@ -194,7 +194,7 @@ fn path_valid(kind: KeywordKind, path: &[String]) -> Result<()> {
     }
     Ok(())
 }
-fn keyword(db: &Connection, kind: KeywordKind, path: &[String]) -> Result<i64> {
+pub(crate) fn keyword(db: &Connection, kind: KeywordKind, path: &[String]) -> Result<i64> {
     path_valid(kind, path)?;
     let mut parent = None;
     for depth in 1..=path.len() {
@@ -207,6 +207,29 @@ fn keyword(db: &Connection, kind: KeywordKind, path: &[String]) -> Result<i64> {
         )?);
     }
     parent.context("empty keyword")
+}
+/// Create a dictionary entry in the same transaction as its import mapping.
+pub(crate) fn create_collection(
+    db: &Connection,
+    name: &str,
+    provenance: &serde_json::Value,
+) -> Result<String> {
+    ensure!(
+        !db.is_autocommit(),
+        "collection creation requires a transaction"
+    );
+    text_limit(name)?;
+    let provenance = serde_json::to_string(provenance)?;
+    ensure!(
+        provenance.len() <= 65536,
+        "collection provenance exceeds 64KiB"
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    db.execute(
+        "INSERT INTO organization_collections(id,name,provenance) VALUES(?1,?2,?3)",
+        params![id, name, provenance],
+    )?;
+    Ok(id)
 }
 /// A photographic calendar value, without inventing a timezone for EXIF dates.
 /// Exact source spelling remains in retained metadata; comparisons use local date/time.
@@ -563,19 +586,14 @@ impl Catalog {
         name: &str,
         provenance: serde_json::Value,
     ) -> Result<String> {
-        text_limit(name)?;
-        ensure!(
-            serde_json::to_vec(&provenance)?.len() <= 65536,
-            "collection provenance exceeds 64KiB"
-        );
-        let id = uuid::Uuid::new_v4().to_string();
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
-        self.db.execute(
-            "INSERT INTO organization_collections(id,name,provenance) VALUES(?1,?2,?3)",
-            params![id, name, serde_json::to_string(&provenance)?],
-        )?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let id = create_collection(&tx, name, &provenance)?;
+        tx.commit()?;
         Ok(id)
     }
     pub fn organization_collections(&self, after: &str, limit: usize) -> Result<Vec<Collection>> {
@@ -1088,6 +1106,26 @@ impl Catalog {
         expected_revision: i64,
         operation: Operation,
     ) -> Result<i64> {
+        self.organize_image_id_with_commit(asset, expected_revision, operation, |_, _| Ok(()))
+    }
+    /// Publish one logical-image organization edit and its importer checkpoint atomically.
+    pub fn organize_image_with_commit(
+        &mut self,
+        key: &crate::catalog_edits::VariantKey,
+        expected_revision: i64,
+        operation: Operation,
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<i64> {
+        let image = crate::catalog_images::id(&self.db, key)?;
+        self.organize_image_id_with_commit(&image, expected_revision, operation, after)
+    }
+    fn organize_image_id_with_commit(
+        &mut self,
+        asset: &str,
+        expected_revision: i64,
+        operation: Operation,
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<i64> {
         crate::catalog_images::require_current(&self.db, asset)?;
         validate_operation(&self.db, &operation)?;
         ensure!(
@@ -1143,13 +1181,14 @@ impl Catalog {
                 let next = advance_local(&tx, asset, "single-asset")?;
                 refresh(&tx, asset)?;
                 tx.execute("INSERT INTO organization_events(sequence,action,detail) VALUES(?1,'single_asset',?2)",params![seq,serde_json::to_string(&operation)?])?;
+                after(&tx, next)?;
                 tx.commit()?;
                 drop(_write);
                 Ok(next)
             }
             _ => {
                 let (base, fields, edits) = organization_edits(self, asset, &operation)?;
-                Ok(self.edit_metadata_commit(asset,expected_revision,base,&edits,&fields,|db,_|{db.execute("INSERT INTO organization_events(sequence,action,detail) VALUES(?1,'single_asset',?2)",params![seq,serde_json::to_string(&operation)?])?;Ok(())})?.revision)
+                Ok(self.edit_metadata_commit(asset,expected_revision,base,&edits,&fields,|db,revision|{db.execute("INSERT INTO organization_events(sequence,action,detail) VALUES(?1,'single_asset',?2)",params![seq,serde_json::to_string(&operation)?])?;after(db,revision)})?.revision)
             }
         }
     }
