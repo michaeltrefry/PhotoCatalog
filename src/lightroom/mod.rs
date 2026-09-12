@@ -5,7 +5,7 @@ pub mod capture;
 pub mod discovery;
 pub mod migration_source;
 pub mod plan;
-mod source;
+pub(crate) mod source;
 pub mod wal;
 
 use crate::storage_volume::NativePath;
