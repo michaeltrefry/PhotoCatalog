@@ -130,7 +130,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 37
+            && receipt["added_tables"].as_array().unwrap().len() == 39
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
@@ -226,7 +226,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
     ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 37);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 39);
     ensure!(
         migrated["added_tables"]
             .as_array()
@@ -344,7 +344,7 @@ fn remove_image_schema(conn: &rusqlite::Connection) -> Result<()> {
             conn.execute_batch(&sql)?;
         }
     }
-    conn.execute_batch("DROP TABLE migration_metadata; DROP TABLE migration_images; DROP TABLE migration_organization; DROP TABLE metadata_image_export_authorities; DROP TABLE migration_artifacts; DROP TABLE migration_retained_fields; DROP TABLE migration_retained_records; DROP TABLE migration_retention; DROP TABLE migration_originals; DROP TABLE migration_evidence_chunks; DROP TABLE migration_evidence_blobs; DROP TABLE migration_evidence; DROP TABLE organization_image_relations; DROP TABLE organization_keyword_synonyms; DROP TABLE organization_collection_order; DROP TABLE organization_collection_structure; DROP TABLE metadata_image_sources; DROP TABLE metadata_image_observations; DROP TABLE image_shared_events; DROP TABLE image_shared_state; DROP TABLE image_storage_events; DROP TABLE image_import_map; DROP TABLE image_import_reservations; DROP TABLE catalog_images; ALTER TABLE assets DROP COLUMN physical_generation; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("DROP TABLE migration_record_lookup; DROP TABLE migration_lookup_backfill; DROP INDEX migration_retained_lookup_sequence; DROP TABLE migration_metadata; DROP TABLE migration_images; DROP TABLE migration_organization; DROP TABLE metadata_image_export_authorities; DROP TABLE migration_artifacts; DROP TABLE migration_retained_fields; DROP TABLE migration_retained_records; DROP TABLE migration_retention; DROP TABLE migration_originals; DROP TABLE migration_evidence_chunks; DROP TABLE migration_evidence_blobs; DROP TABLE migration_evidence; DROP TABLE organization_image_relations; DROP TABLE organization_keyword_synonyms; DROP TABLE organization_collection_order; DROP TABLE organization_collection_structure; DROP TABLE metadata_image_sources; DROP TABLE metadata_image_observations; DROP TABLE image_shared_events; DROP TABLE image_shared_state; DROP TABLE image_storage_events; DROP TABLE image_import_map; DROP TABLE image_import_reservations; DROP TABLE catalog_images; ALTER TABLE assets DROP COLUMN physical_generation; PRAGMA foreign_keys=ON;")?;
     Ok(())
 }
 
@@ -379,7 +379,7 @@ fn schema_six_adds_only_verified_image_state_and_rejects_legacy_sequence_spoof()
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION,
         "{receipt}"
     );
-    ensure!(receipt["added_tables"].as_array().unwrap().len() == 24);
+    ensure!(receipt["added_tables"].as_array().unwrap().len() == 26);
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
             && receipt["original_columns_preserved"] == true

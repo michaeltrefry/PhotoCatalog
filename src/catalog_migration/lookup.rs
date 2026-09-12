@@ -82,6 +82,7 @@ pub struct UnavailableKey {
 /// existing retention serialization, bounded to one ordinary evidence record.
 #[derive(Clone, Debug)]
 pub struct PreparedIndex {
+    canonical: Vec<u8>,
     revision: String,
     collection: Collection,
     rowid: i64,
@@ -91,6 +92,11 @@ pub struct PreparedIndex {
     unavailable: String,
 }
 impl PreparedIndex {
+    /// Canonical bytes used for the immutable lookup digest, also retained by
+    /// the importer so a batch serializes every evidence record only once.
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
+    }
     pub fn new(record: &EvidenceRecord) -> Result<Self> {
         // Cell serialization hex-encodes into a temporary string before writing.
         // Bound those allocations too, not only the eventual output writer.
@@ -172,6 +178,7 @@ impl PreparedIndex {
             raw_length: raw.len(),
             keys,
             unavailable: serde_json::to_string(&unavailable)?,
+            canonical: raw,
         })
     }
 }

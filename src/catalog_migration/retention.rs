@@ -573,13 +573,14 @@ impl Catalog {
         let mut staged = Vec::new();
         let mut staged_bytes = 0usize;
         for record in &page.records {
-            let raw = serde_json::to_vec(record)?;
+            let index = super::lookup::PreparedIndex::new(record)?;
+            let raw = index.canonical_bytes();
             ensure!(raw.len() <= RECORD_LIMIT, "retained record size limit");
             if !staged.is_empty() && staged_bytes.saturating_add(raw.len()) > RECORD_LIMIT {
                 break;
             }
             staged_bytes += raw.len();
-            let compressed = compress(&raw)?;
+            let compressed = compress(raw)?;
             let next = Cursor {
                 seal: id.into(),
                 revision: revision.clone(),
@@ -594,9 +595,10 @@ impl Catalog {
                 record,
                 compressed,
                 raw.len(),
-                blake3::hash(&raw).to_hex().to_string(),
+                blake3::hash(raw).to_hex().to_string(),
                 serde_json::to_string(&next)?,
                 pending,
+                index,
             ));
             if pending {
                 break;
@@ -629,11 +631,12 @@ impl Catalog {
             tx.execute("UPDATE migration_retention SET capture_index=?2,collection_index=?3,cursor=NULL,complete=?4 WHERE id=?1",
                 params![id,i64::try_from(capture)?,i64::try_from(next_collection%COLLECTIONS.len())?,capture==source.seal().selected.len()])?;
         } else {
-            for (record, compressed, length, digest, next, pending) in staged {
+            for (record, compressed, length, digest, next, pending, index) in staged {
                 // Cursor and row commit atomically; a previously committed row
                 // here is corruption, not an opportunity to silently skip bytes.
                 tx.execute("INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,revision,i64::try_from(before.collection_index)?,record.rowid,compressed,i64::try_from(length)?,digest,next,!pending])?;
                 let sequence = tx.last_insert_rowid();
+                super::lookup::index_record(&tx, sequence, &index)?;
                 for (field, value) in &record.fields {
                     if let Field::Bytes(reference) = value {
                         let descriptor = serde_json::to_vec(reference)?;

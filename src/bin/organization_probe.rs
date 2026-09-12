@@ -96,6 +96,8 @@ const SCHEMA7_TABLES: &[&str] = &[
     "metadata_image_sources",
     "migration_artifacts",
     "migration_images",
+    "migration_record_lookup",
+    "migration_lookup_backfill",
     "migration_metadata",
     "migration_organization",
     "migration_evidence",
