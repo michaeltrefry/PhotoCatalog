@@ -1059,7 +1059,7 @@ impl Catalog {
             revision(&tx, asset)? == expected_revision,
             "metadata changed while preparing edit"
         );
-        let previous_choices=tx.prepare("SELECT c.field,v.semantic_hash FROM metadata_choices c JOIN metadata_values v ON v.model_id=c.model_id AND v.field=c.field JOIN metadata_models m ON m.id=c.model_id JOIN metadata_observations o ON o.id=m.observation_id JOIN image_metadata_sources s ON s.id=o.source_id WHERE c.asset_id=?1 AND s.kind='catalog' AND s.locator=?2 AND s.current_observation=o.id")?.query_map(params![asset,source.locator],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
+        let previous_choices=tx.prepare("SELECT c.field,v.semantic_hash FROM metadata_choices c JOIN metadata_values v ON v.model_id=c.model_id AND v.field=c.field JOIN metadata_models m ON m.id=c.model_id JOIN metadata_observations o ON o.id=m.observation_id JOIN image_metadata_sources s ON s.id=o.source_id AND s.asset_id=c.asset_id WHERE c.asset_id=?1 AND s.kind='catalog' AND s.locator=?2 AND s.current_observation=o.id")?.query_map(params![asset,source.locator],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
         let (observation_id, model_ids, _) = store(&tx, asset, &source, &prepared)?;
         let mid = model_ids[0];
         for (field, value) in &updated.fields {
@@ -1459,7 +1459,7 @@ impl Catalog {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (asset,expected,plan,hash):(String,i64,String,String)=tx.query_row("SELECT asset_id,revision,plan,payload_hash FROM metadata_export_plans WHERE operation=?1",[operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         ensure!(
-            revision(&tx, &asset)? == expected,
+            crate::catalog_image_exports::current(&tx, operation, &asset, expected)?,
             "catalog metadata changed since export plan; prepare a new plan"
         );
         let plan: crate::metadata_export::ExportPlan = serde_json::from_str(&plan)?;
@@ -1520,7 +1520,7 @@ impl Catalog {
                 == directory,
             "recovery operation path differs from catalog plan"
         );
-        if revision(&self.db, &asset)? == expected {
+        if crate::catalog_image_exports::current(&self.db, operation, &asset, expected)? {
             return self.apply_metadata_export(operation);
         }
         let receipt = crate::metadata_export::restore_planned_export(&plan)?;

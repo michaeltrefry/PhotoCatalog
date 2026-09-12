@@ -5,6 +5,7 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 pub mod catalog_edits;
 pub mod catalog_export_alias;
 pub mod catalog_exports;
+pub mod catalog_image_exports;
 pub mod catalog_images;
 pub mod catalog_metadata;
 pub mod catalog_migration;
@@ -301,6 +302,7 @@ impl Catalog {
             if version < 7 {
                 catalog_images::migrate(&tx)?;
                 catalog_migration::install(&tx)?;
+                catalog_image_exports::install(&tx)?;
                 let invalid: i64 =
                     tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
                         r.get(0)
@@ -996,14 +998,16 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             |row| row.get(0),
         )?;
         assert_eq!(
-            schema_after.replace(", render_generation INTEGER NOT NULL DEFAULT 0", ""),
+            schema_after
+                .replace(", render_generation INTEGER NOT NULL DEFAULT 0", "")
+                .replace(", physical_generation INTEGER NOT NULL DEFAULT 0", ""),
             schema_before
         );
         assert_eq!(
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            6
+            7
         );
         assert_eq!(
             catalog
