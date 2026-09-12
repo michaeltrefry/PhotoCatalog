@@ -126,6 +126,18 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Page shared global-ID conflicts for an explicitly selected revision pair.
+    GlobalIdConflicts {
+        plan: PathBuf,
+        left: String,
+        right: String,
+        #[arg(long, default_value = "")]
+        after_left: String,
+        #[arg(long, default_value = "")]
+        after_right: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     PathCollisions {
         plan: PathBuf,
         left: String,
@@ -281,6 +293,20 @@ fn main() -> Result<()> {
             after,
             limit,
         } => emit(&Plan::open(&plan)?.metadata_conflicts(&revision, after, limit)?)?,
+        Command::GlobalIdConflicts {
+            plan,
+            left,
+            right,
+            after_left,
+            after_right,
+            limit,
+        } => emit(&Plan::open(&plan)?.global_id_conflicts(
+            &left,
+            &right,
+            &after_left,
+            &after_right,
+            limit,
+        )?)?,
         Command::PathCollisions {
             plan,
             left,

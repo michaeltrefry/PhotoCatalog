@@ -806,6 +806,116 @@ fn duplicate_image_or_file_ids_never_arbitrarily_associate_catalog_metadata() {
 }
 
 #[test]
+fn global_id_conflict_cli_enumerates_all_selected_catalog_pairs() {
+    let temp = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let originals = temp.path().join("source");
+    fs::create_dir(&originals).unwrap();
+    let root = temp.path().join("plan");
+    let mut plan = Plan::create(&root).unwrap();
+    for (index, name) in ["Family-a", "Family-b", "Family-c"].iter().enumerate() {
+        let source = originals.join(format!("{name}.lrcat"));
+        drop(fixture(&source, "1300000", 10.0));
+        let capture = temp.path().join(format!("capture-{index}"));
+        capture_file(&source, &capture);
+        let revision = plan.add_capture(&capture).unwrap();
+        finish(&mut plan, &revision);
+    }
+    let original_bytes = tree(&originals);
+    let families = plan.families().unwrap().families;
+    assert_eq!(families.len(), 3);
+    for family in families {
+        plan.choose(
+            &family.id,
+            &family.members[0].revision_id,
+            &family.evidence_digest,
+            "synthetic identifier-overlap paging test",
+        )
+        .unwrap();
+    }
+    let before = plan.families().unwrap();
+    assert_eq!(
+        before.conflict_count, 9,
+        "three shared IDs in each of three pairs"
+    );
+    let mut selected: Vec<_> = before
+        .families
+        .iter()
+        .map(|f| f.selected.clone().unwrap())
+        .collect();
+    selected.sort();
+    let mut all = std::collections::BTreeSet::new();
+    for (index, left) in selected.iter().enumerate() {
+        for right in &selected[index + 1..] {
+            let mut cursor = (String::new(), String::new());
+            let mut count = 0;
+            loop {
+                let output = std::process::Command::new(worker())
+                    .arg("global-id-conflicts")
+                    .arg(&root)
+                    .arg(left)
+                    .arg(right)
+                    .args([
+                        "--after-left",
+                        &cursor.0,
+                        "--after-right",
+                        &cursor.1,
+                        "--limit",
+                        "1",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let page: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(page.len() <= 1);
+                if page.is_empty() {
+                    break;
+                }
+                let row = &page[0];
+                assert_eq!(row["left_revision"].as_str(), Some(left.as_str()));
+                assert_eq!(row["right_revision"].as_str(), Some(right.as_str()));
+                assert_eq!(
+                    row["classification"],
+                    "shared_global_id_requires_explicit_decision"
+                );
+                let next = (
+                    row["left_source_id"].as_str().unwrap().to_owned(),
+                    row["right_source_id"].as_str().unwrap().to_owned(),
+                );
+                assert!(next > cursor);
+                assert!(all.insert((left.clone(), right.clone(), next.0.clone(), next.1.clone())));
+                // The historical sample labels a/b in families order, not sorted
+                // revision order. Reconcile either orientation without relabeling it.
+                assert!(before.cross_catalog_conflicts.iter().any(|sample| {
+                    sample["table"] == row["table"]
+                        && sample["global_key"] == row["global_key"]
+                        && ((sample["a"] == row["left_source_id"]
+                            && sample["b"] == row["right_source_id"])
+                            || (sample["b"] == row["left_source_id"]
+                                && sample["a"] == row["right_source_id"]))
+                }));
+                cursor = next;
+                count += 1;
+                assert!(
+                    count <= 3,
+                    "cursor must terminate without duplicate matches"
+                );
+            }
+            assert_eq!(count, 3);
+        }
+    }
+    assert_eq!(all.len() as i64, before.conflict_count);
+    assert_eq!(
+        serde_json::to_value(plan.families().unwrap()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+    assert_eq!(tree(&originals), original_bytes);
+}
+
+#[test]
 fn same_locator_with_distinct_global_ids_is_reported_without_claiming_identity() {
     let temp = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let originals = temp.path().join("source");

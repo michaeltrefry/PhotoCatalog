@@ -2123,6 +2123,52 @@ impl Plan {
             possible_path_collisions,
         })
     }
+    /// Enumerate the same shared global-ID pairs counted by `families`, for one
+    /// caller-selected revision pair. Source IDs are unique within each revision,
+    /// so their ordered tuple preserves every match even when global IDs repeat.
+    /// Continue after the last tuple, including short byte-limited pages, until empty.
+    /// These are identifier overlaps, not proof of conflicting edits or unique photos.
+    /// Pair orientation follows the caller; enumerate each unordered pair only once.
+    pub fn global_id_conflicts(
+        &self,
+        left: &str,
+        right: &str,
+        after_left: &str,
+        after_right: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        ensure!(
+            !left.is_empty()
+                && !right.is_empty()
+                && left != right
+                && after_left.is_empty() == after_right.is_empty()
+                && (1..=1000).contains(&limit),
+            "invalid global-ID conflict page"
+        );
+        let mut statement = self.db.prepare(
+            "SELECT a.source_id,b.source_id,a.table_name,a.global_key
+             FROM entities a JOIN entities b
+               ON b.table_name=a.table_name AND b.global_key=a.global_key
+             WHERE a.revision=?1 AND b.revision=?2 AND a.global_key IS NOT NULL
+               AND a.table_name IN ('Adobe_images','AgLibraryFile')
+               AND (a.source_id,b.source_id)>(?3,?4)
+             ORDER BY a.source_id,b.source_id LIMIT ?5",
+        )?;
+        bounded_values(statement.query_map(
+            params![left, right, after_left, after_right, limit as i64],
+            |row| {
+                Ok(serde_json::json!({
+                    "left_revision": left,
+                    "right_revision": right,
+                    "left_source_id": row.get::<_, String>(0)?,
+                    "right_source_id": row.get::<_, String>(1)?,
+                    "table": row.get::<_, String>(2)?,
+                    "global_key": row.get::<_, String>(3)?,
+                    "classification": "shared_global_id_requires_explicit_decision"
+                }))
+            },
+        )?)
+    }
     /// Exact locator equality is only a possible collision, never file/content identity.
     /// Continue with the last (left_sequence,right_sequence), including short pages.
     pub fn path_collisions(
@@ -2487,6 +2533,172 @@ fn bounded_values(
 #[cfg(test)]
 mod bounded_plan_tests {
     use super::*;
+    #[test]
+    fn global_id_conflict_pages_preserve_duplicate_pairs_and_table_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = Plan::create(&temp.path().join("plan")).unwrap();
+        for (revision, source, table, key) in [
+            ("left", "a1", "Adobe_images", Some("shared")),
+            ("left", "a2", "Adobe_images", Some("shared")),
+            ("right", "b1", "Adobe_images", Some("shared")),
+            ("right", "b2", "Adobe_images", Some("shared")),
+            ("left", "f1", "AgLibraryFile", Some("shared")),
+            ("right", "f2", "AgLibraryFile", Some("shared")),
+            ("left", "null1", "Adobe_images", None),
+            ("right", "null2", "Adobe_images", None),
+            ("left", "k1", "AgLibraryKeyword", Some("shared")),
+            ("right", "k2", "AgLibraryKeyword", Some("shared")),
+            ("unrequested", "other", "Adobe_images", Some("shared")),
+        ] {
+            plan.db
+                .execute(
+                    "INSERT INTO entities VALUES(?,?,?,NULL,?,'{}')",
+                    params![revision, source, table, key],
+                )
+                .unwrap();
+        }
+        let before = plan.db.total_changes();
+        let mut cursor = (String::new(), String::new());
+        let mut pairs = vec![];
+        loop {
+            let page = plan
+                .global_id_conflicts("left", "right", &cursor.0, &cursor.1, 2)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for row in page {
+                assert_eq!(row["left_revision"], "left");
+                assert_eq!(row["right_revision"], "right");
+                assert_eq!(row["global_key"], "shared");
+                let next = (
+                    row["left_source_id"].as_str().unwrap().to_owned(),
+                    row["right_source_id"].as_str().unwrap().to_owned(),
+                );
+                assert!(next > cursor);
+                pairs.push(next.clone());
+                cursor = next;
+            }
+        }
+        assert_eq!(
+            pairs,
+            [
+                ("a1", "b1"),
+                ("a1", "b2"),
+                ("a2", "b1"),
+                ("a2", "b2"),
+                ("f1", "f2")
+            ]
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        );
+        assert_eq!(
+            plan.db.total_changes(),
+            before,
+            "report paging cannot mutate evidence"
+        );
+        let reverse = plan
+            .global_id_conflicts("right", "left", "", "", 1000)
+            .unwrap();
+        assert_eq!(reverse.len(), pairs.len());
+        for row in reverse {
+            assert!(pairs.contains(&(
+                row["right_source_id"].as_str().unwrap().to_owned(),
+                row["left_source_id"].as_str().unwrap().to_owned()
+            )));
+        }
+        for (left, right, a, b, limit) in [
+            ("left", "left", "", "", 1),
+            ("", "right", "", "", 1),
+            ("left", "right", "a1", "", 1),
+            ("left", "right", "", "b1", 1),
+            ("left", "right", "", "", 0),
+            ("left", "right", "", "", 1001),
+        ] {
+            assert!(plan.global_id_conflicts(left, right, a, b, limit).is_err());
+        }
+    }
+
+    #[test]
+    fn global_id_conflict_pages_exceed_the_family_sample_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = Plan::create(&temp.path().join("plan")).unwrap();
+        let transaction = plan.db.unchecked_transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO entities VALUES('left','a','Adobe_images',NULL,'shared','{}')",
+                [],
+            )
+            .unwrap();
+        for i in 0..1203 {
+            transaction
+                .execute(
+                    "INSERT INTO entities VALUES('right',?,'Adobe_images',NULL,'shared','{}')",
+                    [format!("b{i:04}")],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let first = plan
+            .global_id_conflicts("left", "right", "", "", 1000)
+            .unwrap();
+        assert_eq!(first.len(), 1000);
+        assert_eq!(first[999]["right_source_id"], "b0999");
+        let second = plan
+            .global_id_conflicts("left", "right", "a", "b0999", 1000)
+            .unwrap();
+        assert_eq!(second.len(), 203);
+        assert_eq!(second[0]["right_source_id"], "b1000");
+        assert_eq!(second[202]["right_source_id"], "b1202");
+        assert!(
+            plan.global_id_conflicts("left", "right", "a", "b1202", 1000)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(first.len() + second.len(), 1203);
+    }
+
+    #[test]
+    fn global_id_conflict_pages_resume_after_byte_limited_short_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = Plan::create(&temp.path().join("plan")).unwrap();
+        let key = "x".repeat(super::super::PAGE_BYTES / 2);
+        for (revision, source) in [("left", "a"), ("right", "b1"), ("right", "b2")] {
+            plan.db
+                .execute(
+                    "INSERT INTO entities VALUES(?,?,'Adobe_images',NULL,?,'{}')",
+                    params![revision, source, key],
+                )
+                .unwrap();
+        }
+        let first = plan
+            .global_id_conflicts("left", "right", "", "", 1000)
+            .unwrap();
+        assert_eq!(first.len(), 1, "byte limit, not row limit, ends the page");
+        assert!(serde_json::to_vec(&first).unwrap().len() + 1 <= super::super::PAGE_BYTES);
+        assert_eq!(first[0]["right_source_id"], "b1");
+        let second = plan
+            .global_id_conflicts("left", "right", "a", "b1", 1000)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["right_source_id"], "b2");
+        assert!(
+            plan.global_id_conflicts("left", "right", "a", "b2", 1000)
+                .unwrap()
+                .is_empty()
+        );
+        plan.db
+            .execute(
+                "UPDATE entities SET global_key=?",
+                ["x".repeat(super::super::PAGE_BYTES)],
+            )
+            .unwrap();
+        assert!(
+            plan.global_id_conflicts("left", "right", "", "", 1000)
+                .is_err(),
+            "one oversized row must not look like a terminal empty page"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_inspection_locator_normalizes_separators_without_retyping_foreign_paths() {
