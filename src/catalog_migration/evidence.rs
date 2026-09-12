@@ -52,6 +52,16 @@ pub(crate) fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Resul
     })
 }
 
+pub(crate) fn size(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<usize> {
+    usize::try_from(row.get::<_, i64>(index)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 fn initial_manifest(descriptor: &[u8], length: u64) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"photocatalog-retained-evidence-v1\0");
@@ -152,7 +162,7 @@ pub(crate) fn append(
         let (hash, length): (String, usize) = db.query_row(
             "SELECT c.hash,b.length FROM migration_evidence_chunks c JOIN migration_evidence_blobs b ON b.hash=c.hash WHERE c.evidence=?1 AND c.offset=?2",
             params![id, i64::try_from(offset)?],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, size(r,1)?)),
         )?;
         ensure!(
             hash == chunk.hash && length == chunk.length,
@@ -166,7 +176,7 @@ pub(crate) fn append(
     );
     db.execute(
         "INSERT OR IGNORE INTO migration_evidence_blobs VALUES(?1,?2,?3)",
-        params![chunk.hash, chunk.length, chunk.compressed],
+        params![chunk.hash, i64::try_from(chunk.length)?, chunk.compressed],
     )?;
     db.execute(
         "INSERT INTO migration_evidence_chunks VALUES(?1,?2,?3)",

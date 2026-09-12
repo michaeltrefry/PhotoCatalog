@@ -167,7 +167,7 @@ pub struct RetentionProgress {
 
 fn progress(db: &Connection, id: &str) -> Result<RetentionProgress> {
     Ok(db.query_row("SELECT capture_index,collection_index,records,complete FROM migration_retention WHERE id=?1", [id],
-        |r|Ok(RetentionProgress{input:id.into(),capture_index:r.get(0)?,collection_index:r.get(1)?,records:evidence::unsigned(r,2)?,complete:r.get(3)?}))?)
+        |r|Ok(RetentionProgress{input:id.into(),capture_index:evidence::size(r,0)?,collection_index:evidence::size(r,1)?,records:evidence::unsigned(r,2)?,complete:r.get(3)?}))?)
 }
 fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     ensure!(bytes.len() <= RECORD_LIMIT, "retained record size limit");
@@ -198,7 +198,7 @@ fn decode(bytes: &[u8], length: usize, digest: &str) -> Result<EvidenceRecord> {
 pub(crate) fn selected_record(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
     let (input, seal, compressed, length, digest): (String, Vec<u8>, Vec<u8>, usize, String) = db.query_row(
         "SELECT i.id,i.seal,r.compressed,r.raw_length,r.digest FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1 AND r.complete=1",
-        [sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        [sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,evidence::size(r,3)?,r.get(4)?)),
     )?;
     ensure!(seal.len() <= RECORD_LIMIT, "retained seal size limit");
     let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
@@ -327,7 +327,7 @@ impl Catalog {
         }
         let pending:Option<(i64,Vec<u8>,usize,String,String)>=self.db.query_row(
             "SELECT sequence,compressed,raw_length,digest,next_cursor FROM migration_retained_records WHERE input=?1 AND complete=0 ORDER BY sequence LIMIT 1",
-            [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+            [id],|r|Ok((r.get(0)?,r.get(1)?,evidence::size(r,2)?,r.get(3)?,r.get(4)?))).optional()?;
         if let Some((sequence, compressed, length, digest, next)) = pending {
             let record = decode(&compressed, length, &digest)?;
             let field:Option<(String,String,u64)>=self.db.query_row(
@@ -430,8 +430,8 @@ impl Catalog {
             "migration cursor advanced concurrently; retry step"
         );
         if let Some((record, compressed, length, digest, next)) = staged {
-            tx.execute("INSERT OR IGNORE INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)",params![id,revision,before.collection_index,record.rowid,compressed,length,digest,next])?;
-            let sequence:i64=tx.query_row("SELECT sequence FROM migration_retained_records WHERE input=?1 AND revision=?2 AND collection=?3 AND source_rowid=?4",params![id,revision,before.collection_index,record.rowid],|r|r.get(0))?;
+            tx.execute("INSERT OR IGNORE INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)",params![id,revision,i64::try_from(before.collection_index)?,record.rowid,compressed,i64::try_from(length)?,digest,next])?;
+            let sequence:i64=tx.query_row("SELECT sequence FROM migration_retained_records WHERE input=?1 AND revision=?2 AND collection=?3 AND source_rowid=?4",params![id,revision,i64::try_from(before.collection_index)?,record.rowid],|r|r.get(0))?;
             for (field, value) in &record.fields {
                 if let Field::Bytes(reference) = value {
                     let descriptor = serde_json::to_vec(reference)?;
@@ -446,7 +446,7 @@ impl Catalog {
             let next_collection = before.collection_index + 1;
             let capture = before.capture_index + usize::from(next_collection == COLLECTIONS.len());
             tx.execute("UPDATE migration_retention SET capture_index=?2,collection_index=?3,cursor=NULL,complete=?4 WHERE id=?1",
-                params![id,capture,next_collection%COLLECTIONS.len(),capture==source.seal().selected.len()])?;
+                params![id,i64::try_from(capture)?,i64::try_from(next_collection%COLLECTIONS.len())?,capture==source.seal().selected.len()])?;
         }
         let result = progress(&tx, id)?;
         tx.commit()?;
@@ -472,11 +472,17 @@ impl Catalog {
             .position(|v| *v == collection)
             .context("unknown collection")?;
         let mut stmt=self.db.prepare("SELECT sequence,compressed,raw_length,digest FROM migration_retained_records WHERE input=?1 AND revision=?2 AND collection=?3 AND sequence>?4 AND complete=1 ORDER BY sequence LIMIT ?5")?;
-        let mut rows = stmt.query(params![input, revision, index, after, limit])?;
+        let mut rows = stmt.query(params![
+            input,
+            revision,
+            i64::try_from(index)?,
+            after,
+            i64::try_from(limit)?
+        ])?;
         let mut result = Vec::new();
         let mut bytes = 0usize;
         while let Some(row) = rows.next()? {
-            let length: usize = row.get(2)?;
+            let length = evidence::size(row, 2)?;
             if !result.is_empty() && bytes.saturating_add(length) > RECORD_LIMIT {
                 break;
             }
