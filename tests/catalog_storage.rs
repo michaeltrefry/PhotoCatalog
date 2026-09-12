@@ -1276,3 +1276,82 @@ fn excluded_unknown_source_never_inherits_new_asset_encoding_and_tag_changes_blo
     ensure!(paths(&cat)? == before);
     Ok(())
 }
+
+#[test]
+fn relink_and_undo_publish_final_source_states_with_bounded_copy_refresh() -> Result<()> {
+    use photocatalog::catalog_edits::VariantKey;
+    let (temp, old, root, mut cat) = setup()?;
+    photo(&old.join("one.jpg"), 20);
+    fs::write(old.join("one.xmp"), br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="3"/></rdf:RDF>"#)?;
+    cat.import(&old, None, |_| Ok(()))?;
+    let a = cat.browse(0, 1)?.remove(0);
+    let master = VariantKey::master(&a.id);
+    let mut last = master.clone();
+    for i in 0..80 {
+        last = cat
+            .create_edit_variant(&master, 0, &format!("copy{i}"))?
+            .key;
+    }
+    let before = cat.image_metadata_identity(&master)?;
+    let historical = cat.metadata_history_for_image(&last, 0, 100)?;
+    let new = temp.path().join("new");
+    fs::rename(&old, &new)?;
+    let plan = prepared(&mut cat, prefix(&old, &new))?;
+    ensure!(
+        cat.apply_relink_with(&plan, |boundary| {
+            if boundary == RelinkBoundary::BeforeCommit {
+                anyhow::bail!("injected rollback after queued source propagation")
+            }
+            Ok(())
+        })
+        .is_err()
+    );
+    ensure!(cat.image_metadata_identity(&master)? == before);
+    ensure!(
+        db(&root)?
+            .query_row::<i64, _, _>("SELECT count(*) FROM image_shared_events", [], |r| r.get(0))?
+            == 0
+    );
+    cat.apply_relink(&plan)?;
+    ensure!(cat.image_metadata_identity(&last).is_err());
+    ensure!(
+        db(&root)?.query_row::<i64, _, _>(
+            "SELECT COALESCE(SUM(cursor>0),0) FROM image_shared_events",
+            [],
+            |r| r.get(0)
+        )? <= 1
+    );
+    for _ in 0..100 {
+        let progress = cat.step_image_metadata_refresh(17)?;
+        ensure!(progress.processed <= 17);
+        if !progress.pending {
+            break;
+        }
+    }
+    ensure!(
+        cat.image_metadata_identity(&master)?.metadata_revision == before.metadata_revision + 1
+    );
+    ensure!(cat.image_metadata_identity(&last)?.shared_source_epoch > before.shared_source_epoch);
+    let sql = "SELECT count(*) FROM metadata_image_sources i JOIN metadata_sources s ON s.id=i.source_id WHERE s.asset_id=?1 AND (i.logical_locator!=s.locator OR i.availability!=s.availability OR i.current_observation IS NOT s.current_observation)";
+    ensure!(db(&root)?.query_row::<i64, _, _>(sql, [&a.id], |r| r.get(0))? == 0);
+    ensure!(
+        cat.metadata_history_for_image(&last, 0, 100)?
+            .iter()
+            .map(|o| o.id)
+            .collect::<Vec<_>>()
+            == historical.iter().map(|o| o.id).collect::<Vec<_>>()
+    );
+    cat.undo_relink(&plan)?;
+    ensure!(cat.image_metadata_identity(&last).is_err());
+    for _ in 0..100 {
+        if !cat.step_image_metadata_refresh(17)?.pending {
+            break;
+        }
+    }
+    ensure!(
+        cat.image_metadata_identity(&master)?.metadata_revision == before.metadata_revision + 2
+    );
+    ensure!(db(&root)?.query_row::<i64, _, _>(sql, [&a.id], |r| r.get(0))? == 0);
+    ensure!(cat.get(&a.id)?.original_path == a.original_path);
+    Ok(())
+}

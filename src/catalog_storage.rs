@@ -1245,6 +1245,7 @@ impl Catalog {
                             native: data.destination.clone(),
                         }),
                     )?;
+                    publish_source_state(&tx, source)?;
                 }
                 Ok(())
             })?;
@@ -1268,6 +1269,7 @@ impl Catalog {
             })?;
             Ok(())
         })?;
+        crate::catalog_images::step_refresh(&tx, 32)?;
         tx.execute(
             "UPDATE storage_plans SET state='applied',applied_epoch=?2 WHERE id=?1",
             params![plan, epoch(&tx)?],
@@ -1384,6 +1386,7 @@ impl Catalog {
             visit_sources(&tx, plan, sequence, |source, status, data| {
                 if status == "matched" {
                     tx.execute("UPDATE metadata_sources SET locator=?2,display=?3,availability=?4 WHERE id=?1",params![source,data.old_locator,data.old_display,data.old_availability])?;
+                    publish_source_state(&tx, source)?;
                 }
                 put_source_tag(&tx, source, data.old_tag.as_ref())?;
                 Ok(())
@@ -1396,6 +1399,7 @@ impl Catalog {
             boundary(RelinkBoundary::Updated(sequence))?;
             Ok(())
         })?;
+        crate::catalog_images::step_refresh(&tx, 32)?;
         tx.execute("UPDATE storage_plans SET state='undone' WHERE id=?", [plan])?;
         boundary(RelinkBoundary::BeforeCommit)?;
         tx.commit()?;
@@ -1582,6 +1586,12 @@ fn sources_changed(db: &Connection, plan: &str, sequence: i64) -> Result<bool> {
         Ok(())
     })?;
     Ok(changed)
+}
+// Preserve the legacy master's single relink revision while propagating the final
+// source location/state to copies through bounded events. Never publish swap keys.
+fn publish_source_state(db: &Connection, source: i64) -> Result<()> {
+    db.execute("UPDATE metadata_image_sources SET logical_locator=(SELECT locator FROM metadata_sources WHERE id=?1),association=(SELECT association FROM metadata_sources WHERE id=?1),availability=(SELECT availability FROM metadata_sources WHERE id=?1) WHERE source_id=?1 AND image_id=(SELECT asset_id FROM metadata_sources WHERE id=?1)", [source])?;
+    crate::catalog_images::enqueue_source_state(db, source)
 }
 fn advance_metadata(db: &Connection, asset: &str, action: &str, plan: &str) -> Result<()> {
     db.execute("INSERT INTO metadata_assets(asset_id,revision) VALUES(?1,1) ON CONFLICT(asset_id) DO UPDATE SET revision=revision+1",[asset])?;

@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub const CURSOR_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Sort {
@@ -557,7 +559,7 @@ fn page(
     let hash = query_hash(query)?;
     if let Some(c) = cursor {
         ensure!(
-            c.version == 2 && c.query_hash == hash,
+            c.version == CURSOR_VERSION && c.query_hash == hash,
             "cursor belongs to a different query or version"
         );
         ensure!(
@@ -637,7 +639,7 @@ fn page(
                 Sort::Rating => Key::Integer(r.get(11)?),
             };
             last = Some(Cursor {
-                version: 2,
+                version: CURSOR_VERSION,
                 query_hash: hash.clone(),
                 epoch,
                 high_water: high,

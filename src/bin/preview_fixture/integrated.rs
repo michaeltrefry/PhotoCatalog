@@ -19,9 +19,10 @@ struct Row {
     preview_hash: Option<String>,
     error: Option<String>,
     render_generation: i64,
+    physical_generation: i64,
 }
 fn rows(db: &Connection, window: u32) -> Result<Vec<Row>> {
-    let mut stmt = db.prepare("SELECT sequence,id,location,path_display,fingerprint,state,metadata,preview_hash,error,render_generation FROM assets WHERE sequence<=?1 ORDER BY sequence")?;
+    let mut stmt = db.prepare("SELECT sequence,id,location,path_display,fingerprint,state,metadata,preview_hash,error,render_generation,physical_generation FROM assets WHERE sequence<=?1 ORDER BY sequence")?;
     Ok(stmt
         .query_map([window], |r| {
             Ok(Row {
@@ -35,6 +36,7 @@ fn rows(db: &Connection, window: u32) -> Result<Vec<Row>> {
                 preview_hash: r.get(7)?,
                 error: r.get(8)?,
                 render_generation: r.get(9)?,
+                physical_generation: r.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
@@ -56,7 +58,7 @@ fn count_schema(db: &Connection, total: u64) -> Result<()> {
     ensure!(
         db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))?
             == photocatalog::CURRENT_SCHEMA_VERSION,
-        "schema must be current (6); explicitly migrate before this experiment"
+        "schema must be current; explicitly migrate before this experiment"
     );
     ensure!(
         db.query_row::<String, _, _>(
@@ -134,6 +136,10 @@ fn overlay(
     let epoch: i64 = tx.query_row("SELECT revision FROM storage_epoch WHERE id=1", [], |r| {
         r.get(0)
     })?;
+    let pending: i64 = tx.query_row("SELECT count(*) FROM image_storage_events", [], |r| {
+        r.get(0)
+    })?;
+    ensure!(!tx.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM image_storage_events e JOIN assets a ON a.id=e.asset_id WHERE a.sequence<=?1)", [window], |r|r.get(0))?, "overlay has pre-existing storage refresh work");
     let changes: i64 = tx.query_row("SELECT total_changes()", [], |r| r.get(0))?;
     let mut expected = before.clone();
     for (row, k) in expected.iter_mut().zip(keys) {
@@ -141,11 +147,13 @@ fn overlay(
             k.asset_id == row.id
                 && row.fingerprint.as_deref() == Some("synthetic-fingerprint")
                 && row.preview_hash.as_deref() == Some("synthetic-preview-no-object")
-                && row.render_generation == 0,
+                && row.render_generation == 0
+                && row.physical_generation == 0,
             "unexpected prior identity or overlay key"
         );
         row.fingerprint = Some(k.fingerprint.clone());
         row.render_generation = i64::try_from(k.generation)?;
+        row.physical_generation += 1;
         row.preview_hash = Some(k.digest()?);
         ensure!(tx.execute("UPDATE assets SET fingerprint=?1,render_generation=?2,preview_hash=?3 WHERE sequence=?4 AND id=?5",params![row.fingerprint,row.render_generation,row.preview_hash,row.sequence,row.id])?==1,"overlay row missing");
     }
@@ -159,9 +167,16 @@ fn overlay(
     let changes_after: i64 = tx.query_row("SELECT total_changes()", [], |r| r.get(0))?;
     ensure!(
         epoch_after - epoch == i64::from(window)
-            && changes_after - changes == 2 * i64::from(window),
+            && changes_after - changes == 4 * i64::from(window),
         "unexpected DML/trigger effects"
     );
+    ensure!(
+        tx.query_row::<i64, _, _>("SELECT count(*) FROM image_storage_events", [], |r| r
+            .get(0))?
+            == pending + i64::from(window),
+        "unexpected storage refresh membership"
+    );
+    ensure!(!tx.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM assets a LEFT JOIN image_storage_events e ON e.asset_id=a.id WHERE a.sequence<=?1 AND (e.asset_id IS NULL OR e.cursor!=0 OR e.high_water!=(SELECT MAX(sequence) FROM catalog_images WHERE asset_id=a.id)))",[window],|r|r.get(0))?, "storage refresh cursor/high-water mismatch");
     ensure!(
         schema(&tx)? == schema_before
             && tx.query_row::<Option<i64>, _, _>(
@@ -172,7 +187,7 @@ fn overlay(
         "schema/sequence changed"
     );
     count_schema(&tx, total)?;
-    let receipt = json!({"changed_columns":["fingerprint","render_generation","preview_hash"],"rows":window,"catalog_count":total,"schema_version":photocatalog::CURRENT_SCHEMA_VERSION,"rows_before_blake3":hash(&before)?,"rows_after_blake3":hash(&after)?,"keys_blake3":hash(&keys)?,"schema_blake3":hash(&schema_before)?,"storage_epoch_before":epoch,"storage_epoch_after":epoch_after,"connection_total_changes_delta":changes_after-changes,"remaining_asset_columns_unchanged":true,"sqlite_sequence_unchanged":true,"actual_offline_root":offline,"source_path_formula":"/synthetic/folder{sequence%5}/file{sequence:012}.jpg","all_overlay_source_paths_verified":true,"organization_effect":"none: only storage_asset_change fires; exact 2*window DML, existing schema unchanged"});
+    let receipt = json!({"changed_columns":["fingerprint","render_generation","preview_hash"],"trigger_changed_columns":["physical_generation"],"queued_storage_refreshes":window,"rows":window,"catalog_count":total,"schema_version":photocatalog::CURRENT_SCHEMA_VERSION,"rows_before_blake3":hash(&before)?,"rows_after_blake3":hash(&after)?,"keys_blake3":hash(&keys)?,"schema_blake3":hash(&schema_before)?,"storage_epoch_before":epoch,"storage_epoch_after":epoch_after,"connection_total_changes_delta":changes_after-changes,"remaining_asset_columns_unchanged":true,"sqlite_sequence_unchanged":true,"actual_offline_root":offline,"source_path_formula":"/synthetic/folder{sequence%5}/file{sequence:012}.jpg","all_overlay_source_paths_verified":true,"organization_effect":"bounded storage refresh queued; storage epoch and physical generation advance; exact 4*window DML, existing schema unchanged"});
     tx.commit()?;
     Ok(receipt)
 }
@@ -339,7 +354,8 @@ mod tests {
             .query_row("SELECT count(*) FROM organization_dirty", [], |r| r.get(0))
             .unwrap();
         let receipt = overlay(&mut db, &keys, 4, &offline, |_| Ok(())).unwrap();
-        assert_eq!(receipt["connection_total_changes_delta"], 4);
+        assert_eq!(receipt["connection_total_changes_delta"], 8);
+        assert_eq!(receipt["queued_storage_refreshes"], 2);
         assert_eq!(rows(&db, 4).unwrap()[2..], tail);
         assert_eq!(
             db.query_row::<i64, _, _>("SELECT count(*) FROM organization_dirty", [], |r| r.get(0))

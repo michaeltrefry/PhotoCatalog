@@ -119,6 +119,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
     let root = temp.path();
     ensure!(run(root, "prepare-migration", &["prepare", "--count", "1000"])?.0);
     let conn = rusqlite::Connection::open(root.join("catalog/catalog.sqlite3"))?;
+    remove_image_schema(&conn)?;
     remove_alias_schema(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
@@ -129,12 +130,19 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 13
+            && receipt["added_tables"].as_array().unwrap().len() == 34
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|row| row[1] == if row[0] == "export_alias_state" { 1 } else { 0 })
+                .all(|row| row[1]
+                    == if row[0] == "export_alias_state" {
+                        1
+                    } else if row[0] == "catalog_images" || row[0] == "image_shared_state" {
+                        1000
+                    } else {
+                        0
+                    })
     );
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
@@ -184,6 +192,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(run(root, "prepare-six", &["prepare", "--count", "1000"])?.0);
     let main = root.join("catalog/catalog.sqlite3");
     let conn = rusqlite::Connection::open(&main)?;
+    remove_image_schema(&conn)?;
     remove_alias_schema(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; PRAGMA wal_checkpoint(TRUNCATE)")?;
     // Existing bindings initialize dirty membership even though projections
@@ -212,12 +221,12 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(
         okay && migrated["protocol"] == 2
             && migrated["schema_before"] == 5
-            && migrated["schema_after"] == 6
+            && migrated["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
     );
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
     ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 13);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 34);
     ensure!(
         migrated["added_tables"]
             .as_array()
@@ -226,6 +235,8 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
             .all(|row| row[1]
                 == if row[0] == "export_alias_state" || row[0] == "export_alias_dirty" {
                     1
+                } else if row[0] == "catalog_images" || row[0] == "image_shared_state" {
+                    1000
                 } else {
                     0
                 })
@@ -239,7 +250,10 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     );
     let after = fs::read(&main)?;
     let (okay, verified) = run(root, "six-noop", &["migrate-fixture"])?;
-    ensure!(okay && verified["schema_before"] == 6 && verified["schema_after"] == 6);
+    ensure!(
+        okay && verified["schema_before"] == photocatalog::CURRENT_SCHEMA_VERSION
+            && verified["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
+    );
     ensure!(verified["added_tables"] == serde_json::json!([]));
     ensure!(
         verified["table_counts_before"]
@@ -287,5 +301,99 @@ fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
         ))?;
     }
     conn.execute_batch("DROP TABLE export_alias_paths; DROP TABLE export_alias_dirty; DROP TABLE export_alias_directories; DROP TABLE export_alias_state")?;
+    Ok(())
+}
+
+// Build the actual pre-image fixture schema, rather than merely lowering user_version
+// while leaving schema7 columns, foreign keys, and triggers installed.
+fn remove_image_schema(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let triggers=conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'image_%' OR name='organization_metadata_update')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for t in triggers {
+        conn.execute_batch(&format!("DROP TRIGGER {t}"))?;
+    }
+    conn.execute_batch("DROP VIEW image_assets; DROP VIEW image_metadata_sources;")?;
+    for name in [
+        "metadata_assets",
+        "metadata_choices",
+        "metadata_history",
+        "metadata_effective",
+        "organization_dirty",
+        "organization_folder_members",
+        "organization_keyword_members",
+        "organization_collection_members",
+        "organization_flags",
+        "organization_assets",
+        "organization_job_items",
+        "organization_events",
+    ] {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name=? AND type='table'",
+            [name],
+            |r| r.get(0),
+        )?;
+        let indices=conn.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL")?.query_map([name],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let body = sql[sql.find('(').unwrap()..]
+            .replace("REFERENCES catalog_images(id)", "REFERENCES assets(id)")
+            .replace(
+                "REFERENCES catalog_images(sequence)",
+                "REFERENCES assets(sequence)",
+            );
+        conn.execute_batch(&format!("CREATE TABLE {name}_old {body}; INSERT INTO {name}_old SELECT * FROM {name}; DROP TABLE {name}; ALTER TABLE {name}_old RENAME TO {name};"))?;
+        for sql in indices {
+            conn.execute_batch(&sql)?;
+        }
+    }
+    conn.execute_batch("DROP TABLE metadata_image_export_authorities; DROP TABLE migration_artifacts; DROP TABLE migration_retained_fields; DROP TABLE migration_retained_records; DROP TABLE migration_retention; DROP TABLE migration_originals; DROP TABLE migration_evidence_chunks; DROP TABLE migration_evidence_blobs; DROP TABLE migration_evidence; DROP TABLE organization_image_relations; DROP TABLE organization_keyword_synonyms; DROP TABLE organization_collection_order; DROP TABLE organization_collection_structure; DROP TABLE metadata_image_sources; DROP TABLE metadata_image_observations; DROP TABLE image_shared_events; DROP TABLE image_shared_state; DROP TABLE image_storage_events; DROP TABLE image_import_map; DROP TABLE image_import_reservations; DROP TABLE catalog_images; ALTER TABLE assets DROP COLUMN physical_generation; PRAGMA foreign_keys=ON;")?;
+    Ok(())
+}
+
+#[test]
+fn schema_six_adds_only_verified_image_state_and_rejects_legacy_sequence_spoof() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    ensure!(run(root, "prepare-six", &["prepare", "--count", "1000"])?.0);
+    let conn = rusqlite::Connection::open(root.join("catalog/catalog.sqlite3"))?;
+    remove_image_schema(&conn)?;
+    conn.execute_batch("PRAGMA user_version=6; INSERT INTO sqlite_sequence VALUES('catalog_images',77); PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    let main = root.join("catalog/catalog.sqlite3");
+    let before = fs::read(&main)?;
+    let (okay, refused) = run(root, "spoofed-sequence", &["migrate-fixture"])?;
+    ensure!(
+        !okay
+            && refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("unexpected image sequence")
+    );
+    ensure!(fs::read(&main)? == before);
+    let conn = rusqlite::Connection::open(&main)?;
+    conn.execute_batch(
+        "DELETE FROM sqlite_sequence WHERE name='catalog_images'; PRAGMA wal_checkpoint(TRUNCATE)",
+    )?;
+    drop(conn);
+    let (okay, receipt) = run(root, "six-to-current", &["migrate-fixture"])?;
+    ensure!(
+        okay && receipt["schema_before"] == 6
+            && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION,
+        "{receipt}"
+    );
+    ensure!(receipt["added_tables"].as_array().unwrap().len() == 21);
+    ensure!(
+        receipt["logical_before"] == receipt["logical_after"]
+            && receipt["original_columns_preserved"] == true
+    );
+    let conn = rusqlite::Connection::open(&main)?;
+    conn.execute_batch("UPDATE assets SET physical_generation=physical_generation+1 WHERE sequence=1; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    let (okay, refused) = run(root, "bad-initial-generation", &["migrate-fixture"])?;
+    ensure!(
+        !okay
+            && refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("identities/generations")
+    );
     Ok(())
 }
