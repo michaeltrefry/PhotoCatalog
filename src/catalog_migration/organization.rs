@@ -261,8 +261,17 @@ struct Kept {
 pub(crate) struct Evidence {
     records: BTreeMap<i64, Kept>,
     bytes: usize,
+    record_limit: Option<usize>,
 }
 impl Evidence {
+    /// Larger packet rosters retain the same cumulative 8 MiB descriptor limit.
+    pub(crate) fn with_record_limit(limit: usize) -> Result<Self> {
+        ensure!((1..=2052).contains(&limit), "evidence record ceiling");
+        Ok(Self {
+            record_limit: Some(limit),
+            ..Self::default()
+        })
+    }
     pub(crate) fn record(&mut self, db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
         Ok(self.load(db, sequence)?.record.clone())
     }
@@ -281,7 +290,7 @@ impl Evidence {
     fn load(&mut self, db: &Connection, sequence: i64) -> Result<&Kept> {
         if !self.records.contains_key(&sequence) {
             ensure!(
-                self.records.len() < MAX_RECORDS,
+                self.records.len() < self.record_limit.unwrap_or(MAX_RECORDS),
                 "organization evidence record limit"
             );
             let (input, length, digest): (String, i64, String) = db.query_row(

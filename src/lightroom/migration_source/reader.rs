@@ -669,6 +669,44 @@ impl MigrationSource {
         })
     }
 
+    /// Exact retained row roster for one inspected embedded/sidecar origin.
+    /// The schema3 UNIQUE index starts with revision/source_id/origin; the
+    /// bounded range includes malformed suffixes so consumers cannot hide them.
+    pub fn origin_packet_roster(
+        &self,
+        revision: &str,
+        source_id: &str,
+        origin: &str,
+    ) -> Result<Vec<i64>> {
+        self.selected(revision)?;
+        ensure!(
+            !source_id.is_empty() && source_id.len() <= 4096,
+            "source ID limit"
+        );
+        ensure!(
+            matches!(
+                origin,
+                "embedded"
+                    | "sidecar_xmp"
+                    | "sidecar_XMP"
+                    | "sidecar_appended_xmp"
+                    | "sidecar_appended_XMP"
+            ),
+            "unsupported file packet origin"
+        );
+        self.operation(|| {
+            let lower = format!("{origin}:");
+            let upper = format!("{origin};");
+            let mut stmt = self.db.prepare("SELECT sequence FROM packets INDEXED BY sqlite_autoindex_packets_1 WHERE revision=?1 AND source_id=?2 AND origin>=?3 AND origin<?4 LIMIT 2049")?;
+            let mut rows = stmt.query(params![revision,source_id,lower,upper])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? { result.push(row.get(0)?); }
+            ensure!(result.len() <= 2048, "origin exceeds 1024 packet and 1024 parse-input ceiling");
+            result.sort_unstable();
+            Ok(result)
+        })
+    }
+
     fn field(
         &self,
         revision: &str,
