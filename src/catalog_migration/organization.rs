@@ -53,6 +53,11 @@ pub enum DictionaryDecision {
     Reuse {
         native_id: String,
     },
+    /// Exact complete native hierarchy with an explicit source-bound decision.
+    ReuseExactHierarchy {
+        native_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +98,12 @@ pub enum Decision {
         keyword: Link,
         value: String,
     },
+    /// Distinct source synonym sharing an already retained exact native value.
+    ReuseSynonym {
+        keyword: Link,
+        value: String,
+        reason: String,
+    },
     CollectionMembership {
         image: Link,
         collection: Link,
@@ -123,7 +134,7 @@ impl Decision {
     fn slot(&self) -> &str {
         match self {
             Self::Collection { .. } | Self::Keyword { .. } => DICTIONARY,
-            Self::Synonym { .. } => "synonym",
+            Self::Synonym { .. } | Self::ReuseSynonym { .. } => "synonym",
             Self::CollectionMembership { .. } => "collection_membership",
             Self::KeywordMembership { .. } => "keyword_membership",
             Self::Flag { .. } => "flag",
@@ -137,7 +148,7 @@ impl Decision {
             Self::Collection { parent, .. } | Self::Keyword { parent, .. } => {
                 parent.iter().collect()
             }
-            Self::Synonym { keyword, .. } => vec![keyword],
+            Self::Synonym { keyword, .. } | Self::ReuseSynonym { keyword, .. } => vec![keyword],
             Self::CollectionMembership {
                 image, collection, ..
             } => vec![image, collection],
@@ -545,6 +556,18 @@ fn validate(request: &Projection) -> Result<()> {
     text(&request.adapter_version, 128)?;
     text(request.decision.slot(), 128)?;
     request.origin.source.identity()?;
+    match &request.decision {
+        Decision::Keyword {
+            decision: DictionaryDecision::ReuseExactHierarchy { reason, .. },
+            ..
+        }
+        | Decision::ReuseSynonym { reason, .. } => text(reason, 4096)?,
+        Decision::Collection {
+            decision: DictionaryDecision::ReuseExactHierarchy { .. },
+            ..
+        } => anyhow::bail!("hierarchy reuse is keyword-only"),
+        _ => (),
+    }
     let required = match &request.decision {
         Decision::Collection { name, position, .. } => {
             text(name, 1024)?;
@@ -555,7 +578,7 @@ fn validate(request: &Projection) -> Result<()> {
             text(name, 1024)?;
             Some("AgLibraryKeyword")
         }
-        Decision::Synonym { value, .. } => {
+        Decision::Synonym { value, .. } | Decision::ReuseSynonym { value, .. } => {
             text(value, 1024)?;
             Some("AgLibraryKeywordSynonym")
         }
@@ -803,7 +826,8 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                 DictionaryDecision::Create => {
                     crate::organization::create_collection(db, name, &provenance)?
                 }
-                DictionaryDecision::Reuse { native_id } => {
+                DictionaryDecision::Reuse { native_id }
+                | DictionaryDecision::ReuseExactHierarchy { native_id, .. } => {
                     text(native_id, 1024)?;
                     let (actual,old_parent,old_position):(String,Option<String>,i64)=db.query_row("SELECT c.name,s.parent,COALESCE(s.position,0) FROM organization_collections c LEFT JOIN organization_collection_structure s ON s.collection=c.id WHERE c.id=?",[native_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
                     ensure!(
@@ -866,7 +890,8 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                     );
                     crate::organization::keyword(db, *keyword_kind, &path)?
                 }
-                DictionaryDecision::Reuse { native_id } => {
+                DictionaryDecision::Reuse { native_id }
+                | DictionaryDecision::ReuseExactHierarchy { native_id, .. } => {
                     text(native_id, 32)?;
                     let id = native_id.parse::<i64>()?;
                     ensure!(actual == Some(id), "explicit reused keyword path differs");
@@ -886,6 +911,16 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                 "synonym already exists; explicit reconciliation required"
             );
             catalog_images::organization::add_keyword_synonym(db, id, value, &provenance)?;
+            Ok(NativeTarget::Synonym { keyword: id })
+        }
+        Decision::ReuseSynonym {
+            keyword: term,
+            value,
+            ..
+        } => {
+            let (id, _, _) = keyword(db, &request.import_source, &term.target)?;
+            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|r.get(0))?;
+            ensure!(exists, "explicit reused synonym differs");
             Ok(NativeTarget::Synonym { keyword: id })
         }
         Decision::CollectionMembership {
