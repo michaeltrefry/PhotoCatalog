@@ -14,10 +14,38 @@ use std::io::{Read, Write};
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 const DESCRIPTOR_BYTES: usize = 64 * 1024;
 
+/// A private admission domain: public byte uploads never confer sealed-source custody.
+#[derive(Clone, Copy)]
+pub(crate) enum Authority {
+    Generic,
+    SelectedSource,
+    CapturedArtifact,
+}
+impl Authority {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::SelectedSource => "selected_source",
+            Self::CapturedArtifact => "captured_artifact",
+        }
+    }
+}
+pub(crate) fn require_authority(db: &Connection, id: &str, authority: Authority) -> Result<()> {
+    ensure!(
+        db.query_row(
+            "SELECT authority=?2 FROM migration_evidence WHERE id=?1",
+            params![id, authority.name()],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "evidence admission authority differs"
+    );
+    Ok(())
+}
+
 pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS migration_evidence(
-            id TEXT PRIMARY KEY, descriptor BLOB NOT NULL,
+            id TEXT PRIMARY KEY, descriptor BLOB NOT NULL, authority TEXT NOT NULL CHECK(authority IN('generic','selected_source','captured_artifact')),
             length INTEGER NOT NULL CHECK(length>=0),
             committed INTEGER NOT NULL DEFAULT 0 CHECK(committed>=0 AND committed<=length),
             manifest TEXT NOT NULL, complete INTEGER NOT NULL CHECK(complete IN (0,1)));
@@ -62,9 +90,11 @@ pub(crate) fn size(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<us
     })
 }
 
-fn initial_manifest(descriptor: &[u8], length: u64) -> String {
+fn initial_manifest(descriptor: &[u8], length: u64, authority: Authority) -> String {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"photocatalog-retained-evidence-v1\0");
+    hash.update(b"photocatalog-retained-evidence-v2\0");
+    hash.update(authority.name().as_bytes());
+    hash.update(b"\0");
     hash.update(&length.to_le_bytes());
     hash.update(descriptor);
     hash.finalize().to_hex().to_string()
@@ -119,6 +149,14 @@ impl PreparedChunk {
 }
 
 pub(crate) fn begin(db: &Connection, descriptor: &[u8], length: u64) -> Result<EvidenceState> {
+    begin_owned(db, descriptor, length, Authority::Generic)
+}
+pub(crate) fn begin_owned(
+    db: &Connection,
+    descriptor: &[u8],
+    length: u64,
+    authority: Authority,
+) -> Result<EvidenceState> {
     ensure!(
         descriptor.len() <= DESCRIPTOR_BYTES,
         "evidence descriptor exceeds 64 KiB"
@@ -127,10 +165,10 @@ pub(crate) fn begin(db: &Connection, descriptor: &[u8], length: u64) -> Result<E
         length <= i64::MAX as u64,
         "evidence length exceeds SQLite range"
     );
-    let id = initial_manifest(descriptor, length);
+    let id = initial_manifest(descriptor, length, authority);
     db.execute(
-        "INSERT OR IGNORE INTO migration_evidence(id,descriptor,length,manifest,complete) VALUES(?1,?2,?3,?1,?4)",
-        params![id, descriptor, i64::try_from(length)?, length == 0],
+        "INSERT OR IGNORE INTO migration_evidence(id,descriptor,length,manifest,complete,authority) VALUES(?1,?2,?3,?1,?4,?5)",
+        params![id, descriptor, i64::try_from(length)?, length == 0, authority.name()],
     )?;
     let existing: (Vec<u8>, u64) = db.query_row(
         "SELECT descriptor,length FROM migration_evidence WHERE id=?1",
@@ -141,6 +179,7 @@ pub(crate) fn begin(db: &Connection, descriptor: &[u8], length: u64) -> Result<E
         existing == (descriptor.to_vec(), length),
         "evidence identity collision"
     );
+    require_authority(db, &id, authority)?;
     state(db, &id)
 }
 
@@ -152,6 +191,16 @@ pub(crate) fn append(
     offset: u64,
     chunk: &PreparedChunk,
 ) -> Result<EvidenceState> {
+    append_owned(db, id, offset, chunk, Authority::Generic)
+}
+pub(crate) fn append_owned(
+    db: &Connection,
+    id: &str,
+    offset: u64,
+    chunk: &PreparedChunk,
+    authority: Authority,
+) -> Result<EvidenceState> {
+    require_authority(db, id, authority)?;
     let before = state(db, id)?;
     ensure!(offset <= before.length, "evidence offset exceeds length");
     ensure!(
@@ -284,6 +333,40 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_domains_cannot_cross_public_append_authority() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        let descriptor = b"same public descriptor";
+        let generic = catalog.begin_migration_evidence(descriptor, 3)?;
+        catalog.append_migration_evidence(&generic.id, 0, b"bad")?;
+        for authority in [Authority::SelectedSource, Authority::CapturedArtifact] {
+            let owned = begin_owned(&catalog.db, descriptor, 3, authority)?;
+            assert_ne!(generic.id, owned.id);
+            assert!(!owned.complete);
+            assert!(
+                catalog
+                    .append_migration_evidence(&owned.id, 0, b"bad")
+                    .is_err()
+            );
+            assert_eq!(catalog.migration_evidence(&owned.id)?, owned);
+            append_owned(
+                &catalog.db,
+                &owned.id,
+                0,
+                &PreparedChunk::new(b"yes")?,
+                authority,
+            )?;
+            assert_eq!(catalog.migration_evidence_chunk(&owned.id, 0)?, b"yes");
+            assert!(
+                catalog
+                    .append_migration_evidence(&owned.id, 0, b"yes")
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn interrupted_large_payload_resumes_without_duplicate_chunks() -> Result<()> {

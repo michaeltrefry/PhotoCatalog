@@ -146,7 +146,7 @@ struct PreparedModel {
     projection: Projection,
     error: Option<String>,
 }
-struct Prepared {
+pub(crate) struct Prepared {
     revision: String,
     status: String,
     issues: String,
@@ -156,7 +156,7 @@ struct Prepared {
     models: Vec<PreparedModel>,
 }
 impl Prepared {
-    fn new(inspection: &Inspection, source: &Source) -> Result<Self> {
+    pub(crate) fn new(inspection: &Inspection, source: &Source) -> Result<Self> {
         ensure!(
             inspection.packets.len() <= 1024 && inspection.parse_inputs.len() <= 1024,
             "metadata observation exceeds packet count limit"
@@ -578,6 +578,44 @@ fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
+/// Commit a prepared metadata observation within the caller's writer transaction.
+/// Preparation parses and compresses outside the writer; migration proof and its
+/// checkpoint can therefore commit atomically with native metadata/recipe state.
+pub(crate) fn retain_prepared(
+    tx: &Transaction<'_>,
+    asset: &str,
+    source: &Source,
+    prepared: &Prepared,
+    shared: bool,
+) -> Result<Change> {
+    if !shared {
+        crate::catalog_images::require_current(tx, asset)?;
+    }
+    let (observation_id, model_ids, changed) = store(tx, asset, source, prepared)?;
+    let revision = if changed {
+        rebuild(tx, asset)?;
+        advance(
+            tx,
+            asset,
+            "observe",
+            &serde_json::json!({"observation_id":observation_id}),
+            true,
+        )?
+    } else {
+        revision(tx, asset)?
+    };
+    if changed && shared {
+        crate::catalog_images::enqueue_shared(tx, asset, observation_id)?;
+        crate::catalog_images::step_refresh(tx, 32)?;
+    }
+    Ok(Change {
+        revision,
+        observation_id,
+        model_ids,
+        changed,
+    })
+}
+
 impl Catalog {
     pub fn metadata_file_instances(
         &self,
@@ -693,35 +731,11 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if !shared {
-            crate::catalog_images::require_current(&tx, asset)?;
-        }
-        let (observation_id, model_ids, changed) = store(&tx, asset, source, &prepared)?;
-        let revision = if changed {
-            rebuild(&tx, asset)?;
-            advance(
-                &tx,
-                asset,
-                "observe",
-                &serde_json::json!({"observation_id":observation_id}),
-                true,
-            )?
-        } else {
-            revision(&tx, asset)?
-        };
-        if changed && shared {
-            crate::catalog_images::enqueue_shared(&tx, asset, observation_id)?;
-            crate::catalog_images::step_refresh(&tx, 32)?;
-        }
+        let result = retain_prepared(&tx, asset, source, &prepared, shared)?;
         tx.commit()?;
-        drop(_write);
-        Ok(Change {
-            revision,
-            observation_id,
-            model_ids,
-            changed,
-        })
+        Ok(result)
     }
+
     pub fn metadata(&self, asset: &str) -> Result<MetadataView> {
         let tx = self.db.unchecked_transaction()?;
         crate::catalog_images::require_current(&tx, asset)?;
@@ -1175,6 +1189,10 @@ impl Catalog {
             return Ok(false);
         }
         tx.execute("INSERT INTO metadata_sources(asset_id,kind,locator,display,association,availability) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(asset_id,kind,locator) DO UPDATE SET availability=excluded.availability",params![asset,source.kind,source.locator,source.display,if source.ambiguous {"ambiguous"} else {"confirmed"},reason])?;
+        // The foreground master receives this change now; the bounded queue
+        // propagates it to followers without advancing the master twice.
+        tx.execute("INSERT OR IGNORE INTO metadata_image_observations SELECT ?1,current_observation FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 AND current_observation IS NOT NULL",params![asset,source.kind,source.locator])?;
+        tx.execute("INSERT INTO metadata_image_sources SELECT ?1,id,current_observation,1,locator,association,availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 ON CONFLICT(image_id,source_id) DO UPDATE SET current_observation=excluded.current_observation,logical_locator=excluded.logical_locator,association=excluded.association,availability=excluded.availability",params![asset,source.kind,source.locator])?;
         advance(
             &tx,
             asset,
@@ -1532,5 +1550,42 @@ impl Catalog {
             params![serde_json::to_string(&receipt)?, operation],
         )?;
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod image_source_state_tests {
+    use super::*;
+    #[test]
+    fn unavailable_shared_source_advances_master_and_follower_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        catalog.db.execute("INSERT INTO assets(id,location,path_display,state) VALUES('source',?1,'source','pending')",[b"source".as_slice()])?;
+        let path = temp.path().join("source.xmp");
+        std::fs::write(&path,br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="3"/></rdf:RDF>"#)?;
+        let inspection = xmp_packets::inspect_sidecar(&path, &xmp_packets::Limits::default())?;
+        let source = Source {
+            kind: "sidecar".into(),
+            locator: location_bytes(&path),
+            display: "fixture sidecar".into(),
+            ambiguous: false,
+            provenance: serde_json::json!({"fixture":true}),
+        };
+        catalog.retain_metadata("source", &source, &inspection)?;
+        let master = crate::catalog_edits::VariantKey::master("source");
+        let copy = catalog.create_edit_variant(&master, 0, "copy")?.key;
+        let before = catalog.metadata_for_image(&master)?.revision;
+        let copy_before = catalog.metadata_for_image(&copy)?.revision;
+        assert!(catalog.unavailable_metadata_source("source", &source, "missing fixture")?);
+        assert_eq!(catalog.metadata_for_image(&master)?.revision, before + 1);
+        assert_eq!(catalog.metadata_for_image(&copy)?.revision, copy_before + 1);
+        assert_eq!(
+            catalog.metadata_for_image(&copy)?.sources[0].availability,
+            "missing fixture"
+        );
+        assert!(!catalog.unavailable_metadata_source("source", &source, "missing fixture")?);
+        assert_eq!(catalog.metadata_for_image(&master)?.revision, before + 1);
+        assert_eq!(catalog.metadata_for_image(&copy)?.revision, copy_before + 1);
+        Ok(())
     }
 }

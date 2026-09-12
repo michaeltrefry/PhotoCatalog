@@ -1,5 +1,5 @@
 //! Incremental custody of selected inspection evidence, before native projection.
-//! One step retains one bounded record or one evidence chunk. It never opens an
+//! One step retains up to 64 small records or one evidence chunk. It never opens an
 //! original image, capture artifact path, or excluded capture.
 use super::evidence::{self, PreparedChunk};
 use crate::{
@@ -129,6 +129,170 @@ mod tests {
                 .migration_evidence_chunk(&retained.id, offset)?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn batches_stop_before_uncustodied_bytes_and_resume_without_skips() -> Result<()> {
+        use crate::lightroom::plan::Cell;
+        let mut fixture = Fixture::new();
+        let revision = fixture.revision().to_owned();
+        let approval = b"approved bounded batch synthetic test";
+        fixture.seal.approval.document_blake3 = blake3::hash(approval).to_hex().to_string();
+        fixture.edit(|db| {
+            db.execute("DELETE FROM rows WHERE revision=?", [&revision]).unwrap();
+            for n in 1..=150i64 {
+                let cells = if n == 70 {
+                    vec![Cell::Blob(vec![173; 200_000])]
+                } else {
+                    vec![Cell::Integer(n)]
+                };
+                db.execute("INSERT INTO rows(revision,source_id,table_name,key_json,cells_json) VALUES(?1,?2,'unknown_plugin',?3,?4)",
+                    params![revision,format!("row-{n}"),serde_json::to_string(&vec![Cell::Integer(n)]).unwrap(),serde_json::to_string(&cells).unwrap()]).unwrap();
+            }
+        });
+        let source = fixture.open();
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("catalog");
+        let mut catalog = Catalog::open(&root)?;
+        catalog.begin_migration_retention(&source, approval)?;
+        let mut before = catalog.migration_retention_progress(source.binding_blake3())?;
+        let mut saw_batch = false;
+        let mut saw_pending = false;
+        for _ in 0..1000 {
+            let after = catalog.step_migration_retention(&source)?;
+            let delta = after.records - before.records;
+            assert!(delta <= 64);
+            saw_batch |= delta == 64;
+            let pending: Option<i64> = catalog
+                .db
+                .query_row(
+                    "SELECT sequence FROM migration_retained_records WHERE complete=0",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(sequence) = pending {
+                // No later record may be visible while a large predecessor waits.
+                assert_eq!(
+                    catalog.db.query_row(
+                        "SELECT count(*) FROM migration_retained_records WHERE sequence>?",
+                        [sequence],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    catalog
+                        .retained_migration_records(
+                            source.binding_blake3(),
+                            &revision,
+                            Collection::Rows,
+                            0,
+                            100
+                        )?
+                        .len(),
+                    69
+                );
+                if !saw_pending {
+                    drop(catalog);
+                    catalog = Catalog::open(&root)?;
+                    catalog.begin_migration_retention(&source, approval)?;
+                    saw_pending = true;
+                }
+            }
+            before = after;
+            if before.complete {
+                break;
+            }
+        }
+        assert!(before.complete && saw_batch && saw_pending);
+        let mut rows = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let page = catalog.retained_migration_records(
+                source.binding_blake3(),
+                &revision,
+                Collection::Rows,
+                cursor,
+                100,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().unwrap().0;
+            rows.extend(page);
+        }
+        assert_eq!(rows.len(), 150);
+        for (i, (_, record)) in rows.iter().enumerate() {
+            let key = record.fields["key_json"].text()?;
+            assert_eq!(
+                serde_json::from_str::<Vec<Cell>>(key)?,
+                vec![Cell::Integer(i as i64 + 1)]
+            );
+        }
+        assert_eq!(catalog.step_migration_retention(&source)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn public_evidence_cannot_preseed_or_append_selected_source_custody() -> Result<()> {
+        let mut fixture = Fixture::with_large_cell(100_000);
+        let approval = b"approved custody authority regression";
+        fixture.seal.approval.document_blake3 = blake3::hash(approval).to_hex().to_string();
+        let source = fixture.open();
+        let revision = fixture.revision();
+        let page = source.page(revision, Collection::Rows, None, 1)?;
+        let Field::Bytes(reference) = &page.records[0].fields["cells_json"] else {
+            panic!("large field expected")
+        };
+        let descriptor = serde_json::to_vec(reference)?;
+        let temp = tempfile::tempdir()?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        let generic = catalog.begin_migration_evidence(&descriptor, reference.bytes)?;
+        // Exact descriptor/length plus forged complete bytes used to be mistaken
+        // for source custody. These public bytes must occupy a different domain.
+        let bogus = vec![b'!'; usize::try_from(reference.bytes)?];
+        catalog.append_migration_evidence(&generic.id, 0, &bogus)?;
+        catalog.begin_migration_retention(&source, approval)?;
+        let mut denied = false;
+        for _ in 0..100 {
+            let progress = catalog.step_migration_retention(&source)?;
+            let owned:Option<String>=catalog.db.query_row("SELECT f.evidence FROM migration_retained_fields f JOIN migration_retained_records r ON r.sequence=f.record WHERE r.complete=0 LIMIT 1",[],|r|r.get(0)).optional()?;
+            if let Some(owned) = owned {
+                assert_ne!(owned, generic.id);
+                let before = catalog.migration_evidence(&owned)?;
+                assert!(
+                    catalog
+                        .append_migration_evidence(&owned, before.committed, b"!")
+                        .is_err()
+                );
+                assert_eq!(catalog.migration_evidence(&owned)?, before);
+                denied = true;
+            }
+            if progress.complete {
+                break;
+            }
+        }
+        assert!(
+            denied
+                && catalog
+                    .migration_retention_progress(source.binding_blake3())?
+                    .complete
+        );
+        let rows = catalog.retained_migration_records(
+            source.binding_blake3(),
+            revision,
+            Collection::Rows,
+            0,
+            100,
+        )?;
+        let owned = catalog.retained_migration_field(rows[0].0, "cells_json")?;
+        assert_ne!(owned.id, generic.id);
+        let actual = catalog.migration_evidence_chunk(&owned.id, 0)?;
+        let expected = source.read_chunk(reference, 0, source.max_chunk_bytes())?;
+        assert_eq!(actual, expected);
+        assert_ne!(actual, bogus);
         Ok(())
     }
 
@@ -359,7 +523,13 @@ impl Catalog {
                 "migration advanced concurrently; retry step"
             );
             if let Some((evidence, offset, chunk)) = &prepared {
-                evidence::append(&tx, evidence, *offset, chunk)?;
+                evidence::append_owned(
+                    &tx,
+                    evidence,
+                    *offset,
+                    chunk,
+                    evidence::Authority::SelectedSource,
+                )?;
             }
             let incomplete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM migration_retained_fields f JOIN migration_evidence e ON e.id=f.evidence WHERE f.record=?1 AND e.complete=0)",[sequence],|r|r.get(0))?;
             if !incomplete {
@@ -390,10 +560,23 @@ impl Catalog {
             |r| r.get(0),
         )?;
         let after: Option<Cursor> = cursor.as_deref().map(serde_json::from_str).transpose()?;
-        let page = source.page(revision, collection, after.as_ref(), 1)?;
-        let staged = if let Some(record) = page.records.first() {
-            ensure!(page.records.len() == 1, "source exceeded one-record limit");
+        // Amortize durable commits over ordinary metadata rows. Stop at the first
+        // external field so there is at most one pending record, and never advance
+        // the source cursor past data whose bytes are not yet in custody.
+        let page = source.page(revision, collection, after.as_ref(), 64)?;
+        ensure!(
+            page.records.len() <= 64,
+            "source exceeded retention batch limit"
+        );
+        let mut staged = Vec::new();
+        let mut staged_bytes = 0usize;
+        for record in &page.records {
             let raw = serde_json::to_vec(record)?;
+            ensure!(raw.len() <= RECORD_LIMIT, "retained record size limit");
+            if !staged.is_empty() && staged_bytes.saturating_add(raw.len()) > RECORD_LIMIT {
+                break;
+            }
+            staged_bytes += raw.len();
             let compressed = compress(&raw)?;
             let next = Cursor {
                 seal: id.into(),
@@ -401,17 +584,26 @@ impl Catalog {
                 collection,
                 after: record.key.clone(),
             };
-            Some((
+            let pending = record
+                .fields
+                .values()
+                .any(|v| matches!(v, Field::Bytes(r) if r.bytes > 0));
+            staged.push((
                 record,
                 compressed,
                 raw.len(),
                 blake3::hash(&raw).to_hex().to_string(),
                 serde_json::to_string(&next)?,
-            ))
-        } else {
-            ensure!(page.exhausted, "empty source page without exhaustion");
-            None
-        };
+                pending,
+            ));
+            if pending {
+                break;
+            }
+        }
+        ensure!(
+            !staged.is_empty() || page.exhausted,
+            "empty source page without exhaustion"
+        );
         let _permit = self.writers.enter(Priority::Background)?;
         let tx = self
             .db
@@ -429,24 +621,39 @@ impl Catalog {
             current == cursor,
             "migration cursor advanced concurrently; retry step"
         );
-        if let Some((record, compressed, length, digest, next)) = staged {
-            tx.execute("INSERT OR IGNORE INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)",params![id,revision,i64::try_from(before.collection_index)?,record.rowid,compressed,i64::try_from(length)?,digest,next])?;
-            let sequence:i64=tx.query_row("SELECT sequence FROM migration_retained_records WHERE input=?1 AND revision=?2 AND collection=?3 AND source_rowid=?4",params![id,revision,i64::try_from(before.collection_index)?,record.rowid],|r|r.get(0))?;
-            for (field, value) in &record.fields {
-                if let Field::Bytes(reference) = value {
-                    let descriptor = serde_json::to_vec(reference)?;
-                    let evidence = evidence::begin(&tx, &descriptor, reference.bytes)?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO migration_retained_fields VALUES(?1,?2,?3)",
-                        params![sequence, field, evidence.id],
-                    )?;
-                }
-            }
-        } else {
+        if staged.is_empty() {
             let next_collection = before.collection_index + 1;
             let capture = before.capture_index + usize::from(next_collection == COLLECTIONS.len());
             tx.execute("UPDATE migration_retention SET capture_index=?2,collection_index=?3,cursor=NULL,complete=?4 WHERE id=?1",
                 params![id,i64::try_from(capture)?,i64::try_from(next_collection%COLLECTIONS.len())?,capture==source.seal().selected.len()])?;
+        } else {
+            for (record, compressed, length, digest, next, pending) in staged {
+                // Cursor and row commit atomically; a previously committed row
+                // here is corruption, not an opportunity to silently skip bytes.
+                tx.execute("INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,revision,i64::try_from(before.collection_index)?,record.rowid,compressed,i64::try_from(length)?,digest,next,!pending])?;
+                let sequence = tx.last_insert_rowid();
+                for (field, value) in &record.fields {
+                    if let Field::Bytes(reference) = value {
+                        let descriptor = serde_json::to_vec(reference)?;
+                        let evidence = evidence::begin_owned(
+                            &tx,
+                            &descriptor,
+                            reference.bytes,
+                            evidence::Authority::SelectedSource,
+                        )?;
+                        tx.execute(
+                            "INSERT INTO migration_retained_fields VALUES(?1,?2,?3)",
+                            params![sequence, field, evidence.id],
+                        )?;
+                    }
+                }
+                if !pending {
+                    tx.execute(
+                        "UPDATE migration_retention SET cursor=?2,records=records+1 WHERE id=?1",
+                        params![id, next],
+                    )?;
+                }
+            }
         }
         let result = progress(&tx, id)?;
         tx.commit()?;

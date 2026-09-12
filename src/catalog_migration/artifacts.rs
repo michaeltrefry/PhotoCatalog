@@ -360,7 +360,12 @@ impl Catalog {
         );
         existing(&tx, &reader.encoded, &reader.descriptor.request)?;
         reader.verify()?;
-        let result = evidence::begin(&tx, &reader.encoded, reader.source.before.bytes)?;
+        let result = evidence::begin_owned(
+            &tx,
+            &reader.encoded,
+            reader.source.before.bytes,
+            evidence::Authority::CapturedArtifact,
+        )?;
         tx.execute(
             "INSERT OR IGNORE INTO migration_artifacts VALUES(?1,?2,?3,?4)",
             params![
@@ -402,7 +407,13 @@ impl Catalog {
         );
         reader.verify()?;
         ensure!(!stop(), "artifact custody stopped before commit");
-        let result = evidence::append(&tx, &id, before.committed, &prepared)?;
+        let result = evidence::append_owned(
+            &tx,
+            &id,
+            before.committed,
+            &prepared,
+            evidence::Authority::CapturedArtifact,
+        )?;
         tx.commit()?;
         Ok(result)
     }

@@ -58,6 +58,8 @@ pub struct ByteRange {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Container {
+    /// Exact Adobe_AdditionalMetadata.xmp typed cell bytes.
+    CatalogXmp,
     Sidecar,
     JpegMain,
     JpegExtended,
@@ -81,6 +83,8 @@ pub struct Packet {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Transformation {
+    /// Four-byte big-endian length followed by the complete zlib stream.
+    CatalogLengthPrefixedZlib,
     Identity,
     CarrierHeaderRemoved,
     ZlibDecompressed,
