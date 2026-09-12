@@ -388,6 +388,9 @@ mod tests {
             Self::with_oversized(false)
         }
         fn with_oversized(oversized: bool) -> Result<Self> {
+            Self::with_oversized_parts(oversized, oversized)
+        }
+        fn with_oversized_parts(oversized: bool, oversized_packets: bool) -> Result<Self> {
             let mut fixture = Fixture::new();
             let revision = fixture.revision().to_owned();
             let approval = b"approved synthetic logical image import";
@@ -432,8 +435,8 @@ mod tests {
                     }
                     if id==40 {
                         db.execute("INSERT INTO references_out VALUES(?1,?2,'image','Adobe_images',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(20)).unwrap()]).unwrap();
-                        let raw=if oversized {vec![b'a';9*1024*1024]}else{raw.clone()};
-                        let decoded=if oversized {vec![b'b';9*1024*1024]}else{xmp.to_vec()};
+                        let raw=if oversized_packets {vec![b'a';9*1024*1024]}else{raw.clone()};
+                        let decoded=if oversized_packets {vec![b'b';9*1024*1024]}else{xmp.to_vec()};
                         db.execute("INSERT INTO packets(revision,source_id,origin,raw_digest,raw,decoded,detail) VALUES(?1,?2,'catalog',?3,?4,?5,'fixture exact catalog XMP')",params![revision,source_id,blake3::hash(&raw).to_hex().to_string(),raw,decoded]).unwrap();
                     }
                 }
@@ -910,6 +913,45 @@ mod tests {
                 .project_migration_current_develop(None, &current)?
                 .edit_revision,
             None
+        );
+        Ok(())
+    }
+    #[test]
+    fn oversized_packet_alone_is_retained_without_blocking_other_native_settings() -> Result<()> {
+        let mut t = Test::with_oversized_parts(false, true)?;
+        t.original()?;
+        t.project(20)?;
+        let packet = t
+            .catalog
+            .retained_migration_records(
+                t.source.binding_blake3(),
+                &t.rows[&40].source.capture_revision,
+                Collection::Packets,
+                0,
+                100,
+            )?
+            .into_iter()
+            .find(|(_, r)| r.fields["source_id"].text().ok() == Some("source-40"))
+            .unwrap();
+        let request = crate::catalog_migration::metadata::CatalogXmp {
+            origin: t.rows[&40].clone(),
+            retained_table: t.tables["Adobe_AdditionalMetadata"],
+            packet_record: packet.0,
+            image: t.link(40, "image", 20),
+            import_source: "lightroom".into(),
+        };
+        let result = t
+            .catalog
+            .project_migration_catalog_xmp(Some(&t.source), &request)?;
+        assert_eq!(result.state, "retained_only");
+        assert!(result.observation.is_none());
+        let current = develop(&t, 20, 30);
+        let applied = t
+            .catalog
+            .project_migration_current_develop(Some(&t.source), &current)?;
+        assert_eq!(
+            applied.extraction.unwrap().contribution.exposure_ev,
+            Some(1.0)
         );
         Ok(())
     }
