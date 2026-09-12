@@ -1142,6 +1142,13 @@ fn legacy_job_reopens_and_legacy_pixels_remain_exact_without_namespace_relabel()
     let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
     catalog.import(&originals, None, |_| Ok(())).unwrap();
     let asset = catalog.browse(0, 10).unwrap().remove(0);
+    // Model the exact schema7 migration baseline for a retained schema6 job.
+    let fixture_db =
+        rusqlite::Connection::open(root.path().join("catalog/catalog.sqlite3")).unwrap();
+    fixture_db
+        .execute_batch("UPDATE assets SET physical_generation=render_generation; UPDATE catalog_images SET pixel_generation=0")
+        .unwrap();
+    drop(fixture_db);
     let cache = root.path().join("cache");
     let mut previews = service(&cache, &originals, ServiceLimits::default());
     previews
@@ -1249,4 +1256,184 @@ fn legacy_job_reopens_and_legacy_pixels_remain_exact_without_namespace_relabel()
             .image_pixel_generation
             .is_some()
     );
+}
+
+#[test]
+fn legacy_virtual_pixel_changes_reject_cache_persisted_and_inflight_jobs() {
+    use photocatalog::catalog_edits::VariantKey;
+    for mode in ["cached", "persisted", "inflight", "rebound"] {
+        let root = tempfile::tempdir().unwrap();
+        let originals = root.path().join("originals");
+        std::fs::create_dir(&originals).unwrap();
+        image(&originals.join("photo.png"), [41, 87, 149]);
+        let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+        catalog.import(&originals, None, |_| Ok(())).unwrap();
+        let asset = catalog.browse(0, 10).unwrap().remove(0);
+        let copy = catalog
+            .create_edit_variant(&VariantKey::master(&asset.id), 0, "legacy")
+            .unwrap()
+            .key;
+        assert_eq!(
+            catalog
+                .image_metadata_identity(&copy)
+                .unwrap()
+                .pixel_generation,
+            0
+        );
+        // Model the exact schema7 migration baseline for a retained schema6 job.
+        let fixture_db =
+            rusqlite::Connection::open(root.path().join("catalog/catalog.sqlite3")).unwrap();
+        fixture_db
+            .execute_batch("UPDATE assets SET physical_generation=render_generation; UPDATE catalog_images SET pixel_generation=0")
+            .unwrap();
+        drop(fixture_db);
+        let cache = root.path().join("cache");
+        let mut previews = service(&cache, &originals, ServiceLimits::default());
+        previews
+            .request_variant(&mut catalog, &copy, Tier::Thumbnail, Priority::Foreground)
+            .unwrap();
+        drop(previews);
+        // A genuine old descriptor has neither per-image scope nor import scope.
+        let db = rusqlite::Connection::open(
+            configuration(&cache).manifest_root.join("previews.sqlite3"),
+        )
+        .unwrap();
+        let (old_id, raw): (String, String) = db
+            .query_row("SELECT id,descriptor FROM render_jobs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let legacy = catalog.render_identity(&asset.id).unwrap();
+        let mut saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        saved.as_object_mut().unwrap().remove("import_image");
+        saved["expected"]["generation"] = legacy.generation.into();
+        saved["edit"]["source"]["generation"] = legacy.generation.into();
+        saved["edit"]
+            .as_object_mut()
+            .unwrap()
+            .remove("image_identity");
+        saved["request"]["keys"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("image_pixel_generation");
+        saved["request"]["keys"][0]["generation"] = legacy.generation.into();
+        let keys: Vec<PreviewKey> =
+            serde_json::from_value(saved["request"]["keys"].clone()).unwrap();
+        let id = blake3::hash(&serde_json::to_vec(&keys).unwrap())
+            .to_hex()
+            .to_string();
+        db.execute(
+            "UPDATE render_jobs SET id=?1,descriptor=?2 WHERE id=?3",
+            rusqlite::params![id, saved.to_string(), old_id],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE wanted SET desired=?1,generation=?2,image_pixel_generation=NULL",
+            rusqlite::params![keys[0].digest().unwrap(), legacy.generation],
+        )
+        .unwrap();
+        drop(db);
+        let mut previews = service(&cache, &originals, ServiceLimits::default());
+        let consumer = if mode != "persisted" {
+            let (_, handles) = previews.resume(&mut catalog, 0, 10, false).unwrap();
+            assert_eq!(handles.len(), 1);
+            if mode == "cached" || mode == "rebound" {
+                assert!(matches!(
+                    await_result(&mut previews, &mut catalog, handles[0]),
+                    ServiceCompletion::Ready
+                ));
+                assert!(
+                    !previews
+                        .cached_variant(&catalog, &copy, Tier::Thumbnail, false)
+                        .unwrap()
+                        .unwrap()
+                        .stale
+                );
+            } else {
+                previews.tick(&mut catalog).unwrap();
+            }
+            Some(handles[0])
+        } else {
+            None
+        };
+        let before = catalog.image_metadata_identity(&copy).unwrap();
+        if mode == "rebound" {
+            use photocatalog::{catalog_storage::RelinkScope, storage_volume::NativePath};
+            let plan = catalog
+                .begin_relink(RelinkScope::Asset {
+                    asset_id: asset.id.clone(),
+                    destinations: vec![NativePath::from_path(&originals.join("photo.png"))],
+                })
+                .unwrap();
+            while catalog.relink_plan(&plan.id).unwrap().state == "preparing" {
+                catalog.prepare_relink_batch(&plan.id, 1).unwrap();
+            }
+            catalog.apply_relink(&plan.id).unwrap();
+            assert_eq!(
+                catalog
+                    .image_metadata_identity(&copy)
+                    .unwrap()
+                    .pixel_generation,
+                before.pixel_generation
+            );
+            assert!(
+                catalog
+                    .image_metadata_identity(&copy)
+                    .unwrap()
+                    .physical_generation
+                    > before.physical_generation
+            );
+        } else {
+            catalog
+                .edit_metadata_for_image(
+                    &copy,
+                    before.metadata_revision,
+                    None,
+                    &[xmp::Edit::Set {
+                        namespace: "http://ns.adobe.com/tiff/1.0/".into(),
+                        path: "Orientation".into(),
+                        value: "6".into(),
+                    }],
+                )
+                .unwrap();
+            assert!(
+                catalog
+                    .image_metadata_identity(&copy)
+                    .unwrap()
+                    .pixel_generation
+                    > before.pixel_generation
+            );
+        }
+        assert_eq!(
+            catalog.render_identity(&asset.id).unwrap().generation,
+            legacy.generation
+        );
+        match mode {
+            "persisted" => assert!(
+                previews
+                    .resume(&mut catalog, 0, 10, false)
+                    .unwrap()
+                    .1
+                    .is_empty()
+            ),
+            "inflight" => assert!(matches!(
+                await_result(&mut previews, &mut catalog, consumer.unwrap()),
+                ServiceCompletion::Stale | ServiceCompletion::Canceled
+            )),
+            _ => {}
+        }
+        assert!(
+            previews
+                .cached_variant(&catalog, &copy, Tier::Thumbnail, false)
+                .unwrap()
+                .is_none(),
+            "{mode}"
+        );
+        if let Some(view) = previews
+            .cached_variant(&catalog, &copy, Tier::Thumbnail, true)
+            .unwrap()
+        {
+            assert!(view.stale, "{mode}");
+        }
+    }
 }

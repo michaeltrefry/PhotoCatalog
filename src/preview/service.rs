@@ -254,11 +254,25 @@ fn same_edit(a: &EditRenderIdentity, b: &EditRenderIdentity) -> bool {
 }
 // Preview pixels ignore rating/label-only revisions. Publication still acquires
 // the existing exact current identity CAS, so export authority is unchanged.
+fn legacy_pixel_eligible(identity: &EditRenderIdentity, legacy: &RenderIdentity) -> bool {
+    // Legacy keys have no per-image pixel authority. Only the migration baseline
+    // can be compared to them; later own-image pixel changes are unrepresentable.
+    // Schema7 initializes physical_generation from render_generation. A later
+    // physical-only change cannot be represented by the legacy key either.
+    identity
+        .image_identity
+        .as_ref()
+        .is_some_and(|image| image.pixel_generation == 0)
+        && identity.source.generation == legacy.generation
+}
 fn current_edit(catalog: &Catalog, expected: &EditRenderIdentity) -> Result<EditRenderIdentity> {
     let mut current = catalog.edit_render_identity(&expected.key)?;
     if expected.image_identity.is_none() {
-        current.source = catalog.render_identity(&expected.key.asset_id)?;
-        current.image_identity = None;
+        let legacy = catalog.render_identity(&expected.key.asset_id)?;
+        if legacy_pixel_eligible(&current, &legacy) {
+            current.source = legacy;
+            current.image_identity = None;
+        }
     }
     Ok(current)
 }
@@ -268,19 +282,38 @@ fn with_preview_transaction<T>(
     priority: crate::catalog_writer::Priority,
     attach: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
 ) -> Result<Option<T>> {
-    let current = current_edit(catalog, expected)?;
-    if !same_edit(expected, &current) {
+    let current = catalog.edit_render_identity(&expected.key)?;
+    let mut comparable = current.clone();
+    if expected.image_identity.is_none() {
+        let legacy = catalog.render_identity(&expected.key.asset_id)?;
+        if legacy_pixel_eligible(&current, &legacy) {
+            comparable.source = legacy;
+            comparable.image_identity = None;
+        }
+    }
+    if !same_edit(expected, &comparable) {
         return Ok(None);
     }
+    // Even when admitting an old key, retain the scoped image identity in the
+    // transaction CAS so a pixel mutation while waiting for the writer rejects it.
     catalog.with_edit_transaction(&current, priority, attach)
 }
 fn import_image_current(
     tx: &rusqlite::Transaction<'_>,
     expected: Option<&EditRenderIdentity>,
+    legacy: &RenderIdentity,
     published: bool,
 ) -> Result<bool> {
     let Some(expected) = expected else {
-        return Ok(true);
+        let current = crate::catalog_images::identity(tx, &legacy.asset_id)?;
+        let revision: i64 = tx.query_row(
+            "SELECT COALESCE((SELECT revision FROM edit_variants WHERE asset_id=?1 AND id='master'),0)",
+            [&legacy.asset_id], |r| r.get(0),
+        )?;
+        return Ok(current.pixel_generation == 0
+            && revision == 0
+            && Some(current.physical_generation)
+                == legacy.generation.checked_add(i64::from(published)));
     };
     let image = expected
         .image_identity
@@ -405,11 +438,9 @@ impl SavedJob {
             if let Some(image) = &self.import_image {
                 return Ok(same_edit(image, &current_edit(catalog, image)?));
             }
-            Ok(self.import
-                || catalog
-                    .edit_render_identity(&VariantKey::master(&self.expected.asset_id))?
-                    .revision
-                    == 0)
+            let master =
+                catalog.edit_render_identity(&VariantKey::master(&self.expected.asset_id))?;
+            Ok(master.revision == 0 && legacy_pixel_eligible(&master, &self.expected))
         }
     }
 }
@@ -674,16 +705,19 @@ impl PreviewService {
             if let Some(cached) = self.store.read_limited(&key, false, allowance)? {
                 return Ok(Some(cached));
             }
-            let mut legacy = identity.clone();
-            legacy.source = catalog.render_identity(&variant.asset_id)?;
-            legacy.image_identity = None;
-            let legacy_key = if interactive {
-                self.interactive_key(&legacy, tier)?
-            } else {
-                self.variant_key(&legacy, tier)?
-            };
-            if let Some(cached) = self.store.read_limited(&legacy_key, false, allowance)? {
-                return Ok(Some(cached));
+            let legacy_source = catalog.render_identity(&variant.asset_id)?;
+            if legacy_pixel_eligible(&identity, &legacy_source) {
+                let mut legacy = identity.clone();
+                legacy.source = legacy_source;
+                legacy.image_identity = None;
+                let legacy_key = if interactive {
+                    self.interactive_key(&legacy, tier)?
+                } else {
+                    self.variant_key(&legacy, tier)?
+                };
+                if let Some(cached) = self.store.read_limited(&legacy_key, false, allowance)? {
+                    return Ok(Some(cached));
+                }
             }
             self.store.read_limited(&key, allow_stale, allowance)
         })?
@@ -982,7 +1016,7 @@ impl PreviewService {
         } else {
             catalog.with_render_transaction(&job.expected, writer_priority, |tx| {
                 ensure!(
-                    import_image_current(tx, job.import_image.as_ref(), false)?,
+                    import_image_current(tx, job.import_image.as_ref(), &job.expected, false)?,
                     "stale import pixel identity"
                 );
                 persist()
@@ -1205,6 +1239,7 @@ impl PreviewService {
                                         import_image_current(
                                             tx,
                                             job.import_image.as_ref(),
+                                            &job.expected,
                                             published,
                                         )
                                     },
@@ -1380,7 +1415,12 @@ impl PreviewService {
                             &key.digest()?,
                             (
                                 |tx, published| {
-                                    import_image_current(tx, job.import_image.as_ref(), published)
+                                    import_image_current(
+                                        tx,
+                                        job.import_image.as_ref(),
+                                        &job.expected,
+                                        published,
+                                    )
                                 },
                                 || Ok(()),
                             ),
