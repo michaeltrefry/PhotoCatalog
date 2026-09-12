@@ -391,6 +391,13 @@ mod tests {
             Self::with_oversized_parts(oversized, oversized)
         }
         fn with_oversized_parts(oversized: bool, oversized_packets: bool) -> Result<Self> {
+            Self::with_source_edit(oversized, oversized_packets, |_, _| {})
+        }
+        fn with_source_edit(
+            oversized: bool,
+            oversized_packets: bool,
+            edit: impl FnOnce(&Connection, &str),
+        ) -> Result<Self> {
             let mut fixture = Fixture::new();
             let revision = fixture.revision().to_owned();
             let approval = b"approved synthetic logical image import";
@@ -440,6 +447,7 @@ mod tests {
                         db.execute("INSERT INTO packets(revision,source_id,origin,raw_digest,raw,decoded,detail) VALUES(?1,?2,'catalog',?3,?4,?5,'fixture exact catalog XMP')",params![revision,source_id,blake3::hash(&raw).to_hex().to_string(),raw,decoded]).unwrap();
                     }
                 }
+                edit(db, &revision);
             });
             let source = fixture.open();
             let temp = tempfile::tempdir()?;
@@ -955,4 +963,5 @@ mod tests {
         );
         Ok(())
     }
+    include!("render_tests.rs");
 }
