@@ -241,7 +241,7 @@ pub struct EncodingProgress {
     pub declared: usize,
     pub scanned_through: i64,
 }
-fn encoded_bytes(path: &NativePath) -> Vec<u8> {
+pub(crate) fn encoded_bytes(path: &NativePath) -> Vec<u8> {
     match path {
         NativePath::UnixBytes(v) => v.clone(),
         NativePath::WindowsWide(v) => v.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -398,6 +398,39 @@ fn volume_id(
     )?;
     Ok(id)
 }
+/// Record a reviewed locator inside the caller's asset-registration transaction.
+/// This validates encoding and path structure without probing the filesystem.
+pub(crate) fn record_storage_path(db: &Connection, asset: &str, path: &NativePath) -> Result<()> {
+    components(&PathReference::Native(path.clone()))?;
+    let location: Vec<u8> =
+        db.query_row("SELECT location FROM assets WHERE id=?", [asset], |r| {
+            r.get(0)
+        })?;
+    ensure!(
+        location == encoded_bytes(path),
+        "declared native locator differs from stored bytes"
+    );
+    if let Some(old) = get_binding(db, asset)? {
+        ensure!(
+            old.native_path == *path,
+            "existing locator encoding differs; explicit review required"
+        );
+    } else {
+        put_binding(
+            db,
+            asset,
+            &Binding {
+                reference: PathReference::Native(path.clone()),
+                native_path: path.clone(),
+                volume_id: None,
+                relative: None,
+                file_key: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 impl Catalog {
     /// Record explicit encoding without filesystem queries, including unavailable
     /// volumes. Call after reserve for every native import. Foreign declarations
@@ -410,32 +443,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let location: Vec<u8> =
-            tx.query_row("SELECT location FROM assets WHERE id=?", [asset], |r| {
-                r.get(0)
-            })?;
-        ensure!(
-            location == encoded_bytes(path),
-            "declared native locator differs from stored bytes"
-        );
-        if let Some(old) = get_binding(&tx, asset)? {
-            ensure!(
-                old.native_path == *path,
-                "existing locator encoding differs; explicit review required"
-            );
-        } else {
-            put_binding(
-                &tx,
-                asset,
-                &Binding {
-                    reference: PathReference::Native(path.clone()),
-                    native_path: path.clone(),
-                    volume_id: None,
-                    relative: None,
-                    file_key: None,
-                },
-            )?;
-        }
+        record_storage_path(&tx, asset, path)?;
         tx.commit()?;
         drop(_write);
         Ok(())

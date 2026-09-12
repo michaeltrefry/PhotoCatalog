@@ -134,18 +134,20 @@ pub(crate) fn append(
 ) -> Result<EvidenceState> {
     let before = state(db, id)?;
     ensure!(offset <= before.length, "evidence offset exceeds length");
-    let expected = (before.length - offset).min(CHUNK_BYTES as u64) as usize;
     ensure!(
-        offset % CHUNK_BYTES as u64 == 0 && chunk.length == expected,
-        "evidence chunk boundary differs"
+        chunk.length as u64 <= before.length - offset,
+        "evidence chunk exceeds declared payload length"
     );
     if offset < before.committed {
-        let hash: String = db.query_row(
-            "SELECT hash FROM migration_evidence_chunks WHERE evidence=?1 AND offset=?2",
+        let (hash, length): (String, usize) = db.query_row(
+            "SELECT c.hash,b.length FROM migration_evidence_chunks c JOIN migration_evidence_blobs b ON b.hash=c.hash WHERE c.evidence=?1 AND c.offset=?2",
             params![id, offset],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        ensure!(hash == chunk.hash, "replayed evidence bytes differ");
+        ensure!(
+            hash == chunk.hash && length == chunk.length,
+            "replayed evidence bytes differ"
+        );
         return Ok(before);
     }
     ensure!(
@@ -176,7 +178,6 @@ fn read(db: &Connection, id: &str, offset: u64) -> Result<Vec<u8>> {
     if offset == status.length {
         return Ok(Vec::new());
     }
-    ensure!(offset % CHUNK_BYTES as u64 == 0, "evidence chunk offset");
     let (hash, length, compressed): (String, u64, Vec<u8>) = db.query_row(
         "SELECT b.hash,b.length,b.compressed FROM migration_evidence_chunks c
          JOIN migration_evidence_blobs b ON b.hash=c.hash WHERE c.evidence=?1 AND c.offset=?2",
@@ -184,7 +185,7 @@ fn read(db: &Connection, id: &str, offset: u64) -> Result<Vec<u8>> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     ensure!(
-        length == (status.length - offset).min(CHUNK_BYTES as u64),
+        length > 0 && length <= (status.length - offset).min(CHUNK_BYTES as u64),
         "evidence chunk length differs"
     );
     ensure!(
