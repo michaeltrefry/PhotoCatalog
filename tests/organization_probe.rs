@@ -130,7 +130,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 44
+            && receipt["added_tables"].as_array().unwrap().len() == 45
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
@@ -226,7 +226,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
     ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 44);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 45);
     ensure!(
         migrated["added_tables"]
             .as_array()
@@ -347,7 +347,7 @@ fn remove_image_schema(conn: &rusqlite::Connection) -> Result<()> {
             conn.execute_batch(&sql)?;
         }
     }
-    conn.execute_batch("DROP TABLE migration_reconciliation; DROP TABLE migration_run_items; DROP TABLE migration_runs;
+    conn.execute_batch("DROP TABLE migration_reconciliation; DROP TABLE migration_run_supplements; DROP TABLE migration_run_items; DROP TABLE migration_runs;
         DROP TRIGGER migration_image_mapping_insert; DROP TRIGGER migration_image_mapping_update; DROP TRIGGER migration_image_mapping_delete;
         DROP TRIGGER migration_original_mapping_insert; DROP TRIGGER migration_original_mapping_update; DROP TRIGGER migration_original_mapping_delete;
         DROP TABLE migration_mapping_epoch; DROP INDEX migration_original_capture;
@@ -387,7 +387,7 @@ fn schema_six_adds_only_verified_image_state_and_rejects_legacy_sequence_spoof()
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION,
         "{receipt}"
     );
-    ensure!(receipt["added_tables"].as_array().unwrap().len() == 31);
+    ensure!(receipt["added_tables"].as_array().unwrap().len() == 32);
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
             && receipt["original_columns_preserved"] == true

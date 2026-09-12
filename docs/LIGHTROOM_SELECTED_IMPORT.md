@@ -30,7 +30,7 @@ Status opens the destination read-only, requires the current schema and does not
 
 ## Retention and compatibility
 
-The worker retains selected schema objects, typed rows, references, paths, metadata packets, issues and raw catalog/companion files in bounded compressed chunks. All selected data enters custody before native projection. Source-table paging uses indexed cursors. Missing and oversized interpretations keep retained evidence and explicit compatibility results.
+The worker retains selected schema objects, typed rows, references, paths, metadata packets, issues and raw catalog/companion files in bounded compressed chunks. All selected inspection data enters custody before native projection; raw catalog and companion copies must complete before reconciliation accepts the run. Source-table paging uses indexed cursors. Missing and oversized interpretations keep retained evidence and explicit compatibility results.
 
 Native projection includes original references, independent logical images, embedded and catalog XMP, supported current Adobe parameters, flags, keyword hierarchy/synonyms/memberships and collection memberships. Sidecar ownership remains unresolved unless separately established. Historical develop settings, snapshots, smart-collection instructions, stacks, group semantics and unsupported fields remain source-bound evidence. Native collection ordering is not claimed to reproduce Lightroom's mixed ordering encodings.
 

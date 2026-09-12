@@ -100,6 +100,7 @@ const SCHEMA7_TABLES: &[&str] = &[
     "migration_lookup_backfill",
     "migration_file_metadata",
     "migration_runs",
+    "migration_run_supplements",
     "migration_run_items",
     "migration_reconciliation",
     "migration_mapping_epoch",
