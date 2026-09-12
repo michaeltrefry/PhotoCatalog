@@ -4,6 +4,45 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
+S10 sc-22845 is In Progress. S1–S9 and the linked inspection repairs are Done;
+S9 merged at `56aa3ca`. The selected TEST imports all 16 approved source catalogs
+into one scratch catalog and preserves the existing filesystem folder hierarchy.
+The 32 excluded catalog candidates remain excluded. Canonical-library migration
+has not been authorized.
+
+PR #14 remains draft. Its published head `fb7bb43715d51068be5e8818807b2cdecc8e20e4`
+passed all four applicable CI jobs: macOS, Windows, Linux, and benchmark contracts.
+The qualified production worker is `d0c5f3c`; debug and optimized all-target gates
+each passed 586 test instances, with zero failures and five existing ignored tests.
+Those gates do not substitute for actual TEST acceptance.
+
+The actual TEST has completed selected-source record preservation: 14,025,415
+records across all 16 selected catalogs, matching the frozen source total. File,
+master-role and virtual-role walks have completed. The same run checkpointed
+cleanly at 664,003 processed rows during embedded metadata, with native exit 0
+and no forced cleanup. All progress is retained in the one scratch catalog;
+originals and source catalogs remain read-only.
+
+A remaining-stage review identified two metadata mapping queries using only a
+prefix of the existing composite index. Repair `e615b076` supplies the full known
+identity and passes independent source review plus a 20,000-row bounded-work
+regression. Its complete optimized gate passed 587 test instances, with zero failures and
+five existing ignored tests; strict Clippy and formatting passed. The successor
+worker has resumed from the clean checkpoint with unchanged inputs and destination.
+Previous worker receipts remain attributed to their original source revision.
+
+Remaining native projections, raw artifact custody, independent selected counts
+and relationships, final acceptance review, merge and terminal merged-head CI
+are required for S10. The combined independent verifier passes source review
+and 29 synthetic tests, including missing projection receipts, incorrect file-XMP
+associations, and actual JSON-encoded checkpoint stages. Its successor source
+binding passes focused qualification and root review; actual execution remains
+pending native completion and a quiescent, explicitly pinned observation. S11 backup/restore and S12 Tauri
+interface retain their S10 dependencies; S13 integrated readiness follows both.
+Fieldbook remains a design reference, not the product name.
+
+## Historical checkpoint before S9 closeout
+
 S9 sc-22844 remains In Progress. All selected extraction and TEST finalization
 are complete and independently reviewed: 16 chosen catalog families, 209,091
 file references, 6,617 virtual copies, 68 enumerated path-overlap pairs, and 6,112
@@ -129,7 +168,7 @@ Linux CI at `58e7a1a` exposed an export owner-drop/reopen failure. A determinist
 ## Resource and authorization ledger
 
 - User authorized epic delivery and ordinary PR/CI/merge. The user changed michaeltrefry/PhotoCatalog to public because private-repository Actions consumed the monthly allowance; preserve public visibility and batch validated changes before CI. The user released the reference Mac on 2026-09-09.
-- Originals and Lightroom sources on the RAID remain read-only. Private fixtures and evidence remain outside Git. No live migration or original mutation has occurred.
+- Originals and Lightroom sources on the RAID remain read-only. Private fixtures and evidence remain outside Git. The selected TEST migration writes only its authorized scratch destination; no canonical migration or original mutation has occurred.
 - User authorized a dedicated RAID scratch folder for S9: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911`. Inspection output is under `inspection/schema3-run`; SQLite temporary files use `sqlite-temp`. Local control/evidence remains under `/Users/michael/PhotoCatalog-private-results/sc-22844-raid-full-control-v1`. Scratch authorization does not permit writes to source catalogs or photos.
 - All S2 measurement sessions are complete. Local builds/renders were paused during timing. The owned passive observer PID 30547/session 93348 was stopped afterward and exited successfully; its final receipt at 2026-09-09T14:00:27Z records SIGTERM and 6,472 samples. No outstanding S2 process needs resuming.
 - S4 and S6 use isolated worktrees. Parent owns catalog schema/model integration; packet extraction and explicit export own separate modules. S6 owns preview adapters/store/scheduler; its rebuildable manifest has separate schema ownership. Heavy Cargo and timed measurements are serialized.
