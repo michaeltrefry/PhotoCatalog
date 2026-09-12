@@ -642,6 +642,8 @@ impl MigrationSource {
 
     /// Identity for destination idempotency: capture + original table + source
     /// key digest. Never use the inspection-local lineage prefix as import ID.
+    /// Only TEXT keys within the inline validation cap receive this identity;
+    /// larger keys remain complete retained evidence via page/read_chunk.
     pub fn stable_source(&self, revision: &str, source_id: &str) -> Result<StableSource> {
         self.selected(revision)?;
         ensure!(
@@ -654,22 +656,16 @@ impl MigrationSource {
             let rowid: i64 = rows.next()?.context("source has no retained row; snapshot-only evidence must not acquire a guessed logical identity")?.get(0)?;
             ensure!(rows.next()?.is_none(), "source ID maps to multiple raw rows");
             let table = self.field(revision,Collection::Rows,rowid,"table_name",false)?.text()?.to_owned();
-            let blob = Blob::open(&self.db,"rows","key_json",rowid)?;
-            let mut hash = blake3::Hasher::new();
-            let until = Instant::now()+Duration::from_millis(self.limits.deadline_ms);
-            let mut offset=0;
-            while offset<blob.len() {
-                ensure!(Instant::now()<until, "source key digest deadline");
-                let bytes=blob.read(offset,self.limits.chunk_bytes)?;
-                hash.update(&bytes);
-                offset+=bytes.len();
-            }
             let key=self.field(revision,Collection::Rows,rowid,"key_json",false)?;
-            if let Field::Inline(Cell::Text(bytes))=&key {
-                let parsed: Vec<Cell>=serde_json::from_slice(bytes)?;
-                ensure!(serde_json::to_vec(&parsed)?==*bytes,"source key is not schema3 canonical Cell JSON");
-            }
-            Ok(StableSource {capture_revision:revision.into(),table,source_key:key,source_key_blake3:hash.finalize().to_hex().to_string(),inspection_source_id:source_id.into()})
+            let bytes=match &key {
+                Field::Inline(Cell::Text(bytes))=>bytes,
+                Field::Bytes(reference) if reference.text => bail!("stable source identity unavailable: canonical key exceeds inline validation limit; retain complete key evidence in chunks"),
+                _=>bail!("stable source identity requires a TEXT canonical key"),
+            };
+            let parsed: Vec<Cell>=serde_json::from_slice(bytes)?;
+            ensure!(serde_json::to_vec(&parsed)?==*bytes,"source key is not schema3 canonical Cell JSON");
+            let key_digest=blake3::hash(bytes).to_hex().to_string();
+            Ok(StableSource {capture_revision:revision.into(),table,source_key:key,source_key_blake3:key_digest,inspection_source_id:source_id.into()})
         })
     }
 

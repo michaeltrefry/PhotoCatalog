@@ -611,3 +611,64 @@ fn active_cooperative_writer_is_rejected_before_reading_data() {
     assert!(ready && status.success() && rejected);
     assert_eq!(before, fs::read(&fixture.path).unwrap());
 }
+
+#[test]
+fn stable_identity_rejects_blob_or_oversized_key_without_losing_raw_evidence() {
+    let canonical = serde_json::to_vec(&vec![Cell::Integer(7)]).unwrap();
+    let mut fixture = Fixture::new();
+    let revision = fixture.revision().to_owned();
+    fixture.edit(|db| {
+        db.execute(
+            "UPDATE rows SET key_json=? WHERE revision=?",
+            params![canonical, revision],
+        )
+        .unwrap();
+    });
+    let source = fixture.open();
+    assert!(
+        source
+            .stable_source(fixture.revision(), "lineage-selected:7")
+            .unwrap_err()
+            .to_string()
+            .contains("TEXT canonical key")
+    );
+    let row = source
+        .page(fixture.revision(), Collection::Rows, None, 1)
+        .unwrap();
+    assert!(
+        matches!(&row.records[0].fields["key_json"],Field::Inline(Cell::Blob(bytes)) if bytes==&canonical)
+    );
+    drop(source);
+    let canonical = serde_json::to_string(&vec![Cell::Text(vec![42; 65536])]).unwrap();
+    fixture.edit(|db| {
+        db.execute(
+            "UPDATE rows SET key_json=? WHERE revision=?",
+            params![canonical, revision],
+        )
+        .unwrap();
+    });
+    let source = fixture.open();
+    assert!(
+        source
+            .stable_source(fixture.revision(), "lineage-selected:7")
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds inline validation limit")
+    );
+    let row = source
+        .page(fixture.revision(), Collection::Rows, None, 1)
+        .unwrap();
+    let Field::Bytes(reference) = &row.records[0].fields["key_json"] else {
+        panic!("oversized key descriptor")
+    };
+    assert!(reference.text);
+    let mut bytes = Vec::new();
+    while (bytes.len() as u64) < reference.bytes {
+        bytes.extend(
+            source
+                .read_chunk(reference, bytes.len() as u64, 4096)
+                .unwrap(),
+        );
+    }
+    assert_eq!(bytes, canonical.as_bytes());
+}
