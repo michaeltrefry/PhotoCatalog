@@ -7,7 +7,7 @@ use crate::{
     lightroom::migration_source::{Collection, MigrationSource},
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -157,6 +157,48 @@ const RETAINED_COMPLETE_COUNT: &str = "SELECT
     (SELECT count(*) FROM migration_retained_records INDEXED BY migration_retained_pending
      WHERE input=?1 AND revision=?2 AND collection=?3 AND complete=0)";
 
+const FIRST_RETAINED_REVISION: &str = "SELECT revision FROM migration_retained_records
+    INDEXED BY migration_retained_page WHERE input=?1 ORDER BY revision LIMIT 1";
+const NEXT_RETAINED_REVISION: &str = "SELECT revision FROM migration_retained_records
+    INDEXED BY migration_retained_page WHERE input=?1 AND revision>?2 ORDER BY revision LIMIT 1";
+
+fn validate_retained_roster(
+    db: &Connection,
+    input: &str,
+    max_revisions: usize,
+    mut allowed: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    // Preserve the old single DISTINCT statement's read snapshot across seeks.
+    // Release it before the caller's existing writer admission and epoch CAS.
+    let tx = db.unchecked_transaction()?;
+    {
+        let mut first = tx.prepare(FIRST_RETAINED_REVISION)?;
+        let mut next = tx.prepare(NEXT_RETAINED_REVISION)?;
+        let mut previous: Option<String> = None;
+        let mut observed = 0;
+        loop {
+            let revision: Option<String> = match &previous {
+                None => first.query_row([input], |r| r.get(0)).optional()?,
+                Some(previous) => next
+                    .query_row(params![input, previous], |r| r.get(0))
+                    .optional()?,
+            };
+            let Some(revision) = revision else { break };
+            // At most max_revisions present keys plus one mandatory empty seek.
+            // Never silently stop after the last expected key: a trailing extra
+            // (including an incomplete retained record) must still be rejected.
+            ensure!(
+                observed < max_revisions && allowed(&revision),
+                "excluded or unselected records entered destination custody"
+            );
+            observed += 1;
+            previous = Some(revision);
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn step(
     catalog: &mut Catalog,
     source: &MigrationSource,
@@ -235,18 +277,19 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
             usize::try_from(count)? == source.seal().selected.len(),
             "capture report roster differs"
         );
-        let retained: Vec<String> = catalog
-            .db
-            .prepare("SELECT DISTINCT revision FROM migration_retained_records WHERE input=?")?
-            .query_map([&before.input], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        ensure!(
-            retained
-                .iter()
-                .all(|r| source.seal().selected.iter().any(|s| s.revision == *r)
-                    && !source.seal().excluded_revisions.contains(r)),
-            "excluded or unselected records entered destination custody"
-        );
+        validate_retained_roster(
+            &catalog.db,
+            &before.input,
+            source.seal().selected.len(),
+            |r| {
+                source.seal().selected.iter().any(|s| s.revision == r)
+                    && !source
+                        .seal()
+                        .excluded_revisions
+                        .iter()
+                        .any(|excluded| excluded == r)
+            },
+        )?;
         let supplements: i64 = catalog.db.query_row(
             "SELECT count(*) FROM migration_run_supplements WHERE run=?",
             [&before.id],
@@ -609,6 +652,179 @@ mod tests {
             optimized.1 * 4 < original.1 * 3,
             "optimized={optimized:?}, original={original:?}"
         );
+        Ok(())
+    }
+
+    fn insert_revision(
+        db: &Connection,
+        input: &str,
+        revision: &str,
+        collection: i64,
+        complete: i64,
+    ) -> Result<()> {
+        db.execute("INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete)
+            SELECT ?1,?2,?3,COALESCE(max(source_rowid),0)+1,x'00',1,'digest','cursor',?4 FROM migration_retained_records", params![input,revision,collection,complete])?;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_roster_seeks_match_distinct_validation_and_reject_all_extra_positions() -> Result<()>
+    {
+        // Empty is an actual first key, not a sentinel that may be skipped.
+        for unexpected in [
+            None,
+            Some(""),
+            Some("a-before"),
+            Some("d-between"),
+            Some("z-after"),
+        ] {
+            let db = fixture()?;
+            for (revision, complete) in [("b-selected", 1), ("f-selected", 0)] {
+                for collection in [0, 3, 4] {
+                    insert_revision(&db, "input", revision, collection, complete)?;
+                }
+            }
+            insert_revision(&db, "other", "unselected-other-input", 0, 1)?;
+            if let Some(revision) = unexpected {
+                insert_revision(&db, "input", revision, 9, 0)?;
+            }
+            for excluded in [None, Some("f-selected")] {
+                let allowed =
+                    |r: &str| ["b-selected", "f-selected"].contains(&r) && excluded != Some(r);
+                let original: Vec<String> = db
+                    .prepare(
+                        "SELECT DISTINCT revision FROM migration_retained_records WHERE input=?",
+                    )?
+                    .query_map(["input"], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let expected = original.iter().all(|r| allowed(r));
+                assert_eq!(
+                    validate_retained_roster(&db, "input", 2, allowed).is_ok(),
+                    expected,
+                    "unexpected={unexpected:?}, excluded={excluded:?}"
+                );
+                assert!(
+                    db.is_autocommit(),
+                    "success and errors release read snapshot"
+                );
+            }
+        }
+        let db = fixture()?;
+        validate_retained_roster(&db, "input", 0, |_| false)?;
+        insert_revision(&db, "input", "b-selected", 0, 0)?;
+        assert!(validate_retained_roster(&db, "input", 0, |_| true).is_err());
+        insert_revision(&db, "input", "f-selected", 0, 1)?;
+        // Even a permissive predicate cannot suppress the mandatory extra seek.
+        assert!(validate_retained_roster(&db, "input", 1, |_| true).is_err());
+        assert!(db.is_autocommit());
+        Ok(())
+    }
+
+    #[test]
+    fn retained_roster_seeks_scale_with_distinct_keys_not_payload_population() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mut work = Vec::new();
+        for copies in [1, 4096] {
+            let db = fixture()?;
+            db.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1),
+                revisions(r) AS (VALUES('a'),('m'),('z'))
+                INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete)
+                SELECT 'input',r,3,i,x'00',1,'digest','cursor',1 FROM revisions CROSS JOIN n", [copies])?;
+            for (sql, arguments, range) in [
+                (FIRST_RETAINED_REVISION, vec!["input"], "(input=?)"),
+                (
+                    NEXT_RETAINED_REVISION,
+                    vec!["input", "a"],
+                    "(input=? AND revision>?)",
+                ),
+            ] {
+                let plan = db
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                    .query_map(rusqlite::params_from_iter(arguments), |r| {
+                        r.get::<_, String>(3)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(
+                    plan.iter().any(
+                        |p| p.contains("USING COVERING INDEX migration_retained_page")
+                            && p.contains(range)
+                    ),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|p| p.contains("TEMP B-TREE")
+                        || p.starts_with("SCAN migration_retained_records")),
+                    "{plan:?}"
+                );
+            }
+            let ticks = Arc::new(AtomicUsize::new(0));
+            let observed = ticks.clone();
+            db.progress_handler(
+                1,
+                Some(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )?;
+            let mut revisions = Vec::new();
+            validate_retained_roster(&db, "input", 3, |r| {
+                revisions.push(r.to_owned());
+                true
+            })?;
+            db.progress_handler(0, None::<fn() -> bool>)?;
+            assert_eq!(revisions, ["a", "m", "z"]);
+            let steps = ticks.load(Ordering::Relaxed);
+            assert!(steps < 1000, "bounded four-seek work: {steps}");
+            work.push(steps);
+            let mut original = db.prepare(
+                "SELECT DISTINCT revision FROM migration_retained_records WHERE input=?",
+            )?;
+            let rows = original
+                .query_map(["input"], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(rows, revisions);
+            if copies == 4096 {
+                assert!(original.get_status(StatementStatus::VmStep) > 30_000);
+            }
+            eprintln!(
+                "retained roster copies_per_revision={copies}, seek_vm={steps}, original_vm={}",
+                original.get_status(StatementStatus::VmStep)
+            );
+        }
+        assert!(work[1] <= work[0] + 64, "work={work:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn retained_roster_seeks_share_one_snapshot_and_release_it_before_return() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("snapshot.sqlite3");
+        let db = Connection::open(&path)?;
+        db.pragma_update(None, "journal_mode", "WAL")?;
+        super::super::retention::install(&db)?;
+        super::super::lookup::install(&db)?;
+        db.execute(
+            "INSERT INTO migration_retention(id,seal,approval) VALUES('input',x'',x'')",
+            [],
+        )?;
+        insert_revision(&db, "input", "a", 0, 1)?;
+        let writer = Connection::open(&path)?;
+        let mut seen = Vec::new();
+        validate_retained_roster(&db, "input", 1, |r| {
+            seen.push(r.to_owned());
+            // The first seek has established the read snapshot. A concurrent
+            // commit must not alter the successor query's view of that roster.
+            insert_revision(&writer, "input", "", 0, 0).unwrap();
+            insert_revision(&writer, "input", "z", 0, 0).unwrap();
+            r == "a"
+        })?;
+        assert_eq!(seen, ["a"]);
+        assert!(db.is_autocommit());
+        assert!(validate_retained_roster(&db, "input", 1, |r| r == "a").is_err());
+        assert!(db.is_autocommit());
         Ok(())
     }
 }
