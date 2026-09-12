@@ -27,6 +27,8 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECORDS: usize = 100;
 const DICTIONARY: &str = "dictionary";
 
+mod candidates;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceRecord {
@@ -171,11 +173,35 @@ pub struct Projection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum NativeTarget {
-    Collection { id: String, revision: i64 },
-    Keyword { id: i64 },
-    Image { key: VariantKey, revision: i64 },
-    Synonym { keyword: i64 },
-    Retained { compatibility: Compatibility },
+    Collection {
+        id: String,
+        revision: i64,
+    },
+    Keyword {
+        id: i64,
+    },
+    Image {
+        key: VariantKey,
+        revision: i64,
+    },
+    /// A source-owned candidate, not a claim that the effective field or native
+    /// keyword membership selected this value. Keyword models contain the terms
+    /// processed so far, not a claim that the source membership walk is finished.
+    MetadataCandidate {
+        key: VariantKey,
+        revision: i64,
+        field: String,
+        observation_id: i64,
+        model_id: i64,
+        conflicted: bool,
+        value_retained_only: bool,
+    },
+    Synonym {
+        keyword: i64,
+    },
+    Retained {
+        compatibility: Compatibility,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,6 +759,42 @@ impl Catalog {
         };
         if let Some((reference, operation)) = operation {
             let expected = image(&self.db, &request.import_source, &reference)?;
+            if let Some(prepared) = candidates::prepare(
+                self,
+                source,
+                request,
+                &reference,
+                &expected,
+                &operation,
+                &mut evidence,
+            )? {
+                let _permit = self.writers.enter(Priority::Background)?;
+                let tx = self
+                    .db
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                evidence.recheck(&tx)?;
+                catalog_images::require_image_metadata_identity(&tx, &expected)?;
+                ensure!(
+                    image(&tx, &request.import_source, &reference)? == expected,
+                    "durable image endpoint changed"
+                );
+                if let Some((reference, id, kind, path)) = &keyword_guard {
+                    ensure!(
+                        keyword(&tx, &request.import_source, reference)?
+                            == (*id, *kind, path.clone()),
+                        "durable keyword endpoint changed"
+                    );
+                }
+                ensure!(
+                    existing(&tx, request, &digest)?.is_none(),
+                    "organization mapping advanced concurrently; retry"
+                );
+                let target = prepared.commit(&tx, &expected)?;
+                let proof = evidence.proof(request)?;
+                let result = save(&tx, request, &digest, &proof, target)?;
+                tx.commit()?;
+                return Ok(result);
+            }
             let mut saved = None;
             self.organize_image_with_commit(
                 &expected.key,
@@ -960,6 +1022,8 @@ mod tests {
     use crate::catalog_images::{ImageRole, ImportImageRequest};
     use crate::lightroom::migration_source::tests::Fixture;
 
+    mod candidate_tests;
+
     struct Bed {
         _temp: tempfile::TempDir,
         catalog: Catalog,
@@ -971,6 +1035,9 @@ mod tests {
     }
     impl Bed {
         fn new(ambiguous: bool) -> Result<Self> {
+            Self::with_incoming(ambiguous, 0)
+        }
+        fn with_incoming(ambiguous: bool, incoming: i64) -> Result<Self> {
             let mut fixture = Fixture::new();
             let revision = fixture.revision().to_owned();
             let specs = [
@@ -991,6 +1058,10 @@ mod tests {
                 (401, "AgLibraryCollectionImage"),
                 (500, "AgLibraryKeywordImage"),
                 (501, "AgLibraryKeywordImage"),
+                (502, "AgLibraryKeywordImage"),
+                (503, "AgLibraryKeywordImage"),
+                (504, "AgLibraryKeywordImage"),
+                (505, "AgLibraryKeywordImage"),
                 (600, "AgLibraryCollectionContent"),
                 (601, "Adobe_imageDevelopHistoryStep"),
             ];
@@ -1008,6 +1079,14 @@ mod tests {
                 (500, "tag", 201),
                 (501, "image", 300),
                 (501, "tag", 999),
+                (502, "image", 300),
+                (502, "tag", 203),
+                (503, "image", 301),
+                (503, "tag", 201),
+                (504, "image", 300),
+                (504, "tag", 201),
+                (505, "image", 300),
+                (505, "tag", 205),
             ];
             fixture.edit(|db|{
                 for (id,table) in specs {
@@ -1018,6 +1097,13 @@ mod tests {
                 for (id,field,target) in links {
                     let table=specs.iter().find(|(i,_)|*i==target).map_or("AgLibraryKeyword",|(_,t)|*t);
                     db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,?3,?4,?5)",params![revision,format!("row-{id}"),field,table,serde_json::to_string(&Cell::Integer(target)).unwrap()]).unwrap();
+                }
+                for i in 0..incoming {
+                    for (id,table) in [(10_000+i,"AgLibraryKeywordImage"),(20_000+i,"Adobe_imageDevelopHistoryStep")] {
+                        db.execute("INSERT INTO rows(revision,source_id,table_name,key_json,cells_json) VALUES(?1,?2,?3,?4,'[]')",params![revision,format!("row-{id}"),table,serde_json::to_string(&vec![Cell::Integer(id)]).unwrap()]).unwrap();
+                        db.execute("INSERT INTO entities VALUES(?1,?2,?3,?4,NULL,'{}')",params![revision,format!("row-{id}"),table,serde_json::to_string(&Cell::Integer(id)).unwrap()]).unwrap();
+                        db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,'image','Adobe_images',?3)",params![revision,format!("row-{id}"),serde_json::to_string(&Cell::Integer(300)).unwrap()]).unwrap();
+                    }
                 }
                 if ambiguous {
                     db.execute("INSERT INTO entities VALUES(?1,'duplicate-keyword','AgLibraryKeyword',?2,NULL,'{}')",params![revision,serde_json::to_string(&Cell::Integer(201)).unwrap()]).unwrap();
@@ -1050,42 +1136,56 @@ mod tests {
                 Collection::Entities,
                 Collection::References,
             ] {
-                for (sequence, record) in catalog.retained_migration_records(
-                    source.binding_blake3(),
-                    &revision,
-                    collection,
-                    0,
-                    100,
-                )? {
-                    let sid = field(&catalog.db, sequence, &record, "source_id")?;
-                    let Some(number) = sid.strip_prefix("row-").and_then(|s| s.parse::<i64>().ok())
-                    else {
-                        continue;
-                    };
-                    match collection {
-                        Collection::Rows => {
-                            rows.insert(
-                                number,
-                                SourceRecord {
-                                    retained_record: sequence,
-                                    source: SourceKey {
-                                        capture_revision: revision.clone(),
-                                        table: field(&catalog.db, sequence, &record, "table_name")?,
-                                        key: vec![Cell::Integer(number)],
+                let mut after = 0;
+                loop {
+                    let records = catalog.retained_migration_records(
+                        source.binding_blake3(),
+                        &revision,
+                        collection,
+                        after,
+                        100,
+                    )?;
+                    if records.is_empty() {
+                        break;
+                    }
+                    for (sequence, record) in records {
+                        after = sequence;
+                        let sid = field(&catalog.db, sequence, &record, "source_id")?;
+                        let Some(number) =
+                            sid.strip_prefix("row-").and_then(|s| s.parse::<i64>().ok())
+                        else {
+                            continue;
+                        };
+                        match collection {
+                            Collection::Rows => {
+                                rows.insert(
+                                    number,
+                                    SourceRecord {
+                                        retained_record: sequence,
+                                        source: SourceKey {
+                                            capture_revision: revision.clone(),
+                                            table: field(
+                                                &catalog.db,
+                                                sequence,
+                                                &record,
+                                                "table_name",
+                                            )?,
+                                            key: vec![Cell::Integer(number)],
+                                        },
                                     },
-                                },
-                            );
+                                );
+                            }
+                            Collection::Entities => {
+                                entities.insert(number, sequence);
+                            }
+                            Collection::References => {
+                                refs.insert(
+                                    (number, field(&catalog.db, sequence, &record, "field")?),
+                                    sequence,
+                                );
+                            }
+                            _ => unreachable!(),
                         }
-                        Collection::Entities => {
-                            entities.insert(number, sequence);
-                        }
-                        Collection::References => {
-                            refs.insert(
-                                (number, field(&catalog.db, sequence, &record, "field")?),
-                                sequence,
-                            );
-                        }
-                        _ => unreachable!(),
                     }
                 }
             }
