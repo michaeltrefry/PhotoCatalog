@@ -52,7 +52,7 @@ const GLOBAL_ID_CONFLICTS_PAGE: &str = "SELECT a.source_id,b.source_id,a.table_n
 
 // These indexes are part of schema 2, including partial-queue predicates. A
 // missing/replaced index must fail admission rather than silently restoring scans.
-fn validate_paging_indexes(db: &Connection) -> Result<()> {
+pub(super) fn validate_paging_indexes(db: &Connection) -> Result<()> {
     for definition in PAGING_INDEXES
         .split(';')
         .map(str::trim)
@@ -206,7 +206,7 @@ pub struct Plan {
 fn identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
-fn uri(path: &Path) -> Result<String> {
+pub(super) fn uri(path: &Path) -> Result<String> {
     let path = fs::canonicalize(path)?;
     #[cfg(unix)]
     let bytes = {

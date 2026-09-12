@@ -3,6 +3,7 @@
 pub mod adobe;
 pub mod capture;
 pub mod discovery;
+pub mod migration_source;
 pub mod plan;
 mod source;
 pub mod wal;
