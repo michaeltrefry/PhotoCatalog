@@ -33,7 +33,7 @@ pub enum Role {
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Decision {
     Register {
-        file: Link,
+        file: Box<Link>,
         role: Role,
         label: String,
     },
@@ -527,7 +527,7 @@ mod tests {
                 retained_table: self.tables["Adobe_images"],
                 import_source: "lightroom".into(),
                 decision: Decision::Register {
-                    file: self.link(id, "rootFile", 10),
+                    file: Box::new(self.link(id, "rootFile", 10)),
                     role: if id == 21 {
                         Role::Virtual {
                             master: self.link(id, "masterImage", 20),
