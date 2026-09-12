@@ -118,7 +118,23 @@ Clippy and package formatting passed. A quiescent APFS clone of the actual TEST
 database preserves its completed progress and epoch 424799 before repair; the
 source database remained unchanged. This recovery copy does not close S11.
 
-Actual repair has not run. Source catalogs and originals remain untouched.
+Source `46f56423` passed all four hosted CI jobs in run 34720501392. Actual TEST
+repair examined all 215,708 records, rebound 215,671 proven settings containers,
+and preserved 37 unchanged entries. All predecessor receipts and 16 reports remain
+archived. Reconciliation committed its first report, then stopped with SQLite
+interruption; one bounded unchanged-worker resume reproduced the interruption.
+Both workers were reaped without forced cleanup or an owner resource stop.
+Read-only checkpoints confirm the same capture index 1, epoch 424799, archive
+counts, and unchanged database content stamp after the failed resume.
+
+The destination-only query trace passed in 11.619 seconds and approximately
+34.286 million VM steps, but omitted source admission/counts and final operations;
+it does not establish the native failure's cause. Operation-specific error context
+now identifies source admission and each reconciliation query boundary, with SQL
+and limits unchanged. Independent source review and 33 focused tests passed,
+including original SQLite error identity and report/cursor rollback. The next
+instrumented attempt remains pending. The repair is not Complete. Source catalogs
+and originals remain untouched.
 Representative API readback, post-repair audit, final acceptance
 review, merge and terminal merged-head CI remain required for S10.
 S11 backup/restore and S12 Tauri interface retain their S10 dependencies;

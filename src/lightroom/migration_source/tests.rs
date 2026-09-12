@@ -421,10 +421,17 @@ fn vm_budget_interrupts_work_and_next_small_query_still_works() {
         },
     )
     .unwrap();
+    let error = source
+        .count(fixture.revision(), Collection::Entities)
+        .unwrap_err();
+    let detail = format!("{error:#}");
     assert!(
-        source
-            .count(fixture.revision(), Collection::Entities)
-            .is_err()
+        detail.contains("inspection source count collection=Entities"),
+        "{detail}"
+    );
+    assert!(detail.contains(fixture.revision()), "{detail}");
+    assert!(
+        matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::OperationInterrupted)
     );
     assert_eq!(
         source
@@ -671,4 +678,40 @@ fn stable_identity_rejects_blob_or_oversized_key_without_losing_raw_evidence() {
         );
     }
     assert_eq!(bytes, canonical.as_bytes());
+}
+
+#[test]
+fn admission_interruption_identifies_pending_path_operation() {
+    let mut fixture = Fixture::new();
+    let revision = fixture.revision().to_owned();
+    fixture.edit(|db| {
+        db.execute("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<20000) INSERT INTO paths(revision,source_id,original,state,evidence) SELECT ?1,printf('path-%08d',x),'fixture-only','available','{}' FROM n",[&revision]).unwrap();
+    });
+    let error = MigrationSource::open(
+        fixture.seal.clone(),
+        ReadLimits {
+            vm_steps: 10_000,
+            ..ReadLimits::default()
+        },
+    )
+    .err()
+    .expect("bounded admission must interrupt");
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("sealed inspection SQL admission"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("source admission pending paths revision="),
+        "{detail}"
+    );
+    assert!(detail.contains(&revision), "{detail}");
+    assert!(
+        matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::OperationInterrupted)
+    );
+    // Error context does not change source state or prevent fresh normal admission.
+    assert_eq!(
+        fixture.open().count(&revision, Collection::Paths).unwrap(),
+        20001
+    );
 }

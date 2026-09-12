@@ -350,11 +350,16 @@ fn main() -> Result<()> {
                     open_deadline_ms: source_open_seconds * 1000,
                     ..ReadLimits::default()
                 },
-            )?;
+            )
+            .context("open and admit sealed inspection source")?;
             let _lock = lock_destination(&destination)?;
-            preflight_repair_upgrade(&destination, source.binding_blake3(), &request)?;
-            let mut catalog = Catalog::open(&destination)?;
-            let mut progress = catalog.begin_current_develop_repair(&source, &request)?;
+            preflight_repair_upgrade(&destination, source.binding_blake3(), &request)
+                .context("preflight current-settings repair destination")?;
+            let mut catalog =
+                Catalog::open(&destination).context("open current-settings repair destination")?;
+            let mut progress = catalog
+                .begin_current_develop_repair(&source, &request)
+                .context("begin or resume current-settings repair")?;
             let started = Instant::now();
             let deadline = started + Duration::from_secs(max_seconds);
             let mut steps = 0;
@@ -362,7 +367,13 @@ fn main() -> Result<()> {
             let mut last_report = Instant::now();
             while !progress.complete && steps < max_steps && Instant::now() < deadline && !stopped {
                 progress = catalog
-                    .step_current_develop_repair(&source, &progress.id)?
+                    .step_current_develop_repair(&source, &progress.id)
+                    .with_context(|| {
+                        format!(
+                            "current-settings repair phase={:?} after_record={} examined={}",
+                            progress.phase, progress.after_record, progress.examined
+                        )
+                    })?
                     .progress;
                 steps += 1;
                 stopped = stop_requested(stop_file.as_deref())?;
@@ -471,7 +482,8 @@ fn main() -> Result<()> {
                     open_deadline_ms: source_open_seconds * 1000,
                     ..ReadLimits::default()
                 },
-            )?;
+            )
+            .context("open and admit sealed inspection source")?;
             let _lock = lock_destination(&destination)?;
             let mut catalog = Catalog::open(&destination)?;
             let mut progress: Progress =

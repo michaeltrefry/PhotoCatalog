@@ -427,7 +427,9 @@ impl MigrationSource {
             limits,
             poisoned: Flag::new(false),
         };
-        value.operation(|| value.admit())?;
+        value
+            .operation(|| value.admit())
+            .context("sealed inspection SQL admission")?;
         Ok(value)
     }
 
@@ -474,9 +476,16 @@ impl MigrationSource {
     fn admit(&self) -> Result<()> {
         let app: i64 = self
             .db
-            .query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let encoding: String = self.db.query_row("PRAGMA encoding", [], |r| r.get(0))?;
+            .query_row("PRAGMA application_id", [], |r| r.get(0))
+            .context("source admission application ID")?;
+        let version: i64 = self
+            .db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("source admission schema version")?;
+        let encoding: String = self
+            .db
+            .query_row("PRAGMA encoding", [], |r| r.get(0))
+            .context("source admission encoding")?;
         ensure!(
             encoding == "UTF-8",
             "schema3 evidence requires UTF-8 SQLite text storage"
@@ -498,16 +507,19 @@ impl MigrationSource {
             "schema_objects",
             "family_choices",
         ] {
-            let valid: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1 AND rootpage>0 AND upper(sql) NOT LIKE 'CREATE VIRTUAL%')", [table], |r| r.get(0))?;
+            let valid: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1 AND rootpage>0 AND upper(sql) NOT LIKE 'CREATE VIRTUAL%')", [table], |r| r.get(0)).with_context(|| format!("source admission ordinary table={table}"))?;
             ensure!(valid, "missing ordinary inspection table: {table}");
         }
-        plan::validate_paging_indexes(&self.db)?;
+        plan::validate_paging_indexes(&self.db).context("source admission paging indexes")?;
         let mut rows = self
             .db
-            .prepare("SELECT revision FROM captures ORDER BY revision LIMIT 16385")?;
+            .prepare("SELECT revision FROM captures ORDER BY revision LIMIT 16385")
+            .context("prepare source admission capture roster")?;
         let actual = rows
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            .query_map([], |r| r.get::<_, String>(0))
+            .context("query source admission capture roster")?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .context("read source admission capture roster")?;
         let expected = self
             .seal
             .selected
@@ -520,33 +532,53 @@ impl MigrationSource {
             "selected/excluded capture partition differs from sealed plan"
         );
         for entry in &self.seal.selected {
-            let (revision, evidence, reason): (String, String, String) = self.db.query_row(
-                "SELECT revision,evidence_digest,reason FROM family_choices WHERE family=?",
-                [&entry.family],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
+            let (revision, evidence, reason): (String, String, String) = self
+                .db
+                .query_row(
+                    "SELECT revision,evidence_digest,reason FROM family_choices WHERE family=?",
+                    [&entry.family],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .with_context(|| {
+                    format!("source admission family choice revision={}", entry.revision)
+                })?;
             ensure!(
                 revision == entry.revision
                     && evidence == entry.family_evidence_digest
                     && !reason.trim().is_empty(),
                 "family choice differs from approved selection"
             );
-            let (stage, current): (String, i64) = self.db.query_row(
-                "SELECT stage,evidence_revision FROM captures WHERE revision=?",
-                [&entry.revision],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let (stage, current): (String, i64) = self
+                .db
+                .query_row(
+                    "SELECT stage,evidence_revision FROM captures WHERE revision=?",
+                    [&entry.revision],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .with_context(|| {
+                    format!("source admission capture state revision={}", entry.revision)
+                })?;
             ensure!(
                 stage == "inspection_complete_with_reported_gaps"
                     && current == entry.evidence_revision,
                 "selected inspection not complete or evidence changed"
             );
-            let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM paths WHERE revision=? AND (state IN ('pending','available_packets_uninspected') OR json_extract(evidence,'$.embedded_sidecar_xmp') IS NOT NULL))", [&entry.revision], |r| r.get(0))?;
+            let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM paths WHERE revision=? AND (state IN ('pending','available_packets_uninspected') OR json_extract(evidence,'$.embedded_sidecar_xmp') IS NOT NULL))", [&entry.revision], |r| r.get(0)).with_context(|| format!("source admission pending paths revision={}", entry.revision))?;
             ensure!(!pending, "selected path/packet inspection remains pending");
-            self.manifest_inner(&entry.revision)?;
+            self.manifest_inner(&entry.revision).with_context(|| {
+                format!(
+                    "source admission capture manifest revision={}",
+                    entry.revision
+                )
+            })?;
         }
         for supplement in &self.seal.supplements {
-            self.admit_supplement(supplement)?;
+            self.admit_supplement(supplement).with_context(|| {
+                format!(
+                    "source admission supplement revision={} origin={}",
+                    supplement.revision, supplement.origin
+                )
+            })?;
         }
         Ok(())
     }
@@ -885,6 +917,9 @@ impl MigrationSource {
                 |r| r.get(0),
             )?;
             Ok(count.try_into()?)
+        })
+        .with_context(|| {
+            format!("inspection source count collection={collection:?} revision={revision}")
         })
     }
 

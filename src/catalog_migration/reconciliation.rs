@@ -204,18 +204,37 @@ pub(crate) fn step(
     source: &MigrationSource,
     before: &Progress,
 ) -> Result<Step> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(30);
     let mut ticks = 0u64;
-    catalog.db.progress_handler(
-        1000,
-        Some(move || {
-            ticks += 1;
-            ticks > 100000 || std::time::Instant::now() >= deadline
-        }),
-    )?;
+    catalog
+        .db
+        .progress_handler(
+            1000,
+            Some(move || {
+                ticks += 1;
+                ticks > 100000 || std::time::Instant::now() >= deadline
+            }),
+        )
+        .context("install reconciliation destination query budget")?;
     let result = step_inner(catalog, source, before);
-    catalog.db.progress_handler(0, None::<fn() -> bool>)?;
-    result
+    catalog
+        .db
+        .progress_handler(0, None::<fn() -> bool>)
+        .context("remove reconciliation destination query budget")?;
+    result.with_context(|| {
+        format!(
+            "reconciliation capture_index={} revision={} elapsed_seconds={:.3}",
+            before.capture_index,
+            source
+                .seal()
+                .selected
+                .get(before.capture_index)
+                .map(|capture| capture.revision.as_str())
+                .unwrap_or("final-roster"),
+            started.elapsed().as_secs_f64()
+        )
+    })
 }
 fn epoch(db: &Connection) -> Result<i64> {
     Ok(db.query_row(
@@ -225,12 +244,15 @@ fn epoch(db: &Connection) -> Result<i64> {
     )?)
 }
 fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress) -> Result<Step> {
-    let snapshot_epoch = epoch(&catalog.db)?;
-    let stale: bool = catalog.db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM migration_reconciliation WHERE run=?1 AND epoch<>?2)",
-        params![before.id, snapshot_epoch],
-        |r| r.get(0),
-    )?;
+    let snapshot_epoch = epoch(&catalog.db).context("read reconciliation mapping epoch")?;
+    let stale: bool = catalog
+        .db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM migration_reconciliation WHERE run=?1 AND epoch<>?2)",
+            params![before.id, snapshot_epoch],
+            |r| r.get(0),
+        )
+        .context("check stale reconciliation reports")?;
     if stale {
         let mut reset = before.clone();
         reset.capture_index = 0;
@@ -239,23 +261,28 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         let _permit = catalog.writers.enter(Priority::Background)?;
         let tx = catalog
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin reconciliation report/cursor transaction")?;
         ensure!(
-            epoch(&tx)? == snapshot_epoch,
+            epoch(&tx).context("recheck reconciliation mapping epoch before commit")?
+                == snapshot_epoch,
             "mapping generation changed; retry reconciliation"
         );
         ensure!(
             tx.execute(
                 "UPDATE migration_runs SET progress=?3 WHERE id=?1 AND progress=?2",
                 params![before.id, old, new]
-            )? == 1,
+            )
+            .context("reset stale reconciliation cursor")?
+                == 1,
             "reconciliation cursor changed; retry"
         );
         tx.execute(
             "DELETE FROM migration_reconciliation WHERE run=?",
             [&before.id],
-        )?;
-        tx.commit()?;
+        )
+        .context("delete stale reconciliation reports")?;
+        tx.commit().context("commit stale reconciliation reset")?;
         return Ok(Step {
             progress: reset,
             outcome: None,
@@ -268,11 +295,14 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         "reconciliation source binding differs"
     );
     if before.capture_index == source.seal().selected.len() {
-        let count: i64 = catalog.db.query_row(
-            "SELECT count(*) FROM migration_reconciliation WHERE run=?",
-            [&before.id],
-            |r| r.get(0),
-        )?;
+        let count: i64 = catalog
+            .db
+            .query_row(
+                "SELECT count(*) FROM migration_reconciliation WHERE run=?",
+                [&before.id],
+                |r| r.get(0),
+            )
+            .context("count final reconciliation reports")?;
         ensure!(
             usize::try_from(count)? == source.seal().selected.len(),
             "capture report roster differs"
@@ -289,12 +319,16 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
                         .iter()
                         .any(|excluded| excluded == r)
             },
-        )?;
-        let supplements: i64 = catalog.db.query_row(
-            "SELECT count(*) FROM migration_run_supplements WHERE run=?",
-            [&before.id],
-            |r| r.get(0),
-        )?;
+        )
+        .context("validate final retained revision roster")?;
+        let supplements: i64 = catalog
+            .db
+            .query_row(
+                "SELECT count(*) FROM migration_run_supplements WHERE run=?",
+                [&before.id],
+                |r| r.get(0),
+            )
+            .context("count final supplemental custody roster")?;
         ensure!(
             usize::try_from(supplements)? == source.seal().supplements.len(),
             "final supplemental custody roster differs"
@@ -306,19 +340,24 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         let _permit = catalog.writers.enter(Priority::Background)?;
         let tx = catalog
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin reconciliation report/cursor transaction")?;
         ensure!(
-            epoch(&tx)? == snapshot_epoch,
+            epoch(&tx).context("recheck reconciliation mapping epoch before commit")?
+                == snapshot_epoch,
             "mapping generation changed before final completion"
         );
         ensure!(
             tx.execute(
                 "UPDATE migration_runs SET progress=?3 WHERE id=?1 AND progress=?2",
                 params![before.id, old, new]
-            )? == 1,
+            )
+            .context("update final reconciliation cursor")?
+                == 1,
             "reconciliation cursor changed before completion"
         );
-        tx.commit()?;
+        tx.commit()
+            .context("commit final reconciliation completion")?;
         return Ok(Step {
             progress: after,
             outcome: None,
@@ -355,12 +394,17 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         (Collection::MetadataFacts, 8),
         (Collection::Issues, 9),
     ] {
-        let expected = source.count(&capture.revision, collection)?;
-        let actual: i64 = catalog.db.query_row(
-            RETAINED_COMPLETE_COUNT,
-            params![before.input, capture.revision, ordinal],
-            |r| r.get(0),
-        )?;
+        let expected = source
+            .count(&capture.revision, collection)
+            .with_context(|| format!("source {collection:?} count"))?;
+        let actual: i64 = catalog
+            .db
+            .query_row(
+                RETAINED_COMPLETE_COUNT,
+                params![before.input, capture.revision, ordinal],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("destination retained {collection:?} count"))?;
         ensure!(
             u64::try_from(actual)? == expected,
             "selected {collection:?} source/destination count differs"
@@ -396,21 +440,28 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         let table = stage
             .table()
             .context("reconciliation walk stage has no table")?;
-        let expected:i64=catalog.db.query_row("SELECT count(*) FROM migration_record_lookup WHERE input=?1 AND revision=?2 AND collection=3 AND table_name=?3",params![before.input,capture.revision,table],|r|r.get(0))?;
+        let expected:i64=catalog.db.query_row("SELECT count(*) FROM migration_record_lookup WHERE input=?1 AND revision=?2 AND collection=3 AND table_name=?3",params![before.input,capture.revision,table],|r|r.get(0))
+            .with_context(|| format!("destination {stage:?} expected lookup count"))?;
         let key = serde_json::to_string(&stage)?;
         let actual: i64 = catalog.db.query_row(
             "SELECT count(*) FROM migration_run_items WHERE run=?1 AND stage=?2 AND revision=?3",
             params![before.id, key, capture.revision],
             |r| r.get(0),
-        )?;
+        ).with_context(|| format!("destination {stage:?} actual walk count"))?;
         ensure!(expected == actual, "source walk {stage:?} count differs");
         report
             .walked
             .insert(format!("{stage:?}"), u64::try_from(actual)?);
-        let mut statement=catalog.db.prepare("SELECT COALESCE(json_extract(outcome,'$.Retained.reason'),json_extract(outcome,'$.Metadata.state'),json_extract(outcome,'$.FileMetadata.state'),json_extract(outcome,'$.Image.kind'),'projected_or_role_skipped'),count(*) FROM migration_run_items WHERE run=?1 AND stage=?2 AND revision=?3 GROUP BY 1 LIMIT 257")?;
-        let mut rows = statement.query(params![before.id, key, capture.revision])?;
+        let mut statement=catalog.db.prepare("SELECT COALESCE(json_extract(outcome,'$.Retained.reason'),json_extract(outcome,'$.Metadata.state'),json_extract(outcome,'$.FileMetadata.state'),json_extract(outcome,'$.Image.kind'),'projected_or_role_skipped'),count(*) FROM migration_run_items WHERE run=?1 AND stage=?2 AND revision=?3 GROUP BY 1 LIMIT 257")
+            .with_context(|| format!("prepare destination {stage:?} classifications"))?;
+        let mut rows = statement
+            .query(params![before.id, key, capture.revision])
+            .with_context(|| format!("query destination {stage:?} classifications"))?;
         let mut groups = 0usize;
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows
+            .next()
+            .with_context(|| format!("read destination {stage:?} classifications"))?
+        {
             groups += 1;
             ensure!(
                 groups <= 256,
@@ -438,34 +489,35 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
                 .insert(key, u64::try_from(row.get::<_, i64>(1)?)?);
         }
     }
-    let (_, policy) = importer::read(&catalog.db, &before.id)?;
+    let (_, policy) =
+        importer::read(&catalog.db, &before.id).context("read reconciliation import policy")?;
     report.native_images = u64::try_from(catalog.db.query_row(
         "SELECT count(*) FROM image_import_map WHERE import_source=?1 AND capture_revision=?2",
         params![policy.import_source, capture.revision],
         |r| r.get::<_, i64>(0),
-    )?)?;
-    report.native_original_mappings=u64::try_from(catalog.db.query_row("SELECT count(*) FROM migration_originals WHERE import_source=?1 AND json_extract(source_json,'$.capture_revision')=?2",params![policy.import_source,capture.revision],|r|r.get::<_,i64>(0))?)?;
-    let expected_images:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage IN ('\"Masters\"','\"VirtualCopies\"') AND json_extract(outcome,'$.Image.kind')='Image'",params![before.id,capture.revision],|r|r.get(0))?;
-    let expected_files:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage='\"Files\"' AND json_type(outcome,'$.Original')='object'",params![before.id,capture.revision],|r|r.get(0))?;
+    ).context("count native image mappings")?)?;
+    report.native_original_mappings=u64::try_from(catalog.db.query_row("SELECT count(*) FROM migration_originals WHERE import_source=?1 AND json_extract(source_json,'$.capture_revision')=?2",params![policy.import_source,capture.revision],|r|r.get::<_,i64>(0)).context("count native original mappings")?)?;
+    let expected_images:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage IN ('\"Masters\"','\"VirtualCopies\"') AND json_extract(outcome,'$.Image.kind')='Image'",params![before.id,capture.revision],|r|r.get(0)).context("count expected native image mappings")?;
+    let expected_files:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage='\"Files\"' AND json_type(outcome,'$.Original')='object'",params![before.id,capture.revision],|r|r.get(0)).context("count expected native original mappings")?;
     ensure!(
         report.native_images == u64::try_from(expected_images)?
             && report.native_original_mappings == u64::try_from(expected_files)?,
         "native source mappings differ from successful source receipts"
     );
-    let captures = catalog.retained_migration_records(
-        &before.input,
-        &capture.revision,
-        Collection::Captures,
-        0,
-        2,
-    )?;
+    let captures = catalog
+        .retained_migration_records(&before.input, &capture.revision, Collection::Captures, 0, 2)
+        .context("read retained capture custody roster")?;
     ensure!(
         captures.len() == 1,
         "selected capture custody roster differs"
     );
-    let manifest = source.capture_manifest(&capture.revision)?;
+    let manifest = source
+        .capture_manifest(&capture.revision)
+        .context("read source capture manifest")?;
     for member in 0..manifest.artifacts.len() {
-        let (descriptor, state) = catalog.migration_artifact(captures[0].0, member)?;
+        let (descriptor, state) = catalog
+            .migration_artifact(captures[0].0, member)
+            .with_context(|| format!("read captured artifact custody member={member}"))?;
         ensure!(
             descriptor.selected_input == before.input
                 && descriptor.capture_revision == capture.revision
@@ -478,7 +530,8 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         );
     }
     report.raw_artifacts = manifest.artifacts.len();
-    report.supplements = supplement_reports(catalog, source, before, &policy, &capture.revision)?;
+    report.supplements = supplement_reports(catalog, source, before, &policy, &capture.revision)
+        .context("reconcile supplemental custody and projections")?;
     let bytes = crate::lightroom::bounded_json(&report, 8 * 1024 * 1024)?;
     after.capture_index += 1;
     let old = crate::lightroom::bounded_json(before, 8 * 1024 * 1024)?;
@@ -486,23 +539,28 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
     let _permit = catalog.writers.enter(Priority::Background)?;
     let tx = catalog
         .db
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("begin reconciliation report/cursor transaction")?;
     ensure!(
-        epoch(&tx)? == snapshot_epoch,
+        epoch(&tx).context("recheck reconciliation mapping epoch before commit")? == snapshot_epoch,
         "native mappings changed during reconciliation; retry"
     );
     ensure!(
         tx.execute(
             "UPDATE migration_runs SET progress=?3 WHERE id=?1 AND progress=?2",
             params![before.id, old, new]
-        )? == 1,
+        )
+        .context("update capture reconciliation cursor")?
+            == 1,
         "reconciliation cursor changed; retry"
     );
     tx.execute(
         "INSERT INTO migration_reconciliation VALUES(?1,?2,?3,?4)",
         params![before.id, capture.revision, bytes, snapshot_epoch],
-    )?;
-    tx.commit()?;
+    )
+    .context("insert capture reconciliation report")?;
+    tx.commit()
+        .context("commit capture reconciliation report and cursor")?;
     Ok(Step {
         progress: after,
         outcome: None,

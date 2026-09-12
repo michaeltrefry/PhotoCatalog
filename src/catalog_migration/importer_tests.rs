@@ -586,14 +586,38 @@ fn wrong_source_approval_and_corrupt_native_counts_cannot_complete() -> Result<(
     let mut worker = Worker::new(&source, &run.id, ImportFixture::limits())?;
     drive(&mut worker, &mut catalog, Stage::Reconciliation)?;
     let before = catalog.selected_import_progress(&run.id)?;
-    catalog.db.execute("DELETE FROM image_import_map WHERE rowid=(SELECT rowid FROM image_import_map WHERE capture_revision=? LIMIT 1)",[&fixture.inspection.seal.selected[0].revision])?;
+    catalog.db.execute_batch("CREATE TRIGGER reject_reconciliation_report BEFORE INSERT ON migration_reconciliation BEGIN SELECT RAISE(ABORT,'fixture report commit failure'); END;")?;
+    let error = worker.step(&mut catalog, &|| false).unwrap_err();
+    let detail = format!("{error:#}");
     assert!(
-        worker
-            .step(&mut catalog, &|| false)
-            .unwrap_err()
-            .to_string()
-            .contains("native source mappings")
+        detail.contains("reconciliation capture_index=0"),
+        "{detail}"
     );
+    assert!(
+        detail.contains(&fixture.inspection.seal.selected[0].revision),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("insert capture reconciliation report"),
+        "{detail}"
+    );
+    assert!(detail.contains("fixture report commit failure"), "{detail}");
+    assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+    assert_eq!(
+        serde_json::to_vec(&catalog.selected_import_progress(&run.id)?)?,
+        serde_json::to_vec(&before)?
+    );
+    assert_eq!(
+        count(&catalog, "SELECT count(*) FROM migration_reconciliation")?,
+        0
+    );
+    assert!(catalog.db.is_autocommit());
+    catalog
+        .db
+        .execute_batch("DROP TRIGGER reject_reconciliation_report")?;
+    catalog.db.execute("DELETE FROM image_import_map WHERE rowid=(SELECT rowid FROM image_import_map WHERE capture_revision=? LIMIT 1)",[&fixture.inspection.seal.selected[0].revision])?;
+    let error = worker.step(&mut catalog, &|| false).unwrap_err();
+    assert!(format!("{error:#}").contains("native source mappings"));
     assert_eq!(
         serde_json::to_vec(&catalog.selected_import_progress(&run.id)?)?,
         serde_json::to_vec(&before)?
