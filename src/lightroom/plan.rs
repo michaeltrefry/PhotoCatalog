@@ -2674,7 +2674,7 @@ mod bounded_plan_tests {
             .global_id_conflicts("left", "right", "", "", 1000)
             .unwrap();
         assert_eq!(first.len(), 1, "byte limit, not row limit, ends the page");
-        assert!(serde_json::to_vec(&first).unwrap().len() + 1 <= super::super::PAGE_BYTES);
+        assert!(serde_json::to_vec(&first).unwrap().len() < super::super::PAGE_BYTES);
         assert_eq!(first[0]["right_source_id"], "b1");
         let second = plan
             .global_id_conflicts("left", "right", "a", "b1", 1000)
