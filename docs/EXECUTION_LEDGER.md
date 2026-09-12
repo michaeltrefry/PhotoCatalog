@@ -411,3 +411,5 @@ sc-22844 | In Progress | second selected slice clean pause a13dae5c:378 successe
 sc-22844 | In Progress | selected PACKETS complete:209091refs/16checks,1044successfulcommands/3slices, next28196; session25675terminal0/reaped | resultevidence8a4ecb9c/outputd849361a/auditeb2acd60; independent actual review pending | final TEST choices/report not yet run;48657missing +5467availablepacketgaps require explicit finalreport; no migration.
 
 sc-22844 | In Progress | selected terminal independent2981479b PASS;6112 appendixrecords capacityprepared | finalizerv2 active session96719 requestda3dec86/outerb29cafd3/admissionb2588c1b | TEST derived-plan choices only, no migration; wait actualterminal and independentfinalreportreview.
+
+sc-22844 | In Progress | TESTfinalizerterminal0/reaped session96719,157 successfulcalls,16choices,68pathpairs,6112indexedpages | FINALIZED_TEST_WITH_NAMED_GAPS:8271globalIDpairs/sample1000 | paginatedendpointfix underway on isolatedbranch; independentfinalizerreview pending; exact5467gapclassification pinned a12d97e5; no migration.
