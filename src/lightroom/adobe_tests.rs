@@ -409,3 +409,124 @@ fn unqualified_crop_coordinates_not_rejected_using_native_units() {
     }
     assert_eq!(r.contribution, RecipeContribution::default());
 }
+
+#[test]
+fn catalog_container_selection_uses_outer_grammar_only() -> Result<()> {
+    for (text, path) in [
+        ("{ProcessVersion='11.0',Exposure2012=1}", vec![]),
+        ("return {ProcessVersion='11.0',Exposure2012=1};", vec![]),
+        (
+            "-- outer assignment\ns = {ProcessVersion='11.0',Exposure2012=1}; -- end",
+            vec![Key::Name("s".into())],
+        ),
+    ] {
+        let selected = catalog_settings_path(text.as_bytes(), Limits::default())??;
+        assert_eq!(selected, path);
+        let mut i = input(text.as_bytes(), Format::CatalogData);
+        i.settings_path = selected;
+        assert_eq!(
+            extract(text.as_bytes(), i, Limits::default())?
+                .contribution
+                .exposure_ev,
+            Some(1.0)
+        );
+    }
+    // Same apparent property address, different outer syntax: never infer `s`
+    // by searching property paths or nested ProcessVersion values.
+    for text in [
+        "{s={ProcessVersion='11.0',Exposure2012=1}}",
+        "return {s={ProcessVersion='11.0',Exposure2012=1}}",
+        "s={history={ProcessVersion='11.0',Exposure2012=1}}",
+    ] {
+        let mut i = input(text.as_bytes(), Format::CatalogData);
+        i.settings_path = catalog_settings_path(text.as_bytes(), Limits::default())??;
+        assert_eq!(
+            extract(text.as_bytes(), i, Limits::default())?.contribution,
+            RecipeContribution::default()
+        );
+    }
+    for text in [
+        "other={ProcessVersion='11.0',Exposure2012=1}",
+        "S={ProcessVersion='11.0',Exposure2012=1}",
+    ] {
+        assert_eq!(
+            catalog_settings_path(text.as_bytes(), Limits::default())?
+                .unwrap_err()
+                .kind,
+            FailureKind::Conflict
+        );
+        assert_eq!(catalog(text).contribution, RecipeContribution::default());
+    }
+    // Explicit callers retain their exact selected path; extraction never
+    // silently substitutes the new coordinator selection.
+    assert_eq!(
+        catalog("s={ProcessVersion='11.0',Exposure2012=1}").contribution,
+        RecipeContribution::default()
+    );
+    let text = "other={ProcessVersion='11.0',Exposure2012=1}";
+    let mut i = input(text.as_bytes(), Format::CatalogData);
+    i.settings_path = vec![Key::Name("other".into())];
+    assert_eq!(
+        extract(text.as_bytes(), i, Limits::default())?
+            .contribution
+            .exposure_ev,
+        Some(1.0)
+    );
+    Ok(())
+}
+
+#[test]
+fn catalog_container_selection_keeps_limits_and_translation_gates() -> Result<()> {
+    for text in [
+        "s={}; execute()",
+        "s={Exposure2012=1,Exposure2012=2}",
+        "s={Exposure2012=",
+        "s = function() return {} end",
+    ] {
+        assert!(catalog_settings_path(text.as_bytes(), Limits::default())?.is_err());
+        assert_eq!(catalog(text).contribution, RecipeContribution::default());
+    }
+    let text = "s={ProcessVersion='11.0',Exposure2012=1}";
+    for limits in [
+        Limits {
+            bytes: 8,
+            ..Limits::default()
+        },
+        Limits {
+            tokens: 2,
+            ..Limits::default()
+        },
+        Limits {
+            properties: 1,
+            ..Limits::default()
+        },
+        Limits {
+            string_bytes: 2,
+            ..Limits::default()
+        },
+    ] {
+        assert_eq!(
+            catalog_settings_path(text.as_bytes(), limits)?
+                .unwrap_err()
+                .kind,
+            FailureKind::ResourceLimit
+        );
+    }
+    for body in [
+        "ProcessVersion='15.4',Exposure2012=1",
+        "ProcessVersion='6.7',Exposure=1",
+        "ProcessVersion='10.0',Exposure2012=1",
+        "ProcessVersion='11.0',Exposure2012=1,EnableExposure=false",
+    ] {
+        let text = format!("s={{{body},history={{ProcessVersion='11.0',Exposure2012=4}}}}");
+        let mut i = input(text.as_bytes(), Format::CatalogData);
+        i.settings_path = catalog_settings_path(text.as_bytes(), Limits::default())??;
+        assert_eq!(
+            extract(text.as_bytes(), i, Limits::default())?
+                .contribution
+                .exposure_ev,
+            None
+        );
+    }
+    Ok(())
+}

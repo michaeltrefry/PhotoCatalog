@@ -59,7 +59,16 @@ pub(super) fn number(text: &str) -> Parsed<f64> {
     }
     Ok(n)
 }
-pub(super) fn parse(bytes: &[u8], limits: Limits) -> Parsed<Vec<Property>> {
+pub(super) enum Root {
+    Bare,
+    Return,
+    Assignment(String),
+}
+pub(super) struct ParsedData {
+    pub properties: Vec<Property>,
+    pub root: Root,
+}
+pub(super) fn parse(bytes: &[u8], limits: Limits) -> Parsed<ParsedData> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| Failure::syntax("catalog data must be UTF-8"))?;
     let mut p = Parser {
@@ -71,12 +80,16 @@ pub(super) fn parse(bytes: &[u8], limits: Limits) -> Parsed<Vec<Property>> {
     };
     p.space()?;
     let mut path = vec![];
+    let mut root = Root::Bare;
     if p.peek() != Some(b'{') {
         let name = p.identifier()?;
         p.space()?;
         if name != "return" {
             p.take(b'=')?;
+            root = Root::Assignment(name.clone());
             path.push(Key::Name(name));
+        } else {
+            root = Root::Return;
         }
     }
     p.space()?;
@@ -94,7 +107,10 @@ pub(super) fn parse(bytes: &[u8], limits: Limits) -> Parsed<Vec<Property>> {
     if p.at != text.len() {
         return Err(Failure::syntax("trailing executable or unsupported data"));
     }
-    Ok(p.out)
+    Ok(ParsedData {
+        properties: p.out,
+        root,
+    })
 }
 struct Parser<'a> {
     text: &'a str,

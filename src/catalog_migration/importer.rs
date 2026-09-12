@@ -483,6 +483,7 @@ impl Catalog {
             params![id, progress.input, policy_bytes, encoded],
         )?;
         let (old, old_policy) = read(&tx, &id)?;
+        super::current_repair::require_not_pending(&tx, &id)?;
         ensure!(
             old.input == source.binding_blake3() && encode(&old_policy)? == policy_bytes,
             "migration run identity differs"
@@ -497,6 +498,7 @@ impl Catalog {
     /// file is opened. Callers may cancel between steps without losing receipts.
     pub fn step_selected_import(&mut self, source: &MigrationSource, id: &str) -> Result<Step> {
         let (before, policy) = read(&self.db, id)?;
+        super::current_repair::require_not_pending(&self.db, id)?;
         ensure!(
             before.input == source.binding_blake3(),
             "migration source binding differs"
@@ -910,6 +912,7 @@ fn metadata(
             import_source: policy.import_source.clone(),
             expected_edit_revision: 0,
         };
+        let request = catalog.prepare_migration_current_develop(request)?;
         Ok(RowResult::Applied(metadata_outcome(
             catalog.project_migration_current_develop(Some(source), &request)?,
         )))

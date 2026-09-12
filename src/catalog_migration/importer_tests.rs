@@ -67,6 +67,9 @@ struct ImportFixture {
 }
 impl ImportFixture {
     fn new(oversized: bool) -> Result<Self> {
+        Self::with_wrapper(oversized, false)
+    }
+    fn with_wrapper(oversized: bool, wrapped: bool) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let absolute = fs::canonicalize(root.path())?;
         let mut paths = Vec::new();
@@ -164,7 +167,7 @@ impl ImportFixture {
                     for (key,file,master,ev) in [(20,10,0,1.0),(21,10,20,-1.0),(22,11,0,2.0)] {
                         let settings = key+10;
                         row(db,revision,"Adobe_images",key,vec![id(key),id(file),id(master),cell("JPEG"),id(settings),cell(if master==0 {"Original"} else {"Virtual"}),id(if key==21 {2}else{4}),id(1),cell("Green")])?;
-                        row(db,revision,"Adobe_imageDevelopSettings",settings,vec![id(settings),cell(&format!("{{ProcessVersion='11.0',Exposure2012={},UnknownPlugin={{opaque='keep'}}}}",ev+index as f64*0.25))])?;
+                        row(db,revision,"Adobe_imageDevelopSettings",settings,vec![id(settings),cell(&format!("{}{{ProcessVersion='11.0',Exposure2012={},UnknownPlugin={{opaque='keep'}}}}",if wrapped {"s = "} else {""},ev+index as f64*0.25))])?;
                         link(db,revision,"Adobe_images",key,"rootFile","AgLibraryFile",file)?;
                         link(db,revision,"Adobe_images",key,"developSettingsIDCache","Adobe_imageDevelopSettings",settings)?;
                         if master!=0 { link(db,revision,"Adobe_images",key,"masterImage","Adobe_images",master)?; }
@@ -625,3 +628,87 @@ fn oversized_image_name_cells_and_key_are_retained_without_cursor_stall() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn wrapped_current_settings_cross_worker_render_and_reopen() -> Result<()> {
+    let fixture = ImportFixture::with_wrapper(false, true)?;
+    let source = fixture.inspection.open();
+    let mut catalog = fixture.open()?;
+    let run = catalog.begin_selected_import(&source, APPROVAL, &fixture.policy)?;
+    let mut worker = Worker::new(&source, &run.id, ImportFixture::limits())?;
+    drive(&mut worker, &mut catalog, Stage::Complete)?;
+    drop(worker);
+    let master = fixture.key(&catalog, 0, 20)?;
+    let copy = fixture.key(&catalog, 0, 21)?;
+    assert_eq!(master.asset_id, copy.asset_id);
+    assert_ne!(master, copy);
+    for (key, ev, expected) in [
+        (&master, 1.0, [0.25, 0.5, 1.0, 0.75]),
+        (&copy, -1.0, [0.0625, 0.125, 0.25, 0.75]),
+    ] {
+        let stored = catalog.edit_variant(key)?;
+        let recipe = stored.recipe.validate()?;
+        assert_eq!(recipe.settings().exposure_ev, ev);
+        let input = crate::edit::fixture(1, 1, vec![[0.125, 0.25, 0.5, 0.75]]);
+        let rendered = crate::edit::render_recipe(
+            &input,
+            &recipe,
+            crate::edit::RenderPurpose::ExportExact,
+            crate::edit::RenderLimits::default(),
+            &(),
+        )?;
+        assert!(rendered.exact());
+        assert_eq!(rendered.as_rendered().pixels, vec![expected]);
+    }
+    let extraction_paths: Vec<Vec<crate::lightroom::adobe::Key>> = catalog
+        .db
+        .prepare("SELECT result FROM migration_metadata WHERE slot='current_develop'")?
+        .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+        .map(|r| {
+            let result: super::metadata::ResultRecord = serde_json::from_slice(&r?)?;
+            assert_eq!(result.state, "translated_with_appearance_gaps");
+            let extraction = result.extraction.unwrap();
+            assert!(!extraction.adobe_rendering_equivalent);
+            assert!(extraction.properties.iter().any(|p| p.name == "opaque"
+                && p.disposition == crate::lightroom::adobe::Disposition::RetainedOnly));
+            Ok(extraction.input.settings_path)
+        })
+        .collect::<Result<_>>()?;
+    assert_eq!(extraction_paths.len(), 6);
+    assert!(
+        extraction_paths
+            .iter()
+            .all(|p| p == &vec![crate::lightroom::adobe::Key::Name("s".into())])
+    );
+    let before = catalog.edit_variant(&master)?;
+    catalog.save_edit_recipe(
+        &master,
+        before.revision,
+        &Recipe::V1(RecipeV1 {
+            exposure_ev: 2.0,
+            ..before.recipe.validate()?.settings().clone()
+        }),
+    )?;
+    let edited = catalog.edit_variant(&master)?;
+    drop(catalog);
+    let mut catalog = fixture.open()?;
+    let resumed = catalog.begin_selected_import(&source, APPROVAL, &fixture.policy)?;
+    assert_eq!(resumed.id, run.id);
+    let mut worker = Worker::new(&source, &run.id, ImportFixture::limits())?;
+    assert!(worker.step(&mut catalog, &|| false)?.progress.complete);
+    assert_eq!(catalog.edit_variant(&master)?.revision, edited.revision);
+    assert_eq!(catalog.edit_variant(&master)?.recipe, edited.recipe);
+    assert_eq!(
+        catalog
+            .edit_variant(&copy)?
+            .recipe
+            .validate()?
+            .settings()
+            .exposure_ev,
+        -1.0
+    );
+    Ok(())
+}
+
+#[path = "current_repair_tests.rs"]
+mod current_repair_tests;

@@ -118,6 +118,11 @@ const SCHEMA7_TABLES: &[&str] = &[
     "organization_image_relations",
     "organization_keyword_synonyms",
 ];
+const SCHEMA8_TABLES: &[&str] = &[
+    "migration_current_repairs",
+    "migration_current_repair_items",
+    "migration_current_repair_reports",
+];
 fn id(i: i64) -> String {
     format!("fixture-{i:012}")
 }
@@ -391,6 +396,12 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 7)),
         "schema7 table roster disagrees with version"
     );
+    ensure!(
+        SCHEMA8_TABLES
+            .iter()
+            .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 8)),
+        "schema8 repair table roster disagrees with version"
+    );
     if before_schema < 7 {
         ensure!(!db.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name IN ('catalog_images','organization_image_relations'))",[],|r|r.get(0))?, "legacy fixture has unexpected image sequence rows");
     }
@@ -414,6 +425,9 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     }
     if before_schema < 7 {
         expected_added.extend(SCHEMA7_TABLES.iter().map(|s| s.to_string()));
+    }
+    if before_schema < 8 {
+        expected_added.extend(SCHEMA8_TABLES.iter().map(|s| s.to_string()));
     }
     expected_added.sort();
     ensure!(
@@ -473,6 +487,18 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
                 0
             }),
         "schema7 fixture has non-initial image/import rows"
+    );
+    let repair_initial = fixture_data_identity(
+        &db,
+        &SCHEMA8_TABLES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        false,
+    )?;
+    ensure!(
+        repair_initial.1.iter().all(|(_, n)| *n == 0),
+        "schema8 fixture has unexpected repair state"
     );
     ensure!(
         db.query_row::<bool, _, _>(

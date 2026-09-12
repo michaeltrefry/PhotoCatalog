@@ -6,6 +6,7 @@ use photocatalog::{
     Catalog,
     catalog_migration::{
         artifacts::ArtifactLimits,
+        current_repair,
         import_artifacts::Worker,
         importer::{Policy, Progress},
     },
@@ -30,6 +31,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Correct current-settings container selection in an explicitly pinned completed import.
+    RepairCurrent {
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        seal: PathBuf,
+        #[arg(long)]
+        approval: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, default_value_t = 1000)]
+        max_steps: u64,
+        #[arg(long, default_value_t = 60)]
+        max_seconds: u64,
+        #[arg(long)]
+        stop_file: Option<PathBuf>,
+        #[arg(long, default_value_t = 600)]
+        source_open_seconds: u64,
+    },
+    /// Read a repair checkpoint without opening the inspection or upgrading the catalog.
+    RepairStatus {
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        repair: String,
+    },
     /// Run bounded work; repeat with identical inputs to resume its saved checkpoint.
     Run {
         #[arg(long)]
@@ -170,11 +197,7 @@ fn emit(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
-fn read_status(destination: &Path, run: &str) -> Result<Progress> {
-    ensure!(
-        run.len() == 64 && run.bytes().all(|b| b.is_ascii_hexdigit()),
-        "invalid run identity"
-    );
+fn status_database(destination: &Path) -> Result<rusqlite::Connection> {
     let db = rusqlite::Connection::open_with_flags(
         destination.join("catalog.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -186,6 +209,15 @@ fn read_status(destination: &Path, run: &str) -> Result<Progress> {
         app == 0x50484341 && schema == photocatalog::CURRENT_SCHEMA_VERSION,
         "status requires a current PhotoCatalog catalog; no schema migration was performed"
     );
+    Ok(db)
+}
+
+fn read_status(destination: &Path, run: &str) -> Result<Progress> {
+    ensure!(
+        run.len() == 64 && run.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid run identity"
+    );
+    let db = status_database(destination)?;
     let raw: Vec<u8> = db.query_row(
         "SELECT progress FROM migration_runs WHERE id=?1 AND length(progress)<=?2",
         rusqlite::params![run, i64::try_from(DOCUMENT_BYTES)?],
@@ -194,6 +226,65 @@ fn read_status(destination: &Path, run: &str) -> Result<Progress> {
     let progress: Progress = serde_json::from_slice(&raw)?;
     ensure!(progress.id == run, "stored run identity differs");
     Ok(progress)
+}
+
+// Reject a stale repair request before upgrading an existing schema7 destination.
+// The repair API repeats its state checks under the writer transaction.
+fn preflight_repair_upgrade(
+    destination: &Path,
+    input: &str,
+    request: &current_repair::Request,
+) -> Result<()> {
+    let hash = |s: &str| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    ensure!(
+        hash(&request.run)
+            && hash(&request.expected_complete_progress_blake3)
+            && request.expected_mapping_epoch >= 0
+            && !request.reason.trim().is_empty()
+            && request.reason.len() <= 4096,
+        "invalid repair request"
+    );
+    let path = destination.join("catalog.sqlite3");
+    ensure!(
+        fs::symlink_metadata(&path)?.is_file(),
+        "repair database must be a regular file"
+    );
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        app == 0x50484341 && (schema == 7 || schema == photocatalog::CURRENT_SCHEMA_VERSION),
+        "repair requires a completed-import catalog schema"
+    );
+    if schema == 7 {
+        let raw: Vec<u8> = db.query_row(
+            "SELECT progress FROM migration_runs WHERE id=?1 AND length(progress)<=?2",
+            rusqlite::params![request.run, i64::try_from(DOCUMENT_BYTES)?],
+            |r| r.get(0),
+        )?;
+        let progress: Progress = serde_json::from_slice(&raw)?;
+        let epoch: i64 = db.query_row(
+            "SELECT epoch FROM migration_mapping_epoch WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            progress.id == request.run
+                && progress.input == input
+                && progress.complete
+                && progress.stage == photocatalog::catalog_migration::importer::Stage::Complete
+                && blake3::hash(&raw).to_hex().as_str()
+                    == request.expected_complete_progress_blake3
+                && epoch == request.expected_mapping_epoch,
+            "legacy repair predecessor differs"
+        );
+    }
+    Ok(())
 }
 
 fn stop_requested(path: Option<&Path>) -> Result<bool> {
@@ -209,6 +300,88 @@ fn stop_requested(path: Option<&Path>) -> Result<bool> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::RepairStatus {
+            destination,
+            repair,
+        } => {
+            let destination = destination_path(&destination)?;
+            let db = status_database(&destination)?;
+            emit(&current_repair::read_progress(&db, &repair)?)
+        }
+        Command::RepairCurrent {
+            destination,
+            seal,
+            approval,
+            request,
+            max_steps,
+            max_seconds,
+            stop_file,
+            source_open_seconds,
+        } => {
+            ensure!(
+                max_steps > 0 && (1..=86400).contains(&max_seconds),
+                "invalid work budget"
+            );
+            ensure!(
+                (1..=3600).contains(&source_open_seconds),
+                "invalid source admission budget"
+            );
+            let seal: InputSeal = document(&seal)?;
+            let approval = bytes(&approval)?;
+            ensure!(
+                blake3::hash(&approval).to_hex().as_str() == seal.approval.document_blake3,
+                "authorization bytes differ from seal"
+            );
+            let request: current_repair::Request = document(&request)?;
+            let destination = destination_path(&destination)?;
+            ensure!(
+                destination.join("catalog.sqlite3").is_file(),
+                "repair requires an existing catalog"
+            );
+            let database = seal.database.to_path()?;
+            disjoint(
+                &destination,
+                database.parent().context("inspection has no parent")?,
+            )?;
+            eprintln!("Verifying sealed inspection before current-settings repair...");
+            let source = MigrationSource::open(
+                seal,
+                ReadLimits {
+                    open_deadline_ms: source_open_seconds * 1000,
+                    ..ReadLimits::default()
+                },
+            )?;
+            let _lock = lock_destination(&destination)?;
+            preflight_repair_upgrade(&destination, source.binding_blake3(), &request)?;
+            let mut catalog = Catalog::open(&destination)?;
+            let mut progress = catalog.begin_current_develop_repair(&source, &request)?;
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(max_seconds);
+            let mut steps = 0;
+            let mut stopped = stop_requested(stop_file.as_deref())?;
+            let mut last_report = Instant::now();
+            while !progress.complete && steps < max_steps && Instant::now() < deadline && !stopped {
+                progress = catalog
+                    .step_current_develop_repair(&source, &progress.id)?
+                    .progress;
+                steps += 1;
+                stopped = stop_requested(stop_file.as_deref())?;
+                if last_report.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "{:?}: examined {}, repaired {}, steps {}",
+                        progress.phase, progress.examined, progress.repaired, steps
+                    );
+                    last_report = Instant::now();
+                }
+            }
+            emit(&serde_json::json!({
+                "protocol": 1,
+                "status": if progress.complete { "complete" } else if stopped { "stopped" } else { "paused" },
+                "repair": progress, "steps": steps,
+                "elapsed_seconds": started.elapsed().as_secs_f64(),
+                "adobe_rendering_equivalent": false
+            }))
+        }
         Command::PrepareSupplements {
             destination,
             requests,
@@ -415,6 +588,55 @@ mod tests {
     }
 
     #[test]
+    fn legacy_repair_preflight_rejects_stale_inputs_without_upgrading() -> Result<()> {
+        use photocatalog::catalog_migration::importer::Stage;
+        let temp = tempfile::tempdir()?;
+        let progress = Progress {
+            id: "a".repeat(64),
+            input: "b".repeat(64),
+            stage: Stage::Complete,
+            capture_index: 1,
+            artifact_index: 0,
+            cursor: None,
+            processed: 19,
+            complete: true,
+        };
+        let raw = serde_json::to_vec(&progress)?;
+        let path = temp.path().join("catalog.sqlite3");
+        {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch(
+                "PRAGMA application_id=1346913089; PRAGMA user_version=7;
+                CREATE TABLE migration_runs(id TEXT PRIMARY KEY,progress BLOB);
+                CREATE TABLE migration_mapping_epoch(id INTEGER PRIMARY KEY,epoch INTEGER);
+                INSERT INTO migration_mapping_epoch VALUES(1,3);",
+            )?;
+            db.execute(
+                "INSERT INTO migration_runs VALUES(?1,?2)",
+                rusqlite::params![progress.id, raw],
+            )?;
+        }
+        let before = fs::read(&path)?;
+        let mut request = current_repair::Request {
+            run: progress.id,
+            expected_complete_progress_blake3: blake3::hash(&raw).to_hex().to_string(),
+            expected_mapping_epoch: 3,
+            reason: "Correct parsed container".into(),
+        };
+        preflight_repair_upgrade(temp.path(), &progress.input, &request)?;
+        assert!(preflight_repair_upgrade(temp.path(), &"c".repeat(64), &request).is_err());
+        request.expected_mapping_epoch = 4;
+        assert!(preflight_repair_upgrade(temp.path(), &progress.input, &request).is_err());
+        request.expected_mapping_epoch = 3;
+        request.expected_complete_progress_blake3 = "d".repeat(64);
+        assert!(preflight_repair_upgrade(temp.path(), &progress.input, &request).is_err());
+        assert_eq!(before, fs::read(&path)?);
+        assert!(!temp.path().join("previews").exists());
+        assert!(status_database(temp.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn status_reads_bounded_checkpoint_and_stop_request_is_explicit() -> Result<()> {
         use photocatalog::catalog_migration::importer::Stage;
         let temp = tempfile::tempdir()?;
@@ -430,7 +652,8 @@ mod tests {
         };
         {
             let db = rusqlite::Connection::open(temp.path().join("catalog.sqlite3"))?;
-            db.execute_batch("PRAGMA application_id=1346913089; PRAGMA user_version=7; CREATE TABLE migration_runs(id TEXT PRIMARY KEY,progress BLOB);")?;
+            db.execute_batch("PRAGMA application_id=1346913089; CREATE TABLE migration_runs(id TEXT PRIMARY KEY,progress BLOB);")?;
+            db.pragma_update(None, "user_version", photocatalog::CURRENT_SCHEMA_VERSION)?;
             db.execute(
                 "INSERT INTO migration_runs VALUES(?1,?2)",
                 rusqlite::params![progress.id, serde_json::to_vec(&progress)?],

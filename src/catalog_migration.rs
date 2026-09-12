@@ -1,6 +1,7 @@
 //! Resumable Lightroom migration into the catalog. Original files remain external.
 
 pub mod artifacts;
+pub mod current_repair;
 pub mod evidence;
 pub mod file_metadata;
 pub mod history;

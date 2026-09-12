@@ -1,6 +1,6 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 /// Current on-disk catalog schema; probes must preflight before timed opens.
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 pub mod catalog_edits;
 pub mod catalog_export_alias;
@@ -309,6 +309,10 @@ impl Catalog {
                     })?;
                 ensure!(invalid == 0, "logical image migration foreign key failure");
                 tx.pragma_update(None, "user_version", 7)?;
+            }
+            if version < 8 {
+                catalog_migration::current_repair::install(&tx)?;
+                tx.pragma_update(None, "user_version", 8)?;
             }
             tx.commit()?;
             db.pragma_update(None, "foreign_keys", true)?;
@@ -1031,7 +1035,7 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            7
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             catalog

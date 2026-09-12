@@ -10,11 +10,11 @@ into one scratch catalog and preserves the existing filesystem folder hierarchy.
 The 32 excluded catalog candidates remain excluded. Canonical-library migration
 has not been authorized.
 
-PR #14 remains draft. Head `f04de439` passed all four applicable CI jobs,
+PR #14 remains draft. Head `33b242f8` passed all four applicable CI jobs,
 including the corrected Linux preview-cache restart check. The reconciliation
 repairs through `5b54d2b9` passed 609 optimized all-target test instances, strict
 all-target Clippy, formatting and independent source review; five existing tests
-remain ignored. Successor remote checks and independent actual acceptance remain.
+remain ignored. The current-settings defect below blocks final acceptance.
 
 The selected TEST has reached native Complete in one scratch catalog: all 16
 capture reports, 22 source-walk stages and 171 companion artifacts reconciled.
@@ -86,18 +86,42 @@ The resumed native worker completed its final step and exited cleanly; the
 read-only checkpoint exactly matches the terminal Complete result. Earlier run
 receipts retain their original source attribution.
 
-Independent verifier v9 retained the previously reviewed algorithm and qualified
-native-source pin. Its first actual attempt was stopped and reaped by the 512 MiB
-RSS guard, with no child acceptance receipt. Source/query-plan diagnosis found
-an avoidable in-memory sort in the initial retained-record aggregation; exact
-historical query attribution remains unproven because that attempt had no query
-telemetry. A bounded verifier successor is being prepared without weakening its
-checks or limits. The representative offline API probe builds with the shipping
-dependency versions but has not yet run on the destination.
+The independent v16 metadata audit passed on the completed TEST in 350.776 seconds:
+1,641 queries, 2,807,048,000 approximate VM steps and 856,309,760 bytes peak RSS.
+All 16 reports, selected custody, 171 artifact members, 20 supplemental proofs,
+native relationships and literal folder ancestry passed. This checks metadata and
+the admitted custody chain; it does not independently rehash every payload or render
+actual photos. Earlier time, VM and RSS stops remain preserved. The final verifier
+repair projects only slot/state before grouping: SQLite's previous sorter included
+the full metadata result. Typed-output comparisons and query-plan review qualified
+the change. Final allowances are 900 seconds, 1 GiB RSS and 10 billion VM steps;
+the data checks remain intact.
 
-Independent actual counts, relationships and evidence audit, representative API
-readback, final acceptance review, merge and terminal merged-head CI remain required
-for S10. S11 backup/restore and S12 Tauri interface retain their S10 dependencies;
+The resulting census exposed a product defect: all 215,708 current-develop receipts
+were retained-only, with no translated native recipe. The coordinator always passed
+an empty settings path, while sampled successfully parsed Lightroom payloads stored
+their settings beneath the outer `s` assignment. A bounded sample across all 16
+captures also contains different process versions and nested historical properties;
+those must not be selected by searching for convenient parameter names. Task 23166
+now explicitly tracks grammar-proven container selection, full importer/render/replay
+regressions and a guarded resumable repair of existing current projections.
+
+The pre-repair audit remains valid evidence of the old state, not editing acceptance.
+The schema-8 repair now archives old receipts and reports, rejects adoption after
+later user edits, and commits each replacement recipe/receipt/archive/cursor in one
+transaction before fresh reconciliation. Independent review found and corrected an
+unchanged oversized-identity row that could stall repair. All 620 distinct Rust test
+instances passed across the optimized all-target run and corrected library rerun,
+with five existing ignores. The initial CLI SQL type error and old schema-7 test
+assertion remain recorded as failures preceding their fixes. Strict all-target
+Clippy and package formatting passed. A quiescent APFS clone of the actual TEST
+database preserves its completed progress and epoch 424799 before repair; the
+source database remained unchanged. This recovery copy does not close S11.
+
+Actual repair has not run. Source catalogs and originals remain untouched.
+Representative API readback, post-repair audit, final acceptance
+review, merge and terminal merged-head CI remain required for S10.
+S11 backup/restore and S12 Tauri interface retain their S10 dependencies;
 S13 integrated readiness follows both.
 Fieldbook remains a design reference, not the product name.
 

@@ -290,6 +290,27 @@ fn validate_input(input: &Input) -> Result<()> {
     );
     Ok(())
 }
+/// Select only a grammar-proven catalog settings container. This does not
+/// qualify any values or reinterpret an explicit `Input::settings_path`.
+/// Unknown assignment names and bounded parse failures remain retained data.
+pub fn catalog_settings_path(
+    bytes: &[u8],
+    limits: Limits,
+) -> Result<std::result::Result<Vec<Key>, Failure>> {
+    limits.validate()?;
+    if bytes.len() > limits.bytes {
+        return Ok(Err(Failure::limit("catalog container byte limit")));
+    }
+    Ok(
+        data::parse(bytes, limits).and_then(|parsed| match parsed.root {
+            data::Root::Bare | data::Root::Return => Ok(vec![]),
+            data::Root::Assignment(name) if name == "s" => Ok(vec![Key::Name(name)]),
+            data::Root::Assignment(_) => Err(Failure::conflict(
+                "unqualified catalog outer assignment; original data retained",
+            )),
+        }),
+    )
+}
 /// Digest mismatch/invalid caller contract returns Err. Parse/limit failures return a
 /// retained Extraction with no partial properties or recipe contributions.
 pub fn extract(bytes: &[u8], input: Input, limits: Limits) -> Result<Extraction> {
@@ -312,7 +333,7 @@ pub fn extract(bytes: &[u8], input: Input, limits: Limits) -> Result<Extraction>
         "Adobe payload digest mismatch"
     );
     let parsed = match input.format {
-        Format::CatalogData => data::parse(bytes, limits),
+        Format::CatalogData => data::parse(bytes, limits).map(|p| p.properties),
         Format::CrsXml => xml(bytes, limits),
     };
     let properties = match parsed {

@@ -23,6 +23,55 @@ mod render_acceptance {
     }
 
     #[test]
+    fn prepared_wrapped_current_projection_requires_atomic_writer_and_retains_replay() -> Result<()> {
+        use crate::catalog_migration::metadata::{commit_current_develop_projection, current_develop_input_digest};
+        let mut t = Test::with_source_edit(false, false, |db, revision| {
+            db.execute("UPDATE rows SET cells_json=?1 WHERE revision=?2 AND source_id='source-30'", params![serde_json::to_string(&vec![Cell::Integer(30),Cell::Text(b"s={ProcessVersion='11.0',Exposure2012=1,UnknownPlugin={opaque='keep'}}".to_vec())]).unwrap(),revision]).unwrap();
+        })?;
+        t.original()?;
+        t.project(20)?;
+        let old = develop(&t,20,30);
+        let mut explicit = old.clone();
+        explicit.settings_path=vec![adobe::Key::Name("explicit".into())];
+        assert_eq!(t.catalog.prepare_migration_current_develop(explicit.clone())?.settings_path,explicit.settings_path);
+        let selected=t.catalog.prepare_migration_current_develop(old.clone())?;
+        assert_eq!(selected.settings_path,vec![adobe::Key::Name("s".into())]);
+        assert_ne!(current_develop_input_digest(&old)?,current_develop_input_digest(&selected)?);
+        let prepared=t.catalog.prepare_current_develop_projection(&t.source,&selected)?;
+        let key=prepared.key().clone();
+        assert_eq!(prepared.result().state,"translated_with_appearance_gaps");
+        assert!(commit_current_develop_projection(&t.catalog.db,&prepared).is_err());
+        let before=t.catalog.edit_variant(&key)?;
+        {
+            let tx=t.catalog.db.transaction()?;
+            let result=commit_current_develop_projection(&tx,&prepared)?;
+            assert!(result.edit_revision.is_some());
+            // Simulates an enclosing repair ledger/cursor failure.
+            tx.rollback()?;
+        }
+        assert_eq!(t.catalog.edit_variant(&key)?.revision,before.revision);
+        assert_eq!(t.catalog.db.query_row("SELECT count(*) FROM migration_metadata WHERE slot='current_develop'",[],|r|r.get::<_,i64>(0))?,0);
+        let result={
+            let tx=t.catalog.db.transaction()?;
+            let result=commit_current_develop_projection(&tx,&prepared)?;
+            tx.commit()?;
+            result
+        };
+        assert_eq!(render_stored(&t.catalog,&key)?,vec![[0.25,0.5,1.0,0.75],[4.0,-0.5,0.0,0.0]]);
+        let edited=edit::Recipe::V1(edit::RecipeV1{exposure_ev:2.0,..Default::default()});
+        t.catalog.save_edit_recipe(&key,result.edit_revision.unwrap(),&edited)?;
+        {
+            let tx=t.catalog.db.transaction()?;
+            assert!(commit_current_develop_projection(&tx,&prepared).is_err());
+            tx.rollback()?;
+        }
+        let replay=t.catalog.project_migration_current_develop(None,&selected)?;
+        assert_eq!(replay.input_digest,result.input_digest);
+        assert_eq!(t.catalog.edit_variant(&key)?.recipe,edited);
+        Ok(())
+    }
+
+    #[test]
     fn selected_current_settings_render_independent_stored_variant_pixels() -> Result<()> {
         let mut t = Test::new()?;
         t.original()?;

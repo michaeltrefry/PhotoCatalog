@@ -425,6 +425,39 @@ impl Catalog {
         Ok(result)
     }
 
+    /// Coordinator/repair selection only. Explicit nonempty caller paths remain
+    /// authoritative. Parse/limit/unknown wrappers keep the old retained path;
+    /// the ordinary extractor still records its failure or missing properties.
+    pub(crate) fn prepare_migration_current_develop(
+        &self,
+        mut request: CurrentDevelop,
+    ) -> Result<CurrentDevelop> {
+        if !request.settings_path.is_empty() {
+            return Ok(request);
+        }
+        let mut proof = Evidence::default();
+        proof.source(&self.db, &request.settings.target)?;
+        if !row_fits(
+            &self.db,
+            &mut proof,
+            &request.settings.target,
+            request.settings_table,
+        )? {
+            return Ok(request);
+        }
+        let fields = images::columns(
+            &self.db,
+            &mut proof,
+            &request.settings.target,
+            request.settings_table,
+        )?;
+        if let Some(Cell::Text(bytes) | Cell::Blob(bytes)) = fields.get("text")
+            && let Ok(path) = adobe::catalog_settings_path(bytes, adobe::Limits::default())?
+        {
+            request.settings_path = path;
+        }
+        Ok(request)
+    }
     /// The current image->develop pointer is mandatory. Historical settings are
     /// retained separately and never silently replace the current native recipe.
     pub fn project_migration_current_develop(
@@ -432,38 +465,14 @@ impl Catalog {
         source: Option<&MigrationSource>,
         request: &CurrentDevelop,
     ) -> Result<ResultRecord> {
-        owner(&request.import_source)?;
-        ensure!(
-            request.image.source.table == "Adobe_images"
-                && request.settings.field == "developSettingsIDCache"
-                && request.settings.target.source.table == "Adobe_imageDevelopSettings",
-            "current settings source/link differs"
-        );
-        ensure!(
-            request.expected_edit_revision >= 0 && request.settings_path.len() <= 64,
-            "current settings decision bounds"
-        );
-        for key in &request.settings_path {
-            match key {
-                adobe::Key::Name(v) => ensure!(v.len() <= 4096, "settings path name bounds"),
-                adobe::Key::Xml {
-                    namespace, name, ..
-                } => ensure!(
-                    namespace.len() <= 4096 && name.len() <= 4096,
-                    "settings XML path bounds"
-                ),
-                adobe::Key::Index(_) => (),
-            }
-        }
+        validate_current_develop(request)?;
         let image = request.image.source.identity()?;
         let payload = request.settings.target.source.identity()?;
-        let input_digest = digest(
-            &serde_json::json!({"adapter":ADAPTER,"owner":request.import_source,"image":request.image.source,"payload":request.settings.target.source,"slot":"current_develop","settings_path":request.settings_path,"expected_edit_revision":request.expected_edit_revision}),
-        )?;
+        let input_digest = current_develop_input_digest(request)?;
         let mut proof = Evidence::default();
         proof.source(&self.db, &request.image)?;
         proof.source(&self.db, &request.settings.target)?;
-        let key = images::mapped_image(&self.db, &request.import_source, &request.image.source)?;
+        let _key = images::mapped_image(&self.db, &request.import_source, &request.image.source)?;
         if let Some(result) = previous(
             &self.db,
             &image,
@@ -474,12 +483,53 @@ impl Catalog {
         )? {
             return Ok(result);
         }
+        drop(proof);
+        let prepared = self.prepare_current_develop_projection(
+            source.context("first current settings projection needs sealed source")?,
+            request,
+        )?;
+        let _permit = self.writers.enter(Priority::Background)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prepared.proof.recheck(&tx)?;
+        if let Some(result) = previous(
+            &tx,
+            prepared.image_source(),
+            prepared.payload_source(),
+            "current_develop",
+            &request.import_source,
+            prepared.input_digest(),
+        )? {
+            tx.commit()?;
+            return Ok(result);
+        }
+        let result = commit_current_develop_projection(&tx, &prepared)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Bounded read preparation without receipt replay/adoption. The caller must
+    /// preserve the exact request and commit through the guarded helper below.
+    pub(crate) fn prepare_current_develop_projection(
+        &self,
+        source: &MigrationSource,
+        request: &CurrentDevelop,
+    ) -> Result<PreparedCurrentDevelop> {
+        validate_current_develop(request)?;
+        let image = request.image.source.identity()?;
+        let payload = request.settings.target.source.identity()?;
+        let input_digest = current_develop_input_digest(request)?;
+        let mut proof = Evidence::default();
+        proof.source(&self.db, &request.image)?;
+        proof.source(&self.db, &request.settings.target)?;
+        let key = images::mapped_image(&self.db, &request.import_source, &request.image.source)?;
         verify_unique_link(
             &self.db,
             &mut proof,
             &request.image,
             &request.settings,
-            source.context("first current settings projection needs sealed source")?,
+            source,
         )?;
         let image_fits = row_fits(&self.db, &mut proof, &request.image, request.image_table)?;
         let settings_fit = row_fits(
@@ -489,18 +539,14 @@ impl Catalog {
             request.settings_table,
         )?;
         if !image_fits || !settings_fit {
-            return retain_only(
-                self,
-                &proof,
-                RetainedDecision {
-                    image: &request.image,
-                    payload: &request.settings.target,
-                    owner: &request.import_source,
-                    slot: "current_develop",
-                    digest: input_digest,
-                    reason: "Current settings interpretation exceeds the bounded row limit; complete original bytes remain in custody",
+            return Ok(PreparedCurrentDevelop {
+                request: request.clone(), image, payload, proof, application: None,
+                result: ResultRecord {
+                    input_digest, image: key, state: "retained_only".into(), observation: None,
+                    edit_revision: None, extraction: None,
+                    reason: Some("Current settings interpretation exceeds the bounded row limit; complete original bytes remain in custody".into()),
                 },
-            );
+            });
         }
         let image_fields =
             images::columns(&self.db, &mut proof, &request.image, request.image_table)?;
@@ -546,7 +592,7 @@ impl Catalog {
         );
         let recipe = contribution.apply_to(&current.recipe)?;
         let expected = self.image_metadata_identity(&key)?;
-        let mut result = ResultRecord {
+        let result = ResultRecord {
             input_digest,
             image: key.clone(),
             state: if translated {
@@ -564,52 +610,121 @@ impl Catalog {
             },
             extraction,
         };
-        // Parse/validation and bounded compatibility serialization precede writer admission.
         encoded(&result)?;
-        let _permit = self.writers.enter(Priority::Background)?;
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        proof.recheck(&tx)?;
-        if let Some(result) = previous(
-            &tx,
-            &image,
-            &payload,
-            "current_develop",
-            &request.import_source,
-            &result.input_digest,
-        )? {
-            tx.commit()?;
-            return Ok(result);
+        Ok(PreparedCurrentDevelop {
+            request: request.clone(),
+            image,
+            payload,
+            proof,
+            result,
+            application: Some((recipe, expected)),
+        })
+    }
+}
+
+fn validate_current_develop(request: &CurrentDevelop) -> Result<()> {
+    owner(&request.import_source)?;
+    ensure!(
+        request.image.source.table == "Adobe_images"
+            && request.settings.field == "developSettingsIDCache"
+            && request.settings.target.source.table == "Adobe_imageDevelopSettings",
+        "current settings source/link differs"
+    );
+    ensure!(
+        request.expected_edit_revision >= 0 && request.settings_path.len() <= 64,
+        "current settings decision bounds"
+    );
+    for key in &request.settings_path {
+        match key {
+            adobe::Key::Name(v) => ensure!(v.len() <= 4096, "settings path name bounds"),
+            adobe::Key::Xml {
+                namespace, name, ..
+            } => ensure!(
+                namespace.len() <= 4096 && name.len() <= 4096,
+                "settings XML path bounds"
+            ),
+            adobe::Key::Index(_) => (),
         }
-        ensure!(
-            images::mapped_image(&tx, &request.import_source, &request.image.source)? == key,
-            "develop native mapping changed"
-        );
-        catalog_images::require_image_metadata_identity(&tx, &expected)?;
+    }
+    Ok(())
+}
+pub(crate) fn current_develop_input_digest(request: &CurrentDevelop) -> Result<String> {
+    validate_current_develop(request)?;
+    digest(
+        &serde_json::json!({"adapter":ADAPTER,"owner":request.import_source,"image":request.image.source,"payload":request.settings.target.source,"slot":"current_develop","settings_path":request.settings_path,"expected_edit_revision":request.expected_edit_revision}),
+    )
+}
+/// Owns the exact selected-custody proof and validated recipe; no public fields
+/// permit replacing its request, recipe, or expected identity after preparation.
+pub(crate) struct PreparedCurrentDevelop {
+    request: CurrentDevelop,
+    image: String,
+    payload: String,
+    proof: Evidence,
+    result: ResultRecord,
+    application: Option<(
+        crate::edit::ValidatedRecipe,
+        catalog_images::ImageMetadataIdentity,
+    )>,
+}
+impl PreparedCurrentDevelop {
+    pub(crate) fn result(&self) -> &ResultRecord {
+        &self.result
+    }
+    pub(crate) fn image_source(&self) -> &str {
+        &self.image
+    }
+    pub(crate) fn payload_source(&self) -> &str {
+        &self.payload
+    }
+    pub(crate) fn key(&self) -> &crate::catalog_edits::VariantKey {
+        &self.result.image
+    }
+    pub(crate) fn input_digest(&self) -> &str {
+        &self.result.input_digest
+    }
+}
+/// Caller supplies one writer transaction encompassing receipt INSERT and any
+/// adoption archive/ledger/cursor CAS. Never overwrites an existing receipt.
+pub(crate) fn commit_current_develop_projection(
+    tx: &Connection,
+    prepared: &PreparedCurrentDevelop,
+) -> Result<ResultRecord> {
+    ensure!(
+        !tx.is_autocommit(),
+        "current projection requires a caller transaction"
+    );
+    prepared.proof.recheck(tx)?;
+    let request = &prepared.request;
+    ensure!(
+        images::mapped_image(tx, &request.import_source, &request.image.source)? == *prepared.key(),
+        "develop native mapping changed"
+    );
+    let mut result = prepared.result().clone();
+    if let Some((recipe, expected)) = &prepared.application {
+        catalog_images::require_image_metadata_identity(tx, expected)?;
         let applied = crate::catalog_edits::install_import_recipe(
-            &tx,
-            &key,
+            tx,
+            prepared.key(),
             request.expected_edit_revision,
-            &recipe,
+            recipe,
             &serde_json::json!({"adapter":ADAPTER,"source":request.settings.target.source,"retained_record":request.settings.target.retained_record,"input_digest":result.input_digest}),
-            if translated {
+            if result.state == "translated_with_appearance_gaps" {
                 TranslationState::Translated
             } else {
                 TranslationState::RetainedOnly
             },
         )?;
         result.edit_revision = Some(applied.revision);
-        save(
-            &tx,
-            &image,
-            &payload,
-            "current_develop",
-            &request.import_source,
-            request.settings.target.retained_record,
-            &result,
-        )?;
-        tx.commit()?;
-        Ok(result)
     }
+    save(
+        tx,
+        prepared.image_source(),
+        prepared.payload_source(),
+        "current_develop",
+        &request.import_source,
+        request.settings.target.retained_record,
+        &result,
+    )?;
+    Ok(result)
 }

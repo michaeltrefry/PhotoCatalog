@@ -40,7 +40,31 @@ Keyword interpretation is bounded. If prefix recovery or the accumulated packet 
 
 Variant evidence APIs expose retained current and historical Adobe settings offline. Ambiguous links cannot establish a variant association. Only qualified current parameter mappings enter native recipes; the compatibility result explicitly does not claim Adobe rendering equivalence.
 
+For catalog current settings, the coordinator validates the complete bounded data grammar before choosing the settings container. Bare and returned tables use the root; Lightroom's recognized `s = { ... }` assignment uses `s`. Unknown assignments, malformed data and nested historical parameters do not establish a current container. The evidence API still honors its caller's explicit settings path.
+
 Reconciliation checks selected custody and walked-row counts, native mappings, artifact completeness and exclusions. A mapping epoch is rechecked under writer admission before accepting each report and marking the run complete. Completion of this worker describes the import and reconciliation; it is not approval to replace a user's canonical library.
+
+## Correcting an earlier current-settings container decision
+
+Schema 8 adds a resumable repair for completed imports made by the earlier coordinator, which always selected the root table. Back up the quiescent destination first. Supply the original seal and approval plus a `current_repair::Request` JSON document containing `run`, `expected_complete_progress_blake3` (the exact stored progress bytes), `expected_mapping_epoch`, and `reason`.
+
+```sh
+lightroom_migrate repair-current \
+  --destination /absolute/test-catalog \
+  --seal /absolute/selected-seal.json \
+  --approval /absolute/authorization.json \
+  --request /absolute/current-repair-request.json \
+  --max-steps 10000 --max-seconds 60 \
+  --stop-file /absolute/control/STOP
+
+lightroom_migrate repair-status --destination /absolute/test-catalog --repair REPAIR_ID
+```
+
+Admission pins the completed run, selection, policy and mapping epoch. A schema-7 destination is checked read-only before upgrading. Repeat the identical repair request to resume; status is read-only and requires the current schema. The work budget and stop file are checked between steps, after source admission.
+
+The repair archives the old completion and reconciliation reports, then visits current-stage outcomes by indexed cursor. It replaces only an original retained-only root decision whose source proves the recognized container. The installed recipe must still be the exact predecessor import revision; a later edit stops adoption. Each changed recipe, metadata receipt, run outcome, compressed predecessor archive and cursor commit together. Already correct or uninterpretable outcomes remain unchanged. Source custody, original files, image identities and folder mappings remain intact.
+
+Ordinary import cannot finish while projection repair is pending. Repair reports `complete` only after fresh reconciliation. Unsupported Adobe parameters remain explicit appearance gaps; rebinding a container does not expand the qualified translation surface or establish Adobe rendering equivalence. Per-item predecessor readback verifies archived byte lengths and digests.
 
 ## Separately qualified PSD evidence
 
