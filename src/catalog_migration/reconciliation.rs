@@ -35,6 +35,10 @@ pub struct SupplementReport {
     pub projection_input_digest: Option<String>,
     pub reason: Option<String>,
 }
+// Both lookup indexes share input/revision/collection. Seek the exact source ID
+// rather than scanning every AgLibraryFile row before checking that ID.
+const SUPPLEMENT_PROJECTION: &str = "SELECT m.input_digest,m.result FROM migration_record_lookup l INDEXED BY migration_lookup_source CROSS JOIN migration_file_metadata m ON m.retained_file=l.record WHERE m.owner=?1 AND m.origin=?2 AND m.supplement=?3 AND l.input=?4 AND l.revision=?5 AND l.collection=3 AND l.table_name='AgLibraryFile' AND l.source_id=?6 LIMIT 2";
+
 /// Every sealed pin has verified generic payload custody, plus a separately
 /// reported projection state. Unprojected evidence is explicit, never omitted.
 pub(crate) fn supplement_reports(
@@ -50,11 +54,14 @@ pub(crate) fn supplement_reports(
         .iter()
         .filter(|p| p.revision == revision)
         .collect::<Vec<_>>();
-    let count: i64 = catalog.db.query_row(
-        "SELECT count(*) FROM migration_run_supplements WHERE run=?1 AND revision=?2",
-        params![before.id, revision],
-        |r| r.get(0),
-    )?;
+    let count: i64 = catalog
+        .db
+        .query_row(
+            "SELECT count(*) FROM migration_run_supplements WHERE run=?1 AND revision=?2",
+            params![before.id, revision],
+            |r| r.get(0),
+        )
+        .context("count supplemental custody receipts")?;
     ensure!(
         usize::try_from(count)? == pins.len(),
         "supplement custody receipt roster differs"
@@ -71,21 +78,32 @@ pub(crate) fn supplement_reports(
                     && s.origin == super::file_metadata::Origin::Embedded
             })
             .context("supplement policy member missing at reconciliation")?;
-        let (hash,evidence,semantic):(String,String,String)=catalog.db.query_row("SELECT proof,evidence,semantic FROM migration_run_supplements WHERE run=?1 AND revision=?2 AND source_id=?3 AND origin=?4",params![before.id,revision,pin.source_id,pin.origin],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let (hash,evidence,semantic):(String,String,String)=catalog.db.query_row("SELECT proof,evidence,semantic FROM migration_run_supplements WHERE run=?1 AND revision=?2 AND source_id=?3 AND origin=?4",params![before.id,revision,pin.source_id,pin.origin],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
+            .with_context(|| format!("read supplemental custody receipt source_id={} origin={}", pin.source_id, pin.origin))?;
         ensure!(
             hash == pin.proof_blake3 && evidence == member.evidence,
             "supplement custody proof differs"
         );
-        let mut statement=catalog.db.prepare("SELECT m.input_digest,m.result FROM migration_record_lookup l CROSS JOIN migration_file_metadata m ON m.retained_file=l.record WHERE m.owner=?1 AND m.origin=?2 AND m.supplement=?3 AND l.input=?4 AND l.revision=?5 AND l.collection=3 AND l.table_name='AgLibraryFile' AND l.source_id=?6 LIMIT 2")?;
-        let mut rows = statement.query(params![
-            policy.import_source,
-            pin.origin,
-            semantic,
-            before.input,
-            revision,
-            pin.source_id
-        ])?;
-        let projection = if let Some(row) = rows.next()? {
+        let mut statement = catalog
+            .db
+            .prepare(SUPPLEMENT_PROJECTION)
+            .context("prepare supplemental projection lookup")?;
+        let mut rows = statement
+            .query(params![
+                policy.import_source,
+                pin.origin,
+                semantic,
+                before.input,
+                revision,
+                pin.source_id
+            ])
+            .context("query supplemental projection lookup")?;
+        let projection = if let Some(row) = rows.next().with_context(|| {
+            format!(
+                "read supplemental projection source_id={} origin={}",
+                pin.source_id, pin.origin
+            )
+        })? {
             let value = row.get_ref(1)?;
             let bytes = value.as_bytes()?;
             ensure!(
@@ -103,7 +121,12 @@ pub(crate) fn supplement_reports(
             None
         };
         ensure!(
-            rows.next()?.is_none(),
+            rows.next()
+                .with_context(|| format!(
+                    "check supplemental projection ambiguity source_id={} origin={}",
+                    pin.source_id, pin.origin
+                ))?
+                .is_none(),
             "supplement projection association ambiguous"
         );
         let report = SupplementReport {
@@ -616,6 +639,129 @@ mod tests {
         let mut statement = db.prepare(sql)?;
         let count = statement.query_row(params![input, revision, collection], |r| r.get(0))?;
         Ok((count, statement.get_status(StatementStatus::VmStep)))
+    }
+
+    fn supplemental_lookup_fixture(noise: i64) -> Result<Connection> {
+        let db = fixture()?;
+        super::super::file_metadata::install(&db)?;
+        db.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+          INSERT INTO migration_retained_records(sequence,input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete)
+          SELECT i,'input','revision',3,i,x'00',1,'digest','cursor',1 FROM n", [noise + 1])?;
+        db.execute("INSERT INTO migration_record_lookup(record,input,revision,collection,digest,raw_length,source_id,table_name,unavailable)
+          SELECT sequence,input,revision,collection,digest,raw_length,CASE WHEN sequence=1 THEN 'wanted' ELSE printf('noise-%08d',sequence) END,'AgLibraryFile','[]' FROM migration_retained_records", [])?;
+        db.execute("INSERT INTO migration_file_metadata VALUES('file','embedded','proof','owner','digest',1,1,x'00',x'7b7d')", [])?;
+        Ok(db)
+    }
+
+    type ProjectionRows = Vec<(String, Vec<u8>)>;
+
+    fn supplemental_rows(db: &Connection, sql: &str) -> Result<(ProjectionRows, i32)> {
+        let mut statement = db.prepare(sql)?;
+        let rows = statement
+            .query_map(
+                ["owner", "embedded", "proof", "input", "revision", "wanted"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, statement.get_status(StatementStatus::VmStep)))
+    }
+
+    #[test]
+    fn supplemental_projection_seek_preserves_scope_missing_and_ambiguity() -> Result<()> {
+        let db = supplemental_lookup_fixture(6)?;
+        // Competing rows have the same source ID but differ in one admitted scope.
+        for (record, column, value) in [
+            (2, "input", "other"),
+            (3, "revision", "other"),
+            (4, "collection", "4"),
+            (5, "table_name", "Adobe_images"),
+        ] {
+            db.execute(
+                "UPDATE migration_record_lookup SET source_id='wanted' WHERE record=?",
+                [record],
+            )?;
+            db.execute(
+                &format!("UPDATE migration_record_lookup SET {column}=?1 WHERE record=?2"),
+                params![value, record],
+            )?;
+        }
+        for (name, owner, origin, proof, record) in [
+            ("input", "owner", "embedded", "proof", 2),
+            ("revision", "owner", "embedded", "proof", 3),
+            ("collection", "owner", "embedded", "proof", 4),
+            ("table", "owner", "embedded", "proof", 5),
+            ("source", "owner", "embedded", "proof", 6),
+            ("owner", "other", "embedded", "proof", 1),
+            ("origin", "owner", "sidecar", "proof", 1),
+            ("proof", "owner", "embedded", "other", 1),
+        ] {
+            db.execute("INSERT INTO migration_file_metadata VALUES(?1,?2,?3,?4,'wrong',?5,?5,x'00',x'7b7d')",params![name,origin,proof,owner,record])?;
+        }
+        let original = SUPPLEMENT_PROJECTION.replace(" INDEXED BY migration_lookup_source", "");
+        let expected = vec![("digest".to_owned(), b"{}".to_vec())];
+        assert_eq!(supplemental_rows(&db, SUPPLEMENT_PROJECTION)?.0, expected);
+        assert_eq!(supplemental_rows(&db, &original)?.0, expected);
+        db.execute(
+            "DELETE FROM migration_file_metadata WHERE file_source='file'",
+            [],
+        )?;
+        assert!(supplemental_rows(&db, SUPPLEMENT_PROJECTION)?.0.is_empty());
+        assert!(supplemental_rows(&db, &original)?.0.is_empty());
+        for name in ["duplicate-a", "duplicate-b", "duplicate-c"] {
+            db.execute("INSERT INTO migration_file_metadata VALUES(?1,'embedded','proof','owner','duplicate',1,1,x'00',x'7b7d')",[name])?;
+        }
+        // Both forms expose two rows, so the existing second-row check rejects ambiguity.
+        assert_eq!(supplemental_rows(&db, SUPPLEMENT_PROJECTION)?.0.len(), 2);
+        assert_eq!(supplemental_rows(&db, &original)?.0.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn supplemental_projection_work_scales_with_exact_source_not_table_population() -> Result<()> {
+        let original = SUPPLEMENT_PROJECTION.replace(" INDEXED BY migration_lookup_source", "");
+        let table_scan = SUPPLEMENT_PROJECTION.replace(
+            "INDEXED BY migration_lookup_source",
+            "INDEXED BY migration_lookup_table",
+        );
+        let mut work = Vec::new();
+        for noise in [8, 4096] {
+            let db = supplemental_lookup_fixture(noise)?;
+            let plan = db
+                .prepare(&format!("EXPLAIN QUERY PLAN {SUPPLEMENT_PROJECTION}"))?
+                .query_map(
+                    ["owner", "embedded", "proof", "input", "revision", "wanted"],
+                    |r| r.get::<_, String>(3),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                plan.iter()
+                    .any(|p| p.contains("migration_lookup_source") && p.contains("source_id=?")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|p| p.contains("migration_file_metadata_retained_origin")
+                        && p.contains("supplement=?")),
+                "{plan:?}"
+            );
+            let (rows, steps) = supplemental_rows(&db, SUPPLEMENT_PROJECTION)?;
+            assert_eq!(supplemental_rows(&db, &original)?.0, rows);
+            let (prior_plan_rows, prior_steps) = supplemental_rows(&db, &table_scan)?;
+            assert_eq!(prior_plan_rows, rows);
+            assert!(steps < 100, "exact source steps={steps}");
+            if noise == 4096 {
+                assert!(
+                    prior_steps > steps * 100,
+                    "old plan={prior_steps}, source seek={steps}"
+                );
+            }
+            eprintln!(
+                "supplemental lookup unrelated_files={noise} exact_source_vm={steps} observed_old_index_vm={prior_steps}"
+            );
+            work.push(steps);
+        }
+        assert!(work[1] <= work[0] + 8, "{work:?}");
+        Ok(())
     }
 
     #[test]

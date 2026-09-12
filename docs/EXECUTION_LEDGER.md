@@ -132,9 +132,19 @@ The destination-only query trace passed in 11.619 seconds and approximately
 it does not establish the native failure's cause. Operation-specific error context
 now identifies source admission and each reconciliation query boundary, with SQL
 and limits unchanged. Independent source review and 33 focused tests passed,
-including original SQLite error identity and report/cursor rollback. The next
-instrumented attempt remains pending. The repair is not Complete. Source catalogs
-and originals remain untouched.
+including original SQLite error identity and report/cursor rollback. The
+instrumented attempt located the interruption at 30.002 seconds in supplemental
+custody/projection reconciliation for capture index 1. Its checkpoint remained
+unchanged. A bounded read-only comparison of all 14 supplemental items in that
+capture showed the original lookup choosing the table-name index; selecting the
+existing exact-source index returned identical results with much less work
+(0.524 seconds / approximately 3.222 million VM steps versus 0.006 seconds in the
+warm Python diagnostic). The query now selects that existing exact-source index
+without changing schema, predicates, limits or checkpoint semantics. Seven
+reconciliation, five supplemental and eleven importer regression tests passed; the native
+VM-step test stayed at 38 steps with 8 and 4,096 unrelated files, while the old
+index plan grew to 20,517 steps. Actual native reconciliation remains pending.
+The repair is not Complete. Source catalogs and originals remain untouched.
 Representative API readback, post-repair audit, final acceptance
 review, merge and terminal merged-head CI remain required for S10.
 S11 backup/restore and S12 Tauri interface retain their S10 dependencies;
