@@ -819,6 +819,12 @@ fn global_id_conflict_cli_enumerates_all_selected_catalog_pairs() {
         capture_file(&source, &capture);
         let revision = plan.add_capture(&capture).unwrap();
         finish(&mut plan, &revision);
+        plan.assign_family(
+            &revision,
+            &format!("synthetic-family-{index}"),
+            "explicit synthetic independent families sharing identifier values",
+        )
+        .unwrap();
     }
     let original_bytes = tree(&originals);
     let families = plan.families().unwrap().families;
