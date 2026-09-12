@@ -15,7 +15,7 @@ flate2 = "1"
 png = "=0.18.1"
 tiff = "=0.10.3"
 kamadak-exif = "0.6"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

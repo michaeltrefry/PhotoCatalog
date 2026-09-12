@@ -17,6 +17,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
 
+#[derive(Debug)]
 pub(crate) enum LinkResolution {
     Missing,
     Ambiguous,
@@ -243,6 +244,36 @@ impl<'a> Walk<'a> {
             "retained target association differs"
         );
         let target_key = inline(&entity, "local_key")?;
+        let target_raw = self.record(rows.records[0].sequence)?;
+        let key_length = match target_raw.fields.get("key_json") {
+            Some(crate::lightroom::migration_source::Field::Inline(Cell::Text(v))) => {
+                v.len() as u64
+            }
+            Some(crate::lightroom::migration_source::Field::Bytes(v)) if v.text => v.bytes,
+            _ => return Ok(unavailable("target typed key is not interpretable text")),
+        };
+        if key_length > 65536 {
+            return Ok(unavailable("target typed key exceeds interpretation bound"));
+        }
+        let key: Vec<Cell> = serde_json::from_slice(&retention::field_bytes(
+            &self.catalog.db,
+            rows.records[0].sequence,
+            &target_raw,
+            "key_json",
+            65536,
+        )?)?;
+        let bytes = key.iter().try_fold(0usize, |sum, v| {
+            sum.checked_add(match v {
+                Cell::Text(v) | Cell::Blob(v) => v.len(),
+                _ => 8,
+            })
+            .context("target key overflow")
+        })?;
+        if key.is_empty() || key.len() > 128 || bytes > 16384 {
+            return Ok(unavailable(
+                "target typed key exceeds stable identity bounds",
+            ));
+        }
         let target = self.source_record(rows.records[0].sequence)?;
         ensure!(
             target.source.table == target_table && self.source_id(&target)? == target_id,

@@ -272,6 +272,56 @@ impl View<'_> {
         let entity = self.record(row.entity_record)?;
         self.text(row.entity_record, &entity, "local_key")
     }
+    /// Offline equivalent of MigrationSource::resolve: count joined target
+    /// matches for the complete source/field/table group, not one edge alone.
+    /// A dangling extra edge contributes no match; two matched edges/entities
+    /// remain ambiguous, even when an individual edge has a unique endpoint.
+    fn group_target(
+        &mut self,
+        source_id: &str,
+        field: &str,
+        target_table: &str,
+    ) -> Result<std::result::Result<i64, Compatibility>> {
+        let page = self.catalog.migration_lookup(
+            &self.input,
+            &self.revision,
+            &Lookup::References {
+                source_id: source_id.into(),
+                field: Some(field.into()),
+                target_table: Some(target_table.into()),
+            },
+            None,
+            100,
+        )?;
+        if !page.coverage_complete || !page.keys_complete || page.next.is_some() {
+            return Ok(Err(Compatibility::Unavailable));
+        }
+        let mut matched = None;
+        for hit in page.records {
+            let reference = self.record(hit.sequence)?;
+            ensure!(
+                reference.collection == Collection::References
+                    && self.text(hit.sequence, &reference, "source_id")? == source_id
+                    && self.text(hit.sequence, &reference, "field")? == field
+                    && self.text(hit.sequence, &reference, "target_table")? == target_table,
+                "history reference group differs"
+            );
+            let key = self.text(hit.sequence, &reference, "target_key")?;
+            match self.unique(&Lookup::EntitiesByLocalKey {
+                table_name: target_table.into(),
+                local_key: key,
+            })? {
+                Ok(id) => {
+                    if matched.replace(id).is_some() {
+                        return Ok(Err(Compatibility::Ambiguous));
+                    }
+                }
+                Err(Compatibility::Missing) => (),
+                Err(why) => return Ok(Err(why)),
+            }
+        }
+        Ok(matched.ok_or(Compatibility::Missing))
+    }
     fn endpoints(&mut self, reference: i64) -> Result<Relation> {
         let r = self.record(reference)?;
         ensure!(
@@ -287,9 +337,11 @@ impl View<'_> {
             table_name: target_table.clone(),
             local_key: target_key.clone(),
         })?;
-        let compatibility = from
+        let group = self.group_target(&source_id, &field, &target_table)?;
+        let compatibility = group
             .as_ref()
             .err()
+            .or(from.as_ref().err())
             .or(to.as_ref().err())
             .cloned()
             .unwrap_or(Compatibility::RetainedOnly);
@@ -384,6 +436,9 @@ fn root<'a>(catalog: &'a Catalog, key: &VariantKey) -> Result<(View<'a>, Anchor,
 }
 
 fn next_row(current: &RawRow, relation: &Relation, direction: &Direction) -> Option<RawRow> {
+    if relation.compatibility != Compatibility::RetainedOnly {
+        return None;
+    }
     let (from, to) = match direction {
         Direction::Incoming => (relation.target.as_ref()?, relation.source.as_ref()?),
         Direction::Outgoing => (relation.source.as_ref()?, relation.target.as_ref()?),
@@ -715,6 +770,9 @@ mod tests {
     }
     impl Test {
         fn new(duplicate: bool, huge: bool) -> Result<Self> {
+            Self::with_case(duplicate, huge, "")
+        }
+        fn with_case(duplicate: bool, huge: bool, case: &str) -> Result<Self> {
             let mut f = Fixture::new();
             let revision = f.revision().to_owned();
             let excluded = f.seal.excluded_revisions[0].clone();
@@ -759,7 +817,39 @@ mod tests {
                     }
                 }
             });
+            if !case.is_empty() {
+                f.edit(|db| {
+                    let (owner,field,table,keys)=match case {
+                        "incoming"=>("h-40","image","Adobe_images",vec![21]),
+                        "outgoing"=>("h-20","developSettingsIDCache","Adobe_imageDevelopSettings",vec![31]),
+                        "dangling"=>("h-20","developSettingsIDCache","Adobe_imageDevelopSettings",vec![999]),
+                        "overlimit"=>("h-20","developSettingsIDCache","Adobe_imageDevelopSettings",(1000..1100).collect()),
+                        _=>unreachable!(),
+                    };
+                    for key in keys {
+                        db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,?3,?4,?5)",params![revision,owner,field,table,serde_json::to_string(&Cell::Integer(key)).unwrap()]).unwrap();
+                    }
+                });
+            }
             let source = f.open();
+            if !case.is_empty() {
+                use crate::lightroom::migration_source::Resolution;
+                let (owner, field, table) = if case == "incoming" {
+                    ("h-40", "image", "Adobe_images")
+                } else {
+                    (
+                        "h-20",
+                        "developSettingsIDCache",
+                        "Adobe_imageDevelopSettings",
+                    )
+                };
+                let actual = source.resolve(&revision, owner, field, table)?;
+                if matches!(case, "incoming" | "outgoing") {
+                    assert_eq!(actual, Resolution::Ambiguous);
+                } else {
+                    assert_eq!(actual, Resolution::Unique("h-30".into()));
+                }
+            }
             let temp = tempfile::tempdir()?;
             let mut catalog = Catalog::open(temp.path().join("catalog"))?;
             catalog.begin_migration_retention(&source, approval)?;
@@ -774,8 +864,23 @@ mod tests {
                     .complete,
                 "fixture retention incomplete"
             );
-            let get = |c| {
-                catalog.retained_migration_records(source.binding_blake3(), &revision, c, 0, 100)
+            let get = |c| -> Result<Vec<(i64, EvidenceRecord)>> {
+                let mut records = Vec::new();
+                let mut after = 0;
+                loop {
+                    let page = catalog.retained_migration_records(
+                        source.binding_blake3(),
+                        &revision,
+                        c,
+                        after,
+                        100,
+                    )?;
+                    let Some(last) = page.last() else { break };
+                    after = last.0;
+                    records.extend(page);
+                    ensure!(records.len() <= 1000, "fixture record bound");
+                }
+                Ok(records)
             };
             let mut rows = BTreeMap::new();
             for (n, r) in get(Collection::Rows)? {
@@ -882,10 +987,10 @@ mod tests {
                     .migration_variant_evidence(key, cursor.as_ref(), 1)?;
                 assert!(p.coverage_complete && p.keys_complete);
                 for r in p.relations {
-                    if let Some(raw) = r.source {
-                        if raw.source.table != "Adobe_images" {
-                            seen.push(raw.source_id);
-                        }
+                    if let Some(raw) = r.source
+                        && raw.source.table != "Adobe_images"
+                    {
+                        seen.push(raw.source_id);
                     }
                 }
                 cursor = p.next;
@@ -1048,6 +1153,133 @@ mod tests {
             .retained_migration_field(result.row.record, "cells_json")?;
         assert!(serde_json::to_string(&evidence)?.contains("complete"));
         assert_eq!(p.input, t.input);
+        Ok(())
+    }
+    #[test]
+    fn incoming_conflicting_history_owners_keep_rows_without_variant_anchors() -> Result<()> {
+        let t = Test::with_case(false, false, "incoming")?;
+        for key in &t.keys[..2] {
+            let page = t.catalog.migration_variant_evidence(key, None, 100)?;
+            let relation = page
+                .relations
+                .iter()
+                .find(|r| r.source_id == "h-40")
+                .unwrap();
+            assert_eq!(relation.compatibility, Compatibility::Ambiguous);
+            assert!(relation.anchor.is_none());
+            assert_eq!(
+                relation.source.as_ref().unwrap().classification,
+                Classification::History
+            );
+            assert_eq!(relation.target.as_ref().unwrap().record, page.row.record);
+            // Serialized private fields are not permission: re-prove the group.
+            let mut forged = page.anchor.clone();
+            forged.hops.push(Hop {
+                reference: relation.reference_record,
+                direction: Direction::Incoming,
+            });
+            assert!(
+                t.catalog
+                    .migration_source_evidence(&forged, Direction::Outgoing, None, 1)
+                    .is_err()
+            );
+            assert!(
+                t.catalog
+                    .migration_adobe_evidence(&forged, "text", vec![])
+                    .is_err()
+            );
+            let row = relation.source.as_ref().unwrap();
+            let retained = t.catalog.migration_lookup_record(row.record)?;
+            let cells = retention::field_bytes(
+                &t.catalog.db,
+                row.record,
+                &retained,
+                "cells_json",
+                MAX_BYTES,
+            )?;
+            assert_eq!(cells.len() as u64, row.cells_json_bytes);
+            assert!(!serde_json::from_slice::<Vec<Cell>>(&cells)?.is_empty());
+        }
+        Ok(())
+    }
+    #[test]
+    fn outgoing_conflicting_current_groups_never_label_or_mint_current_settings() -> Result<()> {
+        let t = Test::with_case(false, false, "outgoing")?;
+        let base = t.catalog.migration_variant_evidence(&t.keys[0], None, 1)?;
+        let out =
+            t.catalog
+                .migration_source_evidence(&base.anchor, Direction::Outgoing, None, 100)?;
+        let targets = out
+            .relations
+            .iter()
+            .filter(|r| r.field == "developSettingsIDCache")
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 2);
+        for relation in targets {
+            assert_eq!(relation.compatibility, Compatibility::Ambiguous);
+            assert!(relation.anchor.is_none());
+            assert_eq!(
+                relation.target.as_ref().unwrap().classification,
+                Classification::Settings
+            );
+            let mut forged = base.anchor.clone();
+            forged.hops.push(Hop {
+                reference: relation.reference_record,
+                direction: Direction::Outgoing,
+            });
+            assert!(
+                t.catalog
+                    .migration_source_evidence(&forged, Direction::Incoming, None, 1)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn dangling_extra_reference_keeps_unique_join_semantics_but_excess_group_is_unavailable()
+    -> Result<()> {
+        let t = Test::with_case(false, false, "dangling")?;
+        let base = t.catalog.migration_variant_evidence(&t.keys[0], None, 1)?;
+        let out =
+            t.catalog
+                .migration_source_evidence(&base.anchor, Direction::Outgoing, None, 100)?;
+        let targets = out
+            .relations
+            .iter()
+            .filter(|r| r.field == "developSettingsIDCache")
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 2);
+        let existing = targets.iter().find(|r| r.target.is_some()).unwrap();
+        assert_eq!(existing.compatibility, Compatibility::RetainedOnly);
+        assert!(existing.anchor.is_some());
+        let missing = targets.iter().find(|r| r.target.is_none()).unwrap();
+        assert_eq!(missing.compatibility, Compatibility::Missing);
+        assert!(missing.anchor.is_none());
+        let t = Test::with_case(false, false, "overlimit")?;
+        let base = t.catalog.migration_variant_evidence(&t.keys[0], None, 1)?;
+        let out =
+            t.catalog
+                .migration_source_evidence(&base.anchor, Direction::Outgoing, None, 100)?;
+        assert!(out.next.is_some());
+        assert!(
+            out.relations
+                .iter()
+                .filter(|r| r.field == "developSettingsIDCache")
+                .all(|r| r.compatibility == Compatibility::Unavailable && r.anchor.is_none())
+        );
+        let last = t.catalog.migration_source_evidence(
+            &base.anchor,
+            Direction::Outgoing,
+            out.next.as_ref(),
+            100,
+        )?;
+        let existing = last
+            .relations
+            .iter()
+            .find(|r| r.field == "developSettingsIDCache" && r.target.is_some())
+            .unwrap();
+        assert_eq!(existing.compatibility, Compatibility::Unavailable);
+        assert!(existing.anchor.is_none());
         Ok(())
     }
 }

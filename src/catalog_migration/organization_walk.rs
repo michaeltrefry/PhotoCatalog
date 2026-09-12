@@ -788,6 +788,8 @@ mod tests {
                 revisions,
                 policy: Policy {
                     import_source: "lightroom".into(),
+                    artifacts: vec![],
+                    supplements: vec![],
                     overlap: super::super::importer::OverlapPolicy::RequireDecision,
                     keyword_overlap: KeywordOverlap::ReuseExactHierarchy {
                         reason: "explicit synthetic full-hierarchy reuse".into(),
