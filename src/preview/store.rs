@@ -204,14 +204,23 @@ fn restore_image_scopes(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+// Created only after successful acquisition: a failed contender must not unlock.
+// Duplicated or fork-inherited descriptors must not extend lexical ownership.
+struct AcquiredPreviewLock(File);
+impl Drop for AcquiredPreviewLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// One owner serializes filesystem/manifest mutations; workers return encoded
 /// data to that owner. The process lock is released automatically on crash.
 pub struct PreviewStore {
     db: Connection,
     config: StoreConfig,
-    _lock: File,
-    _tier_locks: [File; 2],
-    _relocation_lock: Option<File>,
+    _lock: AcquiredPreviewLock,
+    _tier_locks: [AcquiredPreviewLock; 2],
+    _relocation_lock: Option<AcquiredPreviewLock>,
     identity: String,
     clock: Cell<i64>,
     touches: RefCell<HashMap<String, i64>>,
@@ -298,6 +307,7 @@ impl PreviewStore {
             .open(config.manifest_root.join("preview.lock"))?;
         lock.try_lock_exclusive()
             .context("preview service already owns this cache")?;
+        let lock = AcquiredPreviewLock(lock);
         let db = Connection::open(config.manifest_root.join("previews.sqlite3"))?;
         let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -1666,3 +1676,7 @@ mod tests {
         store.desire(&sibling, || Ok(true)).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "store_lock_tests.rs"]
+mod lock_tests;

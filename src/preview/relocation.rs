@@ -9,7 +9,12 @@ pub struct RelocationProgress {
     pub object_bytes: u64,
     pub complete: bool,
 }
-pub(super) fn lock_root(root: &Path, identity: &str, tier: Tier, layout: Layout) -> Result<File> {
+pub(super) fn lock_root(
+    root: &Path,
+    identity: &str,
+    tier: Tier,
+    layout: Layout,
+) -> Result<AcquiredPreviewLock> {
     let marker = root.join(".photocatalog-preview-owner");
     if marker.exists() {
         ensure!(
@@ -17,7 +22,7 @@ pub(super) fn lock_root(root: &Path, identity: &str, tier: Tier, layout: Layout)
             "invalid preview ownership marker"
         );
     }
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -25,17 +30,18 @@ pub(super) fn lock_root(root: &Path, identity: &str, tier: Tier, layout: Layout)
         .open(marker)?;
     file.try_lock_exclusive()
         .context("preview location is owned by another process")?;
+    let mut file = AcquiredPreviewLock(file);
     let expected = serde_json::to_vec(&(identity, tier, layout))?;
-    let length = file.metadata()?.len();
+    let length = file.0.metadata()?.len();
     ensure!(length <= 256, "invalid preview location identity");
     if length == 0 {
-        file.write_all(&expected)?;
-        file.sync_all()?;
+        file.0.write_all(&expected)?;
+        file.0.sync_all()?;
         #[cfg(unix)]
         File::open(root)?.sync_all()?;
     } else {
         let mut actual = vec![0; length as usize];
-        file.read_exact(&mut actual)?;
+        file.0.read_exact(&mut actual)?;
         ensure!(
             actual == expected,
             "preview location belongs to another manifest/tier/layout"
@@ -487,7 +493,7 @@ mod tests {
             use std::io::Seek;
             // Windows excludes reads through a second handle while this marker
             // is byte-range locked. Inspect the actual owning handle instead.
-            let mut owner = &store._tier_locks[0];
+            let mut owner = &store._tier_locks[0].0;
             owner.rewind().unwrap();
             let mut bytes = Vec::new();
             owner.take(257).read_to_end(&mut bytes).unwrap();
