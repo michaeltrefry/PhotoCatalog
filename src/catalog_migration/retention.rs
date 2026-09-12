@@ -194,6 +194,83 @@ fn decode(bytes: &[u8], length: usize, digest: &str) -> Result<EvidenceRecord> {
     Ok(serde_json::from_slice(&raw)?)
 }
 
+/// Resolve completed destination evidence to its retained authorized selection.
+pub(crate) fn selected_record(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
+    let (input, seal, compressed, length, digest): (String, Vec<u8>, Vec<u8>, usize, String) = db.query_row(
+        "SELECT i.id,i.seal,r.compressed,r.raw_length,r.digest FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1 AND r.complete=1",
+        [sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    )?;
+    ensure!(seal.len() <= RECORD_LIMIT, "retained seal size limit");
+    let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
+    ensure!(
+        seal.binding_blake3()? == input,
+        "retained seal binding differs"
+    );
+    let record = decode(&compressed, length, &digest)?;
+    ensure!(
+        seal.selected.iter().any(|s| s.revision == record.revision)
+            && !seal.excluded_revisions.contains(&record.revision),
+        "record is not an authorized selected capture"
+    );
+    Ok(record)
+}
+
+pub(crate) fn field_bytes(
+    db: &Connection,
+    sequence: i64,
+    record: &EvidenceRecord,
+    name: &str,
+    maximum: usize,
+) -> Result<Vec<u8>> {
+    match record.fields.get(name).context("missing retained field")? {
+        Field::Inline(
+            crate::lightroom::plan::Cell::Text(bytes) | crate::lightroom::plan::Cell::Blob(bytes),
+        ) => {
+            ensure!(
+                bytes.len() <= maximum,
+                "retained field exceeds interpretation limit"
+            );
+            Ok(bytes.clone())
+        }
+        Field::Bytes(reference) => {
+            ensure!(
+                reference.bytes <= maximum as u64,
+                "retained field exceeds interpretation limit"
+            );
+            let id: String = db.query_row(
+                "SELECT evidence FROM migration_retained_fields WHERE record=?1 AND field=?2",
+                params![sequence, name],
+                |r| r.get(0),
+            )?;
+            let descriptor: Vec<u8> = db.query_row(
+                "SELECT descriptor FROM migration_evidence WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                serde_json::from_slice::<crate::lightroom::migration_source::ByteRef>(&descriptor)?
+                    == *reference,
+                "retained field descriptor differs"
+            );
+            let mut bytes = Vec::new();
+            while (bytes.len() as u64) < reference.bytes {
+                let chunk = evidence::read(db, &id, bytes.len() as u64)?;
+                ensure!(
+                    !chunk.is_empty() && chunk.len() <= maximum - bytes.len(),
+                    "retained field length differs"
+                );
+                bytes.extend(chunk);
+            }
+            ensure!(
+                bytes.len() as u64 == reference.bytes,
+                "retained field length differs"
+            );
+            Ok(bytes)
+        }
+        _ => anyhow::bail!("retained field is not text or bytes"),
+    }
+}
+
 impl Catalog {
     /// Opening the source already verified its byte seal and selected family
     /// evidence. The exact external authorization is retained and digest checked.

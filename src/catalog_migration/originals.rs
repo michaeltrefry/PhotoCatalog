@@ -66,8 +66,8 @@ pub struct OriginalRequest {
     pub import_source: String,
     pub source: SourceKey,
     pub decision: OriginalDecision,
-    /// Complete retained source evidence, not an inspection scratch path.
-    pub evidence_id: String,
+    /// A completed selected AgLibraryFile row in destination evidence custody.
+    pub retained_record: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginalMapping {
@@ -80,7 +80,7 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS migration_originals(
         source_identity TEXT PRIMARY KEY, import_source TEXT NOT NULL,
         source_json TEXT NOT NULL, decision_json TEXT NOT NULL,
-        evidence_id TEXT NOT NULL REFERENCES migration_evidence(id),
+        retained_record INTEGER NOT NULL REFERENCES migration_retained_records(sequence),
         asset_id TEXT NOT NULL REFERENCES assets(id), created INTEGER NOT NULL CHECK(created IN(0,1)));")?;
     Ok(())
 }
@@ -93,6 +93,29 @@ pub(crate) fn register(db: &Connection, request: &OriginalRequest) -> Result<Ori
         "import owner bounds"
     );
     let identity = request.source.identity()?;
+    let retained = super::retention::selected_record(db, request.retained_record)?;
+    ensure!(
+        retained.collection == crate::lightroom::migration_source::Collection::Rows
+            && retained.revision == request.source.capture_revision,
+        "source record revision/type differs"
+    );
+    let table =
+        super::retention::field_bytes(db, request.retained_record, &retained, "table_name", 1024)?;
+    ensure!(
+        table == b"AgLibraryFile" && table == request.source.table.as_bytes(),
+        "original registration requires the selected file row"
+    );
+    let key = super::retention::field_bytes(
+        db,
+        request.retained_record,
+        &retained,
+        "key_json",
+        64 * 1024,
+    )?;
+    ensure!(
+        serde_json::from_slice::<Vec<Cell>>(&key)? == request.source.key,
+        "source record key differs"
+    );
     let path = match &request.decision {
         OriginalDecision::Create { path } => path,
         OriginalDecision::Reuse {
@@ -114,12 +137,12 @@ pub(crate) fn register(db: &Connection, request: &OriginalRequest) -> Result<Ori
     let source_json = serde_json::to_string(&request.source)?;
     let decision_json = serde_json::to_string(&request.decision)?;
     let existing: Option<(String, String, String, String, bool)> = db.query_row(
-        "SELECT source_json,decision_json,evidence_id,asset_id,created FROM migration_originals WHERE source_identity=?1",
+        "SELECT source_json,decision_json,import_source,asset_id,created FROM migration_originals WHERE source_identity=?1",
         [&identity], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     ).optional()?;
-    if let Some((source, decision, evidence, asset_id, created)) = existing {
+    if let Some((source, decision, owner, asset_id, created)) = existing {
         ensure!(
-            source == source_json && decision == decision_json && evidence == request.evidence_id,
+            source == source_json && decision == decision_json && owner == request.import_source,
             "source original mapping differs; explicit reconciliation required"
         );
         // Relinking after migration is legitimate. An identical replay keeps the
@@ -130,14 +153,6 @@ pub(crate) fn register(db: &Connection, request: &OriginalRequest) -> Result<Ori
             created,
         });
     }
-    ensure!(
-        db.query_row(
-            "SELECT complete FROM migration_evidence WHERE id=?1",
-            [&request.evidence_id],
-            |r| r.get::<_, bool>(0)
-        )?,
-        "source evidence must be completely retained before registration"
-    );
     let (asset_id, created) = match &request.decision {
         OriginalDecision::Create { path } => {
             let asset_id = uuid::Uuid::new_v4().to_string();
@@ -173,7 +188,7 @@ pub(crate) fn register(db: &Connection, request: &OriginalRequest) -> Result<Ori
             request.import_source,
             source_json,
             decision_json,
-            request.evidence_id,
+            request.retained_record,
             asset_id,
             created
         ],
@@ -225,7 +240,36 @@ mod tests {
     fn offline_registration_replay_and_explicit_overlap_do_not_move_originals() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut catalog = Catalog::open(dir.path().join("catalog"))?;
-        let evidence = catalog.begin_migration_evidence(b"source file fixture", 0)?;
+        let mut fixture = crate::lightroom::migration_source::tests::Fixture::new();
+        let revision = fixture.revision().to_owned();
+        fixture.edit(|db| {
+            db.execute("UPDATE tables SET name='AgLibraryFile'",[]).unwrap();
+            db.execute("UPDATE rows SET table_name='AgLibraryFile'",[]).unwrap();
+            db.execute("INSERT INTO rows(revision,source_id,table_name,key_json,cells_json) SELECT revision,'second-file','AgLibraryFile','[{\"type\":\"Integer\",\"value\":8}]',cells_json FROM rows WHERE revision=?1",[&revision]).unwrap();
+            db.execute("UPDATE tables SET expected=2,retained=2 WHERE revision=?1",[&revision]).unwrap();
+        });
+        let approval = b"selected synthetic originals";
+        fixture.seal.approval.document_blake3 = blake3::hash(approval).to_hex().to_string();
+        let source = fixture.open();
+        catalog.begin_migration_retention(&source, approval)?;
+        for _ in 0..100 {
+            if catalog.step_migration_retention(&source)?.complete {
+                break;
+            }
+        }
+        assert!(
+            catalog
+                .migration_retention_progress(source.binding_blake3())?
+                .complete
+        );
+        let records = catalog.retained_migration_records(
+            source.binding_blake3(),
+            &revision,
+            crate::lightroom::migration_source::Collection::Rows,
+            0,
+            100,
+        )?;
+        assert_eq!(records.len(), 2);
         let missing = dir
             .path()
             .join("offline")
@@ -236,19 +280,20 @@ mod tests {
         let request = OriginalRequest {
             import_source: "test-selection".into(),
             source: SourceKey {
-                capture_revision: "a".repeat(64),
+                capture_revision: revision,
                 table: "AgLibraryFile".into(),
                 key: vec![Cell::Integer(7)],
             },
             decision: OriginalDecision::Create { path: path.clone() },
-            evidence_id: evidence.id,
+            retained_record: records[0].0,
         };
         let first = catalog.register_migration_original(&request)?;
         assert!(first.created);
         assert_eq!(first, catalog.register_migration_original(&request)?);
         assert!(!missing.exists());
         let mut second = request.clone();
-        second.source.capture_revision = "b".repeat(64);
+        second.source.key = vec![Cell::Integer(8)];
+        second.retained_record = records[1].0;
         assert!(catalog.register_migration_original(&second).is_err());
         second.decision = OriginalDecision::Reuse {
             asset_id: first.asset_id.clone(),
@@ -257,6 +302,18 @@ mod tests {
         let reused = catalog.register_migration_original(&second)?;
         assert_eq!(reused.asset_id, first.asset_id);
         assert!(!reused.created);
+        let mut wrong = request.clone();
+        wrong.import_source = "another owner".into();
+        assert!(catalog.register_migration_original(&wrong).is_err());
+        wrong = request.clone();
+        wrong.source.capture_revision = fixture.seal.excluded_revisions[0].clone();
+        assert!(catalog.register_migration_original(&wrong).is_err());
+        wrong = request.clone();
+        wrong.retained_record = -1;
+        assert!(catalog.register_migration_original(&wrong).is_err());
+        wrong = request.clone();
+        wrong.source.key = vec![Cell::Integer(9)];
+        assert!(catalog.register_migration_original(&wrong).is_err());
         assert_eq!(
             catalog
                 .db

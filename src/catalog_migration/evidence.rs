@@ -171,7 +171,7 @@ pub(crate) fn append(
     state(db, id)
 }
 
-fn read(db: &Connection, id: &str, offset: u64) -> Result<Vec<u8>> {
+pub(crate) fn read(db: &Connection, id: &str, offset: u64) -> Result<Vec<u8>> {
     let status = state(db, id)?;
     ensure!(status.complete, "evidence is not complete");
     ensure!(offset <= status.length, "evidence chunk offset");
