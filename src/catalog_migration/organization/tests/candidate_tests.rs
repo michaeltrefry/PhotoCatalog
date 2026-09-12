@@ -482,3 +482,62 @@ fn flat_and_hierarchical_accumulators_do_not_seed_each_other() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn ordinary_empty_label_import_keeps_original_model_and_resumes_after_flag() -> Result<()> {
+    let mut b = Bed::new(false)?;
+    let (key, _) = b.images()?;
+    observe(
+        &mut b,
+        &key,
+        "synthetic empty Label",
+        false,
+        &[set("Label", ""), set("Rating", "0")],
+    )?;
+    let view = b.catalog.metadata_for_image(&key)?;
+    let label = view.fields.iter().find(|f| f.name == "label").unwrap();
+    assert!(!label.conflicted);
+    assert_eq!(label.value, Some(Value::Text(String::new())));
+    let old_model = label.selected_model.unwrap();
+    let image_id = b.catalog.image_metadata_identity(&key)?.image_id;
+    let old_bytes = b.catalog.metadata_model(&image_id, old_model)?;
+    let flag = b.request(300, Decision::Flag { value: Flag::Pick });
+    let label = b.request(
+        300,
+        Decision::Label {
+            value: "Red".into(),
+        },
+    );
+    let flag_result = b
+        .catalog
+        .project_migration_organization(Some(&b.source), &flag)?;
+    let label_result = b
+        .catalog
+        .project_migration_organization(Some(&b.source), &label)?;
+    assert!(matches!(label_result.target, NativeTarget::Image { .. }));
+    assert_eq!(
+        b.catalog
+            .metadata_for_image(&key)?
+            .fields
+            .iter()
+            .find(|f| f.name == "label")
+            .unwrap()
+            .value,
+        Some(Value::Text("Red".into()))
+    );
+    assert_eq!(b.catalog.metadata_model(&image_id, old_model)?, old_bytes);
+    let before = b.catalog.image_metadata_identity(&key)?;
+    let path = b._temp.path().join("catalog");
+    drop(b.catalog);
+    b.catalog = Catalog::open(path)?;
+    assert_eq!(
+        b.catalog.project_migration_organization(None, &flag)?,
+        flag_result
+    );
+    assert_eq!(
+        b.catalog.project_migration_organization(None, &label)?,
+        label_result
+    );
+    assert_eq!(b.catalog.image_metadata_identity(&key)?, before);
+    Ok(())
+}

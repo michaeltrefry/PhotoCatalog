@@ -727,7 +727,11 @@ impl XmpMeta {
                     &mut err,
                     c_ns.as_ptr(),
                     c_name.as_ptr(),
-                    if new_value.value.is_empty() {
+                    // A null value requests composite construction in the C++
+                    // SDK. An empty simple value is still a string, including
+                    // when clearing a scalar or restoring it during an undo.
+                    if new_value.value.is_empty() && (new_value.is_struct() || new_value.is_array())
+                    {
                         std::ptr::null()
                     } else {
                         c_value.as_ptr()

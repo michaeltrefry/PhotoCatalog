@@ -47,6 +47,11 @@
       "file": "external/xmp_toolkit/XMPCore/source/ParseRDF.cpp",
       "before_sha256": "58545a128ff375bf3714081a0d56bc89040109126d206475ffe5e320130f9cd8",
       "after_sha256": "8a5aadd3b364256e9e9145eb2d04da55e1f404eb4db2f8d2e1d877ad1de83b39"
+    },
+    {
+      "file": "src/xmp_meta.rs",
+      "before_sha256": "f7140e57e7dd8dcea41cb061d9a2f175a6c4e31d24ed1a42fc2b8a7efdf2e526",
+      "after_sha256": "1f17eef6c9aa8113ddf1b0e0e9d8585e4db2613320e53ad2a3cc5c0b1efc55d5"
     }
   ]
 }
