@@ -427,14 +427,14 @@ mod tests {
                     db.execute("INSERT INTO rows(revision,source_id,table_name,key_json,cells_json) VALUES(?1,?2,?3,?4,?5)",params![revision,source_id,table,serde_json::to_string(&vec![Cell::Integer(id)]).unwrap(),serde_json::to_string(&cells).unwrap()]).unwrap();
                     db.execute("INSERT INTO entities VALUES(?1,?2,?3,?4,NULL,'{}')",params![revision,source_id,table,serde_json::to_string(&Cell::Integer(id)).unwrap()]).unwrap();
                     if table=="Adobe_images" {
-                        db.execute("INSERT INTO references_out VALUES(?1,?2,'rootFile','AgLibraryFile',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(10)).unwrap()]).unwrap();
-                        db.execute("INSERT INTO references_out VALUES(?1,?2,'developSettingsIDCache','Adobe_imageDevelopSettings',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(if id==21 {31}else{30})).unwrap()]).unwrap();
+                        db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,'rootFile','AgLibraryFile',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(10)).unwrap()]).unwrap();
+                        db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,'developSettingsIDCache','Adobe_imageDevelopSettings',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(if id==21 {31}else{30})).unwrap()]).unwrap();
                     }
                     if id==21 {
-                        db.execute("INSERT INTO references_out VALUES(?1,?2,'masterImage','Adobe_images',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(20)).unwrap()]).unwrap();
+                        db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,'masterImage','Adobe_images',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(20)).unwrap()]).unwrap();
                     }
                     if id==40 {
-                        db.execute("INSERT INTO references_out VALUES(?1,?2,'image','Adobe_images',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(20)).unwrap()]).unwrap();
+                        db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,'image','Adobe_images',?3)",params![revision,source_id,serde_json::to_string(&Cell::Integer(20)).unwrap()]).unwrap();
                         let raw=if oversized_packets {vec![b'a';9*1024*1024]}else{raw.clone()};
                         let decoded=if oversized_packets {vec![b'b';9*1024*1024]}else{xmp.to_vec()};
                         db.execute("INSERT INTO packets(revision,source_id,origin,raw_digest,raw,decoded,detail) VALUES(?1,?2,'catalog',?3,?4,?5,'fixture exact catalog XMP')",params![revision,source_id,blake3::hash(&raw).to_hex().to_string(),raw,decoded]).unwrap();

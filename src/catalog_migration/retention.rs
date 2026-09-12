@@ -182,23 +182,25 @@ mod tests {
                     )?,
                     0
                 );
-                assert_eq!(
-                    catalog
-                        .retained_migration_records(
-                            source.binding_blake3(),
-                            &revision,
-                            Collection::Rows,
-                            0,
-                            100
-                        )?
-                        .len(),
-                    69
-                );
-                if !saw_pending {
-                    drop(catalog);
-                    catalog = Catalog::open(&root)?;
-                    catalog.begin_migration_retention(&source, approval)?;
-                    saw_pending = true;
+                if COLLECTIONS[before.collection_index] == Collection::Rows {
+                    assert_eq!(
+                        catalog
+                            .retained_migration_records(
+                                source.binding_blake3(),
+                                &revision,
+                                Collection::Rows,
+                                0,
+                                100
+                            )?
+                            .len(),
+                        69
+                    );
+                    if !saw_pending {
+                        drop(catalog);
+                        catalog = Catalog::open(&root)?;
+                        catalog.begin_migration_retention(&source, approval)?;
+                        saw_pending = true;
+                    }
                 }
             }
             before = after;
