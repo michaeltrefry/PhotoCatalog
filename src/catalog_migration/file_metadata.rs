@@ -187,6 +187,220 @@ fn previous(
         })
         .transpose()
 }
+// Ordinary fields bind actual bytes, irrespective of source seal, row ID or
+// chunk geometry. Oversized fields bind committed chunk content and geometry;
+// they remain retained-only and a rechunked replay requires reconciliation.
+const REPLAY_GEOMETRY: &str = "Oversized custody replay binds ordered chunk geometry; equal bytes with different chunk boundaries require explicit reconciliation";
+struct ContentBudget {
+    bytes: usize,
+    descriptors: usize,
+    chunks: usize,
+    geometry: bool,
+    deadline: std::time::Instant,
+}
+impl ContentBudget {
+    fn new() -> Self {
+        Self {
+            bytes: 0,
+            descriptors: 0,
+            chunks: 0,
+            geometry: false,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
+    fn check(&self) -> Result<()> {
+        ensure!(
+            std::time::Instant::now() < self.deadline,
+            "file metadata content binding deadline"
+        );
+        Ok(())
+    }
+    fn field(
+        &mut self,
+        db: &Connection,
+        seq: i64,
+        name: &str,
+        field: &Field,
+    ) -> Result<serde_json::Value> {
+        self.check()?;
+        let (length, is_text) = match field {
+            Field::Inline(Cell::Text(v)) => (v.len() as u64, true),
+            Field::Inline(Cell::Blob(v)) => (v.len() as u64, false),
+            Field::Inline(other) => return Ok(serde_json::json!({"scalar":other})),
+            Field::Bytes(r) => (r.bytes, r.text),
+        };
+        let mut hash = blake3::Hasher::new();
+        let geometry = length > PACKET as u64;
+        if !geometry {
+            self.bytes = self
+                .bytes
+                .checked_add(usize::try_from(length)?)
+                .context("content byte overflow")?;
+            ensure!(
+                self.bytes <= 2 * PAYLOAD,
+                "file metadata content binding byte limit"
+            );
+        }
+        match field {
+            Field::Inline(Cell::Text(v) | Cell::Blob(v)) => {
+                hash.update(v);
+            }
+            Field::Bytes(reference) => {
+                let (id, descriptor, stored_length, committed, complete, authority): (String, Vec<u8>, u64, u64, bool, String) = db.query_row(
+                    "SELECT e.id,e.descriptor,e.length,e.committed,e.complete,e.authority FROM migration_retained_fields f JOIN migration_evidence e ON e.id=f.evidence WHERE f.record=?1 AND f.field=?2",
+                    params![seq,name], |r| Ok((r.get(0)?,r.get(1)?,evidence::unsigned(r,2)?,evidence::unsigned(r,3)?,r.get(4)?,r.get(5)?)))?;
+                ensure!(
+                    descriptor.len() <= META
+                        && serde_json::from_slice::<crate::lightroom::migration_source::ByteRef>(
+                            &descriptor
+                        )? == *reference
+                        && stored_length == length
+                        && committed == length
+                        && complete
+                        && authority == "selected_source",
+                    "file metadata field custody differs"
+                );
+                let mut offset = 0u64;
+                if geometry {
+                    self.geometry = true;
+                    // Both lookups use primary keys. LIMIT plus the shared row
+                    // budget bounds VM work; no giant roster is materialized.
+                    let mut stmt = db.prepare("SELECT c.offset,c.hash,b.length FROM migration_evidence_chunks c JOIN migration_evidence_blobs b ON b.hash=c.hash WHERE c.evidence=? ORDER BY c.offset LIMIT 65537")?;
+                    let mut rows = stmt.query([&id])?;
+                    while let Some(row) = rows.next()? {
+                        self.check()?;
+                        self.chunks += 1;
+                        ensure!(self.chunks <= 65536, "file metadata chunk descriptor limit");
+                        let start = evidence::unsigned(row, 0)?;
+                        let digest: String = row.get(1)?;
+                        let count = evidence::unsigned(row, 2)?;
+                        ensure!(
+                            start == offset
+                                && count > 0
+                                && count <= evidence::CHUNK_BYTES as u64
+                                && count <= length - offset,
+                            "file metadata chunk geometry differs"
+                        );
+                        let digest = blake3::Hash::from_hex(&digest)?;
+                        hash.update(&start.to_le_bytes());
+                        hash.update(&count.to_le_bytes());
+                        hash.update(digest.as_bytes());
+                        offset += count;
+                    }
+                } else {
+                    while offset < length {
+                        self.check()?;
+                        self.chunks += 1;
+                        ensure!(self.chunks <= 65536, "file metadata chunk read limit");
+                        let bytes = evidence::read(db, &id, offset)?;
+                        ensure!(
+                            !bytes.is_empty() && bytes.len() as u64 <= length - offset,
+                            "file metadata content length differs"
+                        );
+                        hash.update(&bytes);
+                        offset += bytes.len() as u64;
+                    }
+                }
+                ensure!(offset == length, "file metadata custody incomplete");
+            }
+            _ => unreachable!(),
+        }
+        Ok(
+            serde_json::json!({"text":is_text,"length":length,"mode":if geometry {"committed_chunks_v1"} else {"whole_bytes_v1"},"blake3":hash.finalize().to_hex().to_string()}),
+        )
+    }
+}
+fn historical_content(
+    db: &Connection,
+    request: &Projection,
+    guards: &[PacketGuard],
+    source_id: &str,
+    path: &NativePath,
+) -> Result<(String, bool)> {
+    let mut budget = ContentBudget::new();
+    let mut records = BTreeMap::new();
+    for guard in guards {
+        budget.check()?;
+        budget.descriptors = budget
+            .descriptors
+            .checked_add(guard.length)
+            .context("content descriptor overflow")?;
+        ensure!(
+            budget.descriptors <= PAYLOAD,
+            "file metadata content descriptor limit"
+        );
+        let record = retention::selected_record(db, guard.sequence)?;
+        ensure!(
+            record.collection == Collection::Packets
+                && record.revision == request.file.source.capture_revision
+                && text(db, guard.sequence, &record, "source_id", 4096)? == source_id,
+            "file metadata content scope differs"
+        );
+        let origin = text(db, guard.sequence, &record, "origin", 4096)?;
+        ensure!(
+            origin.starts_with(&format!("{}:", request.origin.name())),
+            "file metadata content origin differs"
+        );
+        let mut fields = BTreeMap::new();
+        for (name, field) in &record.fields {
+            // Source IDs are inspection lineage locators; exact membership is
+            // checked above. All remaining data, including unknown fields, bind.
+            if name != "source_id" {
+                fields.insert(name, budget.field(db, guard.sequence, name, field)?);
+            }
+        }
+        ensure!(
+            records
+                .insert(
+                    origin,
+                    blake3::hash(&encoded(&fields)?).to_hex().to_string()
+                )
+                .is_none(),
+            "duplicate file metadata content origin"
+        );
+    }
+    Ok((
+        blake3::hash(&encoded(
+            &serde_json::json!({"path":path,"records":records}),
+        )?)
+        .to_hex()
+        .to_string(),
+        budget.geometry,
+    ))
+}
+fn roster_admission(
+    db: &Connection,
+    source: Option<&MigrationSource>,
+    request: &Projection,
+    binding: &str,
+    supplement: &str,
+    source_id: &str,
+    guards: &[PacketGuard],
+) -> Result<()> {
+    if let Some(source) = source {
+        ensure!(
+            source.binding_blake3() == binding,
+            "enumeration belongs to another selected seal"
+        );
+        let mut rowids = guards.iter().map(|r| r.rowid).collect::<Vec<_>>();
+        rowids.sort_unstable();
+        ensure!(
+            source.origin_packet_roster(
+                &request.file.source.capture_revision,
+                source_id,
+                request.origin.name()
+            )? == rowids,
+            "origin packet enumeration differs; omitted or extra rows"
+        );
+    } else {
+        let old: Option<String> = db.query_row("SELECT r.input FROM migration_file_metadata m JOIN migration_retained_records r ON r.sequence=m.retained_file WHERE m.file_source=?1 AND m.origin=?2 AND m.supplement=?3",params![request.file.source.identity()?,request.origin.name(),supplement],|r|r.get(0)).optional()?;
+        ensure!(
+            old.as_deref() == Some(binding),
+            "first input origin projection requires sealed source enumeration"
+        );
+    }
+    Ok(())
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Observation {
     origin: String,
@@ -786,26 +1000,26 @@ impl Catalog {
             .as_ref()
             .map(|s| s.1.clone())
             .unwrap_or_default();
-        let digest=blake3::hash(&encoded(&serde_json::json!({"adapter":ADAPTER,"source":request.file.source,"owner":request.import_source,"origin":request.origin,"observation":historical.observation,"association":request.association,"supplement":supplement_semantic}))?).to_hex().to_string();
+        roster_admission(
+            &self.db,
+            source,
+            request,
+            &binding,
+            &supplement_semantic,
+            &source_id,
+            &packet_guards,
+        )?;
+        let (content, geometry) = historical_content(
+            &self.db,
+            request,
+            &packet_guards,
+            &source_id,
+            &historical.path,
+        )?;
+        let digest=blake3::hash(&encoded(&serde_json::json!({"adapter":ADAPTER,"source":request.file.source,"owner":request.import_source,"origin":request.origin,"observation":historical.observation,"association":request.association,"supplement":supplement_semantic,"historical_content_v1":content}))?).to_hex().to_string();
         if let Some(old) = previous(&self.db, request, &digest, &supplement_semantic)? {
             return Ok(old);
         }
-        let source =
-            source.context("first origin projection requires sealed source enumeration")?;
-        ensure!(
-            source.binding_blake3() == binding,
-            "enumeration belongs to another selected seal"
-        );
-        let mut rowids = packet_guards.iter().map(|r| r.rowid).collect::<Vec<_>>();
-        rowids.sort_unstable();
-        ensure!(
-            source.origin_packet_roster(
-                &request.file.source.capture_revision,
-                &source_id,
-                request.origin.name()
-            )? == rowids,
-            "origin packet enumeration differs; omitted or extra rows"
-        );
         let asset = mapped(&self.db, request)?;
         let inspection = if let Some((_, _, inspection)) = &mut supplemental {
             inspection.take()
@@ -842,6 +1056,13 @@ impl Catalog {
                 None
             },
         };
+        if geometry {
+            let reason = result.reason.get_or_insert_with(String::new);
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(REPLAY_GEOMETRY);
+        }
         let receipts = encoded(
             &serde_json::json!({"file":request.file.retained_record,"path":request.retained_path,"packet_records":request.packet_records,"supplement_evidence":request.supplement,"source_binding":binding}),
         )?;
@@ -1078,6 +1299,205 @@ mod tests {
             self.catalog
                 .project_migration_file_metadata(Some(&self.source), &self.request)
         }
+    }
+    // A distinct sealed inspection of the same capture, including distinct
+    // inspection-local source IDs. No original is opened or re-inspected.
+    fn rebuilt(
+        t: &mut Test,
+        change: impl FnOnce(&Connection),
+    ) -> Result<(Fixture, MigrationSource, Projection)> {
+        rebuilt_chunks(t, evidence::CHUNK_BYTES, change)
+    }
+    fn rebuilt_chunks(
+        t: &mut Test,
+        chunk_bytes: usize,
+        change: impl FnOnce(&Connection),
+    ) -> Result<(Fixture, MigrationSource, Projection)> {
+        let mut fixture = Fixture::new();
+        std::fs::copy(&t._fixture.path, &fixture.path)?;
+        fixture.seal = t._fixture.seal.clone();
+        fixture.seal.database = NativePath::from_path(&fixture.path);
+        fixture.edit(|db| {
+            db.execute(
+                "UPDATE rows SET source_id='rebuilt-file-id' WHERE source_id='file-id'",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE paths SET source_id='rebuilt-file-id' WHERE source_id='file-id'",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE packets SET source_id='rebuilt-file-id' WHERE source_id='file-id'",
+                [],
+            )
+            .unwrap();
+            change(db);
+        });
+        let source = MigrationSource::open(
+            fixture.seal.clone(),
+            crate::lightroom::migration_source::ReadLimits {
+                chunk_bytes,
+                ..Default::default()
+            },
+        )?;
+        assert_ne!(source.binding_blake3(), t.source.binding_blake3());
+        assert_eq!(fixture.revision(), t._fixture.revision());
+        t.catalog.begin_migration_retention(
+            &source,
+            b"explicit selected synthetic file metadata import",
+        )?;
+        for _ in 0..1000 {
+            if t.catalog.step_migration_retention(&source)?.complete {
+                break;
+            }
+        }
+        ensure!(
+            t.catalog
+                .migration_retention_progress(source.binding_blake3())?
+                .complete,
+            "rebuilt custody incomplete"
+        );
+        let find = |collection| -> Result<Vec<i64>> {
+            Ok(t.catalog
+                .retained_migration_records(
+                    source.binding_blake3(),
+                    fixture.revision(),
+                    collection,
+                    0,
+                    100,
+                )?
+                .into_iter()
+                .filter(|(_, r)| {
+                    r.fields.get("source_id").and_then(|f| f.text().ok()) == Some("rebuilt-file-id")
+                })
+                .map(|(seq, _)| seq)
+                .collect())
+        };
+        let mut request = t.request.clone();
+        request.file.retained_record = find(Collection::Rows)?[0];
+        request.retained_path = find(Collection::Paths)?[0];
+        request.packet_records = find(Collection::Packets)?;
+        Ok((fixture, source, request))
+    }
+    #[test]
+    fn rebuilt_capture_replays_actual_content_without_new_metadata_revision() -> Result<()> {
+        let mut t = Test::new(Origin::Embedded, Status::Complete, false, false)?;
+        let old = t.run()?;
+        let revision = t
+            .catalog
+            .metadata_for_image(&VariantKey::master(&t.asset))?
+            .revision;
+        let (_fixture, source, request) = rebuilt_chunks(&mut t, 64, |_| {})?;
+        // A new input cannot borrow the old input's offline roster admission.
+        assert!(
+            t.catalog
+                .project_migration_file_metadata(None, &request)
+                .is_err()
+        );
+        assert_eq!(
+            t.catalog
+                .project_migration_file_metadata(Some(&source), &request)?,
+            old
+        );
+        assert_eq!(
+            t.catalog
+                .metadata_for_image(&VariantKey::master(&t.asset))?
+                .revision,
+            revision
+        );
+        assert_eq!(
+            t.catalog
+                .project_migration_file_metadata(None, &t.request)?,
+            old
+        );
+        Ok(())
+    }
+    #[test]
+    fn rebuilt_payload_detail_and_omitted_roster_do_not_reuse_old_observation() -> Result<()> {
+        let mut t = Test::new(Origin::Embedded, Status::Complete, false, false)?;
+        let old = t.run()?;
+        for (column, origin) in [
+            ("raw", "embedded:packet:0"),
+            ("decoded", "embedded:parse_input:0"),
+            ("detail", "embedded:packet:0"),
+        ] {
+            let (_fixture, source, request) = rebuilt(&mut t, |db| {
+                // Leave Observation, raw_digest and parse input_blake3 untouched.
+                db.execute(&format!("UPDATE packets SET {column}=?1 WHERE source_id='rebuilt-file-id' AND origin=?2"),params![b"different actual custody".as_slice(),origin]).unwrap();
+            })?;
+            assert!(
+                t.catalog
+                    .project_migration_file_metadata(Some(&source), &request)
+                    .is_err(),
+                "{column}"
+            );
+        }
+        let (_fixture, source, mut request) = rebuilt(&mut t, |db| {
+            db.execute("INSERT INTO packets(revision,source_id,origin,raw_digest,raw,detail) SELECT revision,source_id,'embedded:packet:99','hidden',x'00','{}' FROM packets WHERE source_id='rebuilt-file-id' LIMIT 1",[]).unwrap();
+        })?;
+        request.packet_records.retain(|seq| {
+            retention::selected_record(&t.catalog.db, *seq)
+                .unwrap()
+                .fields["origin"]
+                .text()
+                .unwrap()
+                != "embedded:packet:99"
+        });
+        assert!(
+            t.catalog
+                .project_migration_file_metadata(Some(&source), &request)
+                .unwrap_err()
+                .to_string()
+                .contains("omitted or extra")
+        );
+        assert_eq!(
+            t.catalog
+                .project_migration_file_metadata(None, &t.request)?,
+            old
+        );
+        Ok(())
+    }
+    #[test]
+    fn oversized_rebuilt_custody_binds_committed_chunks_without_reading_payload() -> Result<()> {
+        let mut t = Test::new(Origin::Embedded, Status::ResourceLimit, false, false)?;
+        let large = vec![23u8; PACKET + 1];
+        let (fixture, source, request) = rebuilt(&mut t, |db| {
+            db.execute("UPDATE packets SET raw=?1 WHERE source_id='rebuilt-file-id' AND origin='embedded:packet:0'",[&large]).unwrap();
+        })?;
+        // Make this the independently preserved first over-cap input.
+        t._fixture = fixture;
+        t.source = source;
+        t.request = request;
+        let old = t.run()?;
+        assert_eq!(old.state, "retained_only");
+        assert!(old.reason.as_deref().unwrap().contains(REPLAY_GEOMETRY));
+        // rebuilt() also accepts already-renamed lineage IDs here.
+        let (_fixture, source, request) = rebuilt(&mut t, |_| {})?;
+        assert_eq!(
+            t.catalog
+                .project_migration_file_metadata(Some(&source), &request)?,
+            old
+        );
+        let (_fixture, source, request) = rebuilt_chunks(&mut t, 64 * 1024, |_| {})?;
+        assert!(
+            t.catalog
+                .project_migration_file_metadata(Some(&source), &request)
+                .is_err(),
+            "over-cap rechunking requires reconciliation"
+        );
+        let mut changed = large;
+        changed[0] = 24;
+        let (_fixture, source, request) = rebuilt(&mut t, |db| {
+            db.execute("UPDATE packets SET raw=?1 WHERE source_id='rebuilt-file-id' AND origin='embedded:packet:0'",[&changed]).unwrap();
+        })?;
+        assert!(
+            t.catalog
+                .project_migration_file_metadata(Some(&source), &request)
+                .is_err()
+        );
+        Ok(())
     }
     #[test]
     fn complete_embedded_projects_full_evidence_once_and_shares_with_copy() -> Result<()> {
