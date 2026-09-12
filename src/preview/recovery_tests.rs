@@ -67,6 +67,7 @@ fn import_job(
         .unwrap();
     key.renderer_version = "previous-import-renderer".into();
     SavedJob {
+        import_image: None,
         request: RenderWork {
             source: NativePath::from_path(source),
             keys: vec![key],
@@ -116,6 +117,7 @@ fn old_renderer_edited_jobs_rekey_without_retargeting_recipe_or_undo_revision() 
         let mut key = previews.interactive_key(&edit, Tier::Thumbnail).unwrap();
         key.renderer_version = "previous-edit-renderer:proxy1600".into();
         let job = SavedJob {
+            import_image: None,
             request: RenderWork {
                 source: NativePath::from_path(&source),
                 keys: vec![key],

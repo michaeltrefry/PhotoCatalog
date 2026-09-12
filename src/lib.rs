@@ -629,6 +629,7 @@ impl Catalog {
         );
         Ok(path)
     }
+    #[cfg(test)]
     pub(crate) fn commit_preview_import<T>(
         &mut self,
         expected: &catalog_metadata::RenderIdentity,
@@ -636,6 +637,27 @@ impl Catalog {
         metadata: &Metadata,
         key: &str,
         attach: impl FnOnce() -> Result<T>,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<T>> {
+        self.commit_preview_import_guarded(
+            expected,
+            fingerprint,
+            metadata,
+            key,
+            (|_, _| Ok(true), attach),
+            before_commit,
+        )
+    }
+    pub(crate) fn commit_preview_import_guarded<T>(
+        &mut self,
+        expected: &catalog_metadata::RenderIdentity,
+        fingerprint: &str,
+        metadata: &Metadata,
+        key: &str,
+        publication: (
+            impl Fn(&rusqlite::Transaction<'_>, bool) -> Result<bool>,
+            impl FnOnce() -> Result<T>,
+        ),
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<Option<T>> {
         ensure!(
@@ -652,12 +674,14 @@ impl Catalog {
         );
         let metadata = serde_json::to_string(metadata)?;
         self.with_render_transaction(expected,catalog_writer::Priority::Background,|tx|{
-            let result=attach()?;
+            if !(publication.0)(tx,false)? {return Ok(None);}
             tx.execute("UPDATE assets SET state='ready',fingerprint=?1,metadata=?2,preview_hash=?3,error=NULL WHERE id=?4",params![fingerprint,metadata,key,expected.asset_id])?;
+            ensure!((publication.0)(tx,true)?,"import publication generation differs");
+            let result=(publication.1)()?;
             organization::refresh(tx,&expected.asset_id)?;
             before_commit()?;
-            Ok(result)
-        })
+            Ok(Some(result))
+        }).map(Option::flatten)
     }
     /// A failed/retried import retains its last valid legacy thumbnail until the
     /// service replaces it. This read never assigns current-render provenance.

@@ -566,7 +566,6 @@ fn synchronous_import_rejects_caller_owned_request_without_consuming_it() {
 
 #[test]
 fn resume_error_rolls_back_new_handles_but_preserves_durable_jobs() {
-    use photocatalog::storage_volume::NativePath;
     let root = tempfile::tempdir().unwrap();
     let originals = root.path().join("originals");
     std::fs::create_dir(&originals).unwrap();
@@ -579,39 +578,42 @@ fn resume_error_rolls_back_new_handles_but_preserves_durable_jobs() {
     catalog.import(&originals, None, |_| Ok(())).unwrap();
     let assets = catalog.browse(0, 10).unwrap();
     let mut previews = service(&cache, &originals, ServiceLimits::default());
-    for asset in &assets {
-        previews
-            .request(&mut catalog, &asset.id, Tier::Large, Priority::Background)
-            .unwrap();
-    }
-    drop(previews); // queued journals survive owner shutdown
-    let db = rusqlite::Connection::open(catalog_path.join("catalog.sqlite3")).unwrap();
-    let original: String = db
-        .query_row(
-            "SELECT native_path FROM storage_bindings WHERE asset_id=?1",
-            [&assets[1].id],
-            |r| r.get(0),
+    previews
+        .request(
+            &mut catalog,
+            &assets[0].id,
+            Tier::Large,
+            Priority::Background,
         )
         .unwrap();
-    #[cfg(unix)]
-    let foreign = NativePath::WindowsWide("C:\\unmapped\\photo.png".encode_utf16().collect());
-    #[cfg(windows)]
-    let foreign = NativePath::UnixBytes(b"/unmapped/photo.png".to_vec());
-    db.execute(
-        "UPDATE storage_bindings SET native_path=?1 WHERE asset_id=?2",
-        rusqlite::params![serde_json::to_string(&foreign).unwrap(), assets[1].id],
+    previews
+        .request_interactive(
+            &mut catalog,
+            &photocatalog::catalog_edits::VariantKey::master(&assets[1].id),
+            Tier::Large,
+            Priority::Background,
+        )
+        .unwrap();
+    drop(previews); // queued journals survive owner shutdown
+    // A source-binding change now correctly invalidates the physical identity.
+    // Instead change policy to make only the second (interactive) job invalid,
+    // exercising admission rollback after the first handle was created.
+    let mut policy = PreviewPolicy::default();
+    policy.large.edge = 1601;
+    let mut previews = PreviewService::open(
+        configuration(&cache),
+        std::slice::from_ref(&originals),
+        PathBuf::from(env!("CARGO_BIN_EXE_photocatalog")),
+        policy,
+        ServiceLimits::default(),
     )
     .unwrap();
-    let mut previews = service(&cache, &originals, ServiceLimits::default());
     assert!(previews.resume(&mut catalog, 0, 10, false).is_err());
     assert!(previews.is_drained());
     assert_eq!(previews.scheduler_usage().consumers, 0);
     assert_eq!(previews.jobs(0, 10).unwrap().len(), 2);
-    db.execute(
-        "UPDATE storage_bindings SET native_path=?1 WHERE asset_id=?2",
-        rusqlite::params![original, assets[1].id],
-    )
-    .unwrap();
+    drop(previews);
+    let mut previews = service(&cache, &originals, ServiceLimits::default());
     let (_, consumers) = previews.resume(&mut catalog, 0, 10, false).unwrap();
     assert_eq!(consumers.len(), 2);
     for consumer in consumers {
@@ -1070,4 +1072,181 @@ fn incremental_import_yields_to_foreground_and_resumes_its_background_worker() {
     drop(visible);
     previews.clear_decoded_cache();
     assert_eq!(previews.decoded_live_bytes(), 0);
+}
+
+#[test]
+fn virtual_rating_preserves_pending_pixels_and_master_cache() {
+    use photocatalog::{catalog_edits::VariantKey, organization::Operation};
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("photo.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    let mut previews = service(
+        &root.path().join("cache"),
+        &originals,
+        ServiceLimits::default(),
+    );
+    catalog
+        .import_with_previews(&originals, None, |_| Ok(()), &mut previews)
+        .unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let master = VariantKey::master(&asset.id);
+    let copy = catalog
+        .create_edit_variant(&master, 0, "independent")
+        .unwrap()
+        .key;
+    let before = previews
+        .cached(&catalog, &asset.id, Tier::Thumbnail, false)
+        .unwrap()
+        .unwrap()
+        .key;
+    let consumer = previews
+        .request_variant(&mut catalog, &copy, Tier::Thumbnail, Priority::Foreground)
+        .unwrap();
+    previews.tick(&mut catalog).unwrap();
+    let identity = catalog.image_metadata_identity(&copy).unwrap();
+    catalog
+        .organize_image(
+            &copy,
+            identity.metadata_revision,
+            Operation::Rating { value: 4 },
+        )
+        .unwrap();
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, consumer),
+        ServiceCompletion::Ready
+    ));
+    let rendered = previews
+        .cached_variant(&catalog, &copy, Tier::Thumbnail, false)
+        .unwrap()
+        .unwrap();
+    assert!(!rendered.stale);
+    assert_eq!(rendered.key.unwrap().variant_id, copy.variant_id);
+    assert_eq!(
+        previews
+            .cached(&catalog, &asset.id, Tier::Thumbnail, false)
+            .unwrap()
+            .unwrap()
+            .key,
+        before
+    );
+}
+
+#[test]
+fn legacy_job_reopens_and_legacy_pixels_remain_exact_without_namespace_relabel() {
+    let root = tempfile::tempdir().unwrap();
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    image(&originals.join("photo.png"), [41, 87, 149]);
+    let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+    catalog.import(&originals, None, |_| Ok(())).unwrap();
+    let asset = catalog.browse(0, 10).unwrap().remove(0);
+    let cache = root.path().join("cache");
+    let mut previews = service(&cache, &originals, ServiceLimits::default());
+    previews
+        .request(
+            &mut catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            Priority::Background,
+        )
+        .unwrap();
+    let legacy = catalog.render_identity(&asset.id).unwrap();
+    drop(previews);
+    let db =
+        rusqlite::Connection::open(configuration(&cache).manifest_root.join("previews.sqlite3"))
+            .unwrap();
+    let (old_id, raw): (String, String) = db
+        .query_row("SELECT id,descriptor FROM render_jobs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let mut saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    saved.as_object_mut().unwrap().remove("import_image");
+    saved["expected"]["generation"] = legacy.generation.into();
+    saved["edit"]["source"]["generation"] = legacy.generation.into();
+    saved["edit"]
+        .as_object_mut()
+        .unwrap()
+        .remove("image_identity");
+    saved["request"]["keys"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("image_pixel_generation");
+    saved["request"]["keys"][0]["generation"] = legacy.generation.into();
+    let keys: Vec<PreviewKey> = serde_json::from_value(saved["request"]["keys"].clone()).unwrap();
+    let id = blake3::hash(&serde_json::to_vec(&keys).unwrap())
+        .to_hex()
+        .to_string();
+    db.execute(
+        "UPDATE render_jobs SET id=?1,descriptor=?2 WHERE id=?3",
+        rusqlite::params![id, saved.to_string(), old_id],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE wanted SET desired=?1,generation=?2,image_pixel_generation=NULL",
+        rusqlite::params![keys[0].digest().unwrap(), legacy.generation],
+    )
+    .unwrap();
+    drop(db);
+    let mut previews = service(&cache, &originals, ServiceLimits::default());
+    let (_, consumers) = previews.resume(&mut catalog, 0, 10, false).unwrap();
+    assert_eq!(consumers.len(), 1);
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, consumers[0]),
+        ServiceCompletion::Ready
+    ));
+    let retained = previews
+        .cached(&catalog, &asset.id, Tier::Thumbnail, false)
+        .unwrap()
+        .unwrap();
+    assert!(!retained.stale);
+    assert!(retained.key.unwrap().image_pixel_generation.is_none());
+    let current = previews
+        .request(
+            &mut catalog,
+            &asset.id,
+            Tier::Thumbnail,
+            Priority::Foreground,
+        )
+        .unwrap();
+    let db =
+        rusqlite::Connection::open(configuration(&cache).manifest_root.join("previews.sqlite3"))
+            .unwrap();
+    db.execute(
+        "INSERT INTO render_jobs(id,descriptor,created) VALUES(?1,?2,(SELECT value+1 FROM counter WHERE id=1))",
+        rusqlite::params![id, saved.to_string()],
+    ).unwrap();
+    drop(db);
+    let (_, obsolete) = previews.resume(&mut catalog, 0, 10, false).unwrap();
+    assert!(obsolete.is_empty());
+    let db =
+        rusqlite::Connection::open(configuration(&cache).manifest_root.join("previews.sqlite3"))
+            .unwrap();
+    let old_remaining: i64 = db
+        .query_row("SELECT count(*) FROM render_jobs WHERE id=?1", [&id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(old_remaining, 0);
+    let fresh_remaining: i64 = db
+        .query_row("SELECT count(*) FROM render_jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fresh_remaining, 1);
+    drop(db);
+    assert!(matches!(
+        await_result(&mut previews, &mut catalog, current),
+        ServiceCompletion::Ready
+    ));
+    assert!(
+        previews
+            .cached(&catalog, &asset.id, Tier::Thumbnail, false)
+            .unwrap()
+            .unwrap()
+            .key
+            .unwrap()
+            .image_pixel_generation
+            .is_some()
+    );
 }

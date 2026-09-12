@@ -100,6 +100,8 @@ struct SavedJob {
     expected: RenderIdentity,
     #[serde(default)]
     edit: Option<EditRenderIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_image: Option<EditRenderIdentity>,
     import: bool,
     state: JobState,
 }
@@ -235,20 +237,107 @@ fn same_pixels(a: &RenderIdentity, b: &RenderIdentity) -> bool {
 }
 fn same_edit(a: &EditRenderIdentity, b: &EditRenderIdentity) -> bool {
     same_pixels(&a.source, &b.source)
-        && a.image_identity == b.image_identity
+        && match (&a.image_identity, &b.image_identity) {
+            (Some(a), Some(b)) => {
+                a.image_id == b.image_id
+                    && a.key == b.key
+                    && a.pixel_generation == b.pixel_generation
+                    && a.shared_source_epoch == b.shared_source_epoch
+                    && a.physical_generation == b.physical_generation
+            }
+            (None, None) => true,
+            _ => false,
+        }
         && a.key == b.key
         && a.revision == b.revision
         && a.recipe_digest == b.recipe_digest
 }
+// Preview pixels ignore rating/label-only revisions. Publication still acquires
+// the existing exact current identity CAS, so export authority is unchanged.
+fn current_edit(catalog: &Catalog, expected: &EditRenderIdentity) -> Result<EditRenderIdentity> {
+    let mut current = catalog.edit_render_identity(&expected.key)?;
+    if expected.image_identity.is_none() {
+        current.source = catalog.render_identity(&expected.key.asset_id)?;
+        current.image_identity = None;
+    }
+    Ok(current)
+}
+fn with_preview_transaction<T>(
+    catalog: &mut Catalog,
+    expected: &EditRenderIdentity,
+    priority: crate::catalog_writer::Priority,
+    attach: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+) -> Result<Option<T>> {
+    let current = current_edit(catalog, expected)?;
+    if !same_edit(expected, &current) {
+        return Ok(None);
+    }
+    catalog.with_edit_transaction(&current, priority, attach)
+}
+fn import_image_current(
+    tx: &rusqlite::Transaction<'_>,
+    expected: Option<&EditRenderIdentity>,
+    published: bool,
+) -> Result<bool> {
+    let Some(expected) = expected else {
+        return Ok(true);
+    };
+    let image = expected
+        .image_identity
+        .as_ref()
+        .context("missing scoped import identity")?;
+    let current = crate::catalog_images::identity(tx, &image.image_id)?;
+    let revision: i64 = tx.query_row(
+        "SELECT COALESCE((SELECT revision FROM edit_variants WHERE asset_id=?1 AND id='master'),0)",
+        [&expected.key.asset_id],
+        |r| r.get(0),
+    )?;
+    Ok(current.image_id == image.image_id
+        && current.key == image.key
+        && current.pixel_generation == image.pixel_generation
+        && current.shared_source_epoch == image.shared_source_epoch
+        && current.physical_generation
+            == image
+                .physical_generation
+                .checked_add(i64::from(published))
+                .context("physical generation overflow")?
+        && revision == 0)
+}
 impl SavedJob {
     fn validate(&self) -> Result<()> {
         self.request.validate_persisted()?;
+        if let Some(image) = &self.import_image {
+            ensure!(
+                self.import
+                    && self.edit.is_none()
+                    && image
+                        .image_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.key == image.key
+                            && identity.physical_generation == image.source.generation)
+                    && image.key == VariantKey::master(&self.expected.asset_id)
+                    && image.revision == 0
+                    && image.source.asset_id == self.expected.asset_id
+                    && image.source.state == self.expected.state
+                    && image.source.fingerprint == self.expected.fingerprint,
+                "mixed scoped import authority"
+            );
+        }
+        let key_source = self
+            .import_image
+            .as_ref()
+            .map(|image| &image.source)
+            .unwrap_or(&self.expected);
         ensure!(
             self.request
                 .keys
                 .iter()
                 .all(|key| key.asset_id == self.expected.asset_id
-                    && key.generation == self.expected.generation as u64),
+                    && Some(key.generation)
+                        == u64::try_from(key_source.generation)
+                            .ok()
+                            .and_then(|generation| generation
+                                .checked_add(u64::from(self.import_image.is_some())))),
             "mixed job source identity"
         );
         if let Some(edit) = &self.edit {
@@ -285,7 +374,12 @@ impl SavedJob {
                 self.request
                     .keys
                     .iter()
-                    .all(|key| key.image_pixel_generation.is_none()),
+                    .all(|key| key.image_pixel_generation
+                        == self
+                            .import_image
+                            .as_ref()
+                            .and_then(|edit| edit.image_identity.as_ref())
+                            .map(|image| image.pixel_generation as u64)),
                 "missing image pixel authority"
             );
         }
@@ -293,7 +387,7 @@ impl SavedJob {
     }
     fn current(&self, catalog: &Catalog) -> Result<bool> {
         if let Some(edit) = &self.edit {
-            Ok(same_edit(edit, &catalog.edit_render_identity(&edit.key)?))
+            Ok(same_edit(edit, &current_edit(catalog, edit)?))
         } else {
             ensure!(
                 self.request.edit.is_none()
@@ -307,6 +401,9 @@ impl SavedJob {
             let current = catalog.render_identity(&self.expected.asset_id)?;
             if !same_pixels(&current, &self.expected) {
                 return Ok(false);
+            }
+            if let Some(image) = &self.import_image {
+                return Ok(same_edit(image, &current_edit(catalog, image)?));
             }
             Ok(self.import
                 || catalog
@@ -447,6 +544,23 @@ impl PreviewService {
         key.validate()?;
         Ok(key)
     }
+    // The pending→ready UPDATE advances physical_generation exactly once.
+    // The catalog callback verifies that resulting generation before attachment.
+    fn import_key(
+        &self,
+        identity: &EditRenderIdentity,
+        tier: Tier,
+        fingerprint: &str,
+    ) -> Result<PreviewKey> {
+        let mut key = self.variant_key(identity, tier)?;
+        key.generation = key
+            .generation
+            .checked_add(1)
+            .context("import physical generation overflow")?;
+        key.fingerprint = fingerprint.into();
+        key.validate()?;
+        Ok(key)
+    }
     pub fn interactive_key(&self, identity: &EditRenderIdentity, tier: Tier) -> Result<PreviewKey> {
         let mut key = self.variant_key(identity, tier)?;
         ensure!(
@@ -557,6 +671,20 @@ impl PreviewService {
             .try_reserve(allowance)
             .ok_or(EncodedBudgetExceeded)?;
         let Some(cached) = measured(&mut metrics, ReadPhase::Store, || {
+            if let Some(cached) = self.store.read_limited(&key, false, allowance)? {
+                return Ok(Some(cached));
+            }
+            let mut legacy = identity.clone();
+            legacy.source = catalog.render_identity(&variant.asset_id)?;
+            legacy.image_identity = None;
+            let legacy_key = if interactive {
+                self.interactive_key(&legacy, tier)?
+            } else {
+                self.variant_key(&legacy, tier)?
+            };
+            if let Some(cached) = self.store.read_limited(&legacy_key, false, allowance)? {
+                return Ok(Some(cached));
+            }
             self.store.read_limited(&key, allow_stale, allowance)
         })?
         else {
@@ -706,7 +834,9 @@ impl PreviewService {
             expected.state == "pending",
             "import preview requires reserved catalog asset"
         );
-        let key = self.key(&expected, Tier::Thumbnail, fingerprint)?;
+        let import_image = catalog.edit_render_identity(&VariantKey::master(asset))?;
+        ensure!(import_image.revision == 0, "pending import already edited");
+        let key = self.import_key(&import_image, Tier::Thumbnail, fingerprint)?;
         self.submit(
             catalog,
             SavedJob {
@@ -719,6 +849,7 @@ impl PreviewService {
                 },
                 expected,
                 edit: None,
+                import_image: Some(import_image),
                 import: true,
                 state: JobState::Queued,
             },
@@ -807,6 +938,7 @@ impl PreviewService {
                 },
                 expected: expected.source.clone(),
                 edit: Some(expected),
+                import_image: None,
                 import: false,
                 state: JobState::Queued,
             },
@@ -846,9 +978,15 @@ impl PreviewService {
             Ok(())
         };
         let admitted = if let Some(edit) = &job.edit {
-            catalog.with_edit_transaction(edit, writer_priority, |_| persist())?
+            with_preview_transaction(catalog, edit, writer_priority, |_| persist())?
         } else {
-            catalog.with_render_identity_priority(&job.expected, writer_priority, persist)?
+            catalog.with_render_transaction(&job.expected, writer_priority, |tx| {
+                ensure!(
+                    import_image_current(tx, job.import_image.as_ref(), false)?,
+                    "stale import pixel identity"
+                );
+                persist()
+            })?
         };
         ensure!(admitted.is_some(), "stale preview request");
         let consumer =
@@ -1057,28 +1195,50 @@ impl PreviewService {
                 self.store
                     .publish_record(&object.key, &object.encoded, &record, |attach| {
                         let result = if job.import {
-                            catalog.commit_preview_import(
+                            catalog.commit_preview_import_guarded(
                                 &job.expected,
                                 &object.key.fingerprint,
                                 &batch.metadata,
                                 &object.key.digest()?,
-                                || {
-                                    let publication = attach()?;
-                                    self.observe(ServiceEvent::ManifestAttached)?;
-                                    Ok(publication)
-                                },
+                                (
+                                    |tx, published| {
+                                        import_image_current(
+                                            tx,
+                                            job.import_image.as_ref(),
+                                            published,
+                                        )
+                                    },
+                                    || {
+                                        let publication = attach()?;
+                                        self.observe(ServiceEvent::ManifestAttached)?;
+                                        Ok(publication)
+                                    },
+                                ),
                                 || self.observe(ServiceEvent::BeforeCatalogCommit),
                             )?
                         } else if let Some(edit) = &job.edit {
-                            catalog.with_edit_identity(edit, attach)?
+                            with_preview_transaction(
+                                catalog,
+                                edit,
+                                crate::catalog_writer::Priority::Foreground,
+                                |_| attach(),
+                            )?
                         } else {
-                            let edit = catalog.edit_render_identity(&VariantKey::master(
+                            let mut edit = catalog.edit_render_identity(&VariantKey::master(
                                 &job.expected.asset_id,
                             ))?;
+                            // Historical unscoped jobs use the legacy generation.
+                            edit.source = catalog.render_identity(&job.expected.asset_id)?;
+                            edit.image_identity = None;
                             if edit.revision != 0 || !same_pixels(&edit.source, &job.expected) {
                                 None
                             } else {
-                                catalog.with_edit_identity(&edit, attach)?
+                                with_preview_transaction(
+                                    catalog,
+                                    &edit,
+                                    crate::catalog_writer::Priority::Foreground,
+                                    |_| attach(),
+                                )?
                             }
                         };
                         if job.import && result.is_some() {
@@ -1182,6 +1342,17 @@ impl PreviewService {
                 }
                 let mut job: SavedJob = serde_json::from_str(&descriptor)?;
                 job.validate()?;
+                // A persisted legacy journal cannot downgrade a newer scoped request.
+                // Retire only this obsolete journal; desired/current objects stay intact.
+                let mut superseded = false;
+                for key in &job.request.keys {
+                    superseded |=
+                        key.image_pixel_generation.is_none() && self.store.scoped_desired(key)?;
+                }
+                if superseded {
+                    self.store.finish_job(&id)?;
+                    continue;
+                }
                 let current = catalog.render_identity(&job.expected.asset_id)?;
                 let key = &job.request.keys[0];
                 // Crash after catalog commit but before journal deletion.
@@ -1202,12 +1373,17 @@ impl PreviewService {
                     && self.store.current_is_intact(key)?
                     && let Some(record) = self.store.render_record(key)?
                     && catalog
-                        .commit_preview_import(
+                        .commit_preview_import_guarded(
                             &job.expected,
                             &key.fingerprint,
                             &record.metadata,
                             &key.digest()?,
-                            || Ok(()),
+                            (
+                                |tx, published| {
+                                    import_image_current(tx, job.import_image.as_ref(), published)
+                                },
+                                || Ok(()),
+                            ),
                             || Ok(()),
                         )?
                         .is_some()
@@ -1235,6 +1411,8 @@ impl PreviewService {
                             } else {
                                 self.variant_key(edit, key.tier)
                             }
+                        } else if let Some(image) = &job.import_image {
+                            self.import_key(image, key.tier, &fingerprint)
                         } else {
                             self.key(&current, key.tier, &fingerprint)
                         }

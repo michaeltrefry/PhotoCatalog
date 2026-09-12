@@ -166,6 +166,44 @@ impl std::fmt::Display for CacheQuotaExceeded {
 }
 impl std::error::Error for CacheQuotaExceeded {}
 
+// Schema3 briefly supported scoped object/job keys without a wanted-scope
+// column. Recover that exact namespace from hash-bound descriptors, including
+// queued jobs with no object yet. Keep memory bounded to one journal record.
+fn restore_image_scopes(db: &Connection) -> Result<()> {
+    let apply = |key: PreviewKey| -> Result<()> {
+        if let Some(image) = key.image_pixel_generation {
+            db.execute("UPDATE wanted SET image_pixel_generation=?1 WHERE desired=?2 AND asset=?3 AND variant=?4 AND tier=?5 AND channel=?6 AND generation=?7",rusqlite::params![i64::try_from(image)?,key.digest()?,key.asset_id,key.variant_id,key.tier.name(),key.channel(),i64::try_from(key.generation)?])?;
+        }
+        Ok(())
+    };
+    let mut objects =
+        db.prepare("SELECT descriptor FROM objects WHERE key IN (SELECT desired FROM wanted)")?;
+    let mut rows = objects.query([])?;
+    while let Some(row) = rows.next()? {
+        let descriptor: String = row.get(0)?;
+        ensure!(
+            descriptor.len() <= 64 * 1024,
+            "cached descriptor migration bound"
+        );
+        apply(serde_json::from_str(&descriptor)?)?;
+    }
+    let mut jobs = db.prepare("SELECT descriptor FROM render_jobs ORDER BY created,id")?;
+    let mut rows = jobs.query([])?;
+    while let Some(row) = rows.next()? {
+        let descriptor: String = row.get(0)?;
+        ensure!(descriptor.len() <= 64 * 1024, "cached job migration bound");
+        let value: serde_json::Value = serde_json::from_str(&descriptor)?;
+        let keys = value
+            .get("request")
+            .and_then(|v| v.get("keys"))
+            .context("cached job keys missing")?;
+        for key in serde_json::from_value::<Vec<PreviewKey>>(keys.clone())? {
+            apply(key)?;
+        }
+    }
+    Ok(())
+}
+
 /// One owner serializes filesystem/manifest mutations; workers return encoded
 /// data to that owner. The process lock is released automatically on crash.
 pub struct PreviewStore {
@@ -272,7 +310,7 @@ impl PreviewStore {
             ensure!(count == 0 && app == 0, "unrelated preview manifest");
         } else {
             ensure!(
-                (1..=3).contains(&version) && app == 0x50435056,
+                (1..=4).contains(&version) && app == 0x50435056,
                 "unsupported preview manifest"
             );
         }
@@ -315,7 +353,11 @@ impl PreviewStore {
                     DROP TABLE wanted_v2;
                     CREATE INDEX wanted_current ON wanted(current);")?;
             }
-            db.execute_batch("PRAGMA user_version=3")?;
+            if version < 4 {
+                db.execute_batch("ALTER TABLE wanted ADD COLUMN image_pixel_generation INTEGER CHECK(image_pixel_generation IS NULL OR image_pixel_generation>=0)")?;
+                restore_image_scopes(&db)?;
+            }
+            db.execute_batch("PRAGMA user_version=4")?;
             Ok(())
         })();
         finish(&db, migration)?;
@@ -472,24 +514,40 @@ impl PreviewStore {
     /// The service owner registers a fresh catalog identity and its currently
     /// selected preview policy. Workers may publish, but must never register keys.
     /// Policy changes can replace the desired key without inventing a photo edit.
+    pub(crate) fn scoped_desired(&self, key: &PreviewKey) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT image_pixel_generation IS NOT NULL FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3 AND channel=?4",
+            params![key.asset_id, key.variant_id, key.tier.name(), key.channel()],
+            |row| row.get(0),
+        ).optional()?.unwrap_or(false))
+    }
     pub fn desire(&self, key: &PreviewKey, authority: impl Fn() -> Result<bool>) -> Result<()> {
         let digest = key.digest()?;
         ensure!(authority()?, "stale catalog identity");
-        let old: Option<(i64, String)> = self
+        let old: Option<(i64, Option<i64>)> = self
             .db
             .query_row(
-                "SELECT generation,desired FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3 AND channel=?4",
+                "SELECT generation,image_pixel_generation FROM wanted WHERE asset=?1 AND variant=?2 AND tier=?3 AND channel=?4",
                 params![key.asset_id, key.variant_id, key.tier.name(), key.channel()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some((generation, _)) = old {
+        if let Some((generation, image)) = old {
+            let current = match (image, key.image_pixel_generation) {
+                (None, None) => key.generation >= generation as u64,
+                (None, Some(_)) => true, // Explicit one-way namespace upgrade.
+                (Some(_), None) => false,
+                (Some(old), Some(new)) => {
+                    key.generation > generation as u64
+                        || (key.generation == generation as u64 && new >= old as u64)
+                }
+            };
             ensure!(
-                key.generation >= generation as u64,
-                "stale catalog generation"
+                current,
+                "stale catalog generation or image namespace downgrade"
             );
         }
-        self.db.execute("INSERT INTO wanted VALUES(?1,?2,?3,?4,?5,NULL,?6) ON CONFLICT(asset,variant,tier,channel) DO UPDATE SET generation=excluded.generation,desired=excluded.desired",params![key.asset_id,key.variant_id,key.tier.name(),key.generation as i64,digest,key.channel()])?;
+        self.db.execute("INSERT INTO wanted(asset,variant,tier,generation,desired,current,channel,image_pixel_generation) VALUES(?1,?2,?3,?4,?5,NULL,?6,?7) ON CONFLICT(asset,variant,tier,channel) DO UPDATE SET generation=excluded.generation,desired=excluded.desired,image_pixel_generation=excluded.image_pixel_generation",params![key.asset_id,key.variant_id,key.tier.name(),key.generation as i64,digest,key.channel(),key.image_pixel_generation.map(|n|n as i64)])?;
         Ok(())
     }
     fn desired(&self, key: &PreviewKey, digest: &str) -> Result<bool> {
@@ -1562,5 +1620,49 @@ mod tests {
         let mut changed = cfg;
         changed.thumbnail_root = root.path().join("elsewhere");
         assert!(PreviewStore::open(changed, &[]).is_err());
+    }
+    #[test]
+    fn scoped_namespace_upgrade_reopen_preserves_newer_pending_pixels() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path(), 1000, 1000);
+        let store = PreviewStore::open(cfg.clone(), &[]).unwrap();
+        let legacy = key(9, Tier::Thumbnail);
+        store.desire(&legacy, || Ok(true)).unwrap();
+        store.publish(&legacy, b"legacy", authority).unwrap();
+        let mut scoped = key(0, Tier::Thumbnail);
+        scoped.image_pixel_generation = Some(5);
+        store.desire(&scoped, || Ok(true)).unwrap();
+        store
+            .save_job(
+                &"a".repeat(64),
+                &serde_json::json!({"request":{"keys":[scoped]}}).to_string(),
+                10,
+            )
+            .unwrap();
+        // Recreate the brief schema3 scoped-key layout: no wanted namespace,
+        // a queued scoped job, and only an old unscoped current object.
+        store
+            .db
+            .execute_batch(
+                "ALTER TABLE wanted DROP COLUMN image_pixel_generation; PRAGMA user_version=3;",
+            )
+            .unwrap();
+        drop(store);
+        let store = PreviewStore::open(cfg, &[]).unwrap();
+        assert!(store.desire(&legacy, || Ok(true)).is_err());
+        let mut older = scoped.clone();
+        older.image_pixel_generation = Some(4);
+        assert!(store.desire(&older, || Ok(true)).is_err());
+        assert!(store.read(&scoped, false).unwrap().is_none());
+        let fallback = store.read(&scoped, true).unwrap().unwrap();
+        assert!(fallback.stale);
+        assert_eq!(fallback.key, legacy);
+        let mut newer = scoped.clone();
+        newer.image_pixel_generation = Some(6);
+        store.desire(&newer, || Ok(true)).unwrap();
+        assert!(store.desire(&scoped, || Ok(true)).is_err());
+        let mut sibling = scoped;
+        sibling.variant_id = "independent-copy".into();
+        store.desire(&sibling, || Ok(true)).unwrap();
     }
 }
