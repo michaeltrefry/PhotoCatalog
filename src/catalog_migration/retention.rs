@@ -167,7 +167,7 @@ pub struct RetentionProgress {
 
 fn progress(db: &Connection, id: &str) -> Result<RetentionProgress> {
     Ok(db.query_row("SELECT capture_index,collection_index,records,complete FROM migration_retention WHERE id=?1", [id],
-        |r|Ok(RetentionProgress{input:id.into(),capture_index:r.get(0)?,collection_index:r.get(1)?,records:r.get(2)?,complete:r.get(3)?}))?)
+        |r|Ok(RetentionProgress{input:id.into(),capture_index:r.get(0)?,collection_index:r.get(1)?,records:evidence::unsigned(r,2)?,complete:r.get(3)?}))?)
 }
 fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     ensure!(bytes.len() <= RECORD_LIMIT, "retained record size limit");
@@ -332,7 +332,7 @@ impl Catalog {
             let record = decode(&compressed, length, &digest)?;
             let field:Option<(String,String,u64)>=self.db.query_row(
                 "SELECT f.field,e.id,e.committed FROM migration_retained_fields f JOIN migration_evidence e ON e.id=f.evidence WHERE f.record=?1 AND e.complete=0 ORDER BY f.field LIMIT 1",
-                [sequence],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                [sequence],|r|Ok((r.get(0)?,r.get(1)?,evidence::unsigned(r,2)?))).optional()?;
             let prepared = if let Some((field, evidence, offset)) = field {
                 let Field::Bytes(reference) = record
                     .fields

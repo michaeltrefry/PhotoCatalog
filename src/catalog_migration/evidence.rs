@@ -42,6 +42,16 @@ pub struct EvidenceState {
     pub complete: bool,
 }
 
+pub(crate) fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    u64::try_from(row.get::<_, i64>(index)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 fn initial_manifest(descriptor: &[u8], length: u64) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"photocatalog-retained-evidence-v1\0");
@@ -67,8 +77,8 @@ fn state(db: &Connection, id: &str) -> Result<EvidenceState> {
         |row| {
             Ok(EvidenceState {
                 id: id.into(),
-                length: row.get(0)?,
-                committed: row.get(1)?,
+                length: unsigned(row, 0)?,
+                committed: unsigned(row, 1)?,
                 manifest: row.get(2)?,
                 complete: row.get(3)?,
             })
@@ -110,12 +120,12 @@ pub(crate) fn begin(db: &Connection, descriptor: &[u8], length: u64) -> Result<E
     let id = initial_manifest(descriptor, length);
     db.execute(
         "INSERT OR IGNORE INTO migration_evidence(id,descriptor,length,manifest,complete) VALUES(?1,?2,?3,?1,?4)",
-        params![id, descriptor, length, length == 0],
+        params![id, descriptor, i64::try_from(length)?, length == 0],
     )?;
     let existing: (Vec<u8>, u64) = db.query_row(
         "SELECT descriptor,length FROM migration_evidence WHERE id=?1",
         [&id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, unsigned(r, 1)?)),
     )?;
     ensure!(
         existing == (descriptor.to_vec(), length),
@@ -141,7 +151,7 @@ pub(crate) fn append(
     if offset < before.committed {
         let (hash, length): (String, usize) = db.query_row(
             "SELECT c.hash,b.length FROM migration_evidence_chunks c JOIN migration_evidence_blobs b ON b.hash=c.hash WHERE c.evidence=?1 AND c.offset=?2",
-            params![id, offset],
+            params![id, i64::try_from(offset)?],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         ensure!(
@@ -160,13 +170,18 @@ pub(crate) fn append(
     )?;
     db.execute(
         "INSERT INTO migration_evidence_chunks VALUES(?1,?2,?3)",
-        params![id, offset, chunk.hash],
+        params![id, i64::try_from(offset)?, chunk.hash],
     )?;
     let committed = offset + chunk.length as u64;
     let manifest = next_manifest(&before.manifest, offset, chunk.length, &chunk.hash);
     db.execute(
         "UPDATE migration_evidence SET committed=?2,manifest=?3,complete=?4 WHERE id=?1",
-        params![id, committed, manifest, committed == before.length],
+        params![
+            id,
+            i64::try_from(committed)?,
+            manifest,
+            committed == before.length
+        ],
     )?;
     state(db, id)
 }
@@ -181,8 +196,8 @@ pub(crate) fn read(db: &Connection, id: &str, offset: u64) -> Result<Vec<u8>> {
     let (hash, length, compressed): (String, u64, Vec<u8>) = db.query_row(
         "SELECT b.hash,b.length,b.compressed FROM migration_evidence_chunks c
          JOIN migration_evidence_blobs b ON b.hash=c.hash WHERE c.evidence=?1 AND c.offset=?2",
-        params![id, offset],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        params![id, i64::try_from(offset)?],
+        |r| Ok((r.get(0)?, unsigned(r, 1)?, r.get(2)?)),
     )?;
     ensure!(
         length > 0 && length <= (status.length - offset).min(CHUNK_BYTES as u64),
