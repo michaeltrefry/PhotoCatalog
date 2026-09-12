@@ -10,9 +10,10 @@ into one scratch catalog and preserves the existing filesystem folder hierarchy.
 The 32 excluded catalog candidates remain excluded. Canonical-library migration
 has not been authorized.
 
-PR #14 remains draft. Published head `16ad4e0` passed all four applicable CI
-jobs: macOS, Windows, Linux, and benchmark contracts. Later source changes still
-require their own remote checks and actual TEST acceptance.
+PR #14 remains draft. Head `16ad4e0` passed all four applicable CI jobs. Later
+head `d49b92e` passed macOS, Windows and benchmark contracts but failed a Linux
+preview-cache restart check. The reviewed repair below still requires its own
+remote checks and actual TEST acceptance.
 
 The actual TEST has completed selected-source record preservation: 14,025,415
 records across all 16 selected catalogs, matching the frozen source total. File,
@@ -48,11 +49,23 @@ Red. The checkpoint, original models and exact error are preserved. Repair
 scalar handling, and preserves the existing composite and semantic guards.
 Independent source review, 37 focused tests, all 599 optimized all-target test
 instances, strict all-target Clippy and formatting passed, with five existing
-tests ignored. Run 12 resumes the same TEST from that checkpoint using the
-qualified successor; actual failing-row recovery and terminal acceptance remain
-to be observed. Input, policy, schema, successful receipts and resource limits
-are unchanged. This repair requires a verifier source-pin successor, with no
-weakened acceptance checks.
+tests ignored. Run 12 passed the exact failing row: the effective label is Red,
+rating remains zero, all three organization receipts match the completed source
+row, and both original model descriptors, projections and blob checksums are
+unchanged. It then cooperatively stopped at 2,254,865 processed rows to serialize
+native qualification of the preview-cache repair. The worker and owner exited
+cleanly, and the saved checkpoint was read back.
+
+Repair `e7bfb9c9` explicitly releases acquired preview manifest, tier and relocation
+locks when ownership ends, including failed initialization. A deterministic
+retained-handle test reproduced the lock-lifetime defect; its involvement in the
+earlier Linux CI occurrence remains unproven. Independent source review, 72
+targeted preview tests, all 604 optimized all-target test instances, strict
+all-target Clippy, formatting and the release build passed, with five existing
+tests ignored. Worker teardown and relocation ownership remain intact. Run 13
+resumes the same TEST with the qualified successor. Input, policy, schema,
+successful receipts and resource limits are unchanged. The verifier needs only
+a successor source pin, with no weakened acceptance checks.
 
 Remaining native projections, raw artifact custody, independent selected counts
 and relationships, final acceptance review, merge and terminal merged-head CI
