@@ -10,16 +10,18 @@ into one scratch catalog and preserves the existing filesystem folder hierarchy.
 The 32 excluded catalog candidates remain excluded. Canonical-library migration
 has not been authorized.
 
-PR #14 remains draft. Head `16ad4e0` passed all four applicable CI jobs. Later
-head `d49b92e` passed macOS, Windows and benchmark contracts but failed a Linux
-preview-cache restart check. The reviewed repair below still requires its own
-remote checks and actual TEST acceptance.
+PR #14 remains draft. Head `f04de439` passed all four applicable CI jobs,
+including the corrected Linux preview-cache restart check. The reconciliation
+repairs through `5b54d2b9` passed 609 optimized all-target test instances, strict
+all-target Clippy, formatting and independent source review; five existing tests
+remain ignored. Successor remote checks and independent actual acceptance remain.
 
-The actual TEST has completed selected-source record preservation: 14,025,415
-records across all 16 selected catalogs, matching the frozen source total. File,
-master-role, virtual-role, embedded/sidecar metadata, catalog-XMP and current
-Adobe-settings walks have completed. Progress remains in one scratch catalog;
-originals and source catalogs remain read-only.
+The selected TEST has reached native Complete in one scratch catalog: all 16
+capture reports, 22 source-walk stages and 171 companion artifacts reconciled.
+Selected-source custody contains 14,025,415 records. The final progress counter
+is 3,452,770 processing steps across repeated metadata passes, not unique photos.
+Originals and source catalogs remain read-only. Native completion is separate
+from the independent destination audit and the representative public-API check.
 
 Repair `e615b076` supplied the complete composite key for two metadata mapping
 queries and passed independent review plus a 20,000-row bounded-work regression.
@@ -63,18 +65,40 @@ earlier Linux CI occurrence remains unproven. Independent source review, 72
 targeted preview tests, all 604 optimized all-target test instances, strict
 all-target Clippy, formatting and the release build passed, with five existing
 tests ignored. Worker teardown and relocation ownership remain intact. Run 13
-resumes the same TEST with the qualified successor. Input, policy, schema,
-successful receipts and resource limits are unchanged. The verifier needs only
-a successor source pin, with no weakened acceptance checks.
+and run 14 continued the same TEST; input, policy, schema, successful receipts
+and resource limits remained unchanged.
 
-Remaining native projections, raw artifact custody, independent selected counts
-and relationships, final acceptance review, merge and terminal merged-head CI
-are required for S10. The successor independent verifier passes 41 synthetic tests,
-including candidate source/image/value bindings, missing receipts, wrong file-XMP
-associations and broken keyword accumulation histories. Independent source review
-passed; actual execution remains held until native completion and a
-quiescent, explicitly pinned observation. S11 backup/restore and S12 Tauri interface
-retain their S10 dependencies; S13 integrated readiness follows both.
+Final reconciliation exposed two query costs. Repair `5366ed23` counts completed
+retained records through a covering total minus the scoped incomplete count,
+without fetching every completed payload row. The original diagnostic exhausted
+30 seconds during the first large counts; the candidate destination-query
+sequence completed in 24.13 seconds. These private-runtime timings omit source
+and late reconciliation work. The native successor then completed all 16 capture
+reports, proving the count repair on the selected dataset.
+
+Repair `5b54d2b9` replaces the final full-population DISTINCT with bounded indexed
+capture-key seeks in one read snapshot. It preserves selected/excluded checks,
+incomplete-row inclusion, the terminal empty seek and the final mapping-epoch CAS.
+The actual diagnostic returned the same 16 keys in 17 seeks after the original
+query hit its 30-second limit. Synthetic tests verify scope, pending/extra keys,
+constant VM work across duplicated records and concurrent-insert snapshot behavior.
+The resumed native worker completed its final step and exited cleanly; the
+read-only checkpoint exactly matches the terminal Complete result. Earlier run
+receipts retain their original source attribution.
+
+Independent verifier v9 retained the previously reviewed algorithm and qualified
+native-source pin. Its first actual attempt was stopped and reaped by the 512 MiB
+RSS guard, with no child acceptance receipt. Source/query-plan diagnosis found
+an avoidable in-memory sort in the initial retained-record aggregation; exact
+historical query attribution remains unproven because that attempt had no query
+telemetry. A bounded verifier successor is being prepared without weakening its
+checks or limits. The representative offline API probe builds with the shipping
+dependency versions but has not yet run on the destination.
+
+Independent actual counts, relationships and evidence audit, representative API
+readback, final acceptance review, merge and terminal merged-head CI remain required
+for S10. S11 backup/restore and S12 Tauri interface retain their S10 dependencies;
+S13 integrated readiness follows both.
 Fieldbook remains a design reference, not the product name.
 
 ## Historical checkpoint before S9 closeout
