@@ -1,0 +1,121 @@
+# PhotoCatalog continuation — 2026-09-11
+
+## Current continuation
+
+The selected extraction, TEST finalizer and full global-ID enumeration are complete.
+Root session 96292 exited 0 and was reaped. Result
+`PRIVATE_RESULTS_ROOT/sc-22844-global-query-retry-output-frfnv5l7/result.json`,
+SHA `38c6d2d176d746bcbd8e0e9f937eacab6019ff81a79036bf5f401e8e2cde7a08`,
+contains 120 revision pairs / 8,271 rows / 130 pages; 1,000 sampled matches reconcile and
+all four old/new family comparisons match. Independent actual review passed: `5730310661ed6bcd0260f1da135832fe24daca892817441961cdd50eda33c01e`.
+Native source `f69e7a2` and binary
+`2c0c7fe314395157339a454151873fded2b6aa55330cbeb8402b669ceb65ac31`
+are separately qualified. Previous timeout evidence remains failed and intact.
+Do not rerun extraction, choices or completed enumeration.
+
+The 20-reference PSD correction passed actual source and 40 payload comparisons,
+with independent review `433a3b06e6905338879f3e6ff67a1e8c53e50c034c24537d0ab86d337930f131`.
+Evidence: `PRIVATE_RESULTS_ROOT/sc-23153-probe-actual-review-jMdCl3nW/review.json`.
+The final readable review is complete at
+`PRIVATE_RESULTS_ROOT/sc-22844-private-migration-review-1seycgbk/REVIEW.md`,
+SHA `99fda86fb63d7ce49bb87db685ff94771a97a390634498978b7564f60e0e819f`.
+Independent final review passed, SHA
+`6970985af414c57c2fe7874da8fd1f98ef5f5470781d3272cfd0f811f8c114c2`.
+Historical reports remain intact. Deliver this documentation/source batch through
+PR #11, verify current-head CI and merged CI, then close S9 and sc-23153. No final migration has
+been approved or executed. Older process/status statements below are historical.
+
+## Historical state before final enumeration
+
+**Selected XMP extraction COMPLETE; final test report pending:** attempt `b030a554-c9a9-4d52-a3d7-a3222f9a88fa`, actual root session `25675` terminal exit0/reaped. Result `8a4ecb9cd15d4abeac0850a04f385a4adc1429c9c44afbfbe6aacea43369d77b`, output `d849361a8e582acefc3c2f0e7f20e406df1362c3aea4bd673579508da43b1a9c`, selected audit `/Users/michael/PhotoCatalog-private-results/sc-22844-selected-terminal-audit-uz00d9l5/review.json` SHA `eb2acd608e0b5df90e8b131335a1df7f5326f9c7af34d67a23f5ac2c596f9d94`; audit session50501 terminal0/reaped. All209,091 references/16 selected catalog checks complete,1,044 successful commands across3 slices27152→28196; no failed commands. Counts:48,657 missing paths,5,467 available packet gaps,154,967 available packet-retained references,6,617 virtual copies. These are reported states, not universal preservation or semantic-import acceptance. Independent actual review passed; completed finalizer is recorded below. Read actual state before any continuation.
+
+**TEST finalizer COMPLETE with one named reporting gap:** actual root tool session `96719` terminal0/reaped. Request `/Users/michael/PhotoCatalog-private-results/sc-22844-finalizer-admission-pd3_lvwe/request.json` SHA `da3dec8695f998d4463e5a0e12df06395b29e5fae403976c981fff931800e7eb`; raw terminal `root-terminal.json` beside it. Output `/Users/michael/PhotoCatalog-private-results/sc-22844-post-packets-finalized-c52828bd-1f1f-49c1-b94f-1a07d12e27a3`:157 successfulcalls (34fixed/122collision/1renderer),16 TEST choices recorded,68 exact-path pairs fully enumerated,6112 appendixrecords without retention gaps. The report finds8271 global-ID overlap pairs but existingfamilyreport samples1000; this remains an S9 acceptance gap. Hubble implements a minimal paginated endpoint in isolated `codex/sc-22844-global-conflict-pages` froma95e4fa. Do not rerun choices or priorinspection. Independent actualfinalizerreview PASS_WITH_OPEN_ENUMERATION_GAP: `/Users/michael/PhotoCatalog-private-results/sc-22844-finalizer-actual-independent-v1/review.json` SHA `673917439ebffb75c7a51f31262ab26943eeba7eb9fdeb29e1bdd182267e0f7f`. No realinspectionprocessactive or migration.
+
+Epic sc-22835 remains In Progress. S1–S8 are verified Done; S9 sc-22844 is In Progress. Bugs sc-23102 and sc-23122 are verified Done through PR #12. S10–S13 retain their recorded dependencies. Do not mark S9 Done from the completed inspection phases alone.
+
+**FULL and metadata-only PATHS are complete and independently audited. Do not rerun either phase.** The sidecar metadata scan is also complete and independently reviewed. Selected PACKETS is complete and16 TEST choices have been applied to the derived plan as described above; no migration has executed. Bug sc-23137 is verified Done after PR13 merge, all-platform CI and qualified synthetic S9 use. The user approved trying the proposed16 source catalogs for a test/dry run and clarified ONE consolidated destination showing existing filesystem folders. This is not final-migration or file-reorganization approval.
+
+Current run: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911/inspection/schema3-run`. Read the actual current pointer, journal and process receipt before continuation; earlier terminal PATHS next27152 is a preserved predecessor, not the live checkpoint.
+
+## Completed phase evidence
+
+Private evidence root: `/Users/michael/PhotoCatalog-private-results`.
+
+| Evidence | Location under private root | SHA256 |
+| --- | --- | --- |
+| FULL29 result | `sc-22844-raid-full-control-v1/attempts/17a9c510-8893-4988-a22f-4ca025dbab95/result.json` | `a022b93193438067b3e48692750faf69caf3f69dd53d36ce948c924cf839bb9f` |
+| FULL terminal review | `sc-22844-raid-full-terminal-review-v1/terminal-review.json` | `c2977071b1b4bd9e7c79cbd1ff2082d9cb89c683b066743b26796ebfcf1dc679` |
+| PATHS result | `sc-22844-raid-full-control-v1/attempts/f56d09e7-e3bb-4d19-b43f-ac2252cd0ef1/result.json` | `9c53960818b6d52f7e2e6a8ea610c6186eb6cc2c3e52c9193a9814fd6b044232` |
+| PATHS terminal review | `sc-22844-first-paths-terminal-review-v1/terminal-review.json` | `2b681bb0a4cc4b4448b267641eb503e5db815386e6f8497a90d374f86180e434` |
+| Actual paths tool completion | PATHS attempt `/root-terminal-wait.json` | `3e871fc1d6eafbf6ec28c3b945f179825ad62693f4c9939043550bba9af4d4d8` |
+
+FULL output is run `reports/full-review-bf20b3284ac182c2a65365b66b965169ee2ed3c896bdd5c2ed19a3551d298bff.json`, SHA `7367db0a8cabaab85f1aeff9874357e93cc18e36ddec1c89b119b3251037d3ac`:48 candidates,47 requested full captures,16 families,19,872,102 retained source rows, no errors. Captures and prior failed replay intervals remain preserved.
+
+PATHS output is run `reports/paths-review-7367db0a8cabaab85f1aeff9874357e93cc18e36ddec1c89b119b3251037d3ac.json`, SHA `105b0e7ac5f36497888c55e7d687e026e3337147cd97295eb5a6cc2b137c91dc`:47 requested revisions,1,006,834 paths checked,301,117 available and705,717 missing at stored locations. Counts are catalog references, not unique photos. All3,481 new commands succeeded; session16784 exited0/reaped, cleanup null. Sampled combined RSS peak414,875,648B. The terminal audit read49,963,531B metadata in5.84s, sampled72,581,120B, session84089 exited0/reaped.
+
+The independently authored PATHS auditor is `sc-22844-paths-terminal-source-v2/audit_paths.py`, SHA `af5a71d6cea309fc6b9b13d86c4c3bc36eae3aa83410e9aac94c120f2abb5f05`;13 focused tests pass. Root source review `sc-22844-paths-auditor-root-review-ik27peab/review.json`, SHA `94a69805aecbaf8f1ead617f8927df6766b2726fc7b415846641373f39caffe6`. V1's nonexistent aggregate report field was corrected to actual sparse paths_<state> counts; V1 remains preserved. The older cadence terminal auditor is FULL-only.
+
+Actual audit owner/request/launch/terminal evidence: `sc-22844-paths-terminal-audit-admission-9228de30-d550-4a92-8447-826eee06493b`. Owner recipe `3fdb13ea2e77170a5b78c13c90392b50c17f886bf266c2d7e5f5a0ed94748844`; owner result `82347ace9d2d6834abda1231dc45d75ef534fbd08430cf38e9f41b1d3024d1e6`.
+
+## Completed sidecar metadata measurement
+
+- Actual exec session **36036** exited 0 and was reaped under frozen `edit_campaign.invoke`; no remaining processes or errors. Owner elapsed 24.944 seconds, measured scanner 24.853 seconds, peak 48,431,104 bytes.
+- Admission directory: `sc-22844-sidecar-stat-admission-2a7bfb06-f5e7-4f35-88a4-684815d5a3ef`.
+- Request SHA `ca1f41ef7697e1f367331848ce32d073993afcc2079e7cd264374b4075e42550`; owner recipe SHA `56d4592361ed678bfd515f73ae1f7ea80da3c568c3e55b0e08ca92d370b2603f`; root admission SHA `3dceff5ae1fe63e0f8c510d5137e68e977756f31343b3a00dd3eb7c2c4e0ca6e`.
+- Completed output: `sc-22844-sidecar-stat-result-2a7bfb06-f5e7-4f35-88a4-684815d5a3ef/measurement.json`.
+- Source `sc-22844-sidecar-stat-source-v1-f6u2n08v/measure.py`, SHA `2ac83fc83bdb0c1d79811a5b3cf1364c4594c808c10d7924573441e27dcbda89`.
+- Independent source review `sc-22844-sidecar-stat-independent-h8eynvlj/review.json`, SHA `3cd52dcbf6bc8c6a004b370d2453f40849383fb5fb52784e1e4341a3ec1808cb`;19 synthetic tests pass, earlier case-insensitive fixture failures retained.
+- Exactly1,083 existing PATH pages/626,471,719B admitted, max696,131B;1,006,834 rows and4,027,336 prospective literal sidecar lstat calls. One traversal, no DB/photo/sidecar bodies. Original sizes come from recorded path evidence; four literal sidecar probes preserve alias multiplicity and can coincide with the original pathname.
+- Inner limits600s/512MiB,8MiB/page,8GiB cumulative pages,8192 pages,1.1M rows,4.4M stats,64MiB prerequisite metadata,2MiB output. Owner610s/512MiB,32GiB reserve, one process, bounded logs/telemetry. Unknown candidate sizes remain explicit. No automatic retries or packet grant.
+
+- Measurement SHA `12d07f0e51963781ae1e55fc38ae6d2af6a61c44589ec3fae7324bc1b9d70858`, status MEASURED_SIDECAR_METADATA_ONLY. Independent actual review `sc-22844-sidecar-stat-actual-independent-v1/review.json`, SHA `f6875da60cec50a79c6714b57deaed28e645a7c7e0bb8df8d5ceb598d0645d40`, PASS. Owner result SHA `c97c447b2eaa30b577cdf6140511937bbc1d2d7596324e30deeba86ddbd62d22`. Do not rerun this scan.
+- All 47 revisions and 4,027,336 literal lstat calls reconcile; no unavailable candidate occurrences. Available original references total 15,160,542,029,800 bytes. The 256 regular sidecar occurrences total 846,812 raw bytes and separately 846,812 identity-decoded bytes, preserving case-insensitive alias multiplicity. Embedded packet quantities remain unmeasured; theoretical caps are not expected storage allocations.
+
+## Current-catalog proposal
+
+Private proposal `/Users/michael/PhotoCatalog-private-results/sc-22844-current-catalog-proposal-9oqhobxn/review.md` and `mapping.json` covers all 16 families and 48 candidates using the hash-verified completed PATHS report. Proposed choices are not applied; external image XMP is unassessed. Independent review passed: `sc-22844-catalog-proposal-independent-2i9wwwlz/review.json`, SHA `b4ef4d4fae9267c7cb4a632662eeea510bc47b9c38358e54f50d320e106c5373`. The user approved these inputs for a test/dry run in the subsequent consolidated-catalog clarification; final migration selection remains separate. Highlighted lower counts in seven families, especially 2015-2 and Lightroom Catalog-v13-5; internal recency does not prove intentional removals. No source originals/catalogs were read by this presentation step.
+
+Native family selection has no packet-completion prerequisite. The existing runner's all-47 packet roster is implementation sequencing rather than the user's scope: the user requested one current catalog per family. The qualified successor must bind the explicitly chosen roster with new command/output identities, keep the full 47-member prerequisite evidence, and label excluded backup XMP unassessed. Final family digests must be refreshed after enrichment; prior user choices can remain authorized if membership, chosen revision and decision basis are unchanged, but stale digest values cannot be reused. S9 comment23139 records this requirement reconciliation.
+
+## Completed source and native qualification
+
+- sc-23137 is Done, closeout comment23145 read back. PR13 reviewed head `aa21c2453f3a16cc4423124207ad6ad7ad30b1a7` merged as `b411ab5b16f247e50870227b69e8efda46929f9f`. PR CI34653155165 and merged-main CI34653984699 passed all4 jobs. Source review `40971aa985f8577024d71801a3f3eb4be9f0d36e5c36fdd323d3cdeed10802b9`, local398-test gate `2724dd0b82cc5dec5e35ff569a031a7e64ea103cba708a3b5ef30a99d74ac308`. Qualified one-pass route requires held local APFS or Windows deny-write/full-ID proof; Linux and other/unknown filesystems retain conservative rehashing. Earlier failures and rejected broad Unix eligibility remain recorded.
+- Selected source152f899 plus auditor correction `dccada8c027901d68f5a5f4a9974325879631f66` is integrated as `c1cebd54a878c1557bffb0ab3c1562530df74d08`. All153 Python tests pass under the specified3.14 environment (gate `409f3cc3a8e335dd0aa8b537aaf4b4a202a8d86a02585f8202653544e6969c0d`); independent source review PASS `b89f06ab7640da66e9f6a3ddca0e68d564abbaa7ecfab965888869da434932da`. Tests with the incorrect default runtime remain preserved as failed. Native source is `9aa5d0aac724187b4d6a591f58e523b654a356ae`; later changes are Python/docs only. Separate native `sc-22844-selected-native-build-oil8ij91/lightroom_inspect`, SHA `e85cd0bf661f6653c5f7545058e43f4903c04f6f05d3c3e1ae1171b3cf5583ed`,6,461,040B; build receipt `46516238bdc3befda8c0ecbfd9b939c09cf81cf0051f930b74168a046d2fe462`, session69457 reaped0.
+- Historical config, binding, executable and completed FULL/PATHS remain immutable. The selected transition changes controller/contract/native only through explicit profiles and a reviewed terminal-PATHS transition. It preserves the complete prerequisite roster, selected namespaces, exact native attribution and unchanged configured page limit. Do not copy private incident bridges into shipping code.
+- Direct old/new comparison on two tiny plan copies passed108 native commands/54 output pairs, including21 packets and33 complete raw/decoded chunks perbinary and nonempty projected facts. Result `sc-22844-selected-native-comparison-63c34605-3510-4e04-a357-d8767d52c621/result.json`, SHA `0386cabad9353ee59618579a89d4c341d9be424f6ffa4a64a4fdb3d0229d99ef`; comparison `7ae35c9b2ef64f87d803cc29b5ca70be5aa33689c1845fd76dd254ab41741320`. Session78834 reaped0; prior assertion/copier failures remain distinct, not relabeled or recaptured. Independent synthetic-base qualification `sc-22844-selected-native-independent-v1/qualification.json`, SHA `495ae9063db5fe77d82876d1c55781fecbe2b2cae9f6fab0c731b45d1c168618`, evidence `dfa3b884442ad81cbe4a38d2b0ffda74105d944df6f0e12f69f1296464c4006a`.
+- Actual selected fixture completed pause104→107, resume→136, replay→137 with33 new native commands. Selected2/excluded1, effective native/profile consumption, four negative preflight cases, byte-identical plan/output on replay, all12 source hashes, earlier FULL/PATHS/config/binding/prefix and6 captures preserved. Final `sc-22844-selected-fixture-execution-829d1034-1504-43fd-aa54-ee4a07942d92/final-result.json`, SHA `8ac4405643d9d234a5e9c6574cba776282fd62109607288d3a632c1e94b0168a`; independent review `sc-22844-selected-fixture-independent-v1/review.json`, SHA `aedce5f7126a53662f23789e8d15c106d591a7efbbea587c632facc3fde6fe6d`. Sessions6952/49922/8838 reaped0;39 known PIDs absent. Initial metadata-only fixture schema failure remains separately retained. No production user choice or production dispatch is implied.
+- Selected renderer `sc-22844-family-renderer-selected-zok6agwi/render.py` passed9 tests and independent review `d62610398939f45ba54788cf3701e77d4fb998df51e8e2979370976398b1723d`. It also rendered actual native-generated synthetic reports: `sc-22844-selected-render-native-l0tgnahi/receipt.json`, SHA `47348bfec8aefaa677fd7defd1678f3879ead2481ae11e4cd0e47d8747ebb5a8`,3 rows,2 packet-selected,1 external-unassessed,0 native catalog choices. Native choices remain separate from packet execution membership. Earlier all47 renderer remains historical; use the selected successor.
+
+## Next actions
+
+1. Complete independent terminal selected audit review. Actual terminal output and raw tool responses are preserved. Do not rerun completed phases.
+2. For a clean pause, continue only the same selected16 scope after predecessor review and fresh locked admission. For completed PACKETS, use reviewed post-packets finalizer v2 `/Users/michael/PhotoCatalog-private-results/sc-22844-post-packets-finalizer-source-v2-e2eeb1bf/finalize.py`, SHA `3e9c173028f72e4d720b1621fd590f06e600670d913b8f6f1a0ca60405cb0fb3`, independent review `f25fe739fa1c2ab2431e5fe16fc91fe8a75a673f8fb62686c82b18449920e2ef`. Bind fresh terminal/audit refs and metadata-derived bounds before its separate grant. It applies TEST-only choices to the derived plan, reconciles reports and produces navigation to retained evidence; originals remain read-only.
+3. If actual conflict totals exceed retained enumeration, resolve the concrete gap before claiming S9 acceptance. Preserve missing-path, recency/count and semantic/rendering limitations. No speculative endpoint or whole-source reinspection is required merely to prepare the report.
+4. Finish S9 dry-run acceptance, PR11 merge/applicable terminal CI and tracker read-back before starting dependent S10. The user's approved test selection is distinct from final migration selection. S10–S13 remain outstanding; source/fixture gates alone are not S9 or epic completion.
+
+## Frozen execution and publication
+
+- Delivery worktree `/Users/michael/Repos/PhotoCatalog-worktrees/sc-22844-delivery`, branch `codex/sc-22844-inspection-delivery`, published head `003770e58b4dce5a543731d334e673a23ea6a283`; current closeout documentation may be ahead locally. Do not edit on main or disturb root-worktree ZIPs/.DS_Store.
+- Public PR #11 remains draft/open/unmerged; all4 CI34654732967 jobs passed at that exact published head. PR #12 merged as `9dbcc76d4e9dfa3dbd626007b4e73698d2995a9e`; exact PR and merged-main checks passed, both bug trackers read back Done. Keep source stationary during actual phases and batch publication rather than pushing every progress checkpoint.
+- Native source `ccae8ad46ecd024764e4837cc84c5fe391e43179`; binary SHA `eb541139f7f7888ee5eec58975ad9f36008c65500ee553fa4030d4507c47602f`. Frozen driver `sc-22844-schema3-driver-ccae8ad-v1`, SHA `af2c5e1dcb939713f8296998cc908e87b8e6658a4208b6e6cb12fe3b60132288`.
+- Controller `sc-22844-cadence-source-v1-EvaR9L/lightroom_phase_control.py`, SHA `3c689d0cd71b6c19971dbb8c2a52881da2654cc0b26a9f2e125ebcef9b383ac1`; profile SHA `5ccb6aeaf8e0bdfe861cc35a6dfb2ddaddc1b17554ef3815a26ed956c9fcfd19`. Soft3600s, sampled emergency4800s,512MiB Python/1GiB native/1.5GiB combined, existing disk/log/metadata guards. Local control free is separately observed, not continuously guarded by the RAID monitor.
+- Native/controller Python remains pinned Homebrew3.14 launcher. Metadata measurement owner uses `/Users/michael/PhotoCatalog-private-results/sc-22843-private-python-v1/env/bin/python` with psutil/blake3; bare Homebrew Python lacks psutil. Frozen owner is `sc-22843-service-smoke-driver-v6/helpers/scripts/edit_campaign.py`, SHA `6765732e148bf711a7311e5e231713accf51bff2ec20721af4caac3c762ced3f`.
+- Both SQLITE_TMPDIR and TMPDIR point to `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911/sqlite-temp` for native/controller work. Preserve bound device/inode.
+
+## User and evidence boundaries
+
+Originals `/Volumes/MichaelJon/Raw` and Lightroom catalogs `/Volumes/MichaelJon/Catalogs` remain read-only. User resumed RAID use and authorized dedicated scratch; if disconnect is requested, wind down/reap owned work before declaring it available. Repository is public by the user's choice. Rust core stays UI-independent, Tauri targets all three desktop platforms, and Fieldbook is a design reference rather than the product name. No GPU work is needed for the current inspection.
+
+[Execution ledger](/Users/michael/Repos/PhotoCatalog-worktrees/sc-22844-delivery/docs/EXECUTION_LEDGER.md) retains historical checkpoints, failures, review chains and earlier delivery evidence. Current source of truth remains the live Shortcut epic/stories and exact local/remote receipts.
+
+User consolidation clarification is recorded and read back in epic E7/E10 and S10. Current folder implementation uses parent-linked filesystem-path nodes (`organization.rs`, folder membership and paged child API) and recursive folder filtering. The user confirmed filesystem folders are the intended display, with every year in the same catalog. S9 comment23147 records test-only source approval; no new RAID test was launched during this clarification.
+
+Post-PACKETS finalizer v2 is reviewed but NOT executed: `/Users/michael/PhotoCatalog-private-results/sc-22844-post-packets-finalizer-source-v2-e2eeb1bf/finalize.py`, SHA `3e9c173028f72e4d720b1621fd590f06e600670d913b8f6f1a0ca60405cb0fb3`; independent `/Users/michael/PhotoCatalog-private-results/sc-22844-finalizer-independent-v1/review-v2.json`, SHA `f25fe739fa1c2ab2431e5fe16fc91fe8a75a673f8fb62686c82b18449920e2ef`. Eleven synthetic tests pass. V1 review found preflight ordering, exhausted-Reader failure receipt and derived-output budget defects, corrected in v2 with originals retained. Fixed35 owner envelopes+renderer/terminal reserve require1,534,853,120B before appendix/other derived bytes; conditional collision pages need separate actual-count admission. Use actual terminal selected audit, current plan IDs, exact request and outer existing owner before any finalization. No native/source bodies were read for this source preparation.
+
+## Exact external packet gap classification
+
+Metadata-only classification `/Users/michael/PhotoCatalog-private-results/sc-22844-gap-classification-fVacqcZJ/receipt.json` SHA `a12d97e5e3c6ce9d943dabe16bcc5d430002bfb25ce59efd20239099c25c58d0`:122 retained pages/119120 rows reconcile5467gapreferences.5432RAF unsupported proprietarycarrier boundary,20PSD malformedresourcesignature,14MOV (9unsupported/5malformed),1JPEG missing scanterminator. No sidecar errors, resource/size stops or SourceChanged classifications.12MOV rows have two reasons, not extra references. Sampled partialpackets/digests retained; malformed status does not prove sourcecorruption versusparserdefect. Hooke is doing one bounded PSD framing diagnostic; no wholefilehash or extraction rerun.
+
+## Confirmed PSD compatibility fix sc-23153
+
+Bounded122-byte framing diagnostic `/Users/michael/PhotoCatalog-private-results/sc-22844-psd-framing-VCOuBnrV/receipt.json` SHA `2bade5de3f45dc9e4896ae951dcee5bcba0de8ed6717afe8a7d7812738a01b8b` found aligned AgHg resource8000 endingexactly atsectionend, withunchangedheld/pathmetadata andrecordedsize/mtime. No newwholefilehash. This confirmsone compatibilityblindspot, not all20PSDs. Bugsc-23153 InProgress/readback; Hookeisolated `codex/sc-22844-psd-resource-signature` acceptsAgHgframing whilekeepingAdobe1060semantics8BIMonly. Localfixturetests authorized2jobs; targeted20PSDsuccessorvalidationpreparationonly untilrootadmission. Hubbleglobalendpointcommit72b224d isreadywithnativefixturetests ongoing, Millreviewing. Bothchanges integratebeforeone qualifiedsuccessorbuild; no historicalreport/extraction/choice rerun.
