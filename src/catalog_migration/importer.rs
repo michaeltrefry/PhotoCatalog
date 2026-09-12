@@ -21,7 +21,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-const ADAPTER: &str = "lightroom-selected-import-v1";
+const ADAPTER: &str = "lightroom-selected-import-v2";
 const LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +68,7 @@ pub struct Policy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stage {
     Custody,
+    SupplementCustody,
     Index,
     Files,
     Masters,
@@ -98,7 +99,8 @@ pub enum Stage {
 impl Stage {
     fn next(self) -> Self {
         match self {
-            Self::Custody => Self::Index,
+            Self::Custody => Self::SupplementCustody,
+            Self::SupplementCustody => Self::Index,
             Self::Index => Self::Files,
             Self::Files => Self::Masters,
             Self::Masters => Self::VirtualCopies,
@@ -204,7 +206,11 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
       record INTEGER NOT NULL REFERENCES migration_retained_records(sequence),
       revision TEXT NOT NULL,
       outcome BLOB NOT NULL,PRIMARY KEY(run,stage,record));
-      CREATE INDEX IF NOT EXISTS migration_run_capture ON migration_run_items(run,stage,revision);",
+      CREATE INDEX IF NOT EXISTS migration_run_capture ON migration_run_items(run,stage,revision);
+      CREATE TABLE IF NOT EXISTS migration_run_supplements(
+      run TEXT NOT NULL REFERENCES migration_runs(id),revision TEXT NOT NULL,source_id TEXT NOT NULL,
+      origin TEXT NOT NULL,proof TEXT NOT NULL,evidence TEXT NOT NULL,semantic TEXT NOT NULL,
+      PRIMARY KEY(run,revision,source_id,origin));",
     )?;
     Ok(())
 }
@@ -224,7 +230,15 @@ pub(crate) fn read(db: &Connection, id: &str) -> Result<(Progress, Policy)> {
     );
     let p: Progress = serde_json::from_slice(&p)?;
     ensure!(p.id == id, "migration state identity differs");
-    Ok((p, serde_json::from_slice(&q)?))
+    let policy: Policy = serde_json::from_slice(&q)?;
+    let expected = blake3::hash(&encode(&(ADAPTER, &p.input, &policy))?)
+        .to_hex()
+        .to_string();
+    ensure!(
+        expected == id,
+        "legacy migration run requires a new v2 run; retained component receipts remain reusable"
+    );
+    Ok((p, policy))
 }
 pub(crate) fn advance(
     catalog: &mut Catalog,
@@ -257,6 +271,110 @@ pub(crate) fn advance(
     }
     tx.commit()?;
     Ok(())
+}
+fn admit_supplements(catalog: &Catalog, source: &MigrationSource, policy: &Policy) -> Result<()> {
+    let pins = &source.seal().supplements;
+    ensure!(
+        pins.len() == policy.supplements.len(),
+        "selected seal/policy supplement roster differs"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut remaining = 32 * 1024 * 1024u64;
+    for pin in pins {
+        let matches = policy
+            .supplements
+            .iter()
+            .filter(|s| {
+                s.capture_revision == pin.revision
+                    && s.source_id == pin.source_id
+                    && s.origin == super::file_metadata::Origin::Embedded
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            pin.origin == "embedded" && matches.len() == 1,
+            "selected supplement policy member missing or duplicated"
+        );
+        let state = catalog.migration_evidence(&matches[0].evidence)?;
+        ensure!(
+            state.complete && state.length <= 8 * 1024 * 1024 && state.length <= remaining,
+            "supplement admission document budget/state"
+        );
+        remaining -= state.length;
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "supplement admission deadline"
+        );
+        super::file_metadata::supplement_document(catalog, &matches[0].evidence, pin)?;
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "supplement admission deadline"
+        );
+    }
+    Ok(())
+}
+fn supplement_step(
+    catalog: &mut Catalog,
+    source: &MigrationSource,
+    before: &Progress,
+    policy: &Policy,
+) -> Result<Step> {
+    let mut after = before.clone();
+    let pins = &source.seal().supplements;
+    if before.artifact_index == pins.len() {
+        after.artifact_index = 0;
+        after.stage = Stage::Index;
+        advance(catalog, before, &after, None)?;
+        return Ok(Step {
+            progress: after,
+            outcome: None,
+            needs_decision: None,
+        });
+    }
+    let pin = pins
+        .get(before.artifact_index)
+        .context("supplement custody cursor bounds")?;
+    let member = policy
+        .supplements
+        .iter()
+        .find(|s| {
+            s.capture_revision == pin.revision
+                && s.source_id == pin.source_id
+                && s.origin == super::file_metadata::Origin::Embedded
+        })
+        .context("supplement policy member absent")?;
+    let semantic = super::file_metadata::verify_supplement_custody(catalog, &member.evidence, pin)?;
+    after.artifact_index += 1;
+    let old = encode(before)?;
+    let new = encode(&after)?;
+    let _permit = catalog.writers.enter(Priority::Background)?;
+    let tx = catalog
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure!(
+        tx.execute(
+            "UPDATE migration_runs SET progress=?3 WHERE id=?1 AND progress=?2",
+            params![before.id, old, new]
+        )? == 1,
+        "supplement custody cursor changed; retry"
+    );
+    tx.execute(
+        "INSERT INTO migration_run_supplements VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            before.id,
+            pin.revision,
+            pin.source_id,
+            pin.origin,
+            pin.proof_blake3,
+            member.evidence,
+            semantic
+        ],
+    )?;
+    tx.commit()?;
+    Ok(Step {
+        progress: after,
+        outcome: None,
+        needs_decision: None,
+    })
 }
 impl Catalog {
     pub fn begin_selected_import(
@@ -339,6 +457,7 @@ impl Catalog {
                 "keyword reuse reason bounds"
             );
         }
+        admit_supplements(self, source, policy)?;
         let policy_bytes = encode(policy)?;
         let id = blake3::hash(&encode(&(ADAPTER, source.binding_blake3(), policy))?)
             .to_hex()
@@ -387,9 +506,10 @@ impl Catalog {
         match before.stage {
             Stage::Custody => {
                 if self.step_migration_retention(source)?.complete {
-                    after.stage = Stage::Index;
+                    after.stage = Stage::SupplementCustody;
                 }
             }
+            Stage::SupplementCustody => return supplement_step(self, source, &before, &policy),
             Stage::Index => {
                 if self.step_migration_lookup(&before.input, 64)?.complete {
                     after.stage = Stage::Files;

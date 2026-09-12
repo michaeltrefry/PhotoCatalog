@@ -129,7 +129,8 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
         owner TEXT NOT NULL, input_digest TEXT NOT NULL, retained_file INTEGER NOT NULL REFERENCES migration_retained_records(sequence),
         retained_path INTEGER NOT NULL REFERENCES migration_retained_records(sequence),
         proof BLOB NOT NULL, result BLOB NOT NULL,
-        PRIMARY KEY(file_source,origin,supplement));")?;
+        PRIMARY KEY(file_source,origin,supplement));
+        CREATE INDEX IF NOT EXISTS migration_file_metadata_retained_origin ON migration_file_metadata(retained_file,owner,origin,supplement);")?;
     Ok(())
 }
 fn encoded<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -785,6 +786,7 @@ fn reconstruct(db: &Connection, h: &Historical, origin: Origin) -> Result<Option
     Ok(Some(out))
 }
 fn custody(catalog: &Catalog, id: &str, maximum: usize) -> Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     ensure!(
         id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()),
         "evidence ID bounds"
@@ -796,6 +798,10 @@ fn custody(catalog: &Catalog, id: &str, maximum: usize) -> Result<Vec<u8>> {
     );
     let mut bytes = Vec::new();
     while (bytes.len() as u64) < state.length {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "supplement document custody deadline"
+        );
         let part = evidence::read(&catalog.db, id, bytes.len() as u64)?;
         ensure!(
             !part.is_empty() && part.len() <= maximum - bytes.len(),
@@ -816,6 +822,129 @@ fn payload(catalog: &Catalog, p: &Payload, maximum: usize) -> Result<Vec<u8>> {
         "supplement payload hash/length differs"
     );
     Ok(bytes)
+}
+/// Header-only admission: payload verification is a separate bounded per-pin step.
+pub(crate) fn supplement_document(
+    catalog: &Catalog,
+    id: &str,
+    pin: &crate::lightroom::migration_source::SupplementPin,
+) -> Result<SupplementalProof> {
+    let bytes = custody(catalog, id, META)?;
+    ensure!(
+        blake3::hash(&bytes).to_hex().as_str() == pin.proof_blake3,
+        "supplement proof hash differs"
+    );
+    let value: SupplementalProof = serde_json::from_slice(&bytes)?;
+    supplement_header(&value, pin)?;
+    Ok(value)
+}
+fn supplement_header(
+    value: &SupplementalProof,
+    pin: &crate::lightroom::migration_source::SupplementPin,
+) -> Result<()> {
+    ensure!(
+        value.protocol == 1
+            && value.revision == pin.revision
+            && value.source_id == pin.source_id
+            && value.origin == pin.origin
+            && value.origin == "embedded"
+            && value.source_revision == pin.source_revision
+            && value.historical_status == pin.historical_status,
+        "supplement proof association differs"
+    );
+    ensure!(
+        value.packets.len() <= COUNT && value.parse_inputs.len() <= COUNT,
+        "supplement origin count exceeds native support"
+    );
+    Ok(())
+}
+fn supplement_semantic(value: &SupplementalProof) -> Result<String> {
+    // Transport IDs and inspection lineage are not semantic authority.
+    let mut semantic = serde_json::to_value(value)?;
+    semantic.as_object_mut().unwrap().remove("source_id");
+    semantic["validation_document"]
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence");
+    for key in ["packets", "parse_inputs"] {
+        for item in semantic[key].as_array_mut().unwrap() {
+            item["payload"].as_object_mut().unwrap().remove("evidence");
+        }
+    }
+    Ok(blake3::hash(&encoded(&semantic)?).to_hex().to_string())
+}
+fn verify_payload_stream(
+    catalog: &Catalog,
+    p: &Payload,
+    maximum: u64,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    ensure!(p.length <= maximum, "supplement streamed payload bound");
+    let state = catalog.migration_evidence(&p.evidence)?;
+    ensure!(
+        state.complete && state.length == p.length,
+        "supplement streamed custody length/state differs"
+    );
+    let mut hash = blake3::Hasher::new();
+    let mut offset = 0u64;
+    while offset < p.length {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "supplement custody deadline"
+        );
+        let chunk = evidence::read(&catalog.db, &p.evidence, offset)?;
+        ensure!(
+            !chunk.is_empty() && chunk.len() as u64 <= p.length - offset,
+            "supplement streamed chunk bound"
+        );
+        hash.update(&chunk);
+        offset += chunk.len() as u64;
+    }
+    ensure!(
+        std::time::Instant::now() < deadline && hash.finalize().to_hex().as_str() == p.blake3,
+        "supplement payload hash or deadline differs"
+    );
+    Ok(())
+}
+/// Verify every retained payload even if no native original will be projected.
+/// One pin per call: 8MiB document, 64MiB each raw/decoded, 120s cooperative deadline.
+pub(crate) fn verify_supplement_custody(
+    catalog: &Catalog,
+    id: &str,
+    pin: &crate::lightroom::migration_source::SupplementPin,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let value = supplement_document(catalog, id, pin)?;
+    for (payloads, maximum) in [
+        (
+            &value.packets.iter().map(|v| &v.payload).collect::<Vec<_>>(),
+            PAYLOAD as u64,
+        ),
+        (
+            &value
+                .parse_inputs
+                .iter()
+                .map(|v| &v.payload)
+                .collect::<Vec<_>>(),
+            PAYLOAD as u64,
+        ),
+    ] {
+        let total = payloads.iter().try_fold(0u64, |n, p| {
+            n.checked_add(p.length)
+                .context("supplement streamed total overflow")
+        })?;
+        ensure!(total <= maximum, "supplement aggregate custody bound");
+    }
+    verify_payload_stream(catalog, &value.validation_document, META as u64, deadline)?;
+    for p in &value.packets {
+        ranges(&p.ranges, &value.source_revision)?;
+        verify_payload_stream(catalog, &p.payload, PAYLOAD as u64, deadline)?;
+    }
+    for p in &value.parse_inputs {
+        indices(&p.packet_indices, value.packets.len())?;
+        verify_payload_stream(catalog, &p.payload, PAYLOAD as u64, deadline)?;
+    }
+    supplement_semantic(&value)
 }
 fn supplement(
     catalog: &Catalog,
@@ -849,15 +978,7 @@ fn supplement(
     );
     let pin = pins[0];
     let value: SupplementalProof = serde_json::from_slice(&bytes)?;
-    ensure!(
-        value.protocol == 1
-            && value.revision == pin.revision
-            && value.source_id == pin.source_id
-            && value.origin == pin.origin
-            && value.source_revision == pin.source_revision
-            && value.historical_status == pin.historical_status,
-        "supplement proof association differs"
-    );
+    supplement_header(&value, pin)?;
     ensure!(
         h.observation.status == Some(pin.historical_status)
             && h.observation.revision.as_ref() == Some(&pin.source_revision),
@@ -868,19 +989,7 @@ fn supplement(
         "supplement origin count exceeds native support"
     );
     payload(catalog, &value.validation_document, META)?;
-    // The semantic identity does not contain transport IDs or inspection lineage.
-    let mut semantic = serde_json::to_value(&value)?;
-    semantic.as_object_mut().unwrap().remove("source_id");
-    semantic["validation_document"]
-        .as_object_mut()
-        .unwrap()
-        .remove("evidence");
-    for key in ["packets", "parse_inputs"] {
-        for item in semantic[key].as_array_mut().unwrap() {
-            item["payload"].as_object_mut().unwrap().remove("evidence");
-        }
-    }
-    let semantic_hash = blake3::hash(&encoded(&semantic)?).to_hex().to_string();
+    let semantic_hash = supplement_semantic(&value)?;
     let raw = value.packets.iter().try_fold(0u64, |s, p| {
         s.checked_add(p.payload.length)
             .context("supplement raw overflow")
@@ -1724,6 +1833,289 @@ mod tests {
                 .open()
                 .origin_packet_roster(&revision, "many", "embedded")
                 .is_err()
+        );
+        Ok(())
+    }
+    fn supplemental_policy(t: &Test) -> super::super::importer::Policy {
+        use super::super::importer::{KeywordOverlap, OverlapPolicy, Policy, SupplementInput};
+        Policy {
+            import_source: "lightroom".into(),
+            overlap: OverlapPolicy::RequireDecision,
+            keyword_overlap: KeywordOverlap::RequireDecision,
+            artifacts: vec![],
+            supplements: vec![SupplementInput {
+                capture_revision: t.source.seal().selected[0].revision.clone(),
+                source_id: "file-id".into(),
+                origin: Origin::Embedded,
+                evidence: t.request.supplement.clone().unwrap(),
+            }],
+        }
+    }
+    fn supplement_custody_stage(
+        t: &mut Test,
+        policy: &super::super::importer::Policy,
+    ) -> Result<super::super::importer::Progress> {
+        use super::super::importer::Stage;
+        let run = t.catalog.begin_selected_import(
+            &t.source,
+            b"explicit selected synthetic file metadata import",
+            policy,
+        )?;
+        let step = t.catalog.step_selected_import(&t.source, &run.id)?;
+        assert_eq!(step.progress.stage, Stage::SupplementCustody);
+        let step = t.catalog.step_selected_import(&t.source, &run.id)?;
+        assert_eq!(step.progress.artifact_index, 1);
+        let step = t.catalog.step_selected_import(&t.source, &run.id)?;
+        assert_eq!(step.progress.stage, Stage::Index);
+        for _ in 0..100 {
+            if t.catalog
+                .step_migration_lookup(t.source.binding_blake3(), 64)?
+                .complete
+            {
+                break;
+            }
+        }
+        Ok(step.progress)
+    }
+    #[test]
+    fn coordinator_supplement_admission_rejects_omission_extra_and_wrong_proof() -> Result<()> {
+        for mode in [
+            "omitted",
+            "extra",
+            "unused",
+            "wrong_hash",
+            "wrong_association",
+        ] {
+            let mut t = Test::new(Origin::Embedded, Status::Malformed, true, false)?;
+            let mut policy = supplemental_policy(&t);
+            match mode {
+                "omitted" => policy.supplements.clear(),
+                "extra" => {
+                    let mut extra = policy.supplements[0].clone();
+                    extra.source_id = "unrequested".into();
+                    policy.supplements.push(extra);
+                }
+                "unused" => policy.supplements[0].source_id = "unrequested".into(),
+                "wrong_hash" => {
+                    policy.supplements[0].evidence =
+                        upload(&mut t.catalog, b"wrong proof", "wrong")?.evidence
+                }
+                "wrong_association" => {
+                    let id = t.request.supplement.clone().unwrap();
+                    let mut doc: SupplementalProof =
+                        serde_json::from_slice(&custody(&t.catalog, &id, META)?)?;
+                    doc.source_id = "different-file".into();
+                    let changed = upload(&mut t.catalog, &encoded(&doc)?, "changed association")?;
+                    // Independent helper must check association even with the supplied new hash.
+                    let mut pin = t.source.seal().supplements[0].clone();
+                    pin.proof_blake3 = changed.blake3;
+                    assert!(supplement_document(&t.catalog, &changed.evidence, &pin).is_err());
+                    policy.supplements[0].evidence = changed.evidence;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                t.catalog
+                    .begin_selected_import(
+                        &t.source,
+                        b"explicit selected synthetic file metadata import",
+                        &policy
+                    )
+                    .is_err(),
+                "{mode}"
+            );
+            assert_eq!(
+                t.catalog
+                    .db
+                    .query_row("SELECT count(*) FROM migration_runs", [], |r| r
+                        .get::<_, i64>(0))?,
+                0
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn coordinator_supplement_custody_and_projection_are_both_accounted() -> Result<()> {
+        let mut t = Test::new(Origin::Embedded, Status::Malformed, true, false)?;
+        let policy = supplemental_policy(&t);
+        let run = supplement_custody_stage(&mut t, &policy)?;
+        t.request.association = Association::Confirmed {
+            reason: "synthetic embedded source ownership".into(),
+        };
+        let projected = t.run()?;
+        let reports = super::super::reconciliation::supplement_reports(
+            &t.catalog,
+            &t.source,
+            &run,
+            &policy,
+            &t.request.file.source.capture_revision,
+        )?;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].source_id, "file-id");
+        assert_eq!(
+            reports[0].proof_blake3,
+            t.source.seal().supplements[0].proof_blake3
+        );
+        assert_eq!(
+            reports[0].projection_input_digest.as_ref(),
+            Some(&projected.input_digest)
+        );
+        assert_eq!(reports[0].state, projected.state);
+        let replay = t.catalog.begin_selected_import(
+            &t.source,
+            b"explicit selected synthetic file metadata import",
+            &policy,
+        )?;
+        assert_eq!(serde_json::to_vec(&run)?, serde_json::to_vec(&replay)?);
+        // A missing custody receipt cannot be inferred from an existing projection.
+        t.catalog.db.execute(
+            "DELETE FROM migration_run_supplements WHERE run=?",
+            [&run.id],
+        )?;
+        assert!(
+            super::super::reconciliation::supplement_reports(
+                &t.catalog,
+                &t.source,
+                &run,
+                &policy,
+                &t.request.file.source.capture_revision
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn coordinator_unmapped_supplement_retains_verified_payloads_explicitly() -> Result<()> {
+        let mut t = Test::new(Origin::Embedded, Status::Malformed, true, false)?;
+        t.catalog
+            .db
+            .execute("DELETE FROM migration_originals", [])?;
+        let policy = supplemental_policy(&t);
+        let run = supplement_custody_stage(&mut t, &policy)?;
+        let reports = super::super::reconciliation::supplement_reports(
+            &t.catalog,
+            &t.source,
+            &run,
+            &policy,
+            &t.request.file.source.capture_revision,
+        )?;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, "retained_only_unprojected");
+        assert!(reports[0].projection_input_digest.is_none());
+        assert!(
+            reports[0]
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("verified complete proof")
+        );
+        let proof = supplement_document(
+            &t.catalog,
+            &reports[0].evidence,
+            &t.source.seal().supplements[0],
+        )?;
+        assert_eq!(payload(&t.catalog, &proof.packets[0].payload, PACKET)?, XML);
+        Ok(())
+    }
+    #[test]
+    fn coordinator_supplement_bad_payload_cannot_advance_or_be_skipped() -> Result<()> {
+        use super::super::importer::Stage;
+        let mut t = Test::new(Origin::Embedded, Status::Malformed, true, false)?;
+        let policy = supplemental_policy(&t);
+        let run = t.catalog.begin_selected_import(
+            &t.source,
+            b"explicit selected synthetic file metadata import",
+            &policy,
+        )?;
+        let before = t.catalog.step_selected_import(&t.source, &run.id)?.progress;
+        assert_eq!(before.stage, Stage::SupplementCustody);
+        let document = supplement_document(
+            &t.catalog,
+            policy.supplements[0].evidence.as_str(),
+            &t.source.seal().supplements[0],
+        )?;
+        // Tiny synthetic corruption of the stored decoded/raw object, never a source file.
+        t.catalog.db.execute("UPDATE migration_evidence_blobs SET compressed=x'00' WHERE hash IN (SELECT hash FROM migration_evidence_chunks WHERE evidence=?)",[&document.parse_inputs[0].payload.evidence])?;
+        assert!(t.catalog.step_selected_import(&t.source, &run.id).is_err());
+        assert_eq!(
+            serde_json::to_vec(&before)?,
+            serde_json::to_vec(&t.catalog.selected_import_progress(&run.id)?)?
+        );
+        assert_eq!(
+            t.catalog
+                .db
+                .query_row("SELECT count(*) FROM migration_run_supplements", [], |r| {
+                    r.get::<_, i64>(0)
+                })?,
+            0
+        );
+        Ok(())
+    }
+    #[test]
+    fn coordinator_supplement_checkpoint_is_atomic_and_legacy_run_cannot_bypass_it() -> Result<()> {
+        let mut t = Test::new(Origin::Embedded, Status::Malformed, true, false)?;
+        let policy = supplemental_policy(&t);
+        let run = t.catalog.begin_selected_import(
+            &t.source,
+            b"explicit selected synthetic file metadata import",
+            &policy,
+        )?;
+        let before = t.catalog.step_selected_import(&t.source, &run.id)?.progress;
+        t.catalog.db.execute_batch("CREATE TRIGGER fail_supplement_receipt BEFORE INSERT ON migration_run_supplements BEGIN SELECT RAISE(ABORT,'fixture interruption'); END;")?;
+        assert!(t.catalog.step_selected_import(&t.source, &run.id).is_err());
+        assert_eq!(
+            serde_json::to_vec(&before)?,
+            serde_json::to_vec(&t.catalog.selected_import_progress(&run.id)?)?
+        );
+        assert_eq!(
+            t.catalog
+                .db
+                .query_row("SELECT count(*) FROM migration_run_supplements", [], |r| {
+                    r.get::<_, i64>(0)
+                })?,
+            0
+        );
+        t.catalog
+            .db
+            .execute_batch("DROP TRIGGER fail_supplement_receipt;")?;
+        let done = t.catalog.step_selected_import(&t.source, &run.id)?.progress;
+        assert_eq!(done.artifact_index, 1);
+        let mut legacy = run.clone();
+        legacy.id = blake3::hash(&serde_json::to_vec(&(
+            "lightroom-selected-import-v1",
+            t.source.binding_blake3(),
+            &policy,
+        ))?)
+        .to_hex()
+        .to_string();
+        let old = serde_json::to_vec(&legacy)?;
+        t.catalog.db.execute(
+            "INSERT INTO migration_runs VALUES(?1,?2,?3,?4)",
+            params![legacy.id, legacy.input, serde_json::to_vec(&policy)?, old],
+        )?;
+        assert!(t.catalog.selected_import_progress(&legacy.id).is_err());
+        assert!(
+            t.catalog
+                .step_selected_import(&t.source, &legacy.id)
+                .is_err()
+        );
+        assert_eq!(
+            old,
+            t.catalog.db.query_row(
+                "SELECT progress FROM migration_runs WHERE id=?",
+                [&legacy.id],
+                |r| r.get::<_, Vec<u8>>(0)
+            )?
+        );
+        assert_eq!(
+            t.catalog
+                .begin_selected_import(
+                    &t.source,
+                    b"explicit selected synthetic file metadata import",
+                    &policy
+                )?
+                .artifact_index,
+            1
         );
         Ok(())
     }

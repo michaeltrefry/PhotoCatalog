@@ -20,9 +20,118 @@ pub struct CaptureReport {
     pub native_images: u64,
     pub native_original_mappings: u64,
     pub raw_artifacts: usize,
+    pub supplements: Vec<SupplementReport>,
     pub mapping_epoch: i64,
     pub adobe_rendering_equivalent: bool,
     pub native_collection_order_equivalent: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SupplementReport {
+    pub source_id: String,
+    pub origin: String,
+    pub proof_blake3: String,
+    pub evidence: String,
+    pub state: String,
+    pub projection_input_digest: Option<String>,
+    pub reason: Option<String>,
+}
+/// Every sealed pin has verified generic payload custody, plus a separately
+/// reported projection state. Unprojected evidence is explicit, never omitted.
+pub(crate) fn supplement_reports(
+    catalog: &Catalog,
+    source: &MigrationSource,
+    before: &Progress,
+    policy: &importer::Policy,
+    revision: &str,
+) -> Result<Vec<SupplementReport>> {
+    let pins = source
+        .seal()
+        .supplements
+        .iter()
+        .filter(|p| p.revision == revision)
+        .collect::<Vec<_>>();
+    let count: i64 = catalog.db.query_row(
+        "SELECT count(*) FROM migration_run_supplements WHERE run=?1 AND revision=?2",
+        params![before.id, revision],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        usize::try_from(count)? == pins.len(),
+        "supplement custody receipt roster differs"
+    );
+    let mut reports = Vec::new();
+    let mut report_bytes = 0usize;
+    for pin in pins {
+        let member = policy
+            .supplements
+            .iter()
+            .find(|s| {
+                s.capture_revision == pin.revision
+                    && s.source_id == pin.source_id
+                    && s.origin == super::file_metadata::Origin::Embedded
+            })
+            .context("supplement policy member missing at reconciliation")?;
+        let (hash,evidence,semantic):(String,String,String)=catalog.db.query_row("SELECT proof,evidence,semantic FROM migration_run_supplements WHERE run=?1 AND revision=?2 AND source_id=?3 AND origin=?4",params![before.id,revision,pin.source_id,pin.origin],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        ensure!(
+            hash == pin.proof_blake3 && evidence == member.evidence,
+            "supplement custody proof differs"
+        );
+        let mut statement=catalog.db.prepare("SELECT m.input_digest,m.result FROM migration_record_lookup l CROSS JOIN migration_file_metadata m ON m.retained_file=l.record WHERE m.owner=?1 AND m.origin=?2 AND m.supplement=?3 AND l.input=?4 AND l.revision=?5 AND l.collection=3 AND l.table_name='AgLibraryFile' AND l.source_id=?6 LIMIT 2")?;
+        let mut rows = statement.query(params![
+            policy.import_source,
+            pin.origin,
+            semantic,
+            before.input,
+            revision,
+            pin.source_id
+        ])?;
+        let projection = if let Some(row) = rows.next()? {
+            let value = row.get_ref(1)?;
+            let bytes = value.as_bytes()?;
+            ensure!(
+                bytes.len() <= 8 * 1024 * 1024,
+                "supplement projection receipt bound"
+            );
+            let result: super::file_metadata::ProjectionResult = serde_json::from_slice(bytes)?;
+            ensure!(
+                result.input_digest == row.get::<_, String>(0)?
+                    && result.historical_status == Some(pin.historical_status),
+                "supplement projection receipt association differs"
+            );
+            Some(result)
+        } else {
+            None
+        };
+        ensure!(
+            rows.next()?.is_none(),
+            "supplement projection association ambiguous"
+        );
+        let report = SupplementReport {
+            source_id: pin.source_id.clone(),
+            origin: pin.origin.clone(),
+            proof_blake3: hash,
+            evidence,
+            state: projection
+                .as_ref()
+                .map(|p| p.state.clone())
+                .unwrap_or_else(|| "retained_only_unprojected".into()),
+            projection_input_digest: projection.as_ref().map(|p| p.input_digest.clone()),
+            reason: projection.and_then(|p| p.reason),
+        };
+        let mut report = report;
+        if report.projection_input_digest.is_none() {
+            report.reason=Some("No exact supplemental projection receipt for this selected input/file; verified complete proof and payloads retained without claiming native projection".into());
+        }
+        report_bytes = report_bytes
+            .checked_add(crate::lightroom::bounded_json(&report, 16384)?.len())
+            .context("supplement report byte overflow")?;
+        ensure!(
+            report_bytes <= 2 * 1024 * 1024,
+            "supplement report aggregate bound"
+        );
+        reports.push(report);
+    }
+    Ok(reports)
 }
 pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS migration_reconciliation(
@@ -129,6 +238,15 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
                     && !source.seal().excluded_revisions.contains(r)),
             "excluded or unselected records entered destination custody"
         );
+        let supplements: i64 = catalog.db.query_row(
+            "SELECT count(*) FROM migration_run_supplements WHERE run=?",
+            [&before.id],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            usize::try_from(supplements)? == source.seal().supplements.len(),
+            "final supplemental custody roster differs"
+        );
         after.stage = Stage::Complete;
         after.complete = true;
         let old = serde_json::to_vec(before)?;
@@ -168,6 +286,7 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         native_images: 0,
         native_original_mappings: 0,
         raw_artifacts: 0,
+        supplements: Vec::new(),
         mapping_epoch: snapshot_epoch,
         adobe_rendering_equivalent: false,
         native_collection_order_equivalent: false,
@@ -303,6 +422,7 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         );
     }
     report.raw_artifacts = manifest.artifacts.len();
+    report.supplements = supplement_reports(catalog, source, before, &policy, &capture.revision)?;
     let bytes = crate::lightroom::bounded_json(&report, 8 * 1024 * 1024)?;
     after.capture_index += 1;
     let old = crate::lightroom::bounded_json(before, 8 * 1024 * 1024)?;
