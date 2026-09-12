@@ -10,7 +10,7 @@ into one scratch catalog and preserves the existing filesystem folder hierarchy.
 The 32 excluded catalog candidates remain excluded. Canonical-library migration
 has not been authorized.
 
-PR #14 remains draft. Published head `e7614d7` passed all four applicable CI
+PR #14 remains draft. Published head `16ad4e0` passed all four applicable CI
 jobs: macOS, Windows, Linux, and benchmark contracts. Later source changes still
 require their own remote checks and actual TEST acceptance.
 
@@ -33,12 +33,26 @@ set, with explicit unresolved and resource-limit results. Independent source rev
 Clippy and formatting passed; five existing tests remain ignored. The original
 interactive conflict guard and successful component receipts remain intact.
 
-The same TEST has resumed with the qualified successor. A bounded read-only check
+The same TEST resumed with that qualified successor. A bounded read-only check
 proved recovery of the exact failing row: its rating candidate is retained, ambiguity
 is still visible, prior rating sources and choices are unchanged, and the saved flag
 and label receipts are identical. The checkpoint had advanced beyond 2,149,840
 processed rows. This is a successful repair/resume observation, not terminal import
 acceptance. Earlier native receipts remain attributed to their original source.
+
+That interval later stopped at 2,208,017 processed rows when the XMP wrapper
+treated an empty scalar as a null composite-construction argument during a label
+edit's preservation check. The source label was empty and the incoming value was
+Red. The checkpoint, original models and exact error are preserved. Repair
+`94ebee0b` reproduced the error in a synthetic fixture, fixes the wrapper's empty
+scalar handling, and preserves the existing composite and semantic guards.
+Independent source review, 37 focused tests, all 599 optimized all-target test
+instances, strict all-target Clippy and formatting passed, with five existing
+tests ignored. Run 12 resumes the same TEST from that checkpoint using the
+qualified successor; actual failing-row recovery and terminal acceptance remain
+to be observed. Input, policy, schema, successful receipts and resource limits
+are unchanged. This repair requires a verifier source-pin successor, with no
+weakened acceptance checks.
 
 Remaining native projections, raw artifact custody, independent selected counts
 and relationships, final acceptance review, merge and terminal merged-head CI
