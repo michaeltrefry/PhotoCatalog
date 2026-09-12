@@ -1,6 +1,31 @@
 # PhotoCatalog continuation — 2026-09-11
 
-## Current state
+## Current continuation
+
+The selected extraction, TEST finalizer and full global-ID enumeration are complete.
+Root session 96292 exited 0 and was reaped. Result
+`PRIVATE_RESULTS_ROOT/sc-22844-global-query-retry-output-frfnv5l7/result.json`,
+SHA `38c6d2d176d746bcbd8e0e9f937eacab6019ff81a79036bf5f401e8e2cde7a08`,
+contains 120 revision pairs / 8,271 rows / 130 pages; 1,000 sampled matches reconcile and
+all four old/new family comparisons match. Independent actual review passed: `5730310661ed6bcd0260f1da135832fe24daca892817441961cdd50eda33c01e`.
+Native source `f69e7a2` and binary
+`2c0c7fe314395157339a454151873fded2b6aa55330cbeb8402b669ceb65ac31`
+are separately qualified. Previous timeout evidence remains failed and intact.
+Do not rerun extraction, choices or completed enumeration.
+
+The 20-reference PSD correction passed actual source and 40 payload comparisons,
+with independent review `433a3b06e6905338879f3e6ff67a1e8c53e50c034c24537d0ab86d337930f131`.
+Evidence: `PRIVATE_RESULTS_ROOT/sc-23153-probe-actual-review-jMdCl3nW/review.json`.
+The final readable review is complete at
+`PRIVATE_RESULTS_ROOT/sc-22844-private-migration-review-1seycgbk/REVIEW.md`,
+SHA `99fda86fb63d7ce49bb87db685ff94771a97a390634498978b7564f60e0e819f`.
+Independent final review passed, SHA
+`6970985af414c57c2fe7874da8fd1f98ef5f5470781d3272cfd0f811f8c114c2`.
+Historical reports remain intact. Deliver this documentation/source batch through
+PR #11, verify current-head CI and merged CI, then close S9 and sc-23153. No final migration has
+been approved or executed. Older process/status statements below are historical.
+
+## Historical state before final enumeration
 
 **Selected XMP extraction COMPLETE; final test report pending:** attempt `b030a554-c9a9-4d52-a3d7-a3222f9a88fa`, actual root session `25675` terminal exit0/reaped. Result `8a4ecb9cd15d4abeac0850a04f385a4adc1429c9c44afbfbe6aacea43369d77b`, output `d849361a8e582acefc3c2f0e7f20e406df1362c3aea4bd673579508da43b1a9c`, selected audit `/Users/michael/PhotoCatalog-private-results/sc-22844-selected-terminal-audit-uz00d9l5/review.json` SHA `eb2acd608e0b5df90e8b131335a1df7f5326f9c7af34d67a23f5ac2c596f9d94`; audit session50501 terminal0/reaped. All209,091 references/16 selected catalog checks complete,1,044 successful commands across3 slices27152→28196; no failed commands. Counts:48,657 missing paths,5,467 available packet gaps,154,967 available packet-retained references,6,617 virtual copies. These are reported states, not universal preservation or semantic-import acceptance. Independent actual review passed; completed finalizer is recorded below. Read actual state before any continuation.
 

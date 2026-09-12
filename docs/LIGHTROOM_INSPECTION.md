@@ -188,9 +188,20 @@ lightroom_inspect packets PLAN REVISION --after 0 --limit 100
 lightroom_inspect packet-bytes PLAN REVISION PACKET_SEQUENCE --offset 0 --limit 65536
 lightroom_inspect metadata-conflicts PLAN REVISION --after 0 --limit 100
 lightroom_inspect families PLAN
+lightroom_inspect global-id-conflicts PLAN LEFT_REVISION RIGHT_REVISION --after-left "" --after-right "" --limit 1000
 lightroom_inspect assign-family PLAN REVISION FAMILY --reason EXPLANATION
 lightroom_inspect choose PLAN FAMILY REVISION --expected-evidence DIGEST --reason EXPLANATION
 ```
+
+`families` reports the complete overlap count with a bounded sample. To enumerate
+all shared global-ID pairs, call `global-id-conflicts` for each selected revision
+pair. Start with empty cursors, then use the last returned left/right source IDs
+as the next cursor. Continue until an empty page, even after a short page: both
+row and serialized-byte limits apply. Duplicate IDs retain every matching pair;
+these are shared identifiers, not a count of distinct photos or conflicting edits.
+The query uses the existing `entity_global` index on both join sides to avoid
+revision-wide nested scans while ordering by source IDs. A missing index is an
+error. Neither command changes family choices or imports assets.
 
 `capture` launches a dedicated `capture-worker` subprocess. Its output directory
 must be new and have an existing parent; source/output ancestry overlap is rejected

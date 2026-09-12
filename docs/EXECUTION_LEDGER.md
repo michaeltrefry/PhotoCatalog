@@ -4,6 +4,39 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current wave
 
+S9 sc-22844 remains In Progress. All selected extraction and TEST finalization
+are complete and independently reviewed: 16 chosen catalog families, 209,091
+file references, 6,617 virtual copies, 68 enumerated path-overlap pairs, and 6,112
+indexed source-evidence pages. The original files are unchanged within the
+recorded inspection proofs; this is a dry run, not a migration.
+
+The complete shared-ID list now contains all 8,271 pairs across 120 selected
+revision pairs and 130 page calls, including 120 terminal empty pages. All 1,000
+historical sampled rows reconcile and four old/new family comparisons match.
+Root session 96292 exited 0 and was reaped after 468.75 seconds; result SHA
+`38c6d2d176d746bcbd8e0e9f937eacab6019ff81a79036bf5f401e8e2cde7a08`,
+index SHA `204f3049a3dd70bd426a4bc4825211a5174a33f4957625cf638fc7664c3096c5`.
+Independent actual review passed: `5730310661ed6bcd0260f1da135832fe24daca892817441961cdd50eda33c01e`. The earlier 120-second query timeout remains
+preserved as failed. The repair uses existing global indexes on both join sides;
+zero-byte WAL and 32 KiB SHM were preserved before normal owned-plan reopening.
+No extraction or family choices were repeated.
+
+Bug sc-23153 is fixed locally: all 20 affected PSD references now pass, with
+unchanged full source digests and all 40 raw/decoded baseline payloads matching.
+Independent actual review `433a3b06e6905338879f3e6ff67a1e8c53e50c034c24537d0ab86d337930f131`
+binds the separate supplemental evidence. Historical plan counts are preserved.
+The final private readable report is complete, SHA
+`99fda86fb63d7ce49bb87db685ff94771a97a390634498978b7564f60e0e819f`,
+with independent review `6970985af414c57c2fe7874da8fd1f98ef5f5470781d3272cfd0f811f8c114c2`.
+It is at `PRIVATE_RESULTS_ROOT/sc-22844-private-migration-review-1seycgbk/REVIEW.md`.
+PR #11 is ready for its final delivery batch; current-head CI, merge and tracker
+closeout remain required. S1–S8 and bugs sc-23102/sc-23122/sc-23137 are
+Done; S10–S13 retain their recorded dependencies.
+
+## Historical checkpoints
+
+The entries below describe earlier states and are superseded by the current wave.
+
 S9 sc-22844 remains In Progress. Corrected FULL and metadata-only PATHS are complete and independently audited. PATHS session16784 exited0/reaped after3,481 commands, next27152:1,006,834 references,301,117 available and705,717 missing at their stored paths. Result `9c53960818b6d52f7e2e6a8ea610c6186eb6cc2c3e52c9193a9814fd6b044232`; output `105b0e7ac5f36497888c55e7d687e026e3337147cd97295eb5a6cc2b137c91dc`; independent terminal review `2b681bb0a4cc4b4448b267641eb503e5db815386e6f8497a90d374f86180e434`. No failures/cleanup. Terminal audit source v2 corrects sparse native report-state counts,13 regressions and root source review passed; actual audit completed5.84s/72.6MB sampled/reaped0,49.96MB metadata. No packet phase, family choices or migration yet.
 
 The sidecar metadata scan completed and was independently verified: session 36036 exited 0/reaped, 24.853 seconds and 48,431,104-byte peak, all 47 revisions and 4,027,336 literal stat calls. Measurement `12d07f0e51963781ae1e55fc38ae6d2af6a61c44589ec3fae7324bc1b9d70858`; actual independent review `f6875da60cec50a79c6714b57deaed28e645a7c7e0bb8df8d5ceb598d0645d40`; owner result `c97c447b2eaa30b577cdf6140511937bbc1d2d7596324e30deeba86ddbd62d22`. The 301,117 available original references total 15,160,542,029,800 bytes; 256 sidecar occurrences total 846,812 raw bytes plus the same separately decoded bytes. No photo/sidecar body or database reads. All inspection processes are reaped. Do not rerun completed FULL, PATHS or sidecar measurement.
