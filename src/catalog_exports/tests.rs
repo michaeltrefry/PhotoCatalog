@@ -43,6 +43,94 @@ fn seal(temp: &Path, w: &ExportWork) -> Result<SealedPhotoExport> {
     std::fs::write(&stage, b"completed encoded derivative")?;
     metadata_export::seal_photo_export(&w.plan.destination, &stage, 1024, &w.authority, |_| Ok(()))
 }
+
+#[test]
+fn image_export_freezes_its_metadata_without_sibling_invalidation() -> Result<()> {
+    let (temp, mut catalog, _) = fixture()?;
+    let master = VariantKey::master("a");
+    let copy = catalog
+        .create_edit_variant(&master, 0, "independent copy")?
+        .key;
+    let rating = |value: &str| crate::xmp::Edit::Set {
+        namespace: "http://ns.adobe.com/xap/1.0/".into(),
+        path: "Rating".into(),
+        value: value.into(),
+    };
+    let master_change = catalog.edit_metadata_for_image(&master, 0, None, &[rating("1")])?;
+    let copy_change = catalog.edit_metadata_for_image(&copy, 0, None, &[rating("5")])?;
+    let job = catalog.begin_photo_export()?;
+    let mut selected = target(temp.path().join("copy.png"));
+    selected.key = copy.clone();
+    selected.metadata = MetadataSelection::Resolved {
+        expected_revision: copy_change.revision,
+        base_model: Some(copy_change.model_ids[0]),
+    };
+    catalog.append_photo_export(&job.id, 0, &selected, &output(), 1024, 1024)?;
+    catalog.seal_photo_export_job(&job.id, 1)?;
+    let work = catalog.claim_photo_export(&job.id)?.unwrap();
+    assert_eq!(work.plan.version, 2);
+    assert_eq!(
+        work.plan.identity.image_identity.as_ref().unwrap().key,
+        copy
+    );
+    let packet = read_blob(&catalog.db, work.plan.xmp_blob.as_ref().unwrap())?;
+    assert_eq!(
+        crate::xmp::project(&packet)?.fields.get("rating"),
+        Some(&crate::xmp::Value::Text("5".into()))
+    );
+    catalog.edit_metadata_for_image(
+        &master,
+        master_change.revision,
+        Some(master_change.model_ids[0]),
+        &[rating("2")],
+    )?;
+    assert!(catalog.photo_export_work_current(&work)?);
+    catalog.edit_metadata_for_image(
+        &copy,
+        copy_change.revision,
+        Some(copy_change.model_ids[0]),
+        &[rating("4")],
+    )?;
+    assert!(!catalog.photo_export_work_current(&work)?);
+    assert_eq!(
+        read_blob(&catalog.db, work.plan.xmp_blob.as_ref().unwrap())?,
+        packet
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_photo_plan_keeps_original_authority_and_publication_guards() -> Result<()> {
+    let (temp, mut catalog, _) = fixture()?;
+    let (job, mut work) = queued(&mut catalog, temp.path().join("legacy.png"))?;
+    // Reproduce the exact pre-schema7 plan structure and legacy generation.
+    work.plan.version = 1;
+    work.plan.identity.image_identity = None;
+    work.plan.identity.source = catalog.render_identity("a")?;
+    let original_bytes = serde_json::to_string(&work.plan)?;
+    assert!(!original_bytes.contains("image_identity"));
+    work.authority = blake3::hash(original_bytes.as_bytes()).to_hex().to_string();
+    catalog.db.execute(
+        "UPDATE photo_export_items SET plan=?1,authority=?2 WHERE job=?3 AND sequence=1",
+        params![original_bytes, work.authority, job.id],
+    )?;
+    drop(catalog);
+    let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+    assert!(catalog.photo_export_work_current(&work)?);
+    let sealed = seal(temp.path(), &work)?;
+    catalog.accept_photo_export_seal(&work, &sealed)?;
+    assert_eq!(
+        catalog.publish_photo_export_item(&job.id, 1)?.state,
+        metadata_export::ExportState::Published
+    );
+    let retained: (String, String) = catalog.db.query_row(
+        "SELECT plan,authority FROM photo_export_items WHERE job=?1 AND sequence=1",
+        [&job.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(retained, (original_bytes, work.authority));
+    Ok(())
+}
 #[test]
 fn frozen_job_survives_restart_and_only_accepted_seal_publishes() -> Result<()> {
     let (temp, mut c, original) = fixture()?;

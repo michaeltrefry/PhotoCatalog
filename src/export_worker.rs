@@ -77,7 +77,17 @@ fn validate(request: &Request) -> Result<()> {
 }
 fn validate_persisted(request: &Request) -> Result<()> {
     ensure!(
-        request.version == 1 && request.work.plan.version == 1,
+        request.version == 1
+            && ((request.work.plan.version == 1
+                && request.work.plan.identity.image_identity.is_none())
+                || (request.work.plan.version == 2
+                    && request
+                        .work
+                        .plan
+                        .identity
+                        .image_identity
+                        .as_ref()
+                        .is_some_and(|image| image.key == request.work.plan.identity.key))),
         "export worker protocol"
     );
     let encoded = serde_json::to_vec(&request.work.plan)?;

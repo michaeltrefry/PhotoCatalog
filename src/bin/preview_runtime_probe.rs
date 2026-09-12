@@ -89,6 +89,7 @@ fn run(args: WorkerArgs) -> Result<()> {
         let keys = [(Tier::Thumbnail, 512), (Tier::Large, 1600)]
             .into_iter()
             .map(|(tier, edge)| PreviewKey {
+                image_pixel_generation: None,
                 asset_id: args.fixture_id.clone(),
                 variant_id: "master".into(),
                 generation: 1,

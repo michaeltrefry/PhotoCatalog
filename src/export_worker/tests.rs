@@ -18,6 +18,7 @@ fn request(root: &Path) -> Request {
         // Recovery must not execute or silently upgrade an old renderer's plan.
         renderer_identity: "prior-export-renderer".into(),
         identity: EditRenderIdentity {
+            image_identity: None,
             source: RenderIdentity {
                 asset_id: "a".into(),
                 generation: 1,

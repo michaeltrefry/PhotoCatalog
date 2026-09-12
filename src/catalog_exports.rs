@@ -203,7 +203,14 @@ fn checked_plan(bytes: &str, authority: &str) -> Result<PhotoExportPlan> {
     );
     let plan: PhotoExportPlan = serde_json::from_str(bytes)?;
     ensure!(
-        plan.version == 1 && plan.recipe.validate()?.digest() == plan.identity.recipe_digest,
+        ((plan.version == 1 && plan.identity.image_identity.is_none())
+            || (plan.version == 2
+                && plan
+                    .identity
+                    .image_identity
+                    .as_ref()
+                    .is_some_and(|image| image.key == plan.identity.key)))
+            && plan.recipe.validate()?.digest() == plan.identity.recipe_digest,
         "export recipe binding mismatch"
     );
     Ok(plan)
@@ -266,13 +273,19 @@ fn protect_destination(
     Ok(())
 }
 fn metadata_current(db: &Connection, plan: &PhotoExportPlan) -> Result<()> {
+    let image_id = if let Some(image) = &plan.identity.image_identity {
+        crate::catalog_images::require_image_metadata_identity(db, image)?;
+        &image.image_id
+    } else {
+        &plan.identity.key.asset_id
+    };
     if let MetadataSelection::Resolved {
         expected_revision, ..
     } = plan.metadata
     {
         let revision: i64 = db.query_row(
             "SELECT COALESCE((SELECT revision FROM metadata_assets WHERE asset_id=?1),0)",
-            [&plan.identity.key.asset_id],
+            [image_id],
             |r| r.get(0),
         )?;
         ensure!(
@@ -599,25 +612,26 @@ impl Catalog {
             },
             "output extension does not match format"
         );
+        let image_id = self.image(&target.key)?.id;
         let packet = match target.metadata {
             MetadataSelection::Omit => None,
             MetadataSelection::Resolved {
                 expected_revision,
                 base_model: Some(base),
             } => Some(
-                self.resolved_export_xmp(&target.key.asset_id, expected_revision, base)?
+                self.resolved_export_xmp(&image_id, expected_revision, base)?
                     .0,
             ),
             MetadataSelection::Resolved {
                 expected_revision,
                 base_model: None,
             } => {
-                let view = self.metadata(&target.key.asset_id)?;
+                let view = self.metadata_for_image(&target.key)?;
                 ensure!(
                     view.revision == expected_revision && view.fields.is_empty(),
                     "select a full metadata model"
                 );
-                let count:i64=self.db.query_row("SELECT COUNT(*) FROM metadata_models m JOIN metadata_observations o ON o.id=m.observation_id JOIN metadata_sources s ON s.id=o.source_id WHERE s.asset_id=?1",[&target.key.asset_id],|r|r.get(0))?;
+                let count:i64=self.db.query_row("SELECT COUNT(*) FROM metadata_models m JOIN metadata_image_observations h ON h.observation_id=m.observation_id WHERE h.image_id=?1",[&image_id],|r|r.get(0))?;
                 ensure!(
                     count == 0,
                     "retained metadata requires explicit full base selection"
@@ -631,7 +645,7 @@ impl Catalog {
             protect_destination(tx,&destination.destination,&path,alias_limits)?;
             let profile=match &output.profile {OutputProfile::Srgb=>StoredProfile::Srgb,OutputProfile::LinearSrgb=>StoredProfile::LinearSrgb,OutputProfile::Icc{bytes}=>StoredProfile::Icc{blob:store_blob(tx,bytes)?}};
             let xmp_blob=packet.as_deref().map(|b|store_blob(tx,b)).transpose()?;
-            let plan=PhotoExportPlan{version:1,renderer_identity:crate::photo_render::output_renderer_identity().to_owned(),identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes,alias_limits};
+            let plan=PhotoExportPlan{version:2,renderer_identity:crate::photo_render::output_renderer_identity().to_owned(),identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes,alias_limits};
             metadata_current(tx,&plan)?;
             let encoded=serde_json::to_string(&plan)?;ensure!(encoded.len()<=PLAN_LIMIT,"export plan limit");
             let authority=blake3::hash(encoded.as_bytes()).to_hex().to_string();let sequence=j.total.checked_add(1).context("export job exhausted")?;
@@ -688,20 +702,28 @@ impl Catalog {
     /// revalidates all authority inside its transaction; this is not a permit.
     pub fn photo_export_work_current(&self, work: &ExportWork) -> Result<bool> {
         checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
-        let current = self.edit_render_identity(&work.plan.identity.key)?;
         let expected = &work.plan.identity;
-        if current.revision != expected.revision
-            || current.recipe_digest != expected.recipe_digest
-            || current.source.generation != expected.source.generation
-            || current.source.fingerprint != expected.source.fingerprint
-            || current.source.state != expected.source.state
+        let variant = self.edit_variant(&expected.key)?;
+        let current_source = if let Some(image) = &expected.image_identity {
+            if crate::catalog_images::require_image_metadata_identity(&self.db, image).is_err() {
+                return Ok(false);
+            }
+            self.edit_render_identity(&expected.key)?.source
+        } else {
+            self.render_identity(&expected.key.asset_id)?
+        };
+        if variant.revision != expected.revision
+            || variant.recipe_digest != expected.recipe_digest
+            || current_source.generation != expected.source.generation
+            || current_source.fingerprint != expected.source.fingerprint
+            || current_source.state != expected.source.state
         {
             return Ok(false);
         }
         if let MetadataSelection::Resolved {
             expected_revision, ..
         } = work.plan.metadata
-            && current.source.metadata_revision != expected_revision
+            && current_source.metadata_revision != expected_revision
         {
             return Ok(false);
         }

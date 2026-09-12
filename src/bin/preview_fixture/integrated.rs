@@ -312,6 +312,7 @@ mod tests {
             db.execute("INSERT INTO assets(sequence,id,location,path_display,fingerprint,state,metadata,preview_hash) VALUES(?1,?2,?3,?4,'synthetic-fingerprint','ready','{}','synthetic-preview-no-object')",params![sequence,id,path.as_bytes(),path]).unwrap();
             if sequence <= 2 {
                 keys.push(PreviewKey {
+                    image_pixel_generation: None,
                     asset_id: id,
                     variant_id: "original".into(),
                     generation: 1,

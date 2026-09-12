@@ -35,6 +35,9 @@ pub struct PreviewKey {
     pub variant_id: String,
     /// Obtained from Catalog::render_identity, never advanced by this manifest.
     pub generation: u64,
+    /// Image-local pixel revision. Absent only on pre-image-scope cache keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pixel_generation: Option<u64>,
     pub fingerprint: String,
     pub edit_revision: u64,
     pub renderer_version: String,
@@ -57,7 +60,11 @@ impl PreviewKey {
             "invalid stable identity"
         );
         ensure!(
-            self.generation <= i64::MAX as u64 && self.edit_revision <= i64::MAX as u64,
+            self.generation <= i64::MAX as u64
+                && self.edit_revision <= i64::MAX as u64
+                && self
+                    .image_pixel_generation
+                    .is_none_or(|value| value <= i64::MAX as u64),
             "revision overflow"
         );
         ensure!(
@@ -1113,6 +1120,7 @@ mod tests {
     }
     fn key(generation: u64, tier: Tier) -> PreviewKey {
         PreviewKey {
+            image_pixel_generation: None,
             asset_id: "asset".into(),
             variant_id: "master".into(),
             generation,

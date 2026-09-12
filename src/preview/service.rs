@@ -235,6 +235,7 @@ fn same_pixels(a: &RenderIdentity, b: &RenderIdentity) -> bool {
 }
 fn same_edit(a: &EditRenderIdentity, b: &EditRenderIdentity) -> bool {
     same_pixels(&a.source, &b.source)
+        && a.image_identity == b.image_identity
         && a.key == b.key
         && a.revision == b.revision
         && a.recipe_digest == b.recipe_digest
@@ -259,7 +260,12 @@ impl SavedJob {
                         .keys
                         .iter()
                         .all(|key| key.variant_id == edit.key.variant_id
-                            && key.edit_revision == edit.revision as u64),
+                            && key.edit_revision == edit.revision as u64
+                            && key.image_pixel_generation
+                                == edit
+                                    .image_identity
+                                    .as_ref()
+                                    .map(|image| image.pixel_generation as u64)),
                 "mixed job edit identity"
             );
             if let Some(work) = &self.request.edit {
@@ -275,6 +281,13 @@ impl SavedJob {
             }
         } else {
             ensure!(self.request.edit.is_none(), "missing job edit authority");
+            ensure!(
+                self.request
+                    .keys
+                    .iter()
+                    .all(|key| key.image_pixel_generation.is_none()),
+                "missing image pixel authority"
+            );
         }
         Ok(())
     }
@@ -396,6 +409,7 @@ impl PreviewService {
             Tier::Large => &self.policy.large,
         };
         let key = PreviewKey {
+            image_pixel_generation: None,
             asset_id: identity.asset_id.clone(),
             variant_id: "master".into(),
             generation: u64::try_from(identity.generation)?,
@@ -421,6 +435,11 @@ impl PreviewService {
                 .unwrap_or(&"0".repeat(64)),
         )?;
         key.variant_id = identity.key.variant_id.clone();
+        key.image_pixel_generation = identity
+            .image_identity
+            .as_ref()
+            .map(|image| u64::try_from(image.pixel_generation))
+            .transpose()?;
         key.edit_revision = u64::try_from(identity.revision)?;
         if identity.key.variant_id != MASTER || identity.revision != 0 {
             key.renderer_version = super::worker::edited_renderer(false);
