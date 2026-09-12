@@ -2,6 +2,8 @@
 
 ## Current state
 
+**Active selected XMP test:** attempt `6ae59d32-9b77-4c9a-afe3-e2a30bd1fe91`, root tool session `77218`, recipe `3cfa42acec6800a6dc35c14ae187550d18902ff9db1f10f397dd20b0f83f4bba`, request directory `/Users/michael/PhotoCatalog-private-results/sc-22844-selected-test-request-6c152166`. Root admission `1899f3cf5c704007c6cfca9154d5ba050d3a6bbf7dd528eaee6f9e0f496028be`; independent package review `e22173d705cfaf8eabdb66f5f0fdcf0b90d99625c5e3b030cc3a673a5d116ff2`. Selected16/excluded31; one main-only candidate remains retained. This supersedes the no-process/pending-admission checkpoints below. Read the actual current attempt before any continuation; do not launch a second owner. Raw root launch is in the request directory. No final migration.
+
 Epic sc-22835 remains In Progress. S1–S8 are verified Done; S9 sc-22844 is In Progress. Bugs sc-23102 and sc-23122 are verified Done through PR #12. S10–S13 retain their recorded dependencies. Do not mark S9 Done from the completed inspection phases alone.
 
 **FULL and metadata-only PATHS are complete and independently audited. Do not rerun either phase.** No family choices or migration have executed. The sidecar metadata scan is also complete and independently reviewed; all inspection processes are reaped. Packet extraction has not started. Bug sc-23137 is verified Done after PR13 merge, all-platform CI and qualified synthetic S9 use. The user has now approved trying the proposed16 source catalogs for a test/dry run and clarified ONE consolidated destination with nested folders; this is not final-migration or file-reorganization approval. No inspection process is running; all real and synthetic sessions are reaped.
