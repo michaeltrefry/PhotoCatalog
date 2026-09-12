@@ -391,6 +391,24 @@ fn two_families_share_files_keep_variants_and_resume_full_worker() -> Result<()>
     for path in &fixture.paths {
         let native = path.to_path()?;
         let parent = NativePath::from_path(native.parent().unwrap());
+        // Folder identities alias verbatim drive/UNC spellings. Build the
+        // expected alias directly, without using the product folder parser.
+        // The physical asset assertion below still requires the original bytes.
+        let parent = match parent {
+            NativePath::WindowsWide(units) => {
+                let unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+                let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+                let ordinary = if let Some(tail) = units.strip_prefix(unc.as_slice()) {
+                    r"\\".encode_utf16().chain(tail.iter().copied()).collect()
+                } else if let Some(tail) = units.strip_prefix(verbatim.as_slice()) {
+                    tail.to_vec()
+                } else {
+                    units
+                };
+                NativePath::WindowsWide(ordinary)
+            }
+            other => other,
+        };
         assert_eq!(
             catalog.db.query_row(
                 "SELECT count(*) FROM organization_folders WHERE locator=?",

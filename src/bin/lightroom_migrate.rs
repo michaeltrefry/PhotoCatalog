@@ -372,7 +372,18 @@ mod tests {
         assert!(disjoint(&source.join("catalog"), &source).is_err());
         disjoint(&root.join("test-catalog"), &source)?;
         assert!(destination_path(Path::new("relative/catalog")).is_err());
-        assert!(destination_path(&root.join("missing/../catalog")).is_err());
+        // PathBuf::join normalizes `..` under a Windows verbatim root. Append
+        // literal units so the rejection test actually supplies traversal.
+        let mut traversal = root.as_os_str().to_owned();
+        traversal.push(std::path::MAIN_SEPARATOR_STR);
+        traversal.push("missing");
+        traversal.push(std::path::MAIN_SEPARATOR_STR);
+        traversal.push("..");
+        traversal.push(std::path::MAIN_SEPARATOR_STR);
+        traversal.push("catalog");
+        let traversal = PathBuf::from(traversal);
+        assert!(traversal.components().any(|c| c == Component::ParentDir));
+        assert!(destination_path(&traversal).is_err());
         Ok(())
     }
 
