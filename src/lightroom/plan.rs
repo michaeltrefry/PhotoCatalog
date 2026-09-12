@@ -39,6 +39,17 @@ const PATH_PACKET_QUEUE: &str = "SELECT sequence,source_id,inspection_path FROM 
 const PATH_PENDING: &str = "SELECT EXISTS(SELECT 1 FROM paths INDEXED BY paths_pending_queue WHERE revision=?1 AND state='pending')";
 const CONFLICTS_PAGE: &str = "SELECT rowid,source_id,file_source_id,origin,packet_digest,field,value_json FROM metadata_facts f WHERE revision=? AND rowid>? AND (SELECT count(DISTINCT value_json) FROM metadata_facts other WHERE other.revision=f.revision AND other.file_source_id=f.file_source_id AND other.field=f.field)>1 ORDER BY rowid LIMIT ?";
 
+// Source-ID ordering must not turn the equality join into revision-wide PK scans.
+// Search the existing table/global-ID index on both sides, then order only matches.
+const GLOBAL_ID_CONFLICTS_PAGE: &str = "SELECT a.source_id,b.source_id,a.table_name,a.global_key
+             FROM entities a INDEXED BY entity_global
+             JOIN entities b INDEXED BY entity_global
+               ON b.table_name=a.table_name AND b.global_key=a.global_key
+             WHERE a.revision=?1 AND b.revision=?2 AND a.global_key IS NOT NULL
+               AND a.table_name IN ('Adobe_images','AgLibraryFile')
+               AND (a.source_id,b.source_id)>(?3,?4)
+             ORDER BY a.source_id,b.source_id LIMIT ?5";
+
 // These indexes are part of schema 2, including partial-queue predicates. A
 // missing/replaced index must fail admission rather than silently restoring scans.
 fn validate_paging_indexes(db: &Connection) -> Result<()> {
@@ -2145,15 +2156,7 @@ impl Plan {
                 && (1..=1000).contains(&limit),
             "invalid global-ID conflict page"
         );
-        let mut statement = self.db.prepare(
-            "SELECT a.source_id,b.source_id,a.table_name,a.global_key
-             FROM entities a JOIN entities b
-               ON b.table_name=a.table_name AND b.global_key=a.global_key
-             WHERE a.revision=?1 AND b.revision=?2 AND a.global_key IS NOT NULL
-               AND a.table_name IN ('Adobe_images','AgLibraryFile')
-               AND (a.source_id,b.source_id)>(?3,?4)
-             ORDER BY a.source_id,b.source_id LIMIT ?5",
-        )?;
+        let mut statement = self.db.prepare(GLOBAL_ID_CONFLICTS_PAGE)?;
         bounded_values(statement.query_map(
             params![left, right, after_left, after_right, limit as i64],
             |row| {
@@ -2533,6 +2536,99 @@ fn bounded_values(
 #[cfg(test)]
 mod bounded_plan_tests {
     use super::*;
+    #[test]
+    fn global_id_conflict_query_uses_global_indexes_instead_of_nested_revision_scans() {
+        use rusqlite::StatementStatus;
+        let temp = tempfile::tempdir().unwrap();
+        let plan = Plan::create(&temp.path().join("plan")).unwrap();
+        let transaction = plan.db.unchecked_transaction().unwrap();
+        for revision in ["left", "right"] {
+            for i in 0..1000 {
+                let table = if i < 20 {
+                    "Adobe_images"
+                } else {
+                    "Adobe_libraryImageDevelopHistoryStep"
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO entities VALUES(?,?,?,NULL,?,'{}')",
+                        params![
+                            revision,
+                            format!("source-{i:04}"),
+                            table,
+                            format!("{revision}-global-{i}")
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        let explain = plan
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {GLOBAL_ID_CONFLICTS_PAGE}"))
+            .unwrap()
+            .query_map(params!["left", "right", "", "", 1000], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            explain
+                .iter()
+                .filter(|line| line.contains("USING INDEX entity_global"))
+                .count(),
+            2,
+            "{explain:?}"
+        );
+        assert!(
+            !explain
+                .iter()
+                .any(|line| line.contains("sqlite_autoindex_entities")),
+            "{explain:?}"
+        );
+        // Retain the original query only in this tiny fixture to demonstrate the
+        // observed optimizer hazard on the actual bundled SQLite version.
+        let original = GLOBAL_ID_CONFLICTS_PAGE.replace(" INDEXED BY entity_global", "");
+        fn measured(db: &Connection, sql: &str) -> (Vec<(String, String)>, i32) {
+            let mut statement = db.prepare(sql).unwrap();
+            let rows = statement
+                .query_map(params!["left", "right", "", "", 1000], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (rows, statement.get_status(StatementStatus::VmStep))
+        }
+        let (old_empty, old_steps) = measured(&plan.db, &original);
+        let (new_empty, new_steps) = measured(&plan.db, GLOBAL_ID_CONFLICTS_PAGE);
+        assert!(old_empty.is_empty());
+        assert_eq!(old_empty, new_empty);
+        assert!(
+            new_steps < 5000 && old_steps > new_steps * 10,
+            "old={old_steps} indexed={new_steps}"
+        );
+        eprintln!(
+            "global-ID empty-pair VM steps: old={old_steps}, indexed={new_steps}; plan={explain:?}"
+        );
+        plan.db.execute("UPDATE entities SET global_key='shared' WHERE table_name='Adobe_images' AND source_id IN ('source-0000','source-0001')", []).unwrap();
+        let (old_matches, _) = measured(&plan.db, &original);
+        let (new_matches, _) = measured(&plan.db, GLOBAL_ID_CONFLICTS_PAGE);
+        assert_eq!(
+            old_matches.len(),
+            4,
+            "duplicate IDs retain the full Cartesian match set"
+        );
+        assert_eq!(old_matches, new_matches);
+        plan.db.execute_batch("DROP INDEX entity_global").unwrap();
+        assert!(
+            plan.global_id_conflicts("left", "right", "", "", 1000)
+                .is_err(),
+            "missing required lookup index fails closed instead of returning to the slow scan"
+        );
+    }
+
     #[test]
     fn global_id_conflict_pages_preserve_duplicate_pairs_and_table_scope() {
         let temp = tempfile::tempdir().unwrap();
