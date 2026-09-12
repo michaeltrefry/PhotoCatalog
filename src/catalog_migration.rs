@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod evidence;
+pub mod file_metadata;
 pub mod images;
 pub mod lookup;
 pub mod metadata;
@@ -17,5 +18,6 @@ pub(crate) fn install(db: &rusqlite::Connection) -> anyhow::Result<()> {
     artifacts::install(db)?;
     organization::install(db)?;
     images::install(db)?;
-    metadata::install(db)
+    metadata::install(db)?;
+    file_metadata::install(db)
 }
