@@ -327,11 +327,11 @@ impl Prepared {
         Ok(hash)
     }
 }
-fn revision(db: &Connection, asset: &str) -> Result<i64> {
-    let found: Option<i64> = db.query_row("SELECT COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0)).optional()?;
+pub(crate) fn revision(db: &Connection, asset: &str) -> Result<i64> {
+    let found: Option<i64> = db.query_row("SELECT COALESCE(m.revision,0) FROM image_assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0)).optional()?;
     found.context("asset not found")
 }
-fn advance(
+pub(crate) fn advance(
     db: &Connection,
     asset: &str,
     action: &str,
@@ -345,6 +345,10 @@ fn advance(
         params![asset, next, action, serde_json::to_string(detail)?],
     )?;
     if affects_pixels {
+        db.execute(
+            "UPDATE catalog_images SET pixel_generation=pixel_generation+1 WHERE id=?",
+            [asset],
+        )?;
         db.execute(
             "UPDATE assets SET render_generation=render_generation+1 WHERE id=?1",
             [asset],
@@ -360,6 +364,13 @@ fn store(
     prepared: &Prepared,
 ) -> Result<(i64, Vec<i64>, bool)> {
     revision(db, asset)?;
+    let physical = crate::catalog_images::physical(db, asset)?;
+    let logical_locator = source.locator.clone();
+    let mut scoped_source = source.clone();
+    if physical != asset && source.kind == "catalog" {
+        scoped_source.locator = [format!("image:{asset}\0").as_bytes(), &source.locator].concat();
+    }
+    let source = &scoped_source;
     ensure!(
         !source.kind.is_empty() && source.kind.len() <= 100 && source.locator.len() <= 32768,
         "invalid metadata source"
@@ -369,13 +380,14 @@ fn store(
     } else {
         "confirmed"
     };
-    let old: Option<(i64,Option<i64>,String,String)> = db.query_row("SELECT id,current_observation,association,availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![asset,source.kind,source.locator],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    db.execute("INSERT INTO metadata_sources(asset_id,kind,locator,display,association,availability) VALUES(?1,?2,?3,?4,?5,'available') ON CONFLICT(asset_id,kind,locator) DO UPDATE SET display=excluded.display,association=excluded.association,availability='available'",params![asset,source.kind,source.locator,source.display,association])?;
+    let old: Option<(i64,Option<i64>,String,String)> = db.query_row("SELECT id,current_observation,association,availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![physical,source.kind,source.locator],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    db.execute("INSERT INTO metadata_sources(asset_id,kind,locator,display,association,availability) VALUES(?1,?2,?3,?4,?5,'available') ON CONFLICT(asset_id,kind,locator) DO UPDATE SET display=excluded.display,association=excluded.association,availability='available'",params![physical,source.kind,source.locator,source.display,association])?;
     let sid: i64 = db.query_row(
         "SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",
-        params![asset, source.kind, source.locator],
+        params![physical, source.kind, source.locator],
         |r| r.get(0),
     )?;
+    let image_old: Option<(Option<i64>, String, String)> = db.query_row("SELECT current_observation,association,availability FROM metadata_image_sources WHERE image_id=?1 AND source_id=?2",params![asset,sid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let mut observed: Option<i64> = db
         .query_row(
             "SELECT id FROM metadata_observations WHERE source_id=?1 AND revision=?2",
@@ -392,7 +404,7 @@ fn store(
             .to_hex()
             .to_string();
         db.execute("INSERT OR IGNORE INTO metadata_file_instances(asset_id,source_id,evidence_hash,provenance) VALUES(?1,?2,?3,?4)",
-            params![asset, sid, hash, prepared.provenance])?;
+            params![physical, sid, hash, prepared.provenance])?;
     }
     let oid = if let Some(id) = observed {
         id
@@ -442,14 +454,29 @@ fn store(
         .prepare("SELECT id FROM metadata_models WHERE observation_id=?1 ORDER BY ordinal")?
         .query_map([oid], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<i64>>>()?;
-    let changed = old.is_none_or(|(_, previous, a, availability)| {
-        previous != Some(oid) || a != association || availability != "available"
+    db.execute(
+        "INSERT OR IGNORE INTO metadata_image_observations VALUES(?1,?2)",
+        params![asset, oid],
+    )?;
+    let current = if prepared.status == "SourceChanged" {
+        image_old.as_ref().and_then(|v| v.0)
+    } else {
+        Some(oid)
+    };
+    let availability = if prepared.status == "SourceChanged" {
+        "source changed during inspection; observation retained for review"
+    } else {
+        "available"
+    };
+    db.execute("INSERT INTO metadata_image_sources VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(image_id,source_id) DO UPDATE SET current_observation=excluded.current_observation,association=excluded.association,availability=excluded.availability",params![asset,sid,current,matches!(source.kind.as_str(),"embedded"|"sidecar"),logical_locator,association,availability])?;
+    let changed = image_old.is_none_or(|(previous, a, available)| {
+        previous != Some(oid) || a != association || available != "available"
     });
     Ok((oid, ids, changed))
 }
 fn candidates(db: &Connection, asset: &str) -> Result<BTreeMap<String, Vec<Candidate>>> {
     let mut result: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-    let mut stmt=db.prepare("SELECT v.field,v.value,m.id,s.id,s.kind,s.display,m.observation_id,CASE WHEN s.association='ambiguous' OR o.status!='Complete' THEN 'ambiguous' ELSE 'confirmed' END,v.semantic_hash FROM metadata_sources s JOIN metadata_observations o ON o.id=s.current_observation JOIN metadata_models m ON m.observation_id=s.current_observation JOIN metadata_values v ON v.model_id=m.id WHERE s.asset_id=?1 ORDER BY v.field,s.id,m.ordinal")?;
+    let mut stmt=db.prepare("SELECT v.field,v.value,m.id,s.id,s.kind,s.display,m.observation_id,CASE WHEN s.association='ambiguous' OR o.status!='Complete' THEN 'ambiguous' ELSE 'confirmed' END,v.semantic_hash FROM image_metadata_sources s JOIN metadata_observations o ON o.id=s.current_observation JOIN metadata_models m ON m.observation_id=s.current_observation JOIN metadata_values v ON v.model_id=m.id WHERE s.asset_id=?1 ORDER BY v.field,s.id,m.ordinal")?;
     let rows = stmt.query_map([asset], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -488,7 +515,7 @@ fn candidates(db: &Connection, asset: &str) -> Result<BTreeMap<String, Vec<Candi
     }
     Ok(result)
 }
-fn rebuild(db: &Connection, asset: &str) -> Result<()> {
+pub(crate) fn rebuild(db: &Connection, asset: &str) -> Result<()> {
     let candidates = candidates(db, asset)?;
     let choices = db
         .prepare("SELECT field,model_id FROM metadata_choices WHERE asset_id=?1")?
@@ -645,6 +672,20 @@ impl Catalog {
         source: &Source,
         inspection: &Inspection,
     ) -> Result<Change> {
+        self.retain_image_metadata_id(
+            asset,
+            source,
+            inspection,
+            matches!(source.kind.as_str(), "embedded" | "sidecar"),
+        )
+    }
+    pub(crate) fn retain_image_metadata_id(
+        &mut self,
+        asset: &str,
+        source: &Source,
+        inspection: &Inspection,
+        shared: bool,
+    ) -> Result<Change> {
         let prepared = Prepared::new(inspection, source)?;
         let _write = self
             .writers
@@ -652,6 +693,9 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !shared {
+            crate::catalog_images::require_current(&tx, asset)?;
+        }
         let (observation_id, model_ids, changed) = store(&tx, asset, source, &prepared)?;
         let revision = if changed {
             rebuild(&tx, asset)?;
@@ -665,6 +709,10 @@ impl Catalog {
         } else {
             revision(&tx, asset)?
         };
+        if changed && shared {
+            crate::catalog_images::enqueue_shared(&tx, asset, observation_id)?;
+            crate::catalog_images::step_refresh(&tx, 32)?;
+        }
         tx.commit()?;
         drop(_write);
         Ok(Change {
@@ -676,6 +724,7 @@ impl Catalog {
     }
     pub fn metadata(&self, asset: &str) -> Result<MetadataView> {
         let tx = self.db.unchecked_transaction()?;
+        crate::catalog_images::require_current(&tx, asset)?;
         let revision = revision(&tx, asset)?;
         let mut candidates = candidates(&tx, asset)?;
         let mut fields = Vec::new();
@@ -697,7 +746,7 @@ impl Catalog {
                 selected_model,
             });
         }
-        let mut stmt=tx.prepare("SELECT s.id,s.kind,s.display,s.association,s.availability,s.current_observation,o.status,o.issues FROM metadata_sources s LEFT JOIN metadata_observations o ON o.id=s.current_observation WHERE s.asset_id=?1 ORDER BY s.id")?;
+        let mut stmt=tx.prepare("SELECT s.id,s.kind,s.display,s.association,s.availability,s.current_observation,o.status,o.issues FROM image_metadata_sources s LEFT JOIN metadata_observations o ON o.id=s.current_observation WHERE s.asset_id=?1 ORDER BY s.id")?;
         let mut sources = Vec::new();
         for row in stmt.query_map([asset], |r| {
             Ok((
@@ -745,11 +794,12 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::catalog_images::require_current(&tx, asset)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed; refresh conflict review"
         );
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM metadata_sources s JOIN metadata_models m ON m.observation_id=s.current_observation JOIN metadata_values v ON v.model_id=m.id WHERE s.asset_id=?1 AND m.id=?2 AND v.field=?3)",params![asset,model_id,field],|r|r.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM image_metadata_sources s JOIN metadata_models m ON m.observation_id=s.current_observation JOIN metadata_values v ON v.model_id=m.id WHERE s.asset_id=?1 AND m.id=?2 AND v.field=?3)",params![asset,model_id,field],|r|r.get(0))?;
         ensure!(
             valid,
             "selection is not a current field candidate for this asset"
@@ -768,7 +818,7 @@ impl Catalog {
         Ok(next)
     }
     pub fn metadata_model(&self, asset: &str, model_id: i64) -> Result<Vec<u8>> {
-        let hash:String=self.db.query_row("SELECT m.blob_hash FROM metadata_models m JOIN metadata_observations o ON o.id=m.observation_id JOIN metadata_sources s ON s.id=o.source_id WHERE s.asset_id=?1 AND m.id=?2",params![asset,model_id],|r|r.get(0))?;
+        let hash:String=self.db.query_row("SELECT m.blob_hash FROM metadata_models m JOIN metadata_observations o ON o.id=m.observation_id JOIN metadata_image_observations h ON h.observation_id=o.id WHERE h.image_id=?1 AND m.id=?2",params![asset,model_id],|r|r.get(0))?;
         read_blob(&self.db, &hash)
     }
     fn editable_metadata_model(&self, asset: &str, model_id: i64) -> Result<Vec<u8>> {
@@ -798,7 +848,7 @@ impl Catalog {
             "history requires nonnegative cursor and limit 1..=100"
         );
         let mut result = Vec::new();
-        let mut stmt=self.db.prepare("SELECT o.id,o.source_id,o.revision,o.status,o.issues,o.provenance,s.current_observation=o.id FROM metadata_observations o JOIN metadata_sources s ON s.id=o.source_id WHERE s.asset_id=?1 AND o.id>?2 ORDER BY o.id LIMIT ?3")?;
+        let mut stmt=self.db.prepare("SELECT o.id,o.source_id,o.revision,o.status,o.issues,o.provenance,COALESCE(s.current_observation=o.id,0) FROM metadata_observations o JOIN metadata_image_observations h ON h.observation_id=o.id LEFT JOIN image_metadata_sources s ON s.id=o.source_id AND s.asset_id=h.image_id WHERE h.image_id=?1 AND o.id>?2 ORDER BY o.id LIMIT ?3")?;
         for row in stmt.query_map(params![asset, after, limit as i64], |r| {
             Ok((
                 r.get(0)?,
@@ -833,7 +883,7 @@ impl Catalog {
         asset: &str,
         observation_id: i64,
     ) -> Result<Vec<PacketEvidence>> {
-        let valid:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM metadata_observations o JOIN metadata_sources s ON s.id=o.source_id WHERE s.asset_id=?1 AND o.id=?2)",params![asset,observation_id],|r|r.get(0))?;
+        let valid:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM metadata_image_observations h WHERE h.image_id=?1 AND h.observation_id=?2)",params![asset,observation_id],|r|r.get(0))?;
         ensure!(valid, "observation not owned by asset");
         let mut output = Vec::new();
         for row in self.db.prepare("SELECT ordinal,blob_hash,descriptor FROM metadata_packets WHERE observation_id=?1 ORDER BY ordinal")?.query_map([observation_id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))? {
@@ -903,6 +953,7 @@ impl Catalog {
         organization_fields: &[String],
         after: impl FnOnce(&Connection, i64) -> Result<()>,
     ) -> Result<Change> {
+        crate::catalog_images::require_current(&self.db, asset)?;
         ensure!(
             revision(&self.db, asset)? == expected_revision,
             "metadata changed; refresh before editing"
@@ -1003,11 +1054,12 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::catalog_images::require_current(&tx, asset)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed while preparing edit"
         );
-        let previous_choices=tx.prepare("SELECT c.field,v.semantic_hash FROM metadata_choices c JOIN metadata_values v ON v.model_id=c.model_id AND v.field=c.field JOIN metadata_models m ON m.id=c.model_id JOIN metadata_observations o ON o.id=m.observation_id JOIN metadata_sources s ON s.id=o.source_id WHERE c.asset_id=?1 AND s.kind='catalog' AND s.locator=?2 AND s.current_observation=o.id")?.query_map(params![asset,source.locator],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
+        let previous_choices=tx.prepare("SELECT c.field,v.semantic_hash FROM metadata_choices c JOIN metadata_values v ON v.model_id=c.model_id AND v.field=c.field JOIN metadata_models m ON m.id=c.model_id JOIN metadata_observations o ON o.id=m.observation_id JOIN image_metadata_sources s ON s.id=o.source_id WHERE c.asset_id=?1 AND s.kind='catalog' AND s.locator=?2 AND s.current_observation=o.id")?.query_map(params![asset,source.locator],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
         let (observation_id, model_ids, _) = store(&tx, asset, &source, &prepared)?;
         let mid = model_ids[0];
         for (field, value) in &updated.fields {
@@ -1130,6 +1182,13 @@ impl Catalog {
             &serde_json::json!({"kind":source.kind,"display":source.display,"reason":reason}),
             true,
         )?;
+        let source_id: i64 = tx.query_row(
+            "SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",
+            params![asset, source.kind, source.locator],
+            |r| r.get(0),
+        )?;
+        crate::catalog_images::enqueue_source_state(&tx, source_id)?;
+        crate::catalog_images::step_refresh(&tx, 32)?;
         tx.commit()?;
         drop(_write);
         Ok(true)

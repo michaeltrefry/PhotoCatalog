@@ -1360,6 +1360,7 @@ fn schema_four_to_current_preserves_old_rows_and_initial_derived_state_without_q
     let (_temp, root, cat) = synthetic(113)?;
     drop(cat);
     let conn = db(&root)?;
+    remove_image_schema(&conn)?;
     remove_alias_schema(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA foreign_keys=ON; DROP INDEX organization_lens_capture; PRAGMA user_version=4; PRAGMA wal_checkpoint(TRUNCATE)")?;
     fn contents(conn: &Connection) -> Result<Vec<(String, Vec<Vec<String>>)>> {
@@ -1368,11 +1369,25 @@ fn schema_four_to_current_preserves_old_rows_and_initial_derived_state_without_q
         let mut result = Vec::new();
         for table in tables {
             let quoted = table.replace('"', "\"\"");
-            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{quoted}\""))?;
-            let columns = stmt.column_count();
+            let sql = if table == "sqlite_sequence" {
+                "SELECT * FROM sqlite_sequence WHERE name!='catalog_images'".to_owned()
+            } else {
+                format!("SELECT * FROM \"{quoted}\"")
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            // Compare every pre-existing column; the added generation is checked separately.
+            let columns: Vec<usize> = stmt
+                .column_names()
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| table != "assets" || **name != "physical_generation")
+                .map(|(i, _)| i)
+                .collect();
             let mut rows = stmt
                 .query_map([], |r| {
-                    (0..columns)
+                    columns
+                        .iter()
+                        .copied()
                         .map(|i| r.get_ref(i).map(|v| format!("{v:?}")))
                         .collect::<rusqlite::Result<Vec<_>>>()
                 })?
@@ -1410,7 +1425,23 @@ fn schema_four_to_current_preserves_old_rows_and_initial_derived_state_without_q
             || name.starts_with("photo_export_")
             || name.starts_with("export_alias_"))
     });
-    ensure!(after == before);
+    after.retain(|(name, _)| before.iter().any(|(old, _)| old == name));
+    ensure!(
+        conn.query_row::<i64, _, _>(
+            "SELECT count(*) FROM assets WHERE physical_generation!=render_generation",
+            [],
+            |r| r.get(0)
+        )? == 0
+    );
+    ensure!(
+        after == before,
+        "pre-existing table rows changed: {:?}",
+        after
+            .iter()
+            .zip(&before)
+            .filter(|(a, b)| a != b)
+            .collect::<Vec<_>>()
+    );
     ensure!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?
             == photocatalog::CURRENT_SCHEMA_VERSION
@@ -1448,6 +1479,7 @@ fn failed_schema_six_upgrade_rolls_back_all_added_tables_and_marker() -> Result<
     let (_temp, root, catalog) = synthetic(3)?;
     drop(catalog);
     let conn = db(&root)?;
+    remove_image_schema(&conn)?;
     remove_alias_schema(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5; CREATE TABLE export_alias_dirty(unexpected TEXT); PRAGMA wal_checkpoint(TRUNCATE)")?;
     fn schema(conn: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
@@ -1488,5 +1520,49 @@ fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
         ))?;
     }
     conn.execute_batch("DROP TABLE export_alias_paths; DROP TABLE export_alias_dirty; DROP TABLE export_alias_directories; DROP TABLE export_alias_state")?;
+    Ok(())
+}
+
+// Build the actual pre-image fixture schema, rather than merely lowering user_version
+// while leaving schema7 columns, foreign keys, and triggers installed.
+fn remove_image_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+    let triggers=conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'image_%' OR name='organization_metadata_update')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for t in triggers {
+        conn.execute_batch(&format!("DROP TRIGGER {t}"))?;
+    }
+    conn.execute_batch("DROP VIEW image_assets; DROP VIEW image_metadata_sources;")?;
+    for name in [
+        "metadata_assets",
+        "metadata_choices",
+        "metadata_history",
+        "metadata_effective",
+        "organization_dirty",
+        "organization_folder_members",
+        "organization_keyword_members",
+        "organization_collection_members",
+        "organization_flags",
+        "organization_assets",
+        "organization_job_items",
+        "organization_events",
+    ] {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name=? AND type='table'",
+            [name],
+            |r| r.get(0),
+        )?;
+        let indices=conn.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL")?.query_map([name],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let body = sql[sql.find('(').unwrap()..]
+            .replace("REFERENCES catalog_images(id)", "REFERENCES assets(id)")
+            .replace(
+                "REFERENCES catalog_images(sequence)",
+                "REFERENCES assets(sequence)",
+            );
+        conn.execute_batch(&format!("CREATE TABLE {name}_old {body}; INSERT INTO {name}_old SELECT * FROM {name}; DROP TABLE {name}; ALTER TABLE {name}_old RENAME TO {name};"))?;
+        for sql in indices {
+            conn.execute_batch(&sql)?;
+        }
+    }
+    conn.execute_batch("DROP TABLE organization_image_relations; DROP TABLE organization_keyword_synonyms; DROP TABLE organization_collection_order; DROP TABLE organization_collection_structure; DROP TABLE metadata_image_sources; DROP TABLE metadata_image_observations; DROP TABLE image_shared_events; DROP TABLE image_shared_state; DROP TABLE image_storage_events; DROP TABLE image_import_map; DROP TABLE image_import_reservations; DROP TABLE catalog_images; ALTER TABLE assets DROP COLUMN physical_generation; PRAGMA foreign_keys=ON;")?;
     Ok(())
 }

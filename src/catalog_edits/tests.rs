@@ -94,10 +94,18 @@ fn undo_cannot_reuse_an_earlier_render_revision_and_guard_is_atomic() -> Result<
     );
     assert!(!called.load(Ordering::SeqCst));
     assert!(catalog.with_edit_identity(&undo, || Ok(17))? == Some(17));
+    let mut legacy = undo.clone();
+    legacy.image_identity = None;
+    legacy.source = catalog.render_identity("a")?;
     catalog.db.execute(
         "UPDATE assets SET render_generation=render_generation+1 WHERE id='a'",
         [],
     )?;
+    assert!(catalog.with_edit_identity(&legacy, || Ok(17))?.is_none());
+    assert_eq!(catalog.with_edit_identity(&undo, || Ok(17))?, Some(17));
+    catalog
+        .db
+        .execute("UPDATE assets SET fingerprint='changed' WHERE id='a'", [])?;
     assert!(catalog.with_edit_identity(&undo, || Ok(17))?.is_none());
     Ok(())
 }
@@ -272,32 +280,31 @@ fn copy_database_failure_rolls_back_edit_and_progress_for_safe_resume() -> Resul
 
 #[test]
 fn schema_five_upgrade_is_lazy_and_keeps_existing_assets() -> Result<()> {
-    let (temp, catalog) = fixture()?;
-    let before: i64 = catalog
-        .db
-        .query_row("SELECT count(*) FROM assets", [], |r| r.get(0))?;
-    let triggers = catalog
-        .db
-        .prepare(
-            "SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'export_alias_*'",
-        )?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for trigger in triggers {
-        catalog.db.execute_batch(&format!(
-            "DROP TRIGGER \"{}\"",
-            trigger.replace('"', "\"\"")
-        ))?;
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("catalog");
+    std::fs::create_dir(&root)?;
+    let db = Connection::open(root.join("catalog.sqlite3"))?;
+    db.execute_batch("CREATE TABLE assets(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,location BLOB NOT NULL UNIQUE,path_display TEXT NOT NULL,fingerprint TEXT,state TEXT NOT NULL CHECK(state IN('pending','ready','failed')),metadata TEXT,preview_hash TEXT,error TEXT,CHECK(state!='ready' OR(metadata IS NOT NULL AND preview_hash IS NOT NULL AND fingerprint IS NOT NULL))); PRAGMA application_id=1346913089;")?;
+    db.execute_batch(crate::catalog_metadata::SCHEMA)?;
+    db.execute_batch(crate::catalog_storage::SCHEMA)?;
+    db.execute_batch(crate::catalog_metadata::FILE_INSTANCE_SCHEMA)?;
+    db.execute_batch(crate::organization::SCHEMA)?;
+    db.execute_batch(crate::organization::CAPTURE_LENS_SCHEMA)?;
+    for asset in ["a", "b", "c", "tiny"] {
+        db.execute(
+            "INSERT INTO assets(id,location,path_display,state) VALUES(?1,?2,?1,'pending')",
+            params![asset, asset.as_bytes()],
+        )?;
     }
-    catalog.db.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE export_alias_paths; DROP TABLE export_alias_dirty; DROP TABLE export_alias_directories; DROP TABLE export_alias_state;")?;
-    catalog.db.execute_batch("PRAGMA foreign_keys=OFF; DROP INDEX storage_export_path; DROP INDEX storage_export_object; DROP TABLE photo_export_items; DROP TABLE photo_export_jobs; DROP TABLE photo_export_blobs; DROP TABLE edit_copy_items; DROP TABLE edit_copy_jobs; DROP TABLE edit_changes; DROP TABLE edit_redo_nodes; DROP TABLE edit_recipe_nodes; DROP TABLE edit_variants; PRAGMA user_version=5;")?;
-    drop(catalog);
+    let before = 4;
+    db.pragma_update(None, "user_version", 5)?;
+    drop(db);
     let catalog = Catalog::open(temp.path().join("catalog"))?;
     assert_eq!(
         catalog
             .db
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
-        6
+        crate::CURRENT_SCHEMA_VERSION
     );
     assert_eq!(
         catalog

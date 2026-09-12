@@ -1,11 +1,13 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 /// Current on-disk catalog schema; probes must preflight before timed opens.
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 pub mod catalog_edits;
 pub mod catalog_export_alias;
 pub mod catalog_exports;
+pub mod catalog_images;
 pub mod catalog_metadata;
+pub mod catalog_migration;
 pub mod catalog_storage;
 mod catalog_writer;
 pub mod edit;
@@ -248,6 +250,8 @@ impl Catalog {
         // Opening a current catalog must not rewrite its header or acquire an
         // unnecessary writer transaction. Only actual initialization/migration writes.
         if version < CURRENT_SCHEMA_VERSION {
+            // Schema7 rebuilds leaf foreign keys; enforcement is restored after validation.
+            db.pragma_update(None, "foreign_keys", false)?;
             let _write = writers.enter(catalog_writer::Priority::Foreground)?;
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // Another admitted opener may have completed migration while we waited.
@@ -294,7 +298,18 @@ impl Catalog {
                 tx.execute_batch(catalog_export_alias::SCHEMA)?;
                 tx.pragma_update(None, "user_version", 6)?;
             }
+            if version < 7 {
+                catalog_images::migrate(&tx)?;
+                catalog_migration::install(&tx)?;
+                let invalid: i64 =
+                    tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                        r.get(0)
+                    })?;
+                ensure!(invalid == 0, "logical image migration foreign key failure");
+                tx.pragma_update(None, "user_version", 7)?;
+            }
             tx.commit()?;
+            db.pragma_update(None, "foreign_keys", true)?;
         }
         Ok(Self { db, root, writers })
     }
