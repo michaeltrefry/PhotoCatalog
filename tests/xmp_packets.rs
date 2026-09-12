@@ -359,6 +359,104 @@ fn webp_and_psd_retain_multiple_packets_in_source_order() {
         );
     }
 }
+
+fn append_psd_resource(bytes: &mut Vec<u8>, resource: &[u8]) {
+    bytes.extend_from_slice(resource);
+    let length = u32::try_from(bytes.len() - 34).unwrap();
+    bytes[30..34].copy_from_slice(&length.to_be_bytes());
+}
+
+fn private_psd_resource(id: u16, name: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut resource = b"AgHg".to_vec();
+    resource.extend_from_slice(&id.to_be_bytes());
+    resource.push(u8::try_from(name.len()).unwrap());
+    resource.extend_from_slice(name);
+    if !(name.len() + 1).is_multiple_of(2) {
+        resource.push(0);
+    }
+    resource.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+    resource.extend_from_slice(payload);
+    if !payload.len().is_multiple_of(2) {
+        resource.push(0);
+    }
+    resource
+}
+
+#[test]
+fn psd_private_aghg_framing_preserves_standard_xmp_and_continues() {
+    let xml = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>";
+    let original = psd(&[xml]);
+    let baseline = run(&original);
+    for name in [b"".as_slice(), b"a", b"ab", b"abc"] {
+        for payload in [b"1234".as_slice(), b"123"] {
+            let mut bytes = original.clone();
+            append_psd_resource(&mut bytes, &private_psd_resource(8000, name, payload));
+            let result = run(&bytes);
+            assert_eq!(result.status, Status::Complete);
+            assert!(result.issues.is_empty());
+            assert_eq!(result.packets.len(), 1);
+            assert_eq!(result.packets[0].bytes, baseline.packets[0].bytes);
+            assert_eq!(result.packets[0].ranges, baseline.packets[0].ranges);
+            assert_eq!(result.packets[0].blake3, baseline.packets[0].blake3);
+            assert_eq!(result.parse_inputs[0].bytes, xml);
+
+            // A standard carrier after the private block must still be visited.
+            append_psd_resource(&mut bytes, &psd(&[b"later XMP"])[34..]);
+            let result = run(&bytes);
+            assert_eq!(result.status, Status::Complete);
+            assert_eq!(result.packets.len(), 2);
+            assert_eq!(result.parse_inputs[1].bytes, b"later XMP");
+        }
+    }
+}
+
+#[test]
+fn psd_private_aghg_id_1060_is_not_standard_xmp() {
+    let mut bytes = psd(&[]);
+    append_psd_resource(
+        &mut bytes,
+        &private_psd_resource(1060, b"", b"opaque private data"),
+    );
+    let result = run(&bytes);
+    assert_eq!(result.status, Status::Absent);
+    assert!(result.packets.is_empty());
+    assert!(result.parse_inputs.is_empty());
+    append_psd_resource(&mut bytes, &psd(&[b"standard XMP"])[34..]);
+    let result = run(&bytes);
+    assert_eq!(result.status, Status::Complete);
+    assert_eq!(result.packets.len(), 1);
+    assert_eq!(result.parse_inputs[0].bytes, b"standard XMP");
+}
+
+#[test]
+fn psd_private_resources_keep_malformed_framing_and_signature_failures() {
+    let valid = private_psd_resource(8000, b"", b"1234");
+    let mut bad_name = valid.clone();
+    bad_name[6] = 255;
+    let mut oversized = valid.clone();
+    oversized[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut bad_signature = valid.clone();
+    bad_signature[..4].copy_from_slice(b"????");
+    let mut missing_padding = private_psd_resource(8000, b"", b"123");
+    missing_padding.pop();
+    for resource in [
+        valid[..6].to_vec(),  // truncated resource header
+        valid[..11].to_vec(), // truncated size field
+        valid[..15].to_vec(), // truncated payload
+        bad_name,
+        oversized,
+        bad_signature,
+        missing_padding,
+    ] {
+        let mut bytes = psd(&[b"retained XMP"]);
+        append_psd_resource(&mut bytes, &resource);
+        let result = run(&bytes);
+        assert_eq!(result.status, Status::Malformed);
+        assert!(!result.issues.is_empty());
+        assert_eq!(result.packets.len(), 1);
+        assert_eq!(result.parse_inputs[0].bytes, b"retained XMP");
+    }
+}
 fn bmff_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
     bytes.extend_from_slice(kind);

@@ -1183,7 +1183,10 @@ impl<R: Read + Seek> Parser<'_, R> {
             self.tick(offset)?;
             self.bounds(offset, 7, end)?;
             let header = self.read(offset, 7)?;
-            if &header[..4] != b"8BIM" {
+            let standard_resource = &header[..4] == b"8BIM";
+            // AgHg uses the same bounded framing, but its private resource IDs
+            // do not share the standard 8BIM XMP namespace.
+            if !standard_resource && &header[..4] != b"AgHg" {
                 return Err(malformed(offset, "invalid PSD resource signature"));
             }
             let name_length = u64::from(header[6]) + 1;
@@ -1191,7 +1194,7 @@ impl<R: Read + Seek> Parser<'_, R> {
             self.bounds(size_offset, 4, end)?;
             let length = be32(&self.read(size_offset, 4)?) as u64;
             let payload = size_offset + 4;
-            if be16(&header[4..6]) == 1060 {
+            if standard_resource && be16(&header[4..6]) == 1060 {
                 self.simple_within(
                     Container::PsdResource1060,
                     payload,
