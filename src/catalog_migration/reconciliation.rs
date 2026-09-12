@@ -148,6 +148,15 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
       CREATE INDEX IF NOT EXISTS migration_original_capture ON migration_originals(import_source,json_extract(source_json,'$.capture_revision'));")?;
     Ok(())
 }
+// Complete is constrained to 0/1. Count all matching index entries, then subtract
+// only matching incomplete rows. The total stays index-only instead of fetching
+// every completed record's payload-bearing table row to inspect `complete`.
+const RETAINED_COMPLETE_COUNT: &str = "SELECT
+    (SELECT count(*) FROM migration_retained_records
+     WHERE input=?1 AND revision=?2 AND collection=?3) -
+    (SELECT count(*) FROM migration_retained_records INDEXED BY migration_retained_pending
+     WHERE input=?1 AND revision=?2 AND collection=?3 AND complete=0)";
+
 pub(crate) fn step(
     catalog: &mut Catalog,
     source: &MigrationSource,
@@ -304,7 +313,11 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         (Collection::Issues, 9),
     ] {
         let expected = source.count(&capture.revision, collection)?;
-        let actual:i64=catalog.db.query_row("SELECT count(*) FROM migration_retained_records WHERE input=?1 AND revision=?2 AND collection=?3 AND complete=1",params![before.input,capture.revision,ordinal],|r|r.get(0))?;
+        let actual: i64 = catalog.db.query_row(
+            RETAINED_COMPLETE_COUNT,
+            params![before.input, capture.revision, ordinal],
+            |r| r.get(0),
+        )?;
         ensure!(
             u64::try_from(actual)? == expected,
             "selected {collection:?} source/destination count differs"
@@ -473,5 +486,129 @@ impl Catalog {
             "reconciliation report bounds"
         );
         Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    const ORIGINAL_COUNT: &str = "SELECT count(*) FROM migration_retained_records WHERE input=?1 AND revision=?2 AND collection=?3 AND complete=1";
+
+    fn fixture() -> Result<Connection> {
+        let db = Connection::open_in_memory()?;
+        super::super::retention::install(&db)?;
+        // The full installed lookup module adds another retained-record index.
+        super::super::lookup::install(&db)?;
+        db.execute("INSERT INTO migration_retention(id,seal,approval) VALUES('input',x'',x''),('other',x'',x'')", [])?;
+        Ok(db)
+    }
+
+    fn count(
+        db: &Connection,
+        sql: &str,
+        input: &str,
+        revision: &str,
+        collection: i64,
+    ) -> Result<(i64, i32)> {
+        let mut statement = db.prepare(sql)?;
+        let count = statement.query_row(params![input, revision, collection], |r| r.get(0))?;
+        Ok((count, statement.get_status(StatementStatus::VmStep)))
+    }
+
+    #[test]
+    fn retained_complete_count_preserves_full_scope_and_incomplete_rows() -> Result<()> {
+        let db = fixture()?;
+        let mut source_rowid = 0;
+        for input in ["input", "other"] {
+            for revision in ["capture", "other-capture"] {
+                for collection in [0, 3, 4] {
+                    for complete in [0, 1, 1] {
+                        source_rowid += 1;
+                        db.execute("INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES(?1,?2,?3,?4,x'00',1,'digest','cursor',?5)",params![input,revision,collection,source_rowid,complete])?;
+                    }
+                }
+            }
+        }
+        // A capture containing only incomplete records must still count zero.
+        db.execute("INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES('input','pending-only',3,100,x'00',1,'digest','cursor',0)", [])?;
+        for input in ["input", "other", "absent"] {
+            for revision in ["capture", "other-capture", "pending-only", "absent"] {
+                for collection in [0, 3, 4, 9] {
+                    assert_eq!(
+                        count(&db, RETAINED_COMPLETE_COUNT, input, revision, collection)?.0,
+                        count(&db, ORIGINAL_COUNT, input, revision, collection)?.0
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            count(&db, RETAINED_COMPLETE_COUNT, "input", "capture", 3)?.0,
+            2
+        );
+        db.execute("UPDATE migration_retained_records SET complete=1 WHERE input='input' AND revision='capture' AND collection=3", [])?;
+        assert_eq!(
+            count(&db, RETAINED_COMPLETE_COUNT, "input", "capture", 3)?.0,
+            3
+        );
+        db.execute("UPDATE migration_retained_records SET complete=0 WHERE input='input' AND revision='capture' AND collection=3", [])?;
+        assert_eq!(
+            count(&db, RETAINED_COMPLETE_COUNT, "input", "capture", 3)?.0,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn complete_payload_rows_use_covering_count_and_empty_pending_index() -> Result<()> {
+        let db = fixture()?;
+        db.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<2048)
+            INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete)
+            SELECT 'input','capture',3,i,zeroblob(4096),4096,'digest','cursor',1 FROM n;")?;
+        let plan = |sql: &str| -> Result<Vec<String>> {
+            Ok(db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                .query_map(params!["input", "capture", 3], |r| r.get(3))?
+                .collect::<rusqlite::Result<_>>()?)
+        };
+        let selected = plan(RETAINED_COMPLETE_COUNT)?;
+        assert!(
+            selected.iter().any(|p| p.contains("COVERING INDEX")
+                && p.contains("input=? AND revision=? AND collection=?")),
+            "{selected:?}"
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|p| p.contains("USING INDEX migration_retained_pending (input=?)")),
+            "{selected:?}"
+        );
+        assert!(
+            !selected
+                .iter()
+                .any(|p| p.starts_with("SCAN migration_retained_records")),
+            "{selected:?}"
+        );
+        assert!(
+            !plan(ORIGINAL_COUNT)?
+                .iter()
+                .any(|p| p.contains("COVERING INDEX"))
+        );
+        // All payload rows are complete, so only the covering branch visits them;
+        // the pending branch has zero entries and cannot fetch a payload row.
+        let optimized = count(&db, RETAINED_COMPLETE_COUNT, "input", "capture", 3)?;
+        let original = count(&db, ORIGINAL_COUNT, "input", "capture", 3)?;
+        eprintln!(
+            "retained count query plans: optimized={selected:?}; original={:?}; work optimized={optimized:?}, original={original:?}",
+            plan(ORIGINAL_COUNT)?
+        );
+        assert_eq!(optimized.0, 2048);
+        assert_eq!(optimized.0, original.0);
+        assert!(
+            optimized.1 * 4 < original.1 * 3,
+            "optimized={optimized:?}, original={original:?}"
+        );
+        Ok(())
     }
 }
