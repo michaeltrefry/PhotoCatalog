@@ -188,7 +188,7 @@ fn read_status(destination: &Path, run: &str) -> Result<Progress> {
     );
     let raw: Vec<u8> = db.query_row(
         "SELECT progress FROM migration_runs WHERE id=?1 AND length(progress)<=?2",
-        rusqlite::params![run, DOCUMENT_BYTES],
+        rusqlite::params![run, i64::try_from(DOCUMENT_BYTES)?],
         |r| r.get(0),
     )?;
     let progress: Progress = serde_json::from_slice(&raw)?;
