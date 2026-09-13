@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import edit_campaign
 import installed_worker_smoke as smoke
 
@@ -43,6 +44,55 @@ class EnvironmentTests(unittest.TestCase):
             with self.subTest(inherited=inherited), self.assertRaisesRegex(
                     smoke.package.PackageError, 'missing SYSTEMROOT'):
                 smoke.environment(inherited, 'windows')
+
+
+class ExecutableAssociationTests(unittest.TestCase):
+    def check_observation(self, kind, cleanup=True):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            probe = root/'probe'; probe.write_bytes(b'observer')
+            executable = root/'installed'; executable.write_bytes(b'installed identity')
+            other = root/'reported'
+            if kind == 'hardlink':
+                os.link(executable, other)
+            elif kind == 'same_bytes_copy':
+                other.write_bytes(executable.read_bytes())
+            elif kind == 'verbatim':
+                other = Path('\\\\?\\' + str(executable))
+            elif kind == 'actual':
+                other = executable
+            reported = str(other)
+            if kind == 'relative':
+                reported = 'installed'
+            elif kind == 'malformed':
+                reported = str(root/'invalid') + '\0'
+            def invoke(command, output, limits, disk_root):
+                output.mkdir()
+                (output/'stdout.log').write_text(json.dumps({
+                    'status': 'PASS_INSTALLED_PREVIEW_AND_EXPORT_WORKERS',
+                    'worker_executable': reported, 'temporary_state_removed': cleanup}))
+                return {'ownership': {'root_reaped': True, 'known_absent': True}}
+            with mock.patch.object(edit_campaign, 'invoke', side_effect=invoke):
+                return smoke.run(probe, executable, root/'evidence', 'macos')
+
+    def test_same_file_with_different_name_is_accepted(self):
+        self.assertEqual(self.check_observation('hardlink')['status'], 'PASS_INSTALLED_WORKERS_ONLY')
+
+    def test_equal_bytes_different_file_and_unverifiable_paths_reject(self):
+        for kind in ('same_bytes_copy', 'missing', 'relative', 'malformed'):
+            with self.subTest(kind=kind), self.assertRaisesRegex(
+                    smoke.package.PackageError, 'probe executable association'):
+                self.check_observation(kind)
+
+    def test_cleanup_still_requires_literal_true(self):
+        for cleanup in (False, 1, 'true', None):
+            with self.subTest(cleanup=cleanup), self.assertRaisesRegex(
+                    smoke.package.PackageError, 'probe temporary state cleanup'):
+                self.check_observation('actual', cleanup)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native Windows verbatim path')
+    def test_windows_verbatim_file_name_is_same_object(self):
+        self.assertEqual(self.check_observation('verbatim')['status'], 'PASS_INSTALLED_WORKERS_ONLY')
 
 
 class WorkingDirectoryLifetimeTests(unittest.TestCase):

@@ -50,8 +50,18 @@ def run(probe, executable, output, platform):
     package.require(len(stdout) <= 65536, 'probe output bounds')
     value = json.loads(stdout)
     package.require(value['status'] == 'PASS_INSTALLED_PREVIEW_AND_EXPORT_WORKERS', 'probe did not pass')
-    package.require(Path(value['worker_executable']) == executable and value['temporary_state_removed'] is True,
-                    'probe executable/cleanup association')
+    # Rust canonicalize may report a Windows verbatim path (\\?\...) while
+    # Python resolved the same file without that prefix. Compare the file object,
+    # preserving the executable hashes below, rather than comparing spellings.
+    reported = value.get('worker_executable')
+    package.require(isinstance(reported, str) and Path(reported).is_absolute(),
+                    'probe executable association requires an absolute path')
+    try:
+        same_executable = Path(reported).samefile(executable)
+    except (OSError, ValueError) as error:
+        raise package.PackageError('probe executable association could not be verified') from error
+    package.require(same_executable, 'probe executable association')
+    package.require(value['temporary_state_removed'] is True, 'probe temporary state cleanup')
     package.require(pins == {'probe': package.sha256(probe), 'executable': package.sha256(executable)},
                     'executables changed during probe')
     result = {'status': 'PASS_INSTALLED_WORKERS_ONLY', 'pins': pins, 'ownership': owned['ownership'],
