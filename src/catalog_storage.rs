@@ -241,7 +241,7 @@ pub struct EncodingProgress {
     pub declared: usize,
     pub scanned_through: i64,
 }
-fn encoded_bytes(path: &NativePath) -> Vec<u8> {
+pub(crate) fn encoded_bytes(path: &NativePath) -> Vec<u8> {
     match path {
         NativePath::UnixBytes(v) => v.clone(),
         NativePath::WindowsWide(v) => v.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -398,6 +398,39 @@ fn volume_id(
     )?;
     Ok(id)
 }
+/// Record a reviewed locator inside the caller's asset-registration transaction.
+/// This validates encoding and path structure without probing the filesystem.
+pub(crate) fn record_storage_path(db: &Connection, asset: &str, path: &NativePath) -> Result<()> {
+    components(&PathReference::Native(path.clone()))?;
+    let location: Vec<u8> =
+        db.query_row("SELECT location FROM assets WHERE id=?", [asset], |r| {
+            r.get(0)
+        })?;
+    ensure!(
+        location == encoded_bytes(path),
+        "declared native locator differs from stored bytes"
+    );
+    if let Some(old) = get_binding(db, asset)? {
+        ensure!(
+            old.native_path == *path,
+            "existing locator encoding differs; explicit review required"
+        );
+    } else {
+        put_binding(
+            db,
+            asset,
+            &Binding {
+                reference: PathReference::Native(path.clone()),
+                native_path: path.clone(),
+                volume_id: None,
+                relative: None,
+                file_key: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 impl Catalog {
     /// Record explicit encoding without filesystem queries, including unavailable
     /// volumes. Call after reserve for every native import. Foreign declarations
@@ -410,32 +443,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let location: Vec<u8> =
-            tx.query_row("SELECT location FROM assets WHERE id=?", [asset], |r| {
-                r.get(0)
-            })?;
-        ensure!(
-            location == encoded_bytes(path),
-            "declared native locator differs from stored bytes"
-        );
-        if let Some(old) = get_binding(&tx, asset)? {
-            ensure!(
-                old.native_path == *path,
-                "existing locator encoding differs; explicit review required"
-            );
-        } else {
-            put_binding(
-                &tx,
-                asset,
-                &Binding {
-                    reference: PathReference::Native(path.clone()),
-                    native_path: path.clone(),
-                    volume_id: None,
-                    relative: None,
-                    file_key: None,
-                },
-            )?;
-        }
+        record_storage_path(&tx, asset, path)?;
         tx.commit()?;
         drop(_write);
         Ok(())
@@ -1237,6 +1245,7 @@ impl Catalog {
                             native: data.destination.clone(),
                         }),
                     )?;
+                    publish_source_state(&tx, source)?;
                 }
                 Ok(())
             })?;
@@ -1260,6 +1269,7 @@ impl Catalog {
             })?;
             Ok(())
         })?;
+        crate::catalog_images::step_refresh(&tx, 32)?;
         tx.execute(
             "UPDATE storage_plans SET state='applied',applied_epoch=?2 WHERE id=?1",
             params![plan, epoch(&tx)?],
@@ -1376,6 +1386,7 @@ impl Catalog {
             visit_sources(&tx, plan, sequence, |source, status, data| {
                 if status == "matched" {
                     tx.execute("UPDATE metadata_sources SET locator=?2,display=?3,availability=?4 WHERE id=?1",params![source,data.old_locator,data.old_display,data.old_availability])?;
+                    publish_source_state(&tx, source)?;
                 }
                 put_source_tag(&tx, source, data.old_tag.as_ref())?;
                 Ok(())
@@ -1388,6 +1399,7 @@ impl Catalog {
             boundary(RelinkBoundary::Updated(sequence))?;
             Ok(())
         })?;
+        crate::catalog_images::step_refresh(&tx, 32)?;
         tx.execute("UPDATE storage_plans SET state='undone' WHERE id=?", [plan])?;
         boundary(RelinkBoundary::BeforeCommit)?;
         tx.commit()?;
@@ -1574,6 +1586,12 @@ fn sources_changed(db: &Connection, plan: &str, sequence: i64) -> Result<bool> {
         Ok(())
     })?;
     Ok(changed)
+}
+// Preserve the legacy master's single relink revision while propagating the final
+// source location/state to copies through bounded events. Never publish swap keys.
+fn publish_source_state(db: &Connection, source: i64) -> Result<()> {
+    db.execute("UPDATE metadata_image_sources SET logical_locator=(SELECT locator FROM metadata_sources WHERE id=?1),association=(SELECT association FROM metadata_sources WHERE id=?1),availability=(SELECT availability FROM metadata_sources WHERE id=?1) WHERE source_id=?1 AND image_id=(SELECT asset_id FROM metadata_sources WHERE id=?1)", [source])?;
+    crate::catalog_images::enqueue_source_state(db, source)
 }
 fn advance_metadata(db: &Connection, asset: &str, action: &str, plan: &str) -> Result<()> {
     db.execute("INSERT INTO metadata_assets(asset_id,revision) VALUES(?1,1) ON CONFLICT(asset_id) DO UPDATE SET revision=revision+1",[asset])?;

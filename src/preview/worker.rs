@@ -115,6 +115,7 @@ impl RenderWork {
                 key.asset_id == first.asset_id
                     && key.variant_id == first.variant_id
                     && key.generation == first.generation
+                    && key.image_pixel_generation == first.image_pixel_generation
                     && key.fingerprint == first.fingerprint
                     && key.edit_revision == first.edit_revision,
                 "worker mixed source identities"
@@ -854,6 +855,7 @@ mod tests {
     use super::*;
     fn key() -> PreviewKey {
         PreviewKey {
+            image_pixel_generation: None,
             asset_id: "test".into(),
             variant_id: "master".into(),
             generation: 1,

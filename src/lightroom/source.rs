@@ -43,7 +43,7 @@ fn revision(file: &File) -> Result<Revision> {
             .map(|v| v.as_nanos()),
     })
 }
-pub(super) fn reject_links(path: &Path) -> Result<()> {
+pub(crate) fn reject_links(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
@@ -67,7 +67,7 @@ pub(super) fn reject_links(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub(super) struct Source {
+pub(crate) struct Source {
     pub path: PathBuf,
     pub file: File,
     pub before: Revision,

@@ -194,7 +194,7 @@ fn path_valid(kind: KeywordKind, path: &[String]) -> Result<()> {
     }
     Ok(())
 }
-fn keyword(db: &Connection, kind: KeywordKind, path: &[String]) -> Result<i64> {
+pub(crate) fn keyword(db: &Connection, kind: KeywordKind, path: &[String]) -> Result<i64> {
     path_valid(kind, path)?;
     let mut parent = None;
     for depth in 1..=path.len() {
@@ -207,6 +207,29 @@ fn keyword(db: &Connection, kind: KeywordKind, path: &[String]) -> Result<i64> {
         )?);
     }
     parent.context("empty keyword")
+}
+/// Create a dictionary entry in the same transaction as its import mapping.
+pub(crate) fn create_collection(
+    db: &Connection,
+    name: &str,
+    provenance: &serde_json::Value,
+) -> Result<String> {
+    ensure!(
+        !db.is_autocommit(),
+        "collection creation requires a transaction"
+    );
+    text_limit(name)?;
+    let provenance = serde_json::to_string(provenance)?;
+    ensure!(
+        provenance.len() <= 65536,
+        "collection provenance exceeds 64KiB"
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    db.execute(
+        "INSERT INTO organization_collections(id,name,provenance) VALUES(?1,?2,?3)",
+        params![id, name, provenance],
+    )?;
+    Ok(id)
 }
 /// A photographic calendar value, without inventing a timezone for EXIF dates.
 /// Exact source spelling remains in retained metadata; comparisons use local date/time.
@@ -257,7 +280,7 @@ fn folders(db: &Connection, seq: i64, asset: &str) -> Result<(Option<i64>, Optio
     )?;
     let path: Option<String> = db
         .query_row(
-            "SELECT native_path FROM storage_bindings WHERE asset_id=?",
+            "SELECT native_path FROM storage_bindings WHERE asset_id=(SELECT asset_id FROM catalog_images WHERE id=?)",
             [asset],
             |r| r.get(0),
         )
@@ -298,7 +321,7 @@ fn folders(db: &Connection, seq: i64, asset: &str) -> Result<(Option<i64>, Optio
 /// Refresh only one asset, inside the caller's transaction; never reads image files.
 pub(crate) fn refresh(db: &Connection, asset: &str) -> Result<()> {
     let (seq, display, state, metadata): (i64, String, String, Option<String>) = db.query_row(
-        "SELECT sequence,path_display,state,metadata FROM assets WHERE id=?",
+        "SELECT sequence,path_display,state,metadata FROM image_assets WHERE id=?",
         [asset],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
@@ -480,9 +503,9 @@ impl Catalog {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let rows: Vec<(i64, String)> = if after < high {
-            tx.prepare("SELECT sequence,id FROM assets WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT ?3")?.query_map(params![after,high,limit as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            tx.prepare("SELECT sequence,id FROM image_assets WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT ?3")?.query_map(params![after,high,limit as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         } else {
-            tx.prepare("SELECT d.sequence,a.id FROM organization_dirty d JOIN assets a ON a.sequence=d.sequence ORDER BY d.sequence LIMIT ?1")?.query_map([limit as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            tx.prepare("SELECT d.sequence,a.id FROM organization_dirty d JOIN image_assets a ON a.sequence=d.sequence ORDER BY d.sequence LIMIT ?1")?.query_map([limit as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         };
         for (_, asset) in &rows {
             refresh(&tx, asset)?;
@@ -494,14 +517,15 @@ impl Catalog {
                 [after],
             )?;
         }
+        let storage_processed = crate::catalog_images::step_storage(&tx, limit - rows.len())?;
         let pending = after < high
-            || tx.query_row("SELECT EXISTS(SELECT 1 FROM organization_dirty)", [], |r| {
+            || tx.query_row("SELECT EXISTS(SELECT 1 FROM organization_dirty) OR EXISTS(SELECT 1 FROM image_storage_events)", [], |r| {
                 r.get::<_, bool>(0)
             })?;
         tx.commit()?;
         drop(_write);
         Ok(IndexProgress {
-            processed: rows.len(),
+            processed: rows.len() + storage_processed,
             backfill_after: after,
             backfill_high: high,
             pending,
@@ -562,19 +586,14 @@ impl Catalog {
         name: &str,
         provenance: serde_json::Value,
     ) -> Result<String> {
-        text_limit(name)?;
-        ensure!(
-            serde_json::to_vec(&provenance)?.len() <= 65536,
-            "collection provenance exceeds 64KiB"
-        );
-        let id = uuid::Uuid::new_v4().to_string();
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
-        self.db.execute(
-            "INSERT INTO organization_collections(id,name,provenance) VALUES(?1,?2,?3)",
-            params![id, name, serde_json::to_string(&provenance)?],
-        )?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let id = create_collection(&tx, name, &provenance)?;
+        tx.commit()?;
         Ok(id)
     }
     pub fn organization_collections(&self, after: &str, limit: usize) -> Result<Vec<Collection>> {
@@ -652,7 +671,7 @@ impl Catalog {
         let mut added = 0;
         for item in items {
             let seq: i64 = tx.query_row(
-                "SELECT sequence FROM assets WHERE id=?",
+                "SELECT sequence FROM image_assets WHERE id=?",
                 [&item.asset_id],
                 |r| r.get(0),
             )?;
@@ -727,7 +746,7 @@ impl Catalog {
         limit: usize,
     ) -> Result<Vec<JobItem>> {
         page_limit(limit)?;
-        Ok(self.db.prepare("SELECT j.sequence,a.id,j.expected_revision,j.status,j.error,j.result_revision FROM organization_job_items j JOIN assets a ON a.sequence=j.sequence WHERE job=?1 AND j.sequence>?2 ORDER BY j.sequence LIMIT ?3")?.query_map(params![job,after,limit as i64],|r|Ok(JobItem{sequence:r.get(0)?,asset_id:r.get(1)?,expected_revision:r.get(2)?,status:r.get(3)?,error:r.get(4)?,result_revision:r.get(5)?}))?.collect::<rusqlite::Result<_>>()?)
+        Ok(self.db.prepare("SELECT j.sequence,a.id,j.expected_revision,j.status,j.error,j.result_revision FROM organization_job_items j JOIN image_assets a ON a.sequence=j.sequence WHERE job=?1 AND j.sequence>?2 ORDER BY j.sequence LIMIT ?3")?.query_map(params![job,after,limit as i64],|r|Ok(JobItem{sequence:r.get(0)?,asset_id:r.get(1)?,expected_revision:r.get(2)?,status:r.get(3)?,error:r.get(4)?,result_revision:r.get(5)?}))?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn cancel_organization_batch(&mut self, job: &str) -> Result<Job> {
         let _write = self
@@ -756,13 +775,13 @@ impl Catalog {
             matches!(current.state.as_str(), "ready" | "running"),
             "batch must be ready or running"
         );
-        let row:Option<(i64,String,i64)>=self.db.query_row("SELECT j.sequence,a.id,j.expected_revision FROM organization_job_items j JOIN assets a ON a.sequence=j.sequence WHERE job=?1 AND j.status='pending' ORDER BY j.sequence LIMIT 1",[job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let row:Option<(i64,String,i64)>=self.db.query_row("SELECT j.sequence,a.id,j.expected_revision FROM organization_job_items j JOIN image_assets a ON a.sequence=j.sequence WHERE job=?1 AND j.status='pending' ORDER BY j.sequence LIMIT 1",[job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let Some((seq, asset, revision)) = row else {
             return self.organization_job(job);
         };
         let result = (|| -> Result<()> {
             ensure!(
-                self.render_identity(&asset)?.metadata_revision == revision,
+                crate::catalog_metadata::revision(&self.db, &asset)? == revision,
                 "asset changed after batch review"
             );
             validate_operation(&self.db, &current.operation)?;
@@ -936,7 +955,13 @@ fn validate_operation(db: &Connection, op: &Operation) -> Result<()> {
     Ok(())
 }
 fn assert_pending(db: &Connection, job: &str, seq: i64, revision: i64) -> Result<()> {
-    ensure!(db.query_row("SELECT EXISTS(SELECT 1 FROM organization_job_items j JOIN organization_jobs b ON b.id=j.job JOIN assets a ON a.sequence=j.sequence LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE j.job=?1 AND j.sequence=?2 AND j.status='pending' AND b.state IN ('ready','running') AND COALESCE(m.revision,0)=?3)",params![job,seq,revision],|r|r.get::<_,bool>(0))?,"batch item, revision, or state changed");
+    let image: String = db.query_row(
+        "SELECT id FROM catalog_images WHERE sequence=?",
+        [seq],
+        |r| r.get(0),
+    )?;
+    crate::catalog_images::require_current(db, &image)?;
+    ensure!(db.query_row("SELECT EXISTS(SELECT 1 FROM organization_job_items j JOIN organization_jobs b ON b.id=j.job JOIN image_assets a ON a.sequence=j.sequence LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE j.job=?1 AND j.sequence=?2 AND j.status='pending' AND b.state IN ('ready','running') AND COALESCE(m.revision,0)=?3)",params![job,seq,revision],|r|r.get::<_,bool>(0))?,"batch item, revision, or state changed");
     Ok(())
 }
 fn event(
@@ -1000,7 +1025,7 @@ fn organization_edits(
         current.is_none_or(|v| !v.conflicted),
         "resolve {field} source conflict before changing organization"
     );
-    let base:Option<i64>=cat.db.query_row("SELECT m.id FROM metadata_sources s JOIN metadata_models m ON m.observation_id=s.current_observation WHERE s.asset_id=? AND s.kind='catalog' AND s.locator=X'6C6F63616C2D6D65746164617461' ORDER BY m.id DESC LIMIT 1",[asset],|r|r.get(0)).optional()?;
+    let base:Option<i64>=cat.db.query_row("SELECT m.id FROM image_metadata_sources s JOIN metadata_models m ON m.observation_id=s.current_observation WHERE s.asset_id=? AND s.kind='catalog' AND s.locator=X'6C6F63616C2D6D65746164617461' ORDER BY m.id DESC LIMIT 1",[asset],|r|r.get(0)).optional()?;
     let base = base.or(current.and_then(|f| f.selected_model));
     // Reconciliation/canonicalization can sort RDF Bags. Address items in the
     // exact reconciled input used by the subsequent atomic mutation, not in the
@@ -1081,16 +1106,37 @@ impl Catalog {
         expected_revision: i64,
         operation: Operation,
     ) -> Result<i64> {
+        self.organize_image_id_with_commit(asset, expected_revision, operation, |_, _| Ok(()))
+    }
+    /// Publish one logical-image organization edit and its importer checkpoint atomically.
+    pub fn organize_image_with_commit(
+        &mut self,
+        key: &crate::catalog_edits::VariantKey,
+        expected_revision: i64,
+        operation: Operation,
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<i64> {
+        let image = crate::catalog_images::id(&self.db, key)?;
+        self.organize_image_id_with_commit(&image, expected_revision, operation, after)
+    }
+    fn organize_image_id_with_commit(
+        &mut self,
+        asset: &str,
+        expected_revision: i64,
+        operation: Operation,
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<i64> {
+        crate::catalog_images::require_current(&self.db, asset)?;
         validate_operation(&self.db, &operation)?;
         ensure!(
-            self.render_identity(asset)?.metadata_revision == expected_revision,
+            crate::catalog_metadata::revision(&self.db, asset)? == expected_revision,
             "asset changed before organization edit"
         );
-        let seq: i64 =
-            self.db
-                .query_row("SELECT sequence FROM assets WHERE id=?", [asset], |r| {
-                    r.get(0)
-                })?;
+        let seq: i64 = self.db.query_row(
+            "SELECT sequence FROM image_assets WHERE id=?",
+            [asset],
+            |r| r.get(0),
+        )?;
         match &operation {
             Operation::Flag { .. }
             | Operation::AddCollection { .. }
@@ -1101,6 +1147,7 @@ impl Catalog {
                 let tx = self
                     .db
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                crate::catalog_images::require_current(&tx, asset)?;
                 let revision: i64 = tx.query_row(
                     "SELECT COALESCE((SELECT revision FROM metadata_assets WHERE asset_id=?),0)",
                     [asset],
@@ -1134,13 +1181,14 @@ impl Catalog {
                 let next = advance_local(&tx, asset, "single-asset")?;
                 refresh(&tx, asset)?;
                 tx.execute("INSERT INTO organization_events(sequence,action,detail) VALUES(?1,'single_asset',?2)",params![seq,serde_json::to_string(&operation)?])?;
+                after(&tx, next)?;
                 tx.commit()?;
                 drop(_write);
                 Ok(next)
             }
             _ => {
                 let (base, fields, edits) = organization_edits(self, asset, &operation)?;
-                Ok(self.edit_metadata_commit(asset,expected_revision,base,&edits,&fields,|db,_|{db.execute("INSERT INTO organization_events(sequence,action,detail) VALUES(?1,'single_asset',?2)",params![seq,serde_json::to_string(&operation)?])?;Ok(())})?.revision)
+                Ok(self.edit_metadata_commit(asset,expected_revision,base,&edits,&fields,|db,revision|{db.execute("INSERT INTO organization_events(sequence,action,detail) VALUES(?1,'single_asset',?2)",params![seq,serde_json::to_string(&operation)?])?;after(db,revision)})?.revision)
             }
         }
     }

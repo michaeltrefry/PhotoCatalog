@@ -93,6 +93,8 @@ pub struct VariantView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditRenderIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_identity: Option<crate::catalog_images::ImageMetadataIdentity>,
     pub source: RenderIdentity,
     pub key: VariantKey,
     pub revision: i64,
@@ -189,6 +191,7 @@ fn known_dimensions(db: &Connection, asset: &str) -> Result<Option<(u32, u32)>> 
 }
 
 fn view(db: &Connection, key: &VariantKey) -> Result<VariantView> {
+    crate::catalog_images::id(db, key)?;
     let Some(value) = stored(db, key)? else {
         ensure!(key.variant_id == MASTER, "variant does not exist");
         asset_exists(db, &key.asset_id)?;
@@ -219,7 +222,12 @@ fn view(db: &Connection, key: &VariantKey) -> Result<VariantView> {
     })
 }
 
-fn insert_variant(tx: &Connection, key: &VariantKey, label: &str, recipe: &Recipe) -> Result<()> {
+pub(crate) fn insert_variant(
+    tx: &Connection,
+    key: &VariantKey,
+    label: &str,
+    recipe: &Recipe,
+) -> Result<()> {
     key.validate()?;
     ensure!(
         !label.trim().is_empty() && label.len() <= 1024,
@@ -240,6 +248,7 @@ fn insert_variant(tx: &Connection, key: &VariantKey, label: &str, recipe: &Recip
 }
 
 fn materialize(tx: &Connection, key: &VariantKey) -> Result<StoredVariant> {
+    crate::catalog_images::require_current(tx, &crate::catalog_images::id(tx, key)?)?;
     if let Some(value) = stored(tx, key)? {
         return Ok(value);
     }
@@ -295,6 +304,59 @@ fn save(
     )?;
     record_change(tx, key, revision, kind, current.cursor, node, provenance)?;
     view(tx, key)
+}
+
+/// Commit an already-validated import recipe with its image status and importer checkpoint.
+/// The caller's source mapping/checkpoint supplies retry idempotence; a repeated stale CAS fails.
+pub fn install_import_recipe(
+    db: &Connection,
+    key: &VariantKey,
+    expected_revision: i64,
+    recipe: &crate::edit::ValidatedRecipe,
+    provenance: &serde_json::Value,
+    translation_state: crate::catalog_images::TranslationState,
+) -> Result<VariantView> {
+    ensure!(!db.is_autocommit(), "import recipe requires a transaction");
+    ensure!(
+        translation_state != crate::catalog_images::TranslationState::Native,
+        "import cannot claim native origin"
+    );
+    ensure!(
+        recipe.canonical_bytes().len() <= MAX_RECIPE_BYTES,
+        "import recipe document bound"
+    );
+    let image = crate::catalog_images::id(db, key)?;
+    ensure!(
+        db.query_row(
+            "SELECT origin='import' FROM catalog_images WHERE id=?",
+            [&image],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "import recipe requires imported image"
+    );
+    if translation_state == crate::catalog_images::TranslationState::Untranslated {
+        ensure!(
+            recipe.recipe() == &Recipe::default(),
+            "untranslated appearance must remain native original"
+        );
+    }
+    if let Some((width, height)) = known_dimensions(db, &key.asset_id)? {
+        recipe.validate_dimensions(width, height)?;
+    }
+    let result = save(
+        db,
+        key,
+        expected_revision,
+        recipe.canonical_bytes(),
+        recipe.digest(),
+        "import",
+        provenance,
+    )?;
+    db.execute(
+        "UPDATE catalog_images SET translation_state=?2 WHERE id=?1",
+        params![image, translation_state.sql()],
+    )?;
+    Ok(result)
 }
 
 impl Catalog {
@@ -366,6 +428,7 @@ impl Catalog {
             current.revision == expected_revision && current.recipe_digest == input.recipe_digest,
             "source edit revision changed"
         );
+        crate::catalog_images::register_copy(&tx, &key, source)?;
         insert_variant(&tx, &key, label, &input.recipe)?;
         let value = stored(&tx, &key)?.context("new variant unavailable")?;
         record_change(
@@ -491,9 +554,23 @@ impl Catalog {
     pub fn edit_render_identity(&self, key: &VariantKey) -> Result<EditRenderIdentity> {
         let tx = self.db.unchecked_transaction()?;
         let variant = view(&tx, key)?;
-        let source = tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1", [&key.asset_id], |r| Ok(RenderIdentity {asset_id:key.asset_id.clone(),generation:r.get(0)?,fingerprint:r.get(1)?,state:r.get(2)?,metadata_revision:r.get(3)?}))?;
+        let image = crate::catalog_images::identity(&tx, &crate::catalog_images::id(&tx, key)?)?;
+        let source = tx.query_row(
+            "SELECT physical_generation,fingerprint,state FROM assets WHERE id=?",
+            [&key.asset_id],
+            |r| {
+                Ok(RenderIdentity {
+                    asset_id: key.asset_id.clone(),
+                    generation: r.get(0)?,
+                    fingerprint: r.get(1)?,
+                    state: r.get(2)?,
+                    metadata_revision: image.metadata_revision,
+                })
+            },
+        )?;
         tx.commit()?;
         Ok(EditRenderIdentity {
+            image_identity: Some(image),
             source,
             key: key.clone(),
             revision: variant.revision,
@@ -520,6 +597,35 @@ impl Catalog {
             expected.key.asset_id == expected.source.asset_id,
             "mixed edit/source identities"
         );
+        if let Some(image) = &expected.image_identity {
+            ensure!(image.key == expected.key, "mixed logical image identity");
+            let _write = self.writers.enter(priority)?;
+            let tx = self
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // A stale image is a failed CAS; no attachment or publication callback runs.
+            if crate::catalog_images::require_image_metadata_identity(&tx, image).is_err() {
+                return Ok(None);
+            }
+            let physical: (i64, Option<String>, String) = tx.query_row(
+                "SELECT physical_generation,fingerprint,state FROM assets WHERE id=?",
+                [&expected.key.asset_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let current = view(&tx, &expected.key)?;
+            if physical.0 != expected.source.generation
+                || physical.1 != expected.source.fingerprint
+                || physical.2 != expected.source.state
+                || image.metadata_revision != expected.source.metadata_revision
+                || current.revision != expected.revision
+                || current.recipe_digest != expected.recipe_digest
+            {
+                return Ok(None);
+            }
+            let result = attach(&tx)?;
+            tx.commit()?;
+            return Ok(Some(result));
+        }
         Ok(self
             .with_render_transaction(&expected.source, priority, |tx| {
                 let current = view(tx, &expected.key)?;

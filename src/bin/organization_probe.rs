@@ -84,6 +84,51 @@ const SCHEMA6_TABLES: [&str; 13] = [
     "photo_export_items",
     "photo_export_jobs",
 ];
+const SCHEMA7_TABLES: &[&str] = &[
+    "catalog_images",
+    "image_import_map",
+    "image_import_reservations",
+    "image_shared_events",
+    "image_shared_state",
+    "image_storage_events",
+    "metadata_image_export_authorities",
+    "metadata_image_observations",
+    "metadata_image_sources",
+    "migration_artifacts",
+    "migration_images",
+    "migration_record_lookup",
+    "migration_lookup_backfill",
+    "migration_file_metadata",
+    "migration_runs",
+    "migration_run_supplements",
+    "migration_run_items",
+    "migration_reconciliation",
+    "migration_mapping_epoch",
+    "migration_metadata",
+    "migration_organization",
+    "migration_evidence",
+    "migration_evidence_blobs",
+    "migration_evidence_chunks",
+    "migration_originals",
+    "migration_retained_fields",
+    "migration_retained_records",
+    "migration_retention",
+    "organization_collection_order",
+    "organization_collection_structure",
+    "organization_image_relations",
+    "organization_keyword_synonyms",
+];
+const SCHEMA8_TABLES: &[&str] = &[
+    "migration_current_repairs",
+    "migration_current_repair_items",
+    "migration_current_repair_reports",
+];
+const SCHEMA10_TABLES: &[&str] = &[
+    "migration_keyword_repairs",
+    "migration_keyword_repair_items",
+    "migration_keyword_repair_reports",
+];
+
 fn id(i: i64) -> String {
     format!("fixture-{i:012}")
 }
@@ -233,6 +278,7 @@ fn fixture_tables(db: &Connection) -> Result<Vec<String>> {
 fn fixture_data_identity(
     db: &Connection,
     tables: &[String],
+    pre_image_columns: bool,
 ) -> Result<(String, Vec<(String, i64)>)> {
     use rusqlite::types::ValueRef;
     let mut hash = blake3::Hasher::new();
@@ -246,6 +292,23 @@ fn fixture_data_identity(
             [table],
             |r| r.get(0),
         )?;
+        let columns = db
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?
+            .query_map([table], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let columns = columns
+            .iter()
+            .filter(|c| {
+                !(pre_image_columns && table == "assets" && c.as_str() == "physical_generation")
+            })
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let filter = if pre_image_columns && table == "sqlite_sequence" {
+            " WHERE name NOT IN ('catalog_images','organization_image_relations')"
+        } else {
+            ""
+        };
         let sql = if without_rowid {
             let keys = db
                 .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
@@ -257,9 +320,9 @@ fn fixture_data_identity(
                 .map(|key| format!("\"{}\"", key.replace('"', "\"\"")))
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("SELECT * FROM \"{quoted}\" ORDER BY {order}")
+            format!("SELECT {columns} FROM \"{quoted}\"{filter} ORDER BY {order}")
         } else {
-            format!("SELECT rowid,* FROM \"{quoted}\" ORDER BY rowid")
+            format!("SELECT rowid,{columns} FROM \"{quoted}\"{filter} ORDER BY rowid")
         };
         let mut stmt = db.prepare(&sql)?;
         let columns = stmt.column_count();
@@ -317,7 +380,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         "fixture identity mismatch"
     );
     let tables_before = fixture_tables(&db)?;
-    if before_schema < CURRENT_SCHEMA_VERSION {
+    if before_schema < 6 {
         ensure!(
             !tables_before
                 .iter()
@@ -325,7 +388,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             "legacy schema contains unexpected schema6 tables"
         );
     }
-    if before_schema == CURRENT_SCHEMA_VERSION {
+    if before_schema >= 6 {
         ensure!(
             SCHEMA6_TABLES
                 .iter()
@@ -333,7 +396,28 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             "current schema missing schema6 tables"
         );
     }
-    let before = fixture_data_identity(&db, &tables_before)?;
+    ensure!(
+        SCHEMA7_TABLES
+            .iter()
+            .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 7)),
+        "schema7 table roster disagrees with version"
+    );
+    ensure!(
+        SCHEMA8_TABLES
+            .iter()
+            .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 8)),
+        "schema8 repair table roster disagrees with version"
+    );
+    ensure!(
+        SCHEMA10_TABLES
+            .iter()
+            .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 10)),
+        "schema10 keyword repair table roster disagrees with version"
+    );
+    if before_schema < 7 {
+        ensure!(!db.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name IN ('catalog_images','organization_image_relations'))",[],|r|r.get(0))?, "legacy fixture has unexpected image sequence rows");
+    }
+    let before = fixture_data_identity(&db, &tables_before, before_schema < 7)?;
     drop(db);
     drop(Catalog::open(&args.catalog)?);
     let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
@@ -347,16 +431,25 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
         .filter(|t| !tables_before.contains(t))
         .cloned()
         .collect();
-    let expected_added: Vec<String> = if before_schema < CURRENT_SCHEMA_VERSION {
-        SCHEMA6_TABLES.iter().map(|s| s.to_string()).collect()
-    } else {
-        Vec::new()
-    };
+    let mut expected_added: Vec<String> = Vec::new();
+    if before_schema < 6 {
+        expected_added.extend(SCHEMA6_TABLES.iter().map(|s| s.to_string()));
+    }
+    if before_schema < 7 {
+        expected_added.extend(SCHEMA7_TABLES.iter().map(|s| s.to_string()));
+    }
+    if before_schema < 8 {
+        expected_added.extend(SCHEMA8_TABLES.iter().map(|s| s.to_string()));
+    }
+    if before_schema < 10 {
+        expected_added.extend(SCHEMA10_TABLES.iter().map(|s| s.to_string()));
+    }
+    expected_added.sort();
     ensure!(
         added == expected_added,
         "unexpected migration table additions"
     );
-    let added_identity = fixture_data_identity(&db, &added)?;
+    let added_identity = fixture_data_identity(&db, &added, false)?;
     // This is a pristine query fixture, not an export-projection benchmark.
     // Migration creates a state row and one dirty row per existing binding;
     // those rows must be verified, not incorrectly classified as empty tables.
@@ -380,6 +473,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
+        false,
     )?;
     ensure!(
         all_initial.1.iter().all(|(name, n)| *n
@@ -390,8 +484,49 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             }),
         "schema6 fixture has non-initial edit/export/alias rows"
     );
+    let image_initial = fixture_data_identity(
+        &db,
+        &SCHEMA7_TABLES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        false,
+    )?;
+    ensure!(
+        image_initial.1.iter().all(|(name, n)| *n
+            == if matches!(name.as_str(), "catalog_images" | "image_shared_state") {
+                count
+            } else if name == "migration_mapping_epoch" {
+                1
+            } else {
+                0
+            }),
+        "schema7 fixture has non-initial image/import rows"
+    );
+    let repair_initial = fixture_data_identity(
+        &db,
+        &SCHEMA8_TABLES
+            .iter()
+            .chain(SCHEMA10_TABLES.iter())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        false,
+    )?;
+    ensure!(
+        repair_initial.1.iter().all(|(_, n)| *n == 0),
+        "schema8 fixture has unexpected repair state"
+    );
+    ensure!(
+        db.query_row::<bool, _, _>(
+            "SELECT count(*)=1 AND min(id)=1 AND min(epoch)=0 FROM migration_mapping_epoch",
+            [],
+            |r| r.get(0)
+        )?,
+        "migration mapping epoch is not initial"
+    );
+    ensure!(db.query_row::<bool,_,_>("SELECT NOT EXISTS(SELECT 1 FROM assets a LEFT JOIN catalog_images i ON i.id=a.id WHERE i.id IS NULL OR i.sequence!=a.sequence OR i.asset_id!=a.id OR i.variant_id!='master' OR i.role!='master' OR i.origin!='native' OR i.translation_state!='native' OR i.master_sequence IS NOT NULL OR i.copied_from_sequence IS NOT NULL OR i.pixel_generation!=0 OR i.applied_shared_epoch!=0 OR a.physical_generation!=a.render_generation) AND NOT EXISTS(SELECT 1 FROM image_shared_state WHERE epoch!=0)",[],|r|r.get(0))?, "image migration identities/generations changed");
     let alias_initial_state = json!({"unbound":unbound,"dirty":bound});
-    let after = fixture_data_identity(&db, &tables_before)?;
+    let after = fixture_data_identity(&db, &tables_before, before_schema < 7)?;
     let after_schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let index: String = db.query_row(
         "SELECT sql FROM sqlite_master WHERE name='organization_lens_capture'",
@@ -407,7 +542,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     ensure!(index == expected, "unexpected capture index definition");
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(
-        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"mode":"migrate_fixture","complete":true,"count":count,"schema_before":before_schema,"schema_after":after_schema,"identity_scope":"pre_existing_tables","added_tables":added_identity.1,"alias_initial_state":alias_initial_state,"logical_before":before.0,"logical_after":after.0,"table_counts_before":before.1,"table_counts_after":after.1,"index_sql":index,"engine_version":rusqlite::version(),"provenance":"Explicit owned-copy schema/index migration; streamed typed logical identity covers every pre-existing table, FTS shadow table and row identity; new edit/export tables and derived alias initial rows are reported separately. Not timed query work."}),
+        json!({"protocol":PROTOCOL,"catalog_schema":CURRENT_SCHEMA_VERSION,"mode":"migrate_fixture","complete":true,"count":count,"schema_before":before_schema,"schema_after":after_schema,"identity_scope":"pre_existing_tables","added_tables":added_identity.1,"alias_initial_state":alias_initial_state,"image_initial_state":image_initial.1,"original_columns_preserved":true,"logical_before":before.0,"logical_after":after.0,"table_counts_before":before.1,"table_counts_after":after.1,"index_sql":index,"engine_version":rusqlite::version(),"provenance":"Explicit owned-copy schema/index migration; streamed typed logical identity covers every pre-existing table, FTS shadow table and row identity; new edit/export tables and derived alias initial rows are reported separately. Not timed query work."}),
     )
 }
 
@@ -590,7 +725,7 @@ fn anchor(query: &Query, count: i64, epoch: i64, i: usize) -> Result<Cursor> {
         )),
     };
     Ok(Cursor {
-        version: 1,
+        version: photocatalog::organization_search::CURSOR_VERSION,
         query_hash: blake3::hash(&serde_json::to_vec(query)?)
             .to_hex()
             .to_string(),

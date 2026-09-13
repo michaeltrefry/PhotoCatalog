@@ -1,11 +1,14 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 /// Current on-disk catalog schema; probes must preflight before timed opens.
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 pub mod catalog_edits;
 pub mod catalog_export_alias;
 pub mod catalog_exports;
+pub mod catalog_image_exports;
+pub mod catalog_images;
 pub mod catalog_metadata;
+pub mod catalog_migration;
 pub mod catalog_storage;
 mod catalog_writer;
 pub mod edit;
@@ -248,6 +251,8 @@ impl Catalog {
         // Opening a current catalog must not rewrite its header or acquire an
         // unnecessary writer transaction. Only actual initialization/migration writes.
         if version < CURRENT_SCHEMA_VERSION {
+            // Schema7 rebuilds leaf foreign keys; enforcement is restored after validation.
+            db.pragma_update(None, "foreign_keys", false)?;
             let _write = writers.enter(catalog_writer::Priority::Foreground)?;
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // Another admitted opener may have completed migration while we waited.
@@ -294,7 +299,31 @@ impl Catalog {
                 tx.execute_batch(catalog_export_alias::SCHEMA)?;
                 tx.pragma_update(None, "user_version", 6)?;
             }
+            if version < 7 {
+                catalog_images::migrate(&tx)?;
+                catalog_migration::install(&tx)?;
+                catalog_image_exports::install(&tx)?;
+                let invalid: i64 =
+                    tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                        r.get(0)
+                    })?;
+                ensure!(invalid == 0, "logical image migration foreign key failure");
+                tx.pragma_update(None, "user_version", 7)?;
+            }
+            if version < 8 {
+                catalog_migration::current_repair::install(&tx)?;
+                tx.pragma_update(None, "user_version", 8)?;
+            }
+            if version < 9 {
+                catalog_migration::lookup::install_availability_indexes(&tx)?;
+                tx.pragma_update(None, "user_version", 9)?;
+            }
+            if version < 10 {
+                catalog_migration::keyword_repair::install(&tx)?;
+                tx.pragma_update(None, "user_version", 10)?;
+            }
             tx.commit()?;
+            db.pragma_update(None, "foreign_keys", true)?;
         }
         Ok(Self { db, root, writers })
     }
@@ -612,6 +641,7 @@ impl Catalog {
         );
         Ok(path)
     }
+    #[cfg(test)]
     pub(crate) fn commit_preview_import<T>(
         &mut self,
         expected: &catalog_metadata::RenderIdentity,
@@ -619,6 +649,27 @@ impl Catalog {
         metadata: &Metadata,
         key: &str,
         attach: impl FnOnce() -> Result<T>,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<T>> {
+        self.commit_preview_import_guarded(
+            expected,
+            fingerprint,
+            metadata,
+            key,
+            (|_, _| Ok(true), attach),
+            before_commit,
+        )
+    }
+    pub(crate) fn commit_preview_import_guarded<T>(
+        &mut self,
+        expected: &catalog_metadata::RenderIdentity,
+        fingerprint: &str,
+        metadata: &Metadata,
+        key: &str,
+        publication: (
+            impl Fn(&rusqlite::Transaction<'_>, bool) -> Result<bool>,
+            impl FnOnce() -> Result<T>,
+        ),
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<Option<T>> {
         ensure!(
@@ -635,12 +686,14 @@ impl Catalog {
         );
         let metadata = serde_json::to_string(metadata)?;
         self.with_render_transaction(expected,catalog_writer::Priority::Background,|tx|{
-            let result=attach()?;
+            if !(publication.0)(tx,false)? {return Ok(None);}
             tx.execute("UPDATE assets SET state='ready',fingerprint=?1,metadata=?2,preview_hash=?3,error=NULL WHERE id=?4",params![fingerprint,metadata,key,expected.asset_id])?;
+            ensure!((publication.0)(tx,true)?,"import publication generation differs");
+            let result=(publication.1)()?;
             organization::refresh(tx,&expected.asset_id)?;
             before_commit()?;
-            Ok(result)
-        })
+            Ok(Some(result))
+        }).map(Option::flatten)
     }
     /// A failed/retried import retains its last valid legacy thumbnail until the
     /// service replaces it. This read never assigns current-render provenance.
@@ -981,14 +1034,16 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             |row| row.get(0),
         )?;
         assert_eq!(
-            schema_after.replace(", render_generation INTEGER NOT NULL DEFAULT 0", ""),
+            schema_after
+                .replace(", render_generation INTEGER NOT NULL DEFAULT 0", "")
+                .replace(", physical_generation INTEGER NOT NULL DEFAULT 0", ""),
             schema_before
         );
         assert_eq!(
             catalog
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-            6
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             catalog

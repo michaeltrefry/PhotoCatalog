@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub const CURSOR_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Sort {
@@ -34,6 +36,8 @@ pub enum Direction {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Query {
+    /// Include independent logical images; legacy callers browse physical masters only.
+    pub include_variants: bool,
     pub text: Option<String>,
     pub keyword: Option<i64>,
     pub keyword_direct: bool,
@@ -70,6 +74,10 @@ pub struct Cursor {
 }
 #[derive(Debug, Serialize)]
 pub struct SearchRow {
+    pub image_id: String,
+    pub variant_id: String,
+    /// Published values are coherent, but not mutation/export authority while pending.
+    pub metadata_pending: bool,
     pub sequence: i64,
     pub asset_id: String,
     pub state: String,
@@ -220,9 +228,7 @@ fn ready(db: &Connection) -> Result<(i64, i64)> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     ensure!(
-        after >= high
-            && !db.query_row("SELECT EXISTS(SELECT 1 FROM organization_dirty)", [], |r| r
-                .get::<_, bool>(0))?,
+        after >= high,
         "organization index incomplete; resume organization-index batches"
     );
     let max = db.query_row(
@@ -291,6 +297,9 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
                 )
             ));
         }
+    }
+    if !query.include_variants {
+        predicates.push("ci.variant_id='master'".into());
     }
     if query.only_conflicted {
         predicates.push("a.conflicts!='[]'".into());
@@ -440,7 +449,10 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     let text_column = if local_text { "a.search_text" } else { "NULL" };
     let limit = bind(&mut params, scan as i64);
     let projection = format!(
-        "a.sequence,a.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched,{text_column}"
+        "a.sequence,ci.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched,{text_column},a.asset_id,ci.variant_id,(ci.applied_shared_epoch!=ss.epoch OR di.sequence IS NOT NULL OR se.asset_id IS NOT NULL)"
+    );
+    let source = format!(
+        "{source} CROSS JOIN catalog_images ci ON ci.id=a.asset_id CROSS JOIN image_shared_state ss ON ss.asset_id=ci.asset_id LEFT JOIN organization_dirty di ON di.sequence=a.sequence LEFT JOIN image_storage_events se ON se.asset_id=ci.asset_id AND ci.sequence>se.cursor AND ci.sequence<=se.high_water"
     );
     let select = |predicates: &[String]| {
         format!(
@@ -507,6 +519,9 @@ fn text_execute(
 fn result_row(r: &rusqlite::Row<'_>) -> Result<SearchRow> {
     let rating: i64 = r.get(11)?;
     Ok(SearchRow {
+        image_id: r.get(18)?,
+        variant_id: r.get(19)?,
+        metadata_pending: r.get(20)?,
         sequence: r.get(0)?,
         asset_id: r.get(1)?,
         state: r.get(2)?,
@@ -544,7 +559,7 @@ fn page(
     let hash = query_hash(query)?;
     if let Some(c) = cursor {
         ensure!(
-            c.version == 1 && c.query_hash == hash,
+            c.version == CURSOR_VERSION && c.query_hash == hash,
             "cursor belongs to a different query or version"
         );
         ensure!(
@@ -624,7 +639,7 @@ fn page(
                 Sort::Rating => Key::Integer(r.get(11)?),
             };
             last = Some(Cursor {
-                version: 1,
+                version: CURSOR_VERSION,
                 query_hash: hash.clone(),
                 epoch,
                 high_water: high,

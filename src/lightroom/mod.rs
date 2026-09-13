@@ -1,9 +1,11 @@
 //! Lightroom evidence capture and inspection. This module never imports assets
 //! into the application catalog or executes Adobe develop/plug-in instructions.
+pub mod adobe;
 pub mod capture;
 pub mod discovery;
+pub mod migration_source;
 pub mod plan;
-mod source;
+pub(crate) mod source;
 pub mod wal;
 
 use crate::storage_volume::NativePath;

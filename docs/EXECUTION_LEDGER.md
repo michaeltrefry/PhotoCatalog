@@ -2,7 +2,281 @@
 
 Source of truth: https://app.shortcut.com/trefry/epic/22835
 
-## Current wave
+## S10 pre-merge checkpoint — 2026-09-13
+
+This section records pre-merge evidence; Shortcut holds the live delivery state.
+
+S10 sc-22845 is In Review. S1–S9 and the linked inspection repairs are Done;
+S9 merged at `56aa3ca`. The selected TEST imports all 16 approved source catalogs
+into one scratch catalog and preserves the existing filesystem folder hierarchy.
+The 32 excluded catalog candidates remain excluded. Canonical-library migration
+has not been authorized.
+
+PR #14 remains draft at the qualified implementation `6c4e140`. All 643 optimized
+Rust tests passed (five existing ignored), along with formatting, strict Clippy
+and all four jobs in CI run 34733952105: macOS, Windows, Linux and benchmark
+contracts. Original import `5b54d2b9`, projection fix `46f56423`, current-settings
+repair `063d011a` and the schema-9 `7fda5ebd` upgrade/API evidence retain their own
+source attribution.
+
+The selected TEST completed import and both resumable repairs. Keyword recovery
+replaced and verified 5,050 archived items: 156 dictionaries, including 140 named
+keyword source records and 16 structural roots, plus 4,894 image memberships,
+with 16 fresh capture reports. Current-settings recovery preserves 215,708 archived outcomes:
+215,671 container rebindings and 37 unchanged. Rebinding is not translation;
+215 current settings are translated with appearance gaps and 215,493 remain
+retained-only. Imported candidates preserve source terms without selecting metadata
+precedence. All 429 retained collection memberships point to explicitly unsupported
+module collections (321 print and 108 unsaved-book memberships).
+
+The final full post-keyword preservation audit passed in 491.067 seconds using
+2,392 queries and 43,372,523,371 bytes of cumulative processed metadata. Its private
+correctness owner sampled 1,204,813,824 bytes peak RSS under an explicitly admitted
+2 GiB allowance and reaped the child cleanly. Earlier 1 GiB audit failures remain
+preserved; this allowance is not evidence for the product's 4 GiB performance
+contract. The audit covers the complete original/current/keyword custody and
+association chain, including all repair archives and fresh reports. It does not
+rehash every original or retained raw blob and makes no Adobe appearance claim.
+
+The final public API probe and independent saved-result review passed. It read
+all 140 named keyword source records and their paths, 16 structural roots,
+156 dictionary predecessors and two membership predecessors, plus separate
+master/virtual candidate, effective-value
+and provenance observations. The native probe took 0.797 seconds; its owner took
+1.181 seconds and sampled 274,104,320 bytes peak RSS within the 512 MiB limit.
+The main database stamp and catalog checkpoints were unchanged; the admitted
+Catalog::open WAL/SHM lifecycle completed normally. These two images use different
+physical assets, so this is not an actual same-file sibling or rendering test.
+Earlier schema-9 API evidence covers current/history/before-settings routes and
+literal folder paging; final-source fixtures cover shared-file independence and
+validated native rendering.
+
+S10 acceptance evidence is complete for the approved selected TEST: final native
+reconciliation, full preservation audit and representative API readback all passed
+with independent review. The story is In Review, not Done. Remaining delivery is
+merge, terminal merged-head CI and tracker/task read-back. Canonical migration,
+Adobe appearance equivalence and product performance qualification are not claimed.
+
+The selected TEST has reached native Complete in one scratch catalog: all 16
+capture reports, 22 source-walk stages and 171 companion artifacts reconciled.
+Selected-source custody contains 14,025,415 records. The final progress counter
+is 3,452,770 processing steps across repeated metadata passes, not unique photos.
+Originals and source catalogs remain read-only. Native completion is separate
+from the independent destination audit and the representative public-API check.
+
+Repair `e615b076` supplied the complete composite key for two metadata mapping
+queries and passed independent review plus a 20,000-row bounded-work regression.
+The resumed worker completed both affected metadata stages. A subsequent external
+RSS-probe timeout and a later native rating-conflict failure are preserved as
+separate failed intervals, each with its durable checkpoint.
+
+Repair `30f8cd40` retains conflicted ratings and labels as image-local metadata
+candidates without selecting source precedence. Keywords accumulate a source-owned
+set, with explicit unresolved and resource-limit results. Independent source review,
+13 focused regressions, all 594 optimized all-target test instances, strict all-target
+Clippy and formatting passed; five existing tests remain ignored. The original
+interactive conflict guard and successful component receipts remain intact.
+
+The same TEST resumed with that qualified successor. A bounded read-only check
+proved recovery of the exact failing row: its rating candidate is retained, ambiguity
+is still visible, prior rating sources and choices are unchanged, and the saved flag
+and label receipts are identical. The checkpoint had advanced beyond 2,149,840
+processed rows. This is a successful repair/resume observation, not terminal import
+acceptance. Earlier native receipts remain attributed to their original source.
+
+That interval later stopped at 2,208,017 processed rows when the XMP wrapper
+treated an empty scalar as a null composite-construction argument during a label
+edit's preservation check. The source label was empty and the incoming value was
+Red. The checkpoint, original models and exact error are preserved. Repair
+`94ebee0b` reproduced the error in a synthetic fixture, fixes the wrapper's empty
+scalar handling, and preserves the existing composite and semantic guards.
+Independent source review, 37 focused tests, all 599 optimized all-target test
+instances, strict all-target Clippy and formatting passed, with five existing
+tests ignored. Run 12 passed the exact failing row: the effective label is Red,
+rating remains zero, all three organization receipts match the completed source
+row, and both original model descriptors, projections and blob checksums are
+unchanged. It then cooperatively stopped at 2,254,865 processed rows to serialize
+native qualification of the preview-cache repair. The worker and owner exited
+cleanly, and the saved checkpoint was read back.
+
+Repair `e7bfb9c9` explicitly releases acquired preview manifest, tier and relocation
+locks when ownership ends, including failed initialization. A deterministic
+retained-handle test reproduced the lock-lifetime defect; its involvement in the
+earlier Linux CI occurrence remains unproven. Independent source review, 72
+targeted preview tests, all 604 optimized all-target test instances, strict
+all-target Clippy, formatting and the release build passed, with five existing
+tests ignored. Worker teardown and relocation ownership remain intact. Run 13
+and run 14 continued the same TEST; input, policy, schema, successful receipts
+and resource limits remained unchanged.
+
+Final reconciliation exposed two query costs. Repair `5366ed23` counts completed
+retained records through a covering total minus the scoped incomplete count,
+without fetching every completed payload row. The original diagnostic exhausted
+30 seconds during the first large counts; the candidate destination-query
+sequence completed in 24.13 seconds. These private-runtime timings omit source
+and late reconciliation work. The native successor then completed all 16 capture
+reports, proving the count repair on the selected dataset.
+
+Repair `5b54d2b9` replaces the final full-population DISTINCT with bounded indexed
+capture-key seeks in one read snapshot. It preserves selected/excluded checks,
+incomplete-row inclusion, the terminal empty seek and the final mapping-epoch CAS.
+The actual diagnostic returned the same 16 keys in 17 seeks after the original
+query hit its 30-second limit. Synthetic tests verify scope, pending/extra keys,
+constant VM work across duplicated records and concurrent-insert snapshot behavior.
+The resumed native worker completed its final step and exited cleanly; the
+read-only checkpoint exactly matches the terminal Complete result. Earlier run
+receipts retain their original source attribution.
+
+The independent v16 metadata audit passed on the completed TEST in 350.776 seconds:
+1,641 queries, 2,807,048,000 approximate VM steps and 856,309,760 bytes peak RSS.
+All 16 reports, selected custody, 171 artifact members, 20 supplemental proofs,
+native relationships and literal folder ancestry passed. This checks metadata and
+the admitted custody chain; it does not independently rehash every payload or render
+actual photos. Earlier time, VM and RSS stops remain preserved. The final verifier
+repair projects only slot/state before grouping: SQLite's previous sorter included
+the full metadata result. Typed-output comparisons and query-plan review qualified
+the change. Final allowances are 900 seconds, 1 GiB RSS and 10 billion VM steps;
+the data checks remain intact.
+
+The resulting census exposed a product defect: all 215,708 current-develop receipts
+were retained-only, with no translated native recipe. The coordinator always passed
+an empty settings path, while sampled successfully parsed Lightroom payloads stored
+their settings beneath the outer `s` assignment. A bounded sample across all 16
+captures also contains different process versions and nested historical properties;
+those must not be selected by searching for convenient parameter names. Task 23166
+now explicitly tracks grammar-proven container selection, full importer/render/replay
+regressions and a guarded resumable repair of existing current projections.
+
+The pre-repair audit remains valid evidence of the old state, not editing acceptance.
+The schema-8 repair now archives old receipts and reports, rejects adoption after
+later user edits, and commits each replacement recipe/receipt/archive/cursor in one
+transaction before fresh reconciliation. Independent review found and corrected an
+unchanged oversized-identity row that could stall repair. All 620 distinct Rust test
+instances passed across the optimized all-target run and corrected library rerun,
+with five existing ignores. The initial CLI SQL type error and old schema-7 test
+assertion remain recorded as failures preceding their fixes. Strict all-target
+Clippy and package formatting passed. A quiescent APFS clone of the actual TEST
+database preserves its completed progress and epoch 424799 before repair; the
+source database remained unchanged. This recovery copy does not close S11.
+
+Source `46f56423` passed all four hosted CI jobs in run 34720501392. Actual TEST
+repair examined all 215,708 records, rebound 215,671 proven settings containers,
+and preserved 37 unchanged entries. All predecessor receipts and 16 reports remain
+archived. Reconciliation committed its first report, then stopped with SQLite
+interruption; one bounded unchanged-worker resume reproduced the interruption.
+Both workers were reaped without forced cleanup or an owner resource stop.
+Read-only checkpoints confirm the same capture index 1, epoch 424799, archive
+counts, and unchanged database content stamp after the failed resume.
+
+The destination-only query trace passed in 11.619 seconds and approximately
+34.286 million VM steps, but omitted source admission/counts and final operations;
+it does not establish the native failure's cause. Operation-specific error context
+now identifies source admission and each reconciliation query boundary, with SQL
+and limits unchanged. Independent source review and 33 focused tests passed,
+including original SQLite error identity and report/cursor rollback. The
+instrumented attempt located the interruption at 30.002 seconds in supplemental
+custody/projection reconciliation for capture index 1. Its checkpoint remained
+unchanged. A bounded read-only comparison of all 14 supplemental items in that
+capture showed the original lookup choosing the table-name index; selecting the
+existing exact-source index returned identical results with much less work
+(0.524 seconds / approximately 3.222 million VM steps versus 0.006 seconds in the
+warm Python diagnostic). The query now selects that existing exact-source index
+without changing schema, predicates, limits or checkpoint semantics. Seven
+reconciliation, five supplemental and eleven importer regression tests passed; the native
+VM-step test stayed at 38 steps with 8 and 4,096 unrelated files, while the old
+index plan grew to 20,517 steps. Qualified source `063d011a` then completed actual
+native reconciliation: repair 05 finished all 16 report positions in 116.259 seconds,
+with 215,708 examined, 215,671 container-rebound and 37 unchanged records. The owner
+reaped the native worker at exit zero with no cleanup events or resource stop.
+Container-rebound counts are not translated-recipe counts. Source catalogs and
+originals remain untouched.
+
+The full post-repair v20 audit stopped cleanly at its 900-second observer deadline,
+after base custody and native-relation checks but before finishing archived recipe
+verification. Its failed receipt remains preserved: 1,649 queries, approximately
+2.827 billion VM steps, 17,058,440,223 processed metadata bytes and 864,010,240 bytes
+peak RSS. Completed report observations classify 215 current results as
+translated-with-appearance-gaps and 215,493 as retained-only; they are not a full
+repair-audit PASS. The finite 48 GiB cumulative processing allowance was based on
+measured archive charges and is distinct from the unchanged 1 GiB memory limit.
+A bounded sample of 32 archive rows from each selected revision confirmed exact
+composite indexed lookups and unchanged database content. It identified redundant
+JSON parsing in recipe validation. The reviewed successor reuses parsed values
+without changing validation and adds bounded timing/progress telemetry. Its full
+v22 audit passed in 853.453 seconds: 1,650 queries, 43,212,343,101 cumulative metadata
+bytes, approximately 2.864 billion VM steps and 992,329,728 bytes peak RSS. All
+215,708 archives, 16 predecessor/fresh reports, stored recipes and custody/relationship
+checks passed; the worker exited cleanly. The exact current classifications are
+215 translated-with-appearance-gaps and 215,493 retained-only. The reviewed walltime
+allowance was 1,800 seconds; the audit finished within the earlier 900-second limit
+on this run. Neither warm timing nor parsing improvements alone are asserted as
+the complete explanation for the prior timeout.
+
+Actual API case selection exposed a separate lookup defect: every selected capture
+has ancillary entity records with a non-text local key. The prior public lookup
+used collection-wide key availability, allowing unrelated records to block valid
+image/history anchors. A bounded census confirms those rows have known source and
+table keys, so a known mismatch can safely exclude them from a queried endpoint's
+completeness proof. The correction must retain unknown possible matches, snapshot
+and ambiguity checks, and use indexes to avoid repeatedly scanning the unavailable
+population. Schema-9 adds seven partial indexes that retain unknown keys and
+checks at most eight exact value/NULL branches per query. All 36 focused tests,
+strict all-target Clippy, formatting and independent source review pass. The
+20,000-row regression checks bounded VM work across every lookup shape; migration
+failure rolls back both DDL and schema version. Source `7fda5ebd` passed 627 release
+test instances and all four PR CI jobs. The actual TEST's quiescent schema-8 APFS
+safety copy remains preserved. Its shipping CLI completed the index-only upgrade
+in 147.409 seconds with 587,022,336 bytes sampled peak RSS. All seven index
+definitions match; pre-existing schema objects, import/repair checkpoints, mapping
+epoch and 16 report digests are unchanged. The schema-9 database grew by
+228,605,952 bytes. This reviewed DDL-path and checkpoint evidence is separate from
+the earlier full schema-8 audit; it is not a new complete payload hash.
+
+The organization audit accounts for 4,894 retained keyword memberships and 429
+retained collection memberships without native endpoints. A bounded dictionary
+diagnostic checked all 566 dictionary ledger rows: 390 native collections, 20
+retained collection types, and 156 retained keyword records. Exact retained-row
+proofs establish 16 typed Null-name/Null-parent keyword boundaries. Their rejection
+blocked 140 named keywords and the keyword memberships. A narrow boundary adapter
+is independently reviewed and locally committed as `0ec76399`, with 25 focused
+tests and strict Clippy passing. Atomic archived recovery of the completed TEST
+is source-qualified and awaiting actual execution; it must preserve original custody, current-settings repair
+archives, recipes and local choices, and publish fresh reconciliation reports.
+The 20 retained collection records are Lightroom print, slideshow, book and
+web-gallery constructs. An exact endpoint diagnostic verified all 429 memberships
+in 1.787 seconds: every image has a native mapping and every collection belongs
+to that unsupported roster. Its 9,090 queries processed 8,000,016 metadata bytes
+without changing the database stamp. No unresolved or missing image endpoint
+remains in this population; independent actual-result review passed. The affected
+memberships use two print collections (321) and one unsaved book collection (108).
+
+The schema-9 public API probe passed for three selected cases in 0.256 seconds:
+a translated master, virtual-copy history and earlier settings, with matching
+recipe identities and four literal filesystem folder pages. Independent review
+verified the exact source, selection, process cleanup and unchanged main database
+stamp. Empty WAL/SHM companions were removed on normal close. The history endpoint
+remained addressable but its selected payload was not parsed. Exact retained-cell
+inspection confirms a 14,760-byte Blob, which the text extractor preserves without
+interpretation. All 16 root-table digests are now available for recovery admission.
+A fresh schema-9 APFS safety copy passed exact checkpoint and epoch readback before
+keyword recovery; it is not a full restore or payload-hash qualification. Independent
+review verified the backup and retained-cell diagnostic. These bounded
+observations do not claim actual image rendering or complete migration acceptance.
+The atomic keyword recovery source is locally committed as `ee723c15` and has
+passed independent review, 154 distinct associated tests across preserved runs
+and focused corrections, strict Clippy and formatting. Tests cover exact master
+and virtual candidate terms, effective local choices, source-parent guards,
+reopen/resume, pending-operation fencing and atomic archive/ledger/report rollback.
+An actual read-only predecessor pass bound all 5,050 dictionary/membership records
+and 16 complete root proofs in 246 queries and 0.119 seconds. The recovery request
+is held pending full release qualification; no keyword replacement has run yet.
+Keyword recovery, full post-recovery audit and public readback, final acceptance review,
+merge and terminal merged-head CI remain required for S10.
+S11 backup/restore and S12 Tauri interface retain their S10 dependencies;
+S13 integrated readiness follows both.
+Fieldbook remains a design reference, not the product name.
+
+## Historical checkpoint before S9 closeout
 
 S9 sc-22844 remains In Progress. All selected extraction and TEST finalization
 are complete and independently reviewed: 16 chosen catalog families, 209,091
@@ -129,7 +403,7 @@ Linux CI at `58e7a1a` exposed an export owner-drop/reopen failure. A determinist
 ## Resource and authorization ledger
 
 - User authorized epic delivery and ordinary PR/CI/merge. The user changed michaeltrefry/PhotoCatalog to public because private-repository Actions consumed the monthly allowance; preserve public visibility and batch validated changes before CI. The user released the reference Mac on 2026-09-09.
-- Originals and Lightroom sources on the RAID remain read-only. Private fixtures and evidence remain outside Git. No live migration or original mutation has occurred.
+- Originals and Lightroom sources on the RAID remain read-only. Private fixtures and evidence remain outside Git. The selected TEST migration writes only its authorized scratch destination; no canonical migration or original mutation has occurred.
 - User authorized a dedicated RAID scratch folder for S9: `/Volumes/MichaelJon/PhotoCatalog-Scratch/sc-22844-schema3-20260911`. Inspection output is under `inspection/schema3-run`; SQLite temporary files use `sqlite-temp`. Local control/evidence remains under `/Users/michael/PhotoCatalog-private-results/sc-22844-raid-full-control-v1`. Scratch authorization does not permit writes to source catalogs or photos.
 - All S2 measurement sessions are complete. Local builds/renders were paused during timing. The owned passive observer PID 30547/session 93348 was stopped afterward and exited successfully; its final receipt at 2026-09-09T14:00:27Z records SIGTERM and 6,472 samples. No outstanding S2 process needs resuming.
 - S4 and S6 use isolated worktrees. Parent owns catalog schema/model integration; packet extraction and explicit export own separate modules. S6 owns preview adapters/store/scheduler; its rebuildable manifest has separate schema ownership. Heavy Cargo and timed measurements are serialized.

@@ -57,6 +57,9 @@ fn import_job(
         .db
         .execute("UPDATE assets SET state='pending' WHERE id=?1", [asset])
         .unwrap();
+    // A pending job retained through schema7 migration starts with both
+    // generation namespaces equal and no per-image pixel changes.
+    catalog.db.execute_batch("UPDATE assets SET physical_generation=render_generation; UPDATE catalog_images SET pixel_generation=0").unwrap();
     let expected = catalog.render_identity(asset).unwrap();
     let mut key = previews
         .key(
@@ -67,6 +70,7 @@ fn import_job(
         .unwrap();
     key.renderer_version = "previous-import-renderer".into();
     SavedJob {
+        import_image: None,
         request: RenderWork {
             source: NativePath::from_path(source),
             keys: vec![key],
@@ -116,6 +120,7 @@ fn old_renderer_edited_jobs_rekey_without_retargeting_recipe_or_undo_revision() 
         let mut key = previews.interactive_key(&edit, Tier::Thumbnail).unwrap();
         key.renderer_version = "previous-edit-renderer:proxy1600".into();
         let job = SavedJob {
+            import_image: None,
             request: RenderWork {
                 source: NativePath::from_path(&source),
                 keys: vec![key],
@@ -233,5 +238,71 @@ fn old_renderer_attached_import_recovers_before_rekey_and_cleans_committed_journ
             .unwrap();
         assert_eq!(retained, key.digest().unwrap());
         assert!(previews.native_work_drained());
+    }
+}
+
+#[test]
+fn legacy_import_requires_unchanged_migration_baseline_before_and_after_update() {
+    for change in ["none", "physical", "pixel"] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut catalog, mut previews, asset, source) = setup(root.path());
+        let job = import_job(&catalog, &previews, &asset, &source);
+        let id = persist(&previews, &job);
+        if change == "physical" {
+            // Same-value binding update models the public same-path rebind trigger.
+            catalog
+                .db
+                .execute(
+                    "UPDATE storage_bindings SET native_path=native_path WHERE asset_id=?",
+                    [&asset],
+                )
+                .unwrap();
+        } else if change == "pixel" {
+            catalog
+                .db
+                .execute(
+                    "UPDATE catalog_images SET pixel_generation=pixel_generation+1 WHERE id=?",
+                    [&asset],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            catalog.render_identity(&asset).unwrap().generation,
+            job.expected.generation
+        );
+        assert_eq!(job.current(&catalog).unwrap(), change == "none");
+        {
+            let tx = catalog.db.transaction().unwrap();
+            assert_eq!(
+                import_image_current(&tx, None, &job.expected, false).unwrap(),
+                change == "none"
+            );
+            if change == "none" {
+                tx.execute("UPDATE assets SET state='ready' WHERE id=?", [&asset])
+                    .unwrap();
+                assert!(import_image_current(&tx, None, &job.expected, true).unwrap());
+                tx.execute("UPDATE assets SET state='ready' WHERE id=?", [&asset])
+                    .unwrap();
+                assert!(!import_image_current(&tx, None, &job.expected, true).unwrap());
+            }
+            tx.rollback().unwrap();
+        }
+        if change != "none" {
+            assert!(
+                previews
+                    .resume(&mut catalog, 0, 10, true)
+                    .unwrap()
+                    .1
+                    .is_empty()
+            );
+            assert!(
+                previews
+                    .store
+                    .saved_jobs(0, 10)
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.1 != id)
+            );
+        }
     }
 }
