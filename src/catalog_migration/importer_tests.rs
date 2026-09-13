@@ -739,3 +739,6 @@ mod current_repair_tests;
 
 #[path = "keyword_repair_tests.rs"]
 mod keyword_repair_tests;
+
+#[path = "../../tests/support/backup_snapshot.rs"]
+mod backup_snapshot;

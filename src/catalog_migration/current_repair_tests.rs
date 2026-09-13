@@ -10,6 +10,9 @@ use crate::catalog_migration::{
 use crate::lightroom::migration_source::MigrationSource;
 use anyhow::Context;
 
+#[path = "catalog_backup_current_tests.rs"]
+mod catalog_backup_tests;
+
 fn old_complete(fixture: &ImportFixture) -> Result<(Catalog, MigrationSource, Progress)> {
     let source = fixture.inspection.open();
     let mut catalog = fixture.open()?;
