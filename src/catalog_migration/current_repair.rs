@@ -223,7 +223,7 @@ impl Catalog {
         source: &MigrationSource,
         request: &Request,
     ) -> Result<Progress> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         ensure!(
             hash(&request.run)
                 && hash(&request.expected_complete_progress_blake3)
@@ -340,7 +340,7 @@ impl Catalog {
         source: &MigrationSource,
         id: &str,
     ) -> Result<Step> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         let (binding, before) = read(&self.db, id)?;
         super::keyword_repair::require_owner(&self.db, &before.run, None)?;
         ensure!(

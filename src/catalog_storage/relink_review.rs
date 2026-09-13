@@ -1001,14 +1001,29 @@ pub(crate) fn record_hydration(db: &Connection, asset: &str, before: Option<Stri
 #[derive(Clone)]
 pub struct RelinkWorkerHandle {
     root: PathBuf,
-    file: std::sync::Arc<File>,
+    session: std::sync::Arc<crate::catalog_session::CatalogSessionAuthority>,
+    role: crate::catalog_session::SqlRole,
     writers: std::sync::Arc<crate::catalog_writer::Writers>,
 }
 impl Catalog {
     pub fn relink_worker_handle(&self) -> Result<RelinkWorkerHandle> {
+        self.sql_worker_handle(crate::catalog_session::SqlRole::Relink)
+    }
+    pub(crate) fn sql_worker_handle(
+        &self,
+        role: crate::catalog_session::SqlRole,
+    ) -> Result<RelinkWorkerHandle> {
+        ensure!(
+            matches!(
+                role,
+                crate::catalog_session::SqlRole::Relink | crate::catalog_session::SqlRole::Export
+            ),
+            "invalid catalog worker role"
+        );
         Ok(RelinkWorkerHandle {
             root: self.root.clone(),
-            file: self.relink_file.clone(),
+            session: self.session.clone(),
+            role,
             writers: self.writers.clone(),
         })
     }
@@ -1018,8 +1033,18 @@ impl RelinkWorkerHandle {
         self.open_with(|_| Ok(()))
     }
     fn open_with(self, mut boundary: impl FnMut(bool) -> Result<()>) -> Result<Catalog> {
+        if let Some(pool) = self.session.pool() {
+            let db = pool.lease(crate::catalog_session::role_index(self.role))?;
+            return Ok(Catalog {
+                db,
+                root: self.root,
+                writers: self.writers,
+                session: self.session,
+            });
+        }
+        let file = self.session.legacy_file()?.clone();
         let path = self.root.join("catalog.sqlite3");
-        let expected = object_key(&self.file)?;
+        let expected = object_key(&file)?;
         let before = open_regular(&path)?;
         ensure!(
             object_key(&before)? == expected,
@@ -1036,7 +1061,7 @@ impl RelinkWorkerHandle {
             object_key(&after)? == expected,
             "selected catalog database changed while opening relink worker"
         );
-        verify_database_object(&db, &self.file)?;
+        verify_database_object(&db, &file)?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let application: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         ensure!(
@@ -1045,16 +1070,16 @@ impl RelinkWorkerHandle {
         );
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         crate::configure_catalog_connection(&db)?;
-        verify_database_object(&db, &self.file)?;
+        verify_database_object(&db, &file)?;
         ensure!(
             object_key(&open_regular(&path)?)? == expected,
             "selected catalog changed during worker setup"
         );
         Ok(Catalog {
-            db,
+            db: db.into(),
             root: self.root,
             writers: self.writers,
-            relink_file: self.file,
+            session: self.session,
         })
     }
 }

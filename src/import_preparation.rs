@@ -41,6 +41,7 @@ pub(crate) enum Event {
     Finished,
 }
 pub(crate) struct Preparation {
+    session: Arc<crate::catalog_session::CatalogSessionAuthority>,
     receiver: Option<mpsc::Receiver<Event>>,
     cancel: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -52,12 +53,17 @@ impl Preparation {
         cancel: Arc<AtomicBool>,
         #[cfg(test)] checkpoint: Option<Checkpoint>,
     ) -> Result<Self> {
-        crate::catalog_backup::require_jobs_released(&catalog.root)?;
+        catalog.require_jobs_released()?;
         ensure!(source.is_dir(), "import source must be a directory");
         ensure!(
             !source.starts_with(&catalog.root) && !catalog.root.starts_with(source),
             "catalog and originals must be separate directories"
         );
+        let discovery = if let Some(pool) = catalog.session.pool() {
+            Some(pool.lease(crate::catalog_session::DISCOVERY_ROLE)?)
+        } else {
+            None
+        };
         let (sender, receiver) = mpsc::sync_channel(0);
         let source = source.to_path_buf();
         let stop = cancel.clone();
@@ -65,6 +71,7 @@ impl Preparation {
             .name("catalog-source-preparation".into())
             .spawn(move || {
                 let result = prepare_walk(
+                    discovery,
                     &source,
                     &sender,
                     &stop,
@@ -79,8 +86,20 @@ impl Preparation {
                         message: format!("{e:#}").chars().take(2048).collect(),
                     });
                 }
-            })?;
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                // Failed spawn drops the closure and returns its admitted role;
+                // no thread exists to join, so this concrete owner acknowledges it.
+                if let Some(pool) = catalog.session.pool() {
+                    pool.joined(crate::catalog_session::DISCOVERY_ROLE, true)?;
+                }
+                return Err(error.into());
+            }
+        };
         Ok(Self {
+            session: catalog.session.clone(),
             receiver: Some(receiver),
             cancel,
             thread: Some(worker),
@@ -103,7 +122,10 @@ impl Preparation {
     pub(crate) fn finish(mut self) {
         self.receiver.take();
         if let Some(worker) = self.thread.take() {
-            let _ = worker.join();
+            let healthy = worker.join().is_ok();
+            if let Some(pool) = self.session.pool() {
+                let _ = pool.joined(crate::catalog_session::DISCOVERY_ROLE, healthy);
+            }
         }
     }
     pub(crate) fn request_cancel(&mut self) {
@@ -115,7 +137,10 @@ impl Preparation {
     pub(crate) fn stop(&mut self) {
         self.request_cancel();
         if let Some(worker) = self.thread.take() {
-            let _ = worker.join();
+            let healthy = worker.join().is_ok();
+            if let Some(pool) = self.session.pool() {
+                let _ = pool.joined(crate::catalog_session::DISCOVERY_ROLE, healthy);
+            }
         }
     }
 }
@@ -195,12 +220,16 @@ fn recheck(path: &Path, file: &File, before: &Stamp) -> Result<()> {
     Ok(())
 }
 fn prepare_walk(
+    admitted: Option<crate::catalog_session::SqlConnection>,
     root: &Path,
     sender: &mpsc::SyncSender<Event>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     #[cfg(test)] checkpoint: Option<Checkpoint>,
 ) -> Result<()> {
-    let discovery = catalog_metadata::ImportDiscovery::new()?;
+    let discovery = match admitted {
+        Some(db) => catalog_metadata::ImportDiscovery::from_admitted(db, cancel.clone())?,
+        None => catalog_metadata::ImportDiscovery::new()?,
+    };
     let mut volumes = ImportVolumes::new();
     for entry in walkdir::WalkDir::new(root).follow_links(false).max_open(16) {
         canceled(cancel)?;
@@ -302,7 +331,7 @@ impl Reference {
         Ok(())
     }
     pub(crate) fn begin(catalog: &mut Catalog, header: Header) -> Result<Self> {
-        crate::catalog_backup::require_jobs_released(&catalog.root)?;
+        catalog.require_jobs_released()?;
         let location = location_bytes(&header.path);
         crate::catalog_storage::verify_location_fence(
             &catalog.db,

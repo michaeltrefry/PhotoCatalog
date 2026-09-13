@@ -217,13 +217,29 @@ impl Drop for AcquiredPreviewLock {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestOrigin {
+    Existing,
+    CreatedByAdmission,
+}
+/// Supplied by the separately owned F lease group. The callback receives only
+/// exact SQL-derived config/identity and returns retained opaque ownership.
+pub(crate) trait AdmittedStoreFiles: Send + Sync {
+    fn lock_tiers(
+        &self,
+        config: &StoreConfig,
+        identity: &str,
+    ) -> Result<std::sync::Arc<dyn Send + Sync>>;
+}
+
 /// One owner serializes filesystem/manifest mutations; workers return encoded
 /// data to that owner. The process lock is released automatically on crash.
 pub struct PreviewStore {
-    db: Connection,
+    db: crate::catalog_session::SqlConnection,
     config: StoreConfig,
-    _lock: AcquiredPreviewLock,
-    _tier_locks: [AcquiredPreviewLock; 2],
+    _lock: Option<AcquiredPreviewLock>,
+    _tier_locks: [Option<AcquiredPreviewLock>; 2],
+    _managed_lease: Option<std::sync::Arc<dyn Send + Sync>>,
     _relocation_lock: Option<AcquiredPreviewLock>,
     identity: String,
     clock: Cell<i64>,
@@ -317,6 +333,30 @@ impl PreviewStore {
             .context("preview service already owns this cache")?;
         let lock = AcquiredPreviewLock(lock);
         let db = Connection::open(config.manifest_root.join("previews.sqlite3"))?;
+        Self::initialize(config, db.into(), Some(lock), None)
+    }
+    pub(crate) fn open_admitted(
+        config: StoreConfig,
+        db: crate::catalog_session::SqlConnection,
+        origin: ManifestOrigin,
+        files: std::sync::Arc<dyn AdmittedStoreFiles>,
+    ) -> Result<Self> {
+        let config = Self::current_configuration_on(&db, config, origin)?;
+        ensure!(
+            config.thumbnail_bytes > 0
+                && config.large_bytes > 0
+                && config.thumbnail_bytes <= i64::MAX as u64
+                && config.large_bytes <= i64::MAX as u64,
+            "invalid cache quotas"
+        );
+        Self::initialize(config, db, None, Some(files))
+    }
+    fn initialize(
+        config: StoreConfig,
+        db: crate::catalog_session::SqlConnection,
+        lock: Option<AcquiredPreviewLock>,
+        files: Option<std::sync::Arc<dyn AdmittedStoreFiles>>,
+    ) -> Result<Self> {
         let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
@@ -391,20 +431,36 @@ impl PreviewStore {
             db.query_row("SELECT value FROM store_identity WHERE id=1", [], |r| {
                 r.get(0)
             })?;
-        let tier_locks = [
-            relocation::lock_root(
-                &config.thumbnail_root,
-                &identity,
-                Tier::Thumbnail,
-                config.layout,
-            )?,
-            relocation::lock_root(&config.large_root, &identity, Tier::Large, config.layout)?,
-        ];
+        let (tier_locks, managed_lease) = if let Some(files) = files {
+            (
+                [None, None],
+                Some(db.retain_opaque_owner(|| files.lock_tiers(&config, &identity))?),
+            )
+        } else {
+            (
+                [
+                    Some(relocation::lock_root(
+                        &config.thumbnail_root,
+                        &identity,
+                        Tier::Thumbnail,
+                        config.layout,
+                    )?),
+                    Some(relocation::lock_root(
+                        &config.large_root,
+                        &identity,
+                        Tier::Large,
+                        config.layout,
+                    )?),
+                ],
+                None,
+            )
+        };
         let mut store = Self {
             db,
             config,
             _lock: lock,
             _tier_locks: tier_locks,
+            _managed_lease: managed_lease,
             _relocation_lock: None,
             identity,
             clock: Cell::new(clock),
@@ -458,6 +514,9 @@ impl PreviewStore {
         store.recover_relocation_lock()?;
         store.recover(128)?;
         Ok(store)
+    }
+    pub(crate) fn return_managed_sql(&mut self) {
+        self.db.return_managed();
     }
     pub fn configuration(&self) -> &StoreConfig {
         &self.config

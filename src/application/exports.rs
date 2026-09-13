@@ -152,6 +152,7 @@ impl Control {
 }
 #[derive(Default)]
 pub(super) struct Coordinator {
+    sql_session: Option<Arc<crate::catalog_session::CatalogSessionAuthority>>,
     sender: Option<mpsc::SyncSender<worker::Task>>,
     thread: Option<thread::JoinHandle<()>>,
     cache: Arc<Mutex<Cache>>,
@@ -180,7 +181,10 @@ impl Coordinator {
         self.signal_shutdown(control);
         self.sender.take();
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let healthy = t.join().is_ok();
+            if let Some(session) = &self.sql_session {
+                let _ = session.joined(crate::catalog_session::SqlRole::Export, healthy);
+            }
         }
         self.pause.take();
         self.cache.lock().unwrap().profiles.clear();
@@ -344,7 +348,10 @@ impl Coordinator {
         };
         if self.sender.is_none() {
             self.control = Some(Arc::clone(control));
-            let handle = catalog.relink_worker_handle().map_err(native)?;
+            self.sql_session = Some(catalog.session.clone());
+            let handle = catalog
+                .sql_worker_handle(crate::catalog_session::SqlRole::Export)
+                .map_err(native)?;
             let (tx, rx) = mpsc::sync_channel(1);
             let ctx = worker::Context {
                 control: Arc::clone(control),

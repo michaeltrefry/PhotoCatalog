@@ -70,10 +70,10 @@ pub enum ImportEvent {
     Committed,
 }
 pub struct Catalog {
-    db: Connection,
+    db: catalog_session::SqlConnection,
     root: PathBuf,
     writers: std::sync::Arc<catalog_writer::Writers>,
-    relink_file: std::sync::Arc<std::fs::File>,
+    session: std::sync::Arc<catalog_session::CatalogSessionAuthority>,
 }
 
 /// Incremental import discovery for application actors. Each advance handles at
@@ -211,7 +211,140 @@ pub fn configure_catalog_connection(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn initialize_catalog_connection(
+    db: &mut Connection,
+    writers: &std::sync::Arc<catalog_writer::Writers>,
+    setup: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
+    setup(db)?;
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    ensure!(
+        version <= CURRENT_SCHEMA_VERSION,
+        "catalog schema {version} is newer than this application supports"
+    );
+    let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+    if version == 0 {
+        let tables: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            tables == 0 && application_id == 0,
+            "refusing to initialize an unrelated database"
+        );
+    } else {
+        ensure!(
+            application_id == 0x50484341,
+            "database is not a LensWorks catalog"
+        );
+    }
+    configure_catalog_connection(db)?;
+    // Opening a current catalog must not rewrite its header or acquire an
+    // unnecessary writer transaction. Only actual initialization/migration writes.
+    if version < CURRENT_SCHEMA_VERSION {
+        // Schema7 rebuilds leaf foreign keys; enforcement is restored after validation.
+        db.pragma_update(None, "foreign_keys", false)?;
+        let _write = writers.enter(catalog_writer::Priority::Foreground)?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Another admitted opener may have completed migration while we waited.
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        ensure!(
+            version <= CURRENT_SCHEMA_VERSION,
+            "catalog schema changed while waiting for migration"
+        );
+        tx.execute_batch("
+            CREATE TABLE IF NOT EXISTS assets (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                location BLOB NOT NULL UNIQUE,
+                path_display TEXT NOT NULL,
+                fingerprint TEXT,
+                state TEXT NOT NULL CHECK(state IN ('pending','ready','failed')),
+                metadata TEXT,
+                preview_hash TEXT,
+                error TEXT,
+                CHECK(state != 'ready' OR (metadata IS NOT NULL AND preview_hash IS NOT NULL AND fingerprint IS NOT NULL))
+            );
+            PRAGMA application_id = 1346913089;
+            ")?;
+        if version < 2 {
+            tx.execute_batch(catalog_metadata::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 2)?;
+        }
+        if version < 3 {
+            tx.execute_batch(catalog_storage::SCHEMA)?;
+            tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
+            tx.pragma_update(None, "user_version", 3)?;
+        }
+        if version < 4 {
+            tx.execute_batch(organization::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 4)?;
+        }
+        if version < 5 {
+            tx.execute_batch(organization::CAPTURE_LENS_SCHEMA)?;
+            tx.pragma_update(None, "user_version", 5)?;
+        }
+        if version < 6 {
+            tx.execute_batch(catalog_edits::SCHEMA)?;
+            tx.execute_batch(catalog_exports::SCHEMA)?;
+            tx.execute_batch(catalog_export_alias::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 6)?;
+        }
+        if version < 7 {
+            catalog_images::migrate(&tx)?;
+            catalog_migration::install(&tx)?;
+            catalog_image_exports::install(&tx)?;
+            let invalid: i64 =
+                tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+            ensure!(invalid == 0, "logical image migration foreign key failure");
+            tx.pragma_update(None, "user_version", 7)?;
+        }
+        if version < 8 {
+            catalog_migration::current_repair::install(&tx)?;
+            tx.pragma_update(None, "user_version", 8)?;
+        }
+        if version < 9 {
+            catalog_migration::lookup::install_availability_indexes(&tx)?;
+            tx.pragma_update(None, "user_version", 9)?;
+        }
+        if version < 10 {
+            catalog_migration::keyword_repair::install(&tx)?;
+            tx.pragma_update(None, "user_version", 10)?;
+        }
+        if version < 11 {
+            catalog_images::collection_order_index::install(&tx)?;
+            tx.pragma_update(None, "user_version", 11)?;
+        }
+        if version < 12 {
+            tx.execute_batch(catalog_storage::REVIEW_SCHEMA)?;
+            tx.pragma_update(None, "user_version", 12)?;
+        }
+        tx.commit()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+    }
+    Ok(())
+}
+
 impl Catalog {
+    pub(crate) fn require_jobs_released(&self) -> Result<()> {
+        self.session.require_jobs_released(&self.root)
+    }
+    pub fn restore_status(&self) -> Result<Option<catalog_backup::RestoreStatus>> {
+        self.session.restore_status(&self.root)
+    }
+    pub fn resume_restored_jobs(
+        &self,
+        restore_id: &str,
+        acknowledge_pending_jobs: bool,
+    ) -> Result<catalog_backup::RestoreStatus> {
+        self.session
+            .resume(&self.root, restore_id, acknowledge_pending_jobs)
+    }
+
     /// Resolve source and prospective catalog locations before creating any files.
     /// Use this entry point when opening a catalog for an import operation.
     pub fn open_for_import(root: impl AsRef<Path>, source: impl AsRef<Path>) -> Result<Self> {
@@ -246,123 +379,14 @@ impl Catalog {
         let writers = catalog_writer::for_catalog(&root);
         fs::create_dir_all(root.join("previews"))?;
         let mut db = Connection::open(root.join("catalog.sqlite3"))?;
-        setup(&db)?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(
-            version <= CURRENT_SCHEMA_VERSION,
-            "catalog schema {version} is newer than this application supports"
-        );
-        let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        if version == 0 {
-            let tables: i64 = db.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
-                [],
-                |r| r.get(0),
-            )?;
-            ensure!(
-                tables == 0 && application_id == 0,
-                "refusing to initialize an unrelated database"
-            );
-        } else {
-            ensure!(
-                application_id == 0x50484341,
-                "database is not a LensWorks catalog"
-            );
-        }
-        configure_catalog_connection(&db)?;
-        // Opening a current catalog must not rewrite its header or acquire an
-        // unnecessary writer transaction. Only actual initialization/migration writes.
-        if version < CURRENT_SCHEMA_VERSION {
-            // Schema7 rebuilds leaf foreign keys; enforcement is restored after validation.
-            db.pragma_update(None, "foreign_keys", false)?;
-            let _write = writers.enter(catalog_writer::Priority::Foreground)?;
-            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            // Another admitted opener may have completed migration while we waited.
-            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            ensure!(
-                version <= CURRENT_SCHEMA_VERSION,
-                "catalog schema changed while waiting for migration"
-            );
-            tx.execute_batch("
-            CREATE TABLE IF NOT EXISTS assets (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                id TEXT NOT NULL UNIQUE,
-                location BLOB NOT NULL UNIQUE,
-                path_display TEXT NOT NULL,
-                fingerprint TEXT,
-                state TEXT NOT NULL CHECK(state IN ('pending','ready','failed')),
-                metadata TEXT,
-                preview_hash TEXT,
-                error TEXT,
-                CHECK(state != 'ready' OR (metadata IS NOT NULL AND preview_hash IS NOT NULL AND fingerprint IS NOT NULL))
-            );
-            PRAGMA application_id = 1346913089;
-            ")?;
-            if version < 2 {
-                tx.execute_batch(catalog_metadata::SCHEMA)?;
-                tx.pragma_update(None, "user_version", 2)?;
-            }
-            if version < 3 {
-                tx.execute_batch(catalog_storage::SCHEMA)?;
-                tx.execute_batch(catalog_metadata::FILE_INSTANCE_SCHEMA)?;
-                tx.pragma_update(None, "user_version", 3)?;
-            }
-            if version < 4 {
-                tx.execute_batch(organization::SCHEMA)?;
-                tx.pragma_update(None, "user_version", 4)?;
-            }
-            if version < 5 {
-                tx.execute_batch(organization::CAPTURE_LENS_SCHEMA)?;
-                tx.pragma_update(None, "user_version", 5)?;
-            }
-            if version < 6 {
-                tx.execute_batch(catalog_edits::SCHEMA)?;
-                tx.execute_batch(catalog_exports::SCHEMA)?;
-                tx.execute_batch(catalog_export_alias::SCHEMA)?;
-                tx.pragma_update(None, "user_version", 6)?;
-            }
-            if version < 7 {
-                catalog_images::migrate(&tx)?;
-                catalog_migration::install(&tx)?;
-                catalog_image_exports::install(&tx)?;
-                let invalid: i64 =
-                    tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
-                        r.get(0)
-                    })?;
-                ensure!(invalid == 0, "logical image migration foreign key failure");
-                tx.pragma_update(None, "user_version", 7)?;
-            }
-            if version < 8 {
-                catalog_migration::current_repair::install(&tx)?;
-                tx.pragma_update(None, "user_version", 8)?;
-            }
-            if version < 9 {
-                catalog_migration::lookup::install_availability_indexes(&tx)?;
-                tx.pragma_update(None, "user_version", 9)?;
-            }
-            if version < 10 {
-                catalog_migration::keyword_repair::install(&tx)?;
-                tx.pragma_update(None, "user_version", 10)?;
-            }
-            if version < 11 {
-                catalog_images::collection_order_index::install(&tx)?;
-                tx.pragma_update(None, "user_version", 11)?;
-            }
-            if version < 12 {
-                tx.execute_batch(catalog_storage::REVIEW_SCHEMA)?;
-                tx.pragma_update(None, "user_version", 12)?;
-            }
-            tx.commit()?;
-            db.pragma_update(None, "foreign_keys", true)?;
-        }
+        initialize_catalog_connection(&mut db, &writers, setup)?;
         let relink_file = std::sync::Arc::new(std::fs::File::open(root.join("catalog.sqlite3"))?);
         catalog_storage::verify_database_object(&db, &relink_file)?;
         Ok(Self {
-            db,
+            db: db.into(),
             root,
             writers,
-            relink_file,
+            session: catalog_session::CatalogSessionAuthority::legacy(relink_file)?,
         })
     }
     /// Imports one explicitly selected directory. Repeating a scan resumes pending/failed files.
@@ -396,7 +420,7 @@ impl Catalog {
         folder: impl AsRef<Path>,
         max_files: Option<usize>,
     ) -> Result<ImportSession> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         let folder = fs::canonicalize(folder)?;
         ensure!(folder.is_dir(), "import source must be a folder");
         ensure!(
@@ -427,7 +451,7 @@ impl Catalog {
         mut observer: impl FnMut(ImportEvent) -> Result<()>,
         mut service: Option<&mut preview::PreviewService>,
     ) -> Result<ImportReport> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         let mut session = self.begin_import(folder, max_files)?;
         loop {
             let advance = session.advance_inner(self, &mut service, &mut observer)?;

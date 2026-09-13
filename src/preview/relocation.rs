@@ -413,8 +413,7 @@ impl PreviewStore {
                     ._relocation_lock
                     .take()
                     .context("relocation target lock missing")?;
-                self._relocation_lock =
-                    Some(std::mem::replace(&mut self._tier_locks[index], target_lock));
+                self._relocation_lock = self._tier_locks[index].replace(target_lock);
                 match tier {
                     Tier::Thumbnail => self.config.thumbnail_root = target,
                     Tier::Large => self.config.large_root = target,
@@ -434,19 +433,29 @@ impl PreviewStore {
     }
     /// Resolve authoritative locations after a relocation committed but the app's
     /// settings file was not yet updated. The supplied roots initialize new stores.
-    pub fn current_configuration(mut config: StoreConfig) -> Result<StoreConfig> {
+    pub fn current_configuration(config: StoreConfig) -> Result<StoreConfig> {
         let path = config.manifest_root.join("previews.sqlite3");
         if !path.exists() {
             return Ok(config);
         }
         let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::current_configuration_on(&db, config, ManifestOrigin::Existing)
+    }
+    pub(crate) fn current_configuration_on(
+        db: &Connection,
+        mut config: StoreConfig,
+        origin: ManifestOrigin,
+    ) -> Result<StoreConfig> {
+        if origin == ManifestOrigin::CreatedByAdmission {
+            return Ok(config);
+        }
         ensure!(
             db.pragma_query_value(None, "application_id", |r| r.get::<_, i64>(0))? == 0x50435056,
             "not a preview manifest"
         );
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!((1..=5).contains(&version), "unsupported preview manifest");
-        validate_paths(&db)?;
+        validate_paths(db)?;
         for tier in [Tier::Thumbnail, Tier::Large] {
             let path = db.query_row(
                 "SELECT CASE WHEN length(CAST(path AS BLOB))<=1048576 THEN path ELSE NULL END FROM locations WHERE tier=?1",
@@ -498,7 +507,7 @@ mod tests {
             use std::io::Seek;
             // Windows excludes reads through a second handle while this marker
             // is byte-range locked. Inspect the actual owning handle instead.
-            let mut owner = &store._tier_locks[0].0;
+            let mut owner = &store._tier_locks[0].as_ref().unwrap().0;
             owner.rewind().unwrap();
             let mut bytes = Vec::new();
             owner.take(257).read_to_end(&mut bytes).unwrap();
@@ -577,5 +586,46 @@ mod tests {
             before
         );
         assert!(!destination.join(".photocatalog-relocation").exists());
+    }
+}
+
+#[cfg(test)]
+mod admitted_manifest_tests {
+    use super::*;
+    #[test]
+    fn trusted_created_flag_preserves_missing_versus_preexisting_empty_behavior() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = StoreConfig {
+            manifest_root: temp.path().join("manifest"),
+            thumbnail_root: temp.path().join("thumb"),
+            large_root: temp.path().join("large"),
+            layout: Layout::HashPrefix,
+            thumbnail_bytes: 1000,
+            large_bytes: 2000,
+        };
+        let db = Connection::open_in_memory()?;
+        let resolved = PreviewStore::current_configuration_on(
+            &db,
+            config.clone(),
+            ManifestOrigin::CreatedByAdmission,
+        )?;
+        assert_eq!(resolved.thumbnail_root, config.thumbnail_root);
+        assert_eq!(resolved.large_bytes, config.large_bytes);
+        assert!(
+            PreviewStore::current_configuration_on(&db, config.clone(), ManifestOrigin::Existing)
+                .unwrap_err()
+                .to_string()
+                .contains("not a preview manifest")
+        );
+        db.execute_batch("PRAGMA application_id=1346588758; PRAGMA user_version=99;")?;
+        // A future existing manifest must fail before even querying locations.
+        assert!(
+            PreviewStore::current_configuration_on(&db, config, ManifestOrigin::Existing).is_err()
+        );
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
+            99
+        );
+        Ok(())
     }
 }

@@ -42,3 +42,5 @@ pub use service::{
 
 mod config;
 pub use config::PreviewConfiguration;
+
+pub(crate) use store::{AdmittedStoreFiles, ManifestOrigin};

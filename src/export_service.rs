@@ -119,7 +119,7 @@ impl Drop for AcquiredExecutorLock {
 }
 pub struct ExportService {
     catalog: PathBuf,
-    catalog_pin: std::sync::Arc<File>,
+    catalog_pin: std::sync::Arc<crate::catalog_session::CatalogSessionAuthority>,
     executable: PathBuf,
     staging: PathBuf,
     limits: ExportServiceLimits,
@@ -147,7 +147,7 @@ impl ExportService {
     /// also open the configured preview store, whose process lock prevents a second
     /// application from running that service concurrently.
     pub fn open(catalog: &Catalog, executable: &Path, limits: ExportServiceLimits) -> Result<Self> {
-        crate::catalog_backup::require_jobs_released(&catalog.root)?;
+        catalog.require_jobs_released()?;
         limits.validate()?;
         ensure!(
             executable.is_absolute(),
@@ -173,7 +173,7 @@ impl ExportService {
         );
         Ok(Self {
             catalog: root,
-            catalog_pin: catalog.relink_file.clone(),
+            catalog_pin: catalog.session.clone(),
             executable: executable.to_owned(),
             staging,
             limits,
@@ -187,14 +187,16 @@ impl ExportService {
         })
     }
     fn check_catalog(&self, catalog: &Catalog) -> Result<()> {
-        crate::catalog_backup::require_jobs_released(&catalog.root)?;
+        catalog.require_jobs_released()?;
         ensure!(
             catalog.root.canonicalize()? == self.catalog,
             "export executor belongs to another catalog"
         );
         ensure!(
-            crate::storage_volume::held_object_key(&self.catalog_pin)?
-                == crate::storage_volume::held_object_key(&catalog.relink_file)?,
+            crate::catalog_session::CatalogSessionAuthority::export_matches(
+                &self.catalog_pin,
+                &catalog.session
+            )?,
             "export executor selected database changed"
         );
         Ok(())

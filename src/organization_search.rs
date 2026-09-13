@@ -8,7 +8,8 @@ use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqlValue
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -156,6 +157,7 @@ const RESET_TEXT: &str = "INSERT INTO temp.organization_candidate_text(organizat
 pub struct SearchSession {
     sender: Option<mpsc::SyncSender<SessionRequest>>,
     worker: Option<thread::JoinHandle<()>>,
+    managed: Option<Arc<ManagedSearch>>,
 }
 struct SessionRequest {
     limit: usize,
@@ -864,6 +866,9 @@ impl Catalog {
                 )
             })?;
         let permit = SnapshotPermit;
+        if self.session.pool().is_some() {
+            return managed_search(self, query, lifetime_seconds, text_limits, permit);
+        }
         let path = self.root.join("catalog.sqlite3");
         let (sender, receiver) = mpsc::sync_channel::<SessionRequest>(1);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
@@ -932,6 +937,7 @@ impl Catalog {
         Ok(SearchSession {
             sender: Some(sender),
             worker: Some(worker),
+            managed: None,
         })
     }
     pub fn explain_search(
@@ -962,6 +968,9 @@ impl SearchSession {
     }
     pub fn close(mut self) -> Result<()> {
         self.sender.take();
+        if let Some(owner) = self.managed.take() {
+            return crate::catalog_session::SessionTask::join(owner.as_ref());
+        }
         if let Some(worker) = self.worker.take() {
             worker
                 .join()
@@ -973,5 +982,285 @@ impl SearchSession {
 impl Drop for SearchSession {
     fn drop(&mut self) {
         self.sender.take();
+        if let Some(owner) = &self.managed {
+            crate::catalog_session::SessionTask::request_cancel(owner.as_ref());
+        }
+    }
+}
+
+struct ManagedSearch {
+    state: Mutex<ManagedSearchState>,
+    cancel: Arc<AtomicBool>,
+    interrupt: rusqlite::InterruptHandle,
+    sender: mpsc::SyncSender<SessionRequest>,
+    pool: Arc<crate::catalog_session::RolePool>,
+    role: usize,
+}
+struct ManagedSearchState {
+    worker: Option<thread::JoinHandle<()>>,
+    joined: bool,
+}
+impl crate::catalog_session::SessionTask for ManagedSearch {
+    fn request_cancel(&self) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.joined {
+            return;
+        } // A late callback cannot interrupt a reused role.
+        self.cancel.store(true, Ordering::Release);
+        self.interrupt.interrupt();
+        let (reply, _) = mpsc::sync_channel(1);
+        let _ = self.sender.try_send(SessionRequest {
+            limit: 0,
+            scan: 0,
+            reply,
+        });
+    }
+    fn is_finished(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .worker
+            .as_ref()
+            .is_none_or(|w| w.is_finished())
+    }
+    fn join(&self) -> Result<()> {
+        self.request_cancel();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.joined {
+            return Ok(());
+        }
+        let healthy = state.worker.take().is_none_or(|w| w.join().is_ok());
+        // Keep the owner lock through return admission. Any old cancel waits
+        // until joined=true and therefore cannot affect the next lease.
+        let result = self.pool.joined(self.role, healthy);
+        state.joined = true;
+        result
+    }
+}
+struct QueryCancellation<'a> {
+    db: &'a crate::catalog_session::SqlConnection,
+    armed: bool,
+}
+impl<'a> QueryCancellation<'a> {
+    fn new(db: &'a crate::catalog_session::SqlConnection, cancel: Arc<AtomicBool>) -> Result<Self> {
+        db.install_cancel_progress(cancel)?;
+        Ok(Self { db, armed: true })
+    }
+    fn finish(mut self) -> Result<()> {
+        self.armed = false;
+        self.db.remove_progress_handler()?;
+        Ok(())
+    }
+}
+impl Drop for QueryCancellation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // During unwinding this records quarantine on failure; it never
+            // permits rollback/reuse with an unverified retained callback.
+            let _ = self.db.remove_progress_handler();
+        }
+    }
+}
+fn cancellable_query<T>(
+    db: &crate::catalog_session::SqlConnection,
+    cancel: Arc<AtomicBool>,
+    query: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let hook = QueryCancellation::new(db, cancel)?;
+    let result = query();
+    hook.finish()?;
+    result
+}
+fn managed_search(
+    catalog: &Catalog,
+    query: Query,
+    lifetime_seconds: u64,
+    text_limits: TextLimits,
+    permit: SnapshotPermit,
+) -> Result<SearchSession> {
+    use crate::catalog_session::SessionTask;
+    catalog.session.reap_finished_searches()?;
+    let pool = catalog.session.pool().unwrap().clone();
+    let (role, db) = pool.lease_search()?;
+    let interrupt = db.get_interrupt_handle();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop = cancel.clone();
+    let (sender, receiver) = mpsc::sync_channel::<SessionRequest>(1);
+    let (start_tx, start_rx) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("catalog-search-snapshot".into())
+        .spawn(move || {
+            let _permit = permit;
+            let opened = cancellable_query(&db, stop.clone(), || -> Result<()> {
+                ensure!(!stop.load(Ordering::Acquire), "search snapshot canceled");
+                db.execute_batch("BEGIN")?;
+                ready(&db)?;
+                Ok(())
+            });
+            let healthy_start = opened.is_ok();
+            let _ = start_tx.send(opened);
+            let started = Instant::now();
+            let ttl = Duration::from_secs(lifetime_seconds);
+            let mut next = None;
+            if healthy_start {
+                while !stop.load(Ordering::Acquire) && started.elapsed() < ttl {
+                    let Ok(request) = receiver.recv_timeout(ttl.saturating_sub(started.elapsed()))
+                    else {
+                        break;
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if started.elapsed() >= ttl {
+                        let _ = request
+                            .reply
+                            .send(Err(anyhow::anyhow!("search snapshot expired")));
+                        break;
+                    }
+                    let result = cancellable_query(&db, stop.clone(), || -> Result<Page> {
+                        ensure!(!stop.load(Ordering::Acquire), "search snapshot canceled");
+                        page(
+                            &db,
+                            &query,
+                            next.as_ref(),
+                            request.limit,
+                            request.scan,
+                            text_limits,
+                        )
+                    });
+                    let exhausted = result.as_ref().is_ok_and(|p| p.exhausted);
+                    if let Ok(page) = &result {
+                        next = page.next.clone();
+                    }
+                    if request.reply.send(result).is_err()
+                        || exhausted
+                        || db.hook_owner_unverifiable()
+                    {
+                        break;
+                    }
+                }
+            }
+            // The canceled progress hook is gone before rollback; no poisoned flag
+            // or stale interrupt callback is retained by the next role borrower.
+            if !db.hook_owner_unverifiable() {
+                let _ = db.execute_batch("ROLLBACK");
+            }
+        });
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(error) => {
+            let _ = pool.joined(role, false);
+            return Err(error.into());
+        }
+    };
+    let owner = Arc::new(ManagedSearch {
+        state: Mutex::new(ManagedSearchState {
+            worker: Some(worker),
+            joined: false,
+        }),
+        cancel,
+        interrupt,
+        sender: sender.clone(),
+        pool,
+        role,
+    });
+    if let Err(error) = catalog.session.register_search(owner.clone()) {
+        owner.join()?;
+        return Err(error);
+    }
+    match start_rx.recv() {
+        Ok(Ok(())) => Ok(SearchSession {
+            sender: Some(sender),
+            worker: None,
+            managed: Some(owner),
+        }),
+        Ok(Err(error)) => {
+            owner.join()?;
+            Err(error)
+        }
+        Err(error) => {
+            owner.join()?;
+            Err(error.into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_cancellation_tests {
+    use super::*;
+    #[test]
+    fn progress_registration_closes_interrupt_before_sql_entry_gap_and_clears_for_reuse()
+    -> Result<()> {
+        let db: crate::catalog_session::SqlConnection = Connection::open_in_memory()?.into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let hook = QueryCancellation::new(&db, cancel.clone())?;
+            assert!(!cancel.load(Ordering::Acquire));
+            // Interrupt alone while SQLite is idle has no effect. The scoped
+            // flag hook must catch cancellation after the precheck, at entry.
+            db.get_interrupt_handle().interrupt();
+            cancel.store(true, Ordering::Release);
+            let error=db.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0)).unwrap_err();
+            assert!(
+                matches!(error,rusqlite::Error::SqliteFailure(e,_) if e.code==rusqlite::ErrorCode::OperationInterrupted)
+            );
+            hook.finish()?;
+        }
+        db.execute_batch("BEGIN; SELECT 1; ROLLBACK;")?;
+        assert_eq!(db.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0))?,12_502_500);
+        Ok(())
+    }
+    #[test]
+    fn progress_setup_rejects_unowned_wrapper_before_query() -> Result<()> {
+        let owner = Connection::open_in_memory()?;
+        // A deliberately borrowed wrapper exercises rusqlite check_owned.
+        // Managed roster constructors only use owned open_with_flags handles.
+        let borrowed: crate::catalog_session::SqlConnection =
+            unsafe { Connection::from_handle(owner.handle())? }.into();
+        let called = AtomicBool::new(false);
+        assert!(
+            cancellable_query(&borrowed, Arc::new(AtomicBool::new(false)), || {
+                called.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!called.load(Ordering::Acquire));
+        drop(borrowed);
+        owner.execute_batch("SELECT 1")?;
+        Ok(())
+    }
+    #[test]
+    fn active_query_observes_external_cancel_before_worker_join() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let interrupt = db.get_interrupt_handle();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || -> Result<()> {
+            let sent = AtomicBool::new(false);
+            db.progress_handler(
+                1000,
+                Some(move || {
+                    if !sent.swap(true, Ordering::AcqRel) {
+                        let _ = entered.try_send(());
+                    }
+                    stop.load(Ordering::Acquire)
+                }),
+            )?;
+            let result=db.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0));
+            db.progress_handler(0, None::<fn() -> bool>)?;
+            ensure!(
+                matches!(result,Err(rusqlite::Error::SqliteFailure(e,_)) if e.code==rusqlite::ErrorCode::OperationInterrupted)
+            );
+            db.execute_batch("BEGIN; SELECT 1; ROLLBACK;")?;
+            Ok(())
+        });
+        let entered = observed.recv_timeout(Duration::from_secs(5));
+        cancel.store(true, Ordering::Release);
+        interrupt.interrupt();
+        worker.join().unwrap()?;
+        entered?;
+        Ok(())
     }
 }

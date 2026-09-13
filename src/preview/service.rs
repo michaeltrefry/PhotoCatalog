@@ -217,11 +217,11 @@ impl Drop for NativeLaunchPause {
 pub struct NativeLaunchPermit {
     _pause: NativeLaunchPause,
     exclusive: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    catalog: std::sync::Arc<std::fs::File>,
+    catalog: std::sync::Arc<crate::catalog_session::CatalogSessionAuthority>,
 }
 impl NativeLaunchPermit {
     pub(crate) fn matches_catalog(&self, catalog: &Catalog) -> bool {
-        std::sync::Arc::ptr_eq(&self.catalog, &catalog.relink_file)
+        std::sync::Arc::ptr_eq(&self.catalog, &catalog.session)
     }
 }
 impl Drop for NativeLaunchPermit {
@@ -555,6 +555,9 @@ impl SavedJob {
     }
 }
 impl PreviewService {
+    pub(crate) fn return_managed_sql(&mut self) {
+        self.store.return_managed_sql();
+    }
     pub fn open(
         config: StoreConfig,
         original_roots: &[PathBuf],
@@ -562,6 +565,29 @@ impl PreviewService {
         policy: PreviewPolicy,
         limits: ServiceLimits,
     ) -> Result<Self> {
+        Self::validate_open(&executable, &policy, &limits)?;
+        let config = PreviewStore::current_configuration(config)?;
+        let store = PreviewStore::open(config, original_roots)?;
+        Self::from_store(store, executable, policy, limits)
+    }
+    pub(crate) fn open_admitted(
+        config: StoreConfig,
+        db: crate::catalog_session::SqlConnection,
+        origin: super::store::ManifestOrigin,
+        files: std::sync::Arc<dyn super::store::AdmittedStoreFiles>,
+        executable: PathBuf,
+        policy: PreviewPolicy,
+        limits: ServiceLimits,
+    ) -> Result<Self> {
+        Self::validate_open(&executable, &policy, &limits)?;
+        let store = PreviewStore::open_admitted(config, db, origin, files)?;
+        Self::from_store(store, executable, policy, limits)
+    }
+    fn validate_open(
+        executable: &std::path::Path,
+        policy: &PreviewPolicy,
+        limits: &ServiceLimits,
+    ) -> Result<()> {
         limits.decode_limits.validate()?;
         ensure!(
             executable.is_absolute() && executable.is_file(),
@@ -580,8 +606,14 @@ impl PreviewService {
             ensure!((1..=8192).contains(&tier.edge), "preview policy dimensions");
             tier.encoding.validate()?;
         }
-        let config = PreviewStore::current_configuration(config)?;
-        let store = PreviewStore::open(config, original_roots)?;
+        Ok(())
+    }
+    fn from_store(
+        store: PreviewStore,
+        executable: PathBuf,
+        policy: PreviewPolicy,
+        limits: ServiceLimits,
+    ) -> Result<Self> {
         let staging = store.configuration().manifest_root.join("workers");
         recover_worker_staging(&staging, 128)?;
         let prepared = super::prepared_cache::PreparedCache::open(
@@ -1842,7 +1874,7 @@ impl PreviewService {
         Ok(NativeLaunchPermit {
             _pause: pause,
             exclusive: self.external_native.clone(),
-            catalog: catalog.relink_file.clone(),
+            catalog: catalog.session.clone(),
         })
     }
     /// Bounded by configured workers. These are owned, not-yet-reaped process

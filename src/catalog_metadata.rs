@@ -140,9 +140,9 @@ pub struct FileInstance {
 }
 
 /// In-memory prepared edit; fields are private so only validated preparation
-/// can produce this authority. Catalog handles inherit the same pinned File Arc.
+/// can produce this authority. Catalog workers inherit the exact session Arc.
 pub(crate) struct PreparedEdit {
-    catalog_file: std::sync::Arc<std::fs::File>,
+    catalog_file: std::sync::Arc<crate::catalog_session::CatalogSessionAuthority>,
     image_identity: crate::catalog_images::ImageMetadataIdentity,
     expected_revision: i64,
     base_model: Option<i64>,
@@ -1160,7 +1160,7 @@ impl Catalog {
             .to_hex()
             .to_string();
         Ok(PreparedEdit {
-            catalog_file: self.relink_file.clone(),
+            catalog_file: self.session.clone(),
             image_identity,
             expected_revision,
             base_model,
@@ -1182,7 +1182,7 @@ impl Catalog {
         after: impl FnOnce(&Connection, i64) -> Result<()>,
     ) -> Result<Change> {
         ensure!(
-            std::sync::Arc::ptr_eq(&self.relink_file, &edit.catalog_file),
+            std::sync::Arc::ptr_eq(&self.session, &edit.catalog_file),
             "prepared metadata edit belongs to another catalog session"
         );
         let PreparedEdit {
@@ -1356,26 +1356,67 @@ fn index_directory(
     if indexed {
         return Ok(());
     }
-    // One directory enumeration per import scan; disk-backed indexed joins avoid O(files²).
+    // Enumeration only opens a directory; regular-file content remains the
+    // source reader's responsibility. The SQL seam also consumes bounded facts
+    // from an eventual F stream without moving this connection to that owner.
+    index_directory_facts(
+        db,
+        directory,
+        fs::read_dir(directory)?.map(|entry| {
+            let entry = entry?;
+            Ok(DirectoryFact {
+                path: entry.path(),
+                regular: entry.file_type()?.is_file(),
+            })
+        }),
+        cancel,
+    )
+}
+
+pub(crate) struct DirectoryFact {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) regular: bool,
+}
+fn index_directory_facts(
+    db: &Connection,
+    directory: &Path,
+    facts: impl IntoIterator<Item = Result<DirectoryFact>>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let key = location_bytes(directory);
     let tx = db.unchecked_transaction()?;
-    let mut entries = 0usize;
-    for entry in fs::read_dir(directory)? {
+    for (index, fact) in facts.into_iter().enumerate() {
         if let Some(cancel) = cancel {
             ensure!(
                 !cancel.load(std::sync::atomic::Ordering::Acquire),
                 "metadata discovery canceled"
             );
-            entries += 1;
             ensure!(
-                entries <= xmp_packets::Limits::default().max_entries,
+                index < xmp_packets::Limits::default().max_entries,
                 "directory metadata association entry limit exceeded; no truncated associations admitted"
             );
         }
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        let fact = fact?;
+        ensure!(
+            fact.path.parent() == Some(directory),
+            "directory fact belongs to another parent"
+        );
+        if cancel.is_some() {
+            let native = crate::storage_volume::NativePath::from_path(&fact.path);
+            let units = match &native {
+                crate::storage_volume::NativePath::UnixBytes(v) => v.len(),
+                crate::storage_volume::NativePath::WindowsWide(v) => v.len(),
+            };
+            ensure!(
+                units <= crate::catalog_session::PATH_UNITS,
+                "directory fact path exceeds byte admission"
+            );
+            native.to_path()?;
+        }
+        if !fact.regular {
             continue;
         }
-        let path = entry.path();
+        let path = &fact.path;
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
@@ -1393,7 +1434,7 @@ fn index_directory(
                 location_bytes(Path::new(name)),
                 name_key(stem),
                 name_key(name),
-                location_bytes(&path),
+                location_bytes(path),
                 path.to_string_lossy(),
                 ext == "xmp"
             ],
@@ -1404,17 +1445,39 @@ fn index_directory(
     Ok(())
 }
 
+pub(crate) fn initialize_discovery_connection(db: &Connection) -> Result<()> {
+    db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;")?;
+    initialize_discovery(db)?;
+    db.execute_batch("PRAGMA temp.max_page_count=16384; PRAGMA temp.cache_size=-8192;")?;
+    Ok(())
+}
+
 /// Worker-owned directory facts; no catalog connection or authority is held.
 pub(crate) struct ImportDiscovery {
-    db: Connection,
+    db: crate::catalog_session::SqlConnection,
+    progress_registered: bool,
 }
 impl ImportDiscovery {
     pub(crate) fn new() -> Result<Self> {
         let db = Connection::open("")?;
-        db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;")?;
-        initialize_discovery(&db)?;
-        db.execute_batch("PRAGMA temp.max_page_count=16384; PRAGMA temp.cache_size=-8192;")?;
-        Ok(Self { db })
+        initialize_discovery_connection(&db)?;
+        Ok(Self {
+            db: db.into(),
+            progress_registered: false,
+        })
+    }
+    pub(crate) fn from_admitted(
+        db: crate::catalog_session::SqlConnection,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self> {
+        let mut owner = Self {
+            db,
+            progress_registered: false,
+        };
+        owner.db.install_cancel_progress(cancel)?;
+        owner.progress_registered = true;
+        initialize_discovery_connection(&owner.db)?;
+        Ok(owner)
     }
     pub(crate) fn sidecars(
         &self,
@@ -1436,6 +1499,21 @@ impl ImportDiscovery {
             Ok(Source {kind:"sidecar".into(), locator, display, ambiguous:multiple || matches!=1,
                 provenance:serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}})})
         }).collect()
+    }
+}
+impl Drop for ImportDiscovery {
+    fn drop(&mut self) {
+        if self.db.hook_owner_unverifiable() {
+            return;
+        }
+        if self.progress_registered && self.db.remove_progress_handler().is_err() {
+            // Managed roles are always owned connections. A check_owned error
+            // violates that invariant: retain the owner without further SQL.
+            return;
+        }
+        if !self.db.is_autocommit() {
+            let _ = self.db.execute_batch("ROLLBACK");
+        }
     }
 }
 pub(crate) struct PreparedImportSource {
@@ -1759,7 +1837,7 @@ impl Catalog {
         &mut self,
         operation: &str,
     ) -> Result<crate::metadata_export::ExportReceipt> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         // IMMEDIATE prevents a concurrent catalog writer from changing metadata between the
         // revision check and external publication. Filesystem recovery evidence remains durable
         // even if the catalog transaction itself fails after publication.
@@ -1809,7 +1887,7 @@ impl Catalog {
         &mut self,
         directory: &Path,
     ) -> Result<crate::metadata_export::ExportReceipt> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         let directory = directory.canonicalize()?;
         let name = directory
             .file_name()
@@ -1881,6 +1959,102 @@ mod image_source_state_tests {
         assert!(!catalog.unavailable_metadata_source("source", &source, "missing fixture")?);
         assert_eq!(catalog.metadata_for_image(&master)?.revision, before + 1);
         assert_eq!(catalog.metadata_for_image(&copy)?.revision, copy_before + 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod managed_discovery_tests {
+    use super::*;
+    #[test]
+    fn bounded_directory_facts_preserve_native_names_and_rollback_incomplete_roster() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().canonicalize()?;
+        let discovery = ImportDiscovery::new()?;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let original = directory.join("photo.cr2");
+        let sidecar = directory.join("photo.cr2.xmp");
+        let mut paths = vec![original.clone(), sidecar.clone()];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            paths.push(directory.join(std::ffi::OsString::from_vec(b"native\xff.xmp".to_vec())));
+        }
+        index_directory_facts(
+            &discovery.db,
+            &directory,
+            paths.iter().cloned().map(|path| {
+                Ok(DirectoryFact {
+                    path,
+                    regular: true,
+                })
+            }),
+            Some(&cancel),
+        )?;
+        for path in &paths {
+            let stored: Vec<u8> = discovery.db.query_row(
+                "SELECT path FROM metadata_scan_files WHERE directory=?1 AND name=?2",
+                params![
+                    location_bytes(&directory),
+                    location_bytes(Path::new(path.file_name().unwrap()))
+                ],
+                |r| r.get(0),
+            )?;
+            assert_eq!(stored, location_bytes(path));
+        }
+        assert_eq!(discovery.sidecars(&original, &cancel)?.len(), 1);
+        initialize_discovery(&discovery.db)?;
+        let error = index_directory_facts(
+            &discovery.db,
+            &directory,
+            [
+                Ok(DirectoryFact {
+                    path: original.clone(),
+                    regular: true,
+                }),
+                Ok(DirectoryFact {
+                    path: directory.join("wrong/elsewhere.xmp"),
+                    regular: true,
+                }),
+            ],
+            Some(&cancel),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("another parent"));
+        assert_eq!(
+            discovery
+                .db
+                .query_row("SELECT count(*) FROM metadata_scan_files", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            discovery
+                .db
+                .query_row("SELECT count(*) FROM metadata_scan_dirs", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        let too_many = (0..=xmp_packets::Limits::default().max_entries).map(|_| {
+            Ok(DirectoryFact {
+                path: original.clone(),
+                regular: false,
+            })
+        });
+        assert!(
+            index_directory_facts(&discovery.db, &directory, too_many, Some(&cancel))
+                .unwrap_err()
+                .to_string()
+                .contains("entry limit")
+        );
+        assert_eq!(
+            discovery
+                .db
+                .query_row("SELECT count(*) FROM metadata_scan_dirs", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
         Ok(())
     }
 }

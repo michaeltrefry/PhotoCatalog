@@ -346,6 +346,7 @@ struct Queue {
     ticket_foreground: HashMap<(String, String), TicketPriority>,
 }
 struct Shared {
+    managed_catalog: bool,
     lightroom: Arc<Mutex<lightroom_bridge::Control>>,
     exports: Arc<Mutex<exports::Control>>,
     copy: Arc<Mutex<copy::Control>>,
@@ -439,8 +440,18 @@ impl Drop for Handle {
 pub struct Bridge(Arc<Handle>);
 impl Bridge {
     pub fn spawn(config: Config) -> Result<Self> {
+        Self::spawn_engine(config, None)
+    }
+    /// Unselected C-only constructor; caller must keep F independently owned and
+    /// forbid any live catalog/backup/native descendant at bootstrap admission.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_managed(config: Config, managed: ManagedCatalogConfig) -> Result<Self> {
+        Self::spawn_engine(config, Some(managed))
+    }
+    fn spawn_engine(config: Config, managed: Option<ManagedCatalogConfig>) -> Result<Self> {
         config.validate()?;
         let shared = Arc::new(Shared {
+            managed_catalog: managed.is_some(),
             lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),
             exports: Arc::new(Mutex::new(exports::Control::default())),
             relink: Arc::new(Mutex::new(relink::Control::default())),
@@ -471,7 +482,11 @@ impl Bridge {
         let actor_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("catalog-application".into())
-            .spawn(move || Actor::new(config, actor_shared).run())?;
+            .spawn(move || {
+                let mut actor = Actor::new(config, actor_shared);
+                actor.managed = managed;
+                actor.run()
+            })?;
         Ok(Self(Arc::new(Handle {
             shared,
             thread: Mutex::new(Some(thread)),
@@ -488,6 +503,12 @@ impl Bridge {
         self.0.try_shutdown()
     }
     pub fn submit(&self, request: Request) -> std::result::Result<Pending, BridgeError> {
+        if self.0.shared.managed_catalog && matches!(&request, Request::Lightroom { .. }) {
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "independent Lightroom requests belong to the desktop owner",
+            ));
+        }
         let size = serde_json::to_vec(&request)
             .map_err(|e| error(ErrorCode::InvalidRequest, e.to_string()))?
             .len();
@@ -959,6 +980,7 @@ struct Ticket {
     cancel: Cancellation,
 }
 struct Open {
+    managed: Option<crate::catalog_session::ManagedSession>,
     closing: bool,
     exports: exports::Coordinator,
     token: String,
@@ -1013,7 +1035,16 @@ impl ImportTask {
         self.preparation = None; // Join after signaling every owned consumer.
     }
 }
+#[derive(Clone)]
+pub(crate) struct ManagedCatalogConfig {
+    pub(crate) filesystem: Arc<dyn crate::catalog_session::CatalogFilesystem>,
+    pub(crate) store_files: Arc<dyn preview::AdmittedStoreFiles>,
+}
 struct Actor {
+    failed_admission: Option<crate::catalog_session::AdmissionCleanup>,
+    failed_session: Option<crate::catalog_session::ManagedSession>,
+    managed: Option<ManagedCatalogConfig>,
+    next_admission: u64,
     #[cfg(test)]
     retained_on_drop: Option<mpsc::SyncSender<Open>>,
     lightroom: lightroom_bridge::Coordinator,
@@ -1128,6 +1159,10 @@ impl Actor {
         Self {
             #[cfg(test)]
             retained_on_drop: None,
+            managed: None,
+            failed_admission: None,
+            failed_session: None,
+            next_admission: 0,
             lightroom: lightroom_bridge::Coordinator::new(shared.lightroom.clone()),
             config,
             shared,
@@ -1276,42 +1311,93 @@ impl Actor {
         }
         result
     }
+    fn retained_admission_token(&self) -> Option<&str> {
+        self.failed_admission
+            .as_ref()
+            .map(|c| c.session().as_str())
+            .or_else(|| {
+                self.failed_session
+                    .as_ref()
+                    .map(|s| s.bootstrap.session.as_str())
+            })
+    }
+    fn publish_failed_admission(&self, message: String) {
+        let token = self.retained_admission_token().map(str::to_owned);
+        let mut queue = self.shared.queue.lock().unwrap();
+        queue.status.phase = if token.is_some() {
+            Phase::Closing
+        } else {
+            Phase::Failed
+        };
+        queue.status.catalog = token;
+        queue.status.message = Some(if queue.status.catalog.is_some() {
+            format!("Catalog admission failed; cleanup owner retained. Retry Close. {message}")
+        } else {
+            message
+        });
+    }
     fn close_inner(&mut self) -> std::result::Result<(), BridgeError> {
+        if let Some(cleanup) = &mut self.failed_admission {
+            cleanup.close().map_err(native)?;
+        }
+        self.failed_admission.take();
+        if let Some(owner) = &mut self.failed_session {
+            owner.close().map_err(native)?;
+        }
+        self.failed_session.take();
         if let Some(open) = self.open.as_mut() {
             open.closing = true;
-            open.exports.signal_shutdown(&self.shared.exports);
-            open.service.signal_shutdown();
-            self.shared.relink.lock().unwrap().request_cancel();
-            open.hydration.request_cancel();
-            if let Some(import) = &mut open.import {
-                import.request_cancel_owned(&mut open.service);
+            if let Some(pool) = open.catalog.session.pool() {
+                pool.begin_close();
             }
-            for (_, t) in open.tickets.drain() {
-                if let Some(c) = t.consumer {
-                    let _ = open.service.cancel(c);
+            open.catalog.session.cancel_searches();
+            if let Some(managed) = &mut open.managed
+                && managed.sql_returned
+            {
+                managed.close().map_err(native)?;
+            }
+            if !open.managed.as_ref().is_some_and(|m| m.sql_returned) {
+                open.exports.signal_shutdown(&self.shared.exports);
+                open.service.signal_shutdown();
+                self.shared.relink.lock().unwrap().request_cancel();
+                open.hydration.request_cancel();
+                if let Some(import) = &mut open.import {
+                    import.request_cancel_owned(&mut open.service);
+                }
+                for (_, t) in open.tickets.drain() {
+                    if let Some(c) = t.consumer {
+                        let _ = open.service.cancel(c);
+                    }
+                }
+                self.shared
+                    .backups
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shutdown()
+                    .map_err(native)?;
+                open.relink.shutdown(&self.shared.relink);
+                open.exports.shutdown(&self.shared.exports);
+                copy::close(&mut open.catalog, &self.shared.copy);
+                if let Some(import) = &mut open.import {
+                    import.preparation = None;
+                }
+                // The complete Open, including import lock/catalog, remains owned on
+                // failure. No background maintenance or new command can restart it.
+                #[cfg(test)]
+                if let Some(checkpoint) = &self.config.import_checkpoint
+                    && let Some(import) = &open.import
+                {
+                    checkpoint("before_service_drop", &import.cancel.0);
+                }
+                open.service.try_shutdown().map_err(native)?;
+                open.catalog.session.drain_searches().map_err(native)?;
+                if let Some(managed) = &mut open.managed {
+                    open.catalog.db.return_managed();
+                    open.service.return_managed_sql();
+                    managed.sql_returned = true;
+                    managed.close().map_err(native)?;
                 }
             }
-            self.shared
-                .backups
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .shutdown()
-                .map_err(native)?;
-            open.relink.shutdown(&self.shared.relink);
-            open.exports.shutdown(&self.shared.exports);
-            copy::close(&mut open.catalog, &self.shared.copy);
-            if let Some(import) = &mut open.import {
-                import.preparation = None;
-            }
-            // The complete Open, including import lock/catalog, remains owned on
-            // failure. No background maintenance or new command can restart it.
-            #[cfg(test)]
-            if let Some(checkpoint) = &self.config.import_checkpoint
-                && let Some(import) = &open.import
-            {
-                checkpoint("before_service_drop", &import.cancel.0);
-            }
-            open.service.try_shutdown().map_err(native)?;
         }
         if let Some(mut open) = self.open.take() {
             drop(open.hydration);
@@ -1396,6 +1482,14 @@ impl Actor {
     }
     fn current(&mut self, token: &str) -> std::result::Result<&mut Open, BridgeError> {
         let open = self.current_for_close(token)?;
+        if open
+            .catalog
+            .session
+            .pool()
+            .is_some_and(|pool| pool.is_poisoned())
+        {
+            open.closing = true;
+        }
         if open.closing {
             return Err(error(
                 ErrorCode::Busy,
@@ -1424,11 +1518,14 @@ impl Actor {
         create: bool,
         cancel: &Cancellation,
     ) -> std::result::Result<Response, BridgeError> {
-        if self.open.is_some() {
+        if self.open.is_some() || self.failed_admission.is_some() || self.failed_session.is_some() {
             return Err(error(
                 ErrorCode::Busy,
                 "close the current catalog before opening another",
             ));
+        }
+        if self.managed.is_some() {
+            return self.open_managed_path(path, create, cancel);
         }
         let path = path
             .to_path()
@@ -1480,8 +1577,7 @@ impl Actor {
         self.set_phase(Phase::Opening, None);
         let opened = (|| -> Result<Open> {
             let catalog = Catalog::open(&path)?;
-            let jobs_held =
-                crate::catalog_backup::restore_status(&path)?.is_some_and(|s| s.jobs_held);
+            let jobs_held = catalog.restore_status()?.is_some_and(|s| s.jobs_held);
             let cache = match &self.config.cache_root {
                 Some(parent) => parent.join(
                     blake3::hash(&serde_json::to_vec(&NativePath::from_path(&resolved))?)
@@ -1505,6 +1601,7 @@ impl Actor {
                 self.config.preview_limits.clone(),
             )?;
             Ok(Open {
+                managed: None,
                 closing: false,
                 exports: exports::Coordinator::default(),
                 token: uuid::Uuid::new_v4().to_string(),
@@ -1544,12 +1641,154 @@ impl Actor {
             }
         }
     }
+    fn open_managed_path(
+        &mut self,
+        path: NativePath,
+        create: bool,
+        cancel: &Cancellation,
+    ) -> std::result::Result<Response, BridgeError> {
+        use crate::catalog_session::{BootstrapMode, LeaseId, ManagedSession, PrepareCatalog};
+        let configured = self.managed.as_ref().unwrap().clone();
+        // Full backup SQL isolation remains a separately tracked prerequisite;
+        // this unselected bootstrap must never retire an active backup owner.
+        self.shared
+            .backups
+            .lock()
+            .unwrap()
+            .require_idle_for_catalog_admission()
+            .map_err(native)?;
+        crate::catalog_session::validate_path(&path).map_err(native)?;
+        let root = path.to_path().map_err(|e| native(e.into()))?;
+        let resolved = crate::prospective_directory(&root).map_err(native)?;
+        let cache = match &self.config.cache_root {
+            Some(parent) => crate::prospective_directory(parent).map_err(native)?.join(
+                blake3::hash(
+                    &serde_json::to_vec(&NativePath::from_path(&resolved))
+                        .map_err(|e| native(e.into()))?,
+                )
+                .to_hex()
+                .as_str(),
+            ),
+            None => resolved.join("application-previews"),
+        };
+        self.next_admission = self.next_admission.checked_add(1).ok_or_else(|| {
+            error(
+                ErrorCode::ResourceLimit,
+                "catalog admission sequence exhausted",
+            )
+        })?;
+        let request = PrepareCatalog {
+            operation: U64(self.next_admission),
+            session: LeaseId::new(),
+            mode: if create {
+                BootstrapMode::DesktopCreate
+            } else {
+                BootstrapMode::DesktopExisting
+            },
+            root: path,
+            manifest_root: NativePath::from_path(&cache.join("manifest")),
+            import_source: None,
+        };
+        self.set_phase(Phase::Opening, None);
+        let mut managed = match ManagedSession::admit(configured.filesystem, &request, &cancel.0) {
+            Ok(owner) => owner,
+            Err(failure) if failure.is_poisoned() => failure.retire_poisoned(),
+            Err(failure) => {
+                let message = failure.to_string();
+                self.failed_admission = failure
+                    .into_cleanup()
+                    .filter(|cleanup| !cleanup.is_complete());
+                self.publish_failed_admission(message.clone());
+                return Err(error(ErrorCode::Native, message));
+            }
+        };
+        let built = (|| -> anyhow::Result<(PreviewService, bool)> {
+            let jobs_held = managed
+                .catalog
+                .as_ref()
+                .unwrap()
+                .restore_status()?
+                .is_some_and(|s| s.jobs_held);
+            let origin = if managed.bootstrap.manifest.created {
+                preview::ManifestOrigin::CreatedByAdmission
+            } else {
+                preview::ManifestOrigin::Existing
+            };
+            let service = PreviewService::open_admitted(
+                preview::StoreConfig {
+                    manifest_root: managed
+                        .bootstrap
+                        .manifest
+                        .path
+                        .to_path()?
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("admitted manifest has no parent"))?
+                        .to_path_buf(),
+                    layout: preview::Layout::HashPrefix,
+                    thumbnail_root: cache.join("thumbnail"),
+                    large_root: cache.join("large"),
+                    thumbnail_bytes: 2 * 1024 * 1024 * 1024,
+                    large_bytes: 8 * 1024 * 1024 * 1024,
+                },
+                managed.manifest()?,
+                origin,
+                configured.store_files,
+                self.config.worker_executable.clone(),
+                self.config.preview_policy.clone(),
+                self.config.preview_limits.clone(),
+            )?;
+            Ok((service, jobs_held))
+        })();
+        match built {
+            Ok((service, jobs_held)) => {
+                let catalog = managed.catalog.take().unwrap();
+                self.open = Some(Open {
+                    managed: Some(managed),
+                    closing: false,
+                    exports: exports::Coordinator::default(),
+                    token: uuid::Uuid::new_v4().to_string(),
+                    catalog,
+                    service,
+                    tickets: HashMap::new(),
+                    index_pending: true,
+                    jobs_held,
+                    import: None,
+                    hydration: hydration::State::default(),
+                    relink: relink::Coordinator::default(),
+                });
+                if cancel.is_canceled() {
+                    self.close()?;
+                    return Err(error(ErrorCode::Canceled, "catalog opening canceled"));
+                }
+                let open = self.open.as_ref().unwrap();
+                let mut queue = self.shared.queue.lock().unwrap();
+                queue.status.catalog = Some(open.token.clone());
+                queue.status.jobs_held = open.jobs_held;
+                queue.status.phase = Phase::Indexing;
+                drop(queue);
+                Ok(Response::Status(self.status()))
+            }
+            Err(failure) => {
+                if managed.close().is_err() {
+                    self.failed_session = Some(managed);
+                }
+                self.publish_failed_admission(format!("{failure:#}"));
+                Err(native(failure))
+            }
+        }
+    }
     fn command(
         &mut self,
         r: Request,
         cancel: &Cancellation,
     ) -> std::result::Result<Response, BridgeError> {
         if let Request::Lightroom { request } = r {
+            if self.managed.is_some() {
+                return Err(error(
+                    ErrorCode::InvalidRequest,
+                    "independent Lightroom requests belong to the desktop owner",
+                ));
+            }
             return self
                 .lightroom
                 .request(
@@ -1564,7 +1803,9 @@ impl Actor {
                 .map(|r| Response::Lightroom(Box::new(r)))
                 .map_err(native);
         }
-        if self.open.as_ref().is_some_and(|o| o.closing)
+        if (self.open.as_ref().is_some_and(|o| o.closing)
+            || self.failed_admission.is_some()
+            || self.failed_session.is_some())
             && !matches!(&r, Request::Status | Request::Close { .. })
         {
             return Err(error(
@@ -1678,7 +1919,16 @@ impl Actor {
                 Ok(Response::Status(self.status()))
             }
             Request::Close { catalog } => {
-                self.current_for_close(&catalog)?;
+                if let Some(expected) = self.retained_admission_token() {
+                    if catalog != expected {
+                        return Err(error(
+                            ErrorCode::StaleSession,
+                            "retained catalog cleanup session changed",
+                        ));
+                    }
+                } else {
+                    self.current_for_close(&catalog)?;
+                }
                 self.close()?;
                 Ok(Response::Status(self.status()))
             }
@@ -1795,10 +2045,8 @@ impl Actor {
                 self.shared.backups.lock().unwrap().status()
             ))),
             Request::RestoreStatus { catalog } => {
-                let root = self.current(&catalog)?.catalog.root.clone();
-                Ok(Response::Restore(
-                    core!(crate::catalog_backup::restore_status(root)).map(Into::into),
-                ))
+                let status = core!(self.current(&catalog)?.catalog.restore_status());
+                Ok(Response::Restore(status.map(Into::into)))
             }
             Request::ResumeRestoredJobs {
                 catalog,
@@ -1806,11 +2054,10 @@ impl Actor {
                 acknowledge_pending_jobs,
             } => {
                 let open = self.current(&catalog)?;
-                let status = core!(crate::catalog_backup::resume_restored_jobs(
-                    &open.catalog.root,
-                    &restore_id,
-                    acknowledge_pending_jobs
-                ));
+                let status = core!(
+                    open.catalog
+                        .resume_restored_jobs(&restore_id, acknowledge_pending_jobs)
+                );
                 open.jobs_held = status.jobs_held;
                 self.shared.queue.lock().unwrap().status.jobs_held = status.jobs_held;
                 Ok(Response::Restore(Some(status.into())))
@@ -2208,6 +2455,16 @@ impl Actor {
     fn maintain(&mut self) {
         self.lightroom.maintain();
         let Some(o) = self.open.as_mut() else { return };
+        if o.catalog
+            .session
+            .pool()
+            .is_some_and(|pool| pool.is_poisoned())
+        {
+            o.closing = true;
+            let mut queue = self.shared.queue.lock().unwrap();
+            queue.status.phase = Phase::Closing;
+            queue.status.message = Some("Catalog SQL owner requires checked close".into());
+        }
         if o.closing {
             return;
         }

@@ -205,6 +205,16 @@ impl Coordinator {
         });
         Ok(snapshot)
     }
+    /// Bootstrap retirement may not terminate an unrelated SQL owner. Reap only
+    /// workers already finished; do not cancel an operation to enable admission.
+    pub(crate) fn require_idle_for_catalog_admission(&mut self) -> Result<()> {
+        self.reap(false)?;
+        ensure!(
+            self.active.is_none(),
+            "catalog admission requires the existing backup owner to drain"
+        );
+        Ok(())
+    }
     pub fn status(&mut self) -> Result<Option<Snapshot>> {
         self.reap(false)?;
         self.read_progress()?;
@@ -562,6 +572,8 @@ mod tests {
                 }))
             }),
         });
+        assert!(c.require_idle_for_catalog_admission().is_err());
+        assert!(!c.latest.as_ref().unwrap().cancellation_requested);
         assert_eq!(c.cancel("owned")?.state, State::CancelRequested);
         go.send(())?;
         let done = c.join()?.unwrap();
@@ -569,6 +581,7 @@ mod tests {
         assert!(done.cancellation_requested);
         assert!(done.receipt.is_some());
         assert!(done.error.is_none());
+        c.require_idle_for_catalog_admission()?;
         Ok(())
     }
     #[test]

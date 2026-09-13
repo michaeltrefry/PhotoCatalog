@@ -34,6 +34,7 @@ fn decimal_and_native_path_wire_are_lossless() {
 
 fn disconnected() -> Bridge {
     let shared = Arc::new(Shared {
+        managed_catalog: false,
         lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),
         exports: Arc::new(Mutex::new(exports::Control::default())),
         relink: Arc::new(Mutex::new(relink::Control::default())),
@@ -868,5 +869,155 @@ fn owner_unwind_retains_whole_open_when_worker_wait_fails() -> Result<()> {
         &root.path().join("catalog/import.lock"),
     )?);
     drop(preview::PreviewStore::open(config, &[])?);
+    Ok(())
+}
+
+#[test]
+fn managed_catalog_refuses_independent_lightroom_at_submit_and_dispatch() -> anyhow::Result<()> {
+    struct NoStore;
+    impl preview::AdmittedStoreFiles for NoStore {
+        fn lock_tiers(
+            &self,
+            _: &preview::StoreConfig,
+            _: &str,
+        ) -> anyhow::Result<Arc<dyn Send + Sync>> {
+            anyhow::bail!("fixture must not open preview storage")
+        }
+    }
+    let temp = tempfile::tempdir()?;
+    let mut bridge = disconnected();
+    Arc::get_mut(&mut Arc::get_mut(&mut bridge.0).unwrap().shared)
+        .unwrap()
+        .managed_catalog = true;
+    let request = || Request::Lightroom {
+        request: Box::new(lightroom_bridge::Request::Open {
+            attempt: "synthetic-independent-w".into(),
+            root: NativePath::from_path(&temp.path().join("must-not-create")),
+            mode: lightroom::OpenMode::Create,
+            capture_staging: NativePath::from_path(&temp.path().join("must-not-stage")),
+            limits: lightroom::Limits::default().into(),
+        }),
+    };
+    let failure = bridge.submit(request()).err().unwrap();
+    assert!(matches!(failure.code, ErrorCode::InvalidRequest));
+    assert!(bridge.0.shared.queue.lock().unwrap().pending.is_empty());
+    let mut actor = Actor::new(
+        Config {
+            worker_executable: std::env::current_exe()?,
+            cache_root: None,
+            original_roots: vec![],
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        },
+        bridge.0.shared.clone(),
+    );
+    actor.managed = Some(ManagedCatalogConfig {
+        filesystem: crate::catalog_session::unused_filesystem(temp.path())?,
+        store_files: Arc::new(NoStore),
+    });
+    assert!(matches!(
+        actor
+            .command(request(), &Cancellation::default())
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    ));
+    assert!(!temp.path().join("must-not-create").exists());
+    assert!(!temp.path().join("must-not-stage").exists());
+    Ok(())
+}
+
+#[test]
+fn retained_failed_admission_blocks_global_writes_until_explicit_close() -> anyhow::Result<()> {
+    for initialized in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let bridge = disconnected();
+        let mut actor = Actor::new(
+            Config {
+                worker_executable: std::env::current_exe()?,
+                cache_root: None,
+                original_roots: vec![],
+                preview_policy: Default::default(),
+                preview_limits: Default::default(),
+                limits: Default::default(),
+                import_checkpoint: None,
+            },
+            bridge.0.shared.clone(),
+        );
+        match crate::catalog_session::retained_admission(temp.path(), initialized)? {
+            Ok(session) => actor.failed_session = Some(session),
+            Err(cleanup) => actor.failed_admission = Some(cleanup),
+        }
+        actor.publish_failed_admission("synthetic retained cleanup".into());
+        let failed = actor.status();
+        assert!(matches!(failed.phase, Phase::Closing));
+        assert!(
+            failed
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("cleanup owner retained")
+        );
+        let token = failed.catalog.unwrap();
+        assert!(
+            actor.open.is_none(),
+            "cleanup token must not create a usable Open"
+        );
+        assert!(matches!(
+            actor
+                .command(
+                    Request::Close {
+                        catalog: "wrong-admission".into()
+                    },
+                    &Cancellation::default()
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::StaleSession
+        ));
+        let bundle = NativePath::from_path(&temp.path().join("must-not-open"));
+        for request in [
+            Request::BackupInspect {
+                bundle: bundle.clone(),
+            },
+            Request::OpenExisting { path: bundle },
+        ] {
+            assert!(matches!(
+                actor
+                    .command(request, &Cancellation::default())
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Busy
+            ));
+        }
+        assert!(actor.shared.backups.lock().unwrap().status()?.is_none());
+        assert!(
+            matches!(actor.command(Request::Status,&Cancellation::default())?,Response::Status(s) if matches!(s.phase,Phase::Closing) && s.catalog.as_ref()==Some(&token) && s.message.as_deref().unwrap().contains("cleanup owner retained"))
+        );
+        assert!(matches!(
+            bridge
+                .submit(Request::BackupInspect {
+                    bundle: NativePath::from_path(&temp.path().join("never-open"))
+                })
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::Busy
+        ));
+        assert!(
+            matches!(actor.command(Request::Close {catalog:token.clone()},&Cancellation::default())?,Response::Status(s) if matches!(s.phase,Phase::Closed))
+        );
+        assert!(actor.failed_admission.is_none() && actor.failed_session.is_none());
+        assert!(actor.status().catalog.is_none());
+        assert!(matches!(
+            actor
+                .command(Request::Close { catalog: token }, &Cancellation::default())
+                .unwrap_err()
+                .code,
+            ErrorCode::StaleSession
+        ));
+    }
     Ok(())
 }

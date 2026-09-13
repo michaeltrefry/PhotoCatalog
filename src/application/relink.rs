@@ -479,6 +479,7 @@ struct Commit {
 }
 #[derive(Default)]
 pub(super) struct Coordinator {
+    sql_session: Option<Arc<crate::catalog_session::CatalogSessionAuthority>>,
     cancel: Option<Cancellation>,
     worker: Option<Worker>,
     prepare: Option<(String, usize)>,
@@ -593,7 +594,10 @@ impl Coordinator {
             cancel.cancel();
         }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join.join();
+            let healthy = worker.join.join().is_ok();
+            if let Some(session) = &self.sql_session {
+                let _ = session.joined(crate::catalog_session::SqlRole::Relink, healthy);
+            }
         }
         self.prepare = None;
         self.commit = None;
@@ -609,6 +613,7 @@ impl Coordinator {
         control: &Arc<Mutex<Control>>,
         jobs_held: bool,
     ) -> Result<Response> {
+        self.sql_session = Some(catalog.session.clone());
         if request.read_only() {
             let tx = catalog
                 .db
@@ -1040,7 +1045,10 @@ impl Coordinator {
                 .receiver
                 .try_recv()
                 .unwrap_or_else(|_| Err("relink worker ended without a result".into()));
-            let _ = worker.join.join();
+            let healthy = worker.join.join().is_ok();
+            if let Some(session) = &self.sql_session {
+                let _ = session.joined(crate::catalog_session::SqlRole::Relink, healthy);
+            }
             // A successfully committed transaction wins a concurrent cancellation.
             if let Ok(Output::Committed(p)) = result {
                 self.finish(control, Ok(Some(Outcome::Plan(p.into()))));
@@ -1179,7 +1187,10 @@ impl Drop for Coordinator {
             cancel.cancel();
         }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join.join();
+            let healthy = worker.join.join().is_ok();
+            if let Some(session) = &self.sql_session {
+                let _ = session.joined(crate::catalog_session::SqlRole::Relink, healthy);
+            }
         }
     }
 }
