@@ -45,6 +45,13 @@ failed before worker launch because its environment snapshot uses SYSTEMROOT,
 while the smoke launcher looked up SystemRoot. Repair7fd2d81 normalizes Windows
 environment keys and uses exact Windows path syntax;45 Python tests and independent
 source review pass. Fresh Windows installed-worker qualification remains pending.
+Run34758374938 atc53fbe5 is terminal: contracts passed; all platforms failed the
+schema4 organization fixture because it omitted the shared schema12 teardown.
+The one-line test-only repair233569f passed all23 organization tests and independent
+SQL/source review. Windows additionally timed out in the original-observation test;
+its unqualified channel error does not identify the failed boundary. Test diagnostics
+now report the exact request or checkpoint and worker status without relaxing deadlines.
+The focused local test passes; the Windows cause and installed-worker gate remain pending.
 Local import `557c0ff` is integrated as
 `eebc6e5` after 85 focused tests, strict Clippy and independent source review.
 Root backup dispatch/UI, search/import controls and loading feedback `6e21ff0`
@@ -68,6 +75,11 @@ Root integrated 14 bridge + 9 organization tests and strict Clippy pass. Mac v3
 package at e762c1d passes frontend22/build, Tauri build, dependency closure and
 installed preview/export worker checks. Actual RAW GUI validation is still pending; the Mac
 was locked when Computer Use attempted it, and the user has an unlock request.
+Mac v4 atc53fbe5 also passed build/bundle, dependency closure and installed synthetic
+preview/edited-PNG export. Root verified46 installed file hashes and22 evidence
+artifacts. The app/DMG under private `sc-22847-mac-checkpoint-v4` are immutable,
+arm64 macOS26 debug checkpoints, ad-hoc signed and not notarized. The original user
+app is unchanged; Computer Use still reports a locked Mac.
 
 Schema11 durable zero-position collection projection `97e0394` is integrated as
 `01af9b4`: 50 focused tests plus query-counter fixture and strict Clippy passed;
@@ -110,12 +122,37 @@ and repaired with distinct anchor-qualified keys; the narrow review and build pa
 or canonical migration acceptance. Computer Use rechecked the Mac: still locked;
 the old checkpoint remains running and unmodified.
 
+Adjustment-copy adapter80eb2a5 exposes all seven groups through immutable source
+inspection, bounded named target/job/result pages, explicit append/seal/run/resume,
+and scoped queue-bypass cancellation. One target runs per background opportunity;
+the reviewed priority fix yields to selected previews and byte delivery too. Six
+adapter, nine actor and seven core tests pass with strictClippy and independent review.
+The actual held-relink/copy-cancel/Close test verifies drain before durable cancellation
+and no automatic resume on reopen. Root integrated six copy tests, the original-location
+test and strictClippy pass with exact source hashes unchanged.
+
+Frontend5ad942f provides page-scoped target selection across one persistent batch,
+source groups, review, progress and per-target outcomes. All38 frontend tests/build
+pass; independent review fixes stale canceled-job state, catalog-owned refresh holds,
+and lost Run reply recovery. Synthetic browser evidence covers seven groups, exact
+large revisions, lost append replies, cross-page appends, explicit execution and hidden
+cancellation. The actual App close-race fixture holds Close, completes copy, acknowledges
+Close, then opens another catalog; all11 recipe sliders are enabled. Seven namespaced
+React keys remove the observed sibling collisions, with narrow independent review and
+no duplicate-key console output in the repeated App check. Private evidence is
+`sc-22847-copy-ui-45uny_am`, `sc-22847-copy-close-ui-trxv5o70`,
+`sc-22847-copy-independent-j_66flda` and `sc-22847-copy-integrated-pz_h936r`.
+
 S12 remains incomplete. Lightroom discovery/capture/dry-run/import/reconciliation,
-copy-adjustment groups, full export and controlled metadata-write workflows, backup
+full export and controlled metadata-write workflows, backup
 settings, preview-cache/color settings, accessibility, user visual review, and complete
 installed three-platform workflows remain in the agreed foundation scope. Existing
-organization, metadata and relink implementations still need integrated installed
+organization, metadata, relink and adjustment-copy implementations still need integrated installed
 acceptance; their local tests do not close S12.
+The next independent export compatibility seam preserves non-UTF native paths in
+plans, receipts and worker staging results while retaining exact legacy authority bytes.
+It is under implementation in an isolated branch; this does not complete export UI,
+detached cancellable publication or Lightroom migration workflows.
 S13 remains the sole terminal integrated readiness/scale campaign after S12 is stable.
 
 ## S10 pre-merge checkpoint — 2026-09-13

@@ -8,10 +8,12 @@ use std::{
 };
 
 fn call(bridge: &Bridge, request: app::Request) -> Result<app::Response> {
+    let context = format!("relink test waiting for {request:?}");
     match bridge
         .submit(request)?
         .receiver
-        .recv_timeout(Duration::from_secs(5))?
+        .recv_timeout(Duration::from_secs(5))
+        .with_context(|| context)?
     {
         Reply::Ok { value } => Ok(value),
         Reply::Error { error } => Err(error.into()),
@@ -663,7 +665,20 @@ fn original_observation_is_offactor_and_bound_to_the_selected_variant() -> Resul
             key: copy.key.clone(),
         },
     )?);
-    events.recv_timeout(Duration::from_secs(5))?;
+    events
+        .recv_timeout(Duration::from_secs(5))
+        .with_context(|| {
+            format!(
+                "waiting for original observation checkpoint; current worker status: {:?}",
+                relink(
+                    &bridge,
+                    &token,
+                    Request::Status {
+                        operation: Some(work.id.clone())
+                    }
+                )
+            )
+        })?;
     call(
         &bridge,
         app::Request::SaveRecipe {
