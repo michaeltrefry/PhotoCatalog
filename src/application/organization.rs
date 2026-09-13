@@ -1676,6 +1676,10 @@ mod tests {
             4,
             &serde_json::json!({"original":"kept"}),
         )?;
+        c.db.execute_batch(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/relink-v12-downgrade.sql"
+        )))?;
         // Restore the exact v10 shape; a real upgrade has neither projection nor triggers.
         c.db.execute_batch("DROP TRIGGER organization_member_zero_insert; DROP TRIGGER organization_member_zero_update;
             DROP TRIGGER organization_order_zero_insert; DROP TRIGGER organization_order_zero_update;
@@ -1685,7 +1689,7 @@ mod tests {
         let mut c = Catalog::open(temp.path().join("catalog"))?;
         assert_eq!(
             c.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
-            11
+            crate::CURRENT_SCHEMA_VERSION
         );
         assert!(!c.collection_order_index_ready()?);
         let error = execute(

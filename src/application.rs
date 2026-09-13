@@ -234,6 +234,10 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
+            Work::Command(Request::Metadata { request, .. }, _) => match request.as_ref() {
+                metadata::Request::Resolve { .. } => 1,
+                _ => 2,
+            },
             Work::Command(Request::Organization { request, .. }, _) => match request.as_ref() {
                 organization::Request::Cancel { .. } => 0,
                 organization::Request::Apply { .. }
@@ -781,7 +785,7 @@ impl Actor {
                                     | Request::Images { .. }
                                     | Request::Search { .. }
                                     | Request::Organization { .. }
-                            );
+                            ) || matches!(&r, Request::Metadata { request, .. } if matches!(request.as_ref(), metadata::Request::Resolve { .. }));
                             let result = self.command(r, &e.cancel);
                             if reindex && let Some(o) = self.open.as_mut() {
                                 o.index_pending = true;
@@ -1031,6 +1035,14 @@ impl Actor {
                 self.current(&catalog)?;
                 self.close();
                 Ok(Response::Status(self.status()))
+            }
+            Request::Metadata { catalog, request } => {
+                Ok(Response::Metadata(Box::new(metadata::execute_cancellable(
+                    &mut self.current(&catalog)?.catalog,
+                    *request,
+                    &limits,
+                    cancel,
+                )?)))
             }
             Request::Organization { catalog, request } => Ok(Response::Organization(Box::new(
                 organization::execute(&mut self.current(&catalog)?.catalog, *request, &limits)?,
@@ -1803,3 +1815,6 @@ impl Actor {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod metadata_bridge_tests;
