@@ -28,8 +28,30 @@ and the explicit commit-winning reader-death rule. The migration foundation
 checkpoint `41fdc91` passed 31 focused functions and independent review of
 attempted writer-hold retirement; it does not qualify the whole migration bridge.
 The raw-file executor, managed SQL roles and integration/installed parity remain
-required. Preview drain repairs from comment23327 are undergoing local runtime
-qualification; no unverified worker exit may authorize resource release or Closed.
+required. Preview drain repairs from comment23327 are locally qualified below;
+no unverified worker exit may authorize resource release or Closed.
+
+Local `db023e1` (author `ef98f82e`) corrects preview cleanup and checked Quit.
+Failed native wait retains the active child, scheduler/encoded reservations,
+cache owner and complete catalog/import owner in Closing, with explicit retry.
+Actor unwind retains the same complete owner if drain fails. Startup transport
+errors are latched only after resource registration; partial requests are never
+replayed. Native and global Workbench cancellation precede joins, while ordinary
+Catalog Close preserves independent Workbench lifetime and direct status/cancel.
+All 176 selected test functions pass (two ordinary-harness helper entrypoints are
+ignored), plus strict all-target release Clippy and formatting. Actual worker
+render/cancel, injected failed-wait/retry/panic and held-shutdown tests are
+included. Mac Tauri release/locked compile passes; this is not installed GUI or
+new hosted-platform qualification. Earlier export-status and decode-only test
+failures and a syntax diagnostic are preserved, corrected and covered by the
+final passing gate. No natural OS failure or historical preview cause is inferred.
+Independent committed-source/20-artifact review:
+`sc-22847-preview-drain-independent-2eq50unj/review-final.json`, SHA256
+`fc155b555f96a61f669602b656a572fbb78e7f1f9b8c9cbb866cdcef59729ebd`.
+Final core/Tauri receipt: `sc-22847-preview-drain-ehze1aof/receipt-final.json`, SHA256
+`07ce0bb6b451877872a0b708aaaa20572a705360df229a62f3a469e9524cf054`.
+All local test and compile sessions are terminal/reaped; full process/filesystem
+custody conversion remains required.
 
 Local `298b03c` also binds the sealed Lightroom reader's actual opened SQLite
 object to its retained Source before any PRAGMA and on every verification.
