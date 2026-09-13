@@ -2,20 +2,60 @@
 
 Source of truth: https://app.shortcut.com/trefry/epic/22835
 
-## Current wave
+## S10 pre-merge checkpoint — 2026-09-13
 
-S10 sc-22845 is In Progress. S1–S9 and the linked inspection repairs are Done;
+This section records pre-merge evidence; Shortcut holds the live delivery state.
+
+S10 sc-22845 is In Review. S1–S9 and the linked inspection repairs are Done;
 S9 merged at `56aa3ca`. The selected TEST imports all 16 approved source catalogs
 into one scratch catalog and preserves the existing filesystem folder hierarchy.
 The 32 excluded catalog candidates remain excluded. Canonical-library migration
 has not been authorized.
 
-PR #14 remains draft. Source `063d011a` passed all four applicable CI jobs in
-run 34724636005, including macOS, Windows and Linux. The original import and
-subsequent current-settings repair have both reached native Complete. The fresh
-independent repair audit passed. A subsequent public-API lookup defect and the
-representative API checks still block final acceptance; earlier qualification
-and execution receipts retain their own source identities below.
+PR #14 remains draft at the qualified implementation `6c4e140`. All 643 optimized
+Rust tests passed (five existing ignored), along with formatting, strict Clippy
+and all four jobs in CI run 34733952105: macOS, Windows, Linux and benchmark
+contracts. Original import `5b54d2b9`, projection fix `46f56423`, current-settings
+repair `063d011a` and the schema-9 `7fda5ebd` upgrade/API evidence retain their own
+source attribution.
+
+The selected TEST completed import and both resumable repairs. Keyword recovery
+replaced and verified 5,050 archived items: 156 dictionaries, including 140 named
+keyword source records and 16 structural roots, plus 4,894 image memberships,
+with 16 fresh capture reports. Current-settings recovery preserves 215,708 archived outcomes:
+215,671 container rebindings and 37 unchanged. Rebinding is not translation;
+215 current settings are translated with appearance gaps and 215,493 remain
+retained-only. Imported candidates preserve source terms without selecting metadata
+precedence. All 429 retained collection memberships point to explicitly unsupported
+module collections (321 print and 108 unsaved-book memberships).
+
+The final full post-keyword preservation audit passed in 491.067 seconds using
+2,392 queries and 43,372,523,371 bytes of cumulative processed metadata. Its private
+correctness owner sampled 1,204,813,824 bytes peak RSS under an explicitly admitted
+2 GiB allowance and reaped the child cleanly. Earlier 1 GiB audit failures remain
+preserved; this allowance is not evidence for the product's 4 GiB performance
+contract. The audit covers the complete original/current/keyword custody and
+association chain, including all repair archives and fresh reports. It does not
+rehash every original or retained raw blob and makes no Adobe appearance claim.
+
+The final public API probe and independent saved-result review passed. It read
+all 140 named keyword source records and their paths, 16 structural roots,
+156 dictionary predecessors and two membership predecessors, plus separate
+master/virtual candidate, effective-value
+and provenance observations. The native probe took 0.797 seconds; its owner took
+1.181 seconds and sampled 274,104,320 bytes peak RSS within the 512 MiB limit.
+The main database stamp and catalog checkpoints were unchanged; the admitted
+Catalog::open WAL/SHM lifecycle completed normally. These two images use different
+physical assets, so this is not an actual same-file sibling or rendering test.
+Earlier schema-9 API evidence covers current/history/before-settings routes and
+literal folder paging; final-source fixtures cover shared-file independence and
+validated native rendering.
+
+S10 acceptance evidence is complete for the approved selected TEST: final native
+reconciliation, full preservation audit and representative API readback all passed
+with independent review. The story is In Review, not Done. Remaining delivery is
+merge, terminal merged-head CI and tracker/task read-back. Canonical migration,
+Adobe appearance equivalence and product performance qualification are not claimed.
 
 The selected TEST has reached native Complete in one scratch catalog: all 16
 capture reports, 22 source-walk stages and 171 companion artifacts reconciled.
