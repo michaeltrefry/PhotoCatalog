@@ -165,7 +165,7 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         "manifest",
         crate::lightroom::MANIFEST_BYTES,
     )?;
-    let manifest: Manifest = serde_json::from_slice(&bytes)?;
+    let manifest = crate::lightroom::migration_source::manifest_json::decode(&bytes)?;
     ensure!(
         manifest.protocol == 1
             && manifest.state == "captured"
@@ -173,11 +173,9 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
             && crate::lightroom::json_digest(&manifest.artifacts)? == record.revision,
         "retained artifact manifest revision differs"
     );
-    let (input, seal): (String, Vec<u8>) = db.query_row("SELECT i.id,i.seal FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1", [request.retained_capture_record], |r| Ok((r.get(0)?,r.get(1)?)))?;
-    ensure!(
-        seal.len() <= crate::lightroom::MANIFEST_BYTES,
-        "retained seal limit"
-    );
+    let (input, seal): (Option<String>, Option<Vec<u8>>) = db.query_row("SELECT CASE WHEN typeof(i.id)='text' AND length(CAST(i.id AS BLOB))=64 THEN i.id END,CASE WHEN typeof(i.seal)='blob' AND length(i.seal)<=?2 THEN i.seal END FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1", params![request.retained_capture_record,crate::lightroom::MANIFEST_BYTES as i64], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    let input = input.context("retained input identity storage type/64-byte admission")?;
+    let seal = seal.context("retained seal storage type/byte admission limit")?;
     let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
     let selected = seal
         .selected
@@ -671,6 +669,54 @@ mod tests {
                 chunk_bytes: 256 * 1024,
             }
         }
+    }
+
+    #[test]
+    fn artifact_opening_retention_columns_reject_before_materialization() -> Result<()> {
+        let (fixture, catalog) = RawFixture::new(17)?;
+        let request = &fixture.requests[0];
+        let original = serde_json::to_vec(&descriptor(&catalog.db, request)?)?;
+        for (sql, expected) in [
+            (
+                "UPDATE migration_retention SET seal=zeroblob(8388609)",
+                "retained seal type/size",
+            ),
+            (
+                "UPDATE migration_retention SET seal='{}'",
+                "retained seal type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET compressed=zeroblob(8421377)",
+                "retained record type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET compressed='bad'",
+                "retained record type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET digest=replace(hex(zeroblob(33)),'0','é')",
+                "retained digest type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET raw_length=-1",
+                "Integer",
+            ),
+        ] {
+            catalog.db.execute_batch("SAVEPOINT corrupt")?;
+            catalog.db.execute_batch(sql)?;
+            let error = descriptor(&catalog.db, request).unwrap_err();
+            if expected != "Integer" {
+                assert!(format!("{error:#}").contains(expected), "{sql}: {error:#}");
+            }
+            catalog
+                .db
+                .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            assert_eq!(
+                serde_json::to_vec(&descriptor(&catalog.db, request)?)?,
+                original
+            );
+        }
+        Ok(())
     }
 
     #[test]

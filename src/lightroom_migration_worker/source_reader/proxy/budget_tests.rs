@@ -6,6 +6,23 @@ use crate::lightroom::{Issue, MANIFEST_BYTES, PAGE_BYTES, migration_source::test
 
 #[test]
 fn maximal_short_issue_manifest_exceeds_old_estimate_and_preserves_every_member() -> Result<()> {
+    maximal_issue_manifest(
+        br#"{"code":"","detail":""}"#,
+        "maximal_short_issue_manifest",
+        64 * 1024 * 1024,
+    )
+}
+
+#[test]
+fn maximal_sequence_issue_manifest_preserves_more_members_than_object_case() -> Result<()> {
+    maximal_issue_manifest(
+        br#"["",null,""]"#,
+        "maximal_sequence_issue_manifest",
+        128 * 1024 * 1024,
+    )
+}
+
+fn maximal_issue_manifest(item: &[u8], label: &str, old_capacity_estimate: usize) -> Result<()> {
     let mut fixture = Fixture::new();
     let manifest = fixture.open().capture_manifest(fixture.revision())?;
     let template = serde_json::to_vec(&manifest)?;
@@ -16,7 +33,6 @@ fn maximal_short_issue_manifest_exceeds_old_estimate_and_preserves_every_member(
         .context("manifest issues field")?;
     let prefix = &template[..start + marker.len() - 1];
     let suffix = &template[start + marker.len() - 1..];
-    let item = b"{\"code\":\"\",\"detail\":\"\"}";
     let count = (MANIFEST_BYTES - prefix.len() - suffix.len() + 1) / (item.len() + 1);
     let mut raw = Vec::with_capacity(MANIFEST_BYTES);
     raw.extend_from_slice(prefix);
@@ -58,7 +74,7 @@ fn maximal_short_issue_manifest_exceeds_old_estimate_and_preserves_every_member(
     // This was the invalid v10 estimate. No allocation ceiling can be inferred
     // from16MiB raw JSON alone or only the currently occupied Vec elements.
     #[cfg(target_pointer_width = "64")]
-    assert!(issue_capacity_bytes > 64 * 1024 * 1024);
+    assert!(issue_capacity_bytes > old_capacity_estimate);
     let encoded = exact_json(
         &Value::Manifest(value),
         RESULT_BYTES,
@@ -66,7 +82,7 @@ fn maximal_short_issue_manifest_exceeds_old_estimate_and_preserves_every_member(
     )?;
     eprintln!(
         "{}",
-        serde_json::json!({"fixture":"maximal_short_issue_manifest","source_bytes":raw.len(),"issues":count,"issue_capacity_bytes":issue_capacity_bytes,"encoded_result_bytes":encoded.len()})
+        serde_json::json!({"fixture":label,"source_bytes":raw.len(),"issues":count,"issue_capacity_bytes":issue_capacity_bytes,"encoded_result_bytes":encoded.len()})
     );
     // Its full result traversed the actual reader, ticket stream and proxy; the
     // original source table remains exactly the admitted retained bytes.

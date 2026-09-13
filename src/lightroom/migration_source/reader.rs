@@ -631,13 +631,14 @@ impl MigrationSource {
         plan::validate_paging_indexes(&self.db).context("source admission paging indexes")?;
         let mut rows = self
             .db
-            .prepare("SELECT revision FROM captures ORDER BY revision LIMIT 16385")
+            .prepare("SELECT CASE WHEN typeof(revision)='text' AND length(CAST(revision AS BLOB))=64 THEN revision END FROM captures ORDER BY revision LIMIT 16385")
             .context("prepare source admission capture roster")?;
         let actual = rows
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| r.get::<_, Option<String>>(0))
             .context("query source admission capture roster")?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()
-            .context("read source admission capture roster")?;
+            .collect::<rusqlite::Result<Option<BTreeSet<_>>>>()
+            .context("read source admission capture roster")?
+            .context("capture revision storage type/64-byte admission")?;
         let expected = self
             .seal
             .selected
@@ -650,26 +651,32 @@ impl MigrationSource {
             "selected/excluded capture partition differs from sealed plan"
         );
         for entry in &self.seal.selected {
-            let (revision, evidence, reason): (String, String, String) = self
+            let (revision, evidence, reason): (Option<String>, Option<String>, Option<String>) = self
                 .db
                 .query_row(
-                    "SELECT revision,evidence_digest,reason FROM family_choices WHERE family=?",
+                    "SELECT CASE WHEN typeof(revision)='text' AND length(CAST(revision AS BLOB))=64 THEN revision END,CASE WHEN typeof(evidence_digest)='text' AND length(CAST(evidence_digest AS BLOB))=64 THEN evidence_digest END,CASE WHEN typeof(reason)='text' AND length(CAST(reason AS BLOB))<=4096 THEN reason END FROM family_choices WHERE family=?",
                     [&entry.family],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .with_context(|| {
                     format!("source admission family choice revision={}", entry.revision)
                 })?;
+            let revision = revision.context("family revision storage type/64-byte admission")?;
+            let evidence =
+                evidence.context("family evidence digest storage type/64-byte admission")?;
+            // Plan::choose already limits this exact reason to 4096 UTF-8 bytes.
+            // Retain Rust's Unicode trim semantics after byte admission.
+            let reason = reason.context("family reason storage type/4096-byte admission")?;
             ensure!(
                 revision == entry.revision
                     && evidence == entry.family_evidence_digest
                     && !reason.trim().is_empty(),
                 "family choice differs from approved selection"
             );
-            let (stage, current): (String, i64) = self
+            let (complete, current): (bool, i64) = self
                 .db
                 .query_row(
-                    "SELECT stage,evidence_revision FROM captures WHERE revision=?",
+                    "SELECT typeof(stage)='text' AND stage='inspection_complete_with_reported_gaps',evidence_revision FROM captures WHERE revision=?",
                     [&entry.revision],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -677,8 +684,7 @@ impl MigrationSource {
                     format!("source admission capture state revision={}", entry.revision)
                 })?;
             ensure!(
-                stage == "inspection_complete_with_reported_gaps"
-                    && current == entry.evidence_revision,
+                complete && current == entry.evidence_revision,
                 "selected inspection not complete or evidence changed"
             );
             let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM paths WHERE revision=? AND (state IN ('pending','available_packets_uninspected') OR json_extract(evidence,'$.embedded_sidecar_xmp') IS NOT NULL))", [&entry.revision], |r| r.get(0)).with_context(|| format!("source admission pending paths revision={}", entry.revision))?;
@@ -771,17 +777,15 @@ impl MigrationSource {
             matches.len() == 1,
             "supplement original association missing or ambiguous"
         );
-        let source: crate::xmp_packets::SourceRevision = serde_json::from_value(
+        let source: crate::xmp_packets::SourceRevision = serde::Deserialize::deserialize(
             matches[0]
                 .get("revision")
-                .context("supplement source revision missing")?
-                .clone(),
+                .context("supplement source revision missing")?,
         )?;
-        let status: crate::xmp_packets::Status = serde_json::from_value(
+        let status: crate::xmp_packets::Status = serde::Deserialize::deserialize(
             matches[0]
                 .get("status")
-                .context("supplement status missing")?
-                .clone(),
+                .context("supplement status missing")?,
         )?;
         ensure!(
             source == pin.source_revision && status == pin.historical_status,
@@ -1093,3 +1097,7 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "reader_closed_tests.rs"]
 mod closed_tests;
+
+#[cfg(test)]
+#[path = "reader_opening_tests.rs"]
+mod opening_tests;

@@ -56,6 +56,81 @@ mod tests {
     use crate::lightroom::migration_source::{ReadLimits, tests::Fixture};
 
     #[test]
+    fn opening_retained_field_guards_descriptor_and_identity_before_copy() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        install(&db)?;
+        evidence::install(&db)?;
+        let reference = crate::lightroom::migration_source::ByteRef {
+            seal: "a".repeat(64),
+            revision: "b".repeat(64),
+            collection: Collection::Captures,
+            rowid: 1,
+            field: "manifest".into(),
+            bytes: 3,
+            text: true,
+        };
+        // Real parent rows keep the ordinary schema/foreign-key contract on.
+        // Only the deliberately corrupt reference is deferred inside a
+        // savepoint that is always rolled back before release.
+        db.execute(
+            "INSERT INTO migration_retention(id,seal,approval) VALUES(?1,x'00',x'00')",
+            [&reference.seal],
+        )?;
+        db.execute("INSERT INTO migration_retained_records(sequence,input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete)
+                    VALUES(1,?1,?2,0,1,x'00',0,?3,'',1)", params![reference.seal,reference.revision,"0".repeat(64)])?;
+        let id = evidence::begin(&db, &serde_json::to_vec(&reference)?, 3)?.id;
+        evidence::append(&db, &id, 0, &PreparedChunk::new(b"yes")?)?;
+        db.execute(
+            "INSERT INTO migration_retained_fields VALUES(1,'manifest',?1)",
+            [&id],
+        )?;
+        let record = EvidenceRecord {
+            revision: reference.revision.clone(),
+            collection: Collection::Captures,
+            rowid: 1,
+            key: vec![],
+            fields: [("manifest".into(), Field::Bytes(reference))].into(),
+        };
+        for (sql, expected) in [
+            (
+                "UPDATE migration_retained_fields SET evidence=replace(hex(zeroblob(33)),'0','é')",
+                "evidence identity type/size",
+            ),
+            (
+                "UPDATE migration_retained_fields SET evidence=zeroblob(64)",
+                "evidence identity type/size",
+            ),
+            (
+                "UPDATE migration_evidence SET descriptor=zeroblob(65537)",
+                "descriptor type/size",
+            ),
+            (
+                "UPDATE migration_evidence SET descriptor=replace(hex(zeroblob(16385)),'0','é')",
+                "descriptor type/size",
+            ),
+        ] {
+            db.execute_batch("SAVEPOINT corrupt; PRAGMA defer_foreign_keys=ON")?;
+            db.execute_batch(sql)?;
+            let error = field_bytes(&db, 1, &record, "manifest", 3).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{sql}: {error:#}");
+            db.execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            assert_eq!(
+                db.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
+                1
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })?,
+                0
+            );
+            assert_eq!(field_bytes(&db, 1, &record, "manifest", 3)?, b"yes");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn selected_large_evidence_survives_restart_and_source_disconnect() -> Result<()> {
         let mut fixture = Fixture::with_large_cell(17 * 1024 * 1024);
         let approval = b"approved synthetic selected-only migration test";
@@ -363,11 +438,22 @@ fn decode(bytes: &[u8], length: usize, digest: &str) -> Result<EvidenceRecord> {
 
 /// Resolve completed destination evidence to its retained authorized selection.
 pub(crate) fn selected_record(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
-    let (input, seal, compressed, length, digest): (String, Vec<u8>, Vec<u8>, usize, String) = db.query_row(
-        "SELECT i.id,i.seal,r.compressed,r.raw_length,r.digest FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1 AND r.complete=1",
-        [sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,evidence::size(r,3)?,r.get(4)?)),
+    let (input, seal, compressed, length, digest):
+        (Option<String>, Option<Vec<u8>>, Option<Vec<u8>>, usize, Option<String>) = db.query_row(
+        "SELECT CASE WHEN typeof(i.id)='text' AND length(CAST(i.id AS BLOB))=64 THEN i.id END,
+         CASE WHEN typeof(i.seal)='blob' AND length(i.seal)<=?2 THEN i.seal END,
+         CASE WHEN typeof(r.compressed)='blob' AND length(r.compressed)<=?3
+          AND typeof(r.raw_length)='integer' AND r.raw_length BETWEEN 0 AND ?2 THEN r.compressed END,
+         r.raw_length,
+         CASE WHEN typeof(r.digest)='text' AND length(CAST(r.digest AS BLOB))=64 THEN r.digest END
+         FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1 AND r.complete=1",
+        params![sequence, i64::try_from(RECORD_LIMIT)?, i64::try_from(RECORD_LIMIT + 32768)?],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,evidence::size(r,3)?,r.get(4)?)),
     )?;
-    ensure!(seal.len() <= RECORD_LIMIT, "retained seal size limit");
+    let input = input.context("retained input identity type/size limit")?;
+    let seal = seal.context("retained seal type/size limit")?;
+    let compressed = compressed.context("retained record type/size limit")?;
+    let digest = digest.context("retained digest type/size limit")?;
     let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
     ensure!(
         seal.binding_blake3()? == input,
@@ -404,16 +490,20 @@ pub(crate) fn field_bytes(
                 reference.bytes <= maximum as u64,
                 "retained field exceeds interpretation limit"
             );
-            let id: String = db.query_row(
-                "SELECT evidence FROM migration_retained_fields WHERE record=?1 AND field=?2",
+            let id: Option<String> = db.query_row(
+                "SELECT CASE WHEN typeof(evidence)='text' AND length(CAST(evidence AS BLOB))=64
+                 THEN evidence END FROM migration_retained_fields WHERE record=?1 AND field=?2",
                 params![sequence, name],
                 |r| r.get(0),
             )?;
-            let descriptor: Vec<u8> = db.query_row(
-                "SELECT descriptor FROM migration_evidence WHERE id=?1",
-                [&id],
+            let id = id.context("retained field evidence identity type/size limit")?;
+            let descriptor: Option<Vec<u8>> = db.query_row(
+                "SELECT CASE WHEN typeof(descriptor)='blob' AND length(descriptor)<=?2
+                 THEN descriptor END FROM migration_evidence WHERE id=?1",
+                params![id, i64::try_from(evidence::DESCRIPTOR_BYTES)?],
                 |r| r.get(0),
             )?;
+            let descriptor = descriptor.context("retained field descriptor type/size limit")?;
             ensure!(
                 serde_json::from_slice::<crate::lightroom::migration_source::ByteRef>(&descriptor)?
                     == *reference,
