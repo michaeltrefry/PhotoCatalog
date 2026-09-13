@@ -39,6 +39,13 @@ pub struct SupplementReport {
 // rather than scanning every AgLibraryFile row before checking that ID.
 const SUPPLEMENT_PROJECTION: &str = "SELECT m.input_digest,m.result FROM migration_record_lookup l INDEXED BY migration_lookup_source CROSS JOIN migration_file_metadata m ON m.retained_file=l.record WHERE m.owner=?1 AND m.origin=?2 AND m.supplement=?3 AND l.input=?4 AND l.revision=?5 AND l.collection=3 AND l.table_name='AgLibraryFile' AND l.source_id=?6 LIMIT 2";
 
+// Keep the source outcome out of the GROUP BY sorter. The materialized row
+// contains only the classification, with its original SQLite value type.
+const CLASSIFICATIONS: &str = "WITH classes AS MATERIALIZED (
+    SELECT COALESCE(json_extract(outcome,'$.Retained.reason'),json_extract(outcome,'$.Metadata.state'),json_extract(outcome,'$.FileMetadata.state'),json_extract(outcome,'$.Image.kind'),'projected_or_role_skipped') classification
+    FROM migration_run_items WHERE run=?1 AND stage=?2 AND revision=?3)
+    SELECT classification,count(*) FROM classes GROUP BY classification LIMIT 257";
+
 /// Every sealed pin has verified generic payload custody, plus a separately
 /// reported projection state. Unprojected evidence is explicit, never omitted.
 pub(crate) fn supplement_reports(
@@ -505,7 +512,9 @@ fn step_inner(
         report
             .walked
             .insert(format!("{stage:?}"), u64::try_from(actual)?);
-        let mut statement=catalog.db.prepare("SELECT COALESCE(json_extract(outcome,'$.Retained.reason'),json_extract(outcome,'$.Metadata.state'),json_extract(outcome,'$.FileMetadata.state'),json_extract(outcome,'$.Image.kind'),'projected_or_role_skipped'),count(*) FROM migration_run_items WHERE run=?1 AND stage=?2 AND revision=?3 GROUP BY 1 LIMIT 257")
+        let mut statement = catalog
+            .db
+            .prepare(CLASSIFICATIONS)
             .with_context(|| format!("prepare destination {stage:?} classifications"))?;
         let mut rows = statement
             .query(params![before.id, key, capture.revision])
@@ -679,6 +688,272 @@ mod tests {
         let mut statement = db.prepare(sql)?;
         let count = statement.query_row(params![input, revision, collection], |r| r.get(0))?;
         Ok((count, statement.get_status(StatementStatus::VmStep)))
+    }
+
+    const ORIGINAL_CLASSIFICATIONS: &str = "SELECT COALESCE(json_extract(outcome,'$.Retained.reason'),json_extract(outcome,'$.Metadata.state'),json_extract(outcome,'$.FileMetadata.state'),json_extract(outcome,'$.Image.kind'),'projected_or_role_skipped'),count(*) FROM migration_run_items WHERE run=?1 AND stage=?2 AND revision=?3 GROUP BY 1 LIMIT 257";
+
+    fn classification_fixture() -> Result<Connection> {
+        let db = fixture()?;
+        super::super::importer::install(&db)?;
+        db.execute("INSERT INTO migration_runs VALUES('run','input',x'7b7d',x'7b7d'),('other','input',x'7b7d',x'7b7d')", [])?;
+        Ok(db)
+    }
+
+    fn classification_item(
+        db: &Connection,
+        record: i64,
+        run: &str,
+        stage: &str,
+        revision: &str,
+        outcome: &[u8],
+    ) -> Result<()> {
+        db.execute("INSERT INTO migration_retained_records(sequence,input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) VALUES(?1,'input',?2,3,?1,x'00',1,'digest','cursor',1)", params![record, revision])?;
+        db.execute(
+            "INSERT INTO migration_run_items VALUES(?1,?2,?3,?4,?5)",
+            params![run, stage, record, revision, outcome],
+        )?;
+        Ok(())
+    }
+
+    fn classification_values(
+        db: &Connection,
+        sql: &str,
+    ) -> Result<Vec<(rusqlite::types::Value, i64)>> {
+        Ok(db
+            .prepare(sql)?
+            .query_map(params!["run", "\"ImageFields\"", "capture"], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    #[test]
+    fn classification_scalar_projection_preserves_precedence_default_and_scope() -> Result<()> {
+        let db = classification_fixture()?;
+        for (index, raw) in [
+            r#"{"Retained":{"reason":"first"},"Metadata":{"state":"second"},"FileMetadata":{"state":"third"},"Image":{"kind":"fourth"}}"#,
+            r#"{"Retained":{"reason":""},"Metadata":{"state":"second"}}"#,
+            r#"{"Retained":{"reason":null},"Metadata":{"state":"second"},"FileMetadata":{"state":"third"}}"#,
+            r#"{"Metadata":{"state":null},"FileMetadata":{"state":"third"},"Image":{"kind":"fourth"}}"#,
+            r#"{"FileMetadata":{"state":null},"Image":{"kind":"fourth"}}"#,
+            r#"{}"#,
+            r#"{"Retained":{"reason":null},"Metadata":{"state":null},"FileMetadata":{"state":null},"Image":{"kind":null}}"#,
+            r#"{"Retained":{"reason":"first"}}"#,
+        ].iter().enumerate() {
+            classification_item(&db, i64::try_from(index + 1)?, "run", "\"ImageFields\"", "capture", raw.as_bytes())?;
+        }
+        // Invalid JSON outside any one of the three scope dimensions must not
+        // be parsed by either query, including a plain rather than JSON stage.
+        for (i, run, stage, revision) in [
+            (100, "other", "\"ImageFields\"", "capture"),
+            (101, "run", "ImageFields", "capture"),
+            (102, "run", "\"ImageFields\"", "other"),
+        ] {
+            classification_item(&db, i, run, stage, revision, b"invalid JSON")?;
+        }
+        use rusqlite::types::Value::Text;
+        let expected = vec![
+            (Text(String::new()), 1),
+            (Text("first".into()), 2),
+            (Text("fourth".into()), 1),
+            (Text("projected_or_role_skipped".into()), 2),
+            (Text("second".into()), 1),
+            (Text("third".into()), 1),
+        ];
+        assert_eq!(
+            classification_values(&db, ORIGINAL_CLASSIFICATIONS)?,
+            expected
+        );
+        assert_eq!(classification_values(&db, CLASSIFICATIONS)?, expected);
+        classification_item(
+            &db,
+            103,
+            "run",
+            "\"ImageFields\"",
+            "capture",
+            b"invalid JSON",
+        )?;
+        assert!(classification_values(&db, ORIGINAL_CLASSIFICATIONS).is_err());
+        assert!(classification_values(&db, CLASSIFICATIONS).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn classification_scalar_projection_preserves_nontext_rejection() -> Result<()> {
+        use rusqlite::types::Value;
+        for chosen in [
+            serde_json::json!(false),
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::json!(1.5),
+        ] {
+            let db = classification_fixture()?;
+            let raw = serde_json::to_vec(
+                &serde_json::json!({"Retained":{"reason":chosen},"Metadata":{"state":"must not win"}}),
+            )?;
+            classification_item(&db, 1, "run", "\"ImageFields\"", "capture", &raw)?;
+            let old = classification_values(&db, ORIGINAL_CLASSIFICATIONS)?;
+            assert!(matches!(old[0].0, Value::Integer(_) | Value::Real(_)));
+            assert_eq!(classification_values(&db, CLASSIFICATIONS)?, old);
+            for sql in [ORIGINAL_CLASSIFICATIONS, CLASSIFICATIONS] {
+                let mut statement = db.prepare(sql)?;
+                let mut rows = statement.query(params!["run", "\"ImageFields\"", "capture"])?;
+                // The production reader calls this exact conversion and still
+                // rejects a chosen numeric value rather than casting it to text.
+                assert!(
+                    rows.next()?
+                        .context("classification row")?
+                        .get_ref(0)?
+                        .as_bytes()
+                        .is_err()
+                );
+            }
+        }
+        let db = classification_fixture()?;
+        for (i, chosen) in [serde_json::json!([1, "x"]), serde_json::json!({"x":1})]
+            .iter()
+            .enumerate()
+        {
+            classification_item(
+                &db,
+                i64::try_from(i + 1)?,
+                "run",
+                "\"ImageFields\"",
+                "capture",
+                &serde_json::to_vec(&serde_json::json!({"Retained":{"reason":chosen}}))?,
+            )?;
+        }
+        assert_eq!(
+            classification_values(&db, CLASSIFICATIONS)?,
+            classification_values(&db, ORIGINAL_CLASSIFICATIONS)?
+        );
+        assert!(
+            classification_values(&db, CLASSIFICATIONS)?
+                .iter()
+                .all(|(v, _)| matches!(v, Value::Text(_)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn classification_scalar_projection_preserves_group_and_label_bounds() -> Result<()> {
+        let db = classification_fixture()?;
+        for i in 1..=258 {
+            classification_item(
+                &db,
+                i,
+                "run",
+                "\"ImageFields\"",
+                "capture",
+                &serde_json::to_vec(
+                    &serde_json::json!({"Retained":{"reason":format!("class-{i:04}")}}),
+                )?,
+            )?;
+            if i == 256 || i == 257 || i == 258 {
+                let old = classification_values(&db, ORIGINAL_CLASSIFICATIONS)?;
+                let new = classification_values(&db, CLASSIFICATIONS)?;
+                assert_eq!(old, new);
+                // 257 is the mandatory sentinel rejected by the unchanged
+                // production >256 check, even if more groups exist.
+                assert_eq!(new.len(), usize::try_from(i.min(257))?);
+            }
+        }
+        let db = classification_fixture()?;
+        let name = "z".repeat(16385);
+        classification_item(
+            &db,
+            1,
+            "run",
+            "\"ImageFields\"",
+            "capture",
+            &serde_json::to_vec(&serde_json::json!({"Retained":{"reason":name}}))?,
+        )?;
+        assert_eq!(
+            classification_values(&db, CLASSIFICATIONS)?,
+            classification_values(&db, ORIGINAL_CLASSIFICATIONS)?
+        );
+        let mut statement = db.prepare(CLASSIFICATIONS)?;
+        let mut rows = statement.query(params!["run", "\"ImageFields\"", "capture"])?;
+        assert_eq!(
+            rows.next()?
+                .context("oversized classification")?
+                .get_ref(0)?
+                .as_bytes()?
+                .len(),
+            16385
+        );
+        // The unchanged report reader sees all bytes and rejects >16384.
+        Ok(())
+    }
+
+    #[test]
+    fn classification_sorter_carries_only_scalar_despite_large_outcomes() -> Result<()> {
+        let db = classification_fixture()?;
+        for i in 1..=16 {
+            classification_item(
+                &db,
+                i,
+                "run",
+                "\"ImageFields\"",
+                "capture",
+                &serde_json::to_vec(
+                    &serde_json::json!({"Retained":{"reason":"one"},"opaque":"x".repeat(256 * 1024)}),
+                )?,
+            )?;
+        }
+        assert_eq!(
+            classification_values(&db, CLASSIFICATIONS)?,
+            classification_values(&db, ORIGINAL_CLASSIFICATIONS)?
+        );
+        let program = |sql: &str| -> Result<Vec<(String, i64, i64, i64)>> {
+            Ok(db
+                .prepare(&format!("EXPLAIN {sql}"))?
+                .query_map(params!["run", "\"ImageFields\"", "capture"], |r| {
+                    Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?)
+        };
+        let width = |ops: &[(String, i64, i64, i64)]| -> Result<i64> {
+            let insert = ops
+                .iter()
+                .position(|v| v.0 == "SorterInsert")
+                .context("group sorter")?;
+            let register = ops[insert].2;
+            let make = ops[..insert]
+                .iter()
+                .rev()
+                .find(|v| v.0 == "MakeRecord" && v.3 == register)
+                .context("sorter record builder")?;
+            Ok(make.2)
+        };
+        let original = program(ORIGINAL_CLASSIFICATIONS)?;
+        let scalar = program(CLASSIFICATIONS)?;
+        assert_eq!(width(&original)?, 2, "original sorter carried outcome");
+        assert_eq!(width(&scalar)?, 1, "classification-only sorter");
+        assert!(
+            scalar
+                .iter()
+                .filter(|v| v.0 == "MakeRecord")
+                .all(|v| v.2 == 1),
+            "materialization and sort both hold only one scalar: {scalar:?}"
+        );
+        let plan = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {CLASSIFICATIONS}"))?
+            .query_map(params!["run", "\"ImageFields\"", "capture"], |r| {
+                r.get::<_, String>(3)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            plan.iter()
+                .any(|s| s.contains("migration_run_capture (run=? AND stage=? AND revision=?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|s| !s.starts_with("SCAN migration_run_items")),
+            "{plan:?}"
+        );
+        Ok(())
     }
 
     fn supplemental_lookup_fixture(noise: i64) -> Result<Connection> {
