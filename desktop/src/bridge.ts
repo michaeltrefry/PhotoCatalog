@@ -1,6 +1,8 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Recipe } from './recipe';
 import type { OrganizationRequest, OrganizationResponse } from './organization';
+import type { MetadataRequest, MetadataResponse } from './metadata';
+import type { RelinkRequest, RelinkResponse } from './relink';
 
 export type Decimal = string;
 export type NativePath = { encoding: 'UnixBytes' | 'WindowsWide'; units: number[] };
@@ -22,6 +24,8 @@ type AtCatalog = { catalog: string };
 type AtVariant = AtCatalog & { key: VariantKey };
 type AtRevision = AtVariant & { expected_revision: Decimal };
 export type Request =
+  | { command: 'relink'; args: AtCatalog & { request: RelinkRequest } }
+  | { command: 'metadata'; args: AtCatalog & { request: MetadataRequest } }
   | { command: 'organization'; args: AtCatalog & { request: OrganizationRequest } }
   | { command: 'status' | 'backup_status' }
   | { command: 'backup_create'; args: AtCatalog & { bundle: NativePath } }
@@ -48,6 +52,8 @@ export type Request =
   | { command: 'release_viewport'; args: AtCatalog & { viewport: string; generation: Decimal } }
   | { command: 'preview_status' | 'cancel_preview'; args: AtCatalog & { ticket: string } };
 export interface Data {
+  relink: RelinkResponse;
+  metadata: MetadataResponse;
   organization: OrganizationResponse;
   backup: BackupStatus | null;
   restore: { receipt: RestoreReceipt; jobs_held: boolean } | null;

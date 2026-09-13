@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { command, chooseFolder, desktopAvailable, errorText, type BackupStatus, type CatalogStatus, type CullOperation, type Data, type Folder, type GridImage, type HistoryEntry, type ImportStatus, type Variant } from './bridge';
+import { command, chooseFolder, desktopAvailable, errorText, imageKey, type BackupStatus, type CatalogStatus, type CullOperation, type Data, type Folder, type GridImage, type HistoryEntry, type ImportStatus, type Variant } from './bridge';
 import { Dialog, ErrorNotice, Section } from './components/Controls';
 import { FolderTree } from './components/FolderTree';
 import { CatalogActivity } from './components/CatalogActivity';
 import { OrganizationPanel } from './components/OrganizationPanel';
+import { RelinkPanel } from './components/RelinkPanel';
+import { useRelink } from './state/useRelink';
+import { MetadataPanel } from './components/MetadataPanel';
 import { BackupPanel } from './components/BackupPanel';
 import { SearchFilters, defaultFilters } from './components/SearchFilters';
 import { ImportPanel } from './components/ImportPanel';
@@ -35,6 +38,9 @@ export function App() {
   const [showImport, setShowImport] = useState(false);
   const [showBackup, setShowBackup] = useState(false);
   const [showOrganization, setShowOrganization] = useState(false);
+  const [showMetadata, setShowMetadata] = useState(false);
+  const [showRelink, setShowRelink] = useState(false);
+  const [previewEpoch, setPreviewEpoch] = useState(0);
   const [organizationScopeName, setOrganizationScopeName] = useState('');
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null);
   const [importStatus, setImportStatus] = useState<ImportStatus | null>(null);
@@ -62,6 +68,10 @@ export function App() {
   }, []);
   const operationAbort = useRef<AbortController | null>(null);
   const catalog = status.catalog;
+  const catalogRef = useRef(catalog); catalogRef.current = catalog;
+  const storageRefresh = useRef(0);
+  const storage = useRelink(catalog);
+  const storageWriteHold = !!storage.operation?.write_hold;
 
   useEffect(() => {
     if (!desktopAvailable) return;
@@ -110,6 +120,7 @@ export function App() {
   }, [catalog, attachVariant, perform]);
 
   const organizationMutation = async (action: () => Promise<void>) => {
+    if (storageWriteHold) throw new Error('Wait for the storage operation to finish before changing the catalog.');
     await gate.current.afterCurrent(async () => {
       setTransitioning(true);
       try {
@@ -155,7 +166,7 @@ export function App() {
     catch (e) { setError(errorText(e)); }
   });
   const cull = useCallback(async (operation: CullOperation, advance: boolean) => perform(async () => {
-    if (!catalog || !selected) return;
+    if (!catalog || !selected || storageWriteHold) return;
     try {
       await queueRef.current?.flush();
       const result = await command({ command: 'cull', args: { catalog, key: selected.key, expected_revision: selected.metadata_revision, operation } }, 'culled');
@@ -165,7 +176,7 @@ export function App() {
       if (advance) { const at = page.rows.findIndex(row => row.image_id === selected.image_id); if (at >= 0 && at + 1 < page.rows.length) { const next = page.rows[at + 1]; const variant = await command({ command: 'variant', args: { catalog, key: next.key } }, 'variant'); setSelected(next); attachVariant(variant); } }
       setError('');
     } catch (e) { setError(errorText(e)); }
-  }), [catalog, selected, page.rows, attachVariant, perform]);
+  }), [catalog, selected, page.rows, attachVariant, perform, storageWriteHold]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (document.querySelector('dialog[open]') || (event.target instanceof HTMLElement && (event.target.closest('input,textarea,select') || event.target.isContentEditable)) || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -177,12 +188,12 @@ export function App() {
     window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown);
   }, [selected, cull, mode, page.rows, select]);
   const undo = async (redo: boolean) => perform(async () => {
-    if (!catalog || !queue) return;
+    if (!catalog || !queue || storageWriteHold) return;
     try { await queue.flush(); const value = queue.value.variant; attachVariant(await command({ command: redo ? 'redo' : 'undo', args: { catalog, key: value.key, expected_revision: value.revision } }, 'variant')); }
     catch (e) { setError(errorText(e)); }
   });
   const createCopy = async () => perform(async () => {
-    if (!catalog || !queue || copyName === null) return;
+    if (!catalog || !queue || storageWriteHold || copyName === null) return;
     try { await queue.flush(); const value = queue.value.variant; const variant = await command({ command: 'create_variant', args: { catalog, key: value.key, expected_revision: value.revision, label: copyName } }, 'variant'); const row = await command({ command: 'image', args: { catalog, key: variant.key } }, 'image'); setSelected(row); attachVariant(variant); setCopyName(null); setRefresh(value => value + 1); }
     catch (e) { setError(errorText(e)); }
   });
@@ -205,34 +216,37 @@ export function App() {
       {desktopAvailable ? <div className="welcome-actions"><button className="primary" disabled={!!busy || transitioning} onClick={() => void open(false)}>Open catalog…</button><button disabled={!!busy || transitioning} onClick={() => void open(true)}>Create catalog…</button></div> : <p className="desktop-notice">Open the PhotoCatalog desktop app to create or open a catalog.</p>}
       <p className="hint">Catalogs store metadata and previews. Original photos stay in their existing folders, including external drives.</p>
     </main> : <>
-      <div className="workspace-toolbar"><button disabled={transitioning || status.phase !== 'ready'} onClick={() => setShowImport(true)}>Add photos…</button><button aria-pressed={showFolders} onClick={() => setShowFolders(value => !value)}>Folders</button><div className="breadcrumb">{scope === undefined ? 'Choose a folder' : scope === null ? 'All Photos' : scope.name}</div>
+      <div className="workspace-toolbar"><button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => setShowImport(true)}>Add photos…</button><button onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowRelink(true); })}>Locate originals…</button><button aria-pressed={showFolders} onClick={() => setShowFolders(value => !value)}>Folders</button><div className="breadcrumb">{scope === undefined ? 'Choose a folder' : scope === null ? 'All Photos' : scope.name}</div>
         <form className="search-form" onSubmit={event => { event.preventDefault(); setAppliedSearch(search); setCursor(null); setPrevious([]); }}><input type="search" maxLength={1024} aria-label="Search photos" placeholder="Search photos" value={search} onChange={event => setSearch(event.target.value)} /><button type="submit">Search</button></form>
-        <button disabled={transitioning || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
+        <button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
       {(filters.keyword || filters.collection) && <div className="activity">Organization filter: {organizationScopeName}<button onClick={() => { setFilters(value => ({ ...value, keyword: null, collection: null })); setCursor(null); setPrevious([]); }}>Clear organization filter</button></div>}
+      {storageWriteHold && <div className="activity" role="status">Storage operation in progress: catalog writes and new original rendering are held.<button onClick={() => setShowRelink(true)}>Review progress</button><button onClick={() => void storage.cancel()}>Cancel storage operation</button></div>}
       {status.jobs_held && <div className="activity">Restored catalog: pending external jobs are held for review. Browsing and editing are available.</div>}
       <main className="workspace">
         {showFolders && <aside className="left-panel"><Section title="Library"><button className={scope === null ? 'current scope-button' : 'scope-button'} onClick={() => void changeScope(null)}>All Photos</button><label className="checkbox"><input type="checkbox" checked={recursive} onChange={event => { setRecursive(event.target.checked); setCursor(null); setPrevious([]); }} />Include subfolders</label></Section><Section title="Folders">{status.phase === 'ready' ? <FolderTree key={`${catalog}:${folderEpoch}`} catalog={catalog} selected={scope?.id} onSelect={folder => void changeScope(folder)} /> : <p role="status">Preparing folders…</p>}</Section></aside>}
         <section className="central-panel" aria-label={`${mode} workspace`}>
           {status.phase !== 'ready' ? <CatalogActivity phase={status.phase} message={status.message} /> : mode === 'library' ? <>
             <div className="grid-toolbar"><span>{loading ? 'Loading photos…' : `${page.rows.length} photos on this page`}</span><label>Size<input aria-label="Thumbnail size" type="range" min="130" max="300" step="10" value={size} onChange={event => setSize(Number(event.target.value))} /></label></div>
-            {scope === undefined ? <div className="empty-state"><h2>Choose a folder</h2><p>Your library follows the folders on disk. Select a folder, or open All Photos to browse across every year.</p></div> : page.rows.length ? <PhotoGrid edited={editor?.variant} catalog={catalog} rows={page.rows} selected={selected?.image_id ?? null} onSelect={row => void select(row)} onDevelop={() => setMode('develop')} size={size} /> : <div className="empty-state"><h2>{loading ? 'Loading photos…' : page.has_more ? 'More photos to check' : 'No photos in this view'}</h2><p>{page.has_more ? 'Continue to the next page to search the remaining candidates.' : 'Select another folder or change your search.'}</p></div>}
-          </> : selected && editor ? <Viewport catalog={catalog} image={selected} variant={editor.variant} interactive={mode === 'develop'} /> : <div className="empty-state"><h2>Select a photograph</h2><p>Choose a photo in Library to begin.</p><button onClick={() => setMode('library')}>Open Library</button></div>}
-          {mode === 'cull' && selected && <div className="cull-bar"><button onClick={() => void cull({ operation: 'flag', value: 'pick' }, true)}>Pick <kbd>P</kbd></button><button onClick={() => void cull({ operation: 'flag', value: 'reject' }, true)}>Reject <kbd>X</kbd></button><button onClick={() => void cull({ operation: 'flag', value: 'unflagged' }, true)}>Unflag <kbd>U</kbd></button><span className="hint">0–5 rates · advances after saving</span></div>}
-          {page.rows.length > 0 && <Filmstrip edited={editor?.variant} catalog={catalog} rows={page.rows} selected={selected?.image_id ?? null} onSelect={row => void select(row)} onDevelop={() => setMode('develop')} />}
+            {scope === undefined ? <div className="empty-state"><h2>Choose a folder</h2><p>Your library follows the folders on disk. Select a folder, or open All Photos to browse across every year.</p></div> : page.rows.length ? <PhotoGrid key={previewEpoch} edited={editor?.variant} catalog={catalog} rows={page.rows} selected={selected?.image_id ?? null} onSelect={row => void select(row)} onDevelop={() => setMode('develop')} size={size} /> : <div className="empty-state"><h2>{loading ? 'Loading photos…' : page.has_more ? 'More photos to check' : 'No photos in this view'}</h2><p>{page.has_more ? 'Continue to the next page to search the remaining candidates.' : 'Select another folder or change your search.'}</p></div>}
+          </> : selected && editor ? <Viewport key={previewEpoch} catalog={catalog} image={selected} variant={editor.variant} interactive={mode === 'develop'} /> : <div className="empty-state"><h2>Select a photograph</h2><p>Choose a photo in Library to begin.</p><button onClick={() => setMode('library')}>Open Library</button></div>}
+          {mode === 'cull' && selected && <div className="cull-bar"><button disabled={storageWriteHold} onClick={() => void cull({ operation: 'flag', value: 'pick' }, true)}>Pick <kbd>P</kbd></button><button disabled={storageWriteHold} onClick={() => void cull({ operation: 'flag', value: 'reject' }, true)}>Reject <kbd>X</kbd></button><button disabled={storageWriteHold} onClick={() => void cull({ operation: 'flag', value: 'unflagged' }, true)}>Unflag <kbd>U</kbd></button><span className="hint">0–5 rates · advances after saving</span></div>}
+          {page.rows.length > 0 && <Filmstrip key={previewEpoch} edited={editor?.variant} catalog={catalog} rows={page.rows} selected={selected?.image_id ?? null} onSelect={row => void select(row)} onDevelop={() => setMode('develop')} />}
           <footer className="page-controls"><button disabled={loading || previous.length === 0} onClick={() => { setCursor(previous.at(-1)!); setPrevious(value => value.slice(0, -1)); }}>Previous</button><button disabled={loading || !page.has_more || !page.next} onClick={() => { setPrevious(value => [...value.slice(-7), cursor]); setCursor(page.next); }}>Next</button><button disabled={loading || scope === undefined} onClick={() => { setCursor(null); setPrevious([]); setRefresh(value => value + 1); }}>Refresh view</button><span>{selected?.filename || 'No selection'}</span></footer>
         </section>
         {showInspector && <aside className="right-panel">{selected && editor ? <>
-          <Section title="Selected photo"><div className="selected-filename">{selected.filename}</div><CompatibilityStatus image={selected} selectedKey={editor.variant.key} />{editor.variant.label && <p className="hint">{editor.variant.label}</p>}<div className="rating-buttons" aria-label="Rating">{[0, 1, 2, 3, 4, 5].map(value => <button key={value} aria-label={`${value} stars`} aria-pressed={selected.rating === String(value)} onClick={() => void cull({ operation: 'rating', value }, false)}>{value === 0 ? '—' : '★'}</button>)}</div>
-          <div className="button-group"><button aria-pressed={selected.flag === 'pick'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'pick' ? 'unflagged' : 'pick' }, false)}>Pick</button><button aria-pressed={selected.flag === 'reject'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'reject' ? 'unflagged' : 'reject' }, false)}>Reject</button></div>
-          {selected.conflicts.length > 0 && <p className="hint">Conflicting metadata: {selected.conflicts.join(', ')}</p>}{selected.metadata_pending && <p className="hint">Metadata indexing is pending.</p>}</Section>
-          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={transitioning} recipe={editor.recipe} onChange={value => { if (!gate.current.locked) queueRef.current?.change(value); }} />
-          <div className="edit-actions"><button disabled={transitioning || !editor.variant.can_undo} onClick={() => void undo(false)}>Undo</button><button disabled={transitioning || !editor.variant.can_redo} onClick={() => void undo(true)}>Redo</button><button onClick={() => setCopyName('Copy')}>Create variant…</button><button onClick={() => void inspectHistory()}>Edit history</button></div></>}
+          <Section title="Selected photo"><div className="selected-filename">{selected.filename}</div><CompatibilityStatus image={selected} selectedKey={editor.variant.key} />{editor.variant.label && <p className="hint">{editor.variant.label}</p>}<div className="rating-buttons" aria-label="Rating">{[0, 1, 2, 3, 4, 5].map(value => <button key={value} disabled={storageWriteHold} aria-label={`${value} stars`} aria-pressed={selected.rating === String(value)} onClick={() => void cull({ operation: 'rating', value }, false)}>{value === 0 ? '—' : '★'}</button>)}</div>
+          <div className="button-group"><button disabled={storageWriteHold} aria-pressed={selected.flag === 'pick'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'pick' ? 'unflagged' : 'pick' }, false)}>Pick</button><button disabled={storageWriteHold} aria-pressed={selected.flag === 'reject'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'reject' ? 'unflagged' : 'reject' }, false)}>Reject</button></div>
+          {selected.conflicts.length > 0 && <p className="hint">Conflicting metadata: {selected.conflicts.join(', ')}</p>}{selected.metadata_pending && <p className="hint">Metadata indexing is pending.</p>}<button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowMetadata(true); })}>Metadata & XMP…</button></Section>
+          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={transitioning || storageWriteHold} recipe={editor.recipe} onChange={value => { if (!gate.current.locked && !storageWriteHold) queueRef.current?.change(value); }} />
+          <div className="edit-actions"><button disabled={transitioning || storageWriteHold || !editor.variant.can_undo} onClick={() => void undo(false)}>Undo</button><button disabled={transitioning || storageWriteHold || !editor.variant.can_redo} onClick={() => void undo(true)}>Redo</button><button disabled={storageWriteHold} onClick={() => setCopyName('Copy')}>Create variant…</button><button onClick={() => void inspectHistory()}>Edit history</button></div></>}
           {mode !== 'develop' && <Section title="Editing"><p className="hint">Changes apply to the selected photo or variant and leave the original untouched.</p><button onClick={() => setMode('develop')}>Open Develop</button></Section>}
         </> : <div className="empty-state"><p>Select a photo to inspect its metadata and edits.</p></div>}</aside>}
       </main><footer className="app-status"><span>{status.phase === 'ready' ? 'Catalog ready' : status.phase}</span><span>{importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase) ? `Import ${importStatus.phase.replaceAll('_', ' ')} · ${importStatus.imported} added` : status.message}</span><span>{backupStatus && ['running', 'cancel_requested'].includes(backupStatus.state) ? `Backup ${backupStatus.state.replaceAll('_', ' ')}` : ''}</span><span>{status.active_previews > 0 ? `${status.active_previews} preview requests` : 'Local catalog'}</span></footer>
     </>}
+    {catalog && <RelinkPanel key={catalog} catalog={catalog} selected={selected} open={showRelink} onClose={() => setShowRelink(false)} controller={storage} mutate={organizationMutation} changed={() => { setPreviewEpoch(v => v + 1); setFolderEpoch(v => v + 1); setCursor(null); setPrevious([]); setRefresh(v => v + 1); const selection = selectedRef.current; const generation = ++storageRefresh.current; const current = () => catalogRef.current === catalog && storageRefresh.current === generation && selectedRef.current === selection; if (selection) void command({ command: 'image', args: { catalog, key: selection.key } }, 'image').then(row => { if (current()) setSelected(row); }).catch(e => { if (current()) setError(errorText(e)); }); }} />}
     {catalog && <ImportPanel key={catalog} catalog={catalog} open={showImport} onProgress={setImportStatus} jobsHeld={status.jobs_held} onClose={() => setShowImport(false)} onComplete={() => { setFolderEpoch(value => value + 1); setCursor(null); setPrevious([]); setRefresh(value => value + 1); }} />}
     {desktopAvailable && <BackupPanel catalog={catalog} open={showBackup} onClose={() => setShowBackup(false)} onProgress={setBackupStatus} />}
+    {catalog && selected && showMetadata && <MetadataPanel key={`${catalog}:${imageKey(selected.key)}`} catalog={catalog} variant={selected.key} filename={selected.filename} mutate={organizationMutation} onClose={() => setShowMetadata(false)} />}
     {catalog && <OrganizationPanel phase={status.phase} open={showOrganization} onOpen={() => setShowOrganization(true)} key={catalog} catalog={catalog} selected={selected} selectedVariantLabel={editor?.variant.label ?? null} rows={page.rows} mutate={organizationMutation} onClose={() => setShowOrganization(false)} onSelect={async row => { await gate.current.afterCurrent(async () => { setTransitioning(true); try { await queueRef.current?.flush(); const variant = await command({ command: 'variant', args: { catalog, key: row.key } }, 'variant'); setSelected(row); attachVariant(variant); } finally { setTransitioning(false); } }); }} onFilter={(filter, name) => { setFilters(value => ({ ...value, ...filter })); setOrganizationScopeName(name); setScope(null); setCursor(null); setPrevious([]); setMode('library'); setShowOrganization(false); }} />}
     {showFilters && <SearchFilters value={filters} onApply={value => { setFilters(value); setCursor(null); setPrevious([]); }} onClose={() => setShowFilters(false)} />}
     {copyName !== null && <Dialog title="Create independent variant" onClose={() => setCopyName(null)}><p>Start a new edit from the current saved settings. The original and existing variant remain unchanged.</p><label className="form-field">Variant name<input autoFocus value={copyName} maxLength={256} onChange={event => setCopyName(event.target.value)} /></label><button className="primary" disabled={transitioning || !copyName.trim()} onClick={() => void createCopy()}>Create variant</button></Dialog>}

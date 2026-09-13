@@ -77,13 +77,15 @@ pub async fn catalog_choose_folder(app: tauri::AppHandle, create_catalog: bool) 
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore }
+pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal }
 
 #[tauri::command]
 pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPurpose) -> Result<Option<SelectedPath>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = app.dialog().file();
         let selected = match purpose {
+            LocationPurpose::RelinkFolder => dialog.set_title("Locate the moved originals folder").blocking_pick_folder(),
+            LocationPurpose::RelinkOriginal => dialog.set_title("Locate the original photo or metadata sidecar").blocking_pick_file(),
             LocationPurpose::Originals => dialog.set_title("Add photographs from a folder").blocking_pick_folder(),
             LocationPurpose::BackupBundle => dialog.set_title("Choose a PhotoCatalog backup folder").blocking_pick_folder(),
             LocationPurpose::NewBackup => dialog.set_title("Choose a new backup folder").set_file_name("PhotoCatalog Backup").blocking_save_file(),
