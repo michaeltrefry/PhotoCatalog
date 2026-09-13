@@ -139,6 +139,22 @@ pub struct FileInstance {
     pub observed_at: String,
 }
 
+/// In-memory prepared edit; fields are private so only validated preparation
+/// can produce this authority. Catalog handles inherit the same pinned File Arc.
+pub(crate) struct PreparedEdit {
+    catalog_file: std::sync::Arc<std::fs::File>,
+    image_identity: crate::catalog_images::ImageMetadataIdentity,
+    expected_revision: i64,
+    base_model: Option<i64>,
+    edits: Vec<Edit>,
+    organization_fields: Vec<String>,
+    source: Source,
+    prepared: Prepared,
+    original: Projection,
+    original_semantics: BTreeMap<String, String>,
+    updated: Projection,
+}
+
 struct PreparedModel {
     hash: String,
     semantics: BTreeMap<String, String>,
@@ -1028,9 +1044,29 @@ impl Catalog {
         organization_fields: &[String],
         after: impl FnOnce(&Connection, i64) -> Result<()>,
     ) -> Result<Change> {
-        crate::catalog_images::require_current(&self.db, asset)?;
+        let prepared = self.prepare_metadata_edit(
+            asset,
+            expected_revision,
+            base_model,
+            edits,
+            organization_fields,
+        )?;
+        self.commit_prepared_metadata_edit(prepared, after)
+    }
+
+    /// Parse, project and compress on the selected catalog worker, without a
+    /// writer permit. The returned value cannot authorize a different session.
+    pub(crate) fn prepare_metadata_edit(
+        &self,
+        asset: &str,
+        expected_revision: i64,
+        base_model: Option<i64>,
+        edits: &[Edit],
+        organization_fields: &[String],
+    ) -> Result<PreparedEdit> {
+        let image_identity = crate::catalog_images::identity(&self.db, asset)?;
         ensure!(
-            revision(&self.db, asset)? == expected_revision,
+            image_identity.metadata_revision == expected_revision,
             "metadata changed; refresh before editing"
         );
         ensure!(
@@ -1123,13 +1159,53 @@ impl Catalog {
         prepared.revision = blake3::hash(&serde_json::to_vec(&(&prepared.revision, &updated))?)
             .to_hex()
             .to_string();
+        Ok(PreparedEdit {
+            catalog_file: self.relink_file.clone(),
+            image_identity,
+            expected_revision,
+            base_model,
+            edits: edits.to_vec(),
+            organization_fields: organization_fields.to_vec(),
+            source,
+            prepared,
+            original,
+            original_semantics,
+            updated,
+        })
+    }
+
+    /// Revalidate the frozen image authority and publish the prepared edit in
+    /// the same transaction as any organization job/event bookkeeping.
+    pub(crate) fn commit_prepared_metadata_edit(
+        &mut self,
+        edit: PreparedEdit,
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<Change> {
+        ensure!(
+            std::sync::Arc::ptr_eq(&self.relink_file, &edit.catalog_file),
+            "prepared metadata edit belongs to another catalog session"
+        );
+        let PreparedEdit {
+            catalog_file: _,
+            image_identity,
+            expected_revision,
+            base_model,
+            edits,
+            organization_fields,
+            source,
+            prepared,
+            original,
+            original_semantics,
+            updated,
+        } = edit;
+        let asset = image_identity.image_id.as_str();
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        crate::catalog_images::require_current(&tx, asset)?;
+        crate::catalog_images::require_image_metadata_identity(&tx, &image_identity)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed while preparing edit"
@@ -1167,6 +1243,10 @@ impl Catalog {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "catalog_metadata/prepared_edit_tests.rs"]
+mod prepared_edit_tests;
 
 fn name_key(name: &std::ffi::OsStr) -> Vec<u8> {
     if let Some(s) = name.to_str() {
