@@ -7,6 +7,22 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
 PR16 is at `00463417af8ee8e0ce10c775ba11aea270bdc9c6`; CI34773173909 is
 terminal (Windows/Linux/contracts passed; Mac failed on the repaired close race).
+Local reviewed batch now adds Close/lease repair `716b2ad` and actual-opened
+SQLite identity `63c7796` (author `91610d13`). All 37 frozen identity files and
+committed blobs match, including the upstream ignored lockfile; the full code tree
+matches the qualified author tree (only this ledger differs). Three substantive
+identity/lock tests plus their subprocess helper, 20 relink tests, five notice
+tests, strict all-target release Clippy and formatting passed. The host-filtered
+locked desktop dependency graph resolves exactly one local SQLite links package.
+Unrestricted offline metadata failed only on an uncached Android dependency; no
+all-platform qualification is inferred. Independent review:
+`sc-22847-sqlite-identity-independent-c78ncxhr/review-final.json`, SHA256
+`ad4d492da6feea7f77e621a464a52ed61cd6e93f6c7b6469786ecedf22f9ba79`.
+This is a narrow identity prerequisite. Shared connection/raw-descriptor custody
+remains open; the complete catalog-session helper and filesystem executor design
+is under independent review and exact call-site inventory before implementation.
+Fresh hosted CI is required for this batch.
+
 The earlier reviewed batch
 includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
 Lightroom inspection workbench `9deedea`, and Windows boundary repair `e239268`.
@@ -15,9 +31,9 @@ review verified the repaired completed-review settings binding and the combined
 App merge. All 50 integrated frontend tests and TypeScript/Vite build pass. The
 initial 32 and repair 18 private evidence hashes match. Review:
 `sc-22847-export-interface-independent-4zfru_0x/review-repaired.json`. Integrated
-receipt: `sc-22847-export-frontend-integrated-rbkjseev/receipt.json`. The current
-batched push qualified Mac/Linux; Windows observer repair below awaits the next
-batch. No actual export GUI claim yet.
+receipt: `sc-22847-export-frontend-integrated-rbkjseev/receipt.json`. The earlier
+batch qualified Mac/Linux; Windows observer repair is now qualified by
+CI34773173909 as recorded below. No actual export GUI claim yet.
 
 CI34765013818 is terminal: macOS, Linux and evidence contracts passed. Downloaded
 Mac/Linux qualification receipts and installer hashes match; installed synthetic
