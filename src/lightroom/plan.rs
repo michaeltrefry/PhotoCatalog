@@ -19,6 +19,7 @@ use std::{
 
 /// Inspection-plan storage version; independent of the application catalog.
 pub const PLAN_SCHEMA_VERSION: i64 = 3;
+pub mod selection;
 const PAGING_INDEXES: &str = "CREATE INDEX rows_revision_sequence ON rows(revision,sequence);
 CREATE INDEX issues_revision_sequence ON issues(revision,sequence);
 CREATE INDEX packets_revision_sequence ON packets(revision,sequence);
@@ -1798,6 +1799,9 @@ impl Plan {
     }
     pub fn families(&self) -> Result<FamilyReport> {
         let _read_snapshot = self.db.unchecked_transaction()?;
+        self.families_in_snapshot()
+    }
+    fn families_in_snapshot(&self) -> Result<FamilyReport> {
         let captures = {
             let mut statement=self.db.prepare("SELECT revision,schema_version,provider,stage,evidence_revision FROM captures ORDER BY revision LIMIT 257")?;
             statement

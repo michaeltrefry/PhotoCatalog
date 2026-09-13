@@ -5,6 +5,7 @@ pub mod capture;
 pub mod discovery;
 pub mod migration_source;
 pub mod plan;
+pub use plan::selection;
 pub(crate) mod source;
 pub mod wal;
 

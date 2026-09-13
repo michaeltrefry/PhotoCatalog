@@ -9,6 +9,10 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -131,12 +135,14 @@ impl Collection {
 }
 
 struct Budget {
+    cancel: Arc<AtomicBool>,
     until: Instant,
     remaining: u64,
 }
 unsafe extern "C" fn progress(context: *mut std::ffi::c_void) -> i32 {
     let budget = unsafe { &mut *context.cast::<Budget>() };
-    if budget.remaining == 0
+    if budget.cancel.load(Ordering::Relaxed)
+        || budget.remaining == 0
         || (budget.remaining.is_multiple_of(1000) && Instant::now() >= budget.until)
     {
         return 1;
@@ -149,8 +155,9 @@ struct QueryBudget<'a> {
     state: Box<Budget>,
 }
 impl<'a> QueryBudget<'a> {
-    fn new(db: &'a Connection, limits: ReadLimits) -> Self {
+    fn new(db: &'a Connection, limits: ReadLimits, cancel: Arc<AtomicBool>) -> Self {
         let mut state = Box::new(Budget {
+            cancel,
             until: Instant::now() + Duration::from_millis(limits.deadline_ms),
             remaining: limits.vm_steps,
         });
@@ -165,6 +172,10 @@ impl<'a> QueryBudget<'a> {
         Self { db, state }
     }
     fn check(&self) -> Result<()> {
+        ensure!(
+            !self.state.cancel.load(Ordering::Relaxed),
+            "inspection-source read canceled"
+        );
         ensure!(
             Instant::now() < self.state.until,
             "inspection-source read deadline exceeded"
@@ -254,6 +265,7 @@ pub struct MigrationSource {
     namespace: String,
     limits: ReadLimits,
     poisoned: Flag<bool>,
+    cancel: Arc<AtomicBool>,
 }
 
 fn digest_valid(value: &str) -> bool {
@@ -367,6 +379,19 @@ impl InputSeal {
 
 impl MigrationSource {
     pub fn open(seal: InputSeal, limits: ReadLimits) -> Result<Self> {
+        Self::open_cancellable(seal, limits, Arc::new(AtomicBool::new(false)))
+    }
+    /// The cancellation flag covers initial hashing, SQL admission and later reads.
+    /// This adds interruption without changing any seal or source validation rule.
+    pub fn open_cancellable(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "inspection-source read canceled"
+        );
         limits.validate()?;
         seal.validate()?;
         let path = seal.database.to_path()?;
@@ -393,6 +418,10 @@ impl MigrationSource {
         let mut hash = blake3::Hasher::new();
         let mut buffer = [0; 128 * 1024];
         while left > 0 {
+            ensure!(
+                !cancel.load(Ordering::Relaxed),
+                "inspection-source read canceled"
+            );
             ensure!(
                 Instant::now() < deadline,
                 "sealed source hashing deadline exceeded"
@@ -426,6 +455,7 @@ impl MigrationSource {
             namespace,
             limits,
             poisoned: Flag::new(false),
+            cancel,
         };
         value
             .operation(|| value.admit())
@@ -459,7 +489,11 @@ impl MigrationSource {
     }
     fn operation<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
         self.verify()?;
-        let budget = QueryBudget::new(&self.db, self.limits);
+        ensure!(
+            !self.cancel.load(Ordering::Relaxed),
+            "inspection-source read canceled"
+        );
+        let budget = QueryBudget::new(&self.db, self.limits, self.cancel.clone());
         let result = read();
         self.verify()?;
         budget.check()?;
