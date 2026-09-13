@@ -16,6 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "supplement_json.rs"]
+mod supplement_json;
+
 struct Spec {
     table: &'static str,
     keys: &'static [&'static str],
@@ -765,28 +768,9 @@ impl MigrationSource {
             blob.len() <= crate::lightroom::PAGE_BYTES,
             "supplement baseline metadata limit"
         );
-        let evidence: serde_json::Value = serde_json::from_slice(&blob.read(0, blob.len())?)?;
-        let matches = evidence
-            .get("inspections")
-            .and_then(|v| v.as_array())
-            .context("supplement has no retained original inspection")?
-            .iter()
-            .filter(|v| v.get("origin").and_then(|v| v.as_str()) == Some(&pin.origin))
-            .collect::<Vec<_>>();
-        ensure!(
-            matches.len() == 1,
-            "supplement original association missing or ambiguous"
-        );
-        let source: crate::xmp_packets::SourceRevision = serde::Deserialize::deserialize(
-            matches[0]
-                .get("revision")
-                .context("supplement source revision missing")?,
-        )?;
-        let status: crate::xmp_packets::Status = serde::Deserialize::deserialize(
-            matches[0]
-                .get("status")
-                .context("supplement status missing")?,
-        )?;
+        let bytes = blob.read(0, blob.len())?;
+        let (source, status) =
+            supplement_json::select(&bytes, &pin.origin, &|| self.cancel.load(Ordering::Relaxed))?;
         ensure!(
             source == pin.source_revision && status == pin.historical_status,
             "supplement differs from retained original identity/status"
