@@ -5,8 +5,22 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 ## Current delivery — 2026-09-13
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
-PR16 is at `00463417af8ee8e0ce10c775ba11aea270bdc9c6`; CI34773173909 is
-terminal (Windows/Linux/contracts passed; Mac failed on the repaired close race).
+PR16 is at `3bd92ded58bd00ecd5701e8114fa13a3bf91f60f`; CI34776023414 is
+running for the reviewed Close/lease and SQLite identity batch. Previous
+CI34773173909 is terminal (Windows/Linux/contracts passed; Mac failed on the
+repaired close race). Shortcut comment23323 and exact PR body/head read back.
+
+Local `298b03c` also binds the sealed Lightroom reader's actual opened SQLite
+object to its retained Source before any PRAGMA and on every verification.
+Old checks failed all three new regressions, including accepting a byte-identical
+substitute during directory ABA. Fixed full reader group20 functions, strict
+all-target release Clippy and formatting pass. Independent committed-source and
+nine-artifact readback:
+`sc-22847-migration-reader-identity-independent-iwv0u6d5/review-final.json`, SHA256
+`fd3890d2a98adf84e9588d8ca2aac02dfb3998b55b21e1b260c0fa73a810ee08`.
+All local native owners drained. This remains an identity-only prerequisite;
+shared raw descriptor/failed-open lifetime and external filesystem isolation are
+still required. No new installed/RAID/GUI or three-platform runtime claim.
 Local reviewed batch now adds Close/lease repair `716b2ad` and actual-opened
 SQLite identity `63c7796` (author `91610d13`). All 37 frozen identity files and
 committed blobs match, including the upstream ignored lockfile; the full code tree
