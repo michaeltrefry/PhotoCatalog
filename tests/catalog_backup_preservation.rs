@@ -182,3 +182,193 @@ fn whole_snapshot_preserves_real_xmp_choices_variants_undo_and_partial_evidence(
     assert_eq!(fs::read_to_string(offline.join("雪.xmp"))?, packet(3));
     Ok(())
 }
+
+#[test]
+fn backup_snapshot_excludes_live_application_job_commits_and_preserves_queued_export() -> Result<()>
+{
+    use photocatalog::{
+        catalog_backup::Phase,
+        catalog_exports::{ExportTarget, MetadataSelection},
+        image_export::{AlphaPolicy, OutputFormat, OutputProfile, OutputSize, OutputSpec},
+        organization::BatchItem,
+    };
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals)?;
+    for name in ["one", "two"] {
+        image::RgbImage::from_pixel(16, 12, image::Rgb([40u8, 70, 90]))
+            .save(originals.join(format!("{name}.png")))?;
+        fs::write(originals.join(format!("{name}.xmp")), packet(2))?;
+    }
+    let root = temp.path().join("catalog");
+    let mut catalog = Catalog::open(&root)?;
+    catalog.import(&originals, None, |_| Ok(()))?;
+    let assets = catalog.browse(0, 10)?;
+    assert_eq!(assets.len(), 2);
+    let job = catalog.begin_organization_batch(Operation::Label {
+        value: "Blue".into(),
+    })?;
+    let items = assets
+        .iter()
+        .map(|asset| {
+            Ok(BatchItem {
+                asset_id: asset.id.clone(),
+                expected_revision: catalog.metadata(&asset.id)?.revision,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    catalog.append_organization_batch(&job.id, &items)?;
+    let ready = catalog.seal_organization_batch(&job.id)?;
+    assert_eq!(
+        (ready.state.as_str(), ready.pending, ready.applied),
+        ("ready", 2, 0)
+    );
+
+    // Freeze a real plan, including selected XMP bytes and source/recipe/destination
+    // authority, while originals are available. Neither backup nor restore runs it.
+    let exports = temp.path().join("exports");
+    fs::create_dir(&exports)?;
+    let destination = exports.join("queued.jpg");
+    let key = VariantKey::master(assets[0].id.clone());
+    let metadata = catalog.metadata_for_image(&key)?;
+    let base = metadata
+        .fields
+        .iter()
+        .find(|field| field.name == "rating")
+        .unwrap()
+        .selected_model;
+    let export = catalog.begin_photo_export()?;
+    let item = catalog.append_photo_export(
+        &export.id,
+        0,
+        &ExportTarget {
+            key: key.clone(),
+            expected_revision: catalog.edit_variant(&key)?.revision,
+            destination: destination.clone(),
+            overwrite: false,
+            metadata: MetadataSelection::Resolved {
+                expected_revision: metadata.revision,
+                base_model: base,
+            },
+        },
+        &OutputSpec {
+            size: OutputSize::Original,
+            format: OutputFormat::Jpeg { quality: 90 },
+            profile: OutputProfile::Srgb,
+            alpha: AlphaPolicy::Composite {
+                linear_rgb: [1.; 3],
+            },
+        },
+        8 * 1024 * 1024,
+        8 * 1024 * 1024,
+    )?;
+    let export = catalog.seal_photo_export_job(&export.id, 1)?;
+    assert_eq!(export.state, "queued");
+    assert_eq!(item.state, "pending");
+    let export_plan = serde_json::to_value(catalog.photo_export_plan(&export.id, item.sequence)?)?;
+    let before = snapshot::logical_snapshot(&root)?;
+    assert!(!before["photo_export_blobs"].is_empty());
+    let before_images = assets
+        .iter()
+        .map(|asset| public_state(&catalog, &VariantKey::master(&asset.id)))
+        .collect::<Result<Vec<_>>>()?;
+    let before_job = serde_json::to_value(&ready)?;
+    let before_items = serde_json::to_value(catalog.organization_job_items(&job.id, 0, 10)?)?;
+    fs::rename(&originals, temp.path().join("offline"))?;
+
+    let mut writer = Catalog::open(&root)?;
+    let mut snapshot_write = false;
+    let mut copy_write = false;
+    let bundle = temp.path().join("bundle");
+    let restored = temp.path().join("restored");
+    let limits = Limits {
+        pages_per_step: 1,
+        min_free_bytes: 0,
+        max_seconds: 30,
+        ..Default::default()
+    };
+    backup_catalog(&root, &bundle, &limits, |progress| {
+        assert!(!originals.exists());
+        match progress.phase {
+            Phase::Snapshot => {
+                assert!(!snapshot_write);
+                let running = writer.step_organization_batch(&job.id)?;
+                assert_eq!(
+                    (running.state.as_str(), running.applied, running.pending),
+                    ("running", 1, 1)
+                );
+                snapshot_write = true;
+            }
+            Phase::Copy if !copy_write => {
+                assert!(snapshot_write);
+                let complete = writer.step_organization_batch(&job.id)?;
+                assert_eq!(
+                    (complete.state.as_str(), complete.applied, complete.pending),
+                    ("complete", 2, 0)
+                );
+                assert_eq!(
+                    catalog.organization_job(&job.id)?.applied,
+                    2,
+                    "foreground reader sees committed job progress while backup remains pinned"
+                );
+                copy_write = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    assert!(snapshot_write && copy_write);
+    assert_eq!(snapshot::logical_snapshot(&bundle)?, before);
+    assert_ne!(snapshot::logical_snapshot(&root)?, before);
+    for asset in &assets {
+        assert_eq!(
+            catalog
+                .metadata(&asset.id)?
+                .fields
+                .iter()
+                .find(|field| field.name == "label")
+                .unwrap()
+                .value,
+            Some(Value::Text("Blue".into()))
+        );
+    }
+    restore_catalog(&bundle, &restored, &limits, |_| Ok(()))?;
+    assert_eq!(snapshot::logical_snapshot(&restored)?, before);
+    let mut restored_catalog = Catalog::open(&restored)?;
+    assert_eq!(
+        serde_json::to_value(restored_catalog.organization_job(&job.id)?)?,
+        before_job
+    );
+    assert_eq!(
+        serde_json::to_value(restored_catalog.organization_job_items(&job.id, 0, 10)?)?,
+        before_items
+    );
+    for (asset, expected) in assets.iter().zip(before_images) {
+        assert_eq!(
+            public_state(&restored_catalog, &VariantKey::master(&asset.id))?,
+            expected
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(restored_catalog.photo_export_job(&export.id)?)?,
+        serde_json::to_value(export.clone())?
+    );
+    assert_eq!(
+        serde_json::to_value(restored_catalog.photo_export_plan(&export.id, item.sequence)?)?,
+        export_plan
+    );
+    assert_eq!(
+        restored_catalog.photo_export_items(&export.id, 0, 10)?[0].state,
+        "pending"
+    );
+    assert!(
+        restored_catalog.claim_photo_export(&export.id).is_err(),
+        "restored queued export must remain held"
+    );
+    assert!(restore_status(&restored)?.unwrap().jobs_held);
+    assert!(!destination.exists());
+    assert_eq!(fs::read_dir(&exports)?.count(), 0);
+    assert_eq!(catalog.organization_job(&job.id)?.state, "complete");
+    assert_eq!(catalog.photo_export_job(&export.id)?.state, "queued");
+    Ok(())
+}
