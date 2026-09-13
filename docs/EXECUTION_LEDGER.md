@@ -14,7 +14,8 @@ App merge. All 50 integrated frontend tests and TypeScript/Vite build pass. The
 initial 32 and repair 18 private evidence hashes match. Review:
 `sc-22847-export-interface-independent-4zfru_0x/review-repaired.json`. Integrated
 receipt: `sc-22847-export-frontend-integrated-rbkjseev/receipt.json`. The current
-batched push is qualifying these changes together; no actual export GUI claim yet.
+batched push qualified Mac/Linux; Windows observer repair below awaits the next
+batch. No actual export GUI claim yet.
 
 CI34765013818 is terminal: macOS, Linux and evidence contracts passed. Downloaded
 Mac/Linux qualification receipts and installer hashes match; installed synthetic
@@ -46,13 +47,16 @@ The serialized Lightroom workbench passed 62 executed tests, strict Clippy and
 formatting; independent review verified 12 source and 19 evidence files. It provides
 owned discovery/capture/inspection, exact result chunks, explicit family decisions
 and selection sealing. The complete desktop bridge `a6dad4e` passed independent review and 29 distinct
-focused functions plus strict Clippy, formatting and TypeScript. Isolated UI
-integration is `7e6792a`; this bridge is not in PR16 or v6 yet. Root controller
+focused functions plus strict Clippy, formatting and TypeScript. Reviewed local desktop integration is `ab7a6e1`/
+`ff2bf93`/`d2c53dc`, byte-identical to the isolated reviewed UI tree apart from this
+ledger. This bridge is not in PR16 or v6 yet. Root controller
 `0f84f56` passed 54 frontend functions and synthetic actual-hook lifecycle checks:
 same-generation reads, hidden panel/catalog changes, stale callbacks, lost starts,
 exact Cancel, and ambiguous or typed Close replies. Final delta keeps an accepted
 Close pending through Closing until Closed even when its reply is an error. Final
-TypeScript/build passes; independent final evidence readback is pending. This is
+TypeScript/build passes; independent final review verified four source and 36
+evidence hashes. Review SHA256:
+`199b9aada077f4d1d934095128a84d7d409e2fedf684e1ffaa547ac19ab5e7cc`. This is
 not actual App mounting or installed GUI proof. Full panel mounting is in progress.
 The seven-command migration bridge plan is under independent review; target-free
 preparation, cancellable writer grants, and parent-safe SQLite alias/ABA handling
@@ -70,10 +74,32 @@ other originals. No guessed association or relink was performed. The user questi
 about conversion/removal is pending. V5 is the immutable `4e40972` checkpoint and
 does not contain this newer export/workbench batch.
 
-Fresh CI34768145412 at the exact PR head has passed macOS, Linux and evidence
-contracts. Windows has passed library/recovery, native GUID/junction, RAW, frontend
-and Tauri build checks and is building its installed-worker observer. Terminal
-Windows installed qualification remains required; no additional push during this run.
+CI34768145412 at exact `d62fe14` is terminal: Mac/Linux/contracts passed. Windows
+passed code/recovery/native-path/RAW/frontend/Tauri checks, then failed the final
+observer executable association. Downloaded Windows evidence proves workers passed
+and known processes were reaped; Rust's `\\?\` canonical prefix differed from the
+Python input spelling. Reviewed fix `67975e0` compares actual file identity, keeps
+pre/post SHA pins and literal cleanup verification, and rejects a separate file
+with the same bytes. Nine local test functions pass; the Windows verbatim case
+requires its native host. Observer tests now run in each platform matrix after
+psutil setup. Independent source review SHA256:
+`e9e267fd9a9478041babcccb2ce76bf2348594640df3e7c56006b1221f46f342`.
+No claim that the failed workflow is green; next batched push must qualify the fix.
+Mac/Linux downloaded installer/executable/receipt readback SHA256:
+`5a6ade05fd436060a8115e54674a890616841ddf60c05f6184e32ccffe79a4ff`.
+The downloaded Mac artifact does not include the observer at the Linux package
+path; root independently verified the Linux observer only.
+
+A controlled-metadata prerequisite found a retained-blob allocation gap. Reviewed
+`616aa18` admits raw and compressed lengths in one SQL read before allocating the
+compressed Rust vector. Exact output length and digest checks remain. All 15
+focused functions, strict all-target Clippy and formatting pass; session61932
+exited0. Receipt SHA256:
+`4cad10fed7cac6a6374cf689140e81f28ea5fdff218e6034973b99cd2d3a0dae`.
+Independent review SHA256:
+`331e3ebe4097a9d6f7a020b52b7012976144d45a2b7593e6aaaf9bed80cdec9e`.
+The full editor remains open: a separate prepare/commit seam is under development
+and validation, with early image identity and exact catalog-session pinning.
 
 The immutable Mac v6 package contains exact `d62fe14` (tree
 `14ffdf0ad510912a8bf4f2e26fdd193c68374427`). All eight bounded build/package/worker
@@ -88,7 +114,7 @@ This is arm64 development/ad-hoc packaging, not notarized. V6 GUI acceptance wai
 for the user to unlock the Mac. V5 PID20724 and executable remained unchanged;
 no app switch occurred. The native validation lane is free. Full controlled XMP
 editing, sidecar exports, settings/accessibility/platform acceptance and S13 remain
-open. Shortcut comment23311 was read back with S12 still In Progress.
+open. Shortcut comments23311 and23312 were read back with S12 still In Progress.
 
 ## Earlier integration checkpoints
 
