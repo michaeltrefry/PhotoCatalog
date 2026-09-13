@@ -57,11 +57,23 @@ Close pending through Closing until Closed even when its reply is an error. Fina
 TypeScript/build passes; independent final review verified four source and 36
 evidence hashes. Review SHA256:
 `199b9aada077f4d1d934095128a84d7d409e2fedf684e1ffaa547ac19ab5e7cc`. This is
-not actual App mounting or installed GUI proof. Full panel mounting is in progress.
-The seven-command migration bridge plan is under independent review; target-free
-preparation, cancellable writer grants, and parent-safe SQLite alias/ABA handling
-must resolve before implementation. UI and migration execution, reconciliation and
-repair paths remain required S12 work. No canonical user migration occurred.
+not installed GUI proof. The full panel is integrated as `2fabffd`: all 11 actions,
+13 queries and five review collections, with App-owned input/status lifetime and
+explicit preparation gaps. Independent final review passed after repairing global
+ID continuation, linear UTF-8 chunking and BOM preservation. All 63 frontend tests,
+TypeScript/Vite and 18 actual-App synthetic snapshots pass. Eleven source/dependency
+hashes match the reviewed tree. Review SHA256:
+`2de77e3f54b60dd634046f19fd42d8d2d45e15c67569a39bf3267111acd497df`.
+
+The complete seven-command migration PLANv3/WIREv3 passed independent design review
+and was recorded verbatim in Shortcut comment23313 with read-back verification.
+Implementation is active in an isolated worktree. It covers target-free preparation,
+all saved stages and repairs, exact approval authority, parent-managed cancellable
+writer grants, handle transfer/quarantine and bootstrap recovery. Early source
+review identified a Windows path reopen under the inspection fence and a Linux
+received-descriptor inheritance window; both require correction before that source
+can qualify. Migration execution, reconciliation and repair remain required S12
+work. No canonical user migration occurred.
 
 The old v1 app was closed normally. Installed v5 opens the selected16 TEST catalog:
 preparation reached Catalog ready, and a known existing 2017 CR2 displayed both a
@@ -98,8 +110,16 @@ exited0. Receipt SHA256:
 `4cad10fed7cac6a6374cf689140e81f28ea5fdff218e6034973b99cd2d3a0dae`.
 Independent review SHA256:
 `331e3ebe4097a9d6f7a020b52b7012976144d45a2b7593e6aaaf9bed80cdec9e`.
-The full editor remains open: a separate prepare/commit seam is under development
-and validation, with early image identity and exact catalog-session pinning.
+The prepare/commit seam is now integrated as `0537b29`. It prepares XMP off the
+writer, carries early full image identity and an exact shared catalog-session pin,
+then revalidates under the commit transaction. Four new tests cover all edit forms,
+variant isolation, stale identity/revision, session mismatch and callback rollback.
+All 40 affected functions, strict Clippy and formatting passed; the initial empty
+organization filter is excluded and its corrected two-test run is retained. Final
+independent review SHA256:
+`5d923bf9df072136f0ebcaee7c9a91743e742ac227a03d379daf71491de0903c`.
+This seam does not establish bounded writer duration or the desktop editor/sidecar
+workflow; that complete workflow is being planned from the existing core surface.
 
 The immutable Mac v6 package contains exact `d62fe14` (tree
 `14ffdf0ad510912a8bf4f2e26fdd193c68374427`). All eight bounded build/package/worker
@@ -112,9 +132,20 @@ Root readback SHA256:
 `ef5f0d8f3bcc6cc7bda51d1fe617c94bdab6d72fd7f5d4de9fa04d6d9a1b952c`.
 This is arm64 development/ad-hoc packaging, not notarized. V6 GUI acceptance waits
 for the user to unlock the Mac. V5 PID20724 and executable remained unchanged;
-no app switch occurred. The native validation lane is free. Full controlled XMP
+no app switch occurred. Full controlled XMP
 editing, sidecar exports, settings/accessibility/platform acceptance and S13 remain
 open. Shortcut comments23311 and23312 were read back with S12 still In Progress.
+
+The next integrated code head `2fabffd17e80f0bb3f60550e549ff1d39f1d5773`
+passes 63 frontend tests, TypeScript/Vite, six bridge tests, four prepared-edit
+regressions, Tauri compile plus the existing export-picker mapping test, and
+formatting. This does not validate the new Lightroom pickers. Native
+session64501 exited0 and was reaped. All 11 panel/dependency pins remain exact.
+Receipt `sc-22847-lightroom-ui-integrated-rzlpj9m6/receipt.json`, SHA256
+`c487c47a365d668d1a64fd392a12df4dedf2259a437f85b13803782c6bbfd08e`.
+Independent exact-head integration review passed with no findings, SHA256
+`e1552e3321ce00601ee3c5cc8be4bb694edd2c23dd5a02930e419754bfe3a378`.
+This is combined source validation; installed GUI and fresh hosted CI remain open.
 
 ## Earlier integration checkpoints
 
