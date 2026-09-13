@@ -2,10 +2,10 @@
 //! preview launch suspension held until the export process has been reaped.
 use crate::{
     Catalog,
-    catalog_exports::{ExportPublicationMetrics, ExportWork},
+    catalog_exports::{ExportCheckpoint, ExportControl, ExportPublicationMetrics, ExportWork},
     export_worker::ExportWorkerProcess,
     photo_render::PhotoRenderLimits,
-    preview::{ByteBudget, ByteReservation, NativeLaunchPause, PreviewService},
+    preview::{ByteBudget, ByteReservation, NativeLaunchPause, NativeLaunchPermit, PreviewService},
 };
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -119,13 +119,15 @@ impl Drop for AcquiredExecutorLock {
 }
 pub struct ExportService {
     catalog: PathBuf,
+    catalog_pin: std::sync::Arc<File>,
     executable: PathBuf,
     staging: PathBuf,
     limits: ExportServiceLimits,
     budget: ByteBudget,
     active: Option<Active>,
     pause: Option<NativeLaunchPause>,
-    _lock: AcquiredExecutorLock,
+    permit: Option<NativeLaunchPermit>,
+    _lock: Option<AcquiredExecutorLock>,
     recovery_complete: bool,
     completion_metrics: Option<ExportCompletionMetrics>,
 }
@@ -171,13 +173,15 @@ impl ExportService {
         );
         Ok(Self {
             catalog: root,
+            catalog_pin: catalog.relink_file.clone(),
             executable: executable.to_owned(),
             staging,
             limits,
             budget: ByteBudget::new(limits.working_bytes)?,
             active: None,
             pause: None,
-            _lock: lock,
+            permit: None,
+            _lock: Some(lock),
             recovery_complete: false,
             completion_metrics: None,
         })
@@ -187,6 +191,11 @@ impl ExportService {
         ensure!(
             catalog.root.canonicalize()? == self.catalog,
             "export executor belongs to another catalog"
+        );
+        ensure!(
+            crate::storage_volume::held_object_key(&self.catalog_pin)?
+                == crate::storage_volume::held_object_key(&catalog.relink_file)?,
+            "export executor selected database changed"
         );
         Ok(())
     }
@@ -198,14 +207,32 @@ impl ExportService {
         catalog: &mut Catalog,
         max_directories: usize,
     ) -> Result<ExportRecovery> {
+        self.recover_cancellable(
+            catalog,
+            max_directories,
+            &mut ExportControl::new(&AtomicBool::new(false)),
+        )
+    }
+    /// Explicit execution, never an open/read side effect. Interruption retains
+    /// fenced transports/intents for the next explicitly requested recovery.
+    pub fn recover_cancellable(
+        &mut self,
+        catalog: &mut Catalog,
+        max_directories: usize,
+        control: &mut ExportControl<'_>,
+    ) -> Result<ExportRecovery> {
+        control.begin()?;
         self.check_catalog(catalog)?;
         ensure!(
             self.active.is_none(),
             "cannot recover while export worker is active"
         );
         self.recovery_complete = false;
-        let result =
-            crate::export_worker::recover_export_transports(&self.staging, max_directories)?;
+        let result = crate::export_worker::recover_export_transports_with_checkpoint(
+            &self.staging,
+            max_directories,
+            &mut || control.check(ExportCheckpoint::BeforeMutation),
+        )?;
         ensure!(
             result.retained.is_empty(),
             "export transports require attention: {:?}",
@@ -213,6 +240,7 @@ impl ExportService {
         );
         let mut fenced = 0;
         for retired in &result.retired {
+            control.check(ExportCheckpoint::BeforeMutation)?;
             if let Some(current) = catalog
                 .photo_export_attempt_if_rendering(&retired.work.job, retired.work.sequence)?
                 && current.attempt == retired.work.attempt
@@ -225,6 +253,7 @@ impl ExportService {
         }
         let page = catalog.rendering_photo_export_attempts(200)?;
         for work in &page {
+            control.check(ExportCheckpoint::BeforeMutation)?;
             catalog.requeue_photo_export_attempt(work)?;
             fenced += 1;
         }
@@ -233,7 +262,12 @@ impl ExportService {
         // by that intent; uninstalled stale results fail and retain captures.
         let intents = catalog.photo_export_publication_intents(200)?;
         for (job, sequence) in &intents {
-            if let Err(error) = catalog.publish_photo_export_item(job, *sequence) {
+            if let Err(error) =
+                catalog.publish_photo_export_item_cancellable(job, *sequence, control)
+            {
+                if control.cancel_requested() {
+                    return Err(error);
+                }
                 catalog.fail_sealed_photo_export(
                     job,
                     *sequence,
@@ -256,6 +290,25 @@ impl ExportService {
     pub fn is_active(&self) -> bool {
         self.active.is_some()
     }
+    /// Transfer a permit minted by the sole paused/drained PreviewService. The
+    /// detached coordinator retains it through every worker stop/reap path.
+    pub fn admit_native(&mut self, catalog: &Catalog, permit: NativeLaunchPermit) -> Result<()> {
+        self.check_catalog(catalog)?;
+        ensure!(
+            self.recovery_complete,
+            "explicit export recovery must complete before native admission"
+        );
+        ensure!(
+            permit.matches_catalog(catalog),
+            "export native permit belongs to another catalog handle"
+        );
+        ensure!(
+            self.permit.is_none() && self.active.is_none(),
+            "export already owns native admission"
+        );
+        self.permit = Some(permit);
+        Ok(())
+    }
     /// One bounded execution step on the export executor thread. Completion may
     /// hash full source/payload bytes and run durability barriers: never invoke
     /// this function directly on the UI or foreground catalog actor. Native
@@ -272,18 +325,53 @@ impl ExportService {
             self.recovery_complete,
             "export transport recovery must complete before launch"
         );
+        if self.active.is_none()
+            && self.permit.is_none()
+            && !canceled.load(std::sync::atomic::Ordering::Acquire)
+            && catalog.photo_export_job(job)?.state == "queued"
+            && catalog.next_sealed_photo_export(job)?.is_none()
+        {
+            if self.pause.is_none() {
+                self.pause = Some(previews.pause_native_launches()?);
+            }
+            if previews.native_work_drained() {
+                let permit = previews.native_launch_permit(catalog, self.pause.take().unwrap())?;
+                self.admit_native(catalog, permit)?;
+            }
+        }
+        self.tick_detached(catalog, job, &mut ExportControl::new(canceled))
+    }
+    /// Runs only on the owned coordinator's pinned existing-DB connection. No
+    /// PreviewService borrow or second cache owner is required. A missing permit
+    /// yields WaitingForPreviews; actor may pause/drain and transfer one later.
+    pub fn tick_detached(
+        &mut self,
+        catalog: &mut Catalog,
+        job: &str,
+        control: &mut ExportControl<'_>,
+    ) -> Result<ExportEvent> {
+        self.check_catalog(catalog)?;
+        ensure!(
+            self.recovery_complete,
+            "export transport recovery must complete before launch"
+        );
         if let Some(active) = self.active.as_ref() {
             ensure!(
                 active.process.work().job == job,
                 "another export job is active"
             );
             let work = active.process.work().clone();
-            if canceled.load(std::sync::atomic::Ordering::Acquire) {
+            if control.cancel_requested() {
                 catalog.cancel_photo_export_job(job)?;
             }
             let current = catalog.photo_export_work_current(&work)?;
-            let cancellation = AtomicBool::new(!current);
-            let outcome = self.active.as_mut().unwrap().process.poll(&cancellation);
+            let invalidated = AtomicBool::new(true);
+            let cancellation = if current {
+                control.cancellation()
+            } else {
+                &invalidated
+            };
+            let outcome = self.active.as_mut().unwrap().process.poll(cancellation);
             if matches!(outcome, Ok(None)) {
                 return Ok(ExportEvent::Rendering {
                     sequence: work.sequence,
@@ -299,10 +387,15 @@ impl ExportService {
             let started_unix_ms = active.started_unix_ms;
             drop(active);
             self.pause.take();
+            self.permit.take();
             match outcome {
                 Ok(Some(result)) => {
                     let accept_start = std::time::Instant::now();
-                    let accepted = catalog.accept_photo_export_seal(&work, &result.sealed);
+                    let accepted = catalog.accept_photo_export_seal_cancellable(
+                        &work,
+                        &result.sealed,
+                        control,
+                    );
                     self.completion_metrics = Some(ExportCompletionMetrics {
                         job: work.job.clone(),
                         sequence: work.sequence,
@@ -320,6 +413,11 @@ impl ExportService {
                         publication: None,
                     });
                     if let Err(error) = accepted {
+                        if control.cancel_requested()
+                            && catalog.photo_export_job(job)?.state != "complete"
+                        {
+                            catalog.cancel_photo_export_job(job)?;
+                        }
                         let message = detail(format!("{error:#}"));
                         catalog.fail_photo_export(&work, &message)?;
                         return Ok(ExportEvent::Failed {
@@ -330,7 +428,7 @@ impl ExportService {
                     }
                     let publish_start = std::time::Instant::now();
                     let published =
-                        catalog.publish_photo_export_item_with_metrics(job, work.sequence);
+                        catalog.publish_photo_export_item_cancellable(job, work.sequence, control);
                     if let Some(metrics) = self.completion_metrics.as_mut() {
                         metrics.publication_elapsed_ms =
                             publish_start.elapsed().as_secs_f64() * 1000.;
@@ -354,6 +452,12 @@ impl ExportService {
                             cleanup_warning,
                         }),
                         Err(error) => {
+                            if control.cancel_requested() && !control.finishing() {
+                                if catalog.photo_export_job(job)?.state != "complete" {
+                                    catalog.cancel_photo_export_job(job)?;
+                                }
+                                return Ok(ExportEvent::Idle);
+                            }
                             let message = detail(format!("{error:#}"));
                             catalog.fail_sealed_photo_export(job, work.sequence, &message)?;
                             Ok(ExportEvent::Failed {
@@ -365,6 +469,11 @@ impl ExportService {
                     }
                 }
                 Err(error) => {
+                    if control.cancel_requested()
+                        && catalog.photo_export_job(job)?.state != "complete"
+                    {
+                        catalog.cancel_photo_export_job(job)?;
+                    }
                     let message = detail(format!("{error:#}"));
                     catalog.fail_photo_export(&work, &message)?;
                     Ok(ExportEvent::Failed {
@@ -376,20 +485,22 @@ impl ExportService {
                 Ok(None) => unreachable!(),
             }
         } else {
-            if canceled.load(std::sync::atomic::Ordering::Acquire) {
+            if control.cancel_requested() {
                 if catalog.photo_export_job(job)?.state != "complete" {
                     catalog.cancel_photo_export_job(job)?;
                 }
                 self.pause.take();
+                self.permit.take();
                 return Ok(ExportEvent::Idle);
             }
             if catalog.photo_export_job(job)?.state != "queued" {
                 self.pause.take();
+                self.permit.take();
                 return Ok(ExportEvent::Idle);
             }
             if let Some(sequence) = catalog.next_sealed_photo_export(job)? {
-                return match catalog.publish_photo_export_item(job, sequence) {
-                    Ok(receipt)
+                return match catalog.publish_photo_export_item_cancellable(job, sequence, control) {
+                    Ok((receipt, _))
                         if receipt.state == crate::metadata_export::ExportState::Published =>
                     {
                         Ok(ExportEvent::Published {
@@ -397,12 +508,18 @@ impl ExportService {
                             cleanup_warning: None,
                         })
                     }
-                    Ok(receipt) => Ok(ExportEvent::Failed {
+                    Ok((receipt, _)) => Ok(ExportEvent::Failed {
                         sequence,
                         detail: receipt.detail,
                         cleanup_warning: None,
                     }),
                     Err(error) => {
+                        if control.cancel_requested() && !control.finishing() {
+                            if catalog.photo_export_job(job)?.state != "complete" {
+                                catalog.cancel_photo_export_job(job)?;
+                            }
+                            return Ok(ExportEvent::Idle);
+                        }
                         let message = detail(format!("{error:#}"));
                         catalog.fail_sealed_photo_export(job, sequence, &message)?;
                         Ok(ExportEvent::Failed {
@@ -413,17 +530,20 @@ impl ExportService {
                     }
                 };
             }
-            if self.pause.is_none() {
-                self.pause = Some(previews.pause_native_launches()?);
-            }
-            if !previews.native_work_drained() {
+            if self.permit.is_none() {
                 return Ok(ExportEvent::WaitingForPreviews);
             }
+            ensure!(
+                self.permit.as_ref().unwrap().matches_catalog(catalog),
+                "export native permit changed catalog handle"
+            );
+            control.check(ExportCheckpoint::BeforeMutation)?;
             let Some(reservation) = self.budget.try_reserve(self.limits.worker_bytes) else {
                 return Ok(ExportEvent::Idle);
             };
             let Some(work) = catalog.claim_photo_export(job)? else {
                 self.pause.take();
+                self.permit.take();
                 return Ok(ExportEvent::Idle);
             };
             let sequence = work.sequence;
@@ -432,6 +552,7 @@ impl ExportService {
             self.completion_metrics = None;
             let spawn = (|| -> Result<ExportWorkerProcess> {
                 let (output, xmp) = catalog.photo_export_inputs(&work.plan)?;
+                control.check(ExportCheckpoint::BeforeMutation)?;
                 let mut limits = self.limits.render;
                 ensure!(
                     work.plan.max_payload_bytes <= limits.max_encoded_extent,
@@ -464,6 +585,12 @@ impl ExportService {
                 }
                 Err(error) => {
                     self.pause.take();
+                    self.permit.take();
+                    if control.cancel_requested()
+                        && catalog.photo_export_job(job)?.state != "complete"
+                    {
+                        catalog.cancel_photo_export_job(job)?;
+                    }
                     let message = detail(format!("{error:#}"));
                     catalog.fail_photo_export(&work, &message)?;
                     Ok(ExportEvent::Failed {
@@ -481,6 +608,7 @@ impl ExportService {
         self.check_catalog(catalog)?;
         let Some(active) = self.active.as_mut() else {
             self.pause.take();
+            self.permit.take();
             return Ok(ExportEvent::Idle);
         };
         active.process.stop()?;
@@ -489,6 +617,7 @@ impl ExportService {
         let cleanup_warning = active.process.retire_transport().err().map(detail);
         self.active.take();
         self.pause.take();
+        self.permit.take();
         Ok(ExportEvent::Yielded {
             sequence: work.sequence,
             cleanup_warning,
@@ -497,12 +626,22 @@ impl ExportService {
 }
 impl Drop for ExportService {
     fn drop(&mut self) {
-        // Active's process drop waits too; the pause and reservation outlive it.
-        if let Some(active) = self.active.as_mut() {
-            let _ = active.process.stop();
+        if let Some(active) = self.active.as_mut()
+            && active.process.stop().is_err()
+        {
+            // Drop cannot report an OS reap failure. Keep all admission and the
+            // executor lock permanently held rather than authorize overlapping
+            // native work without proof that this child has terminated. Explicit
+            // tick/yield callers retain self and can retry the fallible stop.
+            std::mem::forget(self.active.take());
+            std::mem::forget(self.pause.take());
+            std::mem::forget(self.permit.take());
+            std::mem::forget(self._lock.take());
+            return;
         }
         self.active.take();
         self.pause.take();
+        self.permit.take();
     }
 }
 
@@ -542,7 +681,7 @@ mod lock_tests {
         let executable = std::env::current_exe()?;
         let service = ExportService::open(&catalog, &executable, limits())?;
         // A fork can retain this same open-file description until exec.
-        let inherited = service._lock.0.try_clone()?;
+        let inherited = service._lock.as_ref().unwrap().0.try_clone()?;
         assert!(ExportService::open(&catalog, &executable, limits()).is_err());
         assert!(ExportService::open(&catalog, &executable, limits()).is_err());
         drop(service);
@@ -564,7 +703,7 @@ mod lock_tests {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let service = ExportService::open(&catalog, &executable, limits())?;
-                    inherited = Some(service._lock.0.try_clone()?);
+                    inherited = Some(service._lock.as_ref().unwrap().0.try_clone()?);
                     if unwind {
                         panic!("controlled executor unwind");
                     }

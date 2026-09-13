@@ -100,8 +100,25 @@ pub fn snapshot_photo_destination(
     path: &Path,
     max_existing_bytes: u64,
 ) -> Result<DestinationSnapshot> {
+    snapshot_photo_destination_with_checkpoint(path, max_existing_bytes, &mut |_| Ok(()))
+}
+pub fn snapshot_photo_destination_with_checkpoint(
+    path: &Path,
+    max_existing_bytes: u64,
+    checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> Result<DestinationSnapshot> {
+    checkpoint(0)?;
     let destination = normalize_photo_destination(path)?;
-    let expected = revision_if_exists_limited(&destination, max_existing_bytes)?;
+    let expected = match fs::symlink_metadata(&destination) {
+        Ok(_) => Some(stream_revision(
+            &destination,
+            max_existing_bytes,
+            checkpoint,
+            None,
+        )?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let snapshot = DestinationSnapshot {
         version: 2,
         operation: uuid::Uuid::new_v4().to_string(),
@@ -116,6 +133,13 @@ pub fn snapshot_photo_destination(
 /// Inspect only an ordinary file, with a fixed memory buffer and byte admission.
 pub fn inspect_file_revision(path: &Path, max_bytes: u64) -> Result<FileRevision> {
     stream_revision(path, max_bytes, &mut |_| Ok(()), None)
+}
+pub fn inspect_file_revision_with_checkpoint(
+    path: &Path,
+    max_bytes: u64,
+    checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> Result<FileRevision> {
+    stream_revision(path, max_bytes, checkpoint, None)
 }
 
 /// Copy a completed encoder file read-only into private recovery staging. Hashes
@@ -215,6 +239,14 @@ pub fn read_photo_seal(
     snapshot: &DestinationSnapshot,
     authority_digest: &str,
 ) -> Result<SealedPhotoExport> {
+    read_photo_seal_with_checkpoint(snapshot, authority_digest, &mut |_| Ok(()))
+}
+pub fn read_photo_seal_with_checkpoint(
+    snapshot: &DestinationSnapshot,
+    authority_digest: &str,
+    checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> Result<SealedPhotoExport> {
+    checkpoint(0)?;
     validate_snapshot(snapshot)?;
     ensure!(
         fs::symlink_metadata(photo_directory(snapshot))?
@@ -230,9 +262,10 @@ pub fn read_photo_seal(
     );
     validate_photo_seal(&sealed)?;
     ensure!(
-        inspect_file_revision(
+        inspect_file_revision_with_checkpoint(
             &sealed.recovery_directory().join("payload"),
-            sealed.max_payload_bytes
+            sealed.max_payload_bytes,
+            checkpoint,
         )? == sealed.payload,
         "sealed photo payload changed"
     );

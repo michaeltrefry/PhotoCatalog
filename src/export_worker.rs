@@ -260,8 +260,19 @@ impl ExportWorkerProcess {
         // Verify the complete staged object under the durable seal, never an
         // untrusted worker pathname or encoded whole-image transport.
         ensure!(
-            metadata_export::read_photo_seal(&work.plan.destination, &work.authority)?
-                == result.sealed,
+            metadata_export::read_photo_seal_with_checkpoint(
+                &work.plan.destination,
+                &work.authority,
+                &mut |_| {
+                    if canceled.load(Ordering::Acquire) {
+                        Err(std::io::Error::other(
+                            "export cancellation requested during seal verification",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )? == result.sealed,
             "export worker seal changed"
         );
         Ok(Some(result))
@@ -270,10 +281,9 @@ impl ExportWorkerProcess {
         if !self.exited {
             self.lease.take();
             if self.child.try_wait()?.is_none() {
-                let killed = self.child.kill();
-                if self.child.try_wait()?.is_none() {
-                    killed?;
-                }
+                // Kill can race natural exit; wait remains authoritative. A
+                // kill error must not release native ownership without reaping.
+                let _ = self.child.kill();
             }
             self.child.wait()?;
             self.exited = true;
@@ -525,6 +535,14 @@ pub fn recover_export_transports(
     root: &Path,
     max_directories: usize,
 ) -> Result<ExportTransportRecovery> {
+    recover_export_transports_with_checkpoint(root, max_directories, &mut || Ok(()))
+}
+pub fn recover_export_transports_with_checkpoint(
+    root: &Path,
+    max_directories: usize,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<ExportTransportRecovery> {
+    checkpoint()?;
     ensure!(
         root.is_absolute() && (1..=1024).contains(&max_directories),
         "export recovery bounds"
@@ -550,6 +568,7 @@ pub fn recover_export_transports(
         ..Default::default()
     };
     for entry in entries {
+        checkpoint()?;
         let staging = entry.path();
         match fence_transport(&staging) {
             Ok(Inspection::Retired(value)) => result.retired.push(*value),

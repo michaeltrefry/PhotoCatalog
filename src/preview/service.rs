@@ -211,6 +211,25 @@ impl Drop for NativeLaunchPause {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
+/// Transferable proof that this sole preview owner is paused and drained.
+/// Neither cloneable nor constructible by callers. The external owner must reap
+/// its process before dropping this permit; keep PreviewService alive until then.
+pub struct NativeLaunchPermit {
+    _pause: NativeLaunchPause,
+    exclusive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    catalog: std::sync::Arc<std::fs::File>,
+}
+impl NativeLaunchPermit {
+    pub(crate) fn matches_catalog(&self, catalog: &Catalog) -> bool {
+        std::sync::Arc::ptr_eq(&self.catalog, &catalog.relink_file)
+    }
+}
+impl Drop for NativeLaunchPermit {
+    fn drop(&mut self) {
+        self.exclusive
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 /// Diagnostic receipt for the most recently consumed successful worker result.
 /// Keys identify the producer; a later cache hit is not a new worker measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +241,8 @@ pub struct WorkerResourceMetrics {
 }
 pub struct PreviewService {
     launch_pauses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    external_native: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    native_catalog: Option<std::sync::Arc<crate::catalog_writer::Writers>>,
     reads: read_queue::ReadQueue,
     prepared: super::prepared_cache::PreparedCache,
     observer: std::cell::RefCell<Option<ServiceObserver>>,
@@ -554,6 +575,8 @@ impl PreviewService {
         )?;
         Ok(Self {
             launch_pauses: Default::default(),
+            external_native: Default::default(),
+            native_catalog: None,
             prepared,
             reads: read_queue::ReadQueue::default(),
             observer: std::cell::RefCell::new(None),
@@ -1751,6 +1774,48 @@ impl PreviewService {
     /// their reservations must drain before the owner admits an external worker.
     pub fn native_work_drained(&self) -> bool {
         self.active.is_empty() && self.scheduler.usage().reserved_bytes == 0
+    }
+    /// Mint without filesystem access on the actor. Pause provenance, actual
+    /// native drain and exclusive external ownership are checked here. The first
+    /// permit binds this service to the selected catalog's shared writer registry.
+    /// Each permit also carries the selected database pin; detached connections
+    /// opened from its worker handle preserve that exact handle lineage.
+    pub fn native_launch_permit(
+        &mut self,
+        catalog: &Catalog,
+        pause: NativeLaunchPause,
+    ) -> Result<NativeLaunchPermit> {
+        ensure!(
+            std::sync::Arc::ptr_eq(&pause.0, &self.launch_pauses),
+            "native pause belongs to another preview service"
+        );
+        ensure!(
+            self.native_work_drained(),
+            "preview native work has not drained"
+        );
+        ensure!(
+            self.native_catalog
+                .as_ref()
+                .is_none_or(|registry| std::sync::Arc::ptr_eq(registry, &catalog.writers)),
+            "preview native admission belongs to another selected catalog"
+        );
+        ensure!(
+            self.external_native
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire
+                )
+                .is_ok(),
+            "another external native permit is active"
+        );
+        self.native_catalog = Some(catalog.writers.clone());
+        Ok(NativeLaunchPermit {
+            _pause: pause,
+            exclusive: self.external_native.clone(),
+            catalog: catalog.relink_file.clone(),
+        })
     }
     /// Bounded by configured workers. These are owned, not-yet-reaped process
     /// IDs; callers must observe OS liveness separately and account for PID reuse.

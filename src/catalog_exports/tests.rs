@@ -2,6 +2,9 @@ use super::*;
 use crate::edit::RecipeV1;
 use crate::image_export::IntegerDepth;
 
+#[path = "execution_tests.rs"]
+mod execution;
+
 fn fixture() -> Result<(tempfile::TempDir, Catalog, PathBuf)> {
     let temp = tempfile::tempdir()?;
     let original = temp.path().join("original.png");

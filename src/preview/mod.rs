@@ -35,8 +35,9 @@ pub use worker::{
 mod service;
 pub use service::{
     CacheReadMetrics, EncodedPreview, HydrationRequest, JobState, JobView, NativeLaunchPause,
-    PreviewPolicy, PreviewService, PreviewView, ReadCompletion, ReadOutcome, ReadQueueUsage,
-    ReadTicket, ServiceCompletion, ServiceEvent, ServiceLimits, TierPolicy, WorkerResourceMetrics,
+    NativeLaunchPermit, PreviewPolicy, PreviewService, PreviewView, ReadCompletion, ReadOutcome,
+    ReadQueueUsage, ReadTicket, ServiceCompletion, ServiceEvent, ServiceLimits, TierPolicy,
+    WorkerResourceMetrics,
 };
 
 mod config;

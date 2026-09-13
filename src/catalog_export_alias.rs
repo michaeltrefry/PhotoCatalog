@@ -291,9 +291,11 @@ struct Admission<'a> {
     target: Option<(u64, u128)>,
     limits: AliasLimits,
     proof: AliasProof,
+    checkpoint: &'a mut dyn FnMut() -> Result<()>,
 }
 impl Admission<'_> {
     fn candidate(&mut self, encoded: String) -> Result<()> {
+        (self.checkpoint)()?;
         self.proof.candidates += 1;
         ensure!(
             self.proof.candidates <= self.limits.candidates,
@@ -353,6 +355,15 @@ pub fn protect_destination(
     destination: &Path,
     limits: AliasLimits,
 ) -> Result<AliasProof> {
+    protect_destination_with_checkpoint(db, destination, limits, &mut || Ok(()))
+}
+pub fn protect_destination_with_checkpoint(
+    db: &Connection,
+    destination: &Path,
+    limits: AliasLimits,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<AliasProof> {
+    checkpoint()?;
     ensure!(
         !db.is_autocommit(),
         "alias validation requires an authoritative catalog transaction"
@@ -400,6 +411,7 @@ pub fn protect_destination(
         destination,
         target,
         limits,
+        checkpoint,
         proof: AliasProof {
             overwrite: target.is_some(),
             directories: 0,
@@ -436,6 +448,7 @@ pub fn protect_destination(
         let mut statement=db.prepare("SELECT id,native_path FROM export_alias_directories INDEXED BY export_alias_active_directories WHERE members>0 ORDER BY id LIMIT ?1")?;
         let mut rows = statement.query([limits.directories as i64 + 1])?;
         while let Some(row) = rows.next()? {
+            (admission.checkpoint)()?;
             admission.proof.directories += 1;
             ensure!(
                 admission.proof.directories <= limits.directories,

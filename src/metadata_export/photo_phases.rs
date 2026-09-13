@@ -174,6 +174,15 @@ impl PhotoPublication {
     pub fn prepare_restore(seal: &SealedPhotoExport) -> Result<Self> {
         Self::prepare_mode(seal, &mut |_| Ok(()), true)
     }
+    pub fn prepare_restore_with_checkpoint(
+        seal: &SealedPhotoExport,
+        checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+    ) -> Result<Self> {
+        checkpoint(0)?;
+        let value = Self::prepare_mode(seal, checkpoint, true)?;
+        checkpoint(0)?;
+        Ok(value)
+    }
     fn prepare_mode(
         seal: &SealedPhotoExport,
         checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
@@ -263,16 +272,25 @@ impl PhotoPublication {
     /// fresh bounded byte proofs. A successful link changes the payload's ctime,
     /// so the pre-link proof cannot establish ownership here.
     pub fn failure_receipt(&self, detail: String) -> ExportReceipt {
+        self.failure_receipt_with_checkpoint(detail, &mut |_| Ok(()))
+    }
+    pub fn failure_receipt_with_checkpoint(
+        &self,
+        detail: String,
+        checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+    ) -> ExportReceipt {
         let state = match fs::symlink_metadata(&self.seal.snapshot.destination) {
             Ok(_) => {
                 let owned = (|| -> Result<bool> {
-                    let payload = VerifiedFile::read(
+                    let payload = VerifiedFile::read_with_checkpoint(
                         &self.directory.join("payload"),
                         self.seal.max_payload_bytes,
+                        checkpoint,
                     )?;
-                    let destination = VerifiedFile::read(
+                    let destination = VerifiedFile::read_with_checkpoint(
                         &self.seal.snapshot.destination,
                         self.seal.max_payload_bytes,
+                        checkpoint,
                     )?;
                     Ok(self.owns_installed_pair(&payload, &destination))
                 })()
@@ -477,6 +495,12 @@ impl PhotoPublication {
         Ok(())
     }
     pub fn verify_restored(&mut self) -> Result<ExportReceipt> {
+        self.verify_restored_with_checkpoint(&mut |_| Ok(()))
+    }
+    pub fn verify_restored_with_checkpoint(
+        &mut self,
+        checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+    ) -> Result<ExportReceipt> {
         let expected = self
             .captured
             .as_ref()
@@ -496,13 +520,15 @@ impl PhotoPublication {
             self.timings.durability_ms += start.elapsed().as_secs_f64() * 1000.;
         }
         let start = Instant::now();
-        let captured = VerifiedFile::read(
+        let captured = VerifiedFile::read_with_checkpoint(
             &self.directory.join("original"),
             self.seal.snapshot.max_existing_bytes,
+            checkpoint,
         )?;
-        let destination = VerifiedFile::read(
+        let destination = VerifiedFile::read_with_checkpoint(
             &self.seal.snapshot.destination,
             self.seal.snapshot.max_existing_bytes,
+            checkpoint,
         )?;
         self.timings.hash_ms += start.elapsed().as_secs_f64() * 1000.;
         ensure!(
