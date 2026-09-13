@@ -5,6 +5,7 @@ import { command, chooseFolder, desktopAvailable, errorText, type BackupStatus, 
 import { Dialog, ErrorNotice, Section } from './components/Controls';
 import { FolderTree } from './components/FolderTree';
 import { CatalogActivity } from './components/CatalogActivity';
+import { OrganizationPanel } from './components/OrganizationPanel';
 import { BackupPanel } from './components/BackupPanel';
 import { SearchFilters, defaultFilters } from './components/SearchFilters';
 import { ImportPanel } from './components/ImportPanel';
@@ -32,10 +33,13 @@ export function App() {
   const [folderEpoch, setFolderEpoch] = useState(0);
   const [showImport, setShowImport] = useState(false);
   const [showBackup, setShowBackup] = useState(false);
+  const [showOrganization, setShowOrganization] = useState(false);
+  const [organizationScopeName, setOrganizationScopeName] = useState('');
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null);
   const [importStatus, setImportStatus] = useState<ImportStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<GridImage | null>(null);
+  const selectedRef = useRef<GridImage | null>(null); selectedRef.current = selected;
   const [queue, setQueue] = useState<EditQueue | null>(null);
   const queueRef = useRef<EditQueue | null>(null);
   const [editor, setEditor] = useState<EditSnapshot | null>(null);
@@ -104,6 +108,21 @@ export function App() {
     });
   }, [catalog, attachVariant, perform]);
 
+  const organizationMutation = async (action: () => Promise<void>) => {
+    await gate.current.afterCurrent(async () => {
+      setTransitioning(true);
+      try {
+        await queueRef.current?.flush();
+        try { await action(); }
+        finally { setCursor(null); setPrevious([]); setRefresh(value => value + 1); }
+        if (catalog && selectedRef.current) {
+          try { setSelected(await command({ command: 'image', args: { catalog, key: selectedRef.current.key } }, 'image')); }
+          catch (e) { setError(`Change saved; selected photo refresh failed: ${errorText(e)}`); }
+        }
+      } finally { setTransitioning(false); }
+    });
+  };
+
   useEffect(() => {
     if (!catalog || status.phase !== 'ready' || scope === undefined) return;
     const abort = new AbortController(); setLoading(true);
@@ -122,7 +141,7 @@ export function App() {
       const abort = new AbortController(); operationAbort.current = abort; setBusy(create ? 'Creating catalog' : 'Opening catalog');
       const next = await command({ command: create ? 'create' : 'open_existing', args: { path: choice.path } }, 'status', abort.signal);
       setStatus(next); setCatalogName(choice.display); setScope(undefined); setPage({ rows: [], next: null, has_more: false, page_complete: true, scanned: 0 });
-      setSelected(null); queueRef.current = null; setQueue(null); setError('');
+      setSelected(null); queueRef.current = null; setQueue(null); setError(''); setShowOrganization(false); setFilters(defaultFilters); setOrganizationScopeName('');
     } catch (e) { setError(errorText(e)); } finally { operationAbort.current = null; setBusy(''); }
   });
   const close = async () => perform(async () => {
@@ -187,7 +206,8 @@ export function App() {
     </main> : <>
       <div className="workspace-toolbar"><button disabled={transitioning || status.phase !== 'ready'} onClick={() => setShowImport(true)}>Add photos…</button><button aria-pressed={showFolders} onClick={() => setShowFolders(value => !value)}>Folders</button><div className="breadcrumb">{scope === undefined ? 'Choose a folder' : scope === null ? 'All Photos' : scope.name}</div>
         <form className="search-form" onSubmit={event => { event.preventDefault(); setAppliedSearch(search); setCursor(null); setPrevious([]); }}><input type="search" maxLength={1024} aria-label="Search photos" placeholder="Search photos" value={search} onChange={event => setSearch(event.target.value)} /><button type="submit">Search</button></form>
-        <button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
+        <button disabled={transitioning || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
+      {(filters.keyword || filters.collection) && <div className="activity">Organization filter: {organizationScopeName}<button onClick={() => { setFilters(value => ({ ...value, keyword: null, collection: null })); setCursor(null); setPrevious([]); }}>Clear organization filter</button></div>}
       {status.jobs_held && <div className="activity">Restored catalog: pending external jobs are held for review. Browsing and editing are available.</div>}
       <main className="workspace">
         {showFolders && <aside className="left-panel"><Section title="Library"><button className={scope === null ? 'current scope-button' : 'scope-button'} onClick={() => void changeScope(null)}>All Photos</button><label className="checkbox"><input type="checkbox" checked={recursive} onChange={event => { setRecursive(event.target.checked); setCursor(null); setPrevious([]); }} />Include subfolders</label></Section><Section title="Folders">{status.phase === 'ready' ? <FolderTree key={`${catalog}:${folderEpoch}`} catalog={catalog} selected={scope?.id} onSelect={folder => void changeScope(folder)} /> : <p role="status">Preparing folders…</p>}</Section></aside>}
@@ -212,6 +232,7 @@ export function App() {
     </>}
     {catalog && status.phase === 'ready' && <ImportPanel key={catalog} catalog={catalog} open={showImport} onProgress={setImportStatus} jobsHeld={status.jobs_held} onClose={() => setShowImport(false)} onComplete={() => { setFolderEpoch(value => value + 1); setCursor(null); setPrevious([]); setRefresh(value => value + 1); }} />}
     {desktopAvailable && <BackupPanel catalog={catalog} open={showBackup} onClose={() => setShowBackup(false)} onProgress={setBackupStatus} />}
+    {catalog && status.phase === 'ready' && <OrganizationPanel open={showOrganization} onOpen={() => setShowOrganization(true)} key={catalog} catalog={catalog} selected={selected} selectedVariantLabel={editor?.variant.label ?? null} rows={page.rows} mutate={organizationMutation} onClose={() => setShowOrganization(false)} onSelect={async row => { await gate.current.afterCurrent(async () => { setTransitioning(true); try { await queueRef.current?.flush(); const variant = await command({ command: 'variant', args: { catalog, key: row.key } }, 'variant'); setSelected(row); attachVariant(variant); } finally { setTransitioning(false); } }); }} onFilter={(filter, name) => { setFilters(value => ({ ...value, ...filter })); setOrganizationScopeName(name); setScope(null); setCursor(null); setPrevious([]); setMode('library'); setShowOrganization(false); }} />}
     {showFilters && <SearchFilters value={filters} onApply={value => { setFilters(value); setCursor(null); setPrevious([]); }} onClose={() => setShowFilters(false)} />}
     {copyName !== null && <Dialog title="Create independent variant" onClose={() => setCopyName(null)}><p>Start a new edit from the current saved settings. The original and existing variant remain unchanged.</p><label className="form-field">Variant name<input autoFocus value={copyName} maxLength={256} onChange={event => setCopyName(event.target.value)} /></label><button className="primary" disabled={transitioning || !copyName.trim()} onClick={() => void createCopy()}>Create variant</button></Dialog>}
     {history && <Dialog title="Edit history" onClose={() => setHistory(null)}>{history.length ? <ol>{history.map(entry => <li key={entry.revision}><strong>Revision {entry.revision}</strong> · {entry.kind}</li>)}</ol> : <p>No saved history for this variant.</p>}</Dialog>}
