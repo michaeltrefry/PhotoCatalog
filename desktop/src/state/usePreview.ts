@@ -4,7 +4,7 @@ import { command, errorText, imageKey, previewBlob, type VariantKey } from '../b
 // Virtualized cells unmount and remount; their consumer generation must not reset.
 let nextGeneration = 0n;
 
-export function usePreview(catalog: string, key: VariantKey, viewport: string, large: boolean, revision: string, interactive = false) {
+export function usePreview(catalog: string, key: VariantKey, viewport: string, large: boolean, revision: string, interactive = false, attempt = 0) {
   const [value, setValue] = useState<{ url?: string; message?: string; loading: boolean }>({ loading: true });
   const generation = useRef(0n);
   const identity = imageKey(key);
@@ -29,6 +29,8 @@ export function usePreview(catalog: string, key: VariantKey, viewport: string, l
           url = URL.createObjectURL(blob);
           setValue({ url, loading: false });
         } else if (state.state === 'queued' || state.state === 'cancel_requested') {
+          const message = state.message ?? 'Preparing preview…';
+          setValue(previous => previous.loading && previous.message === message ? previous : { loading: true, message });
           timer = setTimeout(() => { void poll(); }, 100);
         } else setValue({ loading: false, message: state.message ?? state.state.replaceAll('_', ' ') });
       } catch (e) { if (!abort.signal.aborted) setValue({ loading: false, message: errorText(e) }); }
@@ -41,6 +43,6 @@ export function usePreview(catalog: string, key: VariantKey, viewport: string, l
     return () => { abort.abort(); clearTimeout(timer); release(); if (ticket) cancel(ticket); if (url) URL.revokeObjectURL(url); };
     // key is represented by its stable identity; each render's object is not a new consumer.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catalog, identity, viewport, large, revision, interactive]);
+  }, [catalog, identity, viewport, large, revision, interactive, attempt]);
   return value;
 }
