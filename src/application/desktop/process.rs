@@ -9,7 +9,10 @@ use wire::{Assembly, BinaryHeader, Frame, Seen};
 type IoThreads = Vec<thread::JoinHandle<()>>;
 type DrainResult = (Option<Child>, IoThreads);
 /// Remove the owned process only after an affirmative OS wait result.
-fn wait_owned<T>(slot: &mut Option<T>, wait: impl FnOnce(&mut T) -> std::io::Result<std::process::ExitStatus>) -> std::io::Result<std::process::ExitStatus> {
+fn wait_owned<T>(
+    slot: &mut Option<T>,
+    wait: impl FnOnce(&mut T) -> std::io::Result<std::process::ExitStatus>,
+) -> std::io::Result<std::process::ExitStatus> {
     let status = wait(slot.as_mut().expect("owned process"))?;
     slot.take();
     Ok(status)
@@ -35,8 +38,7 @@ fn finish_wait(shared: &Shared, status: std::process::ExitStatus, threads: IoThr
         }
     }
     shared.complete_failure();
-    shared.state.lock().unwrap().phase = TransportPhase::Closed;
-    shared.wake.notify_all();
+    shared.child_finished();
 }
 impl Owner {
     pub fn pid(&self) -> u32 {
@@ -123,7 +125,8 @@ impl Owner {
                     Err(e) => {
                         shared.fail(format!("desktop process wait failed; owner retained: {e}"));
                         let attempt = shared.state.lock().unwrap().shutdown_attempt;
-                        let _ = shared.drain_failed(attempt, format!("desktop process wait failed: {e}"));
+                        let _ = shared
+                            .drain_failed(attempt, format!("desktop process wait failed: {e}"));
                         (child, threads)
                     }
                 }
@@ -204,7 +207,9 @@ impl Drop for Owner {
 pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Option<Message> {
     let mut s = shared.state.lock().unwrap();
     loop {
-        if s.reaped { return None; }
+        if s.reaped {
+            return None;
+        }
         if s.stopping {
             if let Some(index) = s.control.iter().position(|m| m.kind == Kind::Ack) {
                 return s.control.remove(index);
@@ -257,20 +262,32 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
     let mut assembly: Option<Assembly> = None;
     while let Some(f) = Frame::read(&mut r)? {
         session(&f, shared)?;
-        if !matches!(f.kind, Kind::Ready | Kind::Reply | Kind::BytesError | Kind::DrainError) {
+        if !matches!(
+            f.kind,
+            Kind::Ready | Kind::Reply | Kind::BytesError | Kind::DrainError
+        ) {
             return Err(wire::invalid("unexpected control frame"));
         }
         let a = match assembly.as_mut() {
             Some(a) => a,
-            None => assembly.insert(Assembly::start(&f, if matches!(f.kind, Kind::Ready | Kind::DrainError) {wire::CHUNK} else {shared.limits.reply_bytes.max(wire::ERROR_BYTES)})?),
+            None => assembly.insert(Assembly::start(
+                &f,
+                if matches!(f.kind, Kind::Ready | Kind::DrainError) {
+                    wire::CHUNK
+                } else {
+                    shared.limits.reply_bytes.max(wire::ERROR_BYTES)
+                },
+            )?),
         };
         if !a.push(f)? {
             continue;
         }
         let (kind, id, bytes) = assembly.take().unwrap().finish();
         if kind == Kind::DrainError {
-            let error: BridgeError = serde_json::from_slice(&bytes).map_err(|_|wire::invalid("drain error response"))?;
-            shared.drain_failed(id, error.message)?; continue;
+            let error: BridgeError = serde_json::from_slice(&bytes)
+                .map_err(|_| wire::invalid("drain error response"))?;
+            shared.drain_failed(id, error.message)?;
+            continue;
         }
         if kind == Kind::Ready {
             if id != 0 || bytes != wire::build_identity().as_bytes() {
@@ -305,7 +322,11 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
         } else {
             None
         };
-        if bytes.len() > shared.limits.reply_bytes && decoded_reply.as_ref().is_some_and(|reply| !matches!(reply, Reply::Error { .. })) {
+        if bytes.len() > shared.limits.reply_bytes
+            && decoded_reply
+                .as_ref()
+                .is_some_and(|reply| !matches!(reply, Reply::Error { .. }))
+        {
             return Err(wire::invalid("success reply exceeds configured budget"));
         }
         let entry = {
@@ -632,20 +653,33 @@ struct ChildEngine {
 }
 impl ChildEngine {
     fn drain(&self) -> Result<()> {
-        if self.verified.get() { return Ok(()); }
+        if self.verified.get() {
+            return Ok(());
+        }
         match self.bridge.try_shutdown() {
-            Ok(()) => { self.verified.set(true); self.failed.set(false); Ok(()) }
-            Err(error) => { self.failed.set(true); Err(error) }
+            Ok(()) => {
+                self.verified.set(true);
+                self.failed.set(false);
+                Ok(())
+            }
+            Err(error) => {
+                self.failed.set(true);
+                Err(error)
+            }
         }
     }
 }
 impl Drop for ChildEngine {
     fn drop(&mut self) {
-        if !self.verified.get() && !self.failed.get() { let _ = self.drain(); }
+        if !self.verified.get() && !self.failed.get() {
+            let _ = self.drain();
+        }
         if !self.verified.get() {
             // EOF has removed the explicit retry channel. Retain every actor,
             // lease and descendant owner instead of releasing them via process exit.
-            loop { thread::park(); }
+            loop {
+                thread::park();
+            }
         }
     }
 }
@@ -668,7 +702,11 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
     let config: wire::ConfigWire = serde_json::from_slice(&assembly.finish().2)?;
     let config = config.into_config()?;
     let limits = config.limits.clone();
-    let engine = ChildEngine { bridge: Bridge::spawn(config)?, verified: false.into(), failed: false.into() };
+    let engine = ChildEngine {
+        bridge: Bridge::spawn(config)?,
+        verified: false.into(),
+        failed: false.into(),
+    };
     let bridge = &engine.bridge;
     let shared = Arc::new(Mutex::new(ChildState {
         pending: HashMap::new(),
@@ -695,7 +733,17 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
         0,
         wire::build_identity().into_bytes(),
     ));
-    let result = ready.map_err(anyhow::Error::from).and_then(|_| child_input(&mut input, session, &mut |kind, bytes| dispatch(bridge, kind, bytes), &shared, &limits, &tx, &mut || engine.drain()));
+    let result = ready.map_err(anyhow::Error::from).and_then(|_| {
+        child_input(
+            &mut input,
+            session,
+            &mut |kind, bytes| dispatch(bridge, kind, bytes),
+            &shared,
+            &limits,
+            &tx,
+            &mut || engine.drain(),
+        )
+    });
     // Never force-exit: first drain the engine and its descendants, then transport.
     {
         let state = shared.lock().unwrap();
@@ -705,7 +753,9 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
     }
     // A failed explicit drain is not retried automatically when the parent
     // disappears. ChildEngine keeps the process alive if that owner is unresolved.
-    if !engine.failed.get() { engine.drain()?; }
+    if !engine.failed.get() {
+        engine.drain()?;
+    }
     anyhow::ensure!(engine.verified.get(), "desktop engine drain unresolved");
     shared.lock().unwrap().stopping = true;
     let _ = collector.join();
@@ -722,11 +772,15 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
 fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<ChildPending>> {
     if kind == Kind::Command {
         let request: Request = serde_json::from_slice(bytes)?;
-        anyhow::ensure!(!local_route(&request), "Workbench cannot enter catalog child");
+        anyhow::ensure!(
+            !local_route(&request),
+            "Workbench cannot enter catalog child"
+        );
         Ok(bridge.submit(request).map(ChildPending::Command))
     } else {
         let r: BytesRequest = serde_json::from_slice(bytes)?;
-        Ok(bridge.preview_bytes(r.catalog.clone(), r.ticket.clone(), r.foreground)
+        Ok(bridge
+            .preview_bytes(r.catalog.clone(), r.ticket.clone(), r.foreground)
             .map(|p| ChildPending::Bytes(p, r)))
     }
 }
@@ -816,7 +870,10 @@ fn child_input(
             state.early.remove(&id)
         };
         let admitted = if canceled {
-            Err(error(ErrorCode::Canceled, "request canceled before desktop admission"))
+            Err(error(
+                ErrorCode::Canceled,
+                "request canceled before desktop admission",
+            ))
         } else {
             dispatch(kind, &bytes)?
         };
@@ -858,18 +915,96 @@ mod tests {
     use super::*;
     fn child_state() -> ChildShared {
         Arc::new(Mutex::new(ChildState {
-            pending: HashMap::new(), cancels: HashMap::new(), early: Default::default(),
-            retained: HashMap::new(), stopping: false,
+            pending: HashMap::new(),
+            cancels: HashMap::new(),
+            early: Default::default(),
+            retained: HashMap::new(),
+            stopping: false,
         }))
+    }
+    #[test]
+    fn facade_closed_waits_for_held_local_drain_failure_and_explicit_retry() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        let shared = super::super::tests::shared(8);
+        shared.stop();
+        finish_wait(&shared, std::process::ExitStatus::from_raw(0), vec![]);
+        {
+            let state = shared.state.lock().unwrap();
+            assert!(state.reaped && state.child_finished);
+            assert!(!state.local_verified);
+            assert_eq!(state.phase, TransportPhase::Draining);
+        }
+        for succeeds in [false, true] {
+            shared.stop(); // The second pass is an explicit retry of the retained local owner.
+            let (entered, observed) = mpsc::sync_channel(1);
+            let (release, released) = mpsc::sync_channel(1);
+            let owned = shared.clone();
+            let drain = thread::spawn(move || {
+                owned.drain_local(|| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(error(ErrorCode::Native, "held local drain failed"))
+                    }
+                })
+            });
+            observed.recv().unwrap();
+            assert_eq!(shared.state.lock().unwrap().phase, TransportPhase::Draining);
+            assert!(!shared.state.lock().unwrap().local_verified);
+            release.send(()).unwrap();
+            assert_eq!(drain.join().unwrap().is_ok(), succeeds);
+            let state = shared.state.lock().unwrap();
+            assert_eq!(
+                state.phase,
+                if succeeds {
+                    TransportPhase::Closed
+                } else {
+                    TransportPhase::Draining
+                }
+            );
+            assert_eq!(state.local_verified, succeeds);
+        }
+        // Reversed completion order has the same conjunction: local alone is insufficient.
+        let shared = super::super::tests::shared(8);
+        shared.stop();
+        shared.drain_local(|| Ok(())).unwrap();
+        assert_eq!(shared.state.lock().unwrap().phase, TransportPhase::Draining);
+        finish_wait(&shared, std::process::ExitStatus::from_raw(0), vec![]);
+        assert_eq!(shared.state.lock().unwrap().phase, TransportPhase::Closed);
     }
     #[test]
     fn held_binary_output_does_not_block_command_completion_or_free_child_bytes() {
         let shared = child_state();
         let usage = Arc::new(AtomicUsize::new(4));
-        let value = Arc::new(PreviewBytes { mime: "image/png".into(), bytes: b"raw!".to_vec(), usage: usage.clone() });
-        let request = BytesRequest { catalog: "A".into(), ticket: "T".into(), foreground: true };
-        shared.lock().unwrap().pending.insert(1, ChildPending::Binary(value, request));
-        shared.lock().unwrap().pending.insert(2, ChildPending::Reply(checked_message(Kind::Reply, 2, &failure(ErrorCode::Closed, "no catalog"), 1024)));
+        let value = Arc::new(PreviewBytes {
+            mime: "image/png".into(),
+            bytes: b"raw!".to_vec(),
+            usage: usage.clone(),
+        });
+        let request = BytesRequest {
+            catalog: "A".into(),
+            ticket: "T".into(),
+            foreground: true,
+        };
+        shared
+            .lock()
+            .unwrap()
+            .pending
+            .insert(1, ChildPending::Binary(value, request));
+        shared.lock().unwrap().pending.insert(
+            2,
+            ChildPending::Reply(checked_message(
+                Kind::Reply,
+                2,
+                &failure(ErrorCode::Closed, "no catalog"),
+                1024,
+            )),
+        );
         let (tx, rx) = mpsc::sync_channel(1);
         let (blocked, _held) = mpsc::sync_channel(0);
         collect(&shared, &tx, &blocked, 1024);
@@ -888,48 +1023,95 @@ mod tests {
     }
     #[test]
     fn failed_os_wait_preserves_owner_until_explicit_success() {
-        #[cfg(unix)] use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)] use std::os::windows::process::ExitStatusExt;
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
         struct Owned(Arc<AtomicUsize>);
-        impl Drop for Owned { fn drop(&mut self) { self.0.fetch_add(1, Ordering::AcqRel); } }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         let drops = Arc::new(AtomicUsize::new(0));
         let mut owner = Some(Owned(drops.clone()));
-        assert!(wait_owned(&mut owner, |_| Err(std::io::Error::other("injected wait failure"))).is_err());
-        assert!(owner.is_some()); assert_eq!(drops.load(Ordering::Acquire), 0);
+        assert!(
+            wait_owned(&mut owner, |_| Err(std::io::Error::other(
+                "injected wait failure"
+            )))
+            .is_err()
+        );
+        assert!(owner.is_some());
+        assert_eq!(drops.load(Ordering::Acquire), 0);
         wait_owned(&mut owner, |_| Ok(std::process::ExitStatus::from_raw(0))).unwrap();
-        assert!(owner.is_none()); assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert!(owner.is_none());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
     #[test]
     fn tiny_success_budget_still_delivers_bounded_resource_error() {
         let mut shared = super::super::tests::shared(8);
         Arc::get_mut(&mut shared).unwrap().limits.reply_bytes = 1;
         let (tx, rx) = mpsc::sync_channel(1);
-        shared.state.lock().unwrap().pending.insert(1, Entry {
-            delivery: Delivery::Command(tx), cancel: Cancellation::default(), sent_cancel: false, control: true,
-        });
-        let message = checked_message(Kind::Reply, 1, &failure(ErrorCode::Busy, "a longer original error"), 1);
+        shared.state.lock().unwrap().pending.insert(
+            1,
+            Entry {
+                delivery: Delivery::Command(tx),
+                cancel: Cancellation::default(),
+                sent_cancel: false,
+                control: true,
+            },
+        );
+        let message = checked_message(
+            Kind::Reply,
+            1,
+            &failure(ErrorCode::Busy, "a longer original error"),
+            1,
+        );
         assert!(message.bytes.len() <= wire::ERROR_BYTES);
-        let mut bytes = Vec::new(); message.write(shared.session, &mut bytes).unwrap();
+        let mut bytes = Vec::new();
+        message.write(shared.session, &mut bytes).unwrap();
         parent_control(std::io::Cursor::new(bytes), &shared).unwrap();
-        assert!(matches!(rx.recv().unwrap(), Reply::Error {error: BridgeError {code: ErrorCode::ResourceLimit, ..}}));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Reply::Error {
+                error: BridgeError {
+                    code: ErrorCode::ResourceLimit,
+                    ..
+                }
+            }
+        ));
     }
     #[test]
     fn replies_complete_out_of_order_but_eof_does_not_guess_lost_outcome() {
         let shared = super::super::tests::shared(8);
         let mut receivers = Vec::new();
-        for id in [1,2] {
-            let (tx,rx) = mpsc::sync_channel(1);
-            shared.state.lock().unwrap().pending.insert(id, Entry {
-                delivery: Delivery::Command(tx), cancel: Cancellation::default(), sent_cancel: false, control: true,
-            });
+        for id in [1, 2] {
+            let (tx, rx) = mpsc::sync_channel(1);
+            shared.state.lock().unwrap().pending.insert(
+                id,
+                Entry {
+                    delivery: Delivery::Command(tx),
+                    cancel: Cancellation::default(),
+                    sent_cancel: false,
+                    control: true,
+                },
+            );
             receivers.push(rx);
         }
         let reply = failure(ErrorCode::Busy, "observed second request");
         let mut wire = Vec::new();
-        Message::new(Kind::Reply, 2, serde_json::to_vec(&reply).unwrap()).write(shared.session, &mut wire).unwrap();
+        Message::new(Kind::Reply, 2, serde_json::to_vec(&reply).unwrap())
+            .write(shared.session, &mut wire)
+            .unwrap();
         parent_control(std::io::Cursor::new(wire.clone()), &shared).unwrap();
-        assert!(matches!(receivers[0].try_recv(), Err(mpsc::TryRecvError::Empty)));
-        assert!(matches!(receivers[1].try_recv().unwrap(), Reply::Error {..}));
+        assert!(matches!(
+            receivers[0].try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            receivers[1].try_recv().unwrap(),
+            Reply::Error { .. }
+        ));
         assert_eq!(shared.state.lock().unwrap().phase, TransportPhase::Failed);
         assert!(!shared.state.lock().unwrap().reaped);
         assert!(shared.state.lock().unwrap().unknown);
@@ -939,46 +1121,114 @@ mod tests {
         assert!(parent_control(std::io::Cursor::new(wire), &shared).is_err());
         assert!(shared.state.lock().unwrap().pending.contains_key(&1));
         shared.complete_failure(); // Called by the real implementation only after wait.
-        assert!(matches!(receivers[0].recv().unwrap(), Reply::Error {..}));
+        assert!(matches!(receivers[0].recv().unwrap(), Reply::Error { .. }));
     }
     #[test]
     fn early_cancel_and_full_capacity_prevent_mutation_dispatch() {
         let shared = child_state();
         let (tx, _rx) = mpsc::sync_channel(2);
-        let request = Request::Create { path: NativePath::from_path(std::path::Path::new("/synthetic-mutation")) };
+        let request = Request::Create {
+            path: NativePath::from_path(std::path::Path::new("/synthetic-mutation")),
+        };
         let body = serde_json::to_vec(&request).unwrap();
         let mut input = Vec::new();
-        Message::new(Kind::Cancel, 1, vec![]).write([9;16], &mut input).unwrap();
-        Message::new(Kind::Command, 1, body.clone()).write([9;16], &mut input).unwrap();
+        Message::new(Kind::Cancel, 1, vec![])
+            .write([9; 16], &mut input)
+            .unwrap();
+        Message::new(Kind::Command, 1, body.clone())
+            .write([9; 16], &mut input)
+            .unwrap();
         let mutations = std::cell::Cell::new(0);
         let mut fake = |kind, bytes: &[u8]| {
             assert_eq!(kind, Kind::Command);
-            assert!(matches!(serde_json::from_slice::<Request>(bytes).unwrap(), Request::Create { .. }));
+            assert!(matches!(
+                serde_json::from_slice::<Request>(bytes).unwrap(),
+                Request::Create { .. }
+            ));
             mutations.set(mutations.get() + 1);
-            Ok(Err(error(ErrorCode::Native, "mutation recorded by fake engine")))
+            Ok(Err(error(
+                ErrorCode::Native,
+                "mutation recorded by fake engine",
+            )))
         };
-        child_input(&mut std::io::Cursor::new(input), [9;16], &mut fake, &shared, &Limits::default(), &tx, &mut || Ok(())).unwrap();
+        child_input(
+            &mut std::io::Cursor::new(input),
+            [9; 16],
+            &mut fake,
+            &shared,
+            &Limits::default(),
+            &tx,
+            &mut || Ok(()),
+        )
+        .unwrap();
         let state = shared.lock().unwrap();
         assert!(state.cancels.is_empty());
         assert!(state.early.is_empty());
-        let ChildPending::Reply(reply) = state.pending.get(&1).unwrap() else { panic!("typed canceled reply required") };
-        assert!(matches!(serde_json::from_slice::<Reply>(&reply.bytes).unwrap(), Reply::Error {error: BridgeError {code: ErrorCode::Canceled, ..}}));
+        let ChildPending::Reply(reply) = state.pending.get(&1).unwrap() else {
+            panic!("typed canceled reply required")
+        };
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&reply.bytes).unwrap(),
+            Reply::Error {
+                error: BridgeError {
+                    code: ErrorCode::Canceled,
+                    ..
+                }
+            }
+        ));
         drop(state);
         // A full completion registry must reject before the same mutating dispatcher.
-        let limits = Limits { queued: 1, ..Limits::default() };
+        let limits = Limits {
+            queued: 1,
+            ..Limits::default()
+        };
         for id in 2..=(CONTROL_SLOTS + 1) as u64 {
-            shared.lock().unwrap().pending.insert(id, ChildPending::Reply(Message::new(Kind::Reply, id, vec![])));
+            shared.lock().unwrap().pending.insert(
+                id,
+                ChildPending::Reply(Message::new(Kind::Reply, id, vec![])),
+            );
         }
         let mut input = Vec::new();
-        Message::new(Kind::Command, 99, body.clone()).write([9;16], &mut input).unwrap();
-        let result = child_input(&mut std::io::Cursor::new(input), [9;16], &mut fake, &shared, &limits, &tx, &mut || Ok(()));
-        assert!(result.unwrap_err().to_string().contains("child pending bounds"));
-        assert_eq!(mutations.get(), 0, "canceled and capacity-rejected writes never reach engine");
+        Message::new(Kind::Command, 99, body.clone())
+            .write([9; 16], &mut input)
+            .unwrap();
+        let result = child_input(
+            &mut std::io::Cursor::new(input),
+            [9; 16],
+            &mut fake,
+            &shared,
+            &limits,
+            &tx,
+            &mut || Ok(()),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("child pending bounds")
+        );
+        assert_eq!(
+            mutations.get(),
+            0,
+            "canceled and capacity-rejected writes never reach engine"
+        );
         // Prove the fake records an admitted mutation, and repeated IDs cannot dispatch twice.
         let shared = child_state();
         let mut input = Vec::new();
-        for _ in 0..2 { Message::new(Kind::Command, 1, body.clone()).write([9;16], &mut input).unwrap(); }
-        let result = child_input(&mut std::io::Cursor::new(input), [9;16], &mut fake, &shared, &limits, &tx, &mut || Ok(()));
+        for _ in 0..2 {
+            Message::new(Kind::Command, 1, body.clone())
+                .write([9; 16], &mut input)
+                .unwrap();
+        }
+        let result = child_input(
+            &mut std::io::Cursor::new(input),
+            [9; 16],
+            &mut fake,
+            &shared,
+            &limits,
+            &tx,
+            &mut || Ok(()),
+        );
         assert!(result.unwrap_err().to_string().contains("replayed"));
         assert_eq!(mutations.get(), 1);
     }
@@ -987,13 +1237,30 @@ mod tests {
         let shared = child_state();
         let (tx, rx) = mpsc::sync_channel(2);
         let mut input = Vec::new();
-        Message::new(Kind::Shutdown, 1, vec![]).write([9;16], &mut input).unwrap();
-        Message::new(Kind::Shutdown, 2, vec![]).write([9;16], &mut input).unwrap();
+        Message::new(Kind::Shutdown, 1, vec![])
+            .write([9; 16], &mut input)
+            .unwrap();
+        Message::new(Kind::Shutdown, 2, vec![])
+            .write([9; 16], &mut input)
+            .unwrap();
         let mut calls = 0;
-        child_input(&mut std::io::Cursor::new(input), [9;16], &mut |_, _| panic!("shutdown must not dispatch a command"), &shared, &Limits::default(), &tx, &mut || {
-            calls += 1;
-            if calls == 1 { Err(error(ErrorCode::Native, "injected native drain failure")) } else { Ok(()) }
-        }).unwrap();
+        child_input(
+            &mut std::io::Cursor::new(input),
+            [9; 16],
+            &mut |_, _| panic!("shutdown must not dispatch a command"),
+            &shared,
+            &Limits::default(),
+            &tx,
+            &mut || {
+                calls += 1;
+                if calls == 1 {
+                    Err(error(ErrorCode::Native, "injected native drain failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
         assert_eq!(calls, 2);
         let failure = rx.try_recv().unwrap();
         assert_eq!((failure.kind, failure.id), (Kind::DrainError, 1));

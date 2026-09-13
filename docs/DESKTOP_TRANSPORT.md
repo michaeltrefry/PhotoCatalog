@@ -18,7 +18,7 @@ Preview bytes reserve the parent's aggregate `Limits.binary_bytes` before alloca
 
 ## Failure and shutdown
 
-No transport error replays a request or creates a replacement child. An unacknowledged operation remains unknown until verified process exit; callers explicitly reopen and inspect durable state. Pipe EOF alone is not Closed. A dedicated supervisor waits the exact owned child independently of callers receiving results. Only an affirmative OS wait releases process custody. A wait error preserves the Child and pipe/thread owners for explicit retry.
+No transport error replays a request or creates a replacement child. An unacknowledged operation remains unknown until verified process exit; callers explicitly reopen and inspect durable state. Pipe EOF or child reap alone is not Closed: both child/pipe cleanup and the independent local Workbench must report verified shutdown. A held or failed local drain keeps the façade Draining, and explicit retry uses the retained owner. A dedicated supervisor waits the exact owned child independently of callers receiving results. Only an affirmative OS wait releases process custody. A wait error preserves the Child and pipe/thread owners for explicit retry.
 
 Shutdown requests carry numbered attempts. A checked engine drain failure returns a matching DrainError while keeping stdin and process ownership alive. An explicit retry addresses the same child. Old failure replies cannot replace a newer attempt. Dropping an already failed owner does not implicitly retry or force-exit it. No kill/force-exit is implemented for a child that could own native descendants. The checked engine shutdown integration is a prerequisite for final qualification; a legacy best-effort shutdown is not evidence of verified drain.
 

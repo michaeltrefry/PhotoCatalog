@@ -22,7 +22,7 @@ use wire::{BytesRequest, Kind, Message};
 type Result<T> = std::result::Result<T, BridgeError>;
 const CONTROL_SLOTS: usize = 16;
 
-/// Closed means that the process was waited, not simply that its pipe ended.
+/// Closed requires verified child/pipe drain and verified local Workbench drain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportPhase {
     Starting,
@@ -66,6 +66,8 @@ struct State {
     shutdown_sent: u64,
     drain_error: Option<String>,
     reaped: bool,
+    child_finished: bool,
+    local_verified: bool,
 }
 struct Shared {
     session: [u8; 16],
@@ -75,6 +77,40 @@ struct Shared {
     binary: Arc<AtomicUsize>,
 }
 impl Shared {
+    fn child_finished(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.child_finished = true;
+        if state.local_verified {
+            state.phase = TransportPhase::Closed;
+        } else if state.phase != TransportPhase::Failed {
+            state.phase = TransportPhase::Draining;
+        }
+        self.wake.notify_all();
+    }
+    fn drain_local(&self, drain: impl FnOnce() -> Result<()>) -> Result<()> {
+        // Keep status observable while the independent local owner is blocked.
+        let result = drain();
+        let mut state = self.state.lock().unwrap();
+        match &result {
+            Err(error) => {
+                state.local_verified = false;
+                state.phase = TransportPhase::Draining;
+                state.drain_error = Some(format!(
+                    "local Workbench owner not drained: {}",
+                    error.message
+                ));
+            }
+            Ok(()) => {
+                state.local_verified = true;
+                if state.child_finished {
+                    state.phase = TransportPhase::Closed;
+                    state.drain_error = None;
+                }
+            }
+        }
+        self.wake.notify_all();
+        result
+    }
     fn fail(&self, message: impl Into<String>) {
         let mut s = self.state.lock().unwrap();
         if s.phase == TransportPhase::Closed {
@@ -83,7 +119,9 @@ impl Shared {
         s.unknown |= !s.pending.is_empty();
         s.message.get_or_insert(message.into());
         s.phase = TransportPhase::Failed;
-        if !s.stopping { s.shutdown_attempt += 1; }
+        if !s.stopping {
+            s.shutdown_attempt += 1;
+        }
         s.stopping = true;
         self.wake.notify_all();
     }
@@ -95,7 +133,9 @@ impl Shared {
         if s.phase != TransportPhase::Failed {
             s.phase = TransportPhase::Draining;
         }
-        if !s.stopping || s.drain_error.take().is_some() { s.shutdown_attempt += 1; }
+        if !s.stopping || s.drain_error.take().is_some() {
+            s.shutdown_attempt += 1;
+        }
         s.stopping = true;
         for entry in s.pending.values() {
             if matches!(entry.delivery, Delivery::Bytes { .. }) {
@@ -106,10 +146,16 @@ impl Shared {
     }
     fn drain_failed(&self, attempt: u64, message: String) -> std::io::Result<()> {
         let mut s = self.state.lock().unwrap();
-        if attempt < s.shutdown_attempt { return Ok(()); }
-        if attempt == 0 || attempt != s.shutdown_attempt { return Err(wire::invalid("unowned drain response")); }
-        s.drain_error = Some(message); s.phase = TransportPhase::Draining;
-        self.wake.notify_all(); Ok(())
+        if attempt < s.shutdown_attempt {
+            return Ok(());
+        }
+        if attempt == 0 || attempt != s.shutdown_attempt {
+            return Err(wire::invalid("unowned drain response"));
+        }
+        s.drain_error = Some(message);
+        s.phase = TransportPhase::Draining;
+        self.wake.notify_all();
+        Ok(())
     }
     fn complete_failure(&self) {
         let entries = {
@@ -153,9 +199,11 @@ struct Handle {
     shared: Arc<Shared>,
     process: Mutex<process::Owner>,
     pid: u32,
+    shutdown: Mutex<()>,
 }
 impl Handle {
     fn shutdown(&self) -> Result<()> {
+        let _attempt = self.shutdown.lock().unwrap();
         // Signal both independent owners before either potentially blocking join.
         self.shared.stop();
         self.local
@@ -166,8 +214,8 @@ impl Handle {
             .unwrap_or_else(|e| e.into_inner())
             .signal_shutdown();
         let result = self.process.lock().unwrap().drain();
-        self.local.shutdown();
-        result
+        let local = self.shared.drain_local(|| self.local.try_shutdown());
+        result.and(local)
     }
 }
 impl Drop for Handle {
@@ -206,6 +254,8 @@ impl DesktopBridge {
                 shutdown_sent: 0,
                 drain_error: None,
                 reaped: false,
+                child_finished: false,
+                local_verified: false,
             }),
             wake: Condvar::new(),
             binary: Arc::new(AtomicUsize::new(0)),
@@ -224,6 +274,7 @@ impl DesktopBridge {
             shared,
             process: Mutex::new(owner),
             pid,
+            shutdown: Mutex::new(()),
         }));
         // Failure never force-kills a potentially descendant-owning actor. Drop drains it.
         let s = result.0.shared.state.lock().unwrap();
@@ -267,14 +318,24 @@ impl DesktopBridge {
             return self.0.local.submit(request);
         }
         let control = control_route(&request);
-        let retiring = if let Request::Close { catalog } = &request { Some(catalog.as_str()) } else { None };
+        let retiring = if let Request::Close { catalog } = &request {
+            Some(catalog.as_str())
+        } else {
+            None
+        };
         let bytes = serde_json::to_vec(&request)
             .map_err(|e| error(ErrorCode::InvalidRequest, e.to_string()))?;
         if bytes.len() > self.0.shared.limits.request_bytes {
             return Err(error(ErrorCode::ResourceLimit, "request byte limit"));
         }
         let (tx, receiver) = mpsc::sync_channel(1);
-        let cancel = self.enqueue(Kind::Command, bytes, Delivery::Command(tx), control, retiring)?;
+        let cancel = self.enqueue(
+            Kind::Command,
+            bytes,
+            Delivery::Command(tx),
+            control,
+            retiring,
+        )?;
         Ok(Pending { receiver, cancel })
     }
     pub fn preview_bytes(
@@ -334,7 +395,9 @@ impl DesktopBridge {
         s.next = id
             .checked_add(1)
             .ok_or_else(|| error(ErrorCode::ResourceLimit, "request identifier exhausted"))?;
-        if let Some(catalog) = retiring { retire_bytes(&s, catalog); }
+        if let Some(catalog) = retiring {
+            retire_bytes(&s, catalog);
+        }
         let weak = Arc::downgrade(shared);
         let cancel = Cancellation(
             Arc::new(AtomicBool::new(false)),

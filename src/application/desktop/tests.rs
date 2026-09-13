@@ -19,7 +19,12 @@ pub(super) fn shared(cap: usize) -> Arc<Shared> {
             data: VecDeque::new(),
             ready: true,
             stopping: false,
-            shutdown_attempt: 0, shutdown_sent: 0, drain_error: None, reaped: false,
+            shutdown_attempt: 0,
+            shutdown_sent: 0,
+            drain_error: None,
+            reaped: false,
+            child_finished: false,
+            local_verified: false,
         }),
         wake: Condvar::new(),
         binary: Arc::new(AtomicUsize::new(0)),
@@ -53,7 +58,15 @@ fn close_retires_only_matching_catalog_binary_and_ack_survives_drain() {
     let state = shared(8);
     let (_, old) = bytes_pending(&state, 1);
     let (new_cancel, _) = bytes_pending(&state, 2);
-    if let Delivery::Bytes { request, .. } = &mut state.state.lock().unwrap().pending.get_mut(&2).unwrap().delivery {
+    if let Delivery::Bytes { request, .. } = &mut state
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .get_mut(&2)
+        .unwrap()
+        .delivery
+    {
         request.catalog = "catalog-B".into();
     }
     retire_bytes(&state.state.lock().unwrap(), "catalog-A");
@@ -64,8 +77,14 @@ fn close_retires_only_matching_catalog_binary_and_ack_survives_drain() {
     bytes.finish(&state).unwrap();
     assert!(old.recv().unwrap().is_err());
     assert_eq!(state.binary.load(Ordering::Acquire), 0);
-    assert_eq!(process::next_outgoing(&state, &mut None).unwrap().kind, Kind::Ack);
-    assert_eq!(process::next_outgoing(&state, &mut None).unwrap().kind, Kind::Shutdown);
+    assert_eq!(
+        process::next_outgoing(&state, &mut None).unwrap().kind,
+        Kind::Ack
+    );
+    assert_eq!(
+        process::next_outgoing(&state, &mut None).unwrap().kind,
+        Kind::Shutdown
+    );
 }
 fn bytes_pending(shared: &Shared, id: u64) -> (Cancellation, mpsc::Receiver<Result<PreviewBytes>>) {
     let (reply, rx) = mpsc::sync_channel(1);
@@ -228,7 +247,10 @@ fn outstanding_data_does_not_hide_control_or_early_cancellation() {
         wire::CHUNK
     );
     shared.stop();
-    assert_eq!(process::next_outgoing(&shared, &mut active).unwrap().kind, Kind::Shutdown);
+    assert_eq!(
+        process::next_outgoing(&shared, &mut active).unwrap().kind,
+        Kind::Shutdown
+    );
     shared.state.lock().unwrap().reaped = true;
     assert!(process::next_outgoing(&shared, &mut active).is_none());
 }
