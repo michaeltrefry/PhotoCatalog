@@ -2303,6 +2303,10 @@ pub(crate) fn relink_hydration_state(db: &Connection, asset: &str) -> Result<Opt
 pub(crate) fn verify_database_object(db: &Connection, held: &File) -> Result<()> {
     #[cfg(unix)]
     {
+        ensure!(
+            sqlite_opened_object(db)? == object_key(held)?,
+            "SQLite selected database object changed: opened identity differs from retained pin"
+        );
         let mut moved = 0i32;
         let code = unsafe {
             rusqlite::ffi::sqlite3_file_control(
@@ -2316,7 +2320,6 @@ pub(crate) fn verify_database_object(db: &Connection, held: &File) -> Result<()>
             code == rusqlite::ffi::SQLITE_OK && moved == 0,
             "SQLite selected database object changed or cannot be verified"
         );
-        let _ = held;
     }
     #[cfg(windows)]
     {
@@ -2338,6 +2341,31 @@ pub(crate) fn verify_database_object(db: &Connection, held: &File) -> Result<()>
     }
     Ok(())
 }
+
+/// Private v1 ABI in our single bundled SQLite unixFileControl implementation.
+/// C uses the compiled unixFile type and fstats its borrowed descriptor. Neither
+/// side opens, duplicates or closes a file to observe SQLite's actual identity.
+#[cfg(unix)]
+fn sqlite_opened_object(db: &Connection) -> Result<(u64, u64)> {
+    const PHOTOCATALOG_FCNTL_FILE_IDENTITY_V1: i32 = 0x5043_4301;
+    let mut identity = [0u64; 2];
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            db.handle(),
+            c"main".as_ptr(),
+            PHOTOCATALOG_FCNTL_FILE_IDENTITY_V1,
+            identity.as_mut_ptr().cast(),
+        )
+    };
+    ensure!(
+        code == rusqlite::ffi::SQLITE_OK,
+        "SQLite opened database identity unavailable (file control {code})"
+    );
+    Ok((identity[0], identity[1]))
+}
+
+#[cfg(all(test, unix))]
+mod database_identity_tests;
 
 #[cfg(test)]
 mod folder_alias_tests {
