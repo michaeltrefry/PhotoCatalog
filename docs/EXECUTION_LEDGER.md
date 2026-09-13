@@ -4,6 +4,40 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
+Latest S12 integration: export path compatibility `1da8212` is integrated as
+`ed547a4`, backup lifecycle repairs are `58e3c78`, and owned Lightroom capture
+`ee83b33` is integrated as `cb10f73`. All three received independent source review.
+Export wire formats now retain exact native path units in plans, snapshots, seals,
+receipts and worker completion while preserving legacy raw plan bytes and authority
+hashes. Sixty focused test functions and strict Clippy pass. Four physical nonUTF
+fixtures report the exact macOS EILSEQ92 filename limitation before publication;
+they do not establish physical nonUTF export on this Mac. Five representable-path
+worker/service workflows ran. Root verified11 integrated source and23 evidence
+hashes in private `sc-22847-export-native-path-qnt6co3y`.
+
+Backup browser checks reproduce then repair stale destination/picker/restore replies
+crossing catalog or panel scopes, and unusable Cancel behind an unresolved start
+acknowledgement. Independent status polling now reconciles admission and owns status;
+exact-operation cancellation is separate from review admission. Same-catalog reopen
+also releases an obsolete pending restore-review callback. Actual-component synthetic
+browser evidence is `sc-22847-backup-ui-gilg1rzz`;38 frontend tests and build pass.
+CI34760079137 at90e4041 currently has Mac/Linux failures in lifecycle tests expecting
+literal pre-namespace React keys. The repaired tests check stable ownership through
+indexing, distinct sibling keys, and replacement across catalog sessions. Windows is
+still running; its earlier original-observation timeout and installed-worker gate
+remain unresolved until fresh terminal evidence.
+
+Owned Lightroom capture adds bounded create-new request/result transport, pre-source
+request digest admission, child-only original handles and POSIX byte locks, and an
+EOF ownership lease with explicit cancel/Drop kill and reap. Hidden CLI/Tauri dispatch
+runs before app initialization; the legacy capture-worker protocol remains available.
+Five focused and24 Lightroom integration tests plus strict Clippy/fmt pass. Private
+`sc-22847-lightroom-capture-worker-hdne55hk` retains source, failures and receipt.
+This is a prerequisite: installed helper execution and the full desktop Lightroom
+workbench remain open, as do full photo-export/metadata-write desktop workflows.
+No actual user catalog was recaptured or migrated, and no original was changed.
+
+
 S1–S11 are Done. S10 PR #14 merged as
 `287d3382538b10717bf943553c73fc29a300ffd6`; final and merged CI passed.
 The selected16 migration remains a scratch TEST, with no canonical migration
