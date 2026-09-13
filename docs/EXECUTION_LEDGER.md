@@ -4,40 +4,61 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
-Public PR16 head is `af7e2386c8125b9c14cf18ade6457e8b25864705`.
-CI34765013818 is terminal: macOS, Linux and evidence contracts passed.
-Windows passed434 library tests and failed2 before installed qualification.
-Private full log: `sc-22847-ci-34765013818-o2vc1r2w/windows.log`. Root's repair
-checks native sharing-refusal codes and keeps only the Windows SQLite manifest
-representable while retaining native thumbnail/large/relocation path coverage.
-Invalid Windows manifest paths now reject before root creation. Unix native
-manifest coverage remains. Independent review and targeted gates are pending.
-No newer push has interrupted that run.
-Export controller `3af78e0` passed independent review,43 frontend tests/build,
-and eight actual-hook lifecycle checks. Its full App integration is under review;
-held direct Begin/Seal responses still need independent saved-state reconciliation.
-Root's copy/relink retry, stale-callback and admission repairs compile and pass43
-frontend tests; independent actual-hook verification remains active.
+S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
+PR16 remains at `af7e2386c8125b9c14cf18ade6457e8b25864705`. The reviewed local batch
+includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
+Lightroom inspection workbench `9deedea`, and Windows boundary repair `e239268`.
+The full export frontend is awaiting a repair and independent re-review for stale
+completed naming-review settings. No newer push has interrupted CI.
 
-Serialized Lightroom inspection workbench `e6b7fac` is integrated as `9deedea`.
-All62 executed tests, strict Clippy and formatting pass on macOS. Independent
-review verified12 source and19 evidence files, including opened-review descriptor
-identity and opaque foreign-path retention. Receipt and review are private under
-`sc-22847-lightroom-workbench-hvq23yrv` and
-`sc-22847-lightroom-workbench-independent-0gg02m_c`. This prerequisite provides
-owned discovery/capture/inspection, reports, exact result chunks, explicit family
-decisions and selection sealing. Desktop bridge/UI and migration execution,
-reconciliation and repairs remain S12 work; no final user migration occurred.
+CI34765013818 is terminal: macOS, Linux and evidence contracts passed. Downloaded
+Mac/Linux qualification receipts and installer hashes match; installed synthetic
+preview/export workers reaped successfully. These receipts do not claim GUI testing.
+Windows passed 434 library tests and failed two before installed qualification.
+Root's independently reviewed repair checks native sharing-refusal codes and keeps
+only the Windows SQLite manifest representable while retaining native thumbnail and
+relocation data paths. Invalid Windows manifest paths reject before root creation;
+Unix native manifest coverage remains. Actual Windows validation is still required.
+Evidence: private `sc-22847-ci-34765013818-o2vc1r2w/readback.json` and
+`sc-22847-windows-boundary-independent-p_1yrz8c/review-format-final.json`.
 
-The Mac is unlocked and the old v1 app49373 was closed through Close catalog,
-then normal Quit. Installed v5 app20724 now opens the selected16 TEST catalog.
-Its first-open preparation indicator reached Catalog ready; a known existing2017
-CR2 displayed a thumbnail and a large Develop preview. No editing controls were
-changed. Private visual evidence: `sc-22847-installed-gui-v5-125d2K/receipt.json`.
-The2014-02-21 folder exposes a separate stale-source issue: its catalog lists93
-photos, but its present filesystem directory contains two renamed DNG files and
-no `IMG_6997.CR2`. No automatic CR2-to-DNG association or relink was performed;
-the user was asked whether conversion/removal explains the difference.
+The combined local batch passed 54 focused Rust tests, strict all-target Clippy and
+formatting, plus the separate Tauri picker-purpose mapping test. One macOS native
+cache test returns at filesystem EILSEQ92; this function count is not physical
+nonUnicode workflow coverage. Picker mapping is not actual native-dialog validation.
+The six frozen source hashes match the committed tree. Receipt:
+`sc-22847-export-lightroom-windows-integrated-eenm_abb/receipt.json`, SHA256
+`bdb2bb0760a4cd80bcf0ae68b512517a2ae273f1e3a7749a23f9f5c8b3c63a89`.
+
+Copy/relink retry and stale-callback repair passed independent actual-hook/gate
+verification (nine source and 32 evidence hashes), 43 frontend tests and build.
+The full export actor passed independent review and 35 distinct focused tests,
+including synthetic PNG export through the application bridge, explicit recovery,
+foreground preview preemption, and child drain before ownership release. Strict
+Clippy and formatting pass. Its frontend remains a separate integration gate.
+
+The serialized Lightroom workbench passed 62 executed tests, strict Clippy and
+formatting; independent review verified 12 source and 19 evidence files. It provides
+owned discovery/capture/inspection, exact result chunks, explicit family decisions
+and selection sealing. The complete desktop bridge is being implemented in an
+isolated worktree. Its UI and migration execution, reconciliation and repair paths
+remain required S12 work. No canonical user migration occurred.
+
+The old v1 app was closed normally. Installed v5 opens the selected16 TEST catalog:
+preparation reached Catalog ready, and a known existing 2017 CR2 displayed both a
+thumbnail and a large Develop preview. No editing controls were changed. Evidence:
+`sc-22847-installed-gui-v5-125d2K/receipt.json`. The 2014-02-21 folder exposes a
+separate stale-source issue: its catalog lists 93 photos, but its current directory
+contains two renamed DNG files and no `IMG_6997.CR2`. Bounded DNG headers identify
+one as converted from `IMG_7058.CR2`; they do not identify the missing IMG_6997 or
+other originals. No guessed association or relink was performed. The user question
+about conversion/removal is pending. V5 is the immutable `4e40972` checkpoint and
+does not contain this newer export/workbench batch.
+
+## Earlier integration checkpoints
+
+The entries below preserve historical evidence and pending-state descriptions at
+those checkpoints. Current source, CI and user-app status are stated above.
 
 Cache native-path repair `1f51107` is integrated as `4a51c9c`. It preserves legacy
 TEXT rows, stored previews and both relocation phases while writing versioned
