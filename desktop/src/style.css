@@ -98,6 +98,10 @@ p { line-height: 1.6; }
 .empty-state { padding: 32px; margin: auto; max-width: 450px; color: var(--secondary); text-align: center; }
 .empty-state h2 { color: var(--text); }
 .empty-state p { color: var(--muted); }
+.catalog-activity { max-width: 500px; }
+.activity-spinner { display: inline-block; width: 28px; height: 28px; border: 2px solid var(--muted); border-top-color: var(--text); border-radius: 50%; animation: activity-spin 1s linear infinite; }
+@keyframes activity-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .activity-spinner { animation: none; } }
 .viewport-panel { display: flex; flex: 1; min-height: 0; flex-direction: column; }
 .viewport-toolbar { flex: none; display: flex; align-items: center; gap: 14px; padding: 8px 12px; background: var(--toolbar); border-bottom: 1px solid var(--border); }
 .viewport-toolbar > span { flex: 1; min-width: 0; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
@@ -140,3 +144,9 @@ dialog::backdrop { background: #0009; }
 .dialog-body li { margin-bottom: 10px; }
 @media (max-width: 1120px) { .left-panel { width: 200px; } .right-panel { width: 278px; } .catalog-name { display: none; } .app-header nav { margin-left: auto; } .search-form input { width: 170px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }
+
+.source-path { overflow-wrap: anywhere; padding: 10px; background: var(--canvas); }
+.import-counts { display: grid; grid-template-columns: 1fr auto; gap: 5px 24px; }
+.import-counts dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.filter-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }

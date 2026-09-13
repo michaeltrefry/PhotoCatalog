@@ -60,6 +60,29 @@ pub enum Request {
         catalog: String,
         import: String,
     },
+    BackupCreate {
+        catalog: String,
+        bundle: NativePath,
+    },
+    BackupInspect {
+        bundle: NativePath,
+    },
+    BackupRestore {
+        bundle: NativePath,
+        destination: NativePath,
+    },
+    BackupStatus,
+    BackupCancel {
+        operation: String,
+    },
+    RestoreStatus {
+        catalog: String,
+    },
+    ResumeRestoredJobs {
+        catalog: String,
+        restore_id: String,
+        acknowledge_pending_jobs: bool,
+    },
     Folders {
         catalog: String,
         parent: Option<I64>,
@@ -279,6 +302,8 @@ pub struct PreviewStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
+    Backup(Option<super::backup::Snapshot>),
+    Restore(Option<Restored>),
     Status(Status),
     Import(Option<ImportStatus>),
     Folders {
@@ -336,3 +361,17 @@ impl std::fmt::Display for BridgeError {
     }
 }
 impl std::error::Error for BridgeError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Restored {
+    pub receipt: super::backup::RestoreReceipt,
+    pub jobs_held: bool,
+}
+impl From<crate::catalog_backup::RestoreStatus> for Restored {
+    fn from(status: crate::catalog_backup::RestoreStatus) -> Self {
+        Self {
+            receipt: status.receipt.into(),
+            jobs_held: status.jobs_held,
+        }
+    }
+}

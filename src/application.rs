@@ -280,6 +280,7 @@ struct Queue {
     ticket_foreground: HashMap<(String, String), TicketPriority>,
 }
 struct Shared {
+    backups: Mutex<backup::Coordinator>,
     queue: Mutex<Queue>,
     wake: Condvar,
     limits: Limits,
@@ -315,6 +316,7 @@ impl Bridge {
     pub fn spawn(config: Config) -> Result<Self> {
         config.validate()?;
         let shared = Arc::new(Shared {
+            backups: Mutex::new(backup::Coordinator::new(Default::default())?),
             queue: Mutex::new(Queue {
                 pending: VecDeque::new(),
                 stopping: false,
@@ -383,6 +385,32 @@ impl Bridge {
                 value: Response::Import(q.import_status.clone()),
             });
             self.0.shared.wake.notify_one();
+            return Ok(Pending { receiver, cancel });
+        }
+        if matches!(
+            &request,
+            Request::BackupStatus | Request::BackupCancel { .. }
+        ) {
+            let mut backups = self.0.shared.backups.try_lock().map_err(|_| {
+                error(
+                    ErrorCode::ResourceLimit,
+                    "backup control is busy closing; retry shortly",
+                )
+            })?;
+            let snapshot = match &request {
+                Request::BackupCancel { operation } => {
+                    Some(backups.cancel(operation).map_err(native)?)
+                }
+                _ => backups.status().map_err(native)?,
+            };
+            let response = Reply::Ok {
+                value: Response::Backup(snapshot),
+            };
+            let response = match serde_json::to_vec(&response) {
+                Ok(bytes) if bytes.len() <= self.0.shared.limits.reply_bytes => response,
+                _ => failure(ErrorCode::ResourceLimit, "response byte limit"),
+            };
+            let _ = tx.send(response);
             return Ok(Pending { receiver, cancel });
         }
         if let Request::ReleaseViewport {
@@ -765,6 +793,12 @@ impl Actor {
     }
     fn close(&mut self) {
         self.set_phase(Phase::Closing, None);
+        let _ = self
+            .shared
+            .backups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shutdown();
         if let Some(mut open) = self.open.take() {
             let mut import = open.import.take();
             if let Some(import) = &mut import {
@@ -1030,6 +1064,63 @@ impl Actor {
             Request::ImportStatus { .. } | Request::ImportCancel { .. } => Ok(Response::Import(
                 self.shared.queue.lock().unwrap().import_status.clone(),
             )),
+            Request::BackupCreate { catalog, bundle } => {
+                let source = NativePath::from_path(&self.current(&catalog)?.catalog.root);
+                let snapshot = core!(
+                    self.shared
+                        .backups
+                        .lock()
+                        .unwrap()
+                        .start(backup::Request::Create { source, bundle })
+                );
+                Ok(Response::Backup(Some(snapshot)))
+            }
+            Request::BackupInspect { bundle } => {
+                let snapshot = core!(
+                    self.shared
+                        .backups
+                        .lock()
+                        .unwrap()
+                        .start(backup::Request::Inspect { bundle })
+                );
+                Ok(Response::Backup(Some(snapshot)))
+            }
+            Request::BackupRestore {
+                bundle,
+                destination,
+            } => {
+                let snapshot = core!(self.shared.backups.lock().unwrap().start(
+                    backup::Request::Restore {
+                        bundle,
+                        destination
+                    }
+                ));
+                Ok(Response::Backup(Some(snapshot)))
+            }
+            Request::BackupStatus | Request::BackupCancel { .. } => Ok(Response::Backup(core!(
+                self.shared.backups.lock().unwrap().status()
+            ))),
+            Request::RestoreStatus { catalog } => {
+                let root = self.current(&catalog)?.catalog.root.clone();
+                Ok(Response::Restore(
+                    core!(crate::catalog_backup::restore_status(root)).map(Into::into),
+                ))
+            }
+            Request::ResumeRestoredJobs {
+                catalog,
+                restore_id,
+                acknowledge_pending_jobs,
+            } => {
+                let open = self.current(&catalog)?;
+                let status = core!(crate::catalog_backup::resume_restored_jobs(
+                    &open.catalog.root,
+                    &restore_id,
+                    acknowledge_pending_jobs
+                ));
+                open.jobs_held = status.jobs_held;
+                self.shared.queue.lock().unwrap().status.jobs_held = status.jobs_held;
+                Ok(Response::Restore(Some(status.into())))
+            }
             Request::Folders {
                 catalog,
                 parent,

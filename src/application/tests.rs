@@ -34,6 +34,7 @@ fn decimal_and_native_path_wire_are_lossless() {
 
 fn disconnected() -> Bridge {
     let shared = Arc::new(Shared {
+        backups: Mutex::new(backup::Coordinator::new(Default::default()).unwrap()),
         queue: Mutex::new(Queue {
             pending: VecDeque::new(),
             stopping: false,

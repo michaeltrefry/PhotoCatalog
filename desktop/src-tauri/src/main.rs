@@ -44,6 +44,7 @@ fn main() {
             commands::catalog_command,
             commands::catalog_cancel_operation,
             commands::catalog_choose_folder,
+            commands::catalog_choose_location,
             commands::catalog_preview_bytes,
             commands::catalog_preview_release,
             commands::catalog_frontend_ready,

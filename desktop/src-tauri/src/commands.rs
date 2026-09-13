@@ -1,5 +1,5 @@
 use photocatalog::{application::{Bridge, Cancellation, PreviewBytes, Reply, Request}, storage_volume::NativePath};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::{Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use tauri_plugin_dialog::DialogExt;
 
@@ -68,6 +68,27 @@ pub async fn catalog_choose_folder(app: tauri::AppHandle, create_catalog: bool) 
         let selected = if create_catalog {
             app.dialog().file().set_title("Choose a name and location for the new catalog folder").set_file_name("PhotoCatalog").blocking_save_file()
         } else { app.dialog().file().set_title("Open a catalog folder").blocking_pick_folder() };
+        selected.map(|file| {
+            let path = file.into_path().map_err(|error| error.to_string())?;
+            Ok(SelectedPath { path: NativePath::from_path(&path), display: path.to_string_lossy().into_owned() })
+        }).transpose()
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore }
+
+#[tauri::command]
+pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPurpose) -> Result<Option<SelectedPath>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = app.dialog().file();
+        let selected = match purpose {
+            LocationPurpose::Originals => dialog.set_title("Add photographs from a folder").blocking_pick_folder(),
+            LocationPurpose::BackupBundle => dialog.set_title("Choose a PhotoCatalog backup folder").blocking_pick_folder(),
+            LocationPurpose::NewBackup => dialog.set_title("Choose a new backup folder").set_file_name("PhotoCatalog Backup").blocking_save_file(),
+            LocationPurpose::NewRestore => dialog.set_title("Choose a new restored catalog folder").set_file_name("PhotoCatalog Restored").blocking_save_file(),
+        };
         selected.map(|file| {
             let path = file.into_path().map_err(|error| error.to_string())?;
             Ok(SelectedPath { path: NativePath::from_path(&path), display: path.to_string_lossy().into_owned() })

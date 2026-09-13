@@ -1087,3 +1087,156 @@ fn changed_edited_original_import_fails_actionably_without_reset_or_duplicate() 
     assert_eq!(std::fs::read(&path)?, changed_original);
     Ok(())
 }
+
+#[test]
+fn desktop_backup_restore_uses_selected_catalog_and_explicit_job_admission() -> Result<()> {
+    fn wait_backup(bridge: &Bridge, operation: &str) -> Result<backup::Snapshot> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let Response::Backup(Some(snapshot)) = call(bridge, Request::BackupStatus)? else {
+                bail!("backup status response");
+            };
+            ensure!(snapshot.operation == operation, "backup identity changed");
+            if snapshot.state == backup::State::Complete {
+                return Ok(snapshot);
+            }
+            ensure!(
+                snapshot.state != backup::State::Failed,
+                "{:?}",
+                snapshot.error
+            );
+            ensure!(Instant::now() < deadline, "backup deadline");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("catalog");
+    let bundle = temp.path().join("backup");
+    let destination = temp.path().join("restored");
+    std::fs::create_dir(temp.path().join("originals"))?;
+    let bridge = Bridge::spawn(config(&temp.path().join("originals")))?;
+    let Response::Status(open) = call(
+        &bridge,
+        Request::Create {
+            path: NativePath::from_path(&root),
+        },
+    )?
+    else {
+        bail!("create response");
+    };
+    let catalog = open.catalog.unwrap();
+    wait_ready(&bridge)?;
+    ensure!(
+        call(
+            &bridge,
+            Request::BackupCreate {
+                catalog: "stale-session".into(),
+                bundle: NativePath::from_path(&bundle)
+            }
+        )
+        .is_err(),
+        "stale backup admitted"
+    );
+    ensure!(!bundle.exists(), "stale request created backup");
+    let Response::Backup(Some(start)) = call(
+        &bridge,
+        Request::BackupCreate {
+            catalog: catalog.clone(),
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        bail!("backup start response");
+    };
+    let saved = wait_backup(&bridge, &start.operation)?;
+    let Some(backup::Receipt::Backup(saved_receipt)) = saved.receipt else {
+        bail!("backup receipt");
+    };
+    call(&bridge, Request::Close { catalog })?;
+    let Response::Backup(Some(inspect)) = call(
+        &bridge,
+        Request::BackupInspect {
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        bail!("inspect response");
+    };
+    let inspected = wait_backup(&bridge, &inspect.operation)?;
+    let Some(backup::Receipt::Backup(inspected_receipt)) = inspected.receipt else {
+        bail!("inspection receipt");
+    };
+    assert_eq!(
+        saved_receipt.database_blake3,
+        inspected_receipt.database_blake3
+    );
+    let Response::Backup(Some(start)) = call(
+        &bridge,
+        Request::BackupRestore {
+            bundle: NativePath::from_path(&bundle),
+            destination: NativePath::from_path(&destination),
+        },
+    )?
+    else {
+        bail!("restore start response");
+    };
+    let restored = wait_backup(&bridge, &start.operation)?;
+    let Some(backup::Receipt::Restore(receipt)) = restored.receipt else {
+        bail!("restore receipt");
+    };
+    let Response::Status(open) = call(
+        &bridge,
+        Request::OpenExisting {
+            path: NativePath::from_path(&destination),
+        },
+    )?
+    else {
+        bail!("open restored response");
+    };
+    let catalog = open.catalog.unwrap();
+    wait_ready(&bridge)?;
+    let Response::Restore(Some(held)) = call(
+        &bridge,
+        Request::RestoreStatus {
+            catalog: catalog.clone(),
+        },
+    )?
+    else {
+        bail!("restore status response");
+    };
+    assert!(held.jobs_held);
+    assert_eq!(held.receipt.restore_id, receipt.restore_id);
+    for (id, acknowledge) in [
+        (receipt.restore_id.clone(), false),
+        ("stale-restore".into(), true),
+    ] {
+        ensure!(
+            call(
+                &bridge,
+                Request::ResumeRestoredJobs {
+                    catalog: catalog.clone(),
+                    restore_id: id,
+                    acknowledge_pending_jobs: acknowledge
+                }
+            )
+            .is_err(),
+            "invalid restore acknowledgment admitted"
+        );
+    }
+    assert!(status(&bridge)?.jobs_held);
+    let Response::Restore(Some(released)) = call(
+        &bridge,
+        Request::ResumeRestoredJobs {
+            catalog: catalog.clone(),
+            restore_id: receipt.restore_id,
+            acknowledge_pending_jobs: true,
+        },
+    )?
+    else {
+        bail!("resume response");
+    };
+    assert!(!released.jobs_held);
+    assert!(!status(&bridge)?.jobs_held);
+    bridge.shutdown();
+    Ok(())
+}
