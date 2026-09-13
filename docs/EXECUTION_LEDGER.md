@@ -4,6 +4,31 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
+Public PR16 head is `af7e2386c8125b9c14cf18ade6457e8b25864705`.
+CI34765013818 is terminal: macOS, Linux and evidence contracts passed.
+Windows passed434 library tests and failed2 before installed qualification.
+Private full log: `sc-22847-ci-34765013818-o2vc1r2w/windows.log`. Root's repair
+checks native sharing-refusal codes and keeps only the Windows SQLite manifest
+representable while retaining native thumbnail/large/relocation path coverage.
+Invalid Windows manifest paths now reject before root creation. Unix native
+manifest coverage remains. Independent review and targeted gates are pending.
+No newer push has interrupted that run.
+Export controller `3af78e0` passed independent review,43 frontend tests/build,
+and eight actual-hook lifecycle checks. Its full App integration is under review;
+held direct Begin/Seal responses still need independent saved-state reconciliation.
+Root's copy/relink retry, stale-callback and admission repairs compile and pass43
+frontend tests; independent actual-hook verification remains active.
+
+Serialized Lightroom inspection workbench `e6b7fac` is integrated as `9deedea`.
+All62 executed tests, strict Clippy and formatting pass on macOS. Independent
+review verified12 source and19 evidence files, including opened-review descriptor
+identity and opaque foreign-path retention. Receipt and review are private under
+`sc-22847-lightroom-workbench-hvq23yrv` and
+`sc-22847-lightroom-workbench-independent-0gg02m_c`. This prerequisite provides
+owned discovery/capture/inspection, reports, exact result chunks, explicit family
+decisions and selection sealing. Desktop bridge/UI and migration execution,
+reconciliation and repairs remain S12 work; no final user migration occurred.
+
 The Mac is unlocked and the old v1 app49373 was closed through Close catalog,
 then normal Quit. Installed v5 app20724 now opens the selected16 TEST catalog.
 Its first-open preparation indicator reached Catalog ready; a known existing2017
