@@ -77,13 +77,23 @@ pub async fn catalog_choose_folder(app: tauri::AppHandle, create_catalog: bool) 
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal, ExportDirectory, ExportProfile }
+pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal, ExportDirectory, ExportProfile, LightroomNewWorkbench, LightroomWorkbench, LightroomCaptureStaging, LightroomDiscoveryRoot, LightroomSourceCatalog, LightroomCaptureEvidence, LightroomNewCapture, LightroomNewSeal, LightroomApprovalDestination, LightroomNewApprovalDestination }
 
 #[tauri::command]
 pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPurpose) -> Result<Option<SelectedPath>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = app.dialog().file();
         let selected = match purpose {
+            LocationPurpose::LightroomNewWorkbench => dialog.set_title("Choose a new Lightroom inspection folder").set_file_name("Lightroom Inspection").blocking_save_file(),
+            LocationPurpose::LightroomWorkbench => dialog.set_title("Open an existing Lightroom inspection folder").blocking_pick_folder(),
+            LocationPurpose::LightroomCaptureStaging => dialog.set_title("Choose the folder for temporary Lightroom capture files").blocking_pick_folder(),
+            LocationPurpose::LightroomDiscoveryRoot => dialog.set_title("Choose a folder containing Lightroom catalogs").blocking_pick_folder(),
+            LocationPurpose::LightroomSourceCatalog => dialog.set_title("Choose the Lightroom catalog to inspect").add_filter("Lightroom catalogs", &["lrcat"]).blocking_pick_file(),
+            LocationPurpose::LightroomCaptureEvidence => dialog.set_title("Open a retained Lightroom capture").blocking_pick_folder(),
+            LocationPurpose::LightroomNewCapture => dialog.set_title("Choose a new Lightroom capture folder").set_file_name("Lightroom Capture").blocking_save_file(),
+            LocationPurpose::LightroomNewSeal => dialog.set_title("Choose a new Lightroom selection folder").set_file_name("Lightroom Selection").blocking_save_file(),
+            LocationPurpose::LightroomApprovalDestination => dialog.set_title("Choose an existing PhotoCatalog destination").blocking_pick_folder(),
+            LocationPurpose::LightroomNewApprovalDestination => dialog.set_title("Choose a new PhotoCatalog destination").set_file_name("PhotoCatalog Import").blocking_save_file(),
             LocationPurpose::ExportDirectory => dialog.set_title("Choose the export destination folder").blocking_pick_folder(),
             LocationPurpose::ExportProfile => dialog.set_title("Choose an RGB output profile").add_filter("ICC profiles", &["icc", "icm"]).blocking_pick_file(),
             LocationPurpose::RelinkFolder => dialog.set_title("Locate the moved originals folder").blocking_pick_folder(),
