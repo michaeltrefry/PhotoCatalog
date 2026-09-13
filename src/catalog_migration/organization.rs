@@ -83,6 +83,11 @@ pub struct UnresolvedLink {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Decision {
+    /// Selected raw keyword row with typed Null name and parent. This is a
+    /// structural boundary, never a user keyword or a membership endpoint.
+    KeywordBoundary {
+        retained_table: i64,
+    },
     Collection {
         name: String,
         /// None is an explicit reviewed root placement, not a missing-link guess.
@@ -135,7 +140,9 @@ pub enum Decision {
 impl Decision {
     fn slot(&self) -> &str {
         match self {
-            Self::Collection { .. } | Self::Keyword { .. } => DICTIONARY,
+            Self::Collection { .. } | Self::Keyword { .. } | Self::KeywordBoundary { .. } => {
+                DICTIONARY
+            }
             Self::Synonym { .. } | Self::ReuseSynonym { .. } => "synonym",
             Self::CollectionMembership { .. } => "collection_membership",
             Self::KeywordMembership { .. } => "keyword_membership",
@@ -173,6 +180,8 @@ pub struct Projection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum NativeTarget {
+    /// No native keyword ID exists for this source-only hierarchy boundary.
+    KeywordBoundary,
     Collection {
         id: String,
         revision: i64,
@@ -263,6 +272,7 @@ fn strip_receipt_numbers(value: &mut serde_json::Value) {
         serde_json::Value::Object(map) => {
             for name in [
                 "retained_record",
+                "retained_table",
                 "reference_record",
                 "target_entity_record",
             ] {
@@ -551,6 +561,32 @@ fn collection(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<
         _ => anyhow::bail!("endpoint is not a projected collection"),
     }
 }
+pub(crate) fn keyword_boundary_fields(fields: &BTreeMap<String, Cell>) -> bool {
+    matches!(fields.get("name"), Some(Cell::Null))
+        && matches!(fields.get("parent"), Some(Cell::Null))
+}
+
+/// A boundary contributes no name, while its original parent Link remains in
+/// the child request and is verified by the normal selected-source proof path.
+pub(crate) fn keyword_parent_path(
+    db: &Connection,
+    owner: &str,
+    reference: &SourceRecord,
+) -> Result<(KeywordKind, Vec<String>)> {
+    ensure!(
+        reference.source.table == "AgLibraryKeyword",
+        "keyword parent table differs"
+    );
+    match mapped(db, owner, reference)? {
+        NativeTarget::KeywordBoundary => Ok((KeywordKind::Hierarchical, vec![])),
+        NativeTarget::Keyword { .. } => {
+            let (_, kind, path) = keyword(db, owner, reference)?;
+            Ok((kind, path))
+        }
+        _ => anyhow::bail!("parent is not a native keyword or proven boundary"),
+    }
+}
+
 fn keyword(
     db: &Connection,
     owner: &str,
@@ -595,6 +631,7 @@ fn validate(request: &Projection) -> Result<()> {
         _ => (),
     }
     let required = match &request.decision {
+        Decision::KeywordBoundary { .. } => Some("AgLibraryKeyword"),
         Decision::Collection { name, position, .. } => {
             text(name, 1024)?;
             ensure!(*position >= 0, "negative collection position");
@@ -682,6 +719,23 @@ impl Catalog {
         let mut evidence = Evidence::default();
         let source_id = evidence.source(&self.db, &request.origin)?;
         let prior = existing(&self.db, request, &digest)?;
+        if let Decision::KeywordBoundary { retained_table } = &request.decision {
+            let fields =
+                super::images::columns(&self.db, &mut evidence, &request.origin, *retained_table)?;
+            ensure!(
+                keyword_boundary_fields(&fields),
+                "keyword boundary requires typed Null name and parent",
+            );
+            if prior.is_none() {
+                ensure!(
+                    source
+                        .context("new keyword boundary requires sealed source")?
+                        .binding_blake3()
+                        == evidence.records[&request.origin.retained_record].input,
+                    "keyword boundary source seal differs",
+                );
+            }
+        }
         for link in request.decision.links() {
             if prior.is_none() {
                 verify_unique_link(
@@ -874,6 +928,7 @@ impl Catalog {
 fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTarget> {
     let provenance = serde_json::json!({"source":request.origin.source,"adapter":request.adapter_version,"proof_blake3":blake3::hash(proof.as_bytes()).to_hex().to_string()});
     match &request.decision {
+        Decision::KeywordBoundary { .. } => Ok(NativeTarget::KeywordBoundary),
         Decision::Collection {
             name,
             parent,
@@ -927,7 +982,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                     *keyword_kind == KeywordKind::Hierarchical,
                     "flat keyword cannot have a parent"
                 );
-                let (_, kind, path) = keyword(db, &request.import_source, &parent.target)?;
+                let (kind, path) = keyword_parent_path(db, &request.import_source, &parent.target)?;
                 ensure!(kind == *keyword_kind, "keyword parent kind differs");
                 path
             } else {

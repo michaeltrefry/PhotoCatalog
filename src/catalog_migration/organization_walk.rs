@@ -428,7 +428,10 @@ fn dictionary(
     origin: &SourceRecord,
 ) -> Result<RowResult> {
     if let Some(old) = dictionary_existing(catalog, policy, origin)? {
-        return if matches!(old.target, NativeTarget::Retained { .. }) {
+        return if matches!(
+            old.target,
+            NativeTarget::Retained { .. } | NativeTarget::KeywordBoundary
+        ) {
             Ok(RowResult::Applied(Outcome::Organization(vec![old])))
         } else {
             Ok(RowResult::Applied(Outcome::Organization(vec![
@@ -502,6 +505,13 @@ fn dictionary(
                 Compatibility::Unsupported,
                 "Unknown collection creationId; exact row and hierarchy retained without inventing native behavior",
             );
+        }
+        if origin.source.table == "AgLibraryKeyword"
+            && organization::keyword_boundary_fields(&fields)
+        {
+            let retained_table = walk.schema("AgLibraryKeyword")?;
+            chain.push((current, Decision::KeywordBoundary { retained_table }));
+            break;
         }
         let Some(name) = fields.get("name").and_then(name) else {
             return preserve(
@@ -578,32 +588,16 @@ fn dictionary(
         } = &mut decision
         {
             let mut path = if let Some(parent) = parent {
-                let prior = dictionary_existing(catalog, policy, &parent.target)?;
-                let Some(ProjectionResult {
-                    target: NativeTarget::Keyword { id },
-                    ..
-                }) = prior
-                else {
-                    return preserve(
-                        catalog,
-                        source,
-                        policy,
-                        origin,
-                        "dictionary",
-                        Compatibility::Unsupported,
-                        "Ancestor has no native keyword mapping; exact hierarchy retained",
-                    );
-                };
-                let (kind, raw): (String, String) = catalog.db.query_row(
-                    "SELECT kind,path FROM organization_keywords WHERE id=?",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                let (kind, path) = organization::keyword_parent_path(
+                    &catalog.db,
+                    &policy.import_source,
+                    &parent.target,
                 )?;
                 ensure!(
-                    kind == "hierarchical" && raw.len() <= 131072,
-                    "native keyword parent path differs"
+                    kind == KeywordKind::Hierarchical,
+                    "native keyword parent kind differs"
                 );
-                serde_json::from_str::<Vec<String>>(&raw)?
+                path
             } else {
                 vec![]
             };
@@ -638,8 +632,11 @@ fn dictionary(
                 }
             }
         }
+        let boundary = matches!(decision, Decision::KeywordBoundary { .. });
         results.push(project_one(catalog, source, policy, &node, decision)?);
-        results.push(behavior(catalog, source, policy, &node)?);
+        if !boundary {
+            results.push(behavior(catalog, source, policy, &node)?);
+        }
     }
     Ok(RowResult::Applied(Outcome::Organization(results)))
 }
@@ -649,7 +646,7 @@ mod tests {
     use super::*;
     use crate::{
         catalog_images::{ImageRole, ImportImageRequest},
-        catalog_migration::lookup::Lookup,
+        catalog_migration::{lookup::Lookup, organization::Link},
         lightroom::migration_source::{SelectedCapture, tests::Fixture},
     };
     use anyhow::Context;
@@ -683,6 +680,9 @@ mod tests {
     }
     impl Bed {
         fn new(large: bool) -> Result<Self> {
+            Self::build(large, false)
+        }
+        fn build(large: bool, boundary: bool) -> Result<Self> {
             let mut fixture = Fixture::new();
             let second = fixture.seal.excluded_revisions.pop().unwrap();
             let db = rusqlite::Connection::open(&fixture.path)?;
@@ -710,9 +710,22 @@ mod tests {
                 db.execute("INSERT INTO family_choices VALUES('second family',?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','fixture')",[&second]).unwrap();
                 for (rindex,revision) in revisions.iter().enumerate() {
                     let mut rows:Vec<(i64,&str,Vec<Cell>)>=vec![
-                        (1,"AgLibraryKeyword",vec![i(1),t("Root"),Cell::Null,Cell::Null]),
+                        (1,"AgLibraryKeyword",vec![i(1),if boundary {Cell::Null} else {t("Root")},Cell::Null,Cell::Null]),
                         (2,"AgLibraryKeyword",vec![i(2),t("Child"),i(1),t("person")]),
                     ];
+                    if boundary {
+                        rows.extend([
+                            (14,"AgLibraryKeyword",vec![i(14),t("Grandchild"),i(2),Cell::Null]),
+                            (15,"AgLibraryKeyword",vec![i(15),t(""),Cell::Null,Cell::Null]),
+                            (16,"AgLibraryKeyword",vec![i(16),Cell::Null,i(2),Cell::Null]),
+                        ]);
+                        if rindex==0 {
+                            rows.extend([
+                                (73,"AgLibraryKeywordImage",vec![i(73),i(40),i(1)]),
+                                (23,"AgLibraryKeywordSynonym",vec![i(23),t("root alias"),i(1)]),
+                            ]);
+                        }
+                    }
                     if rindex==0 {
                         rows.extend([
                             (3,"AgLibraryKeyword",vec![i(3),t("Other"),Cell::Null,Cell::Null]),
@@ -1094,6 +1107,184 @@ mod tests {
                     .get::<_, i64>(0))?,
             0
         );
+        Ok(())
+    }
+    #[test]
+    fn keyword_boundary_preserves_named_hierarchy_and_source_link() -> Result<()> {
+        // The sentinel is deliberately id 1, not the observed catalog's id 20.
+        let mut b = Bed::build(false, true)?;
+        b.project(0, 14, Stage::Keywords)?;
+        assert_eq!(b.target(0, 1, "dictionary")?, NativeTarget::KeywordBoundary);
+        for (local, expected) in [(2, vec!["Child"]), (14, vec!["Child", "Grandchild"])] {
+            let NativeTarget::Keyword { id } = b.target(0, local, "dictionary")? else {
+                anyhow::bail!("named keyword missing");
+            };
+            let raw: String = b.catalog.db.query_row(
+                "SELECT path FROM organization_keywords WHERE id=?",
+                [id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(serde_json::from_str::<Vec<String>>(&raw)?, expected);
+        }
+        let child = b.row(0, 2)?;
+        let proof: String = b.catalog.db.query_row(
+            "SELECT proof FROM migration_organization WHERE source_identity=? AND slot='dictionary'",
+            [child.source.identity()?], |r| r.get(0),
+        )?;
+        let proof: serde_json::Value = serde_json::from_str(&proof)?;
+        let parent: Link = serde_json::from_value(proof["request"]["decision"]["parent"].clone())?;
+        assert_eq!(parent.target.source, b.row(0, 1)?.source);
+        assert_eq!(parent.field, "parent");
+        let count: i64 =
+            b.catalog
+                .db
+                .query_row("SELECT count(*) FROM organization_keywords", [], |r| {
+                    r.get(0)
+                })?;
+        assert_eq!(count, 2);
+        // Exact hierarchy reuse remains governed by the existing policy.
+        b.policy.keyword_overlap = KeywordOverlap::RequireDecision;
+        assert!(matches!(
+            b.project(1, 14, Stage::Keywords)?,
+            RowResult::NeedsDecision(_)
+        ));
+        b.policy.keyword_overlap = KeywordOverlap::ReuseExactHierarchy {
+            reason: "same full named hierarchy".into(),
+        };
+        b.project(1, 14, Stage::Keywords)?;
+        assert_eq!(
+            b.target(0, 14, "dictionary")?,
+            b.target(1, 14, "dictionary")?
+        );
+        // Offline root replay proves the same raw row/schema without a source lease.
+        let root = b.row(0, 1)?;
+        let table =
+            Walk::new(&b.catalog, &b.source, &b.revisions[0])?.schema("AgLibraryKeyword")?;
+        let replay = b.catalog.project_migration_organization(
+            None,
+            &Projection {
+                origin: root,
+                import_source: b.policy.import_source.clone(),
+                adapter_version: ADAPTER.into(),
+                decision: Decision::KeywordBoundary {
+                    retained_table: table,
+                },
+            },
+        )?;
+        assert_eq!(replay.target, NativeTarget::KeywordBoundary);
+        Ok(())
+    }
+
+    #[test]
+    fn keyword_boundary_is_not_a_membership_or_synonym_endpoint() -> Result<()> {
+        let mut b = Bed::build(false, true)?;
+        b.images()?;
+        b.project(0, 1, Stage::Keywords)?;
+        for (id, stage) in [
+            (73, Stage::KeywordMemberships),
+            (23, Stage::KeywordSynonyms),
+        ] {
+            assert!(matches!(
+                b.project(0, id, stage)?,
+                RowResult::Applied(Outcome::Retained { .. })
+            ));
+        }
+        // Even a direct caller cannot turn the boundary into a metadata keyword.
+        let origin = b.row(0, 73)?;
+        let walk = Walk::new(&b.catalog, &b.source, &b.revisions[0])?;
+        let LinkResolution::Unique(image) = walk.link(&origin, "image", "Adobe_images")? else {
+            anyhow::bail!("fixture image");
+        };
+        let LinkResolution::Unique(keyword) = walk.link(&origin, "tag", "AgLibraryKeyword")? else {
+            anyhow::bail!("fixture keyword");
+        };
+        assert!(
+            project_one(
+                &mut b.catalog,
+                &b.source,
+                &b.policy,
+                &origin,
+                Decision::KeywordMembership {
+                    image: *image,
+                    keyword: *keyword
+                }
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keyword_boundary_rejects_invalid_and_cross_capture_proofs() -> Result<()> {
+        let mut b = Bed::build(false, true)?;
+        for id in [5, 8, 10, 11, 15, 16] {
+            b.project(0, id, Stage::Keywords)?;
+            assert!(matches!(
+                b.target(0, id, "dictionary")?,
+                NativeTarget::Retained { .. }
+            ));
+        }
+        let table =
+            Walk::new(&b.catalog, &b.source, &b.revisions[0])?.schema("AgLibraryKeyword")?;
+        let foreign_table =
+            Walk::new(&b.catalog, &b.source, &b.revisions[1])?.schema("AgLibraryKeyword")?;
+        let root = b.row(0, 1)?;
+        assert!(
+            project_one(
+                &mut b.catalog,
+                &b.source,
+                &b.policy,
+                &root,
+                Decision::KeywordBoundary {
+                    retained_table: foreign_table
+                }
+            )
+            .is_err()
+        );
+        let named = b.row(0, 3)?;
+        assert!(
+            project_one(
+                &mut b.catalog,
+                &b.source,
+                &b.policy,
+                &named,
+                Decision::KeywordBoundary {
+                    retained_table: table
+                }
+            )
+            .is_err()
+        );
+        let child = b.row(0, 2)?;
+        let walk = Walk::new(&b.catalog, &b.source, &b.revisions[0])?;
+        let LinkResolution::Unique(mut link) = walk.link(&child, "parent", "AgLibraryKeyword")?
+        else {
+            anyhow::bail!("fixture parent");
+        };
+        link.target = b.row(1, 1)?;
+        assert!(
+            project_one(
+                &mut b.catalog,
+                &b.source,
+                &b.policy,
+                &child,
+                Decision::Keyword {
+                    name: "Child".into(),
+                    keyword_kind: KeywordKind::Hierarchical,
+                    parent: Some(*link),
+                    decision: DictionaryDecision::Create
+                }
+            )
+            .is_err()
+        );
+        // Missing columns, empty strings and non-root nulls are never boundaries.
+        for fields in [
+            BTreeMap::new(),
+            BTreeMap::from([("name".into(), Cell::Null)]),
+            BTreeMap::from([("name".into(), t("")), ("parent".into(), Cell::Null)]),
+            BTreeMap::from([("name".into(), Cell::Null), ("parent".into(), i(1))]),
+        ] {
+            assert!(!organization::keyword_boundary_fields(&fields));
+        }
         Ok(())
     }
 }
