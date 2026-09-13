@@ -68,7 +68,7 @@ fn image_export_freezes_its_metadata_without_sibling_invalidation() -> Result<()
     catalog.append_photo_export(&job.id, 0, &selected, &output(), 1024, 1024)?;
     catalog.seal_photo_export_job(&job.id, 1)?;
     let work = catalog.claim_photo_export(&job.id)?.unwrap();
-    assert_eq!(work.plan.version, 2);
+    assert_eq!(work.plan.version, 3);
     assert_eq!(
         work.plan.identity.image_identity.as_ref().unwrap().key,
         copy
@@ -104,12 +104,19 @@ fn legacy_photo_plan_keeps_original_authority_and_publication_guards() -> Result
     let (temp, mut catalog, _) = fixture()?;
     let (job, mut work) = queued(&mut catalog, temp.path().join("legacy.png"))?;
     // Reproduce the exact pre-schema7 plan structure and legacy generation.
-    work.plan.version = 1;
-    work.plan.identity.image_identity = None;
-    work.plan.identity.source = catalog.render_identity("a")?;
-    let original_bytes = serde_json::to_string(&work.plan)?;
+    let mut legacy = (*work.plan).clone();
+    legacy.version = 1;
+    legacy.destination.version = 1;
+    legacy.identity.image_identity = None;
+    legacy.identity.source = catalog.render_identity("a")?;
+    // Preserve noncanonical whitespace and escaping, not only generated JSON.
+    let original_bytes = format!(
+        " \n{}\n ",
+        serde_json::to_string_pretty(&legacy)?.replace("legacy.png", "legacy\\u002epng")
+    );
     assert!(!original_bytes.contains("image_identity"));
     work.authority = blake3::hash(original_bytes.as_bytes()).to_hex().to_string();
+    work.plan = checked_plan(&original_bytes, &work.authority)?;
     catalog.db.execute(
         "UPDATE photo_export_items SET plan=?1,authority=?2 WHERE job=?3 AND sequence=1",
         params![original_bytes, work.authority, job.id],
@@ -191,10 +198,12 @@ fn edit_undo_aba_changed_original_and_forged_work_cannot_accept() -> Result<()> 
             }
             "source" => std::fs::write(original, b"external changed bytes")?,
             _ => {
-                w.plan.metadata = MetadataSelection::Resolved {
+                let mut forged = (*w.plan).clone();
+                forged.metadata = MetadataSelection::Resolved {
                     expected_revision: 0,
                     base_model: None,
-                }
+                };
+                w.plan = PhotoPlanDocument::parse(&serde_json::to_string(&forged)?)?;
             }
         }
         assert!(c.accept_photo_export_seal(&w, &sealed).is_err());
@@ -324,9 +333,13 @@ fn legacy_renderer_work(c: &mut Catalog, temp: &Path) -> Result<(ExportJob, Expo
     c.append_photo_export(&job.id, 0, &target, &output(), 1024, 1024)?;
     c.seal_photo_export_job(&job.id, 1)?;
     let mut work = c.claim_photo_export(&job.id)?.unwrap();
-    work.plan.renderer_identity = "photocatalog-photo-export-1:synthetic-retired-renderer".into();
-    let encoded = serde_json::to_string(&work.plan)?;
+    let mut legacy = (*work.plan).clone();
+    legacy.version = 2;
+    legacy.destination.version = 1;
+    legacy.renderer_identity = "photocatalog-photo-export-1:synthetic-retired-renderer".into();
+    let encoded = serde_json::to_string_pretty(&legacy)?;
     work.authority = blake3::hash(encoded.as_bytes()).to_hex().to_string();
+    work.plan = checked_plan(&encoded, &work.authority)?;
     c.db.execute(
         "UPDATE photo_export_items SET plan=?1,authority=?2 WHERE job=?3 AND sequence=?4",
         params![encoded, work.authority, work.job, work.sequence],
@@ -595,7 +608,7 @@ fn every_bulk_hash_checkpoint_allows_an_unrelated_catalog_writer() -> Result<()>
     assert_eq!(metrics.authority_intervals_ms.len(), 4);
     assert!(metrics.total_ms >= metrics.original_hash_ms);
     assert_eq!(
-        std::fs::read(w.plan.destination.destination)?,
+        std::fs::read(&w.plan.destination.destination)?,
         b"completed encoded derivative"
     );
     assert_eq!(
@@ -835,5 +848,98 @@ fn interrupted_restore_and_repeated_restore_converge_without_clobber_or_double_c
         b"old destination bytes"
     );
     assert_eq!(std::fs::read(original)?, b"source bytes unchanged");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn native_photo_plan_non_utf_destination_reopens_and_publishes_without_authority_rewrite()
+-> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let (temp, mut c, original) = fixture()?;
+    let parent = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b'd', 255]));
+    if let Err(error) = std::fs::create_dir(&parent) {
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(92) {
+            assert!(!parent.exists());
+            eprintln!(
+                "non-UTF filesystem probe rejected before export: EILSEQ92; byte-wire custody remains tested"
+            );
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let dest = parent.join(std::ffi::OsString::from_vec(b"image\xff.png".to_vec()));
+    let (job, work) = queued(&mut c, dest.clone())?;
+    assert_eq!(work.plan.version, 3);
+    assert_eq!(work.plan.destination.version, 2);
+    let raw = work.plan.raw().to_owned();
+    let digest = work.authority.clone();
+    let json: serde_json::Value = serde_json::from_str(&raw)?;
+    assert!(json["destination"]["destination"].is_object());
+    let sealed = seal(temp.path(), &work)?;
+    assert_eq!(sealed.version, 2);
+    c.accept_photo_export_seal(&work, &sealed)?;
+    drop(c);
+    let mut c = Catalog::open(temp.path().join("catalog"))?;
+    let receipt = c.publish_photo_export_item(&job.id, 1)?;
+    assert_eq!(receipt.state, metadata_export::ExportState::Published);
+    assert_eq!(receipt.destination, dest);
+    let encoded = serde_json::to_string(&receipt)?;
+    let decoded: ExportReceipt = serde_json::from_str(&encoded)?;
+    assert_eq!(decoded.destination, dest);
+    let (retained, authority) = c.photo_export_plan(&job.id, 1)?;
+    assert_eq!(retained.raw(), raw);
+    assert_eq!(authority, digest);
+    assert_eq!(std::fs::read(original)?, b"source bytes unchanged");
+    assert_eq!(std::fs::read(dest)?, b"completed encoded derivative");
+    assert_eq!(
+        c.photo_export_items(&job.id, 0, 1)?[0]
+            .receipt
+            .as_ref()
+            .unwrap()
+            .destination,
+        receipt.destination
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_plan_version_snapshot_and_raw_authority_reject_before_claim_mutation() -> Result<()> {
+    let (temp, mut c, _) = fixture()?;
+    let (job, work) = queued(&mut c, temp.path().join("future.png"))?;
+    let valid: serde_json::Value = serde_json::from_str(work.plan.raw())?;
+    for mode in ["future", "mixed", "digest", "trailing"] {
+        let mut value = valid.clone();
+        if mode == "future" {
+            value["version"] = 4.into();
+        }
+        if mode == "mixed" {
+            value["version"] = 2.into();
+        }
+        let raw = serde_json::to_string(&value)?;
+        let authority = blake3::hash(raw.as_bytes()).to_hex().to_string();
+        let raw = if mode == "trailing" {
+            format!("{raw} false")
+        } else {
+            raw
+        };
+        let authority = if mode == "digest" {
+            "0".repeat(64)
+        } else {
+            authority
+        };
+        c.db.execute("UPDATE photo_export_items SET state='pending',attempt=NULL,plan=?1,authority=?2 WHERE job=?3",params![raw,authority,job.id])?;
+        assert!(c.claim_photo_export(&job.id).is_err());
+        let state: String = c.db.query_row(
+            "SELECT state FROM photo_export_items WHERE job=?1",
+            [&job.id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(state, "pending");
+        assert!(!work.plan.destination.destination.exists());
+    }
     Ok(())
 }

@@ -15,6 +15,7 @@ use std::{
 
 #[path = "metadata_export/photo_phases.rs"]
 mod photo_phases;
+pub mod wire;
 pub(crate) use photo_phases::content_change_stamp;
 /// Stable object identity from the same held handle used for a change stamp.
 pub(crate) fn held_file_identity(file: &File) -> Result<(u64, u64)> {
@@ -35,6 +36,7 @@ pub struct FileRevision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "wire::Plan", into = "wire::Plan")]
 pub struct ExportPlan {
     pub version: u32,
     pub operation: String,
@@ -44,9 +46,19 @@ pub struct ExportPlan {
     pub payload_bytes: u64,
 }
 
+impl ExportPlan {
+    pub fn is_photo(&self) -> bool {
+        matches!(self.version, 2 | 4)
+    }
+    pub fn is_xmp(&self) -> bool {
+        matches!(self.version, 1 | 3)
+    }
+}
+
 /// Read-only destination expectation captured before rendering. The parent owns
 /// overwrite authorization and must exclude originals, aliases and batch clashes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "wire::Snapshot", into = "wire::Snapshot")]
 pub struct DestinationSnapshot {
     pub version: u32,
     pub operation: String,
@@ -59,6 +71,7 @@ pub struct DestinationSnapshot {
 /// Possession is not authorization: the parent must persist its sealed job state
 /// before publication/recovery, and must never publish canceled jobs by discovery.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "wire::Seal", into = "wire::Seal")]
 pub struct SealedPhotoExport {
     pub version: u32,
     pub snapshot: DestinationSnapshot,
@@ -70,7 +83,7 @@ pub struct SealedPhotoExport {
 impl SealedPhotoExport {
     fn plan(&self) -> ExportPlan {
         ExportPlan {
-            version: 2,
+            version: if self.snapshot.version == 1 { 2 } else { 4 },
             operation: self.snapshot.operation.clone(),
             destination: self.snapshot.destination.clone(),
             expected: self.snapshot.expected.clone(),
@@ -89,13 +102,15 @@ pub fn snapshot_photo_destination(
 ) -> Result<DestinationSnapshot> {
     let destination = normalize_photo_destination(path)?;
     let expected = revision_if_exists_limited(&destination, max_existing_bytes)?;
-    Ok(DestinationSnapshot {
-        version: 1,
+    let snapshot = DestinationSnapshot {
+        version: 2,
         operation: uuid::Uuid::new_v4().to_string(),
         destination,
         expected,
         max_existing_bytes,
-    })
+    };
+    validate_snapshot(&snapshot)?;
+    Ok(snapshot)
 }
 
 /// Inspect only an ordinary file, with a fixed memory buffer and byte admission.
@@ -167,7 +182,7 @@ pub fn seal_photo_export(
         "photo staging copy differs"
     );
     let sealed = SealedPhotoExport {
-        version: 1,
+        version: snapshot.version,
         snapshot: snapshot.clone(),
         authority_digest: authority_digest.into(),
         max_payload_bytes,
@@ -299,6 +314,7 @@ pub enum ExportState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "wire::Receipt", into = "wire::Receipt")]
 pub struct ExportReceipt {
     pub state: ExportState,
     pub destination: PathBuf,
@@ -324,14 +340,16 @@ pub enum ExportBoundary {
 pub fn plan_export(destination: &Path, payload: &[u8]) -> Result<ExportPlan> {
     let destination = normalize_destination(destination)?;
     let expected = revision_if_exists(&destination)?;
-    Ok(ExportPlan {
-        version: 1,
+    let plan = ExportPlan {
+        version: 3,
         operation: uuid::Uuid::new_v4().to_string(),
         destination,
         expected,
         payload_digest: blake3::hash(payload).to_hex().to_string(),
         payload_bytes: payload.len() as u64,
-    })
+    };
+    admit_paths(&plan)?;
+    Ok(plan)
 }
 
 pub fn apply_export(plan: &ExportPlan, payload: &[u8]) -> Result<ExportReceipt> {
@@ -344,10 +362,7 @@ pub fn apply_export_with_hook(
     payload: &[u8],
     mut hook: impl FnMut(ExportBoundary) -> io::Result<()>,
 ) -> Result<ExportReceipt> {
-    ensure!(
-        plan.version == 1,
-        "XMP entrypoint requires a version-1 plan"
-    );
+    ensure!(plan.is_xmp(), "XMP entrypoint requires an XMP plan");
     validate_plan(plan)?;
     ensure!(
         payload.len() as u64 == plan.payload_bytes
@@ -398,10 +413,7 @@ pub fn recover_export(directory: &Path) -> Result<ExportReceipt> {
 /// Restore only; never publish staged metadata. Used when catalog revisions have
 /// changed since an interrupted export. Concurrent destinations remain untouched.
 pub fn restore_planned_export(plan: &ExportPlan) -> Result<ExportReceipt> {
-    ensure!(
-        plan.version == 1,
-        "XMP entrypoint requires a version-1 plan"
-    );
+    ensure!(plan.is_xmp(), "XMP entrypoint requires an XMP plan");
     validate_plan(plan)?;
     run_recovery(
         &recovery_path(plan),
@@ -445,7 +457,7 @@ fn run_recovery(
     {
         let plan: ExportPlan = read_journal(&directory.join("plan.json"))?;
         ensure!(
-            plan.version == if photo.is_some() { 2 } else { 1 },
+            plan.is_photo() == photo.is_some(),
             "photo recovery requires an authoritative seal"
         );
         validate_plan(&plan)?;
@@ -658,7 +670,7 @@ fn receipt(
 }
 
 fn recovery_path(plan: &ExportPlan) -> PathBuf {
-    let prefix = if plan.version == 2 {
+    let prefix = if plan.is_photo() {
         PHOTO_PREFIX
     } else {
         PREFIX
@@ -702,17 +714,44 @@ fn normalize_parent(path: &Path) -> Result<PathBuf> {
     Ok(parent.canonicalize()?.join(filename))
 }
 
+/// Admit the largest path-bearing receipt before any capture/publication.
+/// The detail allowance leaves room for existing bounded diagnostic messages.
+fn admit_paths(plan: &ExportPlan) -> Result<()> {
+    ensure!(
+        plan.destination.is_absolute(),
+        "export destination must be absolute"
+    );
+    let directory = recovery_path(plan);
+    let receipt = ExportReceipt {
+        state: ExportState::Recoverable,
+        destination: plan.destination.clone(),
+        recovery_directory: directory.clone(),
+        captured_original: Some(directory.join("captured-original")),
+        detail: "x".repeat(8192),
+    };
+    ensure!(
+        serde_json::to_vec(&receipt)?.len() <= 64 * 1024,
+        "export native paths exceed receipt budget"
+    );
+    ensure!(
+        serde_json::to_vec(plan)?.len() <= 64 * 1024,
+        "export plan exceeds journal budget"
+    );
+    Ok(())
+}
+
 fn validate_plan(plan: &ExportPlan) -> Result<()> {
     ensure!(
-        matches!(plan.version, 1 | 2),
+        matches!(plan.version, 1..=4),
         "unsupported export plan version"
     );
+    admit_paths(plan)?;
     ensure!(
         uuid::Uuid::parse_str(&plan.operation)?.to_string() == plan.operation,
         "invalid operation identity"
     );
     ensure!(
-        (if plan.version == 2 {
+        (if plan.is_photo() {
             normalize_photo_destination(&plan.destination)?
         } else {
             normalize_destination(&plan.destination)?
@@ -732,7 +771,18 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn validate_snapshot(snapshot: &DestinationSnapshot) -> Result<()> {
-    ensure!(snapshot.version == 1, "unsupported photo snapshot version");
+    ensure!(
+        matches!(snapshot.version, 1 | 2),
+        "unsupported photo snapshot version"
+    );
+    admit_paths(&ExportPlan {
+        version: if snapshot.version == 1 { 2 } else { 4 },
+        operation: snapshot.operation.clone(),
+        destination: snapshot.destination.clone(),
+        expected: snapshot.expected.clone(),
+        payload_digest: "0".repeat(64),
+        payload_bytes: 0,
+    })?;
     ensure!(
         uuid::Uuid::parse_str(&snapshot.operation)?.to_string() == snapshot.operation,
         "invalid photo operation identity"
@@ -753,7 +803,9 @@ fn validate_snapshot(snapshot: &DestinationSnapshot) -> Result<()> {
 fn validate_photo_seal(sealed: &SealedPhotoExport) -> Result<()> {
     validate_snapshot(&sealed.snapshot)?;
     ensure!(
-        sealed.version == 1 && valid_digest(&sealed.authority_digest),
+        sealed.version == sealed.snapshot.version
+            && matches!(sealed.version, 1 | 2)
+            && valid_digest(&sealed.authority_digest),
         "invalid photo seal authority/version"
     );
     ensure!(
@@ -827,7 +879,7 @@ fn revision_if_exists_limited(path: &Path, max_bytes: u64) -> Result<Option<File
 }
 
 fn revision_for_plan(path: &Path, plan: &ExportPlan) -> Result<FileRevision> {
-    if plan.version == 2 {
+    if plan.is_photo() {
         inspect_file_revision(
             path,
             plan.payload_bytes
@@ -839,7 +891,7 @@ fn revision_for_plan(path: &Path, plan: &ExportPlan) -> Result<FileRevision> {
 }
 
 fn revision_if_exists_for_plan(path: &Path, plan: &ExportPlan) -> Result<Option<FileRevision>> {
-    if plan.version == 2 {
+    if plan.is_photo() {
         revision_if_exists_limited(
             path,
             plan.payload_bytes

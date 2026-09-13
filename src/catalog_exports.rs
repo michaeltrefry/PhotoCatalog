@@ -54,6 +54,7 @@ pub enum MetadataSelection {
 pub struct ExportTarget {
     pub key: VariantKey,
     pub expected_revision: i64,
+    #[serde(with = "crate::metadata_export::wire::native_path")]
     pub destination: PathBuf,
     pub overwrite: bool,
     pub metadata: MetadataSelection,
@@ -90,6 +91,50 @@ pub struct PhotoExportPlan {
     pub max_payload_bytes: u64,
     pub alias_limits: crate::catalog_export_alias::AliasLimits,
 }
+/// Exact persisted authority plus a view derived exclusively from those bytes.
+/// No mutable access: callers cannot replace fields while keeping an old digest.
+#[derive(Debug, Clone)]
+pub struct PhotoPlanDocument {
+    raw: String,
+    view: PhotoExportPlan,
+}
+impl PhotoPlanDocument {
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+    fn parse(raw: &str) -> Result<Self> {
+        ensure!(raw.len() <= PLAN_LIMIT, "export plan size limit");
+        Ok(Self {
+            raw: raw.to_owned(),
+            view: serde_json::from_str(raw)?,
+        })
+    }
+}
+impl std::ops::Deref for PhotoPlanDocument {
+    type Target = PhotoExportPlan;
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+impl Serialize for PhotoPlanDocument {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serde_json::value::RawValue::from_string(self.raw.clone())
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for PhotoPlanDocument {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        Self::parse(raw.get()).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportJob {
     pub sequence: i64,
@@ -101,6 +146,7 @@ pub struct ExportJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportItem {
     pub sequence: i64,
+    #[serde(with = "crate::metadata_export::wire::native_path")]
     pub destination: PathBuf,
     pub state: String,
     pub attempt: Option<String>,
@@ -114,7 +160,7 @@ pub struct ExportWork {
     pub sequence: i64,
     pub attempt: String,
     pub authority: String,
-    pub plan: PhotoExportPlan,
+    pub plan: PhotoPlanDocument,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,15 +242,18 @@ fn job(db: &Connection, id: &str) -> Result<ExportJob> {
         },
     )?)
 }
-fn checked_plan(bytes: &str, authority: &str) -> Result<PhotoExportPlan> {
+pub(crate) fn checked_plan(bytes: &str, authority: &str) -> Result<PhotoPlanDocument> {
     ensure!(
         bytes.len() <= PLAN_LIMIT && blake3::hash(bytes.as_bytes()).to_hex().as_str() == authority,
         "export plan identity mismatch"
     );
-    let plan: PhotoExportPlan = serde_json::from_str(bytes)?;
+    let plan = PhotoPlanDocument::parse(bytes)?;
     ensure!(
-        ((plan.version == 1 && plan.identity.image_identity.is_none())
-            || (plan.version == 2
+        ((plan.version == 1
+            && plan.destination.version == 1
+            && plan.identity.image_identity.is_none())
+            || (matches!(plan.version, 2 | 3)
+                && plan.destination.version == (if plan.version == 2 { 1 } else { 2 })
                 && plan
                     .identity
                     .image_identity
@@ -650,7 +699,7 @@ impl Catalog {
             protect_destination(tx,&destination.destination,&path,alias_limits)?;
             let profile=match &output.profile {OutputProfile::Srgb=>StoredProfile::Srgb,OutputProfile::LinearSrgb=>StoredProfile::LinearSrgb,OutputProfile::Icc{bytes}=>StoredProfile::Icc{blob:store_blob(tx,bytes)?}};
             let xmp_blob=packet.as_deref().map(|b|store_blob(tx,b)).transpose()?;
-            let plan=PhotoExportPlan{version:2,renderer_identity:crate::photo_render::output_renderer_identity().to_owned(),identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes,alias_limits};
+            let plan=PhotoExportPlan{version:3,renderer_identity:crate::photo_render::output_renderer_identity().to_owned(),identity,original,original_revision,recipe,output:StoredOutput{size:output.size,format:output.format,profile,alpha:output.alpha},metadata:target.metadata.clone(),xmp_blob,destination,max_original_bytes,max_payload_bytes,alias_limits};
             metadata_current(tx,&plan)?;
             let encoded=serde_json::to_string(&plan)?;ensure!(encoded.len()<=PLAN_LIMIT,"export plan limit");
             let authority=blake3::hash(encoded.as_bytes()).to_hex().to_string();let sequence=j.total.checked_add(1).context("export job exhausted")?;
@@ -695,7 +744,11 @@ impl Catalog {
         job(&self.db, id)?;
         self.db.prepare("SELECT sequence,destination,state,attempt,authority,error,receipt FROM photo_export_items WHERE job=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3")?.query_map(params![id,after,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?)))?.map(|r|{let(sequence,destination,state,attempt,authority,error,receipt)=r?;Ok(ExportItem{sequence,destination:serde_json::from_str::<NativePath>(&destination)?.to_path()?,state,attempt,authority,error,receipt:receipt.map(|s|serde_json::from_str(&s)).transpose()?})}).collect()
     }
-    pub fn photo_export_plan(&self, id: &str, sequence: i64) -> Result<(PhotoExportPlan, String)> {
+    pub fn photo_export_plan(
+        &self,
+        id: &str,
+        sequence: i64,
+    ) -> Result<(PhotoPlanDocument, String)> {
         let (encoded, authority): (String, String) = self.db.query_row(
             "SELECT plan,authority FROM photo_export_items WHERE job=?1 AND sequence=?2",
             params![id, sequence],
@@ -706,7 +759,7 @@ impl Catalog {
     /// Read-only cancellation hint for an owning actor. Publication separately
     /// revalidates all authority inside its transaction; this is not a permit.
     pub fn photo_export_work_current(&self, work: &ExportWork) -> Result<bool> {
-        checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
+        checked_plan(work.plan.raw(), &work.authority)?;
         let expected = &work.plan.identity;
         let variant = self.edit_variant(&expected.key)?;
         let current_source = if let Some(image) = &expected.image_identity {
@@ -829,7 +882,7 @@ impl Catalog {
         mut hook: impl FnMut(PhotoExportBoundary) -> Result<()>,
     ) -> Result<()> {
         crate::catalog_backup::require_jobs_released(&self.root)?;
-        checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
+        checked_plan(work.plan.raw(), &work.authority)?;
         require_current_renderer(&work.plan)?;
         ensure!(
             seal.authority_digest == work.authority

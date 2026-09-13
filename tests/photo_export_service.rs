@@ -409,3 +409,59 @@ fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn native_catalog_staging_and_destination_paths_use_real_reaped_export_workers()
+-> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = tempfile::tempdir()?;
+    let root = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b'c', 255]));
+    if let Err(error) = std::fs::create_dir(&root) {
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(92) {
+            assert!(!root.exists());
+            eprintln!(
+                "non-UTF filesystem probe rejected before export: EILSEQ92; byte-wire custody remains tested"
+            );
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let (mut c, key, mut previews, original) = setup(&root)?;
+    let original_bytes = std::fs::read(&original)?;
+    let mut service = ExportService::open(&c, &executable(), limits())?;
+    assert!(service.recover(&mut c, 32)?.complete);
+    for destination in [
+        temp.path().join("utf-destination.png"),
+        root.join(std::ffi::OsString::from_vec(b"export\xff.png".to_vec())),
+    ] {
+        let job = enqueue(
+            &mut c,
+            &key,
+            &destination,
+            OutputFormat::Png {
+                depth: IntegerDepth::Eight,
+            },
+        )?;
+        finish(&mut service, &mut c, &mut previews, &job)?;
+        let metrics = service.take_completion_metrics().unwrap();
+        assert_ne!(metrics.worker_pid, std::process::id());
+        assert_eq!(service.reserved_bytes(), 0);
+        let image = image::open(&destination)?;
+        assert_eq!((image.width(), image.height()), (48, 32));
+        let item = &c.photo_export_items(&job, 0, 1)?[0];
+        assert_eq!(item.state, "published");
+        assert_eq!(item.receipt.as_ref().unwrap().destination, destination);
+        let (plan, authority) = c.photo_export_plan(&job, 1)?;
+        assert_eq!(plan.version, 3);
+        assert_eq!(
+            blake3::hash(plan.raw().as_bytes()).to_hex().as_str(),
+            authority
+        );
+    }
+    assert_eq!(std::fs::read(original)?, original_bytes);
+    Ok(())
+}

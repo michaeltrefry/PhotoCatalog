@@ -16,18 +16,18 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
 };
+#[path = "export_worker/wire.rs"]
+mod wire;
 const REQUEST_LIMIT: u64 = 256 * 1024;
 const RECEIPT_LIMIT: u64 = 64 * 1024;
 const BLOB_LIMIT: u64 = 16 * 1024 * 1024;
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Request {
     version: u32,
     work: ExportWork,
     limits: PhotoRenderLimits,
 }
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "wire::Completion")]
 pub struct CompletedExport {
     pub authority: String,
     pub attempt: String,
@@ -36,6 +36,17 @@ pub struct CompletedExport {
     pub seal_ms: f64,
     pub peak_resident_bytes: Option<u64>,
     pub peak_method: String,
+}
+fn admit_output_path(work: &ExportWork, path: &Path) -> Result<()> {
+    // Reserve half the established receipt limit for fixed encoder reports,
+    // notes and timing fields; path arrays and the snapshot share the remainder.
+    let paths = serde_json::to_vec(&crate::storage_volume::NativePath::from_path(path))?.len()
+        + serde_json::to_vec(&work.plan.destination)?.len();
+    ensure!(
+        paths as u64 <= RECEIPT_LIMIT / 2,
+        "export native paths exceed worker result budget"
+    );
+    Ok(())
 }
 fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
@@ -76,25 +87,12 @@ fn validate(request: &Request) -> Result<()> {
     Ok(())
 }
 fn validate_persisted(request: &Request) -> Result<()> {
+    ensure!(matches!(request.version, 1 | 2), "export worker protocol");
     ensure!(
-        request.version == 1
-            && ((request.work.plan.version == 1
-                && request.work.plan.identity.image_identity.is_none())
-                || (request.work.plan.version == 2
-                    && request
-                        .work
-                        .plan
-                        .identity
-                        .image_identity
-                        .as_ref()
-                        .is_some_and(|image| image.key == request.work.plan.identity.key))),
-        "export worker protocol"
+        request.version != 1 || matches!(request.work.plan.version, 1 | 2),
+        "legacy worker requires legacy plan"
     );
-    let encoded = serde_json::to_vec(&request.work.plan)?;
-    ensure!(
-        blake3::hash(&encoded).to_hex().as_str() == request.work.authority,
-        "export worker plan binding"
-    );
+    crate::catalog_exports::checked_plan(request.work.plan.raw(), &request.work.authority)?;
     ensure!(
         request.work.plan.recipe.validate()?.digest() == request.work.plan.identity.recipe_digest,
         "export worker recipe binding"
@@ -137,7 +135,7 @@ impl ExportWorkerProcess {
             "absolute export executable/staging paths required"
         );
         let request = Request {
-            version: 1,
+            version: 2,
             work,
             limits,
         };
@@ -181,6 +179,7 @@ impl ExportWorkerProcess {
             .prefix("photo-worker-")
             .tempdir_in(&staging_root)?
             .keep();
+        admit_output_path(&request.work, &staging.join("output"))?;
         // The owner creates the lease before a child can be canceled or delayed
         // before startup. Children open it; they never recreate a retired lease.
         write(&staging.join("active.lock"), b"")?;
@@ -316,11 +315,13 @@ const TRANSPORT_FILES: &[&str] = &[
 ];
 #[derive(Debug, Serialize)]
 pub struct RetiredExportTransport {
+    #[serde(with = "crate::metadata_export::wire::native_path")]
     pub staging: PathBuf,
     pub work: ExportWork,
 }
 #[derive(Debug, Serialize)]
 pub struct RetainedExportTransport {
+    #[serde(with = "crate::metadata_export::wire::native_path")]
     pub staging: PathBuf,
     pub reason: String,
 }
@@ -617,6 +618,7 @@ pub fn export_worker_main() -> Result<()> {
         let request: Request =
             serde_json::from_slice(&read(&current.join("request.json"), REQUEST_LIMIT)?)?;
         validate(&request)?;
+        admit_output_path(&request.work, &current.join("output"))?;
         let plan = &request.work.plan;
         let profile = match &plan.output.profile {
             StoredProfile::Srgb => OutputProfile::Srgb,

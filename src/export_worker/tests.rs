@@ -68,8 +68,12 @@ fn request(root: &Path) -> Request {
             job: "job".into(),
             sequence: 1,
             attempt: uuid::Uuid::new_v4().to_string(),
+            plan: crate::catalog_exports::checked_plan(
+                &serde_json::to_string(&plan).unwrap(),
+                &authority,
+            )
+            .unwrap(),
             authority,
-            plan,
         },
         limits: PhotoRenderLimits {
             decode: DecodeLimits {
@@ -322,4 +326,81 @@ fn cancellation_reaps_actual_pre_admission_child_and_retires_missing_lease() {
             .retired
             .is_empty()
     );
+}
+
+#[test]
+fn worker_protocols_preserve_legacy_raw_authority_and_reject_future_or_mixed_shapes() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    for version in [1, 2] {
+        let mut r = request(temp.path());
+        r.version = version;
+        let legacy = serde_json::to_string_pretty(&*r.work.plan)?
+            .replace("destination.png", "destination\\u002epng");
+        let raw = if version == 2 {
+            format!(" \n{legacy}\n ")
+        } else {
+            legacy
+        };
+        r.work.authority = blake3::hash(raw.as_bytes()).to_hex().to_string();
+        r.work.plan = crate::catalog_exports::checked_plan(&raw, &r.work.authority)?;
+        let bytes = serde_json::to_vec(&r)?;
+        let recovered: Request = serde_json::from_slice(&bytes)?;
+        validate_persisted(&recovered)?;
+        assert_eq!(recovered.work.plan.raw(), raw);
+        assert_eq!(recovered.work.authority, r.work.authority);
+        assert!(
+            validate(&recovered).is_err(),
+            "retired renderer must not gain authority"
+        );
+        let mut wrong = bytes.clone();
+        let mut value: serde_json::Value = serde_json::from_slice(&wrong)?;
+        value["version"] = 99.into();
+        wrong = serde_json::to_vec(&value)?;
+        assert!(serde_json::from_slice::<Request>(&wrong).is_err());
+        value["version"] = (if version == 1 { 2 } else { 1 }).into();
+        assert!(serde_json::from_slice::<Request>(&serde_json::to_vec(&value)?).is_err());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn native_completion_keeps_non_utf_staging_and_legacy_completion_still_reads() -> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = tempfile::tempdir()?;
+    let r = request(temp.path());
+    let seal = SealedPhotoExport {
+        version: 1,
+        snapshot: r.work.plan.destination.clone(),
+        authority_digest: r.work.authority.clone(),
+        max_payload_bytes: 1024,
+        payload: r.work.plan.original_revision.clone(),
+    };
+    let rendered = serde_json::json!({
+        "staging":"legacy-output", "renderer_identity":"prior-export-renderer", "metadata_notes":[],
+        "encoding":{"output":{"width":1,"height":1,"channels":3,"bits_per_sample":8,"floating_point":false,"orientation":1,"icc_blake3":"fixture","integer_clips_to_unit_range":true,"alpha":{"mode":"preserve"}},"encoded_extent":10,"source_fingerprint":"a".repeat(64),"recipe_digest":r.work.plan.identity.recipe_digest,"metadata_blake3":"fixture","compression":"png"},
+        "timings":{"source_verification_before_ms":0.0,"staging_setup_ms":0.0,"decode_ms":0.0,"recipe_ms":0.0,"metadata_ms":0.0,"encode_ms":0.0,"source_verification_after_ms":0.0,"sync_ms":0.0,"total_ms":0.0}
+    });
+    let legacy = serde_json::json!({"authority":r.work.authority,"attempt":r.work.attempt,"sealed":seal,"rendered":rendered,"seal_ms":0.0,"peak_resident_bytes":null,"peak_method":"fixture"});
+    let mut completion: CompletedExport = serde_json::from_value(legacy.clone())?;
+    assert_eq!(completion.rendered.staging, PathBuf::from("legacy-output"));
+    let parent = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b's', 255]));
+    completion.rendered.staging = parent.join("output");
+    let json = serde_json::to_vec(&completion)?;
+    assert!((json.len() as u64) < RECEIPT_LIMIT);
+    write(&temp.path().join("result.json"), &json)?;
+    let decoded: CompletedExport =
+        serde_json::from_slice(&read(&temp.path().join("result.json"), RECEIPT_LIMIT)?)?;
+    assert_eq!(decoded.rendered.staging, completion.rendered.staging);
+
+    let mut invalid: serde_json::Value = serde_json::from_slice(&json)?;
+    invalid["version"] = 1.into();
+    assert!(serde_json::from_value::<CompletedExport>(invalid).is_err());
+    let mut future = legacy;
+    future["version"] = 77.into();
+    assert!(serde_json::from_value::<CompletedExport>(future).is_err());
+    Ok(())
 }
