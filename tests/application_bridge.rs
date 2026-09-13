@@ -576,3 +576,130 @@ fn opaque_image_cursors_support_back_forward_and_reject_stale_epoch() -> Result<
     b.shutdown();
     Ok(())
 }
+
+#[test]
+fn desktop_search_filters_keep_variant_identity_and_reject_changed_query_cursor() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    for name in ["a.png", "z.png"] {
+        image::RgbImage::from_pixel(8, 8, image::Rgb([30u8, 50, 80])).save(originals.join(name))?;
+    }
+    let root = temp.path().join("catalog");
+    let mut c = Catalog::open(&root)?;
+    c.import(&originals, None, |_| Ok(()))?;
+    let master = VariantKey::master(c.browse(0, 10)?[0].id.clone());
+    drop(c);
+    let bridge = Bridge::spawn(config(&originals))?;
+    let Response::Status(open) = call(
+        &bridge,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?
+    else {
+        bail!("open response");
+    };
+    let token = open.catalog.unwrap();
+    wait_ready(&bridge)?;
+    let original_variant = variant(&bridge, &token, &master)?;
+    let Response::Variant(copy) = call(
+        &bridge,
+        Request::CreateVariant {
+            catalog: token.clone(),
+            key: master.clone(),
+            expected_revision: original_variant.revision,
+            label: "Independent".into(),
+        },
+    )?
+    else {
+        bail!("copy response");
+    };
+    let Response::Image(row) = call(
+        &bridge,
+        Request::Image {
+            catalog: token.clone(),
+            key: copy.key.clone(),
+        },
+    )?
+    else {
+        bail!("image response");
+    };
+    let Response::Culled { metadata_revision } = call(
+        &bridge,
+        Request::Cull {
+            catalog: token.clone(),
+            key: copy.key.clone(),
+            expected_revision: row.metadata_revision,
+            operation: CullOperation::Rating(5),
+        },
+    )?
+    else {
+        bail!("rating response");
+    };
+    call(
+        &bridge,
+        Request::Cull {
+            catalog: token.clone(),
+            key: copy.key.clone(),
+            expected_revision: metadata_revision,
+            operation: CullOperation::Flag(photocatalog::organization::Flag::Pick),
+        },
+    )?;
+    let Response::Images { rows, .. } = call(
+        &bridge,
+        Request::Search {
+            catalog: token.clone(),
+            options: Box::new(browse::Options {
+                rating: Some(5),
+                flag: Some(photocatalog::organization::Flag::Pick),
+                ..Default::default()
+            }),
+            cursor: None,
+            limit: 10,
+        },
+    )?
+    else {
+        bail!("filter response");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, copy.key);
+    let options = browse::Options {
+        sort: photocatalog::organization_search::Sort::Filename,
+        direction: photocatalog::organization_search::Direction::Descending,
+        ..Default::default()
+    };
+    let Response::Images { rows, next, .. } = call(
+        &bridge,
+        Request::Search {
+            catalog: token.clone(),
+            options: Box::new(options.clone()),
+            cursor: None,
+            limit: 1,
+        },
+    )?
+    else {
+        bail!("sorted response");
+    };
+    assert_eq!(rows[0].filename, "z.png");
+    ensure!(next.is_some(), "expected page cursor");
+    let failed = call(
+        &bridge,
+        Request::Search {
+            catalog: token.clone(),
+            options: Box::new(browse::Options {
+                rating: Some(5),
+                ..options
+            }),
+            cursor: next,
+            limit: 1,
+        },
+    );
+    ensure!(failed.is_err(), "cursor must remain bound to exact query");
+    assert_eq!(
+        variant(&bridge, &token, &master)?.revision,
+        original_variant.revision
+    );
+    bridge.shutdown();
+    Ok(())
+}

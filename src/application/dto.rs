@@ -59,6 +59,12 @@ pub enum Request {
         cursor: Option<String>,
         limit: u16,
     },
+    Search {
+        catalog: String,
+        options: Box<super::browse::Options>,
+        cursor: Option<String>,
+        limit: u16,
+    },
     Image {
         catalog: String,
         key: VariantKey,

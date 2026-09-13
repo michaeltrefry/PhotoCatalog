@@ -1,5 +1,6 @@
 //! UI-independent catalog owner. Requests are bounded and native workers remain
 //! owned/reaped by PreviewService; no webview thread touches SQLite.
+pub mod browse;
 mod dto;
 use crate::{
     Catalog,
@@ -448,8 +449,11 @@ impl Bridge {
                 }
                 let obsolete = match (&request, &old.work) {
                     (
-                        Request::Images { catalog, .. },
-                        Work::Command(Request::Images { catalog: c, .. }, _),
+                        Request::Images { catalog, .. } | Request::Search { catalog, .. },
+                        Work::Command(
+                            Request::Images { catalog: c, .. } | Request::Search { catalog: c, .. },
+                            _,
+                        ),
                     ) => catalog == c,
                     (
                         Request::Preview {
@@ -658,6 +662,7 @@ impl Actor {
                                 Request::CreateVariant { .. }
                                     | Request::Cull { .. }
                                     | Request::Images { .. }
+                                    | Request::Search { .. }
                             );
                             let result = self.command(r, &e.cancel);
                             if reindex && let Some(o) = self.open.as_mut() {
@@ -919,61 +924,20 @@ impl Actor {
                 cursor,
                 limit,
             } => {
-                page!(limit);
-                if text.as_ref().is_some_and(|s| s.len() > 4096) {
-                    return Err(error(ErrorCode::InvalidRequest, "search text limit"));
-                }
-                let o = self.current(&catalog)?;
-                let old = cursor
-                    .as_deref()
-                    .map(|token| decode_cursor(token, &catalog))
-                    .transpose()?;
-                let q = Query {
-                    include_variants: true,
-                    folder: folder.map(|v| v.0),
+                let options = browse::Options {
+                    folder,
                     folder_recursive: recursive,
                     text,
-                    ..Query::default()
+                    ..Default::default()
                 };
-                let p = core!(o.catalog.search_grid(
-                    &q,
-                    old.as_ref(),
-                    usize::from(limit),
-                    limits.scan_rows,
-                    limits.page_bytes
-                ));
-                let next = p
-                    .next
-                    .as_ref()
-                    .map(|c| encode_cursor(&catalog, c))
-                    .transpose()?;
-                Ok(Response::Images {
-                    rows: p
-                        .rows
-                        .into_iter()
-                        .map(|v| GridImage {
-                            image_id: v.image_id,
-                            key: VariantKey {
-                                asset_id: v.asset_id,
-                                variant_id: v.variant_id,
-                            },
-                            sequence: I64(v.sequence),
-                            metadata_revision: I64(v.metadata_revision),
-                            metadata_pending: v.metadata_pending,
-                            state: v.state,
-                            filename: v.filename,
-                            rating: v.rating.map(I64),
-                            flag: v.flag,
-                            label: v.label,
-                            conflicts: v.conflicts,
-                        })
-                        .collect(),
-                    next,
-                    has_more: p.has_more,
-                    page_complete: p.page_complete,
-                    scanned: p.scanned as u32,
-                })
+                self.search_page(&catalog, options.query()?, cursor, limit)
             }
+            Request::Search {
+                catalog,
+                options,
+                cursor,
+                limit,
+            } => self.search_page(&catalog, (*options).query()?, cursor, limit),
             Request::Image { catalog, key } => {
                 let o = self.current(&catalog)?;
                 let image = core!(o.catalog.image(&key));
