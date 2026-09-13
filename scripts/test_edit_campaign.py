@@ -29,6 +29,20 @@ def binding():
 
 
 class BindingContracts(unittest.TestCase):
+    def test_campaign_funding_converts_path_before_windows_disk_api(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)/'campaign'
+            def disk_usage(path):
+                self.assertIsInstance(path,str)
+                self.assertEqual(path,str(root))
+                return SimpleNamespace(free=0)
+            with patch.object(campaign,'validate_binding'), \
+                 patch.object(campaign.psutil,'disk_usage',side_effect=disk_usage) as usage:
+                with self.assertRaisesRegex(ValueError,'insufficient fully funded'):
+                    campaign.execute(binding(),root)
+            usage.assert_called_once()
+
     def check(self,value):
         with patch.object(campaign,'digest',return_value='a'*64), patch.object(campaign.edit_admission,'validate_execution'):
             campaign.validate_binding(value)
@@ -77,6 +91,25 @@ class BindingContracts(unittest.TestCase):
 
 class ActualChildSupervisorContracts(unittest.TestCase):
     """Tiny real children, no database, renderer, source image, or campaign."""
+    def test_path_disk_root_reaches_windows_compatible_telemetry_and_child_result(self):
+        disk_usage=campaign.psutil.disk_usage
+        seen=[]
+        def windows_disk_usage(path):
+            # psutil7.2.2 Windows forwards this directly to its str-only C API.
+            if not isinstance(path,str):
+                raise TypeError('argument 1 must be str, not '+type(path).__name__)
+            seen.append(path)
+            return disk_usage(path)
+        with tempfile.TemporaryDirectory() as root:
+            result,folder=self.invoke(Path(root),'print("worker proof reached")',expect_failure=False,
+                patches=(patch.object(campaign.psutil,'disk_usage',side_effect=windows_disk_usage),))
+            self.assertGreater(result['samples'],0)
+            self.assertTrue(result['ownership']['known_absent'])
+            self.assertEqual(result['ownership']['root_returncode'],0)
+            self.assertEqual((folder/'stdout.log').read_text().strip(),'worker proof reached')
+            self.assertTrue(seen)
+            self.assertTrue(all(path==str(Path(root)) for path in seen))
+
     def invoke(self,root,code,*,expect_failure,patches=()):
         spawned=[]
         popen=subprocess.Popen

@@ -425,7 +425,7 @@ def invoke(command, folder, limits, disk_root, *, supervision=None):
                 records=tracker.sample()
                 total=sum(p['rss'] for p in records)
                 peak=max(peak,total)
-                free=psutil.disk_usage(disk_root).free
+                free=psutil.disk_usage(os.fspath(disk_root)).free
                 line=(json.dumps(dict(at=at,processes=records,total_rss=total,free_bytes=free),allow_nan=False)+'\n').encode()
                 if len(line)>settings['max_sample_bytes'] or telemetry_bytes+len(line)>settings['max_telemetry_bytes']:
                     raise RuntimeError('process telemetry byte cap exceeded')
@@ -550,7 +550,7 @@ def execute(binding,root):
     root=Path(root)
     root.mkdir()
     exclusive(root/'binding.json',binding)
-    if psutil.disk_usage(root).free<binding['minimum_free_bytes']:
+    if psutil.disk_usage(os.fspath(root)).free<binding['minimum_free_bytes']:
         raise ValueError('insufficient fully funded campaign free space')
     exclusive(root/'host-identity.json',host_identity(root,[a['path'] for a in binding.get('sources',[])]))
     results=[]

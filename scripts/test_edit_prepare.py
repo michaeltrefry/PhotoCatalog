@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import edit_prepare as preparation
 
 
@@ -11,7 +12,14 @@ class SourceCopyAdmission(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder).resolve();source=root/'original';source.write_bytes(b'unchanged original')
             sha=hashlib.sha256(source.read_bytes()).hexdigest()
-            result=preparation.source_copy(source,root/'copy',1024,sha,0,time.monotonic()+30)
+            disk_usage=preparation.psutil.disk_usage
+            def windows_disk_usage(path):
+                self.assertIsInstance(path,str)
+                self.assertEqual(path,str(root))
+                return disk_usage(path)
+            with patch.object(preparation.psutil,'disk_usage',side_effect=windows_disk_usage) as usage:
+                result=preparation.source_copy(source,root/'copy',1024,sha,0,time.monotonic()+30)
+            usage.assert_called_once()
             self.assertEqual((root/'copy').read_bytes(),source.read_bytes())
             self.assertEqual(result['sha256'],sha)
             self.assertNotEqual(source.stat().st_ino,(root/'copy').stat().st_ino)
@@ -60,12 +68,15 @@ class PreparationHostFailures(unittest.TestCase):
             def generated(*args):
                 launches.append(args)
                 host.error='injected post-generator observer failure'
+            def windows_disk_usage(path):
+                self.assertIsInstance(path,str)
+                return SimpleNamespace(free=10**15)
             with ExitStack() as stack:
                 stack.enter_context(patch.object(preparation.edit_binding,'admit_imports'))
                 stack.enter_context(patch.object(preparation.edit_binding,'validate_runtime'))
                 stack.enter_context(patch.object(preparation,'host_identity',return_value={'fixture':True}))
                 observer=stack.enter_context(patch.object(preparation,'HostObservation',return_value=host))
-                stack.enter_context(patch.object(preparation.psutil,'disk_usage',return_value=SimpleNamespace(free=10**15)))
+                stack.enter_context(patch.object(preparation.psutil,'disk_usage',side_effect=windows_disk_usage))
                 stack.enter_context(patch.object(preparation,'source_copy',side_effect=copied))
                 stack.enter_context(patch.object(preparation.edit_build_plan,'python_command',return_value=['never-executed-generator']))
                 stack.enter_context(patch.object(preparation.edit_campaign,'invoke',side_effect=generated))

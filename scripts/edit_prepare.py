@@ -39,7 +39,7 @@ def source_copy(original,target,limit,expected_sha,free_reserve,deadline):
         source_sha=hashlib.sha256();source_b3=blake3();remaining=before.st_size
         with target.open('xb') as outgoing:
             while remaining:
-                if time.monotonic()>deadline or psutil.disk_usage(target.parent).free<free_reserve:
+                if time.monotonic()>deadline or psutil.disk_usage(os.fspath(target.parent)).free<free_reserve:
                     raise ValueError('copy deadline/free-space admission exhausted')
                 data=incoming.read(min(65536,remaining))
                 if not data:raise ValueError('original shrank during copy')
@@ -80,7 +80,7 @@ def prepare(manifest_descriptor,build,root):
     sources=[];copies=[];records=[];background=None;error=None
     deadline=time.monotonic()+3600
     try:
-        if psutil.disk_usage(root).free<funding['minimum_free_bytes']:
+        if psutil.disk_usage(os.fspath(root)).free<funding['minimum_free_bytes']:
             raise ValueError('preparation lacks the full final-campaign funding')
         (root/'sources').mkdir()
         exclusive(root/'host-identity.json',host_identity(root,[item['path'] for item in manifest['inputs']]))

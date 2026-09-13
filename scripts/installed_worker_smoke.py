@@ -32,18 +32,20 @@ def run(probe, executable, output, platform):
     # Reuse the repository's reviewed process-tree owner and bounded captures.
     from edit_campaign import invoke
     inherited, previous_cwd = dict(os.environ), Path.cwd()
-    try:
-        with tempfile.TemporaryDirectory(prefix='photocatalog-installed-cwd-') as cwd:
+    with tempfile.TemporaryDirectory(prefix='photocatalog-installed-cwd-') as cwd:
+        try:
             os.environ.clear()
             os.environ.update(environment(inherited, platform))
             os.chdir(cwd)
             owned = invoke([str(probe), '--worker-executable', str(executable)], output/'invoke',
                 {'deadline_seconds': 120, 'process_rss_bytes': 1024**3,
                  'group_rss_bytes': 2*1024**3, 'free_reserve_bytes': 64*1024**2}, output)
-    finally:
-        os.chdir(previous_cwd)
-        os.environ.clear()
-        os.environ.update(inherited)
+        finally:
+            # Windows cannot remove a process's current directory. Restore it
+            # before TemporaryDirectory cleanup, including failed child runs.
+            os.chdir(previous_cwd)
+            os.environ.clear()
+            os.environ.update(inherited)
     stdout = (output/'invoke/stdout.log').read_bytes()
     package.require(len(stdout) <= 65536, 'probe output bounds')
     value = json.loads(stdout)
