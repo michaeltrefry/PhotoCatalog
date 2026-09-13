@@ -108,20 +108,51 @@ Original retained bytes and their digest remain authoritative; decoded views do
 not normalize the retained source. Earlier authoring/fixture failures remain
 preserved. Numerical aggregate memory admission is still unqualified.
 
-The subsequent finite opening-read guard batch passed source review. Its first
-compile stopped before tests at three unsupported usize SQL parameters; checked
-i64 conversions are under qualification. The initial v18 manifest omitted two
-changed files already present in its hashed diff; a preserved supplemental
-receipt records that omission, and v19 covers the complete 102 source pins.
-No final allocation or RSS allowance follows from the symbolic capacity proof.
+The finite Source opening guards are qualified in clean author commit `6aa0967`;
+all 102 committed source pins were verified. Ten focused functions pass. The
+maximal accepted sequence fixture retains 16,777,207 input bytes and 1,290,413
+Issues with a 150,994,944-byte Vec capacity, producing 52,908,799 encoded bytes.
+This disproves the prior 128 MiB typed allowance; no replacement aggregate
+allowance is claimed. Failed compile, fixture and source-manifest attempts remain
+preserved. Borrowed supplement selection is the next finite memory slice; other
+preallocation and the numerical aggregate remain required. Comment23341 records
+the qualified checkpoint.
 
-The filesystem bootstrap/marker worker passed 15 initial worker functions,
-12 restore-marker tests and one actual configured helper-process test, including
-explicit helper reaping. Ten strict Clippy diagnostics were repaired and reviewed;
-shared API formatting now passes. The final composed native gate is pending.
-Managed SQL session qualification stopped on test-only type errors before tests
-ran; exact failed-bootstrap Close recovery and manifest-role lease retention are
-being repaired. These isolated workers remain unselected in the desktop.
+The filesystem bootstrap/restore helper is qualified at author `e413c0a`, locally
+integrated as `c10d546` plus `b21b13b`. Eighteen worker functions, one configured
+CLI helper test, twelve marker tests, strict Clippy and formatting pass. Actual
+fault children were reaped; the ordinary-harness helper is excluded. Independent
+review SHA256
+`38ce64f4352f340031310fba3ed131618ac3a927492284994bd64cb9620a28c5`
+and integrated Tauri qualification are retained privately. These results do not
+prove the real SQL/filesystem overlap or production route selection.
+
+Managed SQL author `f46ba230` is integrated as `deae865`. The sole initialization
+conflict preserves its shared initializer, the filesystem module and LensWorks
+diagnostic text. Independent source review verifies 23 of 26 author files are
+identical and the three remaining differences are expected branding and existing
+filesystem integration. Review SHA256
+`31774cff4f7fe55322295032632af0e8ed3896e10804194d6d6712e06298982e`.
+Real CatalogFilesystem relay implementation continues under comment23343; FS6
+store leases and remaining filesystem routes still prevent production selection.
+
+LensWorks branding is commit `1513ded`: desktop/window/installer/dialog/CLI names
+and new derivative CreatorTool change; imported XMP bytes and persistent/internal
+identifiers remain compatible. Frontend build and 63 tests plus the Python
+metadata derivative test passed. The initial Rust XMP selector selected zero
+tests, so its exit zero is compile-only evidence. The corrected run at `deae865`
+passes 64 actual XMP functions. Preserved corrective receipt
+`sc-22847-lensworks-branding/xmp-correction.json`, SHA256
+`7274f5b3276ac882e204bfcb2579ba799ad1eb14ae96f04aaafa38cd08bce1cb`.
+
+Integrated `deae865` passes XMP64, session14 (one inert harness helper),
+filesystem18 (one helper ignored), cancellation3 and discovery1, strict all-target
+release Clippy, Mac Tauri release/locked compilation and formatting. All eight
+gates are terminal/reaped. Receipt
+`sc-22847-lensworks-sql-integration-jwt471d5/receipt.json`, SHA256
+`49e81608cb1ff1f67b8526922b500960039133f79170cc3cf2489cc2beebda7c`.
+Root reverified all eight logs and 26 integrated source hashes. This remains local
+qualification; the new batch has no fresh hosted or installed acceptance yet.
 
 Local `db023e1` (author `ef98f82e`) corrects preview cleanup and checked Quit.
 Failed native wait retains the active child, scheduler/encoded reservations,
