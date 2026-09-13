@@ -1,6 +1,6 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 /// Current on-disk catalog schema; probes must preflight before timed opens.
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 
 pub mod application;
 pub mod catalog_backup;
@@ -71,6 +71,7 @@ pub struct Catalog {
     db: Connection,
     root: PathBuf,
     writers: std::sync::Arc<catalog_writer::Writers>,
+    relink_file: std::sync::Arc<std::fs::File>,
 }
 
 /// Incremental import discovery for application actors. Each advance handles at
@@ -346,10 +347,21 @@ impl Catalog {
                 catalog_images::collection_order_index::install(&tx)?;
                 tx.pragma_update(None, "user_version", 11)?;
             }
+            if version < 12 {
+                tx.execute_batch(catalog_storage::REVIEW_SCHEMA)?;
+                tx.pragma_update(None, "user_version", 12)?;
+            }
             tx.commit()?;
             db.pragma_update(None, "foreign_keys", true)?;
         }
-        Ok(Self { db, root, writers })
+        let relink_file = std::sync::Arc::new(std::fs::File::open(root.join("catalog.sqlite3"))?);
+        catalog_storage::verify_database_object(&db, &relink_file)?;
+        Ok(Self {
+            db,
+            root,
+            writers,
+            relink_file,
+        })
     }
     /// Imports one explicitly selected directory. Repeating a scan resumes pending/failed files.
     /// The observer runs at durability boundaries and can request a controlled interruption.
@@ -452,6 +464,7 @@ impl Catalog {
         let fingerprint = match fingerprint(path) {
             Ok(value) => value,
             Err(error) => {
+                catalog_storage::verify_location_fence(&self.db, &location, None)?;
                 self.reserve(path, &location)?;
                 self.record_import_path(path)?;
                 let (changed, warnings) = self.refresh_metadata(path, true)?;
@@ -462,6 +475,7 @@ impl Catalog {
                 return Ok(None);
             }
         };
+        catalog_storage::verify_location_fence(&self.db, &location, Some(&fingerprint))?;
         let observation = volumes.observe(path)?;
         self.reconnect_storage_asset(path, &observation, &fingerprint, volumes.snapshot())?;
         let existing: Option<(String, String, Option<String>)> = self
@@ -745,9 +759,12 @@ impl Catalog {
         let metadata = serde_json::to_string(publication.metadata)?;
         self.with_edit_transaction(expected, catalog_writer::Priority::Foreground, |tx| {
             if !initial_hydration_source(tx, &expected.key.asset_id, publication.source)? { return Ok(None); }
+            catalog_storage::hydration_fence(tx, &expected.key.asset_id, publication.fingerprint)?;
+            let relink_before = catalog_storage::relink_hydration_state(tx, &expected.key.asset_id)?;
             // The schema's readiness reference uses a native manifest key, as
             // service imports do. No edited bytes enter the master legacy store.
             tx.execute("UPDATE assets SET state='ready',fingerprint=?1,metadata=?2,preview_hash=?3,error=NULL WHERE id=?4", params![publication.fingerprint,metadata,publication.preview_key,expected.key.asset_id])?;
+            catalog_storage::record_hydration(tx, &expected.key.asset_id, relink_before)?;
             let mut image = expected.image_identity.clone().context("missing hydration image")?;
             image.physical_generation = image.physical_generation.checked_add(1).context("hydration generation overflow")?;
             catalog_images::require_image_metadata_identity(tx, &image)?;

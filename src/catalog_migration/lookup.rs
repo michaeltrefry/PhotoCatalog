@@ -1225,6 +1225,10 @@ mod tests {
                 .db
                 .execute_batch(&format!("DROP INDEX migration_unavailable_{name}"))?;
         }
+        f.catalog.db.execute_batch(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/relink-v12-downgrade.sql"
+        )))?;
         f.catalog.db.execute_batch(
             "DROP TRIGGER organization_member_zero_insert; DROP TRIGGER organization_member_zero_update; DROP TRIGGER organization_order_zero_insert; DROP TRIGGER organization_order_zero_update; DROP TRIGGER organization_order_zero_delete; DROP TABLE organization_collection_zero; DROP TABLE organization_collection_zero_backfill; PRAGMA user_version=8; CREATE TABLE migration_unavailable_reference(block_upgrade)",
         )?;

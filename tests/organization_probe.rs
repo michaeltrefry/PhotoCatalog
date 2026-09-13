@@ -130,7 +130,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 53
+            && receipt["added_tables"].as_array().unwrap().len() == 56
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
@@ -229,7 +229,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
     ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 53);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 56);
     ensure!(
         migrated["added_tables"]
             .as_array()
@@ -314,6 +314,7 @@ fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
 // Build the actual pre-image fixture schema, rather than merely lowering user_version
 // while leaving schema7 columns, foreign keys, and triggers installed.
 fn remove_image_schema(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(include_str!("fixtures/relink-v12-downgrade.sql"))?;
     conn.execute_batch("PRAGMA foreign_keys=OFF")?;
     conn.execute_batch("DROP TRIGGER organization_member_zero_insert; DROP TRIGGER organization_member_zero_update; DROP TRIGGER organization_order_zero_insert; DROP TRIGGER organization_order_zero_update; DROP TRIGGER organization_order_zero_delete; DROP TABLE organization_collection_zero; DROP TABLE organization_collection_zero_backfill;")?;
     conn.execute_batch("DROP TABLE migration_keyword_repair_items; DROP TABLE migration_keyword_repair_reports; DROP TABLE migration_keyword_repairs;")?;
@@ -394,7 +395,7 @@ fn schema_six_adds_only_verified_image_state_and_rejects_legacy_sequence_spoof()
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION,
         "{receipt}"
     );
-    ensure!(receipt["added_tables"].as_array().unwrap().len() == 40);
+    ensure!(receipt["added_tables"].as_array().unwrap().len() == 43);
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
             && receipt["original_columns_preserved"] == true

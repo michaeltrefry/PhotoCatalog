@@ -13,6 +13,15 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Read,
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+mod relink_review;
+pub use relink_review::{
+    PreparedRelinkBatch, RelinkOverride, RelinkPreparation, RelinkWorkerHandle,
+};
+pub(crate) use relink_review::{
+    REVIEW_SCHEMA, hydration_fence, record_hydration, verify_location_fence,
 };
 
 pub(crate) const SCHEMA: &str = "
@@ -80,6 +89,9 @@ pub enum RelinkScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchStatus {
     Matched,
+    Unverified,
+    UserConfirmed,
+    Historical,
     Missing,
     Mismatch,
     Ambiguous,
@@ -90,6 +102,9 @@ impl MatchStatus {
     fn name(&self) -> &'static str {
         match self {
             Self::Matched => "matched",
+            Self::Unverified => "unverified",
+            Self::UserConfirmed => "user_confirmed",
+            Self::Historical => "historical",
             Self::Missing => "missing",
             Self::Mismatch => "mismatch",
             Self::Ambiguous => "ambiguous",
@@ -111,6 +126,7 @@ pub struct RelinkItem {
     pub status: String,
     pub detail: String,
     pub original: PathReference,
+    pub identity_basis: String,
     pub candidates: Vec<Candidate>,
     pub destination: Option<NativePath>,
 }
@@ -134,6 +150,12 @@ pub struct RelinkPlan {
     pub excluded: i64,
     pub unresolved: i64,
     pub unresolved_sources: i64,
+    pub revision: i64,
+    pub unverified: i64,
+    pub user_confirmed: i64,
+    pub confirmation_token: Option<String>,
+    /// Pre-review-schema plans require a fresh review; their counts are unavailable.
+    pub summary_complete: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
@@ -182,6 +204,10 @@ struct ItemData {
     destination: Option<NativePath>,
     evidence: Option<Evidence>,
     binding: Option<BindingDraft>,
+    #[serde(default)]
+    expected_identity: Option<String>,
+    #[serde(default)]
+    identity_basis: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceTag {
@@ -190,6 +216,8 @@ struct SourceTag {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceData {
     embedded: bool,
+    #[serde(default)]
+    historical: bool,
     old_native: Option<NativePath>,
     old_tag: Option<SourceTag>,
     old_locator: Vec<u8>,
@@ -759,6 +787,12 @@ impl Catalog {
         {
             *path = NativePath::from_path(&crate::prospective_directory(&native)?);
         }
+        self.begin_relink_review(request)
+    }
+    /// Desktop planning uses the exact stored prefix. Filesystem observations
+    /// belong to detached preparation; CLI begin retains canonicalization.
+    pub fn begin_relink_review(&mut self, request: RelinkScope) -> Result<RelinkPlan> {
+        validate_request(&request)?;
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
@@ -865,117 +899,28 @@ impl Catalog {
         };
         ensure!(exists, "exception entity does not exist");
         tx.execute("INSERT INTO storage_exceptions VALUES(?1,?2,?3,?4) ON CONFLICT(plan,kind,entity) DO UPDATE SET candidates=excluded.candidates",params![plan,kind,entity,json(&candidates)?])?;
+        relink_review::bump_revision(&tx, plan)?;
         tx.commit()?;
         drop(_write);
         Ok(())
     }
     pub fn prepare_relink_batch(&mut self, plan: &str, limit: usize) -> Result<RelinkPlan> {
-        ensure!((1..=1000).contains(&limit), "batch limit must be 1..1000");
-        let catalog_root = self.root.clone();
-        let _write = self
-            .writers
-            .enter(crate::catalog_writer::Priority::Foreground)?;
-        let tx = self
-            .db
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (request, snapshot, cursor, high, state): (String, i64, i64, i64, String) = tx
-            .query_row(
-                "SELECT request,epoch,cursor,high_water,state FROM storage_plans WHERE id=?",
-                [plan],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?;
-        ensure!(state == "preparing", "plan is not preparing");
-        ensure!(
-            snapshot == epoch(&tx)?,
-            "stale relink plan: catalog locations or sources changed"
-        );
-        let request: RelinkScope = serde_json::from_str(&request)?;
-        let (filter, value) = match &request {
-            RelinkScope::Asset { asset_id, .. } => ("AND a.id=?4", asset_id.as_str()),
-            RelinkScope::Volume { logical_volume, .. } => (
-                "AND a.id IN (SELECT asset_id FROM storage_bindings WHERE volume_id=?4)",
-                logical_volume.as_str(),
-            ),
-            _ => ("AND ?4 IS NOT NULL", ""),
-        };
-        let query = format!(
-            "SELECT a.sequence,a.id FROM assets a WHERE a.sequence>?1 AND a.sequence<=?2 {filter} ORDER BY a.sequence LIMIT ?3"
-        );
-        let rows = tx
-            .prepare(&query)?
-            .query_map(params![cursor, high, limit as i64, value], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (sequence, asset) in &rows {
-            let mut data = load_item(&tx, asset)?;
-            let override_paths = exception(&tx, plan, "asset", asset)?;
-            let paths = match &override_paths {
-                Some(paths) => Some(paths.clone()),
-                None => {
-                    mapped_candidates(&request, asset, &data.reference, data.old_binding.as_ref())?
-                }
-            };
-            let Some(paths) = paths else {
-                continue;
-            };
-            let (status, detail, candidates, selected) =
-                if override_paths.as_ref().is_some_and(Vec::is_empty) {
-                    (
-                        MatchStatus::Excluded,
-                        "Explicitly excluded".into(),
-                        vec![],
-                        None,
-                    )
-                } else {
-                    evaluate(&paths, data.fingerprint.as_deref(), &catalog_root)
-                };
-            data.candidates = candidates;
-            if let Some((path, evidence)) = selected {
-                data.binding = Some(binding_draft(&path.to_path()?));
-                data.destination = Some(path);
-                data.evidence = Some(evidence);
-            }
-            let destination = data
-                .destination
-                .as_ref()
-                .map(|p| p.to_path().map(|p| location_bytes(&p)))
-                .transpose()?;
-            tx.execute(
-                "INSERT INTO storage_items VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    plan,
-                    sequence,
-                    asset,
-                    status.name(),
-                    detail,
-                    destination,
-                    data.evidence.as_ref().map(Evidence::key),
-                    json(&data)?
-                ],
-            )?;
-            if status != MatchStatus::Excluded {
-                prepare_sources(&tx, plan, *sequence, asset, &request, &data, &catalog_root)?;
-            }
-        }
-        let finished = rows.len() < limit
-            || matches!(request, RelinkScope::Asset { .. })
-            || rows.last().is_some_and(|(n, _)| *n == high);
-        let next = if finished {
-            high
+        let current = self.relink_plan(plan)?;
+        let prepared = if current.state == "checking" {
+            current
         } else {
-            rows.last().map(|r| r.0).unwrap_or(high)
+            let work = self.relink_preparation(plan, limit)?;
+            self.publish_relink_preparation(work.prepare(&AtomicBool::new(false))?)?
         };
-        tx.execute(
-            "UPDATE storage_plans SET cursor=?2,state=?3 WHERE id=?1",
-            params![plan, next, if finished { "ready" } else { "preparing" }],
-        )?;
-        if finished {
-            mark_collisions(&tx, plan)?;
+        if prepared.state == "checking" {
+            self.finalize_relink_review_cancellable(
+                plan,
+                prepared.revision,
+                &AtomicBool::new(false),
+            )
+        } else {
+            Ok(prepared)
         }
-        tx.commit()?;
-        drop(_write);
-        self.relink_plan(plan)
     }
     /// Restart discovery, ordered by opaque operation ID with a bounded cursor.
     pub fn relink_plans(&self, after: &str, limit: usize) -> Result<Vec<RelinkPlan>> {
@@ -993,9 +938,18 @@ impl Catalog {
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let (total,matched,excluded,unresolved)=self.db.query_row("SELECT COUNT(*),COALESCE(SUM(status='matched'),0),COALESCE(SUM(status='excluded'),0),COALESCE(SUM(status NOT IN ('matched','excluded')),0) FROM storage_items WHERE plan=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        let unresolved_sources=self.db.query_row("SELECT COUNT(*) FROM storage_source_items s JOIN storage_items i ON i.plan=s.plan AND i.sequence=s.sequence WHERE s.plan=? AND i.status!='excluded' AND s.status NOT IN ('matched','excluded')",[id],|r|r.get(0))?;
+        let summary: Option<(i64,i64,i64,i64,i64)> = self.db.query_row("SELECT total,matched,excluded,unresolved,unresolved_sources FROM storage_review_summary WHERE plan=?", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let summary_complete = summary.is_some();
+        let (total, matched, excluded, unresolved, unresolved_sources) =
+            summary.unwrap_or_default();
+        let (revision, unverified, user_confirmed, confirmation_token) =
+            relink_review::review_counts(&self.db, id)?;
         Ok(RelinkPlan {
+            revision,
+            unverified,
+            user_confirmed,
+            confirmation_token,
+            summary_complete,
             id: id.into(),
             state,
             scanned_through: cursor,
@@ -1009,9 +963,14 @@ impl Catalog {
     }
     pub fn relink_items(&self, plan: &str, after: i64, limit: usize) -> Result<Vec<RelinkItem>> {
         ensure!((1..=1000).contains(&limit), "page limit must be 1..1000");
-        let mut stmt=self.db.prepare("SELECT sequence,asset_id,status,detail,data FROM storage_items WHERE plan=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3")?;
+        let mut stmt=self.db.prepare("SELECT sequence,asset_id,status,detail,CASE WHEN length(CAST(data AS BLOB))<=67108864 THEN data END,length(CAST(data AS BLOB)) FROM storage_items WHERE plan=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3")?;
         let mut out = Vec::new();
+        let mut page_bytes = 0i64;
         for row in stmt.query_map(params![plan, after, limit as i64], |r| {
+            page_bytes = page_bytes.saturating_add(r.get::<_, i64>(5)?);
+            if page_bytes > 64 * 1024 * 1024 {
+                return Err(rusqlite::Error::FromSqlConversionFailure(0,rusqlite::types::Type::Text,Box::new(std::io::Error::other("relink review page exceeds 64 MiB; reduce page size or review oversized source custody"))));
+            }
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -1028,6 +987,7 @@ impl Catalog {
                 status,
                 detail,
                 original: data.reference,
+                identity_basis: data.identity_basis,
                 candidates: data.candidates,
                 destination: data.destination,
             });
@@ -1042,9 +1002,14 @@ impl Catalog {
         limit: usize,
     ) -> Result<Vec<RelinkSource>> {
         ensure!((1..=1000).contains(&limit), "page limit must be 1..1000");
-        let mut stmt=self.db.prepare("SELECT source_id,status,detail,data FROM storage_source_items WHERE plan=?1 AND sequence=?2 AND source_id>?3 ORDER BY source_id LIMIT ?4")?;
+        let mut stmt=self.db.prepare("SELECT source_id,status,detail,CASE WHEN length(CAST(data AS BLOB))<=67108864 THEN data END,length(CAST(data AS BLOB)) FROM storage_source_items WHERE plan=?1 AND sequence=?2 AND source_id>?3 ORDER BY source_id LIMIT ?4")?;
         let mut out = Vec::new();
+        let mut page_bytes = 0i64;
         for row in stmt.query_map(params![plan, sequence, after, limit as i64], |r| {
+            page_bytes = page_bytes.saturating_add(r.get::<_, i64>(4)?);
+            if page_bytes > 64 * 1024 * 1024 {
+                return Err(rusqlite::Error::FromSqlConversionFailure(0,rusqlite::types::Type::Text,Box::new(std::io::Error::other("relink review page exceeds 64 MiB; reduce page size or review oversized source custody"))));
+            }
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?))
         })? {
             let (source_id, status, detail, data) = row?;
@@ -1101,6 +1066,7 @@ impl Catalog {
             tx.execute("UPDATE storage_items SET status='excluded',detail='Explicitly excluded after preview' WHERE plan=?1 AND sequence=?2",params![plan,sequence])?
         };
         ensure!(changed == 1, "relink item not found");
+        relink_review::bump_revision(&tx, plan)?;
         tx.commit()?;
         drop(_write);
         Ok(())
@@ -1116,12 +1082,37 @@ impl Catalog {
         plan: &str,
         mut boundary: impl FnMut(RelinkBoundary) -> Result<()>,
     ) -> Result<RelinkPlan> {
+        self.apply_relink_internal(plan, None, &AtomicBool::new(false), &mut boundary)
+    }
+    pub fn apply_relink_cancellable(
+        &mut self,
+        plan: &str,
+        revision: i64,
+        cancel: &AtomicBool,
+        mut progress: impl FnMut(RelinkBoundary),
+    ) -> Result<RelinkPlan> {
+        self.apply_relink_internal(plan, Some(revision), cancel, &mut |b| {
+            progress(b);
+            relink_review::check_cancel(cancel)
+        })
+    }
+    fn apply_relink_internal(
+        &mut self,
+        plan: &str,
+        revision: Option<i64>,
+        cancel: &AtomicBool,
+        boundary: &mut dyn FnMut(RelinkBoundary) -> Result<()>,
+    ) -> Result<RelinkPlan> {
+        relink_review::check_cancel(cancel)?;
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(revision) = revision {
+            relink_review::require_revision(&tx, plan, revision)?;
+        }
         let (state, snapshot): (String, i64) = tx.query_row(
             "SELECT state,epoch FROM storage_plans WHERE id=?",
             [plan],
@@ -1136,7 +1127,8 @@ impl Catalog {
             state == "ready" && snapshot == epoch(&tx)?,
             "plan is incomplete or stale"
         );
-        let unresolved:i64=tx.query_row("SELECT (SELECT COUNT(*) FROM storage_items WHERE plan=?1 AND status NOT IN ('matched','excluded'))+(SELECT COUNT(*) FROM storage_source_items s JOIN storage_items i ON i.plan=s.plan AND i.sequence=s.sequence WHERE s.plan=?1 AND i.status!='excluded' AND s.status NOT IN ('matched','excluded'))",[plan],|r|r.get(0))?;
+        let sql_cancel = relink_review::SqlCancellation::new(&tx, cancel);
+        let unresolved:i64=tx.query_row("SELECT (SELECT COUNT(*) FROM storage_items WHERE plan=?1 AND status NOT IN ('matched','user_confirmed','excluded'))+(SELECT COUNT(*) FROM storage_source_items s JOIN storage_items i ON i.plan=s.plan AND i.sequence=s.sequence WHERE s.plan=?1 AND i.status!='excluded' AND s.status NOT IN ('matched','excluded','historical'))",[plan],|r|r.get(0))?;
         ensure!(
             unresolved == 0,
             "relink requires review of unmatched assets or metadata sources"
@@ -1154,17 +1146,19 @@ impl Catalog {
                     && current.old_binding == data.old_binding,
                 "asset changed after planning"
             );
-            verify_destination(data.destination.as_ref(), data.evidence.as_ref())?;
+            verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
             visit_sources(&tx, plan, sequence, |source, status, data| {
                 check_source_snapshot(&tx, source, data, false, false)?;
                 if status == "matched" && !data.embedded {
-                    verify_destination(data.destination.as_ref(), data.evidence.as_ref())?;
+                    verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
                 }
                 Ok(())
             })?;
+            relink_review::check_cancel(cancel)?;
             boundary(RelinkBoundary::Verified(sequence))?;
             Ok(())
         })?;
+        relink_review::check_cancel(cancel)?;
         boundary(RelinkBoundary::BeforeMutation)?;
         visit_items(&tx, plan, |_, asset, _| {
             record_predecessor(&tx, plan, asset)
@@ -1207,7 +1201,10 @@ impl Catalog {
                     file_key: data.evidence.as_ref().map(Evidence::key),
                 },
             )?;
-            visit_sources(&tx, plan, sequence, |source, _, data| {
+            visit_sources(&tx, plan, sequence, |source, status, data| {
+                if status == "historical" {
+                    return Ok(());
+                }
                 put_source_tag(
                     &tx,
                     source,
@@ -1253,17 +1250,19 @@ impl Catalog {
                 advance_metadata(&tx, asset, "storage_relink", plan)?;
             }
             crate::organization::refresh(&tx, asset)?;
+            relink_review::record_association(&tx, plan, asset, data)?;
             record_applied(&tx, plan, asset)?;
+            relink_review::check_cancel(cancel)?;
             boundary(RelinkBoundary::Updated(sequence))?;
             Ok(())
         })?;
         // Recheck all bytes and object identities immediately before commit;
         // no database/filesystem atomicity is claimed after this observation.
         visit_items(&tx, plan, |sequence, _, data| {
-            verify_destination(data.destination.as_ref(), data.evidence.as_ref())?;
+            verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
             visit_sources(&tx, plan, sequence, |_, status, data| {
                 if status == "matched" && !data.embedded {
-                    verify_destination(data.destination.as_ref(), data.evidence.as_ref())?;
+                    verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
                 }
                 Ok(())
             })?;
@@ -1274,7 +1273,10 @@ impl Catalog {
             "UPDATE storage_plans SET state='applied',applied_epoch=?2 WHERE id=?1",
             params![plan, epoch(&tx)?],
         )?;
+        relink_review::check_cancel(cancel)?;
         boundary(RelinkBoundary::BeforeCommit)?;
+        relink_review::check_cancel(cancel)?;
+        drop(sql_cancel);
         tx.commit()?;
         drop(_write);
         self.relink_plan(plan)
@@ -1288,6 +1290,26 @@ impl Catalog {
         plan: &str,
         mut boundary: impl FnMut(RelinkBoundary) -> Result<()>,
     ) -> Result<RelinkPlan> {
+        self.undo_relink_internal(plan, &AtomicBool::new(false), &mut boundary)
+    }
+    pub fn undo_relink_cancellable(
+        &mut self,
+        plan: &str,
+        cancel: &AtomicBool,
+        mut progress: impl FnMut(RelinkBoundary),
+    ) -> Result<RelinkPlan> {
+        self.undo_relink_internal(plan, cancel, &mut |b| {
+            progress(b);
+            relink_review::check_cancel(cancel)
+        })
+    }
+    fn undo_relink_internal(
+        &mut self,
+        plan: &str,
+        cancel: &AtomicBool,
+        boundary: &mut dyn FnMut(RelinkBoundary) -> Result<()>,
+    ) -> Result<RelinkPlan> {
+        relink_review::check_cancel(cancel)?;
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
@@ -1304,6 +1326,7 @@ impl Catalog {
             return self.relink_plan(plan);
         }
         ensure!(state == "applied", "only an applied relink can be undone");
+        let sql_cancel = relink_review::SqlCancellation::new(&tx, cancel);
         // Undo restores references even if originals are still offline. It never
         // writes/moves files, resurrects old metadata values, or decrements versions.
         visit_items(&tx, plan, |sequence, asset, data| {
@@ -1324,7 +1347,7 @@ impl Catalog {
                     && serde_json::from_str::<AppliedState>(&after)? == state_of(&tx, asset)?,
                 "undo is stale: affected asset, binding, edit, or relink lineage changed"
             );
-            let collision:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets a WHERE a.location=?1 AND a.id!=?2 AND NOT EXISTS(SELECT 1 FROM storage_items i WHERE i.plan=?3 AND i.asset_id=a.id AND i.status='matched'))",params![data.old_location,asset,plan],|r|r.get(0))?;
+            let collision:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets a WHERE a.location=?1 AND a.id!=?2 AND NOT EXISTS(SELECT 1 FROM storage_items i WHERE i.plan=?3 AND i.asset_id=a.id AND i.status IN ('matched','user_confirmed')))",params![data.old_location,asset,plan],|r|r.get(0))?;
             ensure!(
                 !collision,
                 "old destination belongs to another asset; undo refused"
@@ -1346,9 +1369,11 @@ impl Catalog {
                 check_source_snapshot(&tx, source, data, true, status == "matched")?;
                 Ok(())
             })?;
+            relink_review::check_cancel(cancel)?;
             boundary(RelinkBoundary::Verified(sequence))?;
             Ok(())
         })?;
+        relink_review::check_cancel(cancel)?;
         boundary(RelinkBoundary::BeforeMutation)?;
         visit_items(&tx, plan, |_, asset, _| {
             tx.execute(
@@ -1388,7 +1413,9 @@ impl Catalog {
                     tx.execute("UPDATE metadata_sources SET locator=?2,display=?3,availability=?4 WHERE id=?1",params![source,data.old_locator,data.old_display,data.old_availability])?;
                     publish_source_state(&tx, source)?;
                 }
-                put_source_tag(&tx, source, data.old_tag.as_ref())?;
+                if status != "historical" {
+                    put_source_tag(&tx, source, data.old_tag.as_ref())?;
+                }
                 Ok(())
             })?;
             if changed || sources_changed(&tx, plan, sequence)? {
@@ -1396,12 +1423,16 @@ impl Catalog {
             }
             crate::organization::refresh(&tx, asset)?;
             restore_predecessor(&tx, plan, asset)?;
+            relink_review::check_cancel(cancel)?;
             boundary(RelinkBoundary::Updated(sequence))?;
             Ok(())
         })?;
         crate::catalog_images::step_refresh(&tx, 32)?;
         tx.execute("UPDATE storage_plans SET state='undone' WHERE id=?", [plan])?;
+        relink_review::check_cancel(cancel)?;
         boundary(RelinkBoundary::BeforeCommit)?;
+        relink_review::check_cancel(cancel)?;
+        drop(sql_cancel);
         tx.commit()?;
         drop(_write);
         self.relink_plan(plan)
@@ -1517,6 +1548,8 @@ fn load_item(db: &Connection, asset: &str) -> Result<ItemData> {
         destination: None,
         evidence: None,
         binding: None,
+        expected_identity: None,
+        identity_basis: String::new(),
     })
 }
 fn exception(
@@ -1539,7 +1572,7 @@ fn visit_items(
     plan: &str,
     mut visit: impl FnMut(i64, &str, &ItemData) -> Result<()>,
 ) -> Result<()> {
-    let mut stmt=db.prepare("SELECT sequence,asset_id,data FROM storage_items WHERE plan=? AND status='matched' ORDER BY sequence")?;
+    let mut stmt=db.prepare("SELECT sequence,asset_id,data FROM storage_items WHERE plan=? AND status IN ('matched','user_confirmed') ORDER BY sequence")?;
     for row in stmt.query_map([plan], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -1624,7 +1657,7 @@ fn check_source_snapshot(
     } else {
         data.old_locator.clone()
     };
-    let expected_tag = if applied {
+    let expected_tag = if applied && !data.historical {
         Some(SourceTag {
             native: if moved {
                 data.destination.clone()
@@ -1908,6 +1941,8 @@ fn evaluate(
     paths: &[NativePath],
     expected: Option<&str>,
     catalog_root: &Path,
+    allow_unverified: bool,
+    cancel: &AtomicBool,
 ) -> (
     MatchStatus,
     String,
@@ -1922,7 +1957,7 @@ fn evaluate(
             continue;
         }
         let checked = path.to_path().map_err(anyhow::Error::from).and_then(|p| {
-            let evidence = read_evidence(&p)?;
+            let evidence = read_evidence(&p, cancel)?;
             let canonical = fs::canonicalize(&p)?;
             ensure!(
                 !canonical.starts_with(catalog_root),
@@ -1935,11 +1970,23 @@ fn evaluate(
             Ok((NativePath::from_path(&canonical), evidence))
         });
         match checked {
-            Ok((canonical, evidence)) if expected == Some(evidence.hash.as_str()) => {
+            Ok((canonical, evidence))
+                if expected == Some(evidence.hash.as_str())
+                    || (expected.is_none() && allow_unverified) =>
+            {
                 candidates.push(Candidate {
                     path: path.clone(),
-                    status: MatchStatus::Matched,
-                    detail: "Full content digest matches".into(),
+                    status: if expected.is_some() {
+                        MatchStatus::Matched
+                    } else {
+                        MatchStatus::Unverified
+                    },
+                    detail: if expected.is_some() {
+                        "Full content digest matches"
+                    } else {
+                        "No retained original digest; explicit association acknowledgement required"
+                    }
+                    .into(),
                 });
                 matches.push((canonical, evidence));
             }
@@ -1971,8 +2018,17 @@ fn evaluate(
     }
     if matches.len() == 1 {
         (
-            MatchStatus::Matched,
-            "Unique verified candidate".into(),
+            if expected.is_some() {
+                MatchStatus::Matched
+            } else {
+                MatchStatus::Unverified
+            },
+            if expected.is_some() {
+                "Unique verified candidate"
+            } else {
+                "Unique readable candidate; historical identity is unverified"
+            }
+            .into(),
             candidates,
             matches.pop(),
         )
@@ -1996,121 +2052,6 @@ fn evaluate(
         };
         (status, "No verified candidate".into(), candidates, None)
     }
-}
-fn prepare_sources(
-    db: &Connection,
-    plan: &str,
-    sequence: i64,
-    asset: &str,
-    request: &RelinkScope,
-    item: &ItemData,
-    catalog_root: &Path,
-) -> Result<()> {
-    let mut stmt=db.prepare("SELECT s.id,s.kind,s.locator,s.display,s.availability,s.current_observation,o.provenance FROM metadata_sources s LEFT JOIN metadata_observations o ON o.id=s.current_observation WHERE s.asset_id=?1 AND s.kind IN ('embedded','sidecar') ORDER BY s.id")?;
-    for row in stmt.query_map([asset], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Vec<u8>>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, Option<i64>>(5)?,
-            r.get::<_, Option<String>>(6)?,
-        ))
-    })? {
-        let (id, kind, locator, display, availability, observation, provenance) = row?;
-        let override_paths = exception(db, plan, "source", &id.to_string())?;
-        let explicit_exclusion = override_paths.as_ref().is_some_and(Vec::is_empty);
-        let paths = if let Some(paths) = override_paths {
-            paths
-        } else if kind == "embedded" {
-            if locator == item.old_location {
-                item.destination.iter().cloned().collect()
-            } else {
-                vec![]
-            }
-        } else {
-            sidecar_paths(request, item, source_native(db, id, item, &locator)?)?
-        };
-        let expected = provenance
-            .map(|v| serde_json::from_str::<serde_json::Value>(&v))
-            .transpose()?
-            .and_then(|v| {
-                v.get("file_revision")
-                    .and_then(|v| v.get("blake3"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            });
-        let expected = if kind == "embedded" && observation.is_none() {
-            item.fingerprint.clone()
-        } else {
-            expected
-        };
-        let (status, detail, candidates, selected) = if explicit_exclusion {
-            (
-                MatchStatus::Excluded,
-                "Explicitly excluded".into(),
-                vec![],
-                None,
-            )
-        } else if kind == "embedded" && locator == item.old_location {
-            match (item.destination.as_ref(), item.evidence.as_ref()) {
-                (Some(path), Some(evidence))
-                    if expected.as_deref() == Some(evidence.hash.as_str()) =>
-                {
-                    (
-                        MatchStatus::Matched,
-                        "Embedded source follows its verified original".into(),
-                        vec![Candidate {
-                            path: path.clone(),
-                            status: MatchStatus::Matched,
-                            detail: "Same file evidence as original".into(),
-                        }],
-                        Some((path.clone(), evidence.clone())),
-                    )
-                }
-                _ => (
-                    MatchStatus::Mismatch,
-                    "Embedded observation does not match the planned original".into(),
-                    vec![],
-                    None,
-                ),
-            }
-        } else {
-            evaluate(&paths, expected.as_deref(), catalog_root)
-        };
-        let (destination, evidence) = selected
-            .map(|(p, e)| (Some(p), Some(e)))
-            .unwrap_or((None, None));
-        let data = SourceData {
-            embedded: kind == "embedded",
-            old_native: source_native(db, id, item, &locator)?,
-            old_tag: get_source_tag(db, id)?,
-            old_locator: locator,
-            old_display: display,
-            old_availability: availability,
-            observation,
-            candidates,
-            destination,
-            evidence,
-        };
-        db.execute(
-            "INSERT INTO storage_source_items VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                plan,
-                sequence,
-                id,
-                status.name(),
-                detail,
-                data.destination
-                    .as_ref()
-                    .map(|p| p.to_path().map(|p| location_bytes(&p)))
-                    .transpose()?,
-                json(&data)?
-            ],
-        )?;
-    }
-    Ok(())
 }
 fn sidecar_paths(
     request: &RelinkScope,
@@ -2180,22 +2121,22 @@ fn sidecar_paths(
 
     Ok(result)
 }
-const SOURCE_COLLISION: &str = "EXISTS(SELECT 1 FROM storage_source_items j JOIN metadata_sources js ON js.id=j.source_id JOIN metadata_sources ss ON ss.id=s.source_id WHERE j.plan=s.plan AND j.sequence=s.sequence AND j.source_id!=s.source_id AND j.status='matched' AND j.destination=s.destination AND js.kind=ss.kind) OR EXISTS(SELECT 1 FROM metadata_sources old JOIN metadata_sources own ON own.id=s.source_id WHERE old.asset_id=own.asset_id AND old.kind=own.kind AND old.locator=s.destination AND old.id!=own.id AND NOT EXISTS(SELECT 1 FROM storage_source_items j WHERE j.plan=s.plan AND j.source_id=old.id AND j.status='matched'))";
+const SOURCE_COLLISION: &str = "EXISTS(SELECT 1 FROM storage_source_items j JOIN metadata_sources js ON js.id=j.source_id JOIN metadata_sources ss ON ss.id=s.source_id WHERE j.plan=s.plan AND j.sequence=s.sequence AND j.source_id!=s.source_id AND j.status IN ('matched','user_confirmed') AND j.destination=s.destination AND js.kind=ss.kind) OR EXISTS(SELECT 1 FROM metadata_sources old JOIN metadata_sources own ON own.id=s.source_id WHERE old.asset_id=own.asset_id AND old.kind=own.kind AND old.locator=s.destination AND old.id!=own.id AND NOT EXISTS(SELECT 1 FROM storage_source_items j WHERE j.plan=s.plan AND j.source_id=old.id AND j.status IN ('matched','user_confirmed')))";
 fn mark_collisions(db: &Connection, plan: &str) -> Result<()> {
-    db.execute("UPDATE storage_items SET status='ambiguous',detail='Destination path or file object is shared by multiple selected assets' WHERE plan=?1 AND status='matched' AND (destination IN (SELECT destination FROM storage_items WHERE plan=?1 AND status='matched' GROUP BY destination HAVING COUNT(*)>1) OR file_key IN (SELECT file_key FROM storage_items WHERE plan=?1 AND status='matched' GROUP BY file_key HAVING COUNT(*)>1))",[plan])?;
-    db.execute("UPDATE storage_items SET status='ambiguous',detail='Destination already belongs to another unmoved asset' WHERE plan=?1 AND status='matched' AND EXISTS(SELECT 1 FROM assets a WHERE a.location=storage_items.destination AND a.id!=storage_items.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=?1 AND j.asset_id=a.id AND j.status='matched'))",[plan])?;
-    db.execute("UPDATE storage_items SET status='ambiguous',detail='Destination object belongs to another unmoved asset' WHERE plan=?1 AND status='matched' AND EXISTS(SELECT 1 FROM storage_bindings b WHERE b.file_key=storage_items.file_key AND b.asset_id!=storage_items.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=?1 AND j.asset_id=b.asset_id AND j.status='matched'))",[plan])?;
+    db.execute("UPDATE storage_items SET status='ambiguous',detail='Destination path or file object is shared by multiple selected assets' WHERE plan=?1 AND status IN ('matched','user_confirmed','unverified') AND (destination IN (SELECT destination FROM storage_items WHERE plan=?1 AND status IN ('matched','user_confirmed','unverified') GROUP BY destination HAVING COUNT(*)>1) OR file_key IN (SELECT file_key FROM storage_items WHERE plan=?1 AND status IN ('matched','user_confirmed','unverified') GROUP BY file_key HAVING COUNT(*)>1))",[plan])?;
+    db.execute("UPDATE storage_items SET status='ambiguous',detail='Destination already belongs to another unmoved asset' WHERE plan=?1 AND status IN ('matched','user_confirmed','unverified') AND EXISTS(SELECT 1 FROM assets a WHERE a.location=storage_items.destination AND a.id!=storage_items.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=?1 AND j.asset_id=a.id AND j.status IN ('matched','user_confirmed','unverified')))",[plan])?;
+    db.execute("UPDATE storage_items SET status='ambiguous',detail='Destination object belongs to another unmoved asset' WHERE plan=?1 AND status IN ('matched','user_confirmed','unverified') AND EXISTS(SELECT 1 FROM storage_bindings b WHERE b.file_key=storage_items.file_key AND b.asset_id!=storage_items.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=?1 AND j.asset_id=b.asset_id AND j.status IN ('matched','user_confirmed','unverified')))",[plan])?;
     db.execute(&format!("UPDATE storage_source_items AS s SET status='ambiguous',detail='Metadata locator collides with another source' WHERE s.plan=?1 AND s.status='matched' AND ({SOURCE_COLLISION})"),[plan])?;
     Ok(())
 }
 fn validate_collisions(db: &Connection, plan: &str) -> Result<()> {
-    let count:i64=db.query_row("SELECT COUNT(*) FROM storage_items i WHERE i.plan=?1 AND i.status='matched' AND (EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=i.plan AND j.status='matched' AND j.asset_id!=i.asset_id AND (j.destination=i.destination OR j.file_key=i.file_key)) OR EXISTS(SELECT 1 FROM assets a WHERE a.location=i.destination AND a.id!=i.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=i.plan AND j.asset_id=a.id AND j.status='matched')) OR EXISTS(SELECT 1 FROM storage_bindings b WHERE b.file_key=i.file_key AND b.asset_id!=i.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=i.plan AND j.asset_id=b.asset_id AND j.status='matched')))",[plan],|r|r.get(0))?;
+    let count:i64=db.query_row("SELECT COUNT(*) FROM storage_items i WHERE i.plan=?1 AND i.status IN ('matched','user_confirmed') AND (EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=i.plan AND j.status IN ('matched','user_confirmed') AND j.asset_id!=i.asset_id AND (j.destination=i.destination OR j.file_key=i.file_key)) OR EXISTS(SELECT 1 FROM assets a WHERE a.location=i.destination AND a.id!=i.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=i.plan AND j.asset_id=a.id AND j.status IN ('matched','user_confirmed'))) OR EXISTS(SELECT 1 FROM storage_bindings b WHERE b.file_key=i.file_key AND b.asset_id!=i.asset_id AND NOT EXISTS(SELECT 1 FROM storage_items j WHERE j.plan=i.plan AND j.asset_id=b.asset_id AND j.status IN ('matched','user_confirmed'))))",[plan],|r|r.get(0))?;
     ensure!(
         count == 0,
         "selected destination collision; revise the plan"
     );
     let sources: i64 = db.query_row(
-        &format!("SELECT COUNT(*) FROM storage_source_items s JOIN storage_items i ON i.plan=s.plan AND i.sequence=s.sequence WHERE s.plan=?1 AND s.status='matched' AND i.status='matched' AND ({SOURCE_COLLISION})"),
+        &format!("SELECT COUNT(*) FROM storage_source_items s JOIN storage_items i ON i.plan=s.plan AND i.sequence=s.sequence WHERE s.plan=?1 AND s.status='matched' AND i.status IN ('matched','user_confirmed') AND ({SOURCE_COLLISION})"),
         [plan], |r| r.get(0),
     )?;
     ensure!(
@@ -2215,10 +2156,14 @@ fn quick_evidence_matches(path: &Path, expected: &Evidence) -> Result<bool> {
             .as_nanos()
             == expected.modified_ns)
 }
-fn verify_destination(path: Option<&NativePath>, expected: Option<&Evidence>) -> Result<()> {
+fn verify_destination(
+    path: Option<&NativePath>,
+    expected: Option<&Evidence>,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let path = path.context("missing planned destination")?.to_path()?;
     ensure!(
-        Some(&read_evidence(&path)?) == expected,
+        Some(&read_evidence(&path, cancel)?) == expected,
         "destination content or file identity changed after preview: {}",
         path.display()
     );
@@ -2248,7 +2193,15 @@ fn open_regular(path: &Path) -> Result<File> {
     );
     Ok(file)
 }
-fn read_evidence(path: &Path) -> Result<Evidence> {
+fn read_evidence(path: &Path, cancel: &AtomicBool) -> Result<Evidence> {
+    read_evidence_with(path, cancel, |_| {})
+}
+fn read_evidence_with(
+    path: &Path,
+    cancel: &AtomicBool,
+    mut checkpoint: impl FnMut(u64),
+) -> Result<Evidence> {
+    relink_review::check_cancel(cancel)?;
     let mut file = open_regular(path)?;
     let before = file.metadata()?;
     let object = object_key(&file)?;
@@ -2261,12 +2214,14 @@ fn read_evidence(path: &Path) -> Result<Evidence> {
     let mut buf = [0; 65536];
     let mut bounded = (&mut file).take(before.len().saturating_add(1));
     loop {
+        relink_review::check_cancel(cancel)?;
         let n = bounded.read(&mut buf)?;
         if n == 0 {
             break;
         }
         count += n as u64;
         hasher.update(&buf[..n]);
+        checkpoint(count);
     }
     let after = file.metadata()?;
     let reopened = open_regular(path)?;
@@ -2294,6 +2249,10 @@ fn object_key(file: &File) -> Result<(u64, u64)> {
 #[cfg(windows)]
 fn object_key(file: &File) -> Result<(u64, u64)> {
     use std::os::windows::io::AsRawHandle;
+    object_key_handle(file.as_raw_handle())
+}
+#[cfg(windows)]
+fn object_key_handle(handle: *mut std::ffi::c_void) -> Result<(u64, u64)> {
     #[repr(C)]
     struct Info {
         attributes: u32,
@@ -2312,7 +2271,7 @@ fn object_key(file: &File) -> Result<(u64, u64)> {
         fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut Info) -> i32;
     }
     let mut info = std::mem::MaybeUninit::<Info>::uninit();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+    if unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) } == 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     let info = unsafe { info.assume_init() };
@@ -2324,6 +2283,60 @@ fn object_key(file: &File) -> Result<(u64, u64)> {
         info.volume as u64,
         ((info.index_high as u64) << 32) | info.index_low as u64,
     ))
+}
+
+/// Capture only fenced initial hydration; ordinary preview publication acquires no undo authority.
+pub(crate) fn relink_hydration_state(db: &Connection, asset: &str) -> Result<Option<String>> {
+    let fenced: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM storage_source_fences WHERE asset_id=?)",
+        [asset],
+        |r| r.get(0),
+    )?;
+    if fenced {
+        Ok(Some(json(&state_of(db, asset)?)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Verify SQLite's actual open object, not merely the pathname before/after open.
+pub(crate) fn verify_database_object(db: &Connection, held: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut moved = 0i32;
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                db.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                (&mut moved as *mut i32).cast(),
+            )
+        };
+        ensure!(
+            code == rusqlite::ffi::SQLITE_OK && moved == 0,
+            "SQLite selected database object changed or cannot be verified"
+        );
+        let _ = held;
+    }
+    #[cfg(windows)]
+    {
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                db.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+                (&mut handle as *mut *mut std::ffi::c_void).cast(),
+            )
+        };
+        ensure!(
+            code == rusqlite::ffi::SQLITE_OK
+                && !handle.is_null()
+                && object_key_handle(handle)? == object_key(held)?,
+            "SQLite selected database object changed or cannot be verified"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

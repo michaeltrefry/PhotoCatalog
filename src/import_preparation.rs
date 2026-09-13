@@ -304,6 +304,11 @@ impl Reference {
     pub(crate) fn begin(catalog: &mut Catalog, header: Header) -> Result<Self> {
         crate::catalog_backup::require_jobs_released(&catalog.root)?;
         let location = location_bytes(&header.path);
+        crate::catalog_storage::verify_location_fence(
+            &catalog.db,
+            &location,
+            Some(&header.fingerprint),
+        )?;
         ensure!(
             header.observation.requested_path == NativePath::from_path(&header.path),
             "volume observation path differs"
@@ -628,6 +633,73 @@ mod tests {
             serde_json::to_value(&after)?,
             serde_json::to_value(&before)?
         );
+        Ok(())
+    }
+    #[test]
+    fn reviewed_initial_source_fence_rejects_both_import_paths_before_any_mutation() -> Result<()> {
+        use crate::catalog_storage::RelinkScope;
+        let temp = tempfile::tempdir()?;
+        let originals = temp.path().join("originals");
+        fs::create_dir(&originals)?;
+        let path = originals.canonicalize()?.join("one.png");
+        image::RgbImage::from_pixel(24, 16, image::Rgb([20u8, 40, 70])).save(&path)?;
+        let old = temp.path().join("missing/one.png");
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        catalog.db.execute(
+            "INSERT INTO assets(id,location,path_display,state) VALUES('pending',?1,?2,'pending')",
+            params![location_bytes(&old), old.to_string_lossy()],
+        )?;
+        let key = VariantKey::master("pending");
+        let copy = catalog.create_edit_variant(&key, 0, "retained copy")?;
+        catalog.save_edit_recipe(
+            &copy.key,
+            0,
+            &Recipe::V1(RecipeV1 {
+                exposure_ev: 1.5,
+                ..Default::default()
+            }),
+        )?;
+        let plan = catalog.begin_relink_review(RelinkScope::Asset {
+            asset_id: key.asset_id.clone(),
+            destinations: vec![NativePath::from_path(&path)],
+        })?;
+        let plan = catalog.prepare_relink_batch(&plan.id, 1)?;
+        catalog.confirm_relink_associations(
+            &plan.id,
+            plan.revision,
+            plan.confirmation_token.as_deref().unwrap(),
+            "no_retained_original_digest",
+        )?;
+        catalog.apply_relink(&plan.id)?;
+        image::RgbImage::from_pixel(24, 16, image::Rgb([70u8, 40, 20])).save(&path)?;
+        let changed_bytes = fs::read(&path)?;
+        let changes = catalog.db.total_changes();
+        let error = Reference::begin(
+            &mut catalog,
+            Header {
+                path: path.clone(),
+                fingerprint: crate::fingerprint(&path)?,
+                observation: observation(&path, Path::new("one.png")),
+            },
+        )
+        .err()
+        .context("changed reviewed source admitted")?;
+        assert!(error.to_string().contains("user-reviewed"), "{error:#}");
+        assert_eq!(catalog.db.total_changes(), changes);
+        let mut volumes = crate::import_storage::ImportVolumes::new();
+        let mut report = crate::ImportReport::default();
+        let error = catalog
+            .import_file(&path, &mut volumes, &mut report, &mut |_| Ok(()), &mut None)
+            .unwrap_err();
+        assert!(error.to_string().contains("user-reviewed"), "{error:#}");
+        assert_eq!(catalog.db.total_changes(), changes);
+        assert_eq!(fs::read(&path)?, changed_bytes);
+        fs::remove_file(&path)?;
+        let error = catalog
+            .import_file(&path, &mut volumes, &mut report, &mut |_| Ok(()), &mut None)
+            .unwrap_err();
+        assert!(error.to_string().contains("user-reviewed"), "{error:#}");
+        assert_eq!(catalog.db.total_changes(), changes);
         Ok(())
     }
 }

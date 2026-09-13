@@ -475,6 +475,17 @@ impl SavedJob {
     }
     fn current(&self, catalog: &Catalog) -> Result<bool> {
         if let Some(image) = &self.hydration {
+            for key in &self.request.keys {
+                if crate::catalog_storage::hydration_fence(
+                    &catalog.db,
+                    &image.key.asset_id,
+                    &key.fingerprint,
+                )
+                .is_err()
+                {
+                    return Ok(false);
+                }
+            }
             return Ok(crate::initial_hydration_source(
                 &catalog.db,
                 &image.key.asset_id,
@@ -963,6 +974,11 @@ impl PreviewService {
             crate::initial_hydration_source(&catalog.db, &image.key.asset_id, request.source)?,
             "original is not an initial metadata-only source at this path"
         );
+        crate::catalog_storage::hydration_fence(
+            &catalog.db,
+            &image.key.asset_id,
+            request.fingerprint,
+        )?;
         let view = catalog.edit_variant(request.variant)?;
         ensure!(
             view.revision == image.revision && view.recipe_digest == image.recipe_digest,
@@ -1139,6 +1155,13 @@ impl PreviewService {
                     crate::initial_hydration_source(tx, &image.key.asset_id, &job.request.source)?,
                     "initial hydration source changed"
                 );
+                for key in &job.request.keys {
+                    crate::catalog_storage::hydration_fence(
+                        tx,
+                        &image.key.asset_id,
+                        &key.fingerprint,
+                    )?;
+                }
                 persist()
             })?
         } else if let Some(edit) = &job.edit {

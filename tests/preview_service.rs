@@ -1621,3 +1621,6 @@ fn hydration_crash_recovery_rechecks_source_and_never_retargets_edits_or_paths()
         }
     }
 }
+
+#[path = "preview_service/relink.rs"]
+mod relink;
