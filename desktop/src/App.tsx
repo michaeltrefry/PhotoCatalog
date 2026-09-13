@@ -11,6 +11,7 @@ import { SearchFilters, defaultFilters } from './components/SearchFilters';
 import { ImportPanel } from './components/ImportPanel';
 import { PhotoGrid, Filmstrip } from './components/PhotoGrid';
 import { RecipeControls } from './components/RecipeControls';
+import { CompatibilityStatus } from './components/CompatibilityStatus';
 import { Viewport } from './components/Viewport';
 import { EditQueue, type EditSnapshot } from './state/editQueue';
 import { ActionGate } from './state/actionGate';
@@ -221,7 +222,7 @@ export function App() {
           <footer className="page-controls"><button disabled={loading || previous.length === 0} onClick={() => { setCursor(previous.at(-1)!); setPrevious(value => value.slice(0, -1)); }}>Previous</button><button disabled={loading || !page.has_more || !page.next} onClick={() => { setPrevious(value => [...value.slice(-7), cursor]); setCursor(page.next); }}>Next</button><button disabled={loading || scope === undefined} onClick={() => { setCursor(null); setPrevious([]); setRefresh(value => value + 1); }}>Refresh view</button><span>{selected?.filename || 'No selection'}</span></footer>
         </section>
         {showInspector && <aside className="right-panel">{selected && editor ? <>
-          <Section title="Selected photo"><div className="selected-filename">{selected.filename}</div>{editor.variant.label && <p className="hint">{editor.variant.label}</p>}<div className="rating-buttons" aria-label="Rating">{[0, 1, 2, 3, 4, 5].map(value => <button key={value} aria-label={`${value} stars`} aria-pressed={selected.rating === String(value)} onClick={() => void cull({ operation: 'rating', value }, false)}>{value === 0 ? '—' : '★'}</button>)}</div>
+          <Section title="Selected photo"><div className="selected-filename">{selected.filename}</div><CompatibilityStatus image={selected} selectedKey={editor.variant.key} />{editor.variant.label && <p className="hint">{editor.variant.label}</p>}<div className="rating-buttons" aria-label="Rating">{[0, 1, 2, 3, 4, 5].map(value => <button key={value} aria-label={`${value} stars`} aria-pressed={selected.rating === String(value)} onClick={() => void cull({ operation: 'rating', value }, false)}>{value === 0 ? '—' : '★'}</button>)}</div>
           <div className="button-group"><button aria-pressed={selected.flag === 'pick'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'pick' ? 'unflagged' : 'pick' }, false)}>Pick</button><button aria-pressed={selected.flag === 'reject'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'reject' ? 'unflagged' : 'reject' }, false)}>Reject</button></div>
           {selected.conflicts.length > 0 && <p className="hint">Conflicting metadata: {selected.conflicts.join(', ')}</p>}{selected.metadata_pending && <p className="hint">Metadata indexing is pending.</p>}</Section>
           {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={transitioning} recipe={editor.recipe} onChange={value => { if (!gate.current.locked) queueRef.current?.change(value); }} />

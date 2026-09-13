@@ -3,7 +3,7 @@ const { command } = vi.hoisted(() => ({ command: vi.fn() }));
 vi.mock('./bridge', () => ({ command }));
 import { nonnegativeDecimal, organize, selectionPage, jobName, type MembershipCursor } from './organization';
 import type { GridImage } from './bridge';
-const photo = (variant: string): GridImage => ({ image_id: `image-${variant}`, key: { asset_id: 'same original', variant_id: variant }, sequence: '9007199254740993', metadata_revision: '9223372036854775806', metadata_pending: false, state: 'ready', filename: 'photo.raw', rating: null, flag: 'unflagged', label: '', conflicts: [] });
+const photo = (variant: string): GridImage => ({ image_id: `image-${variant}`, key: { asset_id: 'same original', variant_id: variant }, sequence: '9007199254740993', metadata_revision: '9223372036854775806', metadata_pending: false, origin: 'native', translation_state: 'native', state: 'ready', filename: 'photo.raw', rating: null, flag: 'unflagged', label: '', conflicts: [] });
 describe('organization review identity and wire contract', () => {
   it('preserves variants and exact reviewed revisions while copying the chosen page', () => {
     const original = photo('original'); const copy = photo('copy');

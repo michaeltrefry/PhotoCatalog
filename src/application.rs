@@ -1213,26 +1213,10 @@ impl Actor {
                 let image = core!(o.catalog.image(&key));
                 let identity = core!(o.catalog.image_metadata_identity(&key));
                 let v = core!(o.catalog.grid_image(&key, limits.page_bytes.min(16 * 1024)));
-                if v.image_id != image.id
-                    || v.asset_id != key.asset_id
-                    || v.variant_id != key.variant_id
-                {
-                    return Err(error(ErrorCode::Native, "logical image identity changed"));
-                }
-                Ok(Response::Image(GridImage {
-                    image_id: v.image_id,
-                    key,
-                    sequence: I64(v.sequence),
-                    metadata_revision: I64(identity.metadata_revision),
-                    metadata_pending: v.metadata_pending
-                        || v.metadata_revision != identity.metadata_revision,
-                    state: v.state,
-                    filename: v.filename,
-                    rating: v.rating.map(I64),
-                    flag: v.flag,
-                    label: v.label,
-                    conflicts: v.conflicts,
-                }))
+                let mut value = browse::grid_image(v, image)?;
+                value.metadata_pending |= value.metadata_revision.0 != identity.metadata_revision;
+                value.metadata_revision = I64(identity.metadata_revision);
+                Ok(Response::Image(Box::new(value)))
             }
             Request::Variant { catalog, key } => Ok(Response::Variant(variant(core!(
                 self.current(&catalog)?.catalog.edit_variant(&key)

@@ -252,6 +252,8 @@ pub struct Folder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridImage {
     pub image_id: String,
+    pub origin: String,
+    pub translation_state: String,
     pub key: VariantKey,
     pub sequence: I64,
     pub metadata_revision: I64,
@@ -322,7 +324,7 @@ pub enum Response {
         page_complete: bool,
         scanned: u32,
     },
-    Image(GridImage),
+    Image(Box<GridImage>),
     Variant(Variant),
     Variants {
         rows: Vec<(I64, Variant)>,
