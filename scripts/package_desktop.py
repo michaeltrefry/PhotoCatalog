@@ -281,11 +281,18 @@ def package_macos(source_app, output, manifest, dmg=False):
         image_root = output / 'image-root'
         image_root.mkdir()
         shutil.copytree(app, image_root / app.name, symlinks=True)
-        (image_root / 'Applications').symlink_to('/Applications')
+        applications = image_root / 'Applications'
+        applications.symlink_to('/Applications')
         image = output / (source_app.stem + '.dmg')
-        run('hdiutil', 'create', '-volname', source_app.stem, '-srcfolder', image_root,
-            '-format', 'UDZO', image)
-        run('hdiutil', 'verify', image)
+        try:
+            run('hdiutil', 'create', '-volname', source_app.stem, '-srcfolder', image_root,
+                '-format', 'UDZO', image)
+            run('hdiutil', 'verify', image)
+        finally:
+            # The disk image retains the install shortcut. Artifact collectors
+            # must not follow this staging link into the runner's applications,
+            # including when image creation or verification fails.
+            applications.unlink()
         write_json(output / 'dmg.json', {'sha256': sha256(image), 'launch_tested': False})
     return report
 

@@ -12,6 +12,34 @@ import package_desktop as p
 
 
 class StageTests(unittest.TestCase):
+    def test_windows_notices_follow_installed_ports_not_generic_share_directories(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); vcpkg = root/'vcpkg'; triplet = 'x64-windows-static-md'
+            inventory = vcpkg/'installed/vcpkg/info'; inventory.mkdir(parents=True)
+            share = vcpkg/'installed'/triplet/'share'
+            for name in ('zlib', 'doc'):
+                (share/name).mkdir(parents=True)
+            copyright_file = share/'zlib/copyright'; copyright_file.write_bytes(b'exact zlib terms')
+            (inventory/f'zlib_1.3.1_{triplet}.list').write_text(f'{triplet}/share/zlib/copyright\n')
+            (inventory/'host-tool_1.0_x64-windows.list').write_text('other triplet\n')
+            vs = root/'vs'; (vs/'Licenses').mkdir(parents=True)
+            (vs/'Licenses/terms.txt').write_bytes(b'exact runtime terms')
+            native = root/'native'; native.mkdir()
+            args = SimpleNamespace(vcpkg=vcpkg, visual_studio=vs)
+            manifest = stage.native_notices('windows', args, native, {'library_origins': {}}, root/'notices')
+            value = json.loads(manifest.read_text())
+            files = value['components'][0]['files']
+            self.assertEqual(len(files), 1)
+            self.assertEqual((manifest.parent/files[0]['path']).read_bytes(), b'exact zlib terms')
+            # An actually installed port still must have its copyright material.
+            copyright_file.unlink()
+            with self.assertRaisesRegex(p.PackageError, 'copyright absent: zlib'):
+                stage.native_notices('windows', args, native, {'library_origins': {}}, root/'missing')
+            (inventory/f'zlib_1.3.1_{triplet}.list').unlink()
+            with self.assertRaisesRegex(p.PackageError, 'inventory absent'):
+                stage.installed_vcpkg_ports(vcpkg, triplet)
+
     def test_windows_requires_explicit_os_contract_not_developer_dll(self):
         self.assertTrue(stage.system_windows('KERNEL32.dll'))
         self.assertTrue(stage.system_windows('api-ms-win-core-memory-l1-1-0.dll'))

@@ -160,6 +160,22 @@ def libraw_source(vcpkg):
     return files
 
 
+def installed_vcpkg_ports(vcpkg, triplet):
+    # share/ also contains generic data directories (for example doc), so only
+    # vcpkg's installed package file lists establish which ports require notices.
+    manifests = sorted((vcpkg/'installed/vcpkg/info').glob(f'*_{triplet}.list'))
+    p.require(manifests, f'vcpkg installed port inventory absent: {triplet}')
+    ports = set()
+    for manifest in manifests:
+        p.regular(manifest)
+        match = re.fullmatch(r'([a-z0-9][a-z0-9-]*)_.+_' + re.escape(triplet) + r'\.list', manifest.name)
+        p.require(match is not None, f'invalid vcpkg installed port manifest: {manifest.name}')
+        name = match[1]
+        p.require(name not in ports, f'ambiguous vcpkg installed port: {name}')
+        ports.add(name)
+    return [vcpkg/'installed'/triplet/'share'/name for name in sorted(ports)]
+
+
 def native_notices(platform, args, native, provenance, output):
     output.mkdir()
     libraries = [f.name for f in native.iterdir()]
@@ -172,8 +188,7 @@ def native_notices(platform, args, native, provenance, output):
         provenance['sdk_source_license'] = str(source/'LICENSE')
     else:
         vcpkg_material = {}
-        for directory in sorted((args.vcpkg/'installed/x64-windows-static-md/share').iterdir()):
-            if not directory.is_dir(): continue
+        for directory in installed_vcpkg_ports(args.vcpkg, 'x64-windows-static-md'):
             copyright_file = directory/'copyright'
             p.require(copyright_file.is_file(), f'vcpkg installed port copyright absent: {directory.name}')
             files = {'copyright': copyright_file.read_bytes()}

@@ -145,6 +145,28 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(p.PackageError, 'new directory'):
             p.package_macos(info.parent.parent, output, self.manifest())
 
+    def test_failed_dmg_does_not_leave_artifact_link_into_runner_applications(self):
+        for failure in ('create', 'verify'):
+            with self.subTest(failure=failure):
+                exe = self.file(f'{failure}/App.app/Contents/MacOS/app')
+                info = self.file(f'{failure}/App.app/Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'app'}))
+                output = self.root/f'{failure}-output'
+                def tool(*args):
+                    if args[:2] == ('hdiutil', 'create'):
+                        image_root = args[args.index('-srcfolder') + 1]
+                        self.assertEqual((image_root/'Applications').readlink(), Path('/Applications'))
+                    if args[:2] == ('hdiutil', failure):
+                        raise p.PackageError(f'{failure} failed')
+                    return ''
+                with patch.object(p, 'mac_closure', return_value={exe: {'edges': {}, 'rpaths': []}}), \
+                        patch.object(p, 'raise_mac_floor', return_value='12.0'), \
+                        patch.object(p, 'mac_audit', return_value={}), patch.object(p, 'run', side_effect=tool):
+                    with self.assertRaisesRegex(p.PackageError, f'{failure} failed'):
+                        p.package_macos(info.parent.parent, output, self.manifest(), True)
+                self.assertFalse((output/'image-root/Applications').is_symlink())
+                self.assertTrue((output/'image-root/App.app/Contents/MacOS/app').is_file())
+                self.assertFalse((output/'dmg.json').exists())
+
     def test_macos_finalizes_new_copy_before_dmg_and_signs_inside_out(self):
         exe = self.file('App.app/Contents/MacOS/app')
         info = self.file('App.app/Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'app', 'LSMinimumSystemVersion': '12.0'}))
@@ -182,6 +204,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(p.sha256(exe), before)
         self.assertEqual(result['status'], 'PASS_DEPENDENCY_CLOSURE_ONLY')
         self.assertTrue((output / 'dmg.json').is_file())
+        self.assertFalse((output / 'image-root/Applications').is_symlink())
         self.assertEqual(result['declared_minimum'], '26.0')
         self.assertEqual(plistlib.loads(info.read_bytes())['LSMinimumSystemVersion'], '12.0')
         self.assertEqual(states[target_exe][0], ['@executable_path/../Frameworks/liba.dylib'])
