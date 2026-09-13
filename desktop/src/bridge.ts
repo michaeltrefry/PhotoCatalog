@@ -1,3 +1,4 @@
+import type { Request as ExportRequest, Response as ExportResponse } from './photoExport';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Recipe } from './recipe';
 import type { OrganizationRequest, OrganizationResponse } from './organization';
@@ -25,6 +26,7 @@ type AtCatalog = { catalog: string };
 type AtVariant = AtCatalog & { key: VariantKey };
 type AtRevision = AtVariant & { expected_revision: Decimal };
 export type Request =
+  | { command: 'export'; args: AtCatalog & { request: ExportRequest } }
   | { command: 'edit_copy'; args: AtCatalog & { request: CopyRequest } }
   | { command: 'relink'; args: AtCatalog & { request: RelinkRequest } }
   | { command: 'metadata'; args: AtCatalog & { request: MetadataRequest } }
@@ -54,6 +56,7 @@ export type Request =
   | { command: 'release_viewport'; args: AtCatalog & { viewport: string; generation: Decimal } }
   | { command: 'preview_status' | 'cancel_preview'; args: AtCatalog & { ticket: string } };
 export interface Data {
+  export: ExportResponse;
   edit_copy: CopyResponse;
   relink: RelinkResponse;
   metadata: MetadataResponse;
@@ -103,7 +106,7 @@ export async function chooseFolder(createCatalog = false): Promise<{ path: Nativ
 
 export async function chooseSource(): Promise<{ path: NativePath; display: string } | null> { return chooseLocation('originals'); }
 
-export async function chooseLocation(purpose: 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
+export async function chooseLocation(purpose: 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
 
 export async function previewBlob(catalog: string, ticket: string): Promise<Blob> {
   const handoff = crypto.randomUUID();
