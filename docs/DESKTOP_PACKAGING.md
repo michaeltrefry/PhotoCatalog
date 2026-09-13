@@ -1,0 +1,211 @@
+# PhotoCatalog desktop packages
+
+The desktop app lives in `desktop/src-tauri` and its executable is
+`photocatalog-desktop`. Native preview and photo-export workers run through that
+same installed executable, with `--preview-worker` and `--photo-export-worker`
+handled **before** webview initialization. Worker paths must come from
+`std::env::current_exe()`, not the checkout, current directory, or `PATH`.
+
+`scripts/package_desktop.py` finalizes a macOS app or checks the native closure
+of an extracted Linux/Windows install payload. It does not build, download,
+install, publish, use signing credentials, or execute inspected binaries.
+Reports say `PASS_DEPENDENCY_CLOSURE_ONLY`; installed launch/worker validation
+is a separate gate. The script uses Python's standard library (Python 3.9+).
+
+## macOS sequence
+
+Use the repository's pinned Rust/native dependencies and the desktop's locked
+frontend/Tauri dependencies. Build on the intended target architecture; an arm64
+build is not a universal build. Reserve install-name space when linking, for
+example by adding `-C link-arg=-Wl,-headerpad_max_install_names` to the desktop
+build's existing `RUSTFLAGS` (do not discard existing flags).
+
+From `desktop/`, after the frontend dependency install:
+
+```sh
+npm exec tauri build -- --no-bundle
+npm exec tauri bundle -- --bundles app
+```
+
+Use the actual Cargo target directory from that build; it need not be the
+repository's default. Then, from the repository root:
+
+```sh
+python3 scripts/package_desktop.py macos \
+  --app /absolute/target/release/bundle/macos/PhotoCatalog.app \
+  --output /absolute/new-private-package-directory \
+  --notices /absolute/reviewed-notices/manifest.json \
+  --dmg
+```
+
+Tauri's [separate bundle command](https://v2.tauri.app/reference/cli/) operates on
+an already-built executable. Its [macOS framework configuration](https://v2.tauri.app/distribute/macos-application-bundle/)
+copies specified libraries; the native linker paths still require attention.
+For this workflow leave `bundle.macOS.frameworks` empty for the image-library
+closure. The script discovers these libraries itself. Do not subsequently ask
+Tauri to rebuild the finalized app while generating a DMG.
+
+The finalizer resolves recursive `otool` dependencies, including inherited
+`@rpath` paths anchored to their declaring loader. It copies the input app into
+a **new** output directory, copies non-system dylibs into `Contents/Frameworks`,
+rewrites executable edges to `@executable_path/../Frameworks`, rewrites library
+edges to `@loader_path`, and removes previous rpaths. System libraries under
+`/usr/lib` and `/System/Library` remain system dependencies. Custom third-party
+framework bundles require explicit support and currently fail this finalizer;
+they are not flattened into fake dylibs.
+
+Every copied library must support every architecture in the main executable.
+The report preserves each file's `vtool -show-build` output: review the maximum
+native minimum-OS requirement before declaring a deployment baseline. It is
+not enough to read the executable's minimum OS alone. Missing or ambiguous
+libraries, basename collisions, insufficient install-name space, escaping
+symlinks, external final load paths, and missing license coverage fail.
+
+The finalizer signs dylibs and the executable, then the app, using an ad-hoc
+identity and verifies the result. This is local validation signing, **not**
+Developer ID signing, notarization, or Gatekeeper distribution qualification.
+It does not preserve a preexisting release-signing/notarization identity; use
+this on the local Tauri app before release signing. A release-signing pipeline
+must preserve required entitlements and sign the finalized content separately.
+A DMG is created from the finished `.app` plus an Applications link and verified
+with `hdiutil`; an existing installer is never patched. The input app is left
+unchanged. Failed output directories remain for inspection and cannot be reused.
+
+## Licenses and notices
+
+A reviewed manifest binds **verbatim** notice files by SHA-256. An example entry:
+
+```json
+{
+  "protocol": 1,
+  "components": [
+    {
+      "component": "libraw",
+      "libraries": ["libraw.25.dylib"],
+      "files": [
+        {"path": "libraw/COPYRIGHT", "sha256": "<exact file SHA-256>"},
+        {"path": "libraw/LICENSE.LGPL", "sha256": "<exact file SHA-256>"}
+      ]
+    }
+  ]
+}
+```
+
+Paths resolve relative to the manifest. Supply one entry per component, all
+relevant license/notice files, and its actual copied library basenames. The
+complete manifest must also include `adobe-dng-sdk`, `xmp-toolkit`,
+`rust-dependencies`, and `frontend-dependencies` entries even though those need
+not have dynamic library names. The latter inventories must cover the resolved
+Cargo and frontend lockfiles, including statically linked LCMS, bundled SQLite,
+C/C++ dependencies and generated frontend assets. A heading or a dependency
+name is not a license inventory. The script checks coverage and exact supplied
+bytes; the manifest reviewer remains responsible for completeness, version
+association, redistribution terms and any required source/offers. It never
+invents a license or silently substitutes one.
+
+The observed macOS CLI closure during readiness contained LibRaw, libavif,
+WebP, JPEG XL and its threads library, libjpeg, OpenMP, LCMS, dav1d, aom,
+highway, Brotli decoder/common/encoder, and libvmaf. This is a useful starting
+inventory, not a hardcoded promise about a future desktop build. Use that
+build's discovered closure. Native development packages alone are not the
+license inventory.
+
+macOS notices are copied into `Contents/Resources/THIRD_PARTY_NOTICES` before
+signing. On Linux/Windows, place the manifest and its files in the Tauri
+resources/install payload and pass that **installed** manifest to the audit;
+a manifest pointing to texts outside the payload fails.
+
+## Linux and Windows extracted-payload checks
+
+Generate the platform's Tauri artifacts, then extract/install them in a fresh
+test location under the platform's integration procedure. This utility does
+not unpack or install an artifact. Run on the extracted payload using GNU
+`readelf` on Linux or LLVM `llvm-readobj` on Windows. Do not use `ldd` on input
+artifacts: the audit never executes them.
+
+```sh
+python3 scripts/package_desktop.py audit --platform linux \
+  --root /absolute/extracted/AppDir \
+  --executable usr/bin/photocatalog-desktop \
+  --policy /absolute/reviewed-linux-policy.json \
+  --notices /absolute/extracted/AppDir/usr/share/photocatalog/notices/manifest.json \
+  --report /absolute/new-closure.json
+```
+
+Use `--platform windows`, the installed `.exe` relative path and a Windows
+policy for NSIS/MSI payloads. Both native normal and delay DLL imports are
+checked. The policies are explicit deployment contracts, for example:
+
+```json
+{
+  "protocol": 1,
+  "platform": "linux",
+  "library_directories": ["usr/lib"],
+  "system_dependencies": {
+    "libc.so.6": "glibc from the declared minimum supported Linux distribution"
+  }
+}
+```
+
+List exact native names, with a nonempty package/OS contract for every system
+exception. Do not label a build-only image library a system dependency merely
+to make the audit pass. On Linux every packaged non-system dependency must be
+reachable through that object's `$ORIGIN` RPATH/RUNPATH. Absolute build paths,
+relative CWD paths and escaping paths fail. This deliberately stricter local
+layout avoids depending on inherited ELF RPATH or the developer's loader cache.
+`library_directories` identifies payload directories for policy review; it does
+not manufacture an ELF search path. Build/package the libraries with local
+paths, or declare and install the actual supported distro package. In
+particular, the existing Rust CI's checkout `.deps/jxl/lib` and
+`LD_LIBRARY_PATH` must not leak into an installable app.
+
+On Windows `library_directories` must be the executable's directory. Bundled
+DLLs, including any required MSVC runtime or WebView2Loader, must be there and
+match its machine type. `x64-windows-static-md` is not proof of a zero-DLL
+closure. Enumerate exact Windows system/API-set imports in the reviewed policy;
+review the installer configuration for its VC/UCRT and WebView2 prerequisite
+strategy. Test on a machine without the developer's vcpkg or Visual Studio
+paths. Tauri's [WebView2 installation options](https://v2.tauri.app/distribute/windows-installer/)
+are separate from native image-library closure.
+
+For Linux AppImage, ensure private image libraries really reach the AppDir;
+[Tauri's custom AppImage files](https://v2.tauri.app/distribute/appimage/) are one
+supported inclusion mechanism. Test the declared oldest WebKitGTK 4.1 distro
+baseline. DEB/RPM dependency declarations and installation must match any
+system exceptions. The closure report records exceptions rather than claiming
+they were installed or ABI-tested.
+
+## Required platform acceptance after closure checks
+
+Run these gates on each of macOS, Windows and Linux, preserving artifact and
+installed executable hashes, platform/architecture, commands, logs and cleanup:
+
+1. Install/mount/extract into a new location outside the checkout. Check the
+   package's notices, architecture/OS floor and actual installer dependencies.
+   Do not inherit `DYLD_*`, `LD_*`, checkout paths, vcpkg paths or Homebrew paths.
+   Use a fresh temporary working directory and a supported clean-machine image
+   for the platform prerequisite test; merely clearing environment variables
+   does not hide already-installed system libraries.
+2. Launch the installed PhotoCatalog webview as an ordinary user. Confirm it
+   writes catalog/cache/config/staging under user-controlled locations, not the
+   signed bundle, Program Files, or the checkout. Close and reopen it.
+3. Using temporary **synthetic** originals, run preview regeneration and a
+   photo export through the public service path. Observe child processes using
+   the installed executable and the early worker dispatch; no second webview,
+   checkout executable or loader override. Cover representative RAW/DNG,
+   AVIF/WebP/JXL paths, XMP retention and ICC export as supported by the fixture
+   suite. Keep real-original/RAID admission separate.
+4. Preserve timeout/cancel/restart and worker-reaping evidence. Exercise a
+   moved/relinked synthetic original and restored catalog preview regeneration.
+   Removal/update must not delete catalogs, backups or external originals.
+
+The Python synthetic tests qualify dependency discovery, failure handling,
+license pinning and output policy only. They do not qualify native relocation,
+Tauri installation, rendering, signing distribution or any platform's GUI.
+Those actual package/install tests remain required S12 acceptance evidence.
+
+Run the script checks without native builds:
+
+```sh
+python3 -m unittest discover -s scripts -p test_package_desktop.py -v
+```
