@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
+
+mod process;
+pub use process::{CaptureProcess, capture_worker_main};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -63,23 +65,21 @@ pub struct Entry {
 /// Run capture in a dedicated executable process. No original is opened by this
 /// parent API; byte locks cannot be lost by an unrelated original FD close here.
 pub fn spawn(executable: &Path, request: &Request) -> Result<Manifest> {
-    let mut child = Command::new(executable)
-        .arg("capture-worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child.stdin.take().context("capture worker stdin")?;
-    serde_json::to_writer(&mut stdin, request)?;
-    stdin.flush()?;
-    drop(stdin);
-    let output = child.wait_with_output()?;
-    ensure!(
-        output.status.success(),
-        "capture worker failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let mut request = request.clone();
+    let current = std::env::current_dir()?;
+    for path in [&mut request.source, &mut request.output] {
+        let decoded = path.to_path()?;
+        if decoded.is_relative() {
+            *path = NativePath::from_path(&current.join(decoded));
+        }
+    }
+    let mut child = CaptureProcess::spawn(executable, &std::env::temp_dir(), &request)?;
+    loop {
+        if let Some(manifest) = child.poll()? {
+            return Ok(manifest);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 fn append(path: &Path, suffix: &str) -> PathBuf {
     let mut p = path.as_os_str().to_os_string();

@@ -190,6 +190,11 @@ fn read_json<T: serde::de::DeserializeOwned>(mut reader: impl Read) -> Result<T>
     Ok(serde_json::from_slice(&bytes)?)
 }
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--lightroom-capture-worker"))
+    {
+        return capture::capture_worker_main();
+    }
     match Cli::parse().command {
         Command::Discover {
             root,
