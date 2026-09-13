@@ -1,7 +1,7 @@
-# PhotoCatalog bundled SQLite identity patch
+# PhotoCatalog bundled SQLite identity and exclusive-creation patches
 
 This directory contains the exact published `libsqlite3-sys` 0.36.0 crate,
-including SQLite 3.51.1, plus one change to `sqlite3/sqlite3.c`.
+including SQLite 3.51.1, plus two changes to `sqlite3/sqlite3.c`.
 `UPSTREAM.json` records the crates.io archive checksum and every original file
 SHA-256. `photocatalog-identity.patch` is the complete upstream source delta.
 The crate's MIT LICENSE, upstream metadata, SQLite public-domain notice in the
@@ -26,6 +26,23 @@ Null output returns SQLITE_MISUSE; fstat failure returns SQLITE_IOERR_FSTAT.
 Other VFS implementations retain upstream behavior and may return SQLITE_NOTFOUND.
 Rust requires SQLITE_OK before comparing the result with the retained File pin.
 No Rust code casts SQLite's private structure or obtains a native fd.
+
+## Exclusive temporary creation
+
+The Unix read/write-open failure path now excludes `isExclusive` before retrying
+read-only, matching the existing Windows guard. Previously that retry removed
+`O_CREAT` after a failed `O_CREAT|O_EXCL` request. An existing hardlink could then
+be opened read-only and unlinked by `DELETEONCLOSE`. Exclusive creation now fails
+instead of falling back to an existing object. Ordinary nonexclusive fallback,
+temporary-file policy and resource limits are unchanged.
+
+The regression uses the public VFS `xOpen` boundary with the temporary opener's
+read/write, create, exclusive and delete-on-close flags against an existing
+synthetic hardlink. It requires refusal and preservation of both names/content;
+a separate successful fresh-file case requires normal deletion on close. This
+is a deterministic VFS-boundary reproduction, not a naturally observed temporary
+filename race or a claim about user catalog corruption. The historical patch
+filename `photocatalog-identity.patch` retains the complete two-change delta.
 
 The existing HAS_MOVED check remains a second pathname-drift check. Windows
 keeps its supported WIN32_GET_HANDLE observation and existing identity comparison.

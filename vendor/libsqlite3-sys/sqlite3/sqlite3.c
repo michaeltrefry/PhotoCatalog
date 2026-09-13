@@ -45903,7 +45903,7 @@ static int unixOpen(
         /* If unable to create a journal because the directory is not
         ** writable, change the error code to indicate that. */
         rc = SQLITE_READONLY_DIRECTORY;
-      }else if( errno!=EISDIR && isReadWrite ){
+      }else if( errno!=EISDIR && isReadWrite && !isExclusive ){
         /* Failed to open the file for read/write access. Try read-only. */
         UnixUnusedFd *pReadonly = 0;
         flags &= ~(SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);

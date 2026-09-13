@@ -2368,6 +2368,9 @@ fn sqlite_opened_object(db: &Connection) -> Result<(u64, u64)> {
 mod database_identity_tests;
 
 #[cfg(test)]
+mod exclusive_open_tests;
+
+#[cfg(test)]
 mod folder_alias_tests {
     use super::*;
 
