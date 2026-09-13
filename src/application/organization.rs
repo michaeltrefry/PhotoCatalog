@@ -1486,6 +1486,99 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn copying_a_member_invalidates_paused_cursor_before_earlier_position_can_be_skipped()
+    -> anyhow::Result<()> {
+        let (_temp, mut c, master) = fixture()?;
+        let later = c
+            .create_edit_variant(&master, c.edit_variant(&master)?.revision, "later")?
+            .key;
+        let collection = c.create_collection("copies", serde_json::json!({}))?;
+        c.set_image_collection_membership(
+            &c.image_metadata_identity(&master)?,
+            &collection,
+            1,
+            &serde_json::json!({"source":"master"}),
+        )?;
+        c.set_image_collection_membership(
+            &c.image_metadata_identity(&later)?,
+            &collection,
+            5,
+            &serde_json::json!({"source":"later"}),
+        )?;
+        let Response::Members(first) = call(
+            &mut c,
+            Request::Members {
+                collection: collection.clone(),
+                after: None,
+                limit: 1,
+            },
+        )?
+        else {
+            panic!()
+        };
+        assert_eq!(first.rows[0].key, master);
+        let Response::Members(second) = call(
+            &mut c,
+            Request::Members {
+                collection: collection.clone(),
+                after: first.next,
+                limit: 1,
+            },
+        )?
+        else {
+            panic!()
+        };
+        assert_eq!(second.rows[0].key, later);
+        let paused = second.next.unwrap();
+        assert!(paused.ordered);
+        assert_eq!(paused.position, I64(5));
+        let copy = c
+            .create_edit_variant(
+                &master,
+                c.edit_variant(&master)?.revision,
+                "earlier-position copy",
+            )?
+            .key;
+        let revision = c
+            .organization_collections("", 100)?
+            .into_iter()
+            .find(|v| v.id == collection)
+            .unwrap()
+            .revision;
+        assert_eq!(revision, paused.revision.0 + 1);
+        assert!(
+            call(
+                &mut c,
+                Request::Members {
+                    collection: collection.clone(),
+                    after: Some(paused),
+                    limit: 1
+                }
+            )
+            .is_err()
+        );
+        let Response::Members(restarted) = call(
+            &mut c,
+            Request::Members {
+                collection,
+                after: None,
+                limit: 100,
+            },
+        )?
+        else {
+            panic!()
+        };
+        assert_eq!(
+            restarted
+                .rows
+                .into_iter()
+                .map(|v| v.key)
+                .collect::<Vec<_>>(),
+            vec![master, copy, later]
+        );
+        Ok(())
+    }
+    #[test]
     fn restored_external_hold_keeps_local_organization_batch_available() -> anyhow::Result<()> {
         let (temp, mut c, master) = fixture()?;
         let expected = revision(&c, &master)?;

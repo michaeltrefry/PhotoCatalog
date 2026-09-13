@@ -265,6 +265,9 @@ pub(crate) fn register_copy(db: &Connection, key: &VariantKey, source: &VariantK
     db.execute("INSERT INTO organization_flags SELECT t.sequence,f.flag,f.provenance FROM catalog_images s JOIN organization_flags f ON f.sequence=s.sequence JOIN catalog_images t ON t.id=?1 WHERE s.id=?2", params![target,from])?;
     db.execute("INSERT INTO organization_collection_members SELECT m.collection,t.sequence,m.provenance FROM catalog_images s JOIN organization_collection_members m ON m.sequence=s.sequence JOIN catalog_images t ON t.id=?1 WHERE s.id=?2", params![target,from])?;
     db.execute("INSERT INTO organization_collection_order SELECT o.collection,t.sequence,o.position FROM catalog_images s JOIN organization_collection_order o ON o.image_sequence=s.sequence JOIN catalog_images t ON t.id=?1 WHERE s.id=?2", params![target,from])?;
+    // A copied member can sort before a paused collection cursor. Advance the
+    // affected collection revisions in this same variant-creation transaction.
+    db.execute("UPDATE organization_collections SET revision=revision+1 WHERE id IN (SELECT m.collection FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence WHERE i.id=?1)", [&target])?;
     crate::organization::refresh(db, &target)?;
     Ok(())
 }
