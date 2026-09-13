@@ -209,14 +209,20 @@ fn validate_object(key: &PreviewKey, width: u32, height: u32, bytes: &[u8]) -> R
 /// The launcher path is supplied by the application; the library does not guess
 /// a binary from test executables or silently fall back to synchronous rendering.
 pub struct WorkerProcess {
-    child: Child,
+    child: Option<Child>,
     lease: Option<ChildStdin>,
     staging: PathBuf,
     request: RenderWork,
     exited: bool,
     encoding_admitted: bool,
+    initial_request: Option<Vec<u8>>,
+    start_failure: Option<String>,
+    #[cfg(test)]
+    wait_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 impl WorkerProcess {
+    /// Creates the owned child. Register its resource owner, then call start or
+    /// poll to dispatch; observation helpers do not dispatch implicitly.
     pub fn spawn(executable: &Path, staging_root: &Path, request: RenderWork) -> Result<Self> {
         request.validate()?;
         ensure!(
@@ -240,23 +246,70 @@ impl WorkerProcess {
             .env("RAYON_NUM_THREADS", "1")
             .spawn()
             .context("start preview worker")?;
-        let lease = child.stdin.take().context("worker stdin lease missing")?;
-        let mut value = Self {
-            child,
-            lease: Some(lease),
+        // Establish the child owner before any fallible transport operation.
+        let lease = child.stdin.take();
+        Ok(Self {
+            child: Some(child),
+            lease,
             staging,
             request,
             exited: false,
             encoding_admitted: false,
-        };
-        let input = value.lease.as_mut().unwrap();
-        input.write_all(&bytes)?;
-        input.write_all(b"\n!")?;
-        input.flush()?;
-        Ok(value)
+            initial_request: Some(bytes),
+            start_failure: None,
+            #[cfg(test)]
+            wait_failures: Default::default(),
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn test_child(
+        mut child: Child,
+        staging: PathBuf,
+        request: RenderWork,
+        wait_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let lease = child.stdin.take();
+        Self {
+            child: Some(child),
+            lease,
+            staging,
+            request,
+            exited: false,
+            encoding_admitted: true,
+            initial_request: None,
+            start_failure: None,
+            wait_failures,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_initial_send_failure(&mut self) {
+        self.initial_request = Some(vec![0]);
+        self.lease.take();
+    }
+    /// Dispatches once while the caller retains this worker and its resources.
+    /// Transport failure is latched for every later poll; partial input is never
+    /// replayed. The owner must stop/drain before releasing this instance.
+    pub fn start(&mut self) -> Result<()> {
+        if let Some(failure) = &self.start_failure {
+            bail!("{failure}");
+        }
+        if let Some(bytes) = self.initial_request.take() {
+            let result = (|| -> Result<()> {
+                let input = self.lease.as_mut().context("worker stdin lease missing")?;
+                input.write_all(&bytes)?;
+                input.write_all(b"\n!")?;
+                input.flush()?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                self.start_failure = Some(format!("{e:#}"));
+                return Err(e);
+            }
+        }
+        Ok(())
     }
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().expect("owned preview process").id()
     }
     /// Returns only after exit. The service releases the scheduler reservation
     /// after consuming this batch, including its validated decoded pixel buffers.
@@ -266,7 +319,13 @@ impl WorkerProcess {
             self.stop()?;
             bail!("preview request canceled");
         }
-        let Some(status) = self.child.try_wait()? else {
+        self.start()?;
+        let Some(status) = self
+            .child
+            .as_mut()
+            .expect("owned preview process")
+            .try_wait()?
+        else {
             if !self.encoding_admitted && self.awaiting_encode_admission()? {
                 let lease = self.lease.as_mut().context("worker lease closed")?;
                 lease.write_all(b"E")?;
@@ -368,22 +427,43 @@ impl WorkerProcess {
         );
         Ok(true)
     }
-    fn stop(&mut self) -> Result<()> {
+    pub(crate) fn signal_stop(&mut self) {
         self.lease.take();
         if !self.exited {
-            let kill = self.child.kill();
-            let waited = self.child.wait();
+            // Wait, rather than kill's result, establishes that ownership ended.
+            let _ = self.child.as_mut().expect("owned preview process").kill();
+        }
+    }
+    pub(crate) fn stop(&mut self) -> Result<()> {
+        self.signal_stop();
+        if !self.exited {
+            #[cfg(test)]
+            if self
+                .wait_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+            {
+                bail!("injected preview reap failure");
+            }
+            let waited = self.child.as_mut().expect("owned preview process").wait();
             self.exited = waited.is_ok();
             waited.context("wait for canceled preview worker")?;
-            // An already-exited child may reject kill; wait remains authoritative.
-            let _ = kill;
         }
         Ok(())
     }
 }
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if self.stop().is_err() {
+            // Explicit owners keep self for retry. Drop cannot report a reap
+            // failure; retain the native process handle without claiming exit.
+            std::mem::forget(self.child.take());
+            return;
+        }
         if self.exited {
             let _ = clean_staging_directory(&self.staging);
         }
@@ -935,12 +1015,16 @@ mod tests {
             decode_limits: DecodeLimits::default(),
         };
         let mut worker = WorkerProcess {
-            child,
+            child: Some(child),
             lease,
             staging: stage.clone(),
             request,
             exited: false,
             encoding_admitted: false,
+            initial_request: None,
+            start_failure: None,
+            #[cfg(test)]
+            wait_failures: Default::default(),
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

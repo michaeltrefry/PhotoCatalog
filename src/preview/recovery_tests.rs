@@ -2,7 +2,7 @@
 use super::*;
 use crate::edit::{Recipe, RecipeV1};
 
-fn setup(root: &Path) -> (Catalog, PreviewService, String, PathBuf) {
+pub(super) fn setup(root: &Path) -> (Catalog, PreviewService, String, PathBuf) {
     let originals = root.join("originals");
     std::fs::create_dir(&originals).unwrap();
     let source = originals.join("source.png");
@@ -47,7 +47,7 @@ fn persist(previews: &PreviewService, job: &SavedJob) -> String {
     }
     id
 }
-fn import_job(
+pub(super) fn import_job(
     catalog: &Catalog,
     previews: &PreviewService,
     asset: &str,

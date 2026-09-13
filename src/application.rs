@@ -223,6 +223,7 @@ fn reply(r: std::result::Result<Response, BridgeError>) -> Reply {
 }
 
 enum Work {
+    Shutdown(mpsc::SyncSender<std::result::Result<(), BridgeError>>),
     Command(Request, mpsc::SyncSender<Reply>),
     Bytes {
         catalog: String,
@@ -239,6 +240,7 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
+            Work::Shutdown(_) => 0,
             Work::Command(Request::Lightroom { .. }, _) => 4,
             Work::Command(Request::Export { request, .. }, _) => {
                 if matches!(
@@ -310,6 +312,9 @@ impl Envelope {
     }
     fn reject(self, code: ErrorCode, message: &str) {
         match self.work {
+            Work::Shutdown(tx) => {
+                let _ = tx.send(Err(error(code, message)));
+            }
             Work::Command(_, tx) => {
                 let _ = tx.send(failure(code, message));
             }
@@ -348,25 +353,75 @@ struct Shared {
 struct Handle {
     shared: Arc<Shared>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
+    shutdown_failure: Mutex<Option<BridgeError>>,
 }
 impl Handle {
-    fn shutdown(&self) {
-        {
-            let mut q = self.shared.queue.lock().unwrap();
-            q.stopping = true;
-            if let Some(c) = &q.active_cancel {
-                c.cancel();
-            }
-            self.shared.wake.notify_all();
-        }
-        self.shared
-            .lightroom
+    fn try_shutdown(&self) -> std::result::Result<(), BridgeError> {
+        let mut owner = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(failure) = self
+            .shutdown_failure
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .signal_shutdown();
-        if let Some(t) = self.thread.lock().unwrap().take() {
-            let _ = t.join();
+            .as_ref()
+        {
+            return Err(failure.clone());
         }
+        let Some(thread) = owner.as_ref() else {
+            return Ok(());
+        };
+        if !thread.is_finished() {
+            let (tx, rx) = mpsc::sync_channel(1);
+            {
+                let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(c) = &q.active_cancel {
+                    c.cancel();
+                }
+                // One reserved shutdown slot; concurrent shutdowns serialize on owner.
+                q.pending.push_front(Envelope {
+                    work: Work::Shutdown(tx),
+                    cancel: Cancellation::default(),
+                    created: Instant::now(),
+                });
+                self.shared.wake.notify_all();
+            }
+            loop {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(result) => {
+                        result?;
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) if !thread.is_finished() => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        let joined = owner.take().unwrap().join();
+        let closed = matches!(
+            self.shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .status
+                .phase,
+            Phase::Closed
+        );
+        if joined.is_err() || !closed {
+            let failure = error(
+                ErrorCode::Native,
+                "catalog owner stopped without verified shutdown",
+            );
+            *self
+                .shutdown_failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(failure.clone());
+            return Err(failure);
+        }
+        Ok(())
+    }
+    fn shutdown(&self) {
+        // Compatibility/Drop entry point. On a failed drain the actor retains its
+        // Open owner; callers that may exit the process must use try_shutdown.
+        let _ = self.try_shutdown();
     }
 }
 impl Drop for Handle {
@@ -414,11 +469,17 @@ impl Bridge {
         Ok(Self(Arc::new(Handle {
             shared,
             thread: Mutex::new(Some(thread)),
+            shutdown_failure: Mutex::new(None),
         })))
     }
-    /// Joins the owner after worker cleanup; all cloned handles become closed.
+    /// Attempts shutdown, retaining ownership if cleanup cannot be verified.
+    /// Call try_shutdown before exiting the host process or replacing its owner.
     pub fn shutdown(&self) {
         self.0.shutdown()
+    }
+    /// Reports Closed only after all owned cleanup and actor join succeed.
+    pub fn try_shutdown(&self) -> std::result::Result<(), BridgeError> {
+        self.0.try_shutdown()
     }
     pub fn submit(&self, request: Request) -> std::result::Result<Pending, BridgeError> {
         let size = serde_json::to_vec(&request)
@@ -715,6 +776,17 @@ impl Bridge {
                 value: Response::Status(s),
             });
         } else {
+            // Existing direct status/cancel routes remain usable during drain.
+            // Admit no new catalog work after Close has started.
+            if matches!(q.status.phase, Phase::Closing)
+                && !matches!(&request, Request::Close { .. } | Request::Lightroom { .. })
+            {
+                return Err(error(
+                    ErrorCode::Busy,
+                    "catalog is closing; retry Close after cleanup failure",
+                ));
+            }
+
             if let Request::Preview {
                 catalog,
                 viewport,
@@ -842,6 +914,9 @@ impl Bridge {
         if q.stopping {
             return Err(error(ErrorCode::Closed, "catalog owner closed"));
         }
+        if matches!(q.status.phase, Phase::Closing) {
+            return Err(error(ErrorCode::Busy, "catalog is closing"));
+        }
         let _ = foreground; // The transport cannot promote a background ticket.
         let foreground = q
             .ticket_foreground
@@ -878,6 +953,7 @@ struct Ticket {
     cancel: Cancellation,
 }
 struct Open {
+    closing: bool,
     exports: exports::Coordinator,
     token: String,
     catalog: Catalog,
@@ -932,6 +1008,8 @@ impl ImportTask {
     }
 }
 struct Actor {
+    #[cfg(test)]
+    retained_on_drop: Option<mpsc::SyncSender<Open>>,
     lightroom: lightroom_bridge::Coordinator,
     config: Config,
     shared: Arc<Shared>,
@@ -1015,9 +1093,35 @@ fn during_relink_hold(request: &Request) -> bool {
         _ => false,
     }
 }
+impl Drop for Actor {
+    fn drop(&mut self) {
+        if self.open.is_some()
+            && !std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.close()))
+                .is_ok_and(|result| result.is_ok())
+        {
+            // Also runs during actor unwind, before automatic field destruction.
+            // No catalog/import owner is released when drain cannot be verified.
+            self.retain_open();
+        }
+    }
+}
 impl Actor {
+    fn retain_open(&mut self) {
+        #[cfg(test)]
+        if let Some(tx) = self.retained_on_drop.take() {
+            if let Some(open) = self.open.take()
+                && let Err(e) = tx.send(open)
+            {
+                std::mem::forget(e.0);
+            }
+            return;
+        }
+        std::mem::forget(self.open.take());
+    }
     fn new(config: Config, shared: Arc<Shared>) -> Self {
         Self {
+            #[cfg(test)]
+            retained_on_drop: None,
             lightroom: lightroom_bridge::Coordinator::new(shared.lightroom.clone()),
             config,
             shared,
@@ -1064,6 +1168,19 @@ impl Actor {
                     e.reject(ErrorCode::Canceled, "queued operation expired");
                 } else {
                     match e.work {
+                        Work::Shutdown(tx) => {
+                            self.shared
+                                .lightroom
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .signal_shutdown();
+                            let result = self.close();
+                            if result.is_ok() {
+                                self.lightroom.shutdown();
+                                self.shared.queue.lock().unwrap().stopping = true;
+                            }
+                            let _ = tx.send(result);
+                        }
                         Work::Command(r, tx) => {
                             if let Request::Export { catalog, request } = &r
                                 && matches!(
@@ -1137,17 +1254,30 @@ impl Actor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .signal_shutdown();
-        self.close();
+        if self.close().is_err() {
+            // A terminal actor must not drop import/cache/catalog ownership while
+            // a native worker's exit is unverified. Normal checked failure stays
+            // in the loop instead, permitting an explicit Close/shutdown retry.
+            self.retain_open();
+        }
         self.lightroom.shutdown();
     }
-    fn close(&mut self) {
+    fn close(&mut self) -> std::result::Result<(), BridgeError> {
         self.set_phase(Phase::Closing, None);
-        if let Some(mut open) = self.open.take() {
+        let result = self.close_inner();
+        if let Err(e) = &result {
+            self.set_phase(Phase::Closing, Some(e.message.clone()));
+        }
+        result
+    }
+    fn close_inner(&mut self) -> std::result::Result<(), BridgeError> {
+        if let Some(open) = self.open.as_mut() {
+            open.closing = true;
             open.exports.signal_shutdown(&self.shared.exports);
+            open.service.signal_shutdown();
             self.shared.relink.lock().unwrap().request_cancel();
             open.hydration.request_cancel();
-            let mut import = open.import.take();
-            if let Some(import) = &mut import {
+            if let Some(import) = &mut open.import {
                 import.request_cancel_owned(&mut open.service);
             }
             for (_, t) in open.tickets.drain() {
@@ -1155,37 +1285,40 @@ impl Actor {
                     let _ = open.service.cancel(c);
                 }
             }
-            let _ = self
-                .shared
+            self.shared
                 .backups
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .shutdown();
-            // All readers and native consumers have received cancellation before
-            // any join. Owners and the import lock remain held through native drain.
+                .shutdown()
+                .map_err(native)?;
             open.relink.shutdown(&self.shared.relink);
             open.exports.shutdown(&self.shared.exports);
             copy::close(&mut open.catalog, &self.shared.copy);
-            drop(open.hydration);
-            if let Some(import) = &mut import {
+            if let Some(import) = &mut open.import {
                 import.preparation = None;
             }
+            // The complete Open, including import lock/catalog, remains owned on
+            // failure. No background maintenance or new command can restart it.
             #[cfg(test)]
             if let Some(checkpoint) = &self.config.import_checkpoint
-                && let Some(import) = &import
+                && let Some(import) = &open.import
             {
                 checkpoint("before_service_drop", &import.cancel.0);
             }
-            drop(open.service); // worker Drop kills/waits before cache lock release
-            drop(import); // Keep import ownership until every native worker is reaped.
+            open.service.try_shutdown().map_err(native)?;
+        }
+        if let Some(mut open) = self.open.take() {
+            drop(open.hydration);
+            drop(open.service);
+            drop(open.import.take());
             drop(open.catalog);
         }
-        let _ = self
-            .shared
+        self.shared
             .backups
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .shutdown();
+            .shutdown()
+            .map_err(native)?;
         *self.shared.relink.lock().unwrap() = relink::Control::default();
         *self.shared.copy.lock().unwrap() = copy::Control::default();
         *self.shared.exports.lock().unwrap() = exports::Control::default();
@@ -1203,6 +1336,7 @@ impl Actor {
             cancel_requested: false,
             message: None,
         };
+        Ok(())
     }
     fn export_request(
         &mut self,
@@ -1255,6 +1389,16 @@ impl Actor {
         )?)))
     }
     fn current(&mut self, token: &str) -> std::result::Result<&mut Open, BridgeError> {
+        let open = self.current_for_close(token)?;
+        if open.closing {
+            return Err(error(
+                ErrorCode::Busy,
+                "catalog is closing; retry Close after cleanup failure",
+            ));
+        }
+        Ok(open)
+    }
+    fn current_for_close(&mut self, token: &str) -> std::result::Result<&mut Open, BridgeError> {
         self.open
             .as_mut()
             .filter(|o| o.token == token)
@@ -1355,6 +1499,7 @@ impl Actor {
                 self.config.preview_limits.clone(),
             )?;
             Ok(Open {
+                closing: false,
                 exports: exports::Coordinator::default(),
                 token: uuid::Uuid::new_v4().to_string(),
                 catalog,
@@ -1412,6 +1557,14 @@ impl Actor {
                 )
                 .map(|r| Response::Lightroom(Box::new(r)))
                 .map_err(native);
+        }
+        if self.open.as_ref().is_some_and(|o| o.closing)
+            && !matches!(&r, Request::Status | Request::Close { .. })
+        {
+            return Err(error(
+                ErrorCode::Busy,
+                "catalog is closing; retry Close after cleanup failure",
+            ));
         }
         let limits = self.config.limits.clone();
         macro_rules! core {
@@ -1519,8 +1672,8 @@ impl Actor {
                 Ok(Response::Status(self.status()))
             }
             Request::Close { catalog } => {
-                self.current(&catalog)?;
-                self.close();
+                self.current_for_close(&catalog)?;
+                self.close()?;
                 Ok(Response::Status(self.status()))
             }
             Request::Metadata { catalog, request } => {
@@ -2049,6 +2202,9 @@ impl Actor {
     fn maintain(&mut self) {
         self.lightroom.maintain();
         let Some(o) = self.open.as_mut() else { return };
+        if o.closing {
+            return;
+        }
         let hold_since = o.exports.hold_since(&self.shared.exports);
         let prior_foreground = self
             .shared

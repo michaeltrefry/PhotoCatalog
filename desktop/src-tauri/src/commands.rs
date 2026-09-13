@@ -138,7 +138,7 @@ pub fn catalog_frontend_ready(state: tauri::State<'_, State>) {
 #[tauri::command]
 pub async fn catalog_quit(app: tauri::AppHandle, state: tauri::State<'_, State>) -> Result<(), String> {
     let bridge = state.bridge.clone();
-    tauri::async_runtime::spawn_blocking(move || bridge.shutdown()).await.map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || bridge.try_shutdown()).await.map_err(|error| error.to_string())?.map_err(|error| error.message)?;
     state.handoffs.lock().map_err(|_| "Preview state unavailable")?.clear();
     state.quitting.store(true, Ordering::Release);
     app.exit(0);

@@ -904,3 +904,81 @@ fn bridge_cancel_and_close_reap_live_configured_capture_pid_and_retain_diagnosti
     assert!(!temp.path().join("never-opened-original.lrcat").exists());
     b.shutdown();
 }
+
+#[test]
+fn quit_signals_workbench_and_preview_before_catalog_drain_wait() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir()?;
+    let (bridge, mut actor, _, failures) = app::tests::drain_actor(temp.path())?;
+    failures.store(0, std::sync::atomic::Ordering::Release);
+    actor.command(
+        app::Request::Lightroom {
+            request: Box::new(Request::Open {
+                attempt: uuid::Uuid::new_v4().to_string(),
+                root: NativePath::from_path(&temp.path().join("inspection")),
+                mode: lw::OpenMode::Create,
+                capture_staging: NativePath::from_path(temp.path()),
+                limits: lw::Limits::default().into(),
+            }),
+        },
+        &app::Cancellation::default(),
+    )?;
+    #[cfg(unix)]
+    let pid = actor.open.as_ref().unwrap().service.active_worker_pids()[0];
+    let (entered, events) = std::sync::mpsc::sync_channel(1);
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = released.clone();
+    actor.config.import_checkpoint = Some(Arc::new(move |stage, _| {
+        if stage == "before_service_drop" {
+            let _ = entered.send(());
+            let until = Instant::now() + Duration::from_secs(10);
+            while !release.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }));
+    *bridge.0.thread.lock().unwrap() = Some(std::thread::spawn(move || actor.run()));
+    let shutting = bridge.clone();
+    let join = std::thread::spawn(move || shutting.try_shutdown());
+    events.recv_timeout(Duration::from_secs(10))?;
+    let w = bridge.0.shared.lightroom.lock().unwrap().status().unwrap();
+    assert_eq!(w.phase, lw::Phase::Closing);
+    assert!(!w.closed, "unjoined Workbench cannot report Closed");
+    #[cfg(unix)]
+    {
+        // Observe native exit without reaping it or changing the worker owner.
+        // The catalog drain is held above and has not yet called Child::wait.
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()?;
+            if String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .starts_with('Z')
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < until,
+                "preview was not signaled before held drain"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(crate::ImportLock::acquire(&temp.path().join("catalog/import.lock")).is_err());
+    released.store(true, std::sync::atomic::Ordering::Release);
+    join.join().unwrap()?;
+    assert!(
+        bridge
+            .0
+            .shared
+            .lightroom
+            .lock()
+            .unwrap()
+            .status()
+            .unwrap()
+            .closed
+    );
+    Ok(())
+}

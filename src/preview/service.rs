@@ -239,14 +239,30 @@ pub struct WorkerResourceMetrics {
     pub peak_resident_bytes: Option<u64>,
     pub peak_method: String,
 }
+// Allows Drop to retain the whole cache owner, including SQL and all locks,
+// when an OS failure leaves a child or external native permit unverified.
+struct StoreOwner(Option<PreviewStore>);
+impl std::ops::Deref for StoreOwner {
+    type Target = PreviewStore;
+    fn deref(&self) -> &PreviewStore {
+        self.0.as_ref().expect("live preview store owner")
+    }
+}
+impl std::ops::DerefMut for StoreOwner {
+    fn deref_mut(&mut self) -> &mut PreviewStore {
+        self.0.as_mut().expect("live preview store owner")
+    }
+}
+
 pub struct PreviewService {
+    stopping: bool,
     launch_pauses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     external_native: std::sync::Arc<std::sync::atomic::AtomicBool>,
     native_catalog: Option<std::sync::Arc<crate::catalog_writer::Writers>>,
     reads: read_queue::ReadQueue,
     prepared: super::prepared_cache::PreparedCache,
     observer: std::cell::RefCell<Option<ServiceObserver>>,
-    store: PreviewStore,
+    store: StoreOwner,
     decoded: DecodedCache,
     scheduler: PreviewScheduler,
     executable: PathBuf,
@@ -574,13 +590,14 @@ impl PreviewService {
             limits.prepared_cache_entries,
         )?;
         Ok(Self {
+            stopping: false,
             launch_pauses: Default::default(),
             external_native: Default::default(),
             native_catalog: None,
             prepared,
             reads: read_queue::ReadQueue::default(),
             observer: std::cell::RefCell::new(None),
-            store,
+            store: StoreOwner(Some(store)),
             decoded: DecodedCache::new(
                 limits.decoded_cache_bytes,
                 limits.decoded_live_bytes,
@@ -1153,6 +1170,7 @@ impl PreviewService {
         job: SavedJob,
         priority: Priority,
     ) -> Result<Consumer> {
+        ensure!(!self.stopping, "preview service is draining");
         job.validate()?;
         job.request.validate()?;
         self.ensure_original_separate(&job.request.source.to_path()?)?;
@@ -1222,6 +1240,7 @@ impl PreviewService {
     /// One bounded owner iteration. Native work remains in at most `workers`
     /// children; stale/canceled children are joined before reservations release.
     pub fn tick(&mut self, catalog: &mut Catalog) -> Result<()> {
+        ensure!(!self.stopping, "preview service is draining");
         let active_ids = self.active.keys().copied().collect::<Vec<_>>();
         for lease_id in active_ids {
             let active = &self.active[&lease_id];
@@ -1243,6 +1262,9 @@ impl PreviewService {
             if matches!(result, Ok(None)) {
                 continue;
             }
+            // A poll error can precede process exit (transport/OS errors).
+            // Keep every lease and byte reservation until wait succeeds.
+            self.active.get_mut(&lease_id).unwrap().worker.stop()?;
             let active = self.active.remove(&lease_id).unwrap();
             let id = active.lease.key.clone();
             let canceled = active
@@ -1357,14 +1379,18 @@ impl PreviewService {
             })();
             match launch {
                 Ok(worker) => {
+                    let lease_id = lease.id;
                     self.active.insert(
-                        lease.id,
+                        lease_id,
                         ActiveJob {
                             lease,
                             worker,
                             _encoded: guard,
                         },
                     );
+                    // Dispatch only after every owner is registered. A failure
+                    // is latched in the worker and follows normal poll/drain.
+                    let _ = self.active.get_mut(&lease_id).unwrap().worker.start();
                 }
                 Err(error) => {
                     drop(guard);
@@ -1761,6 +1787,7 @@ impl PreviewService {
             .saturating_sub(self.consumers.len() + self.reads.len())
     }
     pub fn pause_native_launches(&self) -> Result<NativeLaunchPause> {
+        ensure!(!self.stopping, "preview service is draining");
         self.launch_pauses
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
@@ -1785,6 +1812,7 @@ impl PreviewService {
         catalog: &Catalog,
         pause: NativeLaunchPause,
     ) -> Result<NativeLaunchPermit> {
+        ensure!(!self.stopping, "preview service is draining");
         ensure!(
             std::sync::Arc::ptr_eq(&pause.0, &self.launch_pauses),
             "native pause belongs to another preview service"
@@ -1836,6 +1864,39 @@ impl PreviewService {
     pub fn clear_decoded_cache(&mut self) {
         self.decoded.clear();
     }
+    /// Stops dispatch and signals every worker without joining. Call before
+    /// waiting on other owners that may be blocked behind a native worker.
+    pub fn signal_shutdown(&mut self) {
+        self.stopping = true;
+        for active in self.active.values_mut() {
+            active
+                .lease
+                .canceled
+                .store(true, std::sync::atomic::Ordering::Release);
+            active.worker.signal_stop();
+        }
+    }
+    /// Reaps owned workers. On failure self, cache ownership and all unverified
+    /// reservations remain available for retry.
+    pub fn try_shutdown(&mut self) -> Result<()> {
+        self.signal_shutdown();
+        for active in self.active.values_mut() {
+            active.worker.stop()?;
+        }
+        ensure!(
+            !self
+                .external_native
+                .load(std::sync::atomic::Ordering::Acquire),
+            "external native worker ownership has not drained"
+        );
+        // Every worker is verified before any aggregate reservation is released.
+        for (id, active) in self.active.drain() {
+            drop(active);
+            self.scheduler.finished(id, WorkerOutcome::Stopped)?;
+        }
+        Ok(())
+    }
+
     pub fn maintenance(&self) -> Result<()> {
         self.store.flush_touches()?;
         self.store.recover(128)?;
@@ -1846,11 +1907,19 @@ impl PreviewService {
 
 impl Drop for PreviewService {
     fn drop(&mut self) {
-        // Join workers before releasing the manifest owner's process lock.
-        self.active.clear();
+        if self.try_shutdown().is_err() {
+            // Retain the cache lock and unverified worker/resource owners rather
+            // than permit overlapping work. Checked callers retain self/retry.
+            std::mem::forget(std::mem::take(&mut self.active));
+            std::mem::forget(self.store.0.take());
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "drain_tests.rs"]
+mod drain_tests;

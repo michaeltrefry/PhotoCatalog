@@ -64,6 +64,7 @@ fn disconnected() -> Bridge {
     Bridge(Arc::new(Handle {
         shared,
         thread: Mutex::new(None),
+        shutdown_failure: Mutex::new(None),
     }))
 }
 fn preview_request(generation: u64, key: &str) -> Request {
@@ -690,5 +691,182 @@ fn canceled_hydration_keeps_blocked_reader_owned_without_blocking_foreground() -
     assert_eq!(c.edit_variant(&key)?.recipe_digest, saved.recipe_digest);
     assert_eq!(c.render_identity(&key.asset_id)?.state, "pending");
     assert!(c.render_identity(&key.asset_id)?.fingerprint.is_none());
+    Ok(())
+}
+
+pub(super) fn drain_actor(
+    root: &std::path::Path,
+) -> Result<(Bridge, Actor, String, Arc<AtomicUsize>)> {
+    let originals = root.join("originals");
+    std::fs::create_dir(&originals)?;
+    let source = originals.join("source.png");
+    image::RgbImage::from_pixel(8, 6, image::Rgb([20u8, 40, 70])).save(&source)?;
+    let mut catalog = Catalog::open(root.join("catalog"))?;
+    catalog.import(&originals, None, |_| Ok(()))?;
+    let asset = catalog.browse(0, 1)?[0].id.clone();
+    drop(catalog);
+    let bridge = disconnected();
+    let mut actor = Actor::new(
+        Config {
+            worker_executable: std::env::current_exe()?,
+            cache_root: None,
+            original_roots: vec![originals.clone()],
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        },
+        bridge.0.shared.clone(),
+    );
+    actor.command(
+        Request::OpenExisting {
+            path: NativePath::from_path(&root.join("catalog")),
+        },
+        &Cancellation::default(),
+    )?;
+    let token = actor.open.as_ref().unwrap().token.clone();
+    actor.command(
+        Request::ImportStart {
+            catalog: token.clone(),
+            source: NativePath::from_path(&originals),
+        },
+        &Cancellation::default(),
+    )?;
+    let failures = Arc::new(AtomicUsize::new(1));
+    let open = actor.open.as_mut().unwrap();
+    open.service
+        .test_owned_worker(&open.catalog, &asset, &source, failures.clone());
+    Ok((bridge, actor, token, failures))
+}
+
+#[test]
+fn failed_close_retains_catalog_import_and_cache_until_retry() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (bridge, mut actor, token, _) = drain_actor(root.path())?;
+    let config = actor
+        .open
+        .as_ref()
+        .unwrap()
+        .service
+        .cache_configuration()
+        .clone();
+    let close = || Request::Close {
+        catalog: token.clone(),
+    };
+    assert!(actor.command(close(), &Cancellation::default()).is_err());
+    assert!(matches!(actor.status().phase, Phase::Closing));
+    let open = actor.open.as_ref().unwrap();
+    assert!(open.closing && open.import.as_ref().unwrap().import_lock.is_some());
+    assert_eq!(open.service.active_worker_pids().len(), 1);
+    assert_eq!(open.service.scheduler_usage().reserved_bytes, 4096);
+    assert!(crate::ImportLock::acquire(&root.path().join("catalog/import.lock")).is_err());
+    assert!(preview::PreviewStore::open(config.clone(), &[]).is_err());
+    let mutation = Request::Create {
+        path: NativePath::from_path(&root.path().join("other")),
+    };
+    assert!(matches!(
+        bridge.submit(mutation.clone()),
+        Err(BridgeError {
+            code: ErrorCode::Busy,
+            ..
+        })
+    ));
+    assert!(matches!(
+        actor.command(mutation, &Cancellation::default()),
+        Err(BridgeError {
+            code: ErrorCode::Busy,
+            ..
+        })
+    ));
+    actor.maintain();
+    assert!(matches!(actor.status().phase, Phase::Closing));
+    assert!(
+        matches!(actor.command(close(), &Cancellation::default())?, Response::Status(s) if matches!(s.phase, Phase::Closed))
+    );
+    assert!(actor.open.is_none());
+    drop(crate::ImportLock::acquire(
+        &root.path().join("catalog/import.lock"),
+    )?);
+    drop(preview::PreviewStore::open(config, &[])?);
+    Ok(())
+}
+
+#[test]
+fn checked_shutdown_returns_failed_drain_and_retries_same_actor() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (bridge, actor, _, _) = drain_actor(root.path())?;
+    *bridge.0.thread.lock().unwrap() = Some(thread::spawn(move || actor.run()));
+    assert!(bridge.try_shutdown().is_err());
+    assert!(bridge.0.thread.lock().unwrap().is_some());
+    let q = bridge.0.shared.queue.lock().unwrap();
+    assert!(!q.stopping);
+    assert!(matches!(q.status.phase, Phase::Closing));
+    drop(q);
+    assert!(crate::ImportLock::acquire(&root.path().join("catalog/import.lock")).is_err());
+    bridge.try_shutdown()?;
+    assert!(bridge.0.thread.lock().unwrap().is_none());
+    assert!(matches!(
+        bridge.0.shared.queue.lock().unwrap().status.phase,
+        Phase::Closed
+    ));
+    drop(crate::ImportLock::acquire(
+        &root.path().join("catalog/import.lock"),
+    )?);
+    bridge.try_shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn checked_shutdown_reports_owner_panic_on_every_retry() {
+    let bridge = disconnected();
+    let (tx, rx) = mpsc::sync_channel(1);
+    *bridge.0.thread.lock().unwrap() = Some(thread::spawn(move || {
+        let _ = tx.send(());
+        panic!("injected catalog owner panic");
+    }));
+    rx.recv().unwrap();
+    assert!(bridge.try_shutdown().is_err());
+    assert!(bridge.try_shutdown().is_err());
+    assert!(bridge.0.shutdown_failure.lock().unwrap().is_some());
+}
+
+#[test]
+fn owner_unwind_retains_whole_open_when_worker_wait_fails() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (bridge, mut actor, _, _) = drain_actor(root.path())?;
+    let config = actor
+        .open
+        .as_ref()
+        .unwrap()
+        .service
+        .cache_configuration()
+        .clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    actor.retained_on_drop = Some(tx);
+    let t = thread::spawn(move || {
+        let _owner = actor;
+        panic!("injected actor unwind with active child and import lock");
+    });
+    assert!(t.join().is_err());
+    // The hook transfers the exact whole owner that production deliberately
+    // retains, allowing this test to retry cleanup without permanent leaks.
+    let mut retained = rx.recv_timeout(Duration::from_secs(5))?;
+    assert!(retained.closing);
+    assert!(matches!(
+        bridge.0.shared.queue.lock().unwrap().status.phase,
+        Phase::Closing
+    ));
+    assert!(retained.import.as_ref().unwrap().import_lock.is_some());
+    assert_eq!(retained.service.active_worker_pids().len(), 1);
+    assert_eq!(retained.service.scheduler_usage().reserved_bytes, 4096);
+    assert!(crate::ImportLock::acquire(&root.path().join("catalog/import.lock")).is_err());
+    assert!(preview::PreviewStore::open(config.clone(), &[]).is_err());
+    assert_eq!(retained.catalog.browse(0, 1)?.len(), 1);
+    retained.service.try_shutdown()?;
+    drop(retained);
+    drop(crate::ImportLock::acquire(
+        &root.path().join("catalog/import.lock"),
+    )?);
+    drop(preview::PreviewStore::open(config, &[])?);
     Ok(())
 }
