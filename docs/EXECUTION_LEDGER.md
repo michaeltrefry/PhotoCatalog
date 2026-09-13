@@ -8,8 +8,13 @@ S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
 PR16 remains at `af7e2386c8125b9c14cf18ade6457e8b25864705`. The reviewed local batch
 includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
 Lightroom inspection workbench `9deedea`, and Windows boundary repair `e239268`.
-The full export frontend is awaiting a repair and independent re-review for stale
-completed naming-review settings. No newer push has interrupted CI.
+The full export frontend is integrated as `c74e9aa` plus `eb0ef3c`. Independent
+review verified the repaired completed-review settings binding and the combined
+App merge. All 50 integrated frontend tests and TypeScript/Vite build pass. The
+initial 32 and repair 18 private evidence hashes match. Review:
+`sc-22847-export-interface-independent-4zfru_0x/review-repaired.json`. Integrated
+receipt: `sc-22847-export-frontend-integrated-rbkjseev/receipt.json`. The next
+batched push will qualify these changes together; no actual export GUI claim yet.
 
 CI34765013818 is terminal: macOS, Linux and evidence contracts passed. Downloaded
 Mac/Linux qualification receipts and installer hashes match; installed synthetic
