@@ -39,11 +39,18 @@ acknowledgement. Independent status polling now reconciles admission and owns st
 exact-operation cancellation is separate from review admission. Same-catalog reopen
 also releases an obsolete pending restore-review callback. Actual-component synthetic
 browser evidence is `sc-22847-backup-ui-gilg1rzz`;38 frontend tests and build pass.
-CI34760079137 at90e4041 currently has Mac/Linux failures in lifecycle tests expecting
-literal pre-namespace React keys. The repaired tests check stable ownership through
-indexing, distinct sibling keys, and replacement across catalog sessions. Windows is
-still running; its earlier original-observation timeout and installed-worker gate
-remain unresolved until fresh terminal evidence.
+CI34760079137 at90e4041 is terminal. All platforms reported obsolete frontend
+lifecycle-key expectations;58e3c78 checks stable ownership through indexing, distinct
+sibling keys, and replacement across catalog sessions. Windows passed the earlier
+original-observation regression and its native library/CLI stage, then failed in
+installed-worker observation. The digest-verified Windows artifact proves a psutil
+WindowsPath TypeError before the first telemetry sample; temporary-directory cleanup
+then masked it with WinError32. Repair9aa8564 is integrated as8bdbcda: all five affected
+qualification helper calls use os.fspath, and caller cwd/environment restore precedes
+temporary-directory deletion. Fifty Python tests pass; original-helper regressions
+fail as expected. Root independently reviewed all8 source and22 evidence hashes in
+private sc-22847-windows-worker-pfoyscb1. This proves the observer defect, not installed
+Windows worker execution; fresh integrated terminal CI remains required.
 
 Owned Lightroom capture adds bounded create-new request/result transport, pre-source
 request digest admission, child-only original handles and POSIX byte locks, and an
@@ -51,8 +58,8 @@ EOF ownership lease with explicit cancel/Drop kill and reap. Hidden CLI/Tauri di
 runs before app initialization; the legacy capture-worker protocol remains available.
 Five focused and24 Lightroom integration tests plus strict Clippy/fmt pass. Private
 `sc-22847-lightroom-capture-worker-hdne55hk` retains source, failures and receipt.
-This is a prerequisite: installed helper execution and the full desktop Lightroom
-workbench remain open, as do full photo-export/metadata-write desktop workflows.
+This is a prerequisite: installed helper execution passed on Mac v5; the full
+desktop Lightroom workbench and photo-export/metadata-write workflows remain open.
 No actual user catalog was recaptured or migrated, and no original was changed.
 
 
