@@ -3,6 +3,7 @@
 pub mod backup;
 pub mod browse;
 pub mod copy;
+pub mod desktop;
 mod dto;
 pub mod exports;
 mod hydration;
@@ -86,7 +87,8 @@ pub struct Config {
     #[cfg(test)]
     import_checkpoint: Option<crate::import_preparation::Checkpoint>,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub queued: usize,
     pub request_bytes: usize,
@@ -144,10 +146,14 @@ impl Config {
     }
 }
 #[derive(Clone, Default)]
-pub struct Cancellation(Arc<AtomicBool>);
+pub struct Cancellation(Arc<AtomicBool>, Option<Arc<dyn Fn() + Send + Sync>>);
 impl Cancellation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release)
+        if !self.0.swap(true, Ordering::AcqRel)
+            && let Some(notify) = &self.1
+        {
+            notify();
+        }
     }
     pub fn is_canceled(&self) -> bool {
         self.0.load(Ordering::Acquire)
