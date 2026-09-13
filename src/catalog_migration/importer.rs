@@ -384,6 +384,7 @@ impl Catalog {
         approval: &[u8],
         policy: &Policy,
     ) -> Result<Progress> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         ensure!(
             !policy.import_source.trim().is_empty()
                 && policy.import_source.len() <= 4096
@@ -499,6 +500,7 @@ impl Catalog {
     /// One bounded custody/index operation or one native source row. No original
     /// file is opened. Callers may cancel between steps without losing receipts.
     pub fn step_selected_import(&mut self, source: &MigrationSource, id: &str) -> Result<Step> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let (before, policy) = read(&self.db, id)?;
         super::current_repair::require_not_pending(&self.db, id)?;
         super::keyword_repair::require_owner(&self.db, id, None)?;

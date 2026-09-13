@@ -145,6 +145,7 @@ impl ExportService {
     /// also open the configured preview store, whose process lock prevents a second
     /// application from running that service concurrently.
     pub fn open(catalog: &Catalog, executable: &Path, limits: ExportServiceLimits) -> Result<Self> {
+        crate::catalog_backup::require_jobs_released(&catalog.root)?;
         limits.validate()?;
         ensure!(
             executable.is_absolute(),
@@ -182,6 +183,7 @@ impl ExportService {
         })
     }
     fn check_catalog(&self, catalog: &Catalog) -> Result<()> {
+        crate::catalog_backup::require_jobs_released(&catalog.root)?;
         ensure!(
             catalog.root.canonicalize()? == self.catalog,
             "export executor belongs to another catalog"

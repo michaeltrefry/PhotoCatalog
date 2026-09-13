@@ -242,6 +242,7 @@ impl Catalog {
         request: &Request,
         stop: &AtomicBool,
     ) -> Result<Prepared> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let deadline = Instant::now() + Duration::from_secs(120);
         path_bound(&request.proof_root)?;
         path_bound(&request.inspection_relative)?;

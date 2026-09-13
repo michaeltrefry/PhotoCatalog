@@ -250,6 +250,7 @@ fn step_owned(
     before: &Progress,
     owner: Option<&str>,
 ) -> Result<Step> {
+    crate::catalog_backup::require_jobs_released(&catalog.root)?;
     super::keyword_repair::require_owner(&catalog.db, &before.id, owner)?;
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(30);

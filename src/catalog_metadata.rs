@@ -1466,6 +1466,7 @@ impl Catalog {
         &mut self,
         operation: &str,
     ) -> Result<crate::metadata_export::ExportReceipt> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         // IMMEDIATE prevents a concurrent catalog writer from changing metadata between the
         // revision check and external publication. Filesystem recovery evidence remains durable
         // even if the catalog transaction itself fails after publication.
@@ -1515,6 +1516,7 @@ impl Catalog {
         &mut self,
         directory: &Path,
     ) -> Result<crate::metadata_export::ExportReceipt> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let directory = directory.canonicalize()?;
         let name = directory
             .file_name()
