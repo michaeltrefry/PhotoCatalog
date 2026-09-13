@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { command, errorText, type GridImage, type SearchOptions } from '../bridge';
+import { command, errorText, type GridImage, type SearchOptions, type Phase } from '../bridge';
 import { organize, nonnegativeDecimal, jobName, selectionPage, type Collection, type ImageIdentity, type Job, type JobItem, type Keyword, type KeywordKind, type MembershipCursor, type OrganizationOperation, type Page, type Placement } from '../organization';
 import { OrganizationRunner } from '../state/organizationRunner';
 import { Dialog, ErrorNotice } from './Controls';
+import { MemberPageStatus } from './MemberPageStatus';
 import './organization.css';
 
 function variantName(label: string | undefined | null) { return label == null ? 'Loading variant name…' : label || 'Unnamed variant'; }
@@ -77,15 +78,14 @@ function Synonyms({ catalog, keyword, mutate, epoch }: { catalog: string; keywor
 function Members({ catalog, collection, epoch, onChoose }: { catalog: string; collection: Collection; epoch: number; onChoose: (row: GridImage) => void }) {
   const [after, setAfter] = useState<MembershipCursor | null>(null); const [refresh, setRefresh] = useState(0);
   const [page, setPage] = useState<{ rows: { photo: GridImage; variantLabel: string; position: string; provenance: string }[]; next: MembershipCursor | null; scanned: string }>({ rows: [], next: null, scanned: '0' });
-  const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const [busy, setBusy] = useState(true); const [error, setError] = useState('');
   useEffect(() => { const abort = new AbortController(); setBusy(true); setError(''); setPage({ rows: [], next: null, scanned: '0' });
     void (async () => { const result = await organize(catalog, { command: 'members', args: { collection: collection.id, after, limit: 20 } }, 'members', abort.signal);
       const rows = []; for (const member of result.rows) { const photo = await command({ command: 'image', args: { catalog, key: member.key } }, 'image', abort.signal); const variant = await command({ command: 'variant', args: { catalog, key: member.key } }, 'variant', abort.signal); rows.push({ photo, variantLabel: variant.label, position: member.cursor.position, provenance: member.provenance_json }); }
       if (!abort.signal.aborted) setPage({ ...result, rows });
     })().catch(e => { if (!abort.signal.aborted) setError(errorText(e)); }).finally(() => { if (!abort.signal.aborted) setBusy(false); }); return () => abort.abort();
   }, [catalog, collection.id, after, refresh, epoch]);
-  return <section><h3>Members</h3>{error && <ErrorNotice message={error} />}{busy ? <p role="status">Loading members…</p> : <p>{page.rows.length} members on this page · {page.scanned} candidates checked</p>}
-    {!busy && !page.rows.length && <p>{page.next ? 'More candidates remain. Continue to the next page.' : 'End of collection.'}</p>}
+  return <section><h3>Members</h3><MemberPageStatus loading={busy} error={error} rows={page.rows.length} scanned={page.scanned} hasNext={page.next !== null} />
     <ul className="organization-list">{page.rows.map(({ photo, variantLabel, position, provenance }) => <li key={photo.image_id}><div><button onClick={() => onChoose(photo)}>{photo.filename} · {variantName(variantLabel)}</button><span>Position {position}</span><Evidence value={provenance} /></div></li>)}</ul>
     <Pager busy={busy} next={page.next} first={() => { setAfter(null); setRefresh(v => v + 1); }} advance={() => setAfter(page.next)} />
   </section>;
@@ -116,8 +116,10 @@ function BatchItems({ catalog, job, title, mutate, onJob }: { catalog: string; j
   </section>;
 }
 
-type Props = { open: boolean; onOpen: () => void; catalog: string; selected: GridImage | null; selectedVariantLabel: string | null; rows: GridImage[]; mutate: Mutation; onClose: () => void; onSelect: (row: GridImage) => Promise<void>; onFilter: (filter: Pick<SearchOptions, 'keyword' | 'keyword_direct' | 'collection'>, name: string) => void };
-export function OrganizationPanel({ open, onOpen, catalog, selected, selectedVariantLabel, rows, mutate, onClose, onSelect, onFilter }: Props) {
+type Props = { phase: Phase; open: boolean; onOpen: () => void; catalog: string; selected: GridImage | null; selectedVariantLabel: string | null; rows: GridImage[]; mutate: Mutation; onClose: () => void; onSelect: (row: GridImage) => Promise<void>; onFilter: (filter: Pick<SearchOptions, 'keyword' | 'keyword_direct' | 'collection'>, name: string) => void };
+export function OrganizationPanel({ phase, open, onOpen, catalog, selected, selectedVariantLabel, rows, mutate, onClose, onSelect, onFilter }: Props) {
+  const sessionActive = phase === 'ready' || phase === 'indexing';
+  const sessionActiveRef = useRef(sessionActive); sessionActiveRef.current = sessionActive;
   const [tab, setTab] = useState<'keywords' | 'collections' | 'batches'>('keywords');
   const [keyword, setKeyword] = useState<Keyword | null>(null); const [destination, setDestination] = useState<Keyword | null>(null);
   const [collection, setCollection] = useState<Collection | null>(null); const [parent, setParent] = useState<Collection | null>(null);
@@ -129,6 +131,7 @@ export function OrganizationPanel({ open, onOpen, catalog, selected, selectedVar
   const [busy, setBusy] = useState(false); const admission = useRef(false); const mounted = useRef(true);
   const [kind, setKind] = useState<OrganizationOperation['operation']>('rating'); const [rating, setRating] = useState(0); const [label, setLabel] = useState(''); const [flag, setFlag] = useState<'pick' | 'reject' | 'unflagged'>('pick');
   const [checked, setChecked] = useState<string[]>([]); const [job, setJob] = useState<Job | null>(null); const [running, setRunning] = useState(false); const runner = useRef(new OrganizationRunner()); const runAdmission = useRef(false);
+  useEffect(() => { if (!sessionActive) runner.current.stop(); }, [sessionActive]);
   const targetCollection = useNamedCollection(catalog, jobCollectionId(job), epoch);
   const currentParent = useNamedCollection(catalog, placement?.parent ?? null, epoch);
   const jobTargetReady = !jobCollectionId(job) || !!targetCollection.collection;
@@ -163,18 +166,19 @@ export function OrganizationPanel({ open, onOpen, catalog, selected, selectedVar
   const chosenRows = rows.filter(row => checked.includes(row.image_id));
   const begin = (chosen: GridImage[]) => void act(async () => { const items = selectionPage(chosen); const created = await organize(catalog, { command: 'begin', args: { operation: operation() } }, 'job'); setJob(created); setEpoch(v => v + 1); setJob(await organize(catalog, { command: 'append', args: { job: created.id, items } }, 'job')); });
   const run = async () => {
-    if (!job || !jobTargetReady || runAdmission.current || admission.current) return; runAdmission.current = true; setRunning(true); setError('');
-    try { await runner.current.run(job, async id => { let next!: Job; await mutate(async () => { if (!mounted.current) throw new Error('Batch stopped because the catalog is no longer open.'); next = await organize(catalog, { command: 'step', args: { job: id } }, 'job'); }); return next; }, value => { if (mounted.current) setJob(value); }); }
+    if (phase !== 'ready' || !job || !jobTargetReady || runAdmission.current || admission.current) return; runAdmission.current = true; setRunning(true); setError('');
+    try { await runner.current.run(job, async id => { let next!: Job; await mutate(async () => { if (!mounted.current || !sessionActiveRef.current) throw new Error('Batch stopped because the catalog is no longer open.'); next = await organize(catalog, { command: 'step', args: { job: id } }, 'job'); }); return next; }, value => { if (mounted.current) setJob(value); }); }
     catch (e) { if (mounted.current) setError(errorText(e)); }
     finally { runAdmission.current = false; if (mounted.current) { setRunning(false); setIdentityEpoch(v => v + 1); setEpoch(v => v + 1); } }
   };
   const cancel = () => { runner.current.stop(); void act(async () => { if (!job) return; setJob(await organize(catalog, { command: 'cancel', args: { job: job.id } }, 'job')); setEpoch(v => v + 1); }); };
-  if (!open) return job ? <div className="activity organization-background" role="status"><span>Batch: {jobTitle} · {job.state} · {job.applied} applied · {job.pending} pending{running ? ' · Running' : ''}</span><button onClick={() => { setTab('batches'); onOpen(); }}>Open batch</button>{running && <button onClick={() => runner.current.stop()}>Pause after current photo</button>}{!['complete','cancelled'].includes(job.state) && <button disabled={busy} onClick={cancel}>Cancel remaining items</button>}{error && <ErrorNotice message={error} />}</div> : null;
+  if (!open) return job ? <div className="activity organization-background" role="status"><span>Batch: {jobTitle} · {job.state} · {job.applied} applied · {job.pending} pending{running ? ' · Running' : ''}</span><button onClick={() => { setTab('batches'); onOpen(); }}>Open batch</button>{running && <button onClick={() => runner.current.stop()}>Pause after current photo</button>}{!['complete','cancelled'].includes(job.state) && <button disabled={busy || !sessionActive} onClick={cancel}>Cancel remaining items</button>}{error && <ErrorNotice message={error} />}</div> : null;
   return <Dialog title="Organize photographs" onClose={onClose}><div className="organization-panel">
     <nav className="button-group" aria-label="Organization sections">{(['keywords', 'collections', 'batches'] as const).map(value => <button key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{value === 'batches' ? 'Batch changes' : value === 'keywords' ? 'Keywords' : 'Collections'}</button>)}</nav>
     <p className="hint">{selected ? `Selected photo: ${selected.filename} · ${variantName(selectedVariantLabel)}` : 'Select a photograph in Library to make an individual change.'} · {rows.length} photos on the current Library page.</p>
     {error && <ErrorNotice message={error} dismiss={() => setError('')} />}{message && <p role="status">{message}</p>}{busy && <p role="status">Saving change…</p>}
-    <fieldset disabled={busy || running} className="organization-fields">
+    {phase !== 'ready' && <p role="status">{sessionActive ? 'Catalog is preparing. New organization changes become available when it is ready; the current batch remains available.' : 'Catalog is closing or unavailable. Batch progress is saved in the catalog.'}</p>}
+    <fieldset disabled={busy || running || phase !== 'ready'} className="organization-fields">
     {tab === 'keywords' && <div className="organization-columns"><section><h3>Browse keywords</h3><KeywordBrowser catalog={catalog} chosen={keyword} onChoose={setKeyword} epoch={epoch} />
       <form onSubmit={e => { e.preventDefault(); void act(async () => { const path = keywordKind === 'hierarchical' && child && keyword?.kind === 'hierarchical' ? [...keyword.path, name.trim()] : [name.trim()]; await organize(catalog, { command: 'create_keyword', args: { kind: keywordKind, path } }, 'keyword_created'); setName(''); setEpoch(v => v + 1); }); }}><h3>Create keyword</h3><label className="form-field">Name<input value={name} maxLength={1024} onChange={e => setName(e.target.value)} /></label><label className="form-field">Type<select value={keywordKind} onChange={e => setKeywordKind(e.target.value as KeywordKind)}><option value="hierarchical">Hierarchical</option><option value="flat">Flat</option></select></label>{keywordKind === 'hierarchical' && <label className="checkbox"><input type="checkbox" checked={child} onChange={e => setChild(e.target.checked)} disabled={keyword?.kind !== 'hierarchical'} />Create inside {keyword?.kind === 'hierarchical' ? keyword.path.join(' / ') : 'selected keyword (choose one first)'}</label>}<p className="hint">{keywordKind === 'flat' || !child || keyword?.kind !== 'hierarchical' ? 'Creates a root keyword.' : 'Creates a child of the selected keyword.'}</p><button disabled={!name.trim()}>Create keyword</button></form>
     </section><section><h3>{keyword ? keyword.path.join(' / ') : 'Choose a keyword'}</h3>{keyword && <><div className="button-group"><button onClick={() => onFilter({ keyword: keyword.id, keyword_direct: false, collection: null }, keyword.path.join(' / '))}>Browse matching photos</button><button onClick={() => onFilter({ keyword: keyword.id, keyword_direct: true, collection: null }, `${keyword.path.join(' / ')} (direct)`)}>Direct matches only</button></div><div className="button-group"><button disabled={!selected} onClick={() => void act(async () => { await apply({ operation: 'add_keyword', kind: keyword.kind, path: keyword.path }); })}>Add to selected photo</button><button disabled={!selected} onClick={() => void act(async () => { await apply({ operation: 'remove_keyword', kind: keyword.kind, path: keyword.path }); })}>Remove from selected photo</button></div>
@@ -205,6 +209,6 @@ export function OrganizationPanel({ open, onOpen, catalog, selected, selectedVar
     </> : <p>Prepare a batch or reopen one from Saved batches. No photos change until the selection is sealed and run.</p>}</section></div>}
     {keyword && collection && <div className="button-group"><button onClick={() => onFilter({ keyword: keyword.id, keyword_direct: false, collection: collection.id }, `${keyword.path.join(' / ')} in ${collection.name}`)}>Browse {keyword.name} within {collection.name}</button><button onClick={() => onFilter({ keyword: keyword.id, keyword_direct: true, collection: collection.id }, `${keyword.path.join(' / ')} (direct) in ${collection.name}`)}>Direct keyword matches within this collection</button></div>}
     </fieldset>
-    {job && <div className="organization-run-controls">{running && <><p role="status">Applying one photo at a time… This batch continues while the panel is closed.</p><button onClick={() => runner.current.stop()}>Pause after current photo</button></>}{!['complete','cancelled'].includes(job.state) && <button disabled={busy} onClick={cancel}>Cancel remaining batch items</button>}</div>}
+    {job && <div className="organization-run-controls">{running && <><p role="status">Applying one photo at a time… This batch continues while the panel is closed.</p><button onClick={() => runner.current.stop()}>Pause after current photo</button></>}{!['complete','cancelled'].includes(job.state) && <button disabled={busy || !sessionActive} onClick={cancel}>Cancel remaining batch items</button>}</div>}
   </div></Dialog>;
 }
