@@ -295,12 +295,7 @@ impl Session {
         // Even when cancellation arrived during streaming, consume its complete
         // ticket before returning the cancellation. Keep the process alive.
         self.check()?;
-        let value: Value = serde_json::from_slice(&encoded)?;
-        ensure!(
-            expected.accepts(&value),
-            "source reply does not match requested method"
-        );
-        Ok(value)
+        Value::decode(&encoded, expected.expected_kind())
     }
     fn retire(&mut self) -> Result<()> {
         if self.retired {

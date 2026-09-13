@@ -239,24 +239,19 @@ pub(super) fn next_chain(
 }
 
 impl Read {
-    pub fn accepts(&self, value: &super::wire::Value) -> bool {
-        use super::wire::{Query as Q, Value as V};
-        matches!(
-            (self, value),
-            (Self::Sql(Q::CaptureManifest { .. }), V::Manifest(_))
-                | (Self::Sql(Q::StableSource { .. }), V::StableSource(_))
-                | (
-                    Self::Sql(Q::OriginPacketRoster { .. }),
-                    V::OriginPacketRoster(_)
-                )
-                | (Self::Sql(Q::Page { .. }), V::Page(_))
-                | (Self::Sql(Q::ReadChunk { .. }), V::Chunk(_))
-                | (Self::Sql(Q::Count { .. }), V::Count(_))
-                | (Self::Sql(Q::Resolve { .. }), V::Resolution(_))
-                | (Self::Sql(Q::ImageLinks { .. }), V::ImageLinks(_))
-                | (Self::ArtifactVerify, V::Verified)
-                | (Self::ArtifactChunk { .. }, V::Chunk(_))
-        )
+    pub fn expected_kind(&self) -> super::wire::Kind {
+        use super::wire::{Kind as K, Query as Q};
+        match self {
+            Self::Sql(Q::CaptureManifest { .. }) => K::Manifest,
+            Self::Sql(Q::StableSource { .. }) => K::StableSource,
+            Self::Sql(Q::OriginPacketRoster { .. }) => K::OriginPacketRoster,
+            Self::Sql(Q::Page { .. }) => K::Page,
+            Self::Sql(Q::ReadChunk { .. }) | Self::ArtifactChunk { .. } => K::Chunk,
+            Self::Sql(Q::Count { .. }) => K::Count,
+            Self::Sql(Q::Resolve { .. }) => K::Resolution,
+            Self::Sql(Q::ImageLinks { .. }) => K::ImageLinks,
+            Self::ArtifactVerify => K::Verified,
+        }
     }
 }
 

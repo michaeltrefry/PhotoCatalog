@@ -5,6 +5,7 @@
 //! seal and the exclusion of other writers for the entire adapter lifetime.
 
 mod access;
+pub(crate) mod manifest_json;
 mod reader;
 pub(crate) use access::MigrationRead;
 pub use reader::MigrationSource;

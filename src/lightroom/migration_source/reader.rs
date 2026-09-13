@@ -718,7 +718,7 @@ impl MigrationSource {
             digest(&bytes) == selected.manifest_blake3,
             "capture manifest differs from seal"
         );
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        let manifest = super::manifest_json::decode(&bytes)?;
         ensure!(
             manifest.revision_id.as_deref() == Some(revision)
                 && manifest.state == "captured"

@@ -196,3 +196,243 @@ fn source_serialization_capacity_is_exact_and_both_passes_are_cancellable() -> R
     }
     Ok(())
 }
+
+#[test]
+fn maximal_units_first_manifest_preserves_foreign_evidence_and_rejects_tamper() -> Result<()> {
+    let mut fixture = Fixture::new();
+    let manifest = fixture.open().capture_manifest(fixture.revision())?;
+    let template = serde_json::to_string(&manifest)?;
+    let needle = format!(
+        "\"output\":{}",
+        serde_json::to_string(&manifest.request.output)?
+    );
+    let at = template.find(&needle).context("output field")?;
+    let prefix = format!("{}\"output\":{{\"units\":[", &template[..at]);
+    let suffix = format!(
+        "],\"encoding\":\"WindowsWide\"}}{}",
+        &template[at + needle.len()..]
+    );
+    let count = (MANIFEST_BYTES - prefix.len() - suffix.len() + 1) / 2;
+    let mut raw = Vec::with_capacity(MANIFEST_BYTES);
+    raw.extend_from_slice(prefix.as_bytes());
+    for index in 0..count {
+        if index > 0 {
+            raw.push(b',');
+        }
+        raw.push(b'0');
+    }
+    raw.extend_from_slice(suffix.as_bytes());
+    assert!(raw.len() <= MANIFEST_BYTES && MANIFEST_BYTES - raw.len() < 2);
+    let revision = fixture.revision().to_owned();
+    fixture.seal.selected[0].manifest_blake3 = crate::lightroom::digest(&raw);
+    fixture.edit(|db| {
+        db.execute(
+            "UPDATE captures SET manifest=? WHERE revision=?",
+            rusqlite::params![std::str::from_utf8(&raw).unwrap(), revision],
+        )
+        .unwrap();
+    });
+    let before = std::fs::read(&fixture.path)?;
+    let remote = maximal_sql(&fixture, ReadLimits::default().inline_bytes)?;
+    let value = remote.capture_manifest(&revision)?;
+    let crate::storage_volume::NativePath::WindowsWide(units) = &value.request.output else {
+        anyhow::bail!("foreign output evidence must retain its units")
+    };
+    assert_eq!(units.len(), count);
+    assert!(units.iter().all(|v| *v == 0));
+    eprintln!(
+        "{}",
+        serde_json::json!({"fixture":"maximal_units_first_manifest","source_bytes":raw.len(),"units":count,"unit_capacity_bytes":units.capacity()*2})
+    );
+    let mut decoded = value;
+    let normalized = serde_json::to_vec(&decoded)?;
+    assert_ne!(
+        crate::lightroom::digest(&normalized),
+        fixture.seal.selected[0].manifest_blake3
+    );
+    let again = remote.capture_manifest(&revision)?;
+    assert_eq!(serde_json::to_vec(&again)?, normalized);
+    drop(remote);
+    assert_eq!(
+        std::fs::read(&fixture.path)?,
+        before,
+        "read admission must preserve original evidence bytes"
+    );
+    // Keep the old manifest authority while independently sealing changed DB
+    // bytes. The original exact manifest digest, not the normalized view, wins.
+    let crate::storage_volume::NativePath::WindowsWide(units) = &mut decoded.request.output else {
+        anyhow::bail!("retained foreign units");
+    };
+    units[0] = 1; // Same-width mutation keeps size admission out of the digest test.
+    let tampered = serde_json::to_string(&decoded)?;
+    fixture.edit(|db| {
+        db.execute(
+            "UPDATE captures SET manifest=? WHERE revision=?",
+            rusqlite::params![tampered, revision],
+        )
+        .unwrap();
+    });
+    let error = match maximal_sql(&fixture, ReadLimits::default().inline_bytes) {
+        Ok(_) => anyhow::bail!("tampered manifest admitted"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("manifest differs from seal"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn borrowed_outer_value_checks_method_before_payload_and_preserves_tag_order() -> Result<()> {
+    use super::super::wire::Kind;
+    let mut fixture = Fixture::new();
+    let revision = fixture.revision().to_owned();
+    fixture.edit(|db| {
+        db.execute(
+            "INSERT INTO entities VALUES(?,'image','Adobe_images',NULL,NULL,'{}')",
+            [&revision],
+        )
+        .unwrap();
+    });
+    let source = fixture.open();
+    let revision = revision.as_str();
+    let values = [
+        (Kind::Verified, Value::Verified),
+        (
+            Kind::Manifest,
+            Value::Manifest(source.capture_manifest(revision)?),
+        ),
+        (
+            Kind::StableSource,
+            Value::StableSource(source.stable_source(revision, "lineage-selected:7")?),
+        ),
+        (
+            Kind::OriginPacketRoster,
+            Value::OriginPacketRoster(vec![
+                crate::application::I64(i64::MIN),
+                crate::application::I64(i64::MAX),
+            ]),
+        ),
+        (
+            Kind::Page,
+            Value::Page(source.page(revision, Collection::Rows, None, 1)?),
+        ),
+        (Kind::Chunk, Value::Chunk(vec![0, 255])),
+        (Kind::Count, Value::Count(U64(u64::MAX))),
+        (
+            Kind::Resolution,
+            Value::Resolution(Resolution::Unique("\0é".into())),
+        ),
+        (
+            Kind::ImageLinks,
+            Value::ImageLinks(source.image_links(revision, "image")?),
+        ),
+    ];
+    for (kind, value) in values {
+        let encoded = exact_json(&value, RESULT_BYTES, &AtomicBool::new(false))?;
+        let decoded = Value::decode(&encoded, kind)?;
+        assert_eq!(serde_json::to_vec(&decoded)?, encoded);
+        if kind != Kind::Verified {
+            #[derive(serde::Deserialize)]
+            struct Envelope<'a> {
+                kind: String,
+                #[serde(borrow)]
+                value: &'a serde_json::value::RawValue,
+            }
+            let raw: Envelope<'_> = serde_json::from_slice(&encoded)?;
+            let reversed = format!(
+                "{{\"value\":{},\"kind\":{}}}",
+                raw.value.get(),
+                serde_json::to_string(&raw.kind)?
+            );
+            assert_eq!(
+                serde_json::to_vec(&Value::decode(reversed.as_bytes(), kind)?)?,
+                encoded
+            );
+        }
+    }
+    // Wrong method must reject at the borrowed header, before any type-specific
+    // Manifest parse; the invalid body must not determine the error instead.
+    let mismatch = br#"{"value":{"not_a_manifest":[1,2,3]},"kind":"Manifest"}"#;
+    assert!(
+        Value::decode(mismatch, Kind::Count)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match requested method")
+    );
+    for invalid in [
+        br#"{"kind":"Count","value":"1","kind":"Count"}"#.as_slice(),
+        br#"{"kind":"Count","value":"1","value":"1"}"#.as_slice(),
+        br#"{"kind":"Count","value":"1","unknown":1}"#.as_slice(),
+        br#"{"kind":"Count"}"#.as_slice(),
+        br#"{"kind":"Count","value":1}"#.as_slice(),
+    ] {
+        assert!(Value::decode(invalid, Kind::Count).is_err());
+    }
+    assert!(matches!(
+        Value::decode(br#"{"value":null,"kind":"Verified"}"#, Kind::Verified)?,
+        Value::Verified
+    ));
+    Ok(())
+}
+
+#[test]
+fn borrowed_envelope_preserves_original_unit_null_and_duplicate_semantics() -> Result<()> {
+    use super::super::wire::Kind;
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "kind", content = "value", deny_unknown_fields)]
+    enum OriginalValue {
+        Verified,
+        Count(U64),
+    }
+    for (kind, raw) in [
+        (Kind::Verified, r#"{"kind":"Verified"}"#),
+        (Kind::Verified, r#"{"kind":"Verified","value":null}"#),
+        (Kind::Verified, r#"{"value":null,"kind":"Verified"}"#),
+        (
+            Kind::Verified,
+            r#"{"kind":"Verified","value":null,"value":null}"#,
+        ),
+        (
+            Kind::Verified,
+            r#"{"value":null,"value":null,"kind":"Verified"}"#,
+        ),
+        (
+            Kind::Verified,
+            r#"{"kind":"Verified","kind":"Verified","value":null}"#,
+        ),
+        (Kind::Verified, r#"{"kind":"Verified","value":{}}"#),
+        (Kind::Verified, r#"{"kind":"Verified","value":[]}"#),
+        (Kind::Verified, r#"{"kind":"Verified","value":0}"#),
+        (
+            Kind::Verified,
+            r#"{"kind":"Verified","value":null,"unknown":null}"#,
+        ),
+        (Kind::Count, r#"{"kind":"Count"}"#),
+        (Kind::Count, r#"{"kind":"Count","value":null}"#),
+        (Kind::Count, r#"{"value":null,"kind":"Count"}"#),
+        (Kind::Count, r#"{"value":null,"value":"1","kind":"Count"}"#),
+        (Kind::Count, r#"{"kind":"Count","value":"1","value":null}"#),
+        (
+            Kind::Count,
+            r#"{"kind":"Count","value":"18446744073709551615"}"#,
+        ),
+        (
+            Kind::Count,
+            r#"{"value":"18446744073709551615","kind":"Count"}"#,
+        ),
+    ] {
+        let original = serde_json::from_str::<OriginalValue>(raw);
+        let borrowed = Value::decode(raw.as_bytes(), kind);
+        assert_eq!(
+            original.is_ok(),
+            borrowed.is_ok(),
+            "raw={raw}; original={original:?}; borrowed={borrowed:?}"
+        );
+        if let (Ok(original), Ok(borrowed)) = (original, borrowed) {
+            assert_eq!(
+                serde_json::to_vec(&original)?,
+                serde_json::to_vec(&borrowed)?
+            );
+        }
+    }
+    Ok(())
+}

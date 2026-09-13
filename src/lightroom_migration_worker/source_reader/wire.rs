@@ -7,7 +7,7 @@ use crate::{
         },
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 /// The three remaining MigrationRead methods (seal, binding and chunk budget)
@@ -54,7 +54,7 @@ pub(super) enum Query {
         source_id: String,
     },
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(super) enum Value {
     Verified,
@@ -118,6 +118,59 @@ impl Query {
                 revision,
                 source_id,
             } => Value::ImageLinks(source.image_links(&revision, &source_id)?),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub(super) enum Kind {
+    Verified,
+    Manifest,
+    StableSource,
+    OriginPacketRoster,
+    Page,
+    Chunk,
+    Count,
+    Resolution,
+    ImageLinks,
+}
+impl Value {
+    /// Inspect the borrowed envelope and expected method before allocating its
+    /// typed body. A content-before-tag reply must not build a generic Content
+    /// graph (or route a different large variant through a small query).
+    pub(super) fn decode(bytes: &[u8], expected: Kind) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope<'a> {
+            kind: Kind,
+            #[serde(borrow)]
+            value: Option<&'a serde_json::value::RawValue>,
+        }
+        let envelope: Envelope<'_> = serde_json::from_slice(bytes)?;
+        ensure!(
+            envelope.kind == expected,
+            "source reply does not match requested method"
+        );
+        if expected == Kind::Verified {
+            ensure!(
+                envelope.value.is_none(),
+                "verified source reply must be unit"
+            );
+            return Ok(Self::Verified);
+        }
+        let body = envelope.value.context("source result body required")?.get();
+        Ok(match expected {
+            Kind::Manifest => Self::Manifest(
+                crate::lightroom::migration_source::manifest_json::decode(body.as_bytes())?,
+            ),
+            Kind::StableSource => Self::StableSource(serde_json::from_str(body)?),
+            Kind::OriginPacketRoster => Self::OriginPacketRoster(serde_json::from_str(body)?),
+            Kind::Page => Self::Page(serde_json::from_str(body)?),
+            Kind::Chunk => Self::Chunk(serde_json::from_str(body)?),
+            Kind::Count => Self::Count(serde_json::from_str(body)?),
+            Kind::Resolution => Self::Resolution(serde_json::from_str(body)?),
+            Kind::ImageLinks => Self::ImageLinks(serde_json::from_str(body)?),
+            Kind::Verified => unreachable!("verified unit handled before body admission"),
         })
     }
 }
