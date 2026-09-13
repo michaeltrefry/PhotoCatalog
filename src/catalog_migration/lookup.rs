@@ -1243,7 +1243,7 @@ mod tests {
             catalog
                 .db
                 .query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))?,
-            9
+            crate::CURRENT_SCHEMA_VERSION
         );
         assert_eq!(catalog.migration_lookup_record(id)?.rowid, r.rowid);
         assert!(

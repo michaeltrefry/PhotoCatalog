@@ -9,6 +9,7 @@ use photocatalog::{
         current_repair,
         import_artifacts::Worker,
         importer::{Policy, Progress},
+        keyword_repair,
     },
     lightroom::migration_source::{InputSeal, MigrationSource, ReadLimits},
 };
@@ -52,6 +53,32 @@ enum Command {
     },
     /// Read a repair checkpoint without opening the inspection or upgrading the catalog.
     RepairStatus {
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        repair: String,
+    },
+    /// Correct keyword hierarchy and memberships in an explicitly pinned completed import.
+    RepairKeywords {
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        seal: PathBuf,
+        #[arg(long)]
+        approval: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, default_value_t = 1000)]
+        max_steps: u64,
+        #[arg(long, default_value_t = 60)]
+        max_seconds: u64,
+        #[arg(long)]
+        stop_file: Option<PathBuf>,
+        #[arg(long, default_value_t = 600)]
+        source_open_seconds: u64,
+    },
+    /// Read a repair checkpoint without opening the inspection or upgrading the catalog.
+    KeywordRepairStatus {
         #[arg(long)]
         destination: PathBuf,
         #[arg(long)]
@@ -287,6 +314,28 @@ fn preflight_repair_upgrade(
     Ok(())
 }
 
+fn preflight_keyword_upgrade(
+    destination: &Path,
+    input: &str,
+    request: &keyword_repair::Request,
+) -> Result<()> {
+    let path = destination.join("catalog.sqlite3");
+    ensure!(
+        fs::symlink_metadata(&path)?.is_file(),
+        "keyword repair database must be a regular file"
+    );
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        app == 0x50484341 && (9..=photocatalog::CURRENT_SCHEMA_VERSION).contains(&schema),
+        "keyword repair requires schema9 or current schema"
+    );
+    keyword_repair::preflight(&db, input, request)
+}
+
 fn stop_requested(path: Option<&Path>) -> Result<bool> {
     let Some(path) = path else {
         return Ok(false);
@@ -371,6 +420,99 @@ fn main() -> Result<()> {
                     .with_context(|| {
                         format!(
                             "current-settings repair phase={:?} after_record={} examined={}",
+                            progress.phase, progress.after_record, progress.examined
+                        )
+                    })?
+                    .progress;
+                steps += 1;
+                stopped = stop_requested(stop_file.as_deref())?;
+                if last_report.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "{:?}: examined {}, repaired {}, steps {}",
+                        progress.phase, progress.examined, progress.repaired, steps
+                    );
+                    last_report = Instant::now();
+                }
+            }
+            emit(&serde_json::json!({
+                "protocol": 1,
+                "status": if progress.complete { "complete" } else if stopped { "stopped" } else { "paused" },
+                "repair": progress, "steps": steps,
+                "elapsed_seconds": started.elapsed().as_secs_f64(),
+                "adobe_rendering_equivalent": false
+            }))
+        }
+        Command::KeywordRepairStatus {
+            destination,
+            repair,
+        } => {
+            let destination = destination_path(&destination)?;
+            let db = status_database(&destination)?;
+            emit(&keyword_repair::read_progress(&db, &repair)?)
+        }
+        Command::RepairKeywords {
+            destination,
+            seal,
+            approval,
+            request,
+            max_steps,
+            max_seconds,
+            stop_file,
+            source_open_seconds,
+        } => {
+            ensure!(
+                max_steps > 0 && (1..=86400).contains(&max_seconds),
+                "invalid work budget"
+            );
+            ensure!(
+                (1..=3600).contains(&source_open_seconds),
+                "invalid source admission budget"
+            );
+            let seal: InputSeal = document(&seal)?;
+            let approval = bytes(&approval)?;
+            ensure!(
+                blake3::hash(&approval).to_hex().as_str() == seal.approval.document_blake3,
+                "authorization bytes differ from seal"
+            );
+            let request: keyword_repair::Request = document(&request)?;
+            let destination = destination_path(&destination)?;
+            ensure!(
+                destination.join("catalog.sqlite3").is_file(),
+                "repair requires an existing catalog"
+            );
+            let database = seal.database.to_path()?;
+            disjoint(
+                &destination,
+                database.parent().context("inspection has no parent")?,
+            )?;
+            eprintln!("Verifying sealed inspection before keyword repair...");
+            let source = MigrationSource::open(
+                seal,
+                ReadLimits {
+                    open_deadline_ms: source_open_seconds * 1000,
+                    ..ReadLimits::default()
+                },
+            )
+            .context("open and admit sealed inspection source")?;
+            let _lock = lock_destination(&destination)?;
+            preflight_keyword_upgrade(&destination, source.binding_blake3(), &request)
+                .context("preflight keyword repair destination")?;
+            let mut catalog =
+                Catalog::open(&destination).context("open keyword repair destination")?;
+            let mut progress = catalog
+                .begin_keyword_repair(&source, &request)
+                .context("begin or resume keyword repair")?;
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(max_seconds);
+            let mut steps = 0;
+            let mut stopped = stop_requested(stop_file.as_deref())?;
+            let mut last_report = Instant::now();
+            while !progress.complete && steps < max_steps && Instant::now() < deadline && !stopped {
+                progress = catalog
+                    .step_keyword_repair(&source, &progress.id)
+                    .with_context(|| {
+                        format!(
+                            "keyword repair phase={:?} after_record={} examined={}",
                             progress.phase, progress.after_record, progress.examined
                         )
                     })?
@@ -713,6 +855,66 @@ mod tests {
         symlink(&file, &link)?;
         assert!(bytes(&link).is_err());
         assert_eq!(bytes(&file)?, b"{}");
+        Ok(())
+    }
+    #[test]
+    fn keyword_cli_has_bounded_repair_and_readonly_status_routes() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "worker",
+            "repair-keywords",
+            "--destination",
+            "/synthetic/catalog",
+            "--seal",
+            "seal.json",
+            "--approval",
+            "approval.json",
+            "--request",
+            "request.json",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Command::RepairKeywords {
+                max_steps: 1000,
+                max_seconds: 60,
+                source_open_seconds: 600,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "worker",
+            "keyword-repair-status",
+            "--destination",
+            "/synthetic/catalog",
+            "--repair",
+            &"a".repeat(64),
+        ])?;
+        assert!(matches!(cli.command, Command::KeywordRepairStatus { .. }));
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("catalog.sqlite3");
+        {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch("PRAGMA application_id=1346913089; PRAGMA user_version=9; CREATE TABLE preserved(v); INSERT INTO preserved VALUES('prior state');")?;
+        }
+        let before = fs::read(&path)?;
+        assert!(status_database(temp.path()).is_err());
+        let request = keyword_repair::Request {
+            expected_dictionaries: 1,
+            expected_memberships: 0,
+            expected_synonyms: 0,
+            expected_captures: 1,
+            run: "a".repeat(64),
+            expected_complete_progress_blake3: "b".repeat(64),
+            expected_mapping_epoch: 1,
+            current_repair: "c".repeat(64),
+            expected_current_repair_progress_blake3: "d".repeat(64),
+            expected_roster_blake3: "e".repeat(64),
+            predecessor_evidence_blake3: "f".repeat(64),
+            roots: vec![],
+            reason: "Bounded test".into(),
+        };
+        assert!(preflight_keyword_upgrade(temp.path(), &"a".repeat(64), &request).is_err());
+        assert_eq!(before, fs::read(&path)?);
+        assert!(!temp.path().join("previews").exists());
         Ok(())
     }
 }

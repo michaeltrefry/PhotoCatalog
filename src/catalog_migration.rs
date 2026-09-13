@@ -8,6 +8,7 @@ pub mod history;
 pub mod images;
 pub mod import_artifacts;
 pub mod importer;
+pub mod keyword_repair;
 pub mod lookup;
 pub mod metadata;
 pub mod organization;

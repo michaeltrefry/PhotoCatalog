@@ -227,6 +227,23 @@ pub(crate) fn step(
     source: &MigrationSource,
     before: &Progress,
 ) -> Result<Step> {
+    step_owned(catalog, source, before, None)
+}
+pub(crate) fn step_keyword(
+    catalog: &mut Catalog,
+    source: &MigrationSource,
+    before: &Progress,
+    owner: &str,
+) -> Result<Step> {
+    step_owned(catalog, source, before, Some(owner))
+}
+fn step_owned(
+    catalog: &mut Catalog,
+    source: &MigrationSource,
+    before: &Progress,
+    owner: Option<&str>,
+) -> Result<Step> {
+    super::keyword_repair::require_owner(&catalog.db, &before.id, owner)?;
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(30);
     let mut ticks = 0u64;
@@ -240,7 +257,7 @@ pub(crate) fn step(
             }),
         )
         .context("install reconciliation destination query budget")?;
-    let result = step_inner(catalog, source, before);
+    let result = step_inner(catalog, source, before, owner);
     catalog
         .db
         .progress_handler(0, None::<fn() -> bool>)
@@ -266,7 +283,12 @@ fn epoch(db: &Connection) -> Result<i64> {
         |r| r.get(0),
     )?)
 }
-fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress) -> Result<Step> {
+fn step_inner(
+    catalog: &mut Catalog,
+    source: &MigrationSource,
+    before: &Progress,
+    owner: Option<&str>,
+) -> Result<Step> {
     let snapshot_epoch = epoch(&catalog.db).context("read reconciliation mapping epoch")?;
     let stale: bool = catalog
         .db
@@ -286,6 +308,7 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("begin reconciliation report/cursor transaction")?;
+        super::keyword_repair::require_owner(&tx, &before.id, owner)?;
         ensure!(
             epoch(&tx).context("recheck reconciliation mapping epoch before commit")?
                 == snapshot_epoch,
@@ -305,6 +328,9 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
             [&before.id],
         )
         .context("delete stale reconciliation reports")?;
+        if let Some(owner) = owner {
+            super::keyword_repair::reports_reset(&tx, owner)?;
+        }
         tx.commit().context("commit stale reconciliation reset")?;
         return Ok(Step {
             progress: reset,
@@ -365,6 +391,7 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("begin reconciliation report/cursor transaction")?;
+        super::keyword_repair::require_owner(&tx, &before.id, owner)?;
         ensure!(
             epoch(&tx).context("recheck reconciliation mapping epoch before commit")?
                 == snapshot_epoch,
@@ -379,6 +406,9 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
                 == 1,
             "reconciliation cursor changed before completion"
         );
+        if let Some(owner) = owner {
+            super::keyword_repair::finish(&tx, owner)?;
+        }
         tx.commit()
             .context("commit final reconciliation completion")?;
         return Ok(Step {
@@ -564,6 +594,7 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         .db
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("begin reconciliation report/cursor transaction")?;
+    super::keyword_repair::require_owner(&tx, &before.id, owner)?;
     ensure!(
         epoch(&tx).context("recheck reconciliation mapping epoch before commit")? == snapshot_epoch,
         "native mappings changed during reconciliation; retry"
@@ -582,6 +613,15 @@ fn step_inner(catalog: &mut Catalog, source: &MigrationSource, before: &Progress
         params![before.id, capture.revision, bytes, snapshot_epoch],
     )
     .context("insert capture reconciliation report")?;
+    if let Some(owner) = owner {
+        super::keyword_repair::report_committed(
+            &tx,
+            owner,
+            &capture.revision,
+            &bytes,
+            snapshot_epoch,
+        )?;
+    }
     tx.commit()
         .context("commit capture reconciliation report and cursor")?;
     Ok(Step {

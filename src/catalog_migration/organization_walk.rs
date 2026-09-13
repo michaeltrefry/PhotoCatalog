@@ -88,14 +88,18 @@ fn behavior(
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<ProjectionResult> {
-    project_one(catalog,source,policy,origin,Decision::Retain {
+    project_one(catalog, source, policy, origin, behavior_decision(origin))
+}
+
+fn behavior_decision(origin: &SourceRecord) -> Decision {
+    Decision::Retain {
         construct: if origin.source.table=="AgLibraryCollection" {"collection_behavior"} else {"keyword_behavior"}.into(),
         compatibility:Compatibility::Unsupported,
         detail:if origin.source.table=="AgLibraryCollection" {
             "Native container is a static membership snapshot; exact creationId, systemOnly, genealogy and source ordering are retained. Adobe smart rules, group restrictions and system behavior are not executed or equivalent."
         } else { "Native hierarchical keyword preserves its exact name/path. Source keywordType/person and export/include flags remain retained; Adobe person and export behavior are not asserted equivalent." }.into(),
         unresolved:None,
-    })
+    }
 }
 
 fn integer(value: &Cell) -> Option<i64> {
@@ -639,6 +643,146 @@ fn dictionary(
         }
     }
     Ok(RowResult::Applied(Outcome::Organization(results)))
+}
+
+/// Source-only single-row decisions for the explicit repair; never commits ancestors.
+pub(crate) fn keyword_row(
+    catalog: &Catalog,
+    source: &MigrationSource,
+    origin: &SourceRecord,
+) -> Result<Decision> {
+    ensure!(
+        origin.source.table == "AgLibraryKeyword",
+        "repair dictionary table differs"
+    );
+    let walk = Walk::new(catalog, source, &origin.source.capture_revision)?;
+    let fields = columns(catalog, &walk, origin)?
+        .ok_or_else(|| anyhow::anyhow!("repair dictionary columns unavailable within bounds"))?;
+    if organization::keyword_boundary_fields(&fields) {
+        return Ok(Decision::KeywordBoundary {
+            retained_table: walk.schema("AgLibraryKeyword")?,
+        });
+    }
+    let name = fields
+        .get("name")
+        .and_then(name)
+        .ok_or_else(|| anyhow::anyhow!("repair dictionary name unsupported"))?;
+    let parent = match fields.get("parent") {
+        Some(value) if absent(value) => None,
+        Some(_) => match walk.link(origin, "parent", "AgLibraryKeyword")? {
+            LinkResolution::Unique(link) => Some(*link),
+            _ => anyhow::bail!("repair dictionary parent must be uniquely proven"),
+        },
+        None => anyhow::bail!("repair dictionary parent column missing"),
+    };
+    Ok(Decision::Keyword {
+        name,
+        keyword_kind: KeywordKind::Hierarchical,
+        parent,
+        decision: DictionaryDecision::Create,
+    })
+}
+pub(crate) fn keyword_request(
+    policy: &Policy,
+    origin: &SourceRecord,
+    decision: Decision,
+) -> Projection {
+    Projection {
+        origin: origin.clone(),
+        import_source: policy.import_source.clone(),
+        adapter_version: ADAPTER.into(),
+        decision,
+    }
+}
+pub(crate) fn keyword_behavior(policy: &Policy, origin: &SourceRecord) -> Projection {
+    keyword_request(policy, origin, behavior_decision(origin))
+}
+pub(crate) fn keyword_overlap(
+    catalog: &Catalog,
+    policy: &Policy,
+    decision: &mut Decision,
+) -> Result<()> {
+    if let Decision::Keyword {
+        name,
+        keyword_kind,
+        parent,
+        decision: choice,
+    } = decision
+    {
+        let mut path = if let Some(parent) = parent {
+            let (kind, path) = organization::keyword_parent_path(
+                &catalog.db,
+                &policy.import_source,
+                &parent.target,
+            )?;
+            ensure!(kind == *keyword_kind, "keyword parent kind differs");
+            path
+        } else {
+            vec![]
+        };
+        path.push(name.clone());
+        ensure!(path.len() <= 64, "keyword hierarchy exceeds native bound");
+        let existing: Option<i64> = catalog
+            .db
+            .query_row(
+                "SELECT id FROM organization_keywords WHERE kind='hierarchical' AND path=?",
+                [serde_json::to_string(&path)?],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            match &policy.keyword_overlap {
+                KeywordOverlap::RequireDecision => anyhow::bail!(
+                    "Exact complete keyword hierarchy already exists; explicit reuse decision required"
+                ),
+                KeywordOverlap::ReuseExactHierarchy { reason } => {
+                    *choice = DictionaryDecision::ReuseExactHierarchy {
+                        native_id: id.to_string(),
+                        reason: reason.clone(),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+pub(crate) fn keyword_member(
+    catalog: &Catalog,
+    source: &MigrationSource,
+    policy: &Policy,
+    origin: &SourceRecord,
+) -> Result<Result<Projection, String>> {
+    ensure!(
+        origin.source.table == "AgLibraryKeywordImage",
+        "repair membership table differs"
+    );
+    let walk = Walk::new(catalog, source, &origin.source.capture_revision)?;
+    walk.source_id(origin)?;
+    let image = walk.link(origin, "image", "Adobe_images")?;
+    let keyword = walk.link(origin, "tag", "AgLibraryKeyword")?;
+    let (LinkResolution::Unique(image), LinkResolution::Unique(keyword)) = (image, keyword) else {
+        return Ok(Err(
+            "Keyword membership has unresolved source endpoints".into()
+        ));
+    };
+    if !mapped(catalog, policy, &image.target)?
+        || !native_dictionary(
+            dictionary_existing(catalog, policy, &keyword.target)?,
+            false,
+        )
+    {
+        return Ok(Err(
+            "Keyword membership endpoints lack native mappings".into()
+        ));
+    }
+    Ok(Ok(keyword_request(
+        policy,
+        origin,
+        Decision::KeywordMembership {
+            image: *image,
+            keyword: *keyword,
+        },
+    )))
 }
 
 #[cfg(test)]

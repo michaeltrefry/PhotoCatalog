@@ -130,7 +130,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 48
+            && receipt["added_tables"].as_array().unwrap().len() == 51
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
@@ -226,7 +226,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
     ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 48);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 51);
     ensure!(
         migrated["added_tables"]
             .as_array()
@@ -311,6 +311,7 @@ fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
 // while leaving schema7 columns, foreign keys, and triggers installed.
 fn remove_image_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+    conn.execute_batch("DROP TABLE migration_keyword_repair_items; DROP TABLE migration_keyword_repair_reports; DROP TABLE migration_keyword_repairs;")?;
     conn.execute_batch("DROP TABLE migration_current_repair_items; DROP TABLE migration_current_repair_reports; DROP TABLE migration_current_repairs;")?;
     let triggers=conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'image_%' OR name='organization_metadata_update')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for t in triggers {
@@ -388,7 +389,7 @@ fn schema_six_adds_only_verified_image_state_and_rejects_legacy_sequence_spoof()
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION,
         "{receipt}"
     );
-    ensure!(receipt["added_tables"].as_array().unwrap().len() == 35);
+    ensure!(receipt["added_tables"].as_array().unwrap().len() == 38);
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
             && receipt["original_columns_preserved"] == true

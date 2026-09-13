@@ -736,3 +736,6 @@ fn wrapped_current_settings_cross_worker_render_and_reopen() -> Result<()> {
 
 #[path = "current_repair_tests.rs"]
 mod current_repair_tests;
+
+#[path = "keyword_repair_tests.rs"]
+mod keyword_repair_tests;

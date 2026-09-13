@@ -256,6 +256,7 @@ pub(crate) fn advance(
     let tx = catalog
         .db
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    super::keyword_repair::require_owner(&tx, &before.id, None)?;
     ensure!(
         tx.execute(
             "UPDATE migration_runs SET progress=?3 WHERE id=?1 AND progress=?2",
@@ -484,6 +485,7 @@ impl Catalog {
         )?;
         let (old, old_policy) = read(&tx, &id)?;
         super::current_repair::require_not_pending(&tx, &id)?;
+        super::keyword_repair::require_owner(&tx, &id, None)?;
         ensure!(
             old.input == source.binding_blake3() && encode(&old_policy)? == policy_bytes,
             "migration run identity differs"
@@ -499,6 +501,7 @@ impl Catalog {
     pub fn step_selected_import(&mut self, source: &MigrationSource, id: &str) -> Result<Step> {
         let (before, policy) = read(&self.db, id)?;
         super::current_repair::require_not_pending(&self.db, id)?;
+        super::keyword_repair::require_owner(&self.db, id, None)?;
         ensure!(
             before.input == source.binding_blake3(),
             "migration source binding differs"

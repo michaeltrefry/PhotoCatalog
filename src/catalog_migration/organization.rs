@@ -705,6 +705,142 @@ fn validate(request: &Projection) -> Result<()> {
     Ok(())
 }
 
+/// A fresh keyword projection, prepared without replacing an existing receipt.
+/// Only the caller owning an exact predecessor CAS may remove that predecessor.
+pub(crate) struct PreparedKeywordProjection {
+    request: Projection,
+    digest: String,
+    evidence: Evidence,
+    candidate: Option<(candidates::Candidate, SourceRecord, ImageMetadataIdentity)>,
+    keyword_guard: Option<(SourceRecord, i64, KeywordKind, Vec<String>)>,
+    parent_guard: Option<(SourceRecord, KeywordKind, Vec<String>)>,
+}
+impl PreparedKeywordProjection {
+    pub(crate) fn require_source_parent_path(&self, expected: &[String]) -> Result<()> {
+        ensure!(
+            matches!(&self.parent_guard, Some((_, KeywordKind::Hierarchical, actual)) if actual == expected),
+            "keyword parent snapshot differs from planned source path"
+        );
+        Ok(())
+    }
+}
+
+fn keyword_preparable(decision: &Decision) -> bool {
+    matches!(
+        decision,
+        Decision::KeywordBoundary { .. }
+            | Decision::Keyword { .. }
+            | Decision::KeywordMembership { .. }
+    ) || matches!(decision, Decision::Retain { construct, unresolved: None, .. } if construct == "keyword_behavior")
+}
+pub(crate) fn commit_keyword_projection(
+    tx: &rusqlite::Transaction<'_>,
+    p: PreparedKeywordProjection,
+) -> Result<ProjectionResult> {
+    p.evidence.recheck(tx)?;
+    ensure!(
+        existing(tx, &p.request, &p.digest)?.is_none(),
+        "keyword receipt changed before commit"
+    );
+    if let Some((reference, kind, path)) = &p.parent_guard {
+        ensure!(
+            keyword_parent_path(tx, &p.request.import_source, reference)? == (*kind, path.clone()),
+            "keyword parent changed before commit"
+        );
+    }
+    if let Some((reference, id, kind, path)) = &p.keyword_guard {
+        ensure!(
+            keyword(tx, &p.request.import_source, reference)? == (*id, *kind, path.clone()),
+            "keyword endpoint changed before commit"
+        );
+    }
+    let proof = p.evidence.proof(&p.request)?;
+    let target = if let Some((candidate, reference, expected)) = p.candidate {
+        catalog_images::require_image_metadata_identity(tx, &expected)?;
+        ensure!(
+            image(tx, &p.request.import_source, &reference)? == expected,
+            "keyword image endpoint changed before commit"
+        );
+        candidate.commit(tx, &expected)?
+    } else {
+        apply(tx, &p.request, &proof)?
+    };
+    save(tx, &p.request, &p.digest, &proof, target)
+}
+impl Catalog {
+    pub(crate) fn prepare_keyword_projection(
+        &self,
+        source: &MigrationSource,
+        request: &Projection,
+    ) -> Result<PreparedKeywordProjection> {
+        ensure!(
+            keyword_preparable(&request.decision),
+            "unsupported keyword repair projection"
+        );
+        let digest = input_digest(request)?;
+        validate(request)?;
+        let mut evidence = Evidence::default();
+        evidence.source(&self.db, &request.origin)?;
+        ensure!(
+            source.binding_blake3() == evidence.records[&request.origin.retained_record].input,
+            "keyword projection input differs"
+        );
+        if let Decision::KeywordBoundary { retained_table } = request.decision {
+            let fields =
+                super::images::columns(&self.db, &mut evidence, &request.origin, retained_table)?;
+            ensure!(
+                keyword_boundary_fields(&fields),
+                "keyword boundary requires typed Null name and parent"
+            );
+        }
+        for link in request.decision.links() {
+            verify_unique_link(&self.db, &mut evidence, &request.origin, link, source)?;
+        }
+        let parent_guard = if let Decision::Keyword {
+            parent: Some(parent),
+            ..
+        } = &request.decision
+        {
+            let (kind, path) =
+                keyword_parent_path(&self.db, &request.import_source, &parent.target)?;
+            Some((parent.target.clone(), kind, path))
+        } else {
+            None
+        };
+        let mut keyword_guard = None;
+        let candidate = if let Decision::KeywordMembership {
+            image: reference,
+            keyword: term,
+        } = &request.decision
+        {
+            let (id, kind, path) = keyword(&self.db, &request.import_source, &term.target)?;
+            keyword_guard = Some((term.target.clone(), id, kind, path.clone()));
+            let expected = image(&self.db, &request.import_source, &reference.target)?;
+            let prepared = candidates::prepare(
+                self,
+                Some(source),
+                request,
+                &reference.target,
+                &expected,
+                &Operation::AddKeyword { kind, path },
+                &mut evidence,
+            )?
+            .context("keyword candidate was not prepared")?;
+            Some((prepared, reference.target.clone(), expected))
+        } else {
+            None
+        };
+        Ok(PreparedKeywordProjection {
+            request: request.clone(),
+            digest,
+            evidence,
+            candidate,
+            keyword_guard,
+            parent_guard,
+        })
+    }
+}
+
 impl Catalog {
     /// One bounded source construct per call (at most 100 proof records/8 MiB).
     /// Identical replay needs no connected source and makes no native writes.
@@ -750,6 +886,22 @@ impl Catalog {
             }
         }
         if let Some(result) = prior {
+            return Ok(result);
+        }
+        if keyword_preparable(&request.decision) && source.is_some() {
+            let prepared = self.prepare_keyword_projection(
+                source.context("new keyword projection requires sealed source")?,
+                request,
+            )?;
+            let _permit = self.writers.enter(Priority::Background)?;
+            let tx = self
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(prior) = existing(&tx, request, &digest)? {
+                return Ok(prior);
+            }
+            let result = commit_keyword_projection(&tx, prepared)?;
+            tx.commit()?;
             return Ok(result);
         }
         if let Decision::Retain {
@@ -1761,6 +1913,41 @@ mod tests {
                 |r| r.get::<_, i64>(0)
             )?,
             0
+        );
+        Ok(())
+    }
+    #[test]
+    fn fresh_parentless_keyword_and_behavior_remain_available_offline() -> Result<()> {
+        let mut b = Bed::new(false)?;
+        let request = b.request(
+            200,
+            Decision::Keyword {
+                name: "Offline".into(),
+                keyword_kind: KeywordKind::Hierarchical,
+                parent: None,
+                decision: DictionaryDecision::Create,
+            },
+        );
+        let result = b.catalog.project_migration_organization(None, &request)?;
+        assert!(matches!(result.target, NativeTarget::Keyword { .. }));
+        let behavior = b.request(
+            200,
+            Decision::Retain {
+                construct: "keyword_behavior".into(),
+                compatibility: Compatibility::Unsupported,
+                detail: "Preserved source behavior".into(),
+                unresolved: None,
+            },
+        );
+        assert!(matches!(
+            b.catalog
+                .project_migration_organization(None, &behavior)?
+                .target,
+            NativeTarget::Retained { .. }
+        ));
+        assert_eq!(
+            b.catalog.project_migration_organization(None, &request)?,
+            result
         );
         Ok(())
     }

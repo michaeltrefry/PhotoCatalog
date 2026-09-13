@@ -178,6 +178,7 @@ pub(crate) fn require_not_pending(db: &Connection, run: &str) -> Result<()> {
     Ok(())
 }
 fn check(db: &Connection, b: &Binding, p: &Progress) -> Result<()> {
+    super::keyword_repair::require_owner(db, &p.run, None)?;
     let (run, policy) = importer::read(db, &p.run)?;
     ensure!(
         run.input == b.input && digest(&encode(&policy)?) == b.policy_blake3,
@@ -230,6 +231,7 @@ impl Catalog {
                 && request.reason.len() <= 4096,
             "repair request bounds"
         );
+        super::keyword_repair::require_owner(&self.db, &request.run, None)?;
         let (before, policy) = importer::read(&self.db, &request.run)?;
         ensure!(
             before.input == source.binding_blake3(),
@@ -302,6 +304,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::keyword_repair::require_owner(&tx, &request.run, None)?;
         ensure!(
             epoch(&tx)? == request.expected_mapping_epoch,
             "repair mapping changed before admission"
@@ -337,6 +340,7 @@ impl Catalog {
         id: &str,
     ) -> Result<Step> {
         let (binding, before) = read(&self.db, id)?;
+        super::keyword_repair::require_owner(&self.db, &before.run, None)?;
         ensure!(
             source.binding_blake3() == binding.input,
             "repair source seal differs"
