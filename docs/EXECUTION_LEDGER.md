@@ -5,32 +5,22 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 ## Current delivery — 2026-09-13
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
-PR16 is at `ab92172791f92c40250ed766f15d619ed35209ff`; CI34779651605 is
-terminal SUCCESS for all four jobs. Three-platform installer artifacts and all
-37 receipt evidence hashes were verified. Receipt
-`sc-22847-ci-34779651605-zcnwn7u1/receipt.json`, SHA256
-`bb75168f1a0f20217766548ac58897ab6981b69cee6ad9d52865c99dd2035bbd`;
-terminal snapshot SHA256
-`3ddc19251c6d95e6eae5cdea4e80f3d348bed218f216758b04293bcb983f78fd`.
-Linux/Windows observer binaries were included and rehashed; Mac observer remains
-receipt-only. Installed preview/export workers, known-child/root reaping, stream
-joins and temporary cleanup passed; GUI remains untested by those artifacts.
-This run qualifies the published reader/preview-drain batch and predates the
-local additive transport and temporary-open guard below. Comment23335 and state
-were read back. The preceding CI34776023414 at `3bd92de` is
-terminal SUCCESS for contracts, macOS, Linux and Windows. All three installers,
-executables, provider archive digests, native closure files and notices were
-independently verified, with known preview/export children reaped and temporary
-state removed. Linux/Windows observer executables were uploaded and rehashed;
-macOS observer identity is receipt-only. No GUI acceptance is claimed. Receipt:
-`sc-22847-ci-34776023414-rpz2s9uc/receipt.json`, SHA256
-`6262fc93428aee1081c9187cf3dfb3f0922772deb29c871be105835e1b3b1f51`;
-terminal run snapshot SHA256
-`04f272339c8b14311390ef8f37961621c96aed29c25b64fd88a3eeef788c372a`.
-Shortcut comment23329 and In Progress state were read back exactly. Previous
-CI34773173909 is terminal (Windows/Linux/contracts passed; Mac failed on the
-repaired close race). That successful run predates the following reader repair
-and preview-drain changes, now published in the current head.
+PR16 checkpoint `e841bdb8a452c747bbf4e1eaf429c52f82c402b6` passed all four
+CI34783536524 jobs (macOS, Linux, Windows, contracts). All three provider ZIP
+digests and included installers, executables, native closure and notices passed
+artifact audit. Root verified all 40 evidence hashes. Receipt
+`sc-22847-ci-34783536524-2pvqkiwe/receipt.json`, SHA256
+`169148975be76f7aa150a9d1ecd6952cb4c2914bfb66397c97fa21493f076d55`.
+Linux/Windows observer executables were included and rehashed; Mac observer is
+receipt-only. Known root/child reaping and temporary cleanup were verified;
+GUI acceptance and absence of undiscovered descendants are not claimed.
+This run includes additive catalog transport and the exclusive-create guard.
+Shortcut comment23340 and In Progress state were read back exactly.
+
+Earlier successful checkpoints remain preserved: CI34779651605 at `ab921727`
+qualifies reader/preview drain before transport and the exclusive-create guard;
+CI34776023414 at `3bd92de` qualifies its preceding identity/close corrections.
+Their original source, artifact and negative-attempt receipts remain available.
 
 The complete custody design, call-site inventory and additive desktop transport
 slice were accepted and read back in comment23326. The transport remains
@@ -80,7 +70,7 @@ Local receipt: `sc-22847-sqlite-exclusive-1uczt_3n/receipt.json`, SHA256
 `20a814e86d0d980f3f2e009c6de0d00809f8c129ec750c23c32daa7a0d09eed6`.
 Integrated release/locked Tauri compilation passed in 19.90 seconds;
 session57536 is terminal/reaped and all five integrated hashes match.
-Windows/Linux runtime qualification awaits the new hosted run.
+Windows/Linux qualification passed in CI34783536524 at the published checkpoint.
 
 The complete paired managed SQL session and filesystem bootstrap/restore plans
 were accepted and read back in comment23334. They preserve all eight fixed
@@ -102,12 +92,31 @@ three closed-reader functions passed on unchanged reader code. Independent final
 review verifies 96 committed source pins and 11 evidence artifacts; focused receipt
 SHA256 `634286acd0d9b54595d6c76fbbc246883f4bef236943802543d74b2ef98492b8`.
 Source v14 passes three maximal-buffer fixtures and uses exact two-pass encoding.
-The 16,777,214-byte issue-heavy Manifest yields 698,974 issues and a 75,497,472-byte
-issue Vec allocation; encoded output is 28,659,800 bytes. Those measurements
-supersede the provisional 64 MiB decoded estimate. Valid JSON property order can
-also cause intermediate Serde buffering. A Source-specific borrowed decoder and
-complete decoded/scratch capacity proof remain required before memory admission
-or full migration bridge acceptance can be claimed.
+Its object-Issue measurement is a specific representation, not the maximum of
+all accepted sequence forms. The Source-specific borrowed Manifest decoder is
+qualified at `8909ec4`: two Manifest parity, six budget, six proxy and three
+closed-reader functions pass. Root verified 99 committed source pins and 12
+evidence hashes in final receipt
+`sc-22847-lightroom-migration-bridge-xksnotzh/source-v17-final-receipt.json`,
+SHA256 `b1f5354e85aa9f97353f9458bcac0a061376268b87702021ef13b6088f5bce9e`.
+Original retained bytes and their digest remain authoritative; decoded views do
+not normalize the retained source. Earlier authoring/fixture failures remain
+preserved. Numerical aggregate memory admission is still unqualified.
+
+The subsequent finite opening-read guard batch passed source review. Its first
+compile stopped before tests at three unsupported usize SQL parameters; checked
+i64 conversions are under qualification. The initial v18 manifest omitted two
+changed files already present in its hashed diff; a preserved supplemental
+receipt records that omission, and v19 covers the complete 102 source pins.
+No final allocation or RSS allowance follows from the symbolic capacity proof.
+
+The filesystem bootstrap/marker worker passed 15 initial worker functions,
+12 restore-marker tests and one actual configured helper-process test, including
+explicit helper reaping. Ten strict Clippy diagnostics were repaired and reviewed;
+shared API formatting now passes. The final composed native gate is pending.
+Managed SQL session qualification stopped on test-only type errors before tests
+ran; exact failed-bootstrap Close recovery and manifest-role lease retention are
+being repaired. These isolated workers remain unselected in the desktop.
 
 Local `db023e1` (author `ef98f82e`) corrects preview cleanup and checked Quit.
 Failed native wait retains the active child, scheduler/encoded reservations,
