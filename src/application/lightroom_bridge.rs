@@ -79,6 +79,7 @@ pub(crate) struct Control {
     attempt: Option<String>,
     workbench: Option<lw::WorkbenchControl>,
     upload: Option<Upload>,
+    drained: bool,
 }
 impl Control {
     pub(crate) fn signal_shutdown(&self) {
@@ -87,9 +88,16 @@ impl Control {
         }
     }
     fn status(&self) -> Option<Status> {
-        self.workbench
-            .as_ref()
-            .map(|w| Status::new(self.attempt.clone().unwrap_or_default(), w.status()))
+        self.workbench.as_ref().map(|w| {
+            let mut status = w.status();
+            // Worker completion precedes the actor's join and lease release.
+            // Cached Closed must certify that a new Bridge can acquire ownership.
+            if status.closed && !self.drained {
+                status.closed = false;
+                status.phase = lw::Phase::Closing;
+            }
+            Status::new(self.attempt.clone().unwrap_or_default(), status)
+        })
     }
     fn checked(&self, g: &Guard) -> Result<lw::WorkbenchControl> {
         let w = self.workbench.as_ref().context("no inspection workbench")?;
@@ -220,6 +228,10 @@ impl Coordinator {
             if joined {
                 self.owner = None;
                 self.lease = None;
+                self.control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .drained = true;
             }
         }
     }
@@ -230,6 +242,10 @@ impl Coordinator {
             .signal_shutdown();
         drop(self.owner.take());
         self.lease = None;
+        self.control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drained = true;
     }
     pub(crate) fn request(
         &mut self,
@@ -289,6 +305,7 @@ impl Coordinator {
             c.attempt = Some(attempt);
             c.workbench = Some(w.control());
             c.upload = None;
+            c.drained = false;
             self.owner = Some(w);
             self.lease = Some(lease);
             return Ok(Response::Status(c.status()));

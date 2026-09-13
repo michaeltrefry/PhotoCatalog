@@ -2,6 +2,51 @@ use super::*;
 use crate::application::{self as app, I64};
 use std::time::{Duration, Instant};
 static SERIAL: Mutex<()> = Mutex::new(());
+#[test]
+fn closed_status_waits_for_join_and_process_lease_release() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let root = temp.path().join("inspection");
+    let request = |mode| Request::Open {
+        attempt: uuid::Uuid::new_v4().to_string(),
+        root: NativePath::from_path(&root),
+        mode,
+        capture_staging: NativePath::from_path(temp.path()),
+        limits: lw::Limits::default().into(),
+    };
+    let control = Arc::new(Mutex::new(Control::default()));
+    let mut coordinator = Coordinator::new(control.clone());
+    coordinator
+        .request(request(lw::OpenMode::Create), &executable, ENVELOPE)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !coordinator.owner.as_ref().unwrap().status().initialized {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    coordinator.owner.as_ref().unwrap().request_close();
+    while !coordinator.owner.as_mut().unwrap().poll_closed().unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The worker is gone but this deliberately held coordinator still owns the
+    // process lease. A cached reply cannot yet authorize a different Bridge.
+    let draining = control.lock().unwrap().status().unwrap();
+    assert!(!draining.closed, "Closed escaped before lease release");
+    assert_eq!(draining.phase, lw::Phase::Closing);
+    let mut next = Coordinator::new(Arc::new(Mutex::new(Control::default())));
+    assert!(
+        next.request(request(lw::OpenMode::OpenExisting), &executable, ENVELOPE)
+            .is_err()
+    );
+    coordinator.maintain();
+    assert!(control.lock().unwrap().status().unwrap().closed);
+    // Keep the first coordinator alive to exercise cross-Bridge reopening.
+    next.request(request(lw::OpenMode::OpenExisting), &executable, ENVELOPE)
+        .unwrap();
+    next.shutdown();
+}
 fn config() -> app::Config {
     app::Config {
         worker_executable: std::env::current_exe().unwrap(),
