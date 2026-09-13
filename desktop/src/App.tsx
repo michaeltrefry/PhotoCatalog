@@ -12,6 +12,9 @@ import { relinkTerminal } from './relink';
 import { CopyPanel } from './components/CopyPanel';
 import { useEditCopy } from './state/useEditCopy';
 import { copyTerminal } from './editCopy';
+import { usePhotoExport } from './state/usePhotoExport';
+import { terminal as exportTerminal } from './photoExport';
+import { ExportPanel, type ExportGate } from './components/ExportPanel';
 import { MetadataPanel } from './components/MetadataPanel';
 import { BackupPanel } from './components/BackupPanel';
 import { SearchFilters, defaultFilters } from './components/SearchFilters';
@@ -45,6 +48,7 @@ export function App() {
   const [showMetadata, setShowMetadata] = useState(false);
   const [showRelink, setShowRelink] = useState(false);
   const [showCopy, setShowCopy] = useState(false);
+  const [showExport, setShowExport] = useState(false);
   const [copyRefreshing, setCopyRefreshing] = useState<{ catalog: string; stamp: string } | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
   const [organizationScopeName, setOrganizationScopeName] = useState('');
@@ -78,9 +82,43 @@ export function App() {
   const storageRefresh = useRef(0);
   const storage = useRelink(catalog);
   const copies = useEditCopy(catalog);
+  const outputs = usePhotoExport(catalog);
+  const [exportPending, setExportPending] = useState<string | null>(null);
+  const exportDirectHeld = catalog !== null && exportPending === catalog;
   const copyEditingHeld = copies.busy || copyRefreshing?.catalog === catalog;
   const copyRefreshed = useRef('');
-  const storageWriteHold = storage.writeHeld;
+  const storageWriteHold = storage.writeHeld || outputs.writeHeld || exportDirectHeld;
+  const exportBlocked = exportDirectHeld || outputs.writeHeld || status.phase !== 'ready' || status.jobs_held || storage.writeHeld || copies.busy || copyRefreshing?.catalog === catalog;
+  const exportBlockedRef = useRef(exportBlocked); exportBlockedRef.current = exportBlocked;
+  const exportGate: ExportGate = async action => {
+    let result!: Awaited<ReturnType<typeof action>>;
+    await gate.current.afterCurrent(async () => {
+      if (!catalog || catalogRef.current !== catalog || exportBlockedRef.current) throw new Error('This catalog is not ready for export admission.');
+      setTransitioning(true);
+      try {
+        await queueRef.current?.flush();
+        if (catalogRef.current !== catalog || exportBlockedRef.current) throw new Error('Catalog or write admission changed while saving edits.');
+        result = await action();
+      } finally { setTransitioning(false); }
+    });
+    return result;
+  };
+  const exportRefreshed = useRef('');
+  useEffect(() => {
+    const operation = outputs.operation;
+    if (!catalog || !operation || !exportTerminal(operation)) return;
+    const stamp = `${catalog}:${operation.id}`;
+    if (exportRefreshed.current === stamp) return;
+    exportRefreshed.current = stamp;
+    const abort = new AbortController(), row = selectedRef.current;
+    setRefresh(v => v + 1);
+    if (row) void command({ command: 'image', args: { catalog, key: row.key } }, 'image', abort.signal).then(value => {
+      if (!abort.signal.aborted && catalogRef.current === catalog && selectedRef.current === row && JSON.stringify(value) !== JSON.stringify(row)) setSelected(value);
+    }).catch(e => { if (!abort.signal.aborted && catalogRef.current === catalog && selectedRef.current === row) setError(`Export operation finished; selected photo refresh failed: ${errorText(e)}`); });
+    // Export does not change edit recipes. Keep the active EditQueue and any
+    // pending draft intact while refreshing the guarded read-only image state.
+    return () => abort.abort();
+  }, [catalog, outputs.operation]);
 
   useEffect(() => {
     if (!desktopAvailable) return;
@@ -191,7 +229,7 @@ export function App() {
       const abort = new AbortController(); operationAbort.current = abort; setBusy(create ? 'Creating catalog' : 'Opening catalog');
       const next = await command({ command: create ? 'create' : 'open_existing', args: { path: choice.path } }, 'status', abort.signal);
       setStatus(next); setCatalogName(choice.display); setScope(undefined); setPage({ rows: [], next: null, has_more: false, page_complete: true, scanned: 0 });
-      setSelected(null); queueRef.current = null; setQueue(null); setError(''); setShowOrganization(false); setFilters(defaultFilters); setOrganizationScopeName('');
+      setSelected(null); queueRef.current = null; setQueue(null); setError(''); setShowOrganization(false); setShowExport(false); setFilters(defaultFilters); setOrganizationScopeName('');
     } catch (e) { setError(errorText(e)); } finally { operationAbort.current = null; setBusy(''); }
   });
   const close = async () => perform(async () => {
@@ -256,10 +294,13 @@ export function App() {
     </main> : <>
       <div className="workspace-toolbar"><button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => setShowImport(true)}>Add photos…</button><button onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowRelink(true); })}>Locate originals…</button><button aria-pressed={showFolders} onClick={() => setShowFolders(value => !value)}>Folders</button><div className="breadcrumb">{scope === undefined ? 'Choose a folder' : scope === null ? 'All Photos' : scope.name}</div>
         <form className="search-form" onSubmit={event => { event.preventDefault(); setAppliedSearch(search); setCursor(null); setPrevious([]); }}><input type="search" maxLength={1024} aria-label="Search photos" placeholder="Search photos" value={search} onChange={event => setSearch(event.target.value)} /><button type="submit">Search</button></form>
-        <button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowCopy(true); })}>Copy adjustments…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
+        <button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowCopy(true); })}>Copy adjustments…</button><button disabled={transitioning} onClick={() => setShowExport(true)}>Export photos…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
       {(filters.keyword || filters.collection) && <div className="activity">Organization filter: {organizationScopeName}<button onClick={() => { setFilters(value => ({ ...value, keyword: null, collection: null })); setCursor(null); setPrevious([]); }}>Clear organization filter</button></div>}
-      {storageWriteHold && <div className="activity" role="status">{storage.ready ? 'Storage operation in progress: catalog writes and new original rendering are held.' : 'Checking storage operation status; catalog writes are held.'}<button onClick={() => setShowRelink(true)}>Review progress</button>{storage.operation && !relinkTerminal(storage.operation) && <button onClick={() => void storage.cancel()}>Cancel storage operation</button>}</div>}
+      {storage.writeHeld && <div className="activity" role="status">{storage.ready ? 'Storage operation in progress: catalog writes and new original rendering are held.' : 'Checking storage operation status; catalog writes are held.'}<button onClick={() => setShowRelink(true)}>Review progress</button>{storage.operation && !relinkTerminal(storage.operation) && <button onClick={() => void storage.cancel()}>Cancel storage operation</button>}</div>}
       {copies.busy && <div className="activity" role="status">{copies.ready ? 'Copying adjustments' : 'Checking adjustment copy status'} · {copies.operation?.job.completed ?? '0'} of {copies.operation?.job.total ?? '…'} targets processed<button onClick={() => setShowCopy(true)}>Review copy progress</button><button disabled={!copies.operation || copyTerminal(copies.operation)} onClick={() => void copies.cancel()}>Cancel adjustment copy</button></div>}
+      {exportDirectHeld && <div className="activity" role="status">Export saved-job acknowledgement pending · catalog writes held. Inspect saved work or close and reopen this catalog.<button onClick={() => setShowExport(true)}>Review pending export write</button></div>}
+      {(outputs.busy || outputs.operation) && <div className="activity" role="status">Photo export: {outputs.operation ? `${outputs.operation.kind.replaceAll('_', ' ')} · ${outputs.operation.stage.replaceAll('_', ' ')} · ${outputs.operation.phase.replaceAll('_', ' ')}` : 'checking operation status'}{outputs.writeHeld ? ' · catalog writes held' : ''}<button onClick={() => setShowExport(true)}>Review export</button>{outputs.operation && !exportTerminal(outputs.operation) && <><button onClick={() => void outputs.cancel().catch(e => setError(errorText(e)))}>Cancel export operation</button>{outputs.operation.kind === 'run' && <button onClick={() => void outputs.yield().catch(e => setError(errorText(e)))}>Pause export worker</button>}</>}{!outputs.ready && <button onClick={outputs.retry}>Retry export status</button>}</div>}
+      {outputs.error && <ErrorNotice message={`Photo export: ${outputs.error}`} />}
       {copies.error && <div className="activity" role="alert">Adjustment copy: {copies.error}<button onClick={() => setShowCopy(true)}>Review copy status</button></div>}
       {status.jobs_held && <div className="activity">Restored catalog: pending external jobs are held for review. Browsing and editing are available.</div>}
       <main className="workspace">
@@ -283,6 +324,7 @@ export function App() {
         </> : <div className="empty-state"><p>Select a photo to inspect its metadata and edits.</p></div>}</aside>}
       </main><footer className="app-status"><span>{status.phase === 'ready' ? 'Catalog ready' : status.phase}</span><span>{importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase) ? `Import ${importStatus.phase.replaceAll('_', ' ')} · ${importStatus.imported} added` : status.message}</span><span>{backupStatus && ['running', 'cancel_requested'].includes(backupStatus.state) ? `Backup ${backupStatus.state.replaceAll('_', ' ')}` : ''}</span><span>{status.active_previews > 0 ? `${status.active_previews} preview requests` : 'Local catalog'}</span></footer>
     </>}
+    {catalog && <ExportPanel key={`export:${catalog}`} catalog={catalog} open={showExport} rows={page.rows} controller={outputs} gate={exportGate} blocked={exportBlocked} onDirectPending={pending => setExportPending(pending ? catalog : null)} onClose={() => setShowExport(false)} />}
     {catalog && <CopyPanel key={`copy:${catalog}`} catalog={catalog} open={showCopy} selected={selected} rows={page.rows} source={() => queueRef.current?.value.variant ?? null} controller={copies} mutate={organizationMutation} jobsHeld={status.jobs_held} writeHeld={storageWriteHold} onClose={() => setShowCopy(false)} />}
     {catalog && <RelinkPanel key={`relink:${catalog}`} catalog={catalog} selected={selected} open={showRelink} onClose={() => setShowRelink(false)} controller={storage} mutate={organizationMutation} changed={() => { setPreviewEpoch(v => v + 1); setFolderEpoch(v => v + 1); setCursor(null); setPrevious([]); setRefresh(v => v + 1); const selection = selectedRef.current; const generation = ++storageRefresh.current; const current = () => catalogRef.current === catalog && storageRefresh.current === generation && selectedRef.current === selection; if (selection) void command({ command: 'image', args: { catalog, key: selection.key } }, 'image').then(row => { if (current()) setSelected(row); }).catch(e => { if (current()) setError(errorText(e)); }); }} />}
     {catalog && <ImportPanel key={`import:${catalog}`} catalog={catalog} open={showImport} onProgress={setImportStatus} jobsHeld={status.jobs_held} onClose={() => setShowImport(false)} onComplete={() => { setFolderEpoch(value => value + 1); setCursor(null); setPrevious([]); setRefresh(value => value + 1); }} />}

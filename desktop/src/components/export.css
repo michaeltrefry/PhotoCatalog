@@ -7,3 +7,11 @@
 .export-settings fieldset > p { grid-column: 1 / -1; margin: 0; line-height: 1.5; }
 .export-settings button { align-self: end; }
 @media (max-width: 600px) { .export-settings fieldset { grid-template-columns: minmax(0, 1fr); } }
+
+.export-panel { max-width: 960px; }
+.export-panel > section, .export-panel article { border-top: 1px solid var(--border, #444); padding: 12px 0; }
+.export-panel fieldset { display: grid; gap: 10px; margin-block: 12px; }
+.export-panel label:not(.checkbox) { display: grid; gap: 4px; }
+.export-path { display: block; overflow-wrap: anywhere; white-space: pre-wrap; }
+.export-panel pre { max-width: 100%; max-height: 24rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.export-panel .button-group { flex-wrap: wrap; }

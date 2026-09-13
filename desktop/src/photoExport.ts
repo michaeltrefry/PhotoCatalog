@@ -64,7 +64,7 @@ export type OperationPhase = 'running'|'waiting_for_previews'|'paused'|'cancel_r
 export type Operation = {
  id:string;kind:OperationKind;phase:OperationPhase;
  job:Job|null;sequence:I64|null;
- stage:'opening'|'planning'|'hashing'|'alias'|'waiting_for_previews'|'rendering'|'accepting'|'intent_committed'|'captured'|'capture_verified'|'linked'|'finalizing'|'installed_verified'|'recovering'|'restoring'|'yielding'|'finished';
+ stage:'draining'|'opening'|'planning'|'hashing'|'alias'|'waiting_for_previews'|'rendering'|'accepting'|'intent_committed'|'captured'|'capture_verified'|'linked'|'finalizing'|'installed_verified'|'recovering'|'restoring'|'yielding'|'finished';
  stream_bytes:U64|null;processed:U64;write_hold:boolean;
  result:ResultValue|null;error:string|null;
 };

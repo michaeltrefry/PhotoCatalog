@@ -75,7 +75,8 @@ export function usePhotoExport(catalog: string | null) {
       }
     };
   }, [catalog]);
-  const admit = async (request: ExportAction): Promise<ExportAdmission> => {
+  type InactiveCancel = { command: 'cancel'; args: { job: string; operation: null } };
+  const admit = async (request: ExportAction | InactiveCancel): Promise<ExportAdmission> => {
     const context = scope.current;
     if (!context.alive || context.catalog !== catalog) throw new Error('Catalog session changed; reopen the export controls.');
     if (!catalog || !statusKnown.current || ticket.current || current.current && (!terminal(current.current) || current.current.write_hold)) throw new Error('Wait for the current export operation or recover its status.');
@@ -84,7 +85,7 @@ export function usePhotoExport(catalog: string | null) {
     return new Promise<ExportAdmission>((resolve, reject) => {
       const active: Ticket = { scope: context, previous: current.current?.id ?? null, kind: request.command, job, failed: false, observed: null, resolve, reject };
       ticket.current = active; setAdmitting(true); setError('');
-      void photoExport(catalog, request, 'operation').then(value => {
+      void photoExport(catalog, request, request.command === 'cancel' ? 'job' : 'operation').then(value => {
         if (!value) throw new Error('Export operation was not admitted.');
       }).catch(e => {
         // Once independently observed, a delayed transport failure cannot revoke
@@ -113,5 +114,5 @@ export function usePhotoExport(catalog: string | null) {
     // result without destroying this catalog's admission or completion ticket.
     readEpoch.current += 1; statusKnown.current = false; setReady(false); setError('Rechecking export status…');
   };
-  return { operation, ready, busy: !ready || admitting || !!operation && (!terminal(operation) || operation.write_hold), writeHeld: !ready || admitting || !!operation?.write_hold, error, admit, cancel: () => stop(false), yield: () => stop(true), retry };
+  return { operation, ready, busy: !ready || admitting || !!operation && (!terminal(operation) || operation.write_hold), writeHeld: !ready || admitting || !!operation?.write_hold, error, admit: (request: ExportAction) => admit(request), cancelJob: (job: string) => admit({ command: 'cancel', args: { job, operation: null } }), cancel: () => stop(false), yield: () => stop(true), retry };
 }
