@@ -14,9 +14,11 @@ class DesktopToolTests(unittest.TestCase):
 
     def test_locked_build_separates_bundle(self):
         args = d.command('build', [])
-        self.assertEqual(args[1:], ['exec', 'tauri', 'build', '--', '--locked', '--no-bundle'])
+        self.assertEqual(args[1:], ['exec', '--', 'tauri', 'build', '--no-bundle', '--', '--locked'])
         self.assertEqual(d.command('bundle', ['--bundles', 'app'])[1:],
-                         ['exec', 'tauri', 'bundle', '--', '--bundles', 'app'])
+                         ['exec', '--', 'tauri', 'bundle', '--bundles', 'app'])
+        self.assertEqual(d.command('build', ['--debug'])[1:],
+                         ['exec', '--', 'tauri', 'build', '--no-bundle', '--debug', '--', '--locked'])
         with self.assertRaises(ValueError):
             d.command('frontend-test', ['arbitrary'])
 

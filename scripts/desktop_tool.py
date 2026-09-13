@@ -18,14 +18,15 @@ def local_build_environment(inherited):
 def command(action, extra):
     commands = {
         'install': ['ci'], 'frontend-build': ['run', 'build'], 'frontend-test': ['run', 'test'],
-        'build': ['exec', 'tauri', 'build', '--', '--locked', '--no-bundle'],
-        'bundle': ['exec', 'tauri', 'bundle', '--'],
+        'build': ['exec', '--', 'tauri', 'build', '--no-bundle'],
+        'bundle': ['exec', '--', 'tauri', 'bundle'],
     }
     if action not in commands:
         raise ValueError('unsupported desktop action')
     if action not in {'build', 'bundle'} and extra:
         raise ValueError('frontend actions do not accept extra arguments')
-    return [shutil.which('npm') or 'npm', *commands[action], *extra]
+    cargo = ['--', '--locked'] if action == 'build' else []
+    return [shutil.which('npm') or 'npm', *commands[action], *extra, *cargo]
 
 
 def main():
