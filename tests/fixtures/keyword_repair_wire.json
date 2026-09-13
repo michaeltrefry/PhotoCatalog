@@ -39,7 +39,8 @@
                 "table": "AgLibraryKeyword",
                 "key": [
                   {
-                    "Integer": 99
+                    "type": "Integer",
+                    "value": 99
                   }
                 ]
               }
@@ -54,12 +55,12 @@
       "input": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "policy_blake3": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     },
-    "json": "{\"adapter\":\"lightroom-keyword-repair-v1\",\"request\":{\"expected_dictionaries\":1,\"expected_memberships\":1,\"expected_synonyms\":0,\"expected_captures\":1,\"run\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"expected_complete_progress_blake3\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"expected_mapping_epoch\":19,\"current_repair\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"expected_current_repair_progress_blake3\":\"9999999999999999999999999999999999999999999999999999999999999999\",\"expected_roster_blake3\":\"382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb\",\"predecessor_evidence_blake3\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"roots\":[{\"origin\":{\"retained_record\":17,\"source\":{\"capture_revision\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"table\":\"AgLibraryKeyword\",\"key\":[{\"Integer\":99}]}},\"raw_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"retained_table\":5,\"table_digest\":\"5555555555555555555555555555555555555555555555555555555555555555\"}],\"reason\":\"Synthetic café Ω; literal \\\\n, quote \\\" and newline\\n\"},\"input\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_blake3\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}",
-    "blake3": "f057b955ce23eca32205792207f59316fc894f460f704e1afc937aa390345f9f"
+    "json": "{\"adapter\":\"lightroom-keyword-repair-v1\",\"request\":{\"expected_dictionaries\":1,\"expected_memberships\":1,\"expected_synonyms\":0,\"expected_captures\":1,\"run\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"expected_complete_progress_blake3\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"expected_mapping_epoch\":19,\"current_repair\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"expected_current_repair_progress_blake3\":\"9999999999999999999999999999999999999999999999999999999999999999\",\"expected_roster_blake3\":\"382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb\",\"predecessor_evidence_blake3\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"roots\":[{\"origin\":{\"retained_record\":17,\"source\":{\"capture_revision\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"table\":\"AgLibraryKeyword\",\"key\":[{\"type\":\"Integer\",\"value\":99}]}},\"raw_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"retained_table\":5,\"table_digest\":\"5555555555555555555555555555555555555555555555555555555555555555\"}],\"reason\":\"Synthetic café Ω; literal \\\\n, quote \\\" and newline\\n\"},\"input\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_blake3\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}",
+    "blake3": "0f29fddb906ea00b15be658e5e41308bbba3eced8fd7748d2df838fc2b82ce4a"
   },
   "progress": {
     "value": {
-      "id": "f057b955ce23eca32205792207f59316fc894f460f704e1afc937aa390345f9f",
+      "id": "0f29fddb906ea00b15be658e5e41308bbba3eced8fd7748d2df838fc2b82ce4a",
       "run": "6666666666666666666666666666666666666666666666666666666666666666",
       "input": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "phase": "PlanMemberships",
@@ -74,8 +75,8 @@
       "roster_blake3": "382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb",
       "complete": false
     },
-    "json": "{\"id\":\"f057b955ce23eca32205792207f59316fc894f460f704e1afc937aa390345f9f\",\"run\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"input\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"phase\":\"PlanMemberships\",\"report_index\":1,\"after_record\":29,\"order_index\":0,\"planned\":2,\"examined\":0,\"repaired\":0,\"retained\":0,\"verified\":0,\"roster_blake3\":\"382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb\",\"complete\":false}",
-    "blake3": "147118fe528532a33a55904d1c3aca7c011b523831610f4e98c85908613371c1"
+    "json": "{\"id\":\"0f29fddb906ea00b15be658e5e41308bbba3eced8fd7748d2df838fc2b82ce4a\",\"run\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"input\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"phase\":\"PlanMemberships\",\"report_index\":1,\"after_record\":29,\"order_index\":0,\"planned\":2,\"examined\":0,\"repaired\":0,\"retained\":0,\"verified\":0,\"roster_blake3\":\"382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb\",\"complete\":false}",
+    "blake3": "c9b80a865502b7f311358cd02f2dcd93ad82e754c16e29c1577258e90f9c922a"
   },
   "new_receipts": {
     "value": [

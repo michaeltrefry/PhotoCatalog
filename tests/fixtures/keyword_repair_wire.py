@@ -20,6 +20,8 @@ class WireGolden(unittest.TestCase):
     def test_receipt_state_and_quoted_stage_roster(self):
         fixture = json.loads(Path(__file__).with_suffix(".json").read_text())
         self.assertEqual(fixture["protocol"], 1)
+        self.assertEqual(fixture["binding"]["value"]["request"]["roots"][0]["origin"]["source"]["key"],
+                         [{"type": "Integer", "value": 99}])
         for name in ("receipt", "binding", "progress", "new_receipts"):
             item = fixture[name]
             raw = encoded(item["value"])
