@@ -179,6 +179,13 @@ jobs:
       - name: Install pinned process observer bindings
         run: |
           python -m pip install --only-binary=:all: -r scripts/edit-requirements.txt
+      - name: Restore pinned JPEG XL discovery after Python setup (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # setup-python replaces PKG_CONFIG_PATH; keep its entries and restore our SDK.
+          export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/.deps/jxl/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          pkg-config --atleast-version=0.11 libjxl
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
       - name: Install locked desktop dependencies and check frontend
         run: |
           python scripts/desktop_tool.py --desktop desktop install
