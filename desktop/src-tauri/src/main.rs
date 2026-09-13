@@ -76,7 +76,7 @@ fn main() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("Unable to start PhotoCatalog");
+        .expect("Unable to start LensWorks");
     app.run(|app, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = &event {
             let state = app.state::<commands::State>();

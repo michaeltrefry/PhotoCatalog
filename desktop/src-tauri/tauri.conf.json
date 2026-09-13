@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "PhotoCatalog",
+  "productName": "LensWorks",
   "version": "0.1.0",
   "identifier": "com.michaeltrefry.photocatalog",
   "build": {
@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{ "label": "main", "title": "PhotoCatalog", "width": 1440, "height": 1000, "minWidth": 960, "minHeight": 640 }],
+    "windows": [{ "label": "main", "title": "LensWorks", "width": 1440, "height": 1000, "minWidth": 960, "minHeight": 640 }],
     "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'self'" }
   },
   "bundle": {

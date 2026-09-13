@@ -15,7 +15,7 @@ mod cli_backup;
 mod cli_edits;
 mod cli_exports;
 #[derive(Parser)]
-#[command(version, about = "PhotoCatalog Rust catalog and metadata tools")]
+#[command(version, about = "LensWorks Rust catalog and metadata tools")]
 struct Cli {
     #[arg(long)]
     catalog: PathBuf,

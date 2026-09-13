@@ -284,7 +284,7 @@ export function App() {
   });
 
   return <div className="app-shell">
-    <header className="app-header"><div className="wordmark"><span className="brand-mark" aria-hidden="true">▧</span>PhotoCatalog</div>
+    <header className="app-header"><div className="wordmark"><span className="brand-mark" aria-hidden="true">▧</span>LensWorks</div>
       <span className="catalog-name" title={catalogName}>{catalog ? catalogName.split(/[\\/]/).filter(Boolean).at(-1) || 'Catalog' : 'Local photo library'}</span>
       {catalog && <nav aria-label="Workspace">{(['library', 'cull', 'develop'] as const).map(value => <button key={value} aria-current={mode === value ? 'page' : undefined} onClick={() => setMode(value)}>{value}</button>)}</nav>}
       {desktopAvailable && <button className="quiet" disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowBackup(true); })}>Backups…</button>}
@@ -295,7 +295,7 @@ export function App() {
     {error && <ErrorNotice message={error} dismiss={() => setError('')} />}
     {busy && <div className="activity" role="status">{busy}… {operationAbort.current && <button onClick={() => operationAbort.current?.abort()}>Cancel</button>}</div>}
     {!catalog ? <main className="welcome"><div className="welcome-mark" aria-hidden="true">▧</div><h1>Your photographs.<br />One library.</h1><p>Keep every year together. Browse your folders, preserve your originals, and edit without losing where you started.</p>
-      {desktopAvailable ? <div className="welcome-actions"><button className="primary" disabled={!!busy || transitioning} onClick={() => void open(false)}>Open catalog…</button><button disabled={!!busy || transitioning} onClick={() => void open(true)}>Create catalog…</button></div> : <p className="desktop-notice">Open the PhotoCatalog desktop app to create or open a catalog.</p>}
+      {desktopAvailable ? <div className="welcome-actions"><button className="primary" disabled={!!busy || transitioning} onClick={() => void open(false)}>Open catalog…</button><button disabled={!!busy || transitioning} onClick={() => void open(true)}>Create catalog…</button></div> : <p className="desktop-notice">Open the LensWorks desktop app to create or open a catalog.</p>}
       <p className="hint">Catalogs store metadata and previews. Original photos stay in their existing folders, including external drives.</p>
     </main> : <>
       <div className="workspace-toolbar"><button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => setShowImport(true)}>Add photos…</button><button onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowRelink(true); })}>Locate originals…</button><button aria-pressed={showFolders} onClick={() => setShowFolders(value => !value)}>Folders</button><div className="breadcrumb">{scope === undefined ? 'Choose a folder' : scope === null ? 'All Photos' : scope.name}</div>

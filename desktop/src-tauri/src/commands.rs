@@ -66,7 +66,7 @@ pub struct SelectedPath { path: NativePath, display: String }
 pub async fn catalog_choose_folder(app: tauri::AppHandle, create_catalog: bool) -> Result<Option<SelectedPath>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let selected = if create_catalog {
-            app.dialog().file().set_title("Choose a name and location for the new catalog folder").set_file_name("PhotoCatalog").blocking_save_file()
+            app.dialog().file().set_title("Choose a name and location for the new catalog folder").set_file_name("LensWorks").blocking_save_file()
         } else { app.dialog().file().set_title("Open a catalog folder").blocking_pick_folder() };
         selected.map(|file| {
             let path = file.into_path().map_err(|error| error.to_string())?;
@@ -92,16 +92,16 @@ pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPur
             LocationPurpose::LightroomCaptureEvidence => dialog.set_title("Open a retained Lightroom capture").blocking_pick_folder(),
             LocationPurpose::LightroomNewCapture => dialog.set_title("Choose a new Lightroom capture folder").set_file_name("Lightroom Capture").blocking_save_file(),
             LocationPurpose::LightroomNewSeal => dialog.set_title("Choose a new Lightroom selection folder").set_file_name("Lightroom Selection").blocking_save_file(),
-            LocationPurpose::LightroomApprovalDestination => dialog.set_title("Choose an existing PhotoCatalog destination").blocking_pick_folder(),
-            LocationPurpose::LightroomNewApprovalDestination => dialog.set_title("Choose a new PhotoCatalog destination").set_file_name("PhotoCatalog Import").blocking_save_file(),
+            LocationPurpose::LightroomApprovalDestination => dialog.set_title("Choose an existing LensWorks destination").blocking_pick_folder(),
+            LocationPurpose::LightroomNewApprovalDestination => dialog.set_title("Choose a new LensWorks destination").set_file_name("LensWorks Import").blocking_save_file(),
             LocationPurpose::ExportDirectory => dialog.set_title("Choose the export destination folder").blocking_pick_folder(),
             LocationPurpose::ExportProfile => dialog.set_title("Choose an RGB output profile").add_filter("ICC profiles", &["icc", "icm"]).blocking_pick_file(),
             LocationPurpose::RelinkFolder => dialog.set_title("Locate the moved originals folder").blocking_pick_folder(),
             LocationPurpose::RelinkOriginal => dialog.set_title("Locate the original photo or metadata sidecar").blocking_pick_file(),
             LocationPurpose::Originals => dialog.set_title("Add photographs from a folder").blocking_pick_folder(),
-            LocationPurpose::BackupBundle => dialog.set_title("Choose a PhotoCatalog backup folder").blocking_pick_folder(),
-            LocationPurpose::NewBackup => dialog.set_title("Choose a new backup folder").set_file_name("PhotoCatalog Backup").blocking_save_file(),
-            LocationPurpose::NewRestore => dialog.set_title("Choose a new restored catalog folder").set_file_name("PhotoCatalog Restored").blocking_save_file(),
+            LocationPurpose::BackupBundle => dialog.set_title("Choose a LensWorks backup folder").blocking_pick_folder(),
+            LocationPurpose::NewBackup => dialog.set_title("Choose a new backup folder").set_file_name("LensWorks Backup").blocking_save_file(),
+            LocationPurpose::NewRestore => dialog.set_title("Choose a new restored catalog folder").set_file_name("LensWorks Restored").blocking_save_file(),
         };
         selected.map(|file| {
             let path = file.into_path().map_err(|error| error.to_string())?;

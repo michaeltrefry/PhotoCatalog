@@ -4,6 +4,11 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
+The user selected **LensWorks** as the product name on 2026-09-13. Current
+branding uses LensWorks; historical evidence below retains its original names.
+Repository, bundle and persistent format identifiers remain compatible.
+Shortcut epic E1 and S12 were updated; comment23342 records the decision.
+
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
 PR16 checkpoint `e841bdb8a452c747bbf4e1eaf429c52f82c402b6` passed all four
 CI34783536524 jobs (macOS, Linux, Windows, contracts). All three provider ZIP

@@ -1817,7 +1817,7 @@ impl Catalog {
             .context("invalid recovery operation directory")?;
         let operation = name
             .strip_prefix(".photocatalog-xmp-export-")
-            .context("not a PhotoCatalog export operation")?;
+            .context("not a LensWorks export operation")?;
         let (asset, expected, plan): (String, i64, String) = self.db.query_row(
             "SELECT asset_id,revision,plan FROM metadata_export_plans WHERE operation=?1",
             [operation],

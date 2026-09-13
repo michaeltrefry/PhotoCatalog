@@ -89,7 +89,7 @@ export const desktopAvailable = isTauri();
 export const imageKey = (key: VariantKey) => JSON.stringify([key.asset_id, key.variant_id]);
 
 export async function command<K extends keyof Data>(request: Request, kind: K, signal?: AbortSignal): Promise<Data[K]> {
-  if (!desktopAvailable) throw new CatalogError('desktop_required', 'Open the PhotoCatalog desktop app to access your catalog.');
+  if (!desktopAvailable) throw new CatalogError('desktop_required', 'Open the LensWorks desktop app to access your catalog.');
   if (signal?.aborted) throw new DOMException('Canceled', 'AbortError');
   const operation = crypto.randomUUID();
   const cancel = () => { void invoke('catalog_cancel_operation', { operation }).catch(() => {}); };

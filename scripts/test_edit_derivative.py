@@ -16,7 +16,7 @@ class DerivativeExpectations(unittest.TestCase):
                 self.assertEqual(description.get('{'+derivative.RDF+'}about'),'')
                 self.assertEqual(root.find('.//{'+derivative.TIFF+'}ImageWidth').text,'48')
                 self.assertEqual(root.find('.//{'+derivative.EXIF+'}PixelYDimension').text,'32')
-                self.assertEqual(root.find('.//{'+derivative.XMP+'}CreatorTool').text,'PhotoCatalog')
+                self.assertEqual(root.find('.//{'+derivative.XMP+'}CreatorTool').text,'LensWorks')
                 self.assertEqual(root.find('.//{'+derivative.DC+'}format').text,'image/jpeg')
                 self.assertEqual(len(list(description)),12)
                 self.assertNotIn('preserve this user text',expected['xmp'])

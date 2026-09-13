@@ -24,7 +24,7 @@ use std::{
 const DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(about = "Import an explicitly sealed Lightroom selection into one PhotoCatalog catalog")]
+#[command(about = "Import an explicitly sealed Lightroom selection into one LensWorks catalog")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -234,7 +234,7 @@ fn status_database(destination: &Path) -> Result<rusqlite::Connection> {
     let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
         app == 0x50484341 && schema == photocatalog::CURRENT_SCHEMA_VERSION,
-        "status requires a current PhotoCatalog catalog; no schema migration was performed"
+        "status requires a current LensWorks catalog; no schema migration was performed"
     );
     Ok(db)
 }

@@ -381,7 +381,7 @@ fn identity(db: &Connection) -> Result<i64> {
     let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
         app == APPLICATION_ID && (1..=CURRENT_SCHEMA_VERSION).contains(&schema),
-        "not a supported PhotoCatalog backup schema (application={app}, schema={schema})"
+        "not a supported LensWorks backup schema (application={app}, schema={schema})"
     );
     Ok(schema)
 }

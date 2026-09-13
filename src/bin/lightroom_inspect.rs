@@ -43,7 +43,7 @@ enum Command {
     },
     #[command(hide = true)]
     CaptureWorker,
-    /// Create a separate inspection plan, never a PhotoCatalog catalog.
+    /// Create a separate inspection plan, never a LensWorks catalog.
     Create {
         plan: PathBuf,
     },

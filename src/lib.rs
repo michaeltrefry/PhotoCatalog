@@ -267,7 +267,7 @@ impl Catalog {
         } else {
             ensure!(
                 application_id == 0x50484341,
-                "database is not a PhotoCatalog catalog"
+                "database is not a LensWorks catalog"
             );
         }
         configure_catalog_connection(&db)?;

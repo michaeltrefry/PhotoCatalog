@@ -1,6 +1,8 @@
-# PhotoCatalog
+# LensWorks
 
 A Rust photo catalog and non-destructive editor in development for macOS, Windows, and Linux. The foundation is tracked in [Shortcut epic sc-22835](https://app.shortcut.com/trefry/epic/22835).
+
+LensWorks is the product name. The existing `PhotoCatalog` repository, `photocatalog` commands, bundle identifier, and catalog formats retain their compatibility identifiers.
 
 ## Foundation CLI
 

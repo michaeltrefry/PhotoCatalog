@@ -817,7 +817,7 @@ pub fn rendered_derivative(base: &[u8], fields: &DerivativeFields) -> Result<Vec
         ),
         (PHOTOSHOP, "ICCProfile", fields.profile_name.clone()),
         (DC, "format", fields.mime_type.clone()),
-        (XMP, "CreatorTool", "PhotoCatalog".into()),
+        (XMP, "CreatorTool", "LensWorks".into()),
     ] {
         edits.push(Edit::Set {
             namespace: namespace.into(),
