@@ -187,6 +187,8 @@ jobs:
           pkg-config --atleast-version=0.11 libjxl
           echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
       - name: Install locked desktop dependencies and check frontend
+        # Fail on each command on Windows too, not only the final build exit.
+        shell: bash
         run: |
           python scripts/desktop_tool.py --desktop desktop install
           python scripts/desktop_tool.py --desktop desktop frontend-test
