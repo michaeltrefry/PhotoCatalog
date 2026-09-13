@@ -1866,3 +1866,260 @@ fn desktop_organization_scopes_changes_to_selected_variant_and_catalog() -> Resu
     b.shutdown();
     Ok(())
 }
+
+#[test]
+fn desktop_export_explicit_recovery_native_run_and_saved_authority() -> Result<()> {
+    use photocatalog::application::exports as ex;
+    use photocatalog::image_export::{AlphaPolicy, IntegerDepth, OutputFormat, OutputSize};
+    let temp = tempfile::Builder::new().tempdir_in(std::env::temp_dir().canonicalize()?)?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    let path = originals.join("selected.png");
+    image::RgbImage::from_pixel(64, 48, image::Rgb([30u8, 70, 110])).save(&path)?;
+    let original = std::fs::read(&path)?;
+    let root = temp.path().join("catalog");
+    let mut c = Catalog::open(&root)?;
+    c.import(&originals, None, |_| Ok(()))?;
+    let master = VariantKey::master(c.browse(0, 1)?[0].id.clone());
+    let selected = c.create_edit_variant(&master, 0, "Selected copy")?.key;
+    let revision = c.edit_variant(&selected)?.revision;
+    drop(c);
+    let b = Bridge::spawn(config(&originals))?;
+    let Response::Status(opened) = call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?
+    else {
+        bail!("open")
+    };
+    let token = opened.catalog.unwrap();
+    wait_ready(&b)?;
+    let send = |request| -> Result<ex::Response> {
+        let Response::Export(response) = call(
+            &b,
+            Request::Export {
+                catalog: token.clone(),
+                request: Box::new(request),
+            },
+        )?
+        else {
+            bail!("export envelope")
+        };
+        Ok(*response)
+    };
+    let wait = |operation: ex::Operation| -> Result<ex::Operation> {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ex::Response::Operation(Some(current)) = send(ex::Request::Status {
+                operation: Some(operation.id.clone()),
+            })?
+            else {
+                bail!("status")
+            };
+            if ["complete", "failed", "canceled", "paused"].contains(&current.phase.as_str()) {
+                return Ok(current);
+            }
+            ensure!(
+                Instant::now() < until,
+                "export operation deadline: {current:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let act = |request| -> Result<ex::Operation> {
+        let ex::Response::Operation(Some(operation)) = send(request)? else {
+            bail!("operation")
+        };
+        wait(operation)
+    };
+    let ex::Response::Options(options) = send(ex::Request::Options)? else {
+        bail!("options")
+    };
+    ensure!(
+        options.profile_bytes == U64(16 * 1024 * 1024),
+        "profile bound"
+    );
+    let aliases = act(ex::Request::Paths { limit: U64(512) })?;
+    ensure!(aliases.phase == "complete", "{aliases:?}");
+    let ex::Response::Job(job) = send(ex::Request::Begin)? else {
+        bail!("job")
+    };
+    let format = OutputFormat::Png {
+        depth: IntegerDepth::Sixteen,
+    };
+    let names = act(ex::Request::Destinations {
+        directory: NativePath::from_path(temp.path()),
+        targets: vec![ex::TargetKey {
+            key: selected.clone(),
+            expected_revision: I64(revision),
+        }],
+        format,
+        naming: ex::Naming {
+            prefix: "export-".into(),
+            suffix: String::new(),
+            variant_suffix: true,
+            sequence_start: None,
+        },
+    })?;
+    let Some(ex::ResultValue::Destinations {
+        token: names_token,
+        total,
+    }) = names.result.map(|value| *value)
+    else {
+        bail!(
+            "destination result missing (phase {}, error {:?})",
+            names.phase,
+            names.error
+        )
+    };
+    ensure!(total == U64(1), "destination count");
+    let ex::Response::Destinations { rows, next, .. } = send(ex::Request::DestinationRows {
+        token: names_token.clone(),
+        after: U64(0),
+        limit: U64(1),
+    })?
+    else {
+        bail!("destination rows")
+    };
+    ensure!(
+        next.is_none() && rows[0].name.variant_label == "Selected copy",
+        "named selection"
+    );
+    let destination = rows[0]
+        .destination
+        .clone()
+        .context("composed destination")?;
+    send(ex::Request::ResultRelease { token: names_token })?;
+    let ex::Response::Operation(Some(admitted)) = send(ex::Request::Append {
+        job: job.id.clone(),
+        expected_total: I64(0),
+        target: ex::Target {
+            key: selected.clone(),
+            expected_revision: I64(revision),
+            destination: destination.clone(),
+            overwrite: false,
+            metadata: ex::Metadata::Omit,
+        },
+        output: ex::Output {
+            size: OutputSize::Original,
+            format,
+            profile: ex::Profile::Srgb,
+            alpha: AlphaPolicy::Preserve,
+        },
+        budgets: None,
+    })?
+    else {
+        bail!("append admission")
+    };
+    ensure!(
+        admitted.job.as_ref().is_some_and(|j| j.id == job.id),
+        "first operation must identify job"
+    );
+    let appended = wait(admitted)?;
+    ensure!(appended.phase == "complete", "{appended:?}");
+    send(ex::Request::Seal {
+        job: job.id.clone(),
+        expected_total: I64(1),
+    })?;
+    let run = || ex::Request::Run {
+        job: job.id.clone(),
+        limits: None,
+        max_items: U64(1),
+        max_seconds: U64(30),
+    };
+    let failed = act(run())?;
+    ensure!(
+        failed.phase == "failed"
+            && failed
+                .error
+                .as_deref()
+                .is_some_and(|s| s.contains("explicit export recovery")),
+        "Run cannot silently recover: {failed:?}"
+    );
+    ensure!(
+        !destination.to_path()?.exists(),
+        "failed admission must not publish"
+    );
+    let recovered = act(ex::Request::Recover {
+        directories: U64(32),
+        limits: None,
+    })?;
+    ensure!(recovered.phase == "complete", "{recovered:?}");
+    let completed = act(run())?;
+    ensure!(
+        completed.phase == "complete"
+            && completed
+                .job
+                .as_ref()
+                .is_some_and(|j| j.state == "complete"),
+        "{completed:?}"
+    );
+    let exported = image::open(destination.to_path()?)?;
+    ensure!(
+        exported.width() == 64 && exported.height() == 48,
+        "native output dimensions"
+    );
+    let ex::Response::Plan(plan) = send(ex::Request::Plan {
+        job: job.id.clone(),
+        sequence: I64(1),
+    })?
+    else {
+        bail!("plan")
+    };
+    ensure!(
+        plan.identity.key == selected && plan.item.state == "published",
+        "selected frozen identity"
+    );
+    let restored = act(ex::Request::Restore {
+        job: job.id.clone(),
+        sequence: I64(1),
+        authority: plan.authority.clone(),
+    })?;
+    ensure!(
+        matches!(restored.result.as_deref(), Some(ex::ResultValue::Receipt { receipt, .. }) if receipt.state == "published"),
+        "installed publication remains published"
+    );
+    ensure!(std::fs::read(&path)? == original, "source original changed");
+    call(
+        &b,
+        Request::Close {
+            catalog: token.clone(),
+        },
+    )?;
+    let Response::Status(reopened) = call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?
+    else {
+        bail!("reopen")
+    };
+    let new_token = reopened.catalog.unwrap();
+    ensure!(new_token != token, "session replacement");
+    let Response::Export(response) = call(
+        &b,
+        Request::Export {
+            catalog: new_token.clone(),
+            request: Box::new(ex::Request::Plan {
+                job: job.id,
+                sequence: I64(1),
+            }),
+        },
+    )?
+    else {
+        bail!("saved plan")
+    };
+    let ex::Response::Plan(saved) = *response else {
+        bail!("saved plan kind")
+    };
+    ensure!(
+        saved.authority == plan.authority,
+        "exact persisted authority changed"
+    );
+    call(&b, Request::Close { catalog: new_token })?;
+    b.shutdown();
+    Ok(())
+}

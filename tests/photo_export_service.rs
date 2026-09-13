@@ -21,7 +21,7 @@ use std::{
 fn detached_executor_requires_same_catalog_drained_permit_and_reaps_before_release()
 -> anyhow::Result<()> {
     use std::sync::{Arc, atomic::Ordering, mpsc};
-    for action in ["yield", "cancel", "drop"] {
+    for action in ["yield", "cancel", "drop", "drain"] {
         let root = tempfile::tempdir()?;
         let (mut catalog, key, mut previews, original) = setup(root.path())?;
         let bytes = std::fs::read(&original)?;
@@ -71,6 +71,12 @@ fn detached_executor_requires_same_catalog_drained_permit_and_reaps_before_relea
             advance_recv.recv_timeout(Duration::from_secs(10))?;
             if action == "drop" {
                 drop(service);
+                return Ok(());
+            }
+            if action == "drain" {
+                service.drain_native()?;
+                assert!(!service.is_active());
+                assert_eq!(service.reserved_bytes(), 0);
                 return Ok(());
             }
             let event = if action == "cancel" {
@@ -132,7 +138,7 @@ fn detached_executor_requires_same_catalog_drained_permit_and_reaps_before_relea
                 "queued"
             }
         );
-        if action == "drop" {
+        if ["drop", "drain"].contains(&action) {
             assert_eq!(
                 catalog.photo_export_items(&job, 0, 1)?[0].state,
                 "rendering"

@@ -946,3 +946,16 @@ fn malformed_plan_version_snapshot_and_raw_authority_reject_before_claim_mutatio
     }
     Ok(())
 }
+
+#[test]
+fn stored_export_blob_admission_rejects_oversize_before_materializing() -> Result<()> {
+    let (_temp, c, _) = fixture()?;
+    let hash = "0".repeat(64);
+    c.db.execute("INSERT INTO photo_export_blobs(hash,raw_length,compressed) VALUES(?1,16,zeroblob(16842753))", [&hash])?;
+    assert!(
+        format!("{:#}", read_blob(&c.db, &hash).unwrap_err()).contains("stored byte allowance")
+    );
+    let valid = store_blob(&c.db, b"retained payload")?;
+    assert_eq!(read_blob(&c.db, &valid)?, b"retained payload");
+    Ok(())
+}

@@ -77,13 +77,15 @@ pub async fn catalog_choose_folder(app: tauri::AppHandle, create_catalog: bool) 
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal }
+pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal, ExportDirectory, ExportProfile }
 
 #[tauri::command]
 pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPurpose) -> Result<Option<SelectedPath>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = app.dialog().file();
         let selected = match purpose {
+            LocationPurpose::ExportDirectory => dialog.set_title("Choose the export destination folder").blocking_pick_folder(),
+            LocationPurpose::ExportProfile => dialog.set_title("Choose an RGB output profile").add_filter("ICC profiles", &["icc", "icm"]).blocking_pick_file(),
             LocationPurpose::RelinkFolder => dialog.set_title("Locate the moved originals folder").blocking_pick_folder(),
             LocationPurpose::RelinkOriginal => dialog.set_title("Locate the original photo or metadata sidecar").blocking_pick_file(),
             LocationPurpose::Originals => dialog.set_title("Add photographs from a folder").blocking_pick_folder(),
@@ -131,4 +133,15 @@ pub async fn catalog_quit(app: tauri::AppHandle, state: tauri::State<'_, State>)
     state.quitting.store(true, Ordering::Release);
     app.exit(0);
     Ok(())
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::LocationPurpose;
+    #[test]
+    fn export_picker_purposes_have_distinct_native_admission() {
+        assert!(matches!(serde_json::from_str::<LocationPurpose>("\"export_directory\"").unwrap(), LocationPurpose::ExportDirectory));
+        assert!(matches!(serde_json::from_str::<LocationPurpose>("\"export_profile\"").unwrap(), LocationPurpose::ExportProfile));
+        assert!(serde_json::from_str::<LocationPurpose>("\"export_destination_file\"").is_err());
+    }
 }

@@ -4,6 +4,7 @@ pub mod backup;
 pub mod browse;
 pub mod copy;
 mod dto;
+pub mod exports;
 mod hydration;
 pub mod lightroom;
 pub mod metadata;
@@ -237,6 +238,18 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
+            Work::Command(Request::Export { request, .. }, _) => {
+                if matches!(
+                    request.as_ref(),
+                    exports::Request::Cancel { .. } | exports::Request::Yield { .. }
+                ) {
+                    0
+                } else if request.read_only() {
+                    2
+                } else {
+                    4
+                }
+            }
             Work::Command(Request::EditCopy { request, .. }, _) => {
                 if matches!(request.as_ref(), copy::Request::Cancel { .. }) {
                     0
@@ -320,6 +333,7 @@ struct Queue {
     ticket_foreground: HashMap<(String, String), TicketPriority>,
 }
 struct Shared {
+    exports: Arc<Mutex<exports::Control>>,
     copy: Arc<Mutex<copy::Control>>,
     relink: Arc<Mutex<relink::Control>>,
     backups: Mutex<backup::Coordinator>,
@@ -358,6 +372,7 @@ impl Bridge {
     pub fn spawn(config: Config) -> Result<Self> {
         config.validate()?;
         let shared = Arc::new(Shared {
+            exports: Arc::new(Mutex::new(exports::Control::default())),
             relink: Arc::new(Mutex::new(relink::Control::default())),
             copy: Arc::new(Mutex::new(copy::Control::default())),
             backups: Mutex::new(backup::Coordinator::new(Default::default())?),
@@ -408,6 +423,62 @@ impl Bridge {
         let mut q = self.0.shared.queue.lock().unwrap();
         if q.stopping {
             return Err(error(ErrorCode::Closed, "catalog owner closed"));
+        }
+        if let Request::Export { catalog, request } = &request
+            && matches!(
+                request.as_ref(),
+                exports::Request::Status { .. }
+                    | exports::Request::Cancel { .. }
+                    | exports::Request::Yield { .. }
+            )
+        {
+            if q.status.catalog.as_ref() != Some(catalog) {
+                return Err(error(ErrorCode::StaleSession, "catalog session changed"));
+            }
+            let direct = match request.as_ref() {
+                exports::Request::Status { operation } => Some(
+                    self.0
+                        .shared
+                        .exports
+                        .lock()
+                        .unwrap()
+                        .status(operation.as_deref())?,
+                ),
+                exports::Request::Cancel { job, operation } => self
+                    .0
+                    .shared
+                    .exports
+                    .lock()
+                    .unwrap()
+                    .cancel(job.as_deref(), operation.as_deref())?
+                    .map(Some),
+                exports::Request::Yield { job, operation } => Some(
+                    self.0
+                        .shared
+                        .exports
+                        .lock()
+                        .unwrap()
+                        .yield_job(job, operation)?,
+                ),
+                _ => unreachable!(),
+            };
+            if let Some(status) = direct {
+                let out = Reply::Ok {
+                    value: Response::Export(Box::new(exports::Response::Operation(status))),
+                };
+                let out = if serde_json::to_vec(&out)
+                    .map_err(|e| native(e.into()))?
+                    .len()
+                    <= self.0.shared.limits.reply_bytes
+                {
+                    out
+                } else {
+                    failure(ErrorCode::ResourceLimit, "response byte limit")
+                };
+                let _ = tx.send(out);
+                self.0.shared.wake.notify_one();
+                return Ok(Pending { receiver, cancel });
+            }
         }
         if let Request::EditCopy { catalog, request } = &request
             && matches!(
@@ -762,6 +833,7 @@ struct Ticket {
     cancel: Cancellation,
 }
 struct Open {
+    exports: exports::Coordinator,
     token: String,
     catalog: Catalog,
     service: PreviewService,
@@ -868,6 +940,13 @@ fn during_relink_hold(request: &Request) -> bool {
         | Request::PreviewStatus { .. }
         | Request::ReleaseViewport { .. }
         | Request::CancelPreview { .. } => true,
+        Request::Export { request, .. } => {
+            request.read_only()
+                || matches!(
+                    request.as_ref(),
+                    exports::Request::Cancel { .. } | exports::Request::Yield { .. }
+                )
+        }
         Request::EditCopy { request, .. } => request.read_only(),
         Request::Metadata { request, .. } => {
             !matches!(request.as_ref(), metadata::Request::Resolve { .. })
@@ -939,6 +1018,24 @@ impl Actor {
                 } else {
                     match e.work {
                         Work::Command(r, tx) => {
+                            if let Request::Export { catalog, request } = &r
+                                && matches!(
+                                    request.as_ref(),
+                                    exports::Request::Cancel {
+                                        operation: None,
+                                        ..
+                                    }
+                                )
+                            {
+                                if let Err(e) = self.export_request(
+                                    catalog,
+                                    (**request).clone(),
+                                    Some(tx.clone()),
+                                ) {
+                                    let _ = tx.send(reply(Err(e)));
+                                }
+                                continue;
+                            }
                             let reindex = matches!(
                                 &r,
                                 Request::CreateVariant { .. }
@@ -984,6 +1081,7 @@ impl Actor {
     fn close(&mut self) {
         self.set_phase(Phase::Closing, None);
         if let Some(mut open) = self.open.take() {
+            open.exports.signal_shutdown(&self.shared.exports);
             self.shared.relink.lock().unwrap().request_cancel();
             open.hydration.request_cancel();
             let mut import = open.import.take();
@@ -1004,6 +1102,7 @@ impl Actor {
             // All readers and native consumers have received cancellation before
             // any join. Owners and the import lock remain held through native drain.
             open.relink.shutdown(&self.shared.relink);
+            open.exports.shutdown(&self.shared.exports);
             copy::close(&mut open.catalog, &self.shared.copy);
             drop(open.hydration);
             if let Some(import) = &mut import {
@@ -1027,6 +1126,7 @@ impl Actor {
             .shutdown();
         *self.shared.relink.lock().unwrap() = relink::Control::default();
         *self.shared.copy.lock().unwrap() = copy::Control::default();
+        *self.shared.exports.lock().unwrap() = exports::Control::default();
         let mut q = self.shared.queue.lock().unwrap();
         q.viewport.clear();
         q.ticket_foreground.clear();
@@ -1041,6 +1141,56 @@ impl Actor {
             cancel_requested: false,
             message: None,
         };
+    }
+    fn export_request(
+        &mut self,
+        catalog: &str,
+        request: exports::Request,
+        deferred: Option<mpsc::SyncSender<Reply>>,
+    ) -> std::result::Result<Response, BridgeError> {
+        let control = Arc::clone(&self.shared.exports);
+        let config = self.config.clone();
+        let copy_active = self
+            .shared
+            .copy
+            .lock()
+            .unwrap()
+            .status
+            .as_ref()
+            .is_some_and(|s| {
+                matches!(
+                    s.phase,
+                    copy::Phase::Running | copy::Phase::Paused | copy::Phase::CancelRequested
+                )
+            });
+        let backup_active = self
+            .shared
+            .backups
+            .lock()
+            .unwrap()
+            .status()
+            .map_err(native)?
+            .is_some_and(|s| {
+                matches!(
+                    s.state,
+                    backup::State::Running | backup::State::CancelRequested
+                )
+            });
+        let o = self.current(catalog)?;
+        let held = o.jobs_held
+            || o.relink.busy()
+            || copy_active
+            || backup_active
+            || o.import.as_ref().is_some_and(|i| !i.terminal())
+            || o.exports.write_hold(&control);
+        Ok(Response::Export(Box::new(o.exports.execute(
+            &mut o.catalog,
+            request,
+            &config,
+            &control,
+            held,
+            deferred,
+        )?)))
     }
     fn current(&mut self, token: &str) -> std::result::Result<&mut Open, BridgeError> {
         self.open
@@ -1143,6 +1293,7 @@ impl Actor {
                 self.config.preview_limits.clone(),
             )?;
             Ok(Open {
+                exports: exports::Coordinator::default(),
                 token: uuid::Uuid::new_v4().to_string(),
                 catalog,
                 service,
@@ -1204,7 +1355,34 @@ impl Actor {
                 "relink write hold: wait for completion or cancel the relink operation",
             ));
         }
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.exports.write_hold(&self.shared.exports))
+            && !during_relink_hold(&r)
+        {
+            return Err(error(
+                ErrorCode::Busy,
+                "export write hold: cached reads and cancellation remain available",
+            ));
+        }
+        if self.shared.exports.lock().unwrap().busy()
+            && (matches!(
+                &r,
+                Request::ImportStart { .. }
+                    | Request::ImportResume { .. }
+                    | Request::BackupCreate { .. }
+                    | Request::BackupRestore { .. }
+            ) || matches!(&r,Request::Relink{request,..} if !request.read_only())
+                || matches!(&r,Request::EditCopy{request,..} if matches!(request.as_ref(),copy::Request::Run{..})))
+        {
+            return Err(error(
+                ErrorCode::Busy,
+                "finish or cancel the export operation before starting another catalog worker",
+            ));
+        }
         match r {
+            Request::Export { catalog, request } => self.export_request(&catalog, *request, None),
             Request::EditCopy { catalog, request } => {
                 let control = Arc::clone(&self.shared.copy);
                 let o = self.current(&catalog)?;
@@ -1600,10 +1778,12 @@ impl Actor {
                 } else {
                     core!(o.service.cached_variant(&o.catalog, &key, tier, false))
                 };
-                if o.relink.write_hold() && cached.is_none() {
+                if (o.relink.write_hold() || o.exports.write_hold(&shared.exports))
+                    && cached.is_none()
+                {
                     return Err(error(
                         ErrorCode::Busy,
-                        "relink write hold: cached previews remain available; request original rendering after completion",
+                        "catalog write hold: cached previews remain available; request original rendering after completion",
                     ));
                 }
                 let needs_hydration = identity.source.state == "pending"
@@ -1790,6 +1970,39 @@ impl Actor {
     }
     fn maintain(&mut self) {
         let Some(o) = self.open.as_mut() else { return };
+        let hold_since = o.exports.hold_since(&self.shared.exports);
+        let prior_foreground = self
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .any(|e| e.priority() <= 3 && hold_since.is_none_or(|at| e.created <= at));
+        let native_demand = o.tickets.values().any(|t| {
+            t.foreground
+                && !t.cancel.is_canceled()
+                && matches!(
+                    t.dto.state,
+                    PreviewState::Queued | PreviewState::CancelRequested
+                )
+        });
+        if let Err(e) = o.exports.advance(
+            &o.catalog,
+            &mut o.service,
+            &self.shared.exports,
+            prior_foreground,
+            native_demand,
+            o.jobs_held || o.relink.write_hold(),
+        ) {
+            self.shared.queue.lock().unwrap().status.message = Some(e.message);
+            self.shared.exports.lock().unwrap().request_cancel();
+        }
+        if o.exports.write_hold(&self.shared.exports) {
+            self.shared.queue.lock().unwrap().status.active_previews =
+                o.service.scheduler_usage().active as u32;
+            return;
+        }
         let relink_foreground = self
             .shared
             .queue

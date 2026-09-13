@@ -602,6 +602,19 @@ impl ExportService {
             }
         }
     }
+    /// Stop and reap native ownership without consulting or changing the catalog.
+    /// Shutdown uses this when actor write admission is no longer available.
+    /// Unfinished transport and attempt rows remain for explicit recovery. On any
+    /// reap error every owner stays in place so the caller may retry safely.
+    pub fn drain_native(&mut self) -> Result<()> {
+        if let Some(active) = self.active.as_mut() {
+            active.process.stop()?;
+        }
+        self.active.take();
+        self.pause.take();
+        self.permit.take();
+        Ok(())
+    }
     /// Foreground development can preempt background export. Reap first, fence
     /// the old token, then resume preview launch admission. The item stays queued.
     pub fn yield_to_previews(&mut self, catalog: &mut Catalog) -> Result<ExportEvent> {

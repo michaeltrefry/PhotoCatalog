@@ -40,7 +40,7 @@ CREATE INDEX storage_export_object ON storage_bindings(file_key) WHERE file_key 
 const BLOB_LIMIT: usize = 16 * 1024 * 1024;
 const PLAN_LIMIT: usize = 128 * 1024;
 const NEXT_SEALED: &str = "SELECT sequence FROM photo_export_items WHERE job=?1 AND state='sealed' ORDER BY sequence LIMIT 1";
-const NEXT_PENDING: &str = "SELECT sequence,plan,authority FROM photo_export_items WHERE job=?1 AND state='pending' ORDER BY sequence LIMIT 1";
+const NEXT_PENDING: &str = "SELECT sequence,CASE WHEN length(CAST(plan AS BLOB))<=131072 THEN plan END,CASE WHEN length(CAST(authority AS BLOB))=64 THEN authority END FROM photo_export_items WHERE job=?1 AND state='pending' ORDER BY sequence LIMIT 1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -213,11 +213,12 @@ fn store_blob(db: &Connection, bytes: &[u8]) -> Result<String> {
     Ok(hash)
 }
 fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
-    let (length, compressed): (i64, Vec<u8>) = db.query_row(
-        "SELECT raw_length,compressed FROM photo_export_blobs WHERE hash=?1",
+    let (length, compressed): (i64, Option<Vec<u8>>) = db.query_row(
+        "SELECT raw_length,CASE WHEN raw_length BETWEEN 0 AND 16777216 AND length(compressed)<=16842752 THEN compressed END FROM photo_export_blobs WHERE hash=?1",
         [hash],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let compressed = compressed.context("export blob exceeds stored byte allowance")?;
     let length = usize::try_from(length).context("negative export blob length")?;
     ensure!(length <= BLOB_LIMIT, "export blob length limit");
     let mut bytes = Vec::new();
@@ -401,7 +402,7 @@ impl Catalog {
     }
     pub fn rendering_photo_export_attempts(&self, limit: usize) -> Result<Vec<ExportWork>> {
         ensure!(limit > 0 && limit <= 200, "export recovery page limit");
-        let mut statement=self.db.prepare("SELECT job,sequence,attempt,plan,authority FROM photo_export_items WHERE state='rendering' ORDER BY job,sequence LIMIT ?1")?;
+        let mut statement=self.db.prepare("SELECT CASE WHEN length(CAST(job AS BLOB))<=256 THEN job END,sequence,CASE WHEN length(CAST(attempt AS BLOB))<=256 THEN attempt END,CASE WHEN length(CAST(plan AS BLOB))<=131072 THEN plan END,CASE WHEN length(CAST(authority AS BLOB))=64 THEN authority END FROM photo_export_items WHERE state='rendering' ORDER BY job,sequence LIMIT ?1")?;
         let rows = statement.query_map([limit as i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -443,7 +444,7 @@ impl Catalog {
         id: &str,
         sequence: i64,
     ) -> Result<Option<ExportWork>> {
-        let attempt:Option<String>=self.db.query_row("SELECT attempt FROM photo_export_items WHERE job=?1 AND sequence=?2 AND state='rendering'",params![id,sequence],|r|r.get(0)).optional()?;
+        let attempt:Option<String>=self.db.query_row("SELECT CASE WHEN length(CAST(attempt AS BLOB))<=256 THEN attempt END FROM photo_export_items WHERE job=?1 AND sequence=?2 AND state='rendering'",params![id,sequence],|r|r.get(0)).optional()?;
         let Some(attempt) = attempt else {
             return Ok(None);
         };
@@ -833,7 +834,7 @@ impl Catalog {
         sequence: i64,
     ) -> Result<(PhotoPlanDocument, String)> {
         let (encoded, authority): (String, String) = self.db.query_row(
-            "SELECT plan,authority FROM photo_export_items WHERE job=?1 AND sequence=?2",
+            "SELECT CASE WHEN length(CAST(plan AS BLOB))<=131072 THEN plan END,CASE WHEN length(CAST(authority AS BLOB))=64 THEN authority END FROM photo_export_items WHERE job=?1 AND sequence=?2",
             params![id, sequence],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;

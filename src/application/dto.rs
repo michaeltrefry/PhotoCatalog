@@ -35,6 +35,10 @@ decimal!(U64, u64);
     deny_unknown_fields
 )]
 pub enum Request {
+    Export {
+        catalog: String,
+        request: Box<super::exports::Request>,
+    },
     EditCopy {
         catalog: String,
         request: Box<super::copy::Request>,
@@ -320,6 +324,7 @@ pub struct PreviewStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
+    Export(Box<super::exports::Response>),
     Metadata(Box<super::metadata::Response>),
     Relink(Box<super::relink::Response>),
     EditCopy(Box<super::copy::Response>),
