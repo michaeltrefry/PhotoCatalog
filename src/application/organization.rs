@@ -1,7 +1,7 @@
 //! Bounded organization requests over public, logical-image-aware catalog APIs.
 //! Catalog selection and NativePath authority belong to the enclosing actor.
 //! Provenance is an opaque JSON string so retained integers survive JavaScript.
-use super::{BridgeError, ErrorCode, I64, Limits, error, native};
+use super::{BridgeError, ErrorCode, I64, Limits, U64, error, native};
 use crate::{Catalog, catalog_edits::VariantKey, organization as core};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -65,7 +65,7 @@ pub enum Request {
     },
     Members {
         collection: String,
-        after: Option<MemberCursor>,
+        after: Option<MembershipCursor>,
         limit: u16,
     },
     Identity {
@@ -162,6 +162,43 @@ pub struct MemberCursor {
     pub sequence: I64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipCursor {
+    pub collection: String,
+    pub revision: I64,
+    pub ordered: bool,
+    pub position: I64,
+    pub sequence: I64,
+}
+impl From<crate::catalog_images::organization::CollectionMemberCursor> for MembershipCursor {
+    fn from(v: crate::catalog_images::organization::CollectionMemberCursor) -> Self {
+        Self {
+            collection: v.collection,
+            revision: I64(v.revision),
+            ordered: v.ordered,
+            position: I64(v.position),
+            sequence: I64(v.sequence),
+        }
+    }
+}
+impl From<MembershipCursor> for crate::catalog_images::organization::CollectionMemberCursor {
+    fn from(v: MembershipCursor) -> Self {
+        Self {
+            collection: v.collection,
+            revision: v.revision.0,
+            ordered: v.ordered,
+            position: v.position.0,
+            sequence: v.sequence.0,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipPage {
+    pub rows: Vec<Member>,
+    pub next: Option<MembershipCursor>,
+    pub scanned: U64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T, C> {
     pub rows: Vec<T>,
     pub next: Option<C>,
@@ -240,7 +277,7 @@ pub enum Response {
     Collections(Page<Collection, String>),
     CollectionCreated { id: String },
     Placement(Placement),
-    Members(Page<Member, MemberCursor>),
+    Members(MembershipPage),
     Identity(ImageIdentity),
     Changed { revision: I64 },
     Acknowledged,
@@ -594,28 +631,60 @@ pub fn execute(catalog: &mut Catalog, request: Request, bounds: &Limits) -> Resu
             text(&collection, false)?;
             let limit = count(limit, bounds)?;
             if let Some(v) = &after {
-                invalid(v.position.0 >= 0 && v.sequence.0 > 0, "membership cursor")?;
+                text(&v.collection, false)?;
+                invalid(
+                    v.position.0 >= 0 && v.sequence.0 >= 0 && v.revision.0 >= 0,
+                    "membership cursor",
+                )?;
             }
-            let rows = catalog
-                .image_collection_members(
-                    &collection,
-                    after.map(|v| (v.position.0, v.sequence.0)),
-                    limit,
-                )
-                .map_err(native)?
-                .into_iter()
-                .map(|(sequence, v)| {
-                    Ok(Member {
+            let budget = bounds
+                .page_bytes
+                .min(bounds.reply_bytes.saturating_sub(128));
+            let mut page = MembershipPage {
+                rows: Vec::new(),
+                next: after,
+                scanned: U64(0),
+            };
+            while page.rows.len() < limit && page.scanned.0 < bounds.scan_rows as u64 {
+                let before = page.next.clone();
+                let cursor = before.clone().map(Into::into);
+                let step = catalog
+                    .image_collection_member_step(
+                        &collection,
+                        cursor.as_ref(),
+                        bounds.scan_rows - page.scanned.0 as usize,
+                        budget,
+                    )
+                    .map_err(native)?;
+                page.scanned.0 += step.scanned as u64;
+                page.next = step.next.map(Into::into);
+                if let Some((sequence, v)) = step.member {
+                    page.rows.push(Member {
                         key: v.key,
                         cursor: MemberCursor {
                             position: I64(v.position),
                             sequence: I64(sequence),
                         },
                         provenance_json: opaque(v.provenance, bounds)?,
-                    })
-                })
-                .collect::<Result<_>>()?;
-            Response::Members(page(rows, limit, bounds, |v| v.cursor.clone())?)
+                    });
+                    if size(&page, budget).is_err() {
+                        page.rows.pop();
+                        page.next = before;
+                        if page.rows.is_empty() {
+                            return Err(error(
+                                ErrorCode::ResourceLimit,
+                                "organization member exceeds page bytes",
+                            ));
+                        }
+                        break;
+                    }
+                }
+                if page.next.is_none() {
+                    break;
+                }
+            }
+            size(&page, budget)?;
+            Response::Members(page)
         }
         Request::SetMember {
             identity,
@@ -1211,8 +1280,10 @@ mod tests {
     fn bounds_and_decimal_wire_reject_without_mutating_jobs() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let mut c = Catalog::open(temp.path().join("catalog"))?;
-        let mut limits = Limits::default();
-        limits.reply_bytes = 1024;
+        let mut limits = Limits {
+            reply_bytes: 1024,
+            ..Default::default()
+        };
         let op = core::Operation::AddKeyword {
             kind: core::KeywordKind::Hierarchical,
             path: vec!["x".repeat(1024); 4],
@@ -1268,6 +1339,150 @@ mod tests {
             }
         }
         assert_eq!(ids.len(), 8);
+        Ok(())
+    }
+    #[test]
+    fn membership_progress_handles_sparse_defaults_byte_cuts_and_revision_changes()
+    -> anyhow::Result<()> {
+        let (_temp, mut c, master) = fixture()?;
+        let collection = c.create_collection("ordered", serde_json::json!({}))?;
+        let mut keys = Vec::new();
+        for n in 0..12 {
+            let v = c
+                .create_edit_variant(&master, c.edit_variant(&master)?.revision, &format!("{n}"))?
+                .key;
+            c.set_image_collection_membership(
+                &c.image_metadata_identity(&v)?,
+                &collection,
+                n + 1,
+                &serde_json::json!({"retained":"x".repeat(400)}),
+            )?;
+            keys.push(v);
+        }
+        let limits = Limits {
+            page_rows: 2,
+            scan_rows: 3,
+            page_bytes: 1024,
+            reply_bytes: 1024,
+            ..Default::default()
+        };
+        let Response::Members(first) = execute(
+            &mut c,
+            Request::Members {
+                collection: collection.clone(),
+                after: None,
+                limit: 2,
+            },
+            &limits,
+        )?
+        else {
+            panic!()
+        };
+        assert!(first.rows.is_empty());
+        assert_eq!(first.scanned, U64(3));
+        assert!(!first.next.as_ref().unwrap().ordered);
+        let mut cursor = first.next;
+        let mut found = Vec::new();
+        let mut calls = 0;
+        loop {
+            let Response::Members(page) = execute(
+                &mut c,
+                Request::Members {
+                    collection: collection.clone(),
+                    after: cursor,
+                    limit: 2,
+                },
+                &limits,
+            )?
+            else {
+                panic!()
+            };
+            assert!(page.scanned.0 <= 3);
+            assert!(
+                page.rows.len() <= 1,
+                "byte cap should stop before second member"
+            );
+            found.extend(page.rows.into_iter().map(|v| v.key));
+            cursor = page.next;
+            calls += 1;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(calls < 100);
+        }
+        assert_eq!(found, keys);
+        let expected = revision(&c, &master)?;
+        call(
+            &mut c,
+            Request::Apply {
+                key: master.clone(),
+                expected_revision: expected,
+                operation: core::Operation::AddCollection {
+                    collection: collection.clone(),
+                },
+            },
+        )?;
+        c.set_image_collection_membership(
+            &c.image_metadata_identity(&keys[4])?,
+            &collection,
+            0,
+            &serde_json::json!({}),
+        )?;
+        let expected = c
+            .image_collection_members(&collection, None, 100)?
+            .into_iter()
+            .map(|v| v.1.key)
+            .collect::<Vec<_>>();
+        let mut cursor = None;
+        let mut actual = Vec::new();
+        loop {
+            let Response::Members(page) = execute(
+                &mut c,
+                Request::Members {
+                    collection: collection.clone(),
+                    after: cursor,
+                    limit: 2,
+                },
+                &limits,
+            )?
+            else {
+                panic!()
+            };
+            actual.extend(page.rows.into_iter().map(|v| v.key));
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0], master);
+        assert_eq!(actual[1], keys[4]);
+        let Response::Members(page) = execute(
+            &mut c,
+            Request::Members {
+                collection: collection.clone(),
+                after: None,
+                limit: 2,
+            },
+            &limits,
+        )?
+        else {
+            panic!()
+        };
+        let cursor = page.next.unwrap();
+        c.rename_collection(&collection, cursor.revision.0, "changed")?;
+        assert!(
+            execute(
+                &mut c,
+                Request::Members {
+                    collection,
+                    after: Some(cursor),
+                    limit: 2
+                },
+                &limits
+            )
+            .is_err()
+        );
         Ok(())
     }
     #[test]
