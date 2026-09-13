@@ -6,7 +6,8 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
 PR16 is at `00463417af8ee8e0ce10c775ba11aea270bdc9c6`; CI34773173909 is
-still running (Linux/contracts passed, Mac failed, Windows building). The earlier reviewed batch
+terminal (Windows/Linux/contracts passed; Mac failed on the repaired close race).
+The earlier reviewed batch
 includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
 Lightroom inspection workbench `9deedea`, and Windows boundary repair `e239268`.
 The full export frontend is integrated as `c74e9aa` plus `eb0ef3c`. Independent
@@ -165,6 +166,12 @@ Native baseline62974 and repaired76727 are terminal/reaped. No retry push yet.
 Downloaded Linux installer, executable, observer and worker receipts at0046341
 verified; readback SHA256:
 `e36b3c99c5db1986138109f5ee991357e84cccaa3f1ff40547a3fd6ea54ba2e1`.
+Windows installer/executable and qualified worker receipts also verified, including
+accepted verbatim path spelling and both known workers reaped. Windows readback:
+`5525afe7400d99af0d711110ebbc741d8788084c858c841994e1b8817b6b8ef0`.
+Its observer executable is not in the downloaded Windows payload; no independent
+observer hash readback is claimed there. The failed Mac job produces no new Mac
+installer qualification. These checks do not test GUI behavior.
 
 New custody findings qualify the earlier integration PASS. Same-process photo
 export destination snapshot opens/closes can release a live Workbench Source lock
