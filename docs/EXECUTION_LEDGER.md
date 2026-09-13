@@ -5,7 +5,7 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 ## Current delivery — 2026-09-13
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
-PR16 remains at `af7e2386c8125b9c14cf18ade6457e8b25864705`. The reviewed local batch
+PR16 is at `d62fe14030213e19b533429758591af919d8c793`. The reviewed batch
 includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
 Lightroom inspection workbench `9deedea`, and Windows boundary repair `e239268`.
 The full export frontend is integrated as `c74e9aa` plus `eb0ef3c`. Independent
@@ -13,8 +13,8 @@ review verified the repaired completed-review settings binding and the combined
 App merge. All 50 integrated frontend tests and TypeScript/Vite build pass. The
 initial 32 and repair 18 private evidence hashes match. Review:
 `sc-22847-export-interface-independent-4zfru_0x/review-repaired.json`. Integrated
-receipt: `sc-22847-export-frontend-integrated-rbkjseev/receipt.json`. The next
-batched push will qualify these changes together; no actual export GUI claim yet.
+receipt: `sc-22847-export-frontend-integrated-rbkjseev/receipt.json`. The current
+batched push is qualifying these changes together; no actual export GUI claim yet.
 
 CI34765013818 is terminal: macOS, Linux and evidence contracts passed. Downloaded
 Mac/Linux qualification receipts and installer hashes match; installed synthetic
@@ -40,14 +40,24 @@ verification (nine source and 32 evidence hashes), 43 frontend tests and build.
 The full export actor passed independent review and 35 distinct focused tests,
 including synthetic PNG export through the application bridge, explicit recovery,
 foreground preview preemption, and child drain before ownership release. Strict
-Clippy and formatting pass. Its frontend remains a separate integration gate.
+Clippy and formatting pass. Its frontend is integrated above; actual installed GUI acceptance remains open.
 
 The serialized Lightroom workbench passed 62 executed tests, strict Clippy and
 formatting; independent review verified 12 source and 19 evidence files. It provides
 owned discovery/capture/inspection, exact result chunks, explicit family decisions
-and selection sealing. The complete desktop bridge is being implemented in an
-isolated worktree. Its UI and migration execution, reconciliation and repair paths
-remain required S12 work. No canonical user migration occurred.
+and selection sealing. The complete desktop bridge `a6dad4e` passed independent review and 29 distinct
+focused functions plus strict Clippy, formatting and TypeScript. Isolated UI
+integration is `7e6792a`; this bridge is not in PR16 or v6 yet. Root controller
+`0f84f56` passed 54 frontend functions and synthetic actual-hook lifecycle checks:
+same-generation reads, hidden panel/catalog changes, stale callbacks, lost starts,
+exact Cancel, and ambiguous or typed Close replies. Final delta keeps an accepted
+Close pending through Closing until Closed even when its reply is an error. Final
+TypeScript/build passes; independent final evidence readback is pending. This is
+not actual App mounting or installed GUI proof. Full panel mounting is in progress.
+The seven-command migration bridge plan is under independent review; target-free
+preparation, cancellable writer grants, and parent-safe SQLite alias/ABA handling
+must resolve before implementation. UI and migration execution, reconciliation and
+repair paths remain required S12 work. No canonical user migration occurred.
 
 The old v1 app was closed normally. Installed v5 opens the selected16 TEST catalog:
 preparation reached Catalog ready, and a known existing 2017 CR2 displayed both a
@@ -59,6 +69,26 @@ one as converted from `IMG_7058.CR2`; they do not identify the missing IMG_6997 
 other originals. No guessed association or relink was performed. The user question
 about conversion/removal is pending. V5 is the immutable `4e40972` checkpoint and
 does not contain this newer export/workbench batch.
+
+Fresh CI34768145412 at the exact PR head has passed macOS, Linux and evidence
+contracts. Windows has passed library/recovery, native GUID/junction, RAW, frontend
+and Tauri build checks and is building its installed-worker observer. Terminal
+Windows installed qualification remains required; no additional push during this run.
+
+The immutable Mac v6 package contains exact `d62fe14` (tree
+`14ffdf0ad510912a8bf4f2e26fdd193c68374427`). All eight bounded build/package/worker
+gates passed. Root verified 95 package file hashes, 65 evidence hashes, source/tree
+identity, and all individually known children reaped. Private package:
+`sc-22847-mac-checkpoint-v6/PhotoCatalog.app`; receipt:
+`sc-22847-mac-v6-build-2l4msxyj/receipt.json`, SHA256
+`1d341ea586ae1cff0a9108357a284ec4960cdd5a18291203ad4e4898abe864f7`.
+Root readback SHA256:
+`ef5f0d8f3bcc6cc7bda51d1fe617c94bdab6d72fd7f5d4de9fa04d6d9a1b952c`.
+This is arm64 development/ad-hoc packaging, not notarized. V6 GUI acceptance waits
+for the user to unlock the Mac. V5 PID20724 and executable remained unchanged;
+no app switch occurred. The native validation lane is free. Full controlled XMP
+editing, sidecar exports, settings/accessibility/platform acceptance and S13 remain
+open. Shortcut comment23311 was read back with S12 still In Progress.
 
 ## Earlier integration checkpoints
 
