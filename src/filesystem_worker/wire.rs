@@ -1,0 +1,648 @@
+//! Private F transport. These messages carry facts, never file descriptors.
+use crate::{
+    application::U64,
+    catalog_backup::RestoreStatus,
+    catalog_session::{
+        CatalogBootstrap, ConfirmSqlAdmission, LeaseId, PrepareCatalog, RootCapability,
+        SqlAdmissionConfirmed, validate_path,
+    },
+    storage_volume::NativePath,
+};
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::io::{self, Read, Write};
+
+pub const CONFIG_BYTES: usize = 4 * 1024 * 1024;
+pub const MESSAGE_BYTES: usize = 1024 * 1024;
+pub const ERROR_BYTES: usize = 4096;
+pub const CHUNK_BYTES: usize = 16 * 1024;
+const HEADER_BYTES: usize = 48;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Startup {
+    pub epoch: LeaseId,
+    pub build: String,
+    pub original_roots: Vec<NativePath>,
+}
+impl Startup {
+    pub fn new(original_roots: Vec<NativePath>) -> Result<Self> {
+        let value = Self {
+            epoch: LeaseId::new(),
+            build: build_identity(),
+            original_roots,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.build == build_identity(),
+            "filesystem helper build mismatch"
+        );
+        encode(self, CONFIG_BYTES)?;
+        for path in &self.original_roots {
+            validate_path(path)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn nonce(&self) -> [u8; 16] {
+        *uuid::Uuid::parse_str(self.epoch.as_str())
+            .expect("validated LeaseId")
+            .as_bytes()
+    }
+}
+/// Identity of this explicit source/dependency set, not an executable-file hash.
+pub fn build_identity() -> String {
+    blake3::hash(
+        concat!(
+            env!("CARGO_PKG_VERSION"),
+            include_str!("wire.rs"),
+            include_str!("client.rs"),
+            include_str!("process.rs"),
+            include_str!("../catalog_session.rs"),
+            include_str!("../filesystem_worker.rs"),
+            include_str!("bootstrap.rs"),
+            include_str!("../catalog_backup.rs"),
+            include_str!("../lib.rs"),
+            include_str!("../catalog_storage.rs"),
+            include_str!("../metadata_export.rs"),
+            include_str!("../storage_volume.rs"),
+            include_str!("../../Cargo.lock")
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "command",
+    content = "args",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+// Only one active and one queued request exist. Keep the fixed eight-role
+// confirmation inline instead of adding a separate allocation to every decode.
+#[allow(clippy::large_enum_variant)]
+pub enum Operation {
+    PrepareCatalog(PrepareCatalog),
+    ConfirmSqlAdmission(ConfirmSqlAdmission),
+    AbandonPrepare {
+        operation: U64,
+        session: LeaseId,
+    },
+    RestoreStatus {
+        root: RootCapability,
+    },
+    ResumeRestoredJobs {
+        root: RootCapability,
+        restore_id: String,
+        acknowledge_pending_jobs: bool,
+    },
+    RequireJobsReleased {
+        root: RootCapability,
+    },
+    ReleaseRoot {
+        root: RootCapability,
+    },
+    GlobalRestoreStatus {
+        root: NativePath,
+    },
+    GlobalResumeRestoredJobs {
+        root: NativePath,
+        restore_id: String,
+        acknowledge_pending_jobs: bool,
+    },
+}
+impl Operation {
+    pub(crate) fn is_cleanup(&self) -> bool {
+        matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
+    }
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::PrepareCatalog(value) => value.validate()?,
+            Self::ConfirmSqlAdmission(value) => {
+                validate_root(&value.root)?;
+                ensure!(value.operation.0 > 0, "invalid prepare operation");
+                for row in &value.roles {
+                    row.physical.validate()?;
+                }
+            }
+            Self::AbandonPrepare { operation, .. } => {
+                ensure!(operation.0 > 0, "invalid prepare operation")
+            }
+            Self::RestoreStatus { root }
+            | Self::RequireJobsReleased { root }
+            | Self::ReleaseRoot { root } => validate_root(root)?,
+            Self::ResumeRestoredJobs {
+                root, restore_id, ..
+            } => {
+                validate_root(root)?;
+                uuid::Uuid::parse_str(restore_id)?;
+            }
+            Self::GlobalRestoreStatus { root } => validate_path(root)?,
+            Self::GlobalResumeRestoredJobs {
+                root, restore_id, ..
+            } => {
+                validate_path(root)?;
+                uuid::Uuid::parse_str(restore_id)?;
+            }
+        }
+        Ok(())
+    }
+}
+fn validate_root(root: &RootCapability) -> Result<()> {
+    validate_path(&root.canonical_root)?;
+    root.root_physical.validate()?;
+    root.catalog_physical.validate()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionState {
+    Preparing,
+    Prepared,
+    Confirmed,
+    Abandoned,
+    Failed,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionSnapshot {
+    pub operation: U64,
+    pub session: LeaseId,
+    pub directory_created: bool,
+    pub catalog_created: bool,
+    pub manifest_created: bool,
+    pub bootstrap: Option<CatalogBootstrap>,
+    pub state: AdmissionState,
+    pub failure: Option<Failure>,
+}
+impl AdmissionSnapshot {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.operation.0 > 0, "invalid admission snapshot operation");
+        if let Some(value) = &self.bootstrap {
+            value.validate()?;
+            ensure!(
+                value.operation == self.operation && value.session == self.session,
+                "admission snapshot identity mismatch"
+            );
+            ensure!(
+                value.catalog.created == self.catalog_created
+                    && value.manifest.created == self.manifest_created,
+                "admission creation facts disagree with bootstrap"
+            );
+        }
+        ensure!(
+            !matches!(
+                self.state,
+                AdmissionState::Prepared | AdmissionState::Confirmed
+            ) || self.bootstrap.is_some(),
+            "prepared admission has no bootstrap authority"
+        );
+        if let Some(error) = &self.failure {
+            error.validate()?;
+        }
+        // Includes the Control wrapper budget used by the actual writer.
+        encode(&Control::Admission(Some(self.clone())), MESSAGE_BYTES)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum Response {
+    Bootstrap(CatalogBootstrap),
+    Confirmed(SqlAdmissionConfirmed),
+    RestoreStatus(Option<RestoreStatus>),
+    Released(Empty),
+    Unit(Empty),
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Empty {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    Rejected,
+    Canceled,
+    Unknown,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Failure {
+    pub kind: FailureKind,
+    pub message: String,
+}
+impl Failure {
+    pub fn new(kind: FailureKind, message: impl ToString) -> Self {
+        let mut message = message.to_string();
+        if message.len() > ERROR_BYTES {
+            let mut end = ERROR_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        Self { kind, message }
+    }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.message.len() <= ERROR_BYTES,
+            "filesystem error byte limit"
+        );
+        Ok(())
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl std::error::Error for Failure {}
+pub type Outcome = std::result::Result<Response, Failure>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Starting,
+    Ready,
+    Stopping,
+    DrainFailed,
+    Stopped,
+    Unknown,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultInfo {
+    pub sequence: U64,
+    pub bytes: U64,
+    pub blake3: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    pub phase: Phase,
+    pub shutdown_attempt: U64,
+    pub active: Option<U64>,
+    pub queued: Option<U64>,
+    pub retained: Option<ResultInfo>,
+    /// Exact queued request removed before any Handler execution by Stop.
+    pub canceled_before_execution: Option<U64>,
+    pub error: Option<Failure>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+// This reserved channel retains one admission snapshot and one in-flight frame,
+// not a growable collection of variants; inline storage keeps ownership simple.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Control {
+    Status(Status),
+    Admission(Option<AdmissionSnapshot>),
+    Rejected(Failure),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmissionQuery {
+    pub operation: U64,
+    pub session: LeaseId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Ack {
+    pub sequence: U64,
+    pub blake3: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Kind {
+    Startup = 1,
+    Ready = 2,
+    Execute = 3,
+    Status = 4,
+    AdmissionStatus = 5,
+    Cancel = 6,
+    Ack = 7,
+    Stop = 8,
+    Control = 9,
+    Result = 10,
+}
+impl Kind {
+    fn decode(value: u8) -> io::Result<Self> {
+        match value {
+            1 => Ok(Self::Startup),
+            2 => Ok(Self::Ready),
+            3 => Ok(Self::Execute),
+            4 => Ok(Self::Status),
+            5 => Ok(Self::AdmissionStatus),
+            6 => Ok(Self::Cancel),
+            7 => Ok(Self::Ack),
+            8 => Ok(Self::Stop),
+            9 => Ok(Self::Control),
+            10 => Ok(Self::Result),
+            _ => Err(invalid("unknown filesystem frame kind")),
+        }
+    }
+    fn cap(self) -> usize {
+        if self == Self::Startup {
+            CONFIG_BYTES
+        } else {
+            MESSAGE_BYTES
+        }
+    }
+}
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+pub(crate) struct Frame {
+    pub kind: Kind,
+    pub epoch: [u8; 16],
+    pub sequence: u64,
+    pub offset: usize,
+    pub total: usize,
+    pub payload: Vec<u8>,
+}
+impl Frame {
+    pub fn read(reader: &mut impl Read) -> io::Result<Option<Self>> {
+        let mut header = [0; HEADER_BYTES];
+        loop {
+            match reader.read(&mut header[..1]) {
+                Ok(0) => return Ok(None),
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        reader.read_exact(&mut header[1..])?;
+        if &header[..4] != b"PCFS" || header[4] != 1 || header[6..8] != [0, 0] {
+            return Err(invalid("filesystem protocol header mismatch"));
+        }
+        let kind = Kind::decode(header[5])?;
+        let offset = usize::try_from(u64::from_le_bytes(header[32..40].try_into().unwrap()))
+            .map_err(|_| invalid("filesystem offset overflow"))?;
+        let total = u32::from_le_bytes(header[40..44].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(header[44..48].try_into().unwrap()) as usize;
+        if total > kind.cap()
+            || size > CHUNK_BYTES
+            || offset.checked_add(size).is_none_or(|end| end > total)
+            || (size == 0 && total != 0)
+        {
+            return Err(invalid("filesystem frame byte admission"));
+        }
+        let mut payload = vec![0; size];
+        reader.read_exact(&mut payload)?;
+        Ok(Some(Self {
+            kind,
+            epoch: header[8..24].try_into().unwrap(),
+            sequence: u64::from_le_bytes(header[24..32].try_into().unwrap()),
+            offset,
+            total,
+            payload,
+        }))
+    }
+    fn write(&self, writer: &mut impl Write) -> io::Result<()> {
+        if self.total > self.kind.cap()
+            || self.payload.len() > CHUNK_BYTES
+            || self
+                .offset
+                .checked_add(self.payload.len())
+                .is_none_or(|end| end > self.total)
+            || (self.payload.is_empty() && self.total != 0)
+        {
+            return Err(invalid("filesystem outgoing frame byte admission"));
+        }
+        let mut header = [0; HEADER_BYTES];
+        header[..4].copy_from_slice(b"PCFS");
+        header[4] = 1;
+        header[5] = self.kind as u8;
+        header[8..24].copy_from_slice(&self.epoch);
+        header[24..32].copy_from_slice(&self.sequence.to_le_bytes());
+        header[32..40].copy_from_slice(&(self.offset as u64).to_le_bytes());
+        header[40..44].copy_from_slice(&(self.total as u32).to_le_bytes());
+        header[44..48].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        writer.write_all(&header)?;
+        writer.write_all(&self.payload)?;
+        writer.flush()
+    }
+}
+
+pub(crate) struct Message {
+    pub kind: Kind,
+    pub sequence: u64,
+    pub bytes: Vec<u8>,
+}
+impl Message {
+    pub fn write(self, epoch: [u8; 16], writer: &mut impl Write) -> io::Result<()> {
+        Self::write_bytes(self.kind, self.sequence, &self.bytes, epoch, writer)
+    }
+    pub fn write_bytes(
+        kind: Kind,
+        sequence: u64,
+        bytes: &[u8],
+        epoch: [u8; 16],
+        writer: &mut impl Write,
+    ) -> io::Result<()> {
+        if bytes.len() > kind.cap() {
+            return Err(invalid("filesystem message byte admission"));
+        }
+        let mut offset = 0;
+        loop {
+            let end = bytes.len().min(offset + CHUNK_BYTES);
+            Frame {
+                kind,
+                epoch,
+                sequence,
+                offset,
+                total: bytes.len(),
+                payload: bytes[offset..end].to_vec(),
+            }
+            .write(writer)?;
+            offset = end;
+            if offset == bytes.len() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+pub(crate) struct Assembly {
+    kind: Kind,
+    sequence: u64,
+    epoch: [u8; 16],
+    bytes: Vec<u8>,
+    received: usize,
+}
+impl Assembly {
+    pub fn start(frame: &Frame) -> io::Result<Self> {
+        if frame.offset != 0 || frame.total > frame.kind.cap() {
+            return Err(invalid("filesystem message initial frame"));
+        }
+        Ok(Self {
+            kind: frame.kind,
+            sequence: frame.sequence,
+            epoch: frame.epoch,
+            bytes: vec![0; frame.total],
+            received: 0,
+        })
+    }
+    pub fn push(&mut self, frame: Frame) -> io::Result<bool> {
+        if frame.kind != self.kind
+            || frame.sequence != self.sequence
+            || frame.epoch != self.epoch
+            || frame.total != self.bytes.len()
+            || frame.offset != self.received
+        {
+            return Err(invalid("filesystem message continuity"));
+        }
+        let end = self
+            .received
+            .checked_add(frame.payload.len())
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| invalid("filesystem fragment length"))?;
+        self.bytes[self.received..end].copy_from_slice(&frame.payload);
+        self.received = end;
+        Ok(end == self.bytes.len())
+    }
+    pub fn finish(self) -> io::Result<Message> {
+        if self.received != self.bytes.len() {
+            return Err(invalid("incomplete filesystem message"));
+        }
+        Ok(Message {
+            kind: self.kind,
+            sequence: self.sequence,
+            bytes: self.bytes,
+        })
+    }
+}
+
+/// Count before the sole exact-sized encoded allocation; no geometric Vec growth.
+pub(crate) fn encode(value: &impl Serialize, cap: usize) -> Result<Vec<u8>> {
+    struct Count {
+        bytes: usize,
+        cap: usize,
+    }
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.cap.saturating_sub(self.bytes) {
+                return Err(invalid("filesystem encoded byte limit"));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count { bytes: 0, cap };
+    serde_json::to_writer(&mut count, value)?;
+    let mut bytes = vec![0; count.bytes];
+    let mut cursor = io::Cursor::new(bytes.as_mut_slice());
+    serde_json::to_writer(&mut cursor, value)?;
+    ensure!(
+        cursor.position() as usize == count.bytes,
+        "filesystem serializer changed length"
+    );
+    Ok(bytes)
+}
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], cap: usize) -> Result<T> {
+    ensure!(bytes.len() <= cap, "filesystem decoded envelope byte limit");
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn frame_rejects_size_before_read_and_preserves_exact_chunks() -> Result<()> {
+        let payload = vec![0xa5; MESSAGE_BYTES];
+        let mut stream = vec![];
+        Message {
+            kind: Kind::Execute,
+            sequence: 9007199254740993,
+            bytes: payload.clone(),
+        }
+        .write([7; 16], &mut stream)?;
+        let mut input = stream.as_slice();
+        let first = Frame::read(&mut input)?.unwrap();
+        let mut assembly = Assembly::start(&first)?;
+        assembly.push(first)?;
+        while let Some(frame) = Frame::read(&mut input)? {
+            assembly.push(frame)?;
+        }
+        assert_eq!(assembly.finish()?.bytes, payload);
+        stream[44..48].copy_from_slice(&((CHUNK_BYTES + 1) as u32).to_le_bytes());
+        assert!(Frame::read(&mut &stream[..HEADER_BYTES]).is_err());
+        Ok(())
+    }
+    #[test]
+    fn exact_encoding_and_epoch_continuity_are_checked() -> Result<()> {
+        let value = "é\0".repeat(1000);
+        let expected = serde_json::to_vec(&value)?;
+        let encoded = encode(&value, expected.len())?;
+        assert_eq!(encoded, expected);
+        assert_eq!(encoded.capacity(), encoded.len());
+        assert!(encode(&value, expected.len() - 1).is_err());
+        let mut frame = Frame {
+            kind: Kind::Result,
+            epoch: [0; 16],
+            sequence: 1,
+            offset: 0,
+            total: 1,
+            payload: vec![1],
+        };
+        let mut assembly = Assembly::start(&frame)?;
+        frame.epoch = [1; 16];
+        assert!(assembly.push(frame).is_err());
+        Ok(())
+    }
+    #[test]
+    fn configuration_and_native_path_boundaries_preserve_full_roster() -> Result<()> {
+        #[cfg(unix)]
+        let path = NativePath::UnixBytes(b"/a".to_vec());
+        #[cfg(windows)]
+        let path = NativePath::WindowsWide("C:\\a".encode_utf16().collect());
+        let mut startup = Startup::new(vec![])?;
+        let base = encode(&startup, CONFIG_BYTES)?.len();
+        let item = encode(&path, MESSAGE_BYTES)?.len();
+        let count = (CONFIG_BYTES - base + 1) / (item + 1);
+        startup.original_roots = vec![path.clone(); count];
+        let encoded = encode(&startup, CONFIG_BYTES)?;
+        assert!(CONFIG_BYTES - encoded.len() < item + 1);
+        let decoded: Startup = decode(&encoded, CONFIG_BYTES)?;
+        decoded.validate()?;
+        assert_eq!(decoded.original_roots.len(), count);
+        assert!(decoded.original_roots.iter().all(|v| v == &path));
+        startup.original_roots.push(path.clone());
+        assert!(startup.validate().is_err());
+        let mut maximum = path;
+        match &mut maximum {
+            NativePath::UnixBytes(units) => units.resize(crate::catalog_session::PATH_UNITS, b'a'),
+            NativePath::WindowsWide(units) => {
+                units.resize(crate::catalog_session::PATH_UNITS, b'a' as u16)
+            }
+        }
+        validate_path(&maximum)?;
+        match &mut maximum {
+            NativePath::UnixBytes(units) => units.push(b'a'),
+            NativePath::WindowsWide(units) => units.push(b'a' as u16),
+        }
+        assert!(validate_path(&maximum).is_err());
+        assert!(decode::<Operation>(br#"{"command":"global_restore_status","args":{"root":{"encoding":"UnixBytes","units":[47]},"extra":true}}"#,MESSAGE_BYTES).is_err());
+        Ok(())
+    }
+}

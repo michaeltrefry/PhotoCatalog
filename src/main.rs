@@ -475,6 +475,18 @@ enum MetadataCommand {
 fn main() -> Result<()> {
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|arg| arg == "--catalog-filesystem-worker")
+    {
+        // stderr is a framed control stream; suppress Rust's unframed Result
+        // main diagnostic. The parent observes exit plus verified stream joins.
+        std::process::exit(if photocatalog::filesystem_worker::worker_main().is_ok() {
+            0
+        } else {
+            1
+        });
+    }
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|arg| arg == "--catalog-desktop-worker")
     {
         return photocatalog::application::desktop::worker_main();

@@ -17,6 +17,7 @@ mod catalog_writer;
 pub mod edit;
 pub mod export_service;
 pub mod export_worker;
+pub mod filesystem_worker;
 pub mod image_export;
 mod import_preparation;
 mod import_storage;

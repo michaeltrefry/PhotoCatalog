@@ -130,18 +130,31 @@ impl CatalogBootstrap {
             validate_path(&db.path)?;
             db.physical.validate()?;
         }
-        ensure!(self.catalog.physical != self.manifest.physical,
-            "catalog and preview manifest are the same object");
-        ensure!(self.catalog.path.to_path()? == self.canonical_root.to_path()?.join("catalog.sqlite3"),
-            "catalog admission path does not match root");
-        ensure!(self.manifest.path.to_path()?.file_name().is_some_and(|n| n == "previews.sqlite3"),
-            "invalid preview manifest admission path");
+        ensure!(
+            self.catalog.physical != self.manifest.physical,
+            "catalog and preview manifest are the same object"
+        );
+        ensure!(
+            self.catalog.path.to_path()? == self.canonical_root.to_path()?.join("catalog.sqlite3"),
+            "catalog admission path does not match root"
+        );
+        ensure!(
+            self.manifest
+                .path
+                .to_path()?
+                .file_name()
+                .is_some_and(|n| n == "previews.sqlite3"),
+            "invalid preview manifest admission path"
+        );
         Ok(())
     }
     pub fn root_capability(&self) -> RootCapability {
         RootCapability {
-            epoch: self.epoch.clone(), token: self.token.clone(), session: self.session.clone(),
-            canonical_root: self.canonical_root.clone(), root_physical: self.root_physical,
+            epoch: self.epoch.clone(),
+            token: self.token.clone(),
+            session: self.session.clone(),
+            canonical_root: self.canonical_root.clone(),
+            root_physical: self.root_physical,
             catalog_physical: self.catalog.physical,
         }
     }
@@ -160,9 +173,26 @@ pub struct RootCapability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SqlRole { Actor, Relink, Export, Search0, Search1, Search2, Search3, Manifest }
-pub const SQL_ROLES: [SqlRole; 8] = [SqlRole::Actor, SqlRole::Relink, SqlRole::Export,
-    SqlRole::Search0, SqlRole::Search1, SqlRole::Search2, SqlRole::Search3, SqlRole::Manifest];
+pub enum SqlRole {
+    Actor,
+    Relink,
+    Export,
+    Search0,
+    Search1,
+    Search2,
+    Search3,
+    Manifest,
+}
+pub const SQL_ROLES: [SqlRole; 8] = [
+    SqlRole::Actor,
+    SqlRole::Relink,
+    SqlRole::Export,
+    SqlRole::Search0,
+    SqlRole::Search1,
+    SqlRole::Search2,
+    SqlRole::Search3,
+    SqlRole::Manifest,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,13 +210,20 @@ pub struct ConfirmSqlAdmission {
 }
 impl ConfirmSqlAdmission {
     pub fn validate_for(&self, bootstrap: &CatalogBootstrap) -> Result<()> {
-        ensure!(self.operation == bootstrap.operation && self.root == bootstrap.root_capability(),
-            "admission confirmation belongs to another owner");
+        ensure!(
+            self.operation == bootstrap.operation && self.root == bootstrap.root_capability(),
+            "admission confirmation belongs to another owner"
+        );
         for (observation, role) in self.roles.iter().zip(SQL_ROLES) {
-            let expected = if role == SqlRole::Manifest { bootstrap.manifest.physical }
-                else { bootstrap.catalog.physical };
-            ensure!(observation.role == role && observation.physical == expected,
-                "invalid admission role roster");
+            let expected = if role == SqlRole::Manifest {
+                bootstrap.manifest.physical
+            } else {
+                bootstrap.catalog.physical
+            };
+            ensure!(
+                observation.role == role && observation.physical == expected,
+                "invalid admission role roster"
+            );
         }
         Ok(())
     }
@@ -204,22 +241,42 @@ pub trait CatalogFilesystem: Send + Sync {
     /// A lost reply is recovered by the original operation identity inside the
     /// client. Never repeat Prepare/creation. An error/cancel can still leave an
     /// outstanding token, which the caller explicitly abandons before SQL opens.
-    fn prepare_catalog(&self, request: &PrepareCatalog, cancel: &AtomicBool) -> Result<CatalogBootstrap>;
+    fn prepare_catalog(
+        &self,
+        request: &PrepareCatalog,
+        cancel: &AtomicBool,
+    ) -> Result<CatalogBootstrap>;
     /// Only before any SQLite open attempt; reconciles a lost Prepare by its
     /// original operation/session and releases pins without deleting evidence.
     fn abandon_prepare(&self, operation: U64, session: &LeaseId) -> Result<()>;
-    fn confirm_sql_admission(&self, request: &ConfirmSqlAdmission, cancel: &AtomicBool)
-        -> Result<SqlAdmissionConfirmed>;
+    fn confirm_sql_admission(
+        &self,
+        request: &ConfirmSqlAdmission,
+        cancel: &AtomicBool,
+    ) -> Result<SqlAdmissionConfirmed>;
     fn restore_status(&self, root: &RootCapability) -> Result<Option<RestoreStatus>>;
-    fn resume_restored_jobs(&self, root: &RootCapability, restore_id: &str,
-        acknowledge_pending_jobs: bool) -> Result<RestoreStatus>;
+    fn resume_restored_jobs(
+        &self,
+        root: &RootCapability,
+        restore_id: &str,
+        acknowledge_pending_jobs: bool,
+    ) -> Result<RestoreStatus>;
     /// Called only after dependent SQL/native ownership has been verified drained.
     fn release_root(&self, root: &RootCapability) -> Result<()>;
 }
 
 pub fn validate_path(path: &NativePath) -> Result<()> {
-    let units = match path { NativePath::UnixBytes(v) => v.len(), NativePath::WindowsWide(v) => v.len() };
-    ensure!((1..=PATH_UNITS).contains(&units), "native path admission limit");
-    ensure!(path.to_path()?.is_absolute(), "admission path must be absolute");
+    let units = match path {
+        NativePath::UnixBytes(v) => v.len(),
+        NativePath::WindowsWide(v) => v.len(),
+    };
+    ensure!(
+        (1..=PATH_UNITS).contains(&units),
+        "native path admission limit"
+    );
+    ensure!(
+        path.to_path()?.is_absolute(),
+        "admission path must be absolute"
+    );
     Ok(())
 }
