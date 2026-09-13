@@ -806,6 +806,9 @@ fn during_relink_hold(request: &Request) -> bool {
         | Request::PreviewStatus { .. }
         | Request::ReleaseViewport { .. }
         | Request::CancelPreview { .. } => true,
+        Request::Metadata { request, .. } => {
+            !matches!(request.as_ref(), metadata::Request::Resolve { .. })
+        }
         Request::Relink { request, .. } => request.read_only(),
         Request::Organization { request, .. } => matches!(
             request.as_ref(),

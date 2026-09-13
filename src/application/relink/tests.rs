@@ -763,6 +763,53 @@ fn atomic_relink_status_write_hold_cancel_commit_wins_and_close_undo() -> Result
     )?);
     assert!(s.write_hold);
     assert_eq!(s.boundary.as_deref(), Some("before_mutation"));
+    let app::Response::Metadata(identity) = call(
+        &bridge,
+        app::Request::Metadata {
+            catalog: token.clone(),
+            request: Box::new(app::metadata::Request::Identity { key: f.key.clone() }),
+        },
+    )?
+    else {
+        panic!("metadata read blocked during relink hold")
+    };
+    let app::metadata::Response::Identity(identity) = *identity else {
+        panic!("metadata identity")
+    };
+    assert!(matches!(
+        call(
+            &bridge,
+            app::Request::Metadata {
+                catalog: token.clone(),
+                request: Box::new(app::metadata::Request::Fields {
+                    identity: identity.clone(),
+                    after: None,
+                    limit: 20
+                }),
+            }
+        )?,
+        app::Response::Metadata(_)
+    ));
+    let blocked_metadata = call(
+        &bridge,
+        app::Request::Metadata {
+            catalog: token.clone(),
+            request: Box::new(app::metadata::Request::Resolve {
+                key: f.key.clone(),
+                expected_revision: identity.metadata_revision,
+                field: "rating".into(),
+                model: I64(1),
+            }),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        blocked_metadata
+            .downcast_ref::<BridgeError>()
+            .map(|e| &e.code),
+        Some(ErrorCode::Busy)
+    ));
+
     assert!(matches!(
         call(
             &bridge,

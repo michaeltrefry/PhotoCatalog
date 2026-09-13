@@ -25,7 +25,7 @@ and Tauri implement the first grid/editor integration; PhotoCatalog remains the
 working name. Actual filesystem folders across all years share one catalog.
 The UI-independent Rust application actor owns typed bounded commands, precise
 paths/revisions, foreground priority, preview scheduling and worker lifecycle.
-Draft PR #16 is open at `e762c1d70160e7e3e61ff7857093bab4e499ad62` on the
+Draft PR #16 remains open on the
 PUBLIC repository. Run `34751855171` finished: contracts passed; Linux failed
 late JPEG XL discovery after Python setup replaced PKG_CONFIG_PATH; Windows failed
 notice collection; macOS package/installed-worker checks passed but evidence upload
@@ -39,7 +39,12 @@ first marker UNK→DEB/NSS. The local repair predicts that exact whole-file dige
 before bundling and still rejects every unrelated byte change. Eleven staging
 tests, the deterministic SQLite cancellation regression, strict Clippy and independent
 source review pass. Private evidence is `sc-22847-ci-marker-backup-gate-v2` and
-`sc-22847-ci-34754042585`; repaired hosted acceptance remains pending.
+`sc-22847-ci-34754042585`. Run34755832775 at04d6913 passed macOS,
+Linux and evidence contracts. Windows built and inspected the NSIS payload but
+failed before worker launch because its environment snapshot uses SYSTEMROOT,
+while the smoke launcher looked up SystemRoot. Repair7fd2d81 normalizes Windows
+environment keys and uses exact Windows path syntax;45 Python tests and independent
+source review pass. Fresh Windows installed-worker qualification remains pending.
 Local import `557c0ff` is integrated as
 `eebc6e5` after 85 focused tests, strict Clippy and independent source review.
 Root backup dispatch/UI, search/import controls and loading feedback `6e21ff0`
@@ -72,16 +77,45 @@ and bounded single-collection lookup passed integrated gates and source
 review. Organization UI review identified transient-indexing unmount and false
 end-of-page on errors; both are repaired in `5ab1560`, integrated as `77b58c0`, and independently
 re-reviewed PASS with all 11 source files matching root exactly. Older recorded
-drive paths still need the planned relink UI; no path rewrite was performed.
+drive paths remain unchanged; the new relink workflow has not been used on the user catalog.
 
 Compatibility badges now distinguish translated, retained-only and untranslated
 Lightroom settings without asserting Adobe appearance equivalence (`72b0e41`).
-Metadata/XMP inspection and source-fenced relink review/apply/undo are actively
-being qualified in isolated slices; they are not installed-app acceptance yet.
+Metadata adapters15330a6/f4f4e57 expose selected-variant effective values,
+conflict resolution, source/packet/observation/decision provenance, exact retained
+bytes, immutable Lightroom graph history, actual source columns and Adobe settings
+interpretation. Native-copy ancestry follows immutable same-asset predecessors.
+Four metadata UI findings were repaired and independently re-reviewed.
 
-The first grid/editor checkpoint remains incomplete: full organization, conflicts,
-Lightroom migration/reconciliation, import/export, relink, backup/restore, settings,
-accessibility, user visual review and installed three-platform workflows remain S12.
+Relink core5fc7b5d introduces schema12 with detached bounded candidate preparation,
+explicit association acknowledgement where no historical digest exists, exact source
+fences, cancellable apply/undo, pinned existing database workers, and hydration lineage.
+Its58 focused tests and strictClippy passed independent exact-source review. Adapter
+2214d55 plus sparse-scan repair8e38d9b owns status/cancel and worker drain, preserves
+cached browsing during write holds, and bounds Rules scans by candidates examined.
+The10k-row sparse-exclusion regression and native imported master/copy hydration/undo
+passed. Legacy plans report counts unavailable but retain strict lineage-checked undo.
+
+Desktopdaa9dc2 adds Metadata & XMP and Locate originals workflows. All36 frontend
+tests/build and bounded independent reviews pass. Synthetic browser scenarios cover
+history continuation, failed-read retry, opaque provenance, explicit whole-plan
+confirmation, commit-winning cancellation, undo, and stale picker/cancel replies.
+The post-apply image refresh binds catalog, request generation and selected-row identity.
+Root61b45f8 validates selected-copy metadata revision and session isolation and the
+schema12 downgrade fixture. The combined gate passes41 actor tests,15 native bridge
+tests and strictClippy; independent integration review passes. Its held transaction
+permits metadata reads and rejects conflict-resolution writes. Duplicate React keys
+on the retained-column and settings-path siblings were found in the browser console
+and repaired with distinct anchor-qualified keys; the narrow review and build pass. These are local source/fixture results, not installed user-catalog
+or canonical migration acceptance. Computer Use rechecked the Mac: still locked;
+the old checkpoint remains running and unmodified.
+
+S12 remains incomplete. Lightroom discovery/capture/dry-run/import/reconciliation,
+copy-adjustment groups, full export and controlled metadata-write workflows, backup
+settings, preview-cache/color settings, accessibility, user visual review, and complete
+installed three-platform workflows remain in the agreed foundation scope. Existing
+organization, metadata and relink implementations still need integrated installed
+acceptance; their local tests do not close S12.
 S13 remains the sole terminal integrated readiness/scale campaign after S12 is stable.
 
 ## S10 pre-merge checkpoint — 2026-09-13
