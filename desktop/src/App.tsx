@@ -8,6 +8,9 @@ import { CatalogActivity } from './components/CatalogActivity';
 import { OrganizationPanel } from './components/OrganizationPanel';
 import { RelinkPanel } from './components/RelinkPanel';
 import { useRelink } from './state/useRelink';
+import { CopyPanel } from './components/CopyPanel';
+import { useEditCopy } from './state/useEditCopy';
+import { copyTerminal } from './editCopy';
 import { MetadataPanel } from './components/MetadataPanel';
 import { BackupPanel } from './components/BackupPanel';
 import { SearchFilters, defaultFilters } from './components/SearchFilters';
@@ -40,6 +43,8 @@ export function App() {
   const [showOrganization, setShowOrganization] = useState(false);
   const [showMetadata, setShowMetadata] = useState(false);
   const [showRelink, setShowRelink] = useState(false);
+  const [showCopy, setShowCopy] = useState(false);
+  const [copyRefreshing, setCopyRefreshing] = useState<{ catalog: string; stamp: string } | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
   const [organizationScopeName, setOrganizationScopeName] = useState('');
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null);
@@ -71,6 +76,9 @@ export function App() {
   const catalogRef = useRef(catalog); catalogRef.current = catalog;
   const storageRefresh = useRef(0);
   const storage = useRelink(catalog);
+  const copies = useEditCopy(catalog);
+  const copyEditingHeld = copies.busy || copyRefreshing?.catalog === catalog;
+  const copyRefreshed = useRef('');
   const storageWriteHold = !!storage.operation?.write_hold;
 
   useEffect(() => {
@@ -118,6 +126,35 @@ export function App() {
       setSelected(row); attachVariant(variant); setError('');
     });
   }, [catalog, attachVariant, perform]);
+
+  useEffect(() => {
+    const operation = copies.operation;
+    if (!catalog || !operation || !copyTerminal(operation) || operation.job.completed === '0') return;
+    const stamp = `${catalog}:${operation.id}:${operation.job.completed}`;
+    if (copyRefreshed.current === stamp) return;
+    const hold = { catalog, stamp };
+    let stopped = false; setCopyRefreshing(hold);
+    void gate.current.afterCurrent(async () => {
+      if (stopped || catalogRef.current !== catalog) return;
+      const row = selectedRef.current, currentQueue = queueRef.current;
+      let flushed = false;
+      try {
+        await currentQueue?.flush();
+        flushed = true;
+        if (row) {
+          const variant = await command({ command: 'variant', args: { catalog, key: row.key } }, 'variant');
+          if (!stopped && catalogRef.current === catalog && selectedRef.current === row && queueRef.current === currentQueue) attachVariant(variant);
+        }
+        if (!stopped) { copyRefreshed.current = stamp; setPreviewEpoch(v => v + 1); setRefresh(v => v + 1); }
+      } catch (e) {
+        if (!stopped && catalogRef.current === catalog) {
+          setError(`${flushed ? 'Adjustment copy finished; reselect the photo to reload its settings' : 'Adjustment copy finished; pending edits could not be saved and remain in the editor'}: ${errorText(e)}`);
+          if (flushed && queueRef.current === currentQueue) { queueRef.current = null; setQueue(null); }
+        }
+      } finally { setCopyRefreshing(value => value === hold ? null : value); }
+    });
+    return () => { stopped = true; setCopyRefreshing(value => value === hold ? null : value); };
+  }, [catalog, copies.operation, attachVariant]);
 
   const organizationMutation = async (action: () => Promise<void>) => {
     if (storageWriteHold) throw new Error('Wait for the storage operation to finish before changing the catalog.');
@@ -188,12 +225,12 @@ export function App() {
     window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown);
   }, [selected, cull, mode, page.rows, select]);
   const undo = async (redo: boolean) => perform(async () => {
-    if (!catalog || !queue || storageWriteHold) return;
+    if (!catalog || !queue || storageWriteHold || copyEditingHeld) return;
     try { await queue.flush(); const value = queue.value.variant; attachVariant(await command({ command: redo ? 'redo' : 'undo', args: { catalog, key: value.key, expected_revision: value.revision } }, 'variant')); }
     catch (e) { setError(errorText(e)); }
   });
   const createCopy = async () => perform(async () => {
-    if (!catalog || !queue || storageWriteHold || copyName === null) return;
+    if (!catalog || !queue || storageWriteHold || copyEditingHeld || copyName === null) return;
     try { await queue.flush(); const value = queue.value.variant; const variant = await command({ command: 'create_variant', args: { catalog, key: value.key, expected_revision: value.revision, label: copyName } }, 'variant'); const row = await command({ command: 'image', args: { catalog, key: variant.key } }, 'image'); setSelected(row); attachVariant(variant); setCopyName(null); setRefresh(value => value + 1); }
     catch (e) { setError(errorText(e)); }
   });
@@ -218,9 +255,11 @@ export function App() {
     </main> : <>
       <div className="workspace-toolbar"><button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => setShowImport(true)}>Add photos…</button><button onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowRelink(true); })}>Locate originals…</button><button aria-pressed={showFolders} onClick={() => setShowFolders(value => !value)}>Folders</button><div className="breadcrumb">{scope === undefined ? 'Choose a folder' : scope === null ? 'All Photos' : scope.name}</div>
         <form className="search-form" onSubmit={event => { event.preventDefault(); setAppliedSearch(search); setCursor(null); setPrevious([]); }}><input type="search" maxLength={1024} aria-label="Search photos" placeholder="Search photos" value={search} onChange={event => setSearch(event.target.value)} /><button type="submit">Search</button></form>
-        <button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
+        <button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowCopy(true); })}>Copy adjustments…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
       {(filters.keyword || filters.collection) && <div className="activity">Organization filter: {organizationScopeName}<button onClick={() => { setFilters(value => ({ ...value, keyword: null, collection: null })); setCursor(null); setPrevious([]); }}>Clear organization filter</button></div>}
       {storageWriteHold && <div className="activity" role="status">Storage operation in progress: catalog writes and new original rendering are held.<button onClick={() => setShowRelink(true)}>Review progress</button><button onClick={() => void storage.cancel()}>Cancel storage operation</button></div>}
+      {copies.busy && <div className="activity" role="status">{copies.ready ? 'Copying adjustments' : 'Checking adjustment copy status'} · {copies.operation?.job.completed ?? '0'} of {copies.operation?.job.total ?? '…'} targets processed<button onClick={() => setShowCopy(true)}>Review copy progress</button><button disabled={!copies.operation || copyTerminal(copies.operation)} onClick={() => void copies.cancel()}>Cancel adjustment copy</button></div>}
+      {copies.error && <div className="activity" role="alert">Adjustment copy: {copies.error}<button onClick={() => setShowCopy(true)}>Review copy status</button></div>}
       {status.jobs_held && <div className="activity">Restored catalog: pending external jobs are held for review. Browsing and editing are available.</div>}
       <main className="workspace">
         {showFolders && <aside className="left-panel"><Section title="Library"><button className={scope === null ? 'current scope-button' : 'scope-button'} onClick={() => void changeScope(null)}>All Photos</button><label className="checkbox"><input type="checkbox" checked={recursive} onChange={event => { setRecursive(event.target.checked); setCursor(null); setPrevious([]); }} />Include subfolders</label></Section><Section title="Folders">{status.phase === 'ready' ? <FolderTree key={`${catalog}:${folderEpoch}`} catalog={catalog} selected={scope?.id} onSelect={folder => void changeScope(folder)} /> : <p role="status">Preparing folders…</p>}</Section></aside>}
@@ -237,12 +276,13 @@ export function App() {
           <Section title="Selected photo"><div className="selected-filename">{selected.filename}</div><CompatibilityStatus image={selected} selectedKey={editor.variant.key} />{editor.variant.label && <p className="hint">{editor.variant.label}</p>}<div className="rating-buttons" aria-label="Rating">{[0, 1, 2, 3, 4, 5].map(value => <button key={value} disabled={storageWriteHold} aria-label={`${value} stars`} aria-pressed={selected.rating === String(value)} onClick={() => void cull({ operation: 'rating', value }, false)}>{value === 0 ? '—' : '★'}</button>)}</div>
           <div className="button-group"><button disabled={storageWriteHold} aria-pressed={selected.flag === 'pick'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'pick' ? 'unflagged' : 'pick' }, false)}>Pick</button><button disabled={storageWriteHold} aria-pressed={selected.flag === 'reject'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'reject' ? 'unflagged' : 'reject' }, false)}>Reject</button></div>
           {selected.conflicts.length > 0 && <p className="hint">Conflicting metadata: {selected.conflicts.join(', ')}</p>}{selected.metadata_pending && <p className="hint">Metadata indexing is pending.</p>}<button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowMetadata(true); })}>Metadata & XMP…</button></Section>
-          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={transitioning || storageWriteHold} recipe={editor.recipe} onChange={value => { if (!gate.current.locked && !storageWriteHold) queueRef.current?.change(value); }} />
-          <div className="edit-actions"><button disabled={transitioning || storageWriteHold || !editor.variant.can_undo} onClick={() => void undo(false)}>Undo</button><button disabled={transitioning || storageWriteHold || !editor.variant.can_redo} onClick={() => void undo(true)}>Redo</button><button disabled={storageWriteHold} onClick={() => setCopyName('Copy')}>Create variant…</button><button onClick={() => void inspectHistory()}>Edit history</button></div></>}
+          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={transitioning || storageWriteHold || copyEditingHeld} recipe={editor.recipe} onChange={value => { if (!gate.current.locked && !storageWriteHold && !copyEditingHeld) queueRef.current?.change(value); }} />
+          <div className="edit-actions"><button disabled={transitioning || storageWriteHold || copyEditingHeld || !editor.variant.can_undo} onClick={() => void undo(false)}>Undo</button><button disabled={transitioning || storageWriteHold || copyEditingHeld || !editor.variant.can_redo} onClick={() => void undo(true)}>Redo</button><button disabled={storageWriteHold || copyEditingHeld} onClick={() => setCopyName('Copy')}>Create variant…</button><button onClick={() => void inspectHistory()}>Edit history</button></div></>}
           {mode !== 'develop' && <Section title="Editing"><p className="hint">Changes apply to the selected photo or variant and leave the original untouched.</p><button onClick={() => setMode('develop')}>Open Develop</button></Section>}
         </> : <div className="empty-state"><p>Select a photo to inspect its metadata and edits.</p></div>}</aside>}
       </main><footer className="app-status"><span>{status.phase === 'ready' ? 'Catalog ready' : status.phase}</span><span>{importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase) ? `Import ${importStatus.phase.replaceAll('_', ' ')} · ${importStatus.imported} added` : status.message}</span><span>{backupStatus && ['running', 'cancel_requested'].includes(backupStatus.state) ? `Backup ${backupStatus.state.replaceAll('_', ' ')}` : ''}</span><span>{status.active_previews > 0 ? `${status.active_previews} preview requests` : 'Local catalog'}</span></footer>
     </>}
+    {catalog && <CopyPanel key={catalog} catalog={catalog} open={showCopy} selected={selected} rows={page.rows} source={() => queueRef.current?.value.variant ?? null} controller={copies} mutate={organizationMutation} jobsHeld={status.jobs_held} writeHeld={storageWriteHold} onClose={() => setShowCopy(false)} />}
     {catalog && <RelinkPanel key={catalog} catalog={catalog} selected={selected} open={showRelink} onClose={() => setShowRelink(false)} controller={storage} mutate={organizationMutation} changed={() => { setPreviewEpoch(v => v + 1); setFolderEpoch(v => v + 1); setCursor(null); setPrevious([]); setRefresh(v => v + 1); const selection = selectedRef.current; const generation = ++storageRefresh.current; const current = () => catalogRef.current === catalog && storageRefresh.current === generation && selectedRef.current === selection; if (selection) void command({ command: 'image', args: { catalog, key: selection.key } }, 'image').then(row => { if (current()) setSelected(row); }).catch(e => { if (current()) setError(errorText(e)); }); }} />}
     {catalog && <ImportPanel key={catalog} catalog={catalog} open={showImport} onProgress={setImportStatus} jobsHeld={status.jobs_held} onClose={() => setShowImport(false)} onComplete={() => { setFolderEpoch(value => value + 1); setCursor(null); setPrevious([]); setRefresh(value => value + 1); }} />}
     {desktopAvailable && <BackupPanel catalog={catalog} open={showBackup} onClose={() => setShowBackup(false)} onProgress={setBackupStatus} />}

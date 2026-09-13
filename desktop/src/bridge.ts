@@ -3,6 +3,7 @@ import type { Recipe } from './recipe';
 import type { OrganizationRequest, OrganizationResponse } from './organization';
 import type { MetadataRequest, MetadataResponse } from './metadata';
 import type { RelinkRequest, RelinkResponse } from './relink';
+import type { CopyRequest, CopyResponse } from './editCopy';
 
 export type Decimal = string;
 export type NativePath = { encoding: 'UnixBytes' | 'WindowsWide'; units: number[] };
@@ -24,6 +25,7 @@ type AtCatalog = { catalog: string };
 type AtVariant = AtCatalog & { key: VariantKey };
 type AtRevision = AtVariant & { expected_revision: Decimal };
 export type Request =
+  | { command: 'edit_copy'; args: AtCatalog & { request: CopyRequest } }
   | { command: 'relink'; args: AtCatalog & { request: RelinkRequest } }
   | { command: 'metadata'; args: AtCatalog & { request: MetadataRequest } }
   | { command: 'organization'; args: AtCatalog & { request: OrganizationRequest } }
@@ -52,6 +54,7 @@ export type Request =
   | { command: 'release_viewport'; args: AtCatalog & { viewport: string; generation: Decimal } }
   | { command: 'preview_status' | 'cancel_preview'; args: AtCatalog & { ticket: string } };
 export interface Data {
+  edit_copy: CopyResponse;
   relink: RelinkResponse;
   metadata: MetadataResponse;
   organization: OrganizationResponse;
