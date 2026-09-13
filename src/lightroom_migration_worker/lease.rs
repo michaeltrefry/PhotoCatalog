@@ -182,11 +182,11 @@ impl DestinationLease {
             Role::ImportLock,
             false,
         )?;
-        if let Some(expected) = expected_lock {
-            if lock.key() != expected {
-                review.audit.poison();
-                anyhow::bail!("import lock differs from reviewed object");
-            }
+        if let Some(expected) = expected_lock
+            && lock.key() != expected
+        {
+            review.audit.poison();
+            anyhow::bail!("import lock differs from reviewed object");
         }
         loop {
             review.audit.check()?;

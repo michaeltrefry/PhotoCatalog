@@ -360,18 +360,16 @@ pub(crate) fn execute<A: Admission>(
                 Output::End => ended = true,
             }
         }
-        if ended {
-            if let Some(status) = owner.process.try_reap()? {
-                ensure!(status.success(), "migration helper exited {status}");
-                owner
-                    .state
-                    .terminal
-                    .take()
-                    .context("migration helper ended without a terminal result")??;
-                // Drop/join transport threads before returning the cached result.
-                owner.process.terminate();
-                return Ok(std::mem::take(&mut owner.state.result));
-            }
+        if ended && let Some(status) = owner.process.try_reap()? {
+            ensure!(status.success(), "migration helper exited {status}");
+            owner
+                .state
+                .terminal
+                .take()
+                .context("migration helper ended without a terminal result")??;
+            // Drop/join transport threads before returning the cached result.
+            owner.process.terminate();
+            return Ok(std::mem::take(&mut owner.state.result));
         }
         ensure!(
             !stop.requested(),

@@ -64,8 +64,10 @@ fn deadlines_retire_and_pre_cancellation_allocates_no_ticket() -> Result<()> {
 
 #[test]
 fn retirement_ranges_preserve_live_heads_and_do_not_grow_per_cancel() {
-    let mut s = State::default();
-    s.next = [10002, 0];
+    let mut s = State {
+        next: [10002, 0],
+        ..State::default()
+    };
     for t in 1..10001 {
         s.retire(0, t);
     }
@@ -75,8 +77,10 @@ fn retirement_ranges_preserve_live_heads_and_do_not_grow_per_cancel() {
     s.retire(0, 0);
     assert_eq!(s.serving[0], 10002);
     assert!(s.retired[0].is_empty());
-    let mut s = State::default();
-    s.next = [9, 0];
+    let mut s = State {
+        next: [9, 0],
+        ..State::default()
+    };
     for t in [7, 3, 5, 4, 6, 1] {
         s.retire(0, t);
     }
