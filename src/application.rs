@@ -2,6 +2,7 @@
 //! owned/reaped by PreviewService; no webview thread touches SQLite.
 pub mod backup;
 pub mod browse;
+pub mod organization;
 mod dto;
 use crate::{
     Catalog,

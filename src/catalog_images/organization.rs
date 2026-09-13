@@ -165,10 +165,38 @@ pub(crate) fn add_keyword_synonym(
 }
 impl Catalog {
     pub fn place_collection(&mut self, placement: &CollectionPlacement) -> Result<()> {
+        self.place_collection_revision(placement, None)
+    }
+    /// Compare the reviewed collection revision inside the hierarchy transaction.
+    /// Existing import/CLI callers retain their explicit unconditional API.
+    pub fn place_collection_checked(
+        &mut self,
+        placement: &CollectionPlacement,
+        expected_revision: i64,
+    ) -> Result<()> {
+        ensure!(expected_revision >= 0, "negative collection revision");
+        self.place_collection_revision(placement, Some(expected_revision))
+    }
+    fn place_collection_revision(
+        &mut self,
+        placement: &CollectionPlacement,
+        expected_revision: Option<i64>,
+    ) -> Result<()> {
         let _w = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(expected) = expected_revision {
+            let revision: i64 = tx.query_row(
+                "SELECT revision FROM organization_collections WHERE id=?",
+                [&placement.collection],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                revision == expected,
+                "collection changed after placement review"
+            );
+        }
         place_collection(&tx, placement)?;
         tx.commit()?;
         Ok(())
@@ -209,10 +237,38 @@ impl Catalog {
         synonym: &str,
         evidence: &serde_json::Value,
     ) -> Result<()> {
+        self.write_keyword_synonym(keyword, synonym, evidence, false)
+    }
+    /// Create a synonym without overwriting retained source provenance.
+    pub fn create_keyword_synonym(
+        &mut self,
+        keyword: i64,
+        synonym: &str,
+        evidence: &serde_json::Value,
+    ) -> Result<()> {
+        self.write_keyword_synonym(keyword, synonym, evidence, true)
+    }
+    fn write_keyword_synonym(
+        &mut self,
+        keyword: i64,
+        synonym: &str,
+        evidence: &serde_json::Value,
+        create_only: bool,
+    ) -> Result<()> {
         let _w = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if create_only {
+            ensure!(
+                !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=?1 AND synonym=?2)",
+                    params![keyword, synonym],
+                    |r| r.get::<_, bool>(0),
+                )?,
+                "synonym already exists; retained provenance is unchanged"
+            );
+        }
         add_keyword_synonym(&tx, keyword, synonym, evidence)?;
         tx.commit()?;
         Ok(())
