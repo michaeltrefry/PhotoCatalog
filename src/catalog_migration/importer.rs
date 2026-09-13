@@ -217,13 +217,23 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
 fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     crate::lightroom::bounded_json(v, LIMIT)
 }
+// Both fields must fit before either is returned to Rust. BLOB affinity does
+// not prohibit stored TEXT, so length admission counts bytes explicitly.
+const READ_DOCUMENTS_SQL: &str = "SELECT
+    CASE WHEN length(CAST(progress AS BLOB))<=?2 AND length(CAST(policy AS BLOB))<=?2 THEN progress END,
+    CASE WHEN length(CAST(progress AS BLOB))<=?2 AND length(CAST(policy AS BLOB))<=?2 THEN policy END
+    FROM migration_runs WHERE id=?1";
 pub(crate) fn read(db: &Connection, id: &str) -> Result<(Progress, Policy)> {
     ensure!(id.len() == 64, "migration run identity bounds");
-    let (p, q): (Vec<u8>, Vec<u8>) = db.query_row(
-        "SELECT progress,policy FROM migration_runs WHERE id=?",
-        [id],
+    let (p, q): (Option<Vec<u8>>, Option<Vec<u8>>) = db.query_row(
+        READ_DOCUMENTS_SQL,
+        params![id, i64::try_from(LIMIT)?],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let (p, q) = (
+        p.context("migration state bounds before allocation")?,
+        q.context("migration state bounds before allocation")?,
+    );
     ensure!(
         p.len() <= LIMIT && q.len() <= LIMIT,
         "migration state bounds"
@@ -1211,6 +1221,59 @@ mod mapping_query_tests {
                 .get::<_, bool>(0))?
         );
         assert!(legacy.get_status(StatementStatus::VmStep) > 20_000);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod document_admission_tests {
+    use super::*;
+    use rusqlite::types::Type;
+    #[test]
+    fn oversized_progress_or_policy_never_crosses_the_sql_row_boundary() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        retention::install(&db)?;
+        install(&db)?;
+        let id = "a".repeat(64);
+        db.execute(
+            "INSERT INTO migration_retention(id,seal,approval) VALUES(?1,?2,?2)",
+            params![id, b"{}".as_slice()],
+        )?;
+        db.execute(
+            "INSERT INTO migration_runs VALUES(?1,?1,?2,?2)",
+            params![id, b"{}".as_slice()],
+        )?;
+        for field in ["progress", "policy"] {
+            db.execute(
+                "UPDATE migration_runs SET progress=?1,policy=?1",
+                [b"{}".as_slice()],
+            )?;
+            db.execute(
+                &format!("UPDATE migration_runs SET {field}=zeroblob(?1)"),
+                [i64::try_from(LIMIT + 1)?],
+            )?;
+            let mut statement = db.prepare(READ_DOCUMENTS_SQL)?;
+            let mut rows = statement.query(params![id, i64::try_from(LIMIT)?])?;
+            let row = rows.next()?.context("fixture row")?;
+            assert_eq!(row.get_ref(0)?.data_type(), Type::Null);
+            assert_eq!(row.get_ref(1)?.data_type(), Type::Null);
+            assert!(format!("{:#}", read(&db, &id).unwrap_err()).contains("before allocation"));
+        }
+        // A TEXT value with fewer characters than bytes cannot evade admission.
+        let multibyte = "é".repeat(LIMIT / 2 + 1);
+        db.execute(
+            "UPDATE migration_runs SET progress=?1,policy=?2",
+            params![multibyte, b"{}".as_slice()],
+        )?;
+        assert!(format!("{:#}", read(&db, &id).unwrap_err()).contains("before allocation"));
+        assert_eq!(
+            db.query_row(
+                "SELECT length(CAST(progress AS BLOB)) FROM migration_runs",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            i64::try_from(LIMIT + 2)?
+        );
         Ok(())
     }
 }

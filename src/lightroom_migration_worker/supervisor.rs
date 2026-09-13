@@ -23,7 +23,10 @@ const RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// The coordinator implements this against immutable operation admission and
 /// the actor's cached attached identities. `writer` obtains an exact actor hold
 /// acknowledgement before returning its shared Writers registry entry. Its
-/// wait must observe Stop/deadline; it must not open supplied pathnames.
+/// wait must observe Stop/deadline; it must not open supplied pathnames. The
+/// supervisor records the attempt before calling writer: release is delivered
+/// once after exact ReleaseWrite or helper reap even when writer errors/panics
+/// after posting an actor hold. Release must safely retire an unacknowledged hold.
 pub(crate) trait Admission {
     fn lock(&mut self, target: &str, destination: &DestinationPin, lock: &FileKey) -> Result<()>;
     fn writer(
@@ -51,6 +54,7 @@ struct State<A: Admission> {
     lock: Option<(String, FileKey)>,
     next_write: u64,
     held: Option<Held>,
+    attempted: Option<(u64, WriteKind)>,
     result: String,
     terminal: Option<Result<()>>,
 }
@@ -64,6 +68,7 @@ impl<A: Admission> State<A> {
             lock: None,
             next_write: 1,
             held: None,
+            attempted: None,
             result: String::with_capacity(RESULT_BYTES),
             terminal: None,
         }
@@ -121,7 +126,9 @@ impl<A: Admission> State<A> {
                 ..
             } => {
                 ensure!(
-                    sequence.0 == self.next_write && self.held.is_none(),
+                    sequence.0 == self.next_write
+                        && self.held.is_none()
+                        && self.attempted.is_none(),
                     "nested or stale migration writer request"
                 );
                 digest(&target_token)?;
@@ -137,6 +144,9 @@ impl<A: Admission> State<A> {
                         "bootstrap after catalog lock admission"
                     ),
                 }
+                // The callback can post an actor hold before its acknowledgement
+                // fails. Own that attempted hold before entering caller code.
+                self.attempted = Some((sequence.0, write));
                 let writers = self.admission.writer(
                     sequence.0,
                     write,
@@ -145,17 +155,11 @@ impl<A: Admission> State<A> {
                     stop,
                     until,
                 )?;
-                let permit = match writers.enter_cancellable(
+                let permit = writers.enter_cancellable(
                     Priority::Background,
                     stop.admission(),
                     Some(until),
-                ) {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        self.admission.release(sequence.0, write);
-                        return Err(error);
-                    }
-                };
+                )?;
                 // Retain before enqueueing Grant. Lost/blocked output is an
                 // uncertain grant, resolved only by exact release or actual reap.
                 self.held = Some(Held {
@@ -211,8 +215,8 @@ impl<A: Admission> State<A> {
                 ..
             } => {
                 ensure!(
-                    self.held.is_none(),
-                    "helper finished with an unreleased writer"
+                    self.held.is_none() && self.attempted.is_none(),
+                    "helper finished with an unreleased writer/admission"
                 );
                 digest(&result_blake3)?;
                 ensure!(
@@ -231,13 +235,10 @@ impl<A: Admission> State<A> {
         Ok(None)
     }
     fn release(&mut self) {
-        if let Some(Held {
-            sequence,
-            kind,
-            permit,
-        }) = self.held.take()
-        {
+        if let Some(Held { permit, .. }) = self.held.take() {
             drop(permit);
+        }
+        if let Some((sequence, kind)) = self.attempted.take() {
             self.admission.release(sequence, kind);
         }
     }

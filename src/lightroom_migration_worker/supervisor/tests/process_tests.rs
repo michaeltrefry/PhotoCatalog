@@ -112,6 +112,8 @@ struct Parent {
     contender: File,
     needs: mpsc::Sender<u64>,
     released: Arc<Mutex<Vec<(u64, bool)>>>,
+    actor_held: Arc<AtomicBool>,
+    fail_admission: Option<bool>,
 }
 impl Admission for Parent {
     fn lock(&mut self, _: &str, destination: &DestinationPin, _: &FileKey) -> Result<()> {
@@ -130,7 +132,12 @@ impl Admission for Parent {
         _: &Stop,
         _: Instant,
     ) -> Result<Arc<Writers>> {
+        self.actor_held.store(true, Ordering::Release);
         self.needs.send(sequence)?;
+        if let Some(panic) = self.fail_admission {
+            assert!(!panic, "synthetic acknowledgement panic after actor hold");
+            anyhow::bail!("synthetic acknowledgement lost after actor hold");
+        }
         Ok(self.writers.clone())
     }
     fn release(&mut self, sequence: u64, _: WriteKind) {
@@ -139,6 +146,7 @@ impl Admission for Parent {
             FileExt::unlock(&self.contender).unwrap();
         }
         self.released.lock().unwrap().push((sequence, unlocked));
+        self.actor_held.store(false, Ordering::Release);
     }
     fn progress(&mut self, _: &str, _: u64, _: Option<u64>) -> Result<()> {
         Ok(())
@@ -162,6 +170,8 @@ fn setup() -> Result<(tempfile::TempDir, Catalog, Parent, mpsc::Receiver<u64>)> 
         contender,
         needs,
         released: Arc::new(Mutex::new(Vec::new())),
+        actor_held: Arc::new(AtomicBool::new(false)),
+        fail_admission: None,
     };
     Ok((temp, catalog, parent, receiver))
 }
@@ -271,5 +281,56 @@ fn cancel_while_parent_writer_held_reaps_without_waiting_for_that_writer() -> Re
     // This release occurs after join: cancel could not have depended on it.
     drop(held);
     let _next = catalog.writers.enter(Priority::Background)?;
+    Ok(())
+}
+
+#[test]
+fn failed_or_panicked_actor_acknowledgement_retires_hold_after_actual_reap() -> Result<()> {
+    for panic in [false, true] {
+        let (_temp, catalog, mut parent, _needs) = setup()?;
+        parent.fail_admission = Some(panic);
+        let actor_held = parent.actor_held.clone();
+        let released = parent.released.clone();
+        let request = serde_json::to_string(&parent.root)?;
+        let mut pid = None;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_owned(
+                |stop| {
+                    let process = Process::spawn_test_command(command("normal")?, stop)?;
+                    pid = Some(process.pid());
+                    Ok(process)
+                },
+                guard(),
+                &request,
+                Arc::new(Stop::default()),
+                Instant::now() + Duration::from_secs(20),
+                parent,
+            )
+        }));
+        if panic {
+            assert!(outcome.is_err());
+        } else {
+            assert!(outcome.unwrap().is_err());
+        }
+        assert!(!actor_held.load(Ordering::Acquire));
+        // The callback can acquire the physical lock only after the helper has
+        // exited; no GrantWrite was sent, so its SQL table must not exist.
+        assert_eq!(*released.lock().unwrap(), [(1, true)]);
+        assert!(
+            catalog
+                .db
+                .prepare("SELECT * FROM lm_owned_process_probe")
+                .is_err()
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(unsafe { libc::kill(pid.unwrap() as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        let _permit = catalog.writers.enter(Priority::Foreground)?;
+    }
     Ok(())
 }

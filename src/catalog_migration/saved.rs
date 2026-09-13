@@ -3,6 +3,8 @@
 //! Lists are live keyset pages, not a cross-request snapshot: explicit refresh
 //! discovers newly inserted earlier IDs. Documents return their exact bytes and
 //! digest; execution must independently revalidate its reviewed authority.
+//! The serialized SQL owner must exclusively own the connection and its progress
+//! callback for the call; do not nest this budget inside another SQL callback owner.
 use crate::{
     lightroom::bounded_json,
     lightroom::control::{Control, SqlControl},

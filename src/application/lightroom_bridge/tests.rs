@@ -433,6 +433,8 @@ fn uploads_envelopes_stale_guards_and_foreign_evidence_are_exact() {
         panic!()
     };
     assert_eq!(o.envelope_bytes, U64(ENVELOPE as u64));
+    assert_eq!(o.selection_preparation_chunk_bytes, U64(64 * 1024));
+    assert_eq!(o.selection_preparation_page_rows, U64(256));
     let stale = g(&s);
     read(&b, Query::Families {});
     assert!(
