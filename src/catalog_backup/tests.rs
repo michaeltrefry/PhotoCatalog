@@ -265,22 +265,11 @@ fn sqlite_verification_observes_cancel_and_vm_budget() -> Result<()> {
     let cancel = CancellationToken::default();
     let l = limits();
     let op = Operation::new(&l, &cancel, |_| Ok(()))?;
-    op.guard(&db)?;
-    let ticks = Arc::clone(&op.vm);
     let c = cancel.clone();
-    let done = Arc::new(AtomicBool::new(false));
-    let finished = Arc::clone(&done);
-    let thread = std::thread::spawn(move || {
-        while ticks.load(Ordering::Relaxed) == 0 && !finished.load(Ordering::Relaxed) {
-            std::thread::yield_now();
-        }
-        if !finished.load(Ordering::Relaxed) {
-            c.cancel();
-        }
-    });
+    // Cancel from the first actual SQLite progress callback. A competing OS
+    // thread can miss an integrity check that finishes before it is scheduled.
+    op.guard_observed(&db, move || c.cancel())?;
     let result = db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0));
-    done.store(true, Ordering::Relaxed);
-    thread.join().unwrap();
     assert!(cancel.is_cancelled());
     assert!(result.is_err());
     let l = Limits {

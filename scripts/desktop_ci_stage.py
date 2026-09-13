@@ -8,6 +8,7 @@ compiler directory. Unknown imports fail before installer qualification.
 """
 import argparse
 import hashlib
+import mmap
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,37 @@ import subprocess
 
 import collect_desktop_notices as notices
 import package_desktop as p
+
+
+def expected_bundled_executable(executable, platform):
+    """Hash only the pinned Tauri 2.11.4 first-token patch, without changing input.
+
+    Upstream crates/tauri-bundler/src/bundle.rs::patch_binary replaces the first
+    UNK marker with DEB or NSS before copying the executable into its installer.
+    Every other byte remains part of the exact expected installed digest.
+    """
+    before = b'__TAURI_BUNDLE_TYPE_VAR_UNK'
+    after = {'linux': b'__TAURI_BUNDLE_TYPE_VAR_DEB',
+             'windows': b'__TAURI_BUNDLE_TYPE_VAR_NSS'}[platform]
+    digest = hashlib.sha256()
+    with open(executable, 'rb') as stream:
+        p.require(stream.seek(0, 2) > 0, 'empty staged executable')
+        stream.seek(0)
+        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as mapping:
+            offset = mapping.find(before)
+        p.require(offset >= 0, 'pinned Tauri bundle marker absent from staged executable')
+        position = 0
+        while block := stream.read(64 * 1024):
+            start = max(position, offset)
+            end = min(position + len(block), offset + len(before))
+            if start < end:
+                block = (block[:start-position] + after[start-offset:end-offset]
+                         + block[end-position:])
+            digest.update(block)
+            position += len(block)
+    return {'bundled_executable_sha256': digest.hexdigest(),
+            'bundle_patch': {'offset': offset, 'before': before.decode(),
+                             'after': after.decode(), 'tauri_cli': '2.11.4'}}
 
 WINDOWS_SYSTEM = set(('kernel32 ntdll user32 gdi32 advapi32 ole32 oleaut32 shell32 shlwapi '
     'comdlg32 comctl32 crypt32 secur32 ws2_32 iphlpapi userenv version winmm winspool '
@@ -231,6 +263,7 @@ def main():
     manifest = native_notices(args.platform, args, native, provenance, output/'native-notices')
     p.write_json(output/'policy.json', policy)
     p.write_json(output/'stage.json', {'platform': args.platform, 'executable_sha256': p.sha256(executable),
+        **expected_bundled_executable(executable, args.platform),
         'native': {f.name: p.sha256(f) for f in native.iterdir()}, 'depends': depends,
         'native_notice_input': str(manifest), 'provenance': provenance})
 

@@ -45,7 +45,8 @@ def bundle_config(platform, stage, notices):
 def verify_staged_payload(platform, installed, executable, stage):
     record = p.json_file(stage/'stage.json')
     p.require(record['platform'] == platform, 'staged platform mismatch')
-    p.require(p.sha256(executable) == record['executable_sha256'], 'installer changed staged executable')
+    expected = record.get('bundled_executable_sha256', record['executable_sha256'])
+    p.require(p.sha256(executable) == expected, 'installer changed staged executable beyond the pinned bundle-type patch')
     native = installed/'usr/lib/photocatalog-desktop/native' if platform == 'linux' else installed
     for name, checksum in record['native'].items():
         p.require(Path(name).name == name, 'staged native name is not local')

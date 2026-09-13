@@ -25,12 +25,22 @@ and Tauri implement the first grid/editor integration; PhotoCatalog remains the
 working name. Actual filesystem folders across all years share one catalog.
 The UI-independent Rust application actor owns typed bounded commands, precise
 paths/revisions, foreground priority, preview scheduling and worker lifecycle.
-Draft PR #16 is open at `27860290ce5e00d55fa83fcaa80fb1b08909574d` on the
+Draft PR #16 is open at `e762c1d70160e7e3e61ff7857093bab4e499ad62` on the
 PUBLIC repository. Run `34751855171` finished: contracts passed; Linux failed
 late JPEG XL discovery after Python setup replaced PKG_CONFIG_PATH; Windows failed
 notice collection; macOS package/installed-worker checks passed but evidence upload
 failed. Linux environment repair `d242842` is local; remaining platform failures are
-being repaired without adding CI lanes. Local import `557c0ff` is integrated as
+repaired by `be54877` integrated as `e762c1d`, with 37 Python tests and independent review.
+Run `34754042585` finished with contracts passing and three platform failures:
+macOS exposed a scheduling race in the backup cancellation test; Linux and Windows
+reached installed payload verification, which rejected Tauri's package marker patch.
+Captured installer bytes on both platforms prove the only change is the pinned
+first marker UNK→DEB/NSS. The local repair predicts that exact whole-file digest
+before bundling and still rejects every unrelated byte change. Eleven staging
+tests, the deterministic SQLite cancellation regression, strict Clippy and independent
+source review pass. Private evidence is `sc-22847-ci-marker-backup-gate-v2` and
+`sc-22847-ci-34754042585`; repaired hosted acceptance remains pending.
+Local import `557c0ff` is integrated as
 `eebc6e5` after 85 focused tests, strict Clippy and independent source review.
 Root backup dispatch/UI, search/import controls and loading feedback `6e21ff0`
 passed 24 native bridge/actor tests, strict Clippy, Tauri check, frontend build and
@@ -49,18 +59,25 @@ variant-specific pixels, translated import recipe history, retained metadata/XMP
 missing originals, held-reader cancellation and seven crash cases. Exact v4 source
 review passed independently. Preparation reads one selected original at a time;
 its result establishes physical readiness without replacing recipes or paths.
-Root integrated bridge tests now pass; final organization/Clippy gates and the new
-Mac package are in progress. Actual RAW GUI validation is still pending; the Mac
+Root integrated 14 bridge + 9 organization tests and strict Clippy pass. Mac v3
+package at e762c1d passes frontend22/build, Tauri build, dependency closure and
+installed preview/export worker checks. Actual RAW GUI validation is still pending; the Mac
 was locked when Computer Use attempted it, and the user has an unlock request.
 
 Schema11 durable zero-position collection projection `97e0394` is integrated as
 `01af9b4`: 50 focused tests plus query-counter fixture and strict Clippy passed;
 independent review verified all source/log hashes. Bounded persistent initialization
 prevents a full membership scan before a positive-only first page. Root dispatcher
-and bounded single-collection lookup are under integrated gates and passed source
+and bounded single-collection lookup passed integrated gates and source
 review. Organization UI review identified transient-indexing unmount and false
-end-of-page on errors; both are being repaired before integration. Older recorded
+end-of-page on errors; both are repaired in `5ab1560`, integrated as `77b58c0`, and independently
+re-reviewed PASS with all 11 source files matching root exactly. Older recorded
 drive paths still need the planned relink UI; no path rewrite was performed.
+
+Compatibility badges now distinguish translated, retained-only and untranslated
+Lightroom settings without asserting Adobe appearance equivalence (`72b0e41`).
+Metadata/XMP inspection and source-fenced relink review/apply/undo are actively
+being qualified in isolated slices; they are not installed-app acceptance yet.
 
 The first grid/editor checkpoint remains incomplete: full organization, conflicts,
 Lightroom migration/reconciliation, import/export, relink, backup/restore, settings,

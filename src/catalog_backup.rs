@@ -190,6 +190,13 @@ impl<'a, F: FnMut(Progress) -> Result<()>> Operation<'a, F> {
         Ok(())
     }
     fn guard(&self, db: &Connection) -> Result<()> {
+        self.guard_observed(db, || {})
+    }
+    fn guard_observed(
+        &self,
+        db: &Connection,
+        mut observed: impl FnMut() + Send + 'static,
+    ) -> Result<()> {
         let cancel = self.cancel.clone();
         let vm = Arc::clone(&self.vm);
         let limit = self.limits.verification_vm_steps;
@@ -198,6 +205,7 @@ impl<'a, F: FnMut(Progress) -> Result<()>> Operation<'a, F> {
         db.progress_handler(
             1000,
             Some(move || {
+                observed();
                 cancel.is_cancelled()
                     || vm.fetch_add(1000, Ordering::Relaxed) >= limit
                     || started.elapsed() >= Duration::from_secs(seconds)

@@ -12,6 +12,33 @@ import package_desktop as p
 
 
 class StageTests(unittest.TestCase):
+    def test_pinned_tauri_patch_is_exact_and_handles_chunk_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); exe = root/'app'; marker = b'__TAURI_BUNDLE_TYPE_VAR_UNK'
+            # The first marker crosses a streaming hash boundary; a later copy
+            # must remain unchanged, matching upstream's first-match behavior.
+            original = b'x'*(65536-7) + marker + b'tail' + marker
+            exe.write_bytes(original)
+            for platform, suffix in [('linux', b'DEB'), ('windows', b'NSS')]:
+                proof = stage.expected_bundled_executable(exe, platform)
+                expected = original.replace(marker, marker[:-3] + suffix, 1)
+                self.assertEqual(proof['bundled_executable_sha256'], notices.digest(expected))
+                self.assertEqual(exe.read_bytes(), original)
+                installed = root/'installed'; installed.mkdir(exist_ok=True)
+                output = installed/'app'; output.write_bytes(expected)
+                if platform == 'linux':
+                    (installed/'usr/lib/photocatalog-desktop/native').mkdir(parents=True, exist_ok=True)
+                (root/'stage.json').write_text(json.dumps({'platform': platform,
+                    'executable_sha256': p.sha256(exe), **proof, 'native': {}}))
+                package.verify_staged_payload(platform, installed, output, root)
+                for bad in (original, expected[:-1]+b'!', expected.replace(marker, marker[:-3]+suffix)):
+                    output.write_bytes(bad)
+                    with self.assertRaisesRegex(p.PackageError, 'changed staged executable'):
+                        package.verify_staged_payload(platform, installed, output, root)
+            exe.write_bytes(b'no marker')
+            with self.assertRaisesRegex(p.PackageError, 'marker absent'):
+                stage.expected_bundled_executable(exe, 'linux')
+
     def test_windows_notices_follow_installed_ports_not_generic_share_directories(self):
         from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as tmp:
