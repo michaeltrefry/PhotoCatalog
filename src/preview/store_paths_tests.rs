@@ -81,8 +81,11 @@ fn native_codec_is_exact_and_rejects_invalid_or_oversized_authority() -> Result<
     assert!(decode_path(ValueRef::Integer(1)).is_err());
     Ok(())
 }
-fn relocation_roundtrip(root: &Path, legacy: bool) -> Result<()> {
-    let cfg = config(root);
+fn relocation_roundtrip(root: &Path, manifest: Option<&Path>, legacy: bool) -> Result<()> {
+    let mut cfg = config(root);
+    if let Some(manifest) = manifest {
+        cfg.manifest_root = manifest.to_owned();
+    }
     let mut store = PreviewStore::open(cfg.clone(), &[])?;
     let key = key();
     store.desire(&key, || Ok(true))?;
@@ -162,7 +165,7 @@ fn relocation_roundtrip(root: &Path, legacy: bool) -> Result<()> {
 fn legacy_and_native_locations_resume_both_phases_without_losing_objects() -> Result<()> {
     for legacy in [true, false] {
         let root = tempfile::tempdir()?;
-        relocation_roundtrip(root.path(), legacy)?;
+        relocation_roundtrip(root.path(), None, legacy)?;
     }
     Ok(())
 }
@@ -190,7 +193,29 @@ fn physical_native_cache_paths_relocate_and_reopen() -> Result<()> {
         }
         return Err(error.into());
     }
-    relocation_roundtrip(&root, false)
+    // SQLite's Windows API rejects unpaired surrogates in its database filename.
+    // Keep that database representable while exercising actual native thumbnail,
+    // large-cache and relocation paths (including both restart phases).
+    let manifest = cfg!(windows).then(|| temp.path().join("manifest"));
+    relocation_roundtrip(&root, manifest.as_deref(), false)
+}
+
+#[cfg(windows)]
+#[test]
+fn unrepresentable_manifest_path_fails_before_creating_cache_roots() -> Result<()> {
+    use std::os::windows::ffi::OsStringExt;
+    let temp = tempfile::tempdir()?;
+    let root = temp
+        .path()
+        .join(std::ffi::OsString::from_wide(&[99, 0xd800]));
+    let error = PreviewStore::open(config(&root), &[]).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("manifest path must be valid Unicode")
+    );
+    assert!(!root.exists());
+    Ok(())
 }
 #[test]
 fn malformed_or_future_cache_authority_leaves_schema_and_rows_unchanged() -> Result<()> {

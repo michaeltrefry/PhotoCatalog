@@ -529,7 +529,9 @@ fn live_companion_replacement_invalidates_without_claiming_shm_cache_immutabilit
             panic!("unexpected rename failure: {error}");
             #[cfg(windows)]
             {
-                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                // ERROR_SHARING_VIOLATION (32) is Uncategorized in current Rust;
+                // check the native refusal, not its unstable broad category.
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
                 review.current(&review.summary.token).unwrap();
             }
         }

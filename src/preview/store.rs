@@ -279,6 +279,11 @@ impl PreviewStore {
             prospective(&config.thumbnail_root)?,
             prospective(&config.large_root)?,
         ];
+        #[cfg(windows)]
+        ensure!(
+            roots[0].to_str().is_some(),
+            "preview SQLite manifest path must be valid Unicode; choose another manifest directory"
+        );
         for source in original_roots {
             let source = prospective(source)?;
             for root in &roots {
