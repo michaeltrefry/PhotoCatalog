@@ -209,8 +209,32 @@ class PackagingTests(unittest.TestCase):
                  'Import {\n Name: KERNEL32.dll\n}\nDelayImport {\n Name: WebView2Loader.dll\n}\n')
         with patch.object(p, 'run', return_value=value) as tool:
             names, _, _ = p.pe_info('app.exe')
-        self.assertEqual(names, ['kernel32.dll', 'webview2loader.dll'])
+        self.assertEqual(names, ['KERNEL32.dll', 'WebView2Loader.dll'])
         self.assertEqual(tool.call_args.args, ('llvm-readobj', '--file-headers', '--coff-imports', 'app.exe'))
+
+    def test_pe_all_import_names_preserved_and_missing_non_dll_fails(self):
+        self.file('bin/app.exe')
+        policy = self.policy('windows')
+        manifest = self.manifest()
+        for block, name in [('Import', 'HOST.EXE'), ('DelayImport', 'codec.plugin'),
+                            ('Import', 'extensionless'), ('DelayImport', 'trailing.dll ')]:
+            with self.subTest(block=block, name=name):
+                value = ('ImageFileHeader {\n Machine: IMAGE_FILE_MACHINE_AMD64 (0x8664)\n}\n'
+                         f'{block} {{\n Name: {name}\n'
+                         ' Import {\n Symbol: nested_symbol (0)\n Address: 0x0\n }\n}\n')
+                with patch.object(p, 'run', return_value=value):
+                    self.assertEqual(p.pe_info('app.exe')[0], [name])
+                    with self.assertRaisesRegex(p.PackageError, 'unresolved dependency'):
+                        p.audit_package('windows', self.root, 'bin/app.exe', policy, manifest)
+
+    def test_pe_import_name_cannot_disappear_in_malformed_block(self):
+        header = 'ImageFileHeader {\n Machine: IMAGE_FILE_MACHINE_AMD64 (0x8664)\n}\n'
+        for tail in ['Import {\n}\n', 'DelayImport {\n Name: \n}\n',
+                     'Import {\n Name: a.dll\n Name: b.dll\n}\n',
+                     'Import {\n Name: a.dll\n']:
+            with self.subTest(tail=tail), patch.object(p, 'run', return_value=header + tail):
+                with self.assertRaises(p.PackageError):
+                    p.pe_info('app.exe')
 
     def test_linux_installed_origin_closure_with_explicit_system_contract(self):
         exe = self.file('bin/app')

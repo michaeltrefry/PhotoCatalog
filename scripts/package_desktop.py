@@ -260,10 +260,30 @@ def elf_info(path):
 def pe_info(path):
     # LLVM's COFFImports dump includes both Import and DelayImport blocks.
     output = run('llvm-readobj', '--file-headers', '--coff-imports', path)
-    needed = re.findall(r'^\s*Name: (.+\.dll)\s*$', output, re.M | re.I)
+    needed, depth, importing, name = [], 0, False, None
+    for line in output.splitlines():
+        opening = re.fullmatch(r'\s*(\w+) \{', line)
+        if opening:
+            if depth == 0:
+                importing = opening[1] in {'Import', 'DelayImport'}
+                name = None
+            depth += 1
+        elif re.fullmatch(r'\s*}', line):
+            require(depth > 0, 'unbalanced PE inspection block')
+            depth -= 1
+            if depth == 0 and importing:
+                require(name is not None and name != '', 'PE import block lacks a name')
+                needed.append(name)
+                importing = False
+        elif importing and depth == 1:
+            match = re.fullmatch(r'\s*Name: (.*)', line)
+            if match:
+                require(name is None, 'duplicate PE import name')
+                name = match[1]  # Preserve spelling and whitespace; no suffix filter or strip.
+    require(depth == 0, 'unterminated PE inspection block')
     machine = re.search(r'^\s*Machine: (.+)$', output, re.M)
     require(machine is not None, f'PE machine missing: {path}')
-    return list(dict.fromkeys(n.lower() for n in needed)), [], machine[1]
+    return list(dict.fromkeys(needed)), [], machine[1]
 
 
 def audit_package(platform, root, executable, policy_path, manifest):
@@ -307,13 +327,14 @@ def audit_package(platform, root, executable, policy_path, manifest):
             directories = search
         edges = []
         for name in needed:
+            lookup = name.lower() if platform == 'windows' else name
             require(Path(name).name == name and '/' not in name and '\\' not in name, 'nonlocal dependency name')
             matches = set()
             for directory in directories:
                 if not directory.is_dir():
                     continue
                 for candidate in directory.iterdir():
-                    equal = candidate.name == name if platform == 'linux' else candidate.name.lower() == name
+                    equal = candidate.name == name if platform == 'linux' else candidate.name.lower() == lookup
                     if equal and candidate.is_file():
                         require(inside(candidate, root), 'library symlink escapes package')
                         matches.add(candidate.resolve())
@@ -323,8 +344,8 @@ def audit_package(platform, root, executable, policy_path, manifest):
                 edges.append(str(target.relative_to(root)))
                 queue.append(target)
             else:
-                require(name in system, f'unresolved dependency (no installed loader path): {name} from {path}')
-                used_system[name] = system[name]
+                require(lookup in system, f'unresolved dependency (no installed loader path): {name} from {path}')
+                used_system[name] = system[lookup]
         records.append({'path': str(path.relative_to(root)), 'sha256': sha256(path), 'dependencies': edges})
     libraries = [p.name for p in seen if p != executable]
     notice_records = notices(manifest, libraries)
