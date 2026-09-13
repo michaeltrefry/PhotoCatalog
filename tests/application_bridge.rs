@@ -514,3 +514,65 @@ fn app_cache_parent_is_namespaced_by_catalog_and_reused_on_reopen() -> Result<()
     assert_eq!(names()?, before);
     Ok(())
 }
+
+#[test]
+fn opaque_image_cursors_support_back_forward_and_reject_stale_epoch() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    for n in 0..4 {
+        image::RgbImage::from_pixel(8, 8, image::Rgb([20u8 + n, 40, 70]))
+            .save(originals.join(format!("{n}.png")))?;
+    }
+    let root = temp.path().join("catalog");
+    let mut c = Catalog::open(&root)?;
+    c.import(&originals, None, |_| Ok(()))?;
+    drop(c);
+    let b = Bridge::spawn(config(&originals))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    let page = |cursor: Option<String>| -> Result<(GridImage, Option<String>)> {
+        let Response::Images { mut rows, next, .. } = call(
+            &b,
+            Request::Images {
+                catalog: token.clone(),
+                folder: None,
+                recursive: false,
+                text: None,
+                cursor,
+                limit: 1,
+            },
+        )?
+        else {
+            bail!("wrong page")
+        };
+        ensure!(rows.len() == 1, "missing page row");
+        Ok((rows.remove(0), next))
+    };
+    let (first, cursor1) = page(None)?;
+    let (second, cursor2) = page(cursor1.clone())?;
+    let (third, _) = page(cursor2.clone())?;
+    assert_ne!(first.image_id, second.image_id);
+    assert_ne!(second.image_id, third.image_id);
+    assert_eq!(page(cursor1.clone())?.0.image_id, second.image_id);
+    assert_eq!(page(cursor2)?.0.image_id, third.image_id);
+    call(
+        &b,
+        Request::Cull {
+            catalog: token.clone(),
+            key: first.key,
+            expected_revision: first.metadata_revision,
+            operation: CullOperation::Rating(4),
+        },
+    )?;
+    wait_ready(&b)?;
+    assert!(page(cursor1).is_err());
+    b.shutdown();
+    Ok(())
+}

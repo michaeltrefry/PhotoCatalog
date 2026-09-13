@@ -184,3 +184,109 @@ fn compact_search_omits_huge_provenance_and_preserves_bounds_and_cursor() -> Res
     );
     Ok(())
 }
+
+#[test]
+fn released_viewports_do_not_accumulate_and_stale_release_preserves_new_generation() {
+    let b = disconnected();
+    b.0.shared.queue.lock().unwrap().status.catalog = Some("catalog".into());
+    for i in 0..200 {
+        let viewport = format!("cell{i}");
+        let mut r = preview_request(1, "asset");
+        if let Request::Preview { viewport: v, .. } = &mut r {
+            *v = viewport.clone();
+        }
+        let pending = b.submit(r).unwrap();
+        let released = b
+            .submit(Request::ReleaseViewport {
+                catalog: "catalog".into(),
+                viewport,
+                generation: U64(1),
+            })
+            .unwrap()
+            .recv();
+        assert!(matches!(
+            released,
+            Reply::Ok {
+                value: Response::Status(_)
+            }
+        ));
+        assert!(matches!(
+            pending.recv(),
+            Reply::Error {
+                error: BridgeError {
+                    code: ErrorCode::Superseded,
+                    ..
+                }
+            }
+        ));
+        let q = b.0.shared.queue.lock().unwrap();
+        assert!(q.viewport.is_empty());
+        assert!(q.pending.is_empty());
+    }
+    let _new = b.submit(preview_request(3, "new")).unwrap();
+    b.0.shared.queue.lock().unwrap().ticket_foreground.insert(
+        ("catalog".into(), "ready".into()),
+        TicketPriority {
+            foreground: false,
+            viewport: "grid".into(),
+            generation: 3,
+        },
+    );
+    let bytes = b
+        .preview_bytes("catalog".into(), "ready".into(), false)
+        .unwrap();
+    b.submit(Request::ReleaseViewport {
+        catalog: "catalog".into(),
+        viewport: "grid".into(),
+        generation: U64(2),
+    })
+    .unwrap()
+    .recv();
+    {
+        let q = b.0.shared.queue.lock().unwrap();
+        assert_eq!(q.viewport.get(&("catalog".into(), "grid".into())), Some(&3));
+        assert_eq!(q.pending.len(), 2);
+    }
+    b.submit(Request::ReleaseViewport {
+        catalog: "catalog".into(),
+        viewport: "grid".into(),
+        generation: U64(3),
+    })
+    .unwrap()
+    .recv();
+    assert!(matches!(
+        bytes.recv(),
+        Err(BridgeError {
+            code: ErrorCode::Superseded,
+            ..
+        })
+    ));
+    assert!(
+        b.0.shared
+            .queue
+            .lock()
+            .unwrap()
+            .ticket_foreground
+            .is_empty()
+    );
+}
+
+#[test]
+fn opaque_cursor_preserves_large_integers_and_rejects_noncanonical_or_wrong_session() {
+    let c = Cursor {
+        version: 1,
+        query_hash: "hash".into(),
+        epoch: i64::MAX,
+        high_water: i64::MAX,
+        sequence: i64::MAX - 1,
+        key: crate::organization_search::Key::Integer(i64::MAX - 1),
+    };
+    let s = encode_cursor("session", &c).unwrap();
+    let decoded = decode_cursor(&s, "session").unwrap();
+    assert_eq!(decoded.sequence, c.sequence);
+    assert!(decode_cursor(&s, "other").is_err());
+    assert!(decode_cursor(&format!(" {s}"), "session").is_err());
+    assert!(decode_cursor(&"x".repeat(CURSOR_BYTES + 1), "session").is_err());
+    let altered = s.replace("\"version\":1", "\"unexpected\":true,\"version\":1");
+    assert!(decode_cursor(&altered, "session").is_err());
+}

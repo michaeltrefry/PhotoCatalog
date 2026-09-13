@@ -120,6 +120,11 @@ pub enum Request {
         catalog: String,
         ticket: String,
     },
+    ReleaseViewport {
+        catalog: String,
+        viewport: String,
+        generation: U64,
+    },
     CancelPreview {
         catalog: String,
         ticket: String,

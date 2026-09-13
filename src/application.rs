@@ -22,6 +22,47 @@ use std::{
     time::{Duration, Instant},
 };
 
+const CURSOR_BYTES: usize = 32 * 1024;
+
+// The renderer treats this entire string as opaque, so nested i64 JSON never
+// crosses the JavaScript number boundary. Canonical encoding rejects extra fields.
+fn encode_cursor(session: &str, cursor: &Cursor) -> std::result::Result<String, BridgeError> {
+    let token = serde_json::to_string(&(session, cursor)).map_err(|e| native(e.into()))?;
+    if token.len() > CURSOR_BYTES {
+        return Err(error(ErrorCode::ResourceLimit, "search cursor byte limit"));
+    }
+    Ok(token)
+}
+fn decode_cursor(token: &str, session: &str) -> std::result::Result<Cursor, BridgeError> {
+    if token.len() > CURSOR_BYTES {
+        return Err(error(ErrorCode::ResourceLimit, "search cursor byte limit"));
+    }
+    let (owner, cursor): (String, Cursor) = serde_json::from_str(token).map_err(|e| {
+        error(
+            ErrorCode::InvalidRequest,
+            format!("invalid search cursor: {e}"),
+        )
+    })?;
+    if owner != session {
+        return Err(error(
+            ErrorCode::StaleSession,
+            "search cursor belongs to another session",
+        ));
+    }
+    if encode_cursor(session, &cursor)? != token
+        || cursor.epoch < 0
+        || cursor.high_water < 0
+        || cursor.sequence <= 0
+        || cursor.sequence > cursor.high_water
+    {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "invalid search cursor encoding or range",
+        ));
+    }
+    Ok(cursor)
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub worker_executable: PathBuf,
@@ -42,7 +83,6 @@ pub struct Limits {
     pub scan_rows: usize,
     pub page_bytes: usize,
     pub tickets: usize,
-    pub cursors: usize,
     pub ttl_seconds: u64,
     pub binary_bytes: usize,
 }
@@ -56,7 +96,6 @@ impl Default for Limits {
             scan_rows: 512,
             page_bytes: 128 * 1024,
             tickets: 128,
-            cursors: 16,
             ttl_seconds: 60,
             binary_bytes: 16 * 1024 * 1024,
         }
@@ -66,9 +105,7 @@ impl Config {
     fn validate(&self) -> Result<()> {
         let l = &self.limits;
         ensure!(
-            (1..=256).contains(&l.queued)
-                && (1..=256).contains(&l.tickets)
-                && (1..=64).contains(&l.cursors),
+            (1..=256).contains(&l.queued) && (1..=256).contains(&l.tickets),
             "descriptor limits"
         );
         ensure!(
@@ -318,7 +355,58 @@ impl Bridge {
         if q.stopping {
             return Err(error(ErrorCode::Closed, "catalog owner closed"));
         }
-        if matches!(request, Request::Status) {
+        if let Request::ReleaseViewport {
+            catalog,
+            viewport,
+            generation,
+        } = &request
+        {
+            if viewport.len() > 128 {
+                return Err(error(ErrorCode::InvalidRequest, "viewport identity length"));
+            }
+            if q.status.catalog.as_ref() != Some(catalog) {
+                return Err(error(ErrorCode::StaleSession, "catalog session changed"));
+            }
+            if q.viewport.get(&(catalog.clone(), viewport.clone())) == Some(&generation.0) {
+                q.viewport.remove(&(catalog.clone(), viewport.clone()));
+                let mut keep = VecDeque::new();
+                while let Some(old) = q.pending.pop_front() {
+                    let released = match &old.work {
+                        Work::Command(
+                            Request::Preview {
+                                catalog: c,
+                                viewport: v,
+                                generation: g,
+                                ..
+                            },
+                            _,
+                        ) => c == catalog && v == viewport && g == generation,
+                        Work::Bytes {
+                            catalog: c, ticket, ..
+                        } => {
+                            c == catalog
+                                && q.ticket_foreground
+                                    .get(&(c.clone(), ticket.clone()))
+                                    .is_some_and(|t| {
+                                        t.viewport == *viewport && t.generation == generation.0
+                                    })
+                        }
+                        _ => false,
+                    };
+                    if released {
+                        old.reject(ErrorCode::Superseded, "viewport released");
+                    } else {
+                        keep.push_back(old);
+                    }
+                }
+                q.pending = keep;
+                q.ticket_foreground.retain(|(c, _), t| {
+                    c != catalog || t.viewport != *viewport || t.generation != generation.0
+                });
+            }
+            self.0.shared.wake.notify_one();
+        }
+        if matches!(request, Request::Status | Request::ReleaseViewport { .. }) {
             let mut s = q.status.clone();
             s.pending_commands = q.pending.len() as u32;
             s.cancel_requested = q
@@ -346,7 +434,9 @@ impl Bridge {
                         "viewport generation already superseded",
                     ));
                 }
-                if !q.viewport.contains_key(&key) && q.viewport.len() >= 32 {
+                if !q.viewport.contains_key(&key)
+                    && q.viewport.len() >= self.0.shared.limits.tickets
+                {
                     return Err(error(ErrorCode::ResourceLimit, "viewport count limit"));
                 }
             }
@@ -488,7 +578,6 @@ struct Open {
     token: String,
     catalog: Catalog,
     service: PreviewService,
-    cursors: HashMap<String, (Cursor, Instant)>,
     tickets: HashMap<String, Ticket>,
     index_pending: bool,
     jobs_held: bool,
@@ -732,7 +821,6 @@ impl Actor {
                 token: uuid::Uuid::new_v4().to_string(),
                 catalog,
                 service,
-                cursors: HashMap::new(),
                 tickets: HashMap::new(),
                 index_pending: true,
                 jobs_held,
@@ -785,7 +873,9 @@ impl Actor {
         match r {
             Request::OpenExisting { path } => self.open_path(path, false, cancel),
             Request::Create { path } => self.open_path(path, true, cancel),
-            Request::Status => Ok(Response::Status(self.status())),
+            Request::Status | Request::ReleaseViewport { .. } => {
+                Ok(Response::Status(self.status()))
+            }
             Request::Close { catalog } => {
                 self.current(&catalog)?;
                 self.close();
@@ -834,17 +924,10 @@ impl Actor {
                     return Err(error(ErrorCode::InvalidRequest, "search text limit"));
                 }
                 let o = self.current(&catalog)?;
-                let old = if let Some(token) = &cursor {
-                    Some(
-                        o.cursors
-                            .get(token)
-                            .ok_or_else(|| error(ErrorCode::StaleSession, "search cursor expired"))?
-                            .0
-                            .clone(),
-                    )
-                } else {
-                    None
-                };
+                let old = cursor
+                    .as_deref()
+                    .map(|token| decode_cursor(token, &catalog))
+                    .transpose()?;
                 let q = Query {
                     include_variants: true,
                     folder: folder.map(|v| v.0),
@@ -859,19 +942,11 @@ impl Actor {
                     limits.scan_rows,
                     limits.page_bytes
                 ));
-                if let Some(token) = cursor {
-                    o.cursors.remove(&token);
-                }
-                let next = if let Some(c) = p.next {
-                    if o.cursors.len() >= limits.cursors {
-                        return Err(error(ErrorCode::ResourceLimit, "search cursor count"));
-                    }
-                    let token = uuid::Uuid::new_v4().to_string();
-                    o.cursors.insert(token.clone(), (c, Instant::now()));
-                    Some(token)
-                } else {
-                    None
-                };
+                let next = p
+                    .next
+                    .as_ref()
+                    .map(|c| encode_cursor(&catalog, c))
+                    .transpose()?;
                 Ok(Response::Images {
                     rows: p
                         .rows
@@ -1048,6 +1123,7 @@ impl Actor {
                 generation,
                 foreground,
             } => {
+                let shared = Arc::clone(&self.shared);
                 let o = self.current(&catalog)?;
                 if o.tickets.len() >= limits.tickets {
                     return Err(error(ErrorCode::ResourceLimit, "preview ticket count"));
@@ -1087,6 +1163,16 @@ impl Actor {
                         Err(e) => (PreviewState::Failed, None, Some(format!("{e:#}"))),
                     }
                 };
+                let mut queue = shared.queue.lock().unwrap();
+                if queue.viewport.get(&(catalog.clone(), viewport.clone())) != Some(&generation.0) {
+                    if let Some(c) = consumer {
+                        core!(o.service.cancel(c));
+                    }
+                    return Err(error(
+                        ErrorCode::Superseded,
+                        "viewport released during preview admission",
+                    ));
+                }
                 let id = uuid::Uuid::new_v4().to_string();
                 let dto = PreviewStatus {
                     ticket: id.clone(),
@@ -1110,7 +1196,7 @@ impl Actor {
                         cancel: cancel.clone(),
                     },
                 );
-                self.shared.queue.lock().unwrap().ticket_foreground.insert(
+                queue.ticket_foreground.insert(
                     (catalog, id),
                     TicketPriority {
                         foreground,
@@ -1176,7 +1262,17 @@ impl Actor {
             .map_err(native)?
             .ok_or_else(|| error(ErrorCode::Native, "current preview no longer cached"))?;
         let after = o.catalog.edit_render_identity(&t.dto.key).map_err(native)?;
-        if !identity_equal(&before, &after) || cancel.is_canceled() {
+        let live = {
+            let queue = shared.queue.lock().unwrap();
+            queue
+                .viewport
+                .get(&(token.to_owned(), t.dto.viewport.clone()))
+                == Some(&t.dto.generation.0)
+                && queue
+                    .ticket_foreground
+                    .contains_key(&(token.to_owned(), id.to_owned()))
+        };
+        if !identity_equal(&before, &after) || cancel.is_canceled() || !live {
             return Err(error(
                 ErrorCode::Canceled,
                 "preview changed or delivery canceled",
@@ -1218,12 +1314,18 @@ impl Actor {
                 q.pending.iter().any(|e| e.priority() <= 2),
             )
         };
-        o.cursors.retain(|_, (_, at)| at.elapsed() < ttl);
         let mut expired = Vec::new();
         for (id, t) in &mut o.tickets {
             let obsolete = viewport
                 .get(&(o.token.clone(), t.dto.viewport.clone()))
-                .is_some_and(|g| *g > t.dto.generation.0);
+                .is_none_or(|g| *g != t.dto.generation.0)
+                || !self
+                    .shared
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .ticket_foreground
+                    .contains_key(&(o.token.clone(), id.clone()));
             if obsolete || t.cancel.is_canceled() || t.touched.elapsed() > ttl {
                 if let Some(c) = t.consumer.take() {
                     let _ = o.service.cancel(c);
