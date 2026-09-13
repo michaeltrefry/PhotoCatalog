@@ -158,12 +158,23 @@ fn non_utf_parent_and_filename_publish_capture_and_restore_idempotently() -> any
     fs::write(&second, b"captured")?;
     let plan = plan_export(&second, b"never publish")?;
     let receipt = apply_export_with_hook(&plan, b"never publish", |boundary| {
-        if boundary == ExportBoundary::Captured {
-            Err(std::io::Error::other("stop after capture"))
+        if matches!(
+            boundary,
+            ExportBoundary::Captured | ExportBoundary::BeforeRestore
+        ) {
+            Err(std::io::Error::other(
+                "retain captured original for explicit restore",
+            ))
         } else {
             Ok(())
         }
     })?;
+    assert_eq!(receipt.state, ExportState::Recoverable);
+    assert!(!second.exists());
+    assert_eq!(
+        fs::read(receipt.captured_original.as_ref().unwrap())?,
+        b"captured"
+    );
     let restored = restore_planned_export(&plan)?;
     assert_eq!(restored.state, ExportState::Restored);
     assert_eq!(fs::read(&second)?, b"captured");
@@ -230,5 +241,34 @@ fn snapshot_and_seal_versions_preserve_native_and_legacy_shapes() -> anyhow::Res
         fs::read_to_string(old_seal.recovery_directory().join("plan.json"))?
             .contains("\"version\":2")
     );
+    Ok(())
+}
+
+#[test]
+fn explicit_restore_starts_from_retained_capture_not_automatic_rollback() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("restore.xmp");
+    fs::write(&destination, b"captured")?;
+    let plan = plan_export(&destination, b"never publish")?;
+    let receipt = apply_export_with_hook(&plan, b"never publish", |boundary| {
+        if matches!(
+            boundary,
+            ExportBoundary::Captured | ExportBoundary::BeforeRestore
+        ) {
+            Err(std::io::Error::other(
+                "retain captured original for explicit restore",
+            ))
+        } else {
+            Ok(())
+        }
+    })?;
+    assert_eq!(receipt.state, ExportState::Recoverable);
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read(receipt.captured_original.as_ref().unwrap())?,
+        b"captured"
+    );
+    assert_eq!(restore_planned_export(&plan)?.state, ExportState::Restored);
+    assert_eq!(fs::read(&destination)?, b"captured");
     Ok(())
 }

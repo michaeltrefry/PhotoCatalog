@@ -106,12 +106,12 @@ fn verify(path: &Path, length: u64, checksum: &str) -> Result<()> {
 }
 impl PreviewStore {
     pub(super) fn recover_relocation_lock(&mut self) -> Result<()> {
-        let value: Option<(String, String, String, String)> = self
+        let value: Option<(String, PathBuf, PathBuf, String)> = self
             .db
             .query_row(
-                "SELECT tier,source,target,phase FROM relocations LIMIT 1",
+                "SELECT tier,CASE WHEN length(CAST(source AS BLOB))<=1048576 THEN source ELSE NULL END,CASE WHEN length(CAST(target AS BLOB))<=1048576 THEN target ELSE NULL END,phase FROM relocations LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, read_path(r, 1)?, read_path(r, 2)?, r.get(3)?)),
             )
             .optional()?;
         if let Some((tier, source, target, phase)) = value {
@@ -126,12 +126,8 @@ impl PreviewStore {
                 ensure!(phase == "cleanup", "invalid relocation phase");
                 source
             };
-            self._relocation_lock = Some(lock_root(
-                Path::new(&extra),
-                &self.identity,
-                tier,
-                self.config.layout,
-            )?);
+            self._relocation_lock =
+                Some(lock_root(&extra, &self.identity, tier, self.config.layout)?);
         }
         Ok(())
     }
@@ -263,8 +259,8 @@ impl PreviewStore {
             params![
                 tier.name(),
                 id,
-                self.root(tier).to_str().context("cache path encoding")?,
-                destination.to_str().context("cache path encoding")?
+                encode_path(self.root(tier))?,
+                encode_path(&destination)?
             ],
         )?;
         self._relocation_lock = Some(target_lock);
@@ -282,12 +278,20 @@ impl PreviewStore {
             (1..=1024).contains(&limit) && byte_limit > 0,
             "relocation batch admission"
         );
-        let row: Option<(String, String, String, String, String)> = self
+        let row: Option<(String, PathBuf, PathBuf, String, String)> = self
             .db
             .query_row(
-                "SELECT id,source,target,phase,cursor FROM relocations WHERE tier=?1",
+                "SELECT id,CASE WHEN length(CAST(source AS BLOB))<=1048576 THEN source ELSE NULL END,CASE WHEN length(CAST(target AS BLOB))<=1048576 THEN target ELSE NULL END,phase,cursor FROM relocations WHERE tier=?1",
                 [tier.name()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        read_path(r, 1)?,
+                        read_path(r, 2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                    ))
+                },
             )
             .optional()?;
         let Some((id, source, target, phase, cursor)) = row else {
@@ -299,8 +303,6 @@ impl PreviewStore {
                 complete: true,
             });
         };
-        let source = PathBuf::from(source);
-        let target = PathBuf::from(target);
         let mut marker_file = File::open(target.join(".photocatalog-relocation"))?;
         ensure!(
             id.len() <= 128 && marker_file.metadata()?.len() == id.len() as u64,
@@ -399,7 +401,7 @@ impl PreviewStore {
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 tx.execute(
                     "UPDATE locations SET path=?1 WHERE tier=?2",
-                    params![target.to_str().context("cache encoding")?, tier.name()],
+                    params![encode_path(&target)?, tier.name()],
                 )?;
                 tx.execute(
                     "UPDATE relocations SET phase='cleanup',cursor='' WHERE tier=?1",
@@ -442,15 +444,18 @@ impl PreviewStore {
             db.pragma_query_value(None, "application_id", |r| r.get::<_, i64>(0))? == 0x50435056,
             "not a preview manifest"
         );
+        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!((1..=5).contains(&version), "unsupported preview manifest");
+        validate_paths(&db)?;
         for tier in [Tier::Thumbnail, Tier::Large] {
-            let path: String = db.query_row(
-                "SELECT path FROM locations WHERE tier=?1",
+            let path = db.query_row(
+                "SELECT CASE WHEN length(CAST(path AS BLOB))<=1048576 THEN path ELSE NULL END FROM locations WHERE tier=?1",
                 [tier.name()],
-                |r| r.get(0),
+                |r| read_path(r, 0),
             )?;
             match tier {
-                Tier::Thumbnail => config.thumbnail_root = path.into(),
-                Tier::Large => config.large_root = path.into(),
+                Tier::Thumbnail => config.thumbnail_root = path,
+                Tier::Large => config.large_root = path,
             };
         }
         let has_budgets: bool = db.query_row(

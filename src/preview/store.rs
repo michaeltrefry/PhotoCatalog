@@ -1,4 +1,8 @@
 //! Rebuildable preview manifest. Main-catalog generations remain authoritative.
+#[path = "store_paths.rs"]
+mod paths;
+use paths::{encode_path, read_path, validate_paths};
+
 #[path = "relocation.rs"]
 mod relocation;
 use super::{CodecSettings, PREPARATION_VERSION};
@@ -247,13 +251,12 @@ impl PreviewStore {
         ];
         let mut statement = self
             .db
-            .prepare("SELECT source,target FROM relocations LIMIT 2")?;
-        let relocations = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+            .prepare("SELECT CASE WHEN length(CAST(source AS BLOB))<=1048576 THEN source ELSE NULL END,CASE WHEN length(CAST(target AS BLOB))<=1048576 THEN target ELSE NULL END FROM relocations LIMIT 2")?;
+        let relocations =
+            statement.query_map([], |row| Ok((read_path(row, 0)?, read_path(row, 1)?)))?;
         for row in relocations {
             let (old, new) = row?;
-            roots.extend([PathBuf::from(old), PathBuf::from(new)]);
+            roots.extend([old, new]);
         }
         for root in roots {
             ensure!(
@@ -320,9 +323,12 @@ impl PreviewStore {
             ensure!(count == 0 && app == 0, "unrelated preview manifest");
         } else {
             ensure!(
-                (1..=4).contains(&version) && app == 0x50435056,
+                (1..=5).contains(&version) && app == 0x50435056,
                 "unsupported preview manifest"
             );
+        }
+        if version > 0 {
+            validate_paths(&db)?;
         }
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA fullfsync=ON; PRAGMA cache_size=-8192; PRAGMA mmap_size=0; BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS usage(tier TEXT PRIMARY KEY,bytes INTEGER NOT NULL CHECK(bytes>=0),objects INTEGER NOT NULL CHECK(objects>=0),pending INTEGER NOT NULL CHECK(pending>=0));
@@ -367,7 +373,7 @@ impl PreviewStore {
                 db.execute_batch("ALTER TABLE wanted ADD COLUMN image_pixel_generation INTEGER CHECK(image_pixel_generation IS NULL OR image_pixel_generation>=0)")?;
                 restore_image_scopes(&db)?;
             }
-            db.execute_batch("PRAGMA user_version=4")?;
+            db.execute_batch("PRAGMA user_version=5")?;
             Ok(())
         })();
         finish(&db, migration)?;
@@ -415,16 +421,13 @@ impl PreviewStore {
                 .execute("INSERT INTO layout VALUES(?1)", [layout])?;
         }
         for tier in [Tier::Thumbnail, Tier::Large] {
-            let path = store
-                .root(tier)
-                .to_str()
-                .context("cache location must be Unicode")?;
-            let saved: Option<String> = store
+            let path = store.root(tier);
+            let saved: Option<PathBuf> = store
                 .db
                 .query_row(
-                    "SELECT path FROM locations WHERE tier=?1",
+                    "SELECT CASE WHEN length(CAST(path AS BLOB))<=1048576 THEN path ELSE NULL END FROM locations WHERE tier=?1",
                     [tier.name()],
-                    |r| r.get(0),
+                    |r| read_path(r, 0),
                 )
                 .optional()?;
             if let Some(saved) = saved {
@@ -435,7 +438,7 @@ impl PreviewStore {
             } else {
                 store.db.execute(
                     "INSERT INTO locations VALUES(?1,?2)",
-                    params![tier.name(), path],
+                    params![tier.name(), encode_path(path)?],
                 )?;
             }
         }
