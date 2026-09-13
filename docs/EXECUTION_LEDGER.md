@@ -5,7 +5,19 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 ## Current delivery — 2026-09-13
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
-PR16 is at `3bd92ded58bd00ecd5701e8114fa13a3bf91f60f`; CI34776023414 is
+PR16 is at `ab92172791f92c40250ed766f15d619ed35209ff`; CI34779651605 is
+terminal SUCCESS for all four jobs. Three-platform installer artifacts and all
+37 receipt evidence hashes were verified. Receipt
+`sc-22847-ci-34779651605-zcnwn7u1/receipt.json`, SHA256
+`bb75168f1a0f20217766548ac58897ab6981b69cee6ad9d52865c99dd2035bbd`;
+terminal snapshot SHA256
+`3ddc19251c6d95e6eae5cdea4e80f3d348bed218f216758b04293bcb983f78fd`.
+Linux/Windows observer binaries were included and rehashed; Mac observer remains
+receipt-only. Installed preview/export workers, known-child/root reaping, stream
+joins and temporary cleanup passed; GUI remains untested by those artifacts.
+This run qualifies the published reader/preview-drain batch and predates the
+local additive transport and temporary-open guard below. Comment23335 and state
+were read back. The preceding CI34776023414 at `3bd92de` is
 terminal SUCCESS for contracts, macOS, Linux and Windows. All three installers,
 executables, provider archive digests, native closure files and notices were
 independently verified, with known preview/export children reaped and temporary
@@ -17,8 +29,8 @@ terminal run snapshot SHA256
 `04f272339c8b14311390ef8f37961621c96aed29c25b64fd88a3eeef788c372a`.
 Shortcut comment23329 and In Progress state were read back exactly. Previous
 CI34773173909 is terminal (Windows/Linux/contracts passed; Mac failed on the
-repaired close race). This successful run predates the following local reader
-repair and the unfinished preview-drain/owned-process integration.
+repaired close race). That successful run predates the following reader repair
+and preview-drain changes, now published in the current head.
 
 The complete custody design, call-site inventory and additive desktop transport
 slice were accepted and read back in comment23326. The transport remains
@@ -30,6 +42,72 @@ attempted writer-hold retirement; it does not qualify the whole migration bridge
 The raw-file executor, managed SQL roles and integration/installed parity remain
 required. Preview drain repairs from comment23327 are locally qualified below;
 no unverified worker exit may authorize resource release or Closed.
+
+The additive transport is locally integrated as `b828834` + `222d897` (authors
+`c7fd476` + `8094f514`); all 17 integrated source files match frozen v7. It passes
+91 application functions, including 15 transport functions, 16 application bridge
+functions, one Lightroom bridge function and one actual CLI transport process
+test, plus strict all-target release Clippy and formatting. The actual transport
+child test covers Status/Close before opening a catalog; native descendants and
+installed GUI behavior are outside this test. Independent final review verified
+the clean source and all 26 receipt artifacts:
+`sc-22847-catalog-transport-independent-mwbdzs68/review-final.json`, SHA256
+`c34fc35f4e418c4d43d4094fb2f9ee0a4e7eb979f406286178dbffe645bd6a21`.
+Receipt: `sc-22847-catalog-desktop-transport-q7ofz57b/final-receipt.json`, SHA256
+`6584882e25561716d006ca5d4dc1fb5859efd4d958927a059390d3eecda5ec56`.
+Mac release/locked Tauri compilation for its hidden child dispatch passes;
+session77548 is terminal/reaped. All 17 integrated source hashes still match.
+Root integration receipt SHA256
+`864469933168431f9e58aff7d37fc1f9631c828e7dd2334864891a1de910dfd5`.
+Production State
+still uses the existing engine; managed SQL roles and filesystem isolation are
+the next required implementation, not completed by transport alone. The earlier
+owned-worker PID fixture failure is retained and unexplained; the unchanged
+binary passed three isolated observations and the unchanged fixture passed the
+full final suite. Shortcut comment23332 and In Progress state were read back.
+
+The SQLite exclusive-create guard is integrated as `aafd442` (author
+`cc42d94`). Pinned SQLite 3.51.1 could retry a failed Unix exclusive temporary
+open as read-only, then unlink an existing hardlink on close. The one-line guard
+preserves exclusive creation. The supported SQLite filename fixture reproduces
+the old behavior; the fixed existing-hardlink regression and fresh-file control
+pass. Prior identity tests, strict all-target release Clippy and formatting pass.
+All five source hashes and the complete two-patch upstream delta were verified;
+no natural random-filename race or user-data corruption is claimed. Independent
+final review: `sc-22847-sqlite-exclusive-independent-88sgcr8c/review-final.json`,
+SHA256 `f2f835b09ada6a372ad1384d19389cfdf72be31ec58e10524cb335953be41237`.
+Local receipt: `sc-22847-sqlite-exclusive-1uczt_3n/receipt.json`, SHA256
+`20a814e86d0d980f3f2e009c6de0d00809f8c129ec750c23c32daa7a0d09eed6`.
+Integrated release/locked Tauri compilation passed in 19.90 seconds;
+session57536 is terminal/reaped and all five integrated hashes match.
+Windows/Linux runtime qualification awaits the new hosted run.
+
+The complete paired managed SQL session and filesystem bootstrap/restore plans
+were accepted and read back in comment23334. They preserve all eight fixed
+catalog/manifest connection roles, a private discovery role, explicit admission
+confirmation, checked query cancellation, original creation semantics and bounded
+restore documents. Implementation continues in isolated worktrees. Filesystem
+ownership is a sibling of the catalog child; a failed bootstrap must not run SQL
+cleanup against unconfirmed handles. Remaining backup, native worker, publication,
+metadata and migration filesystem routes are still required.
+
+The migration reader remains under qualification in its separate worktree.
+Source v12 replaced a manually owned SQLite commit-hook context with a connection-
+owned closure, retaining its lifetime if Catalog moves out of its lock wrapper.
+The first v12 actual-owner attempt failed frame admission; that evidence remains.
+Source v13 repaired private authority tagging for the full u128 range and opening
+failure frames. Its six proxy functions pass, including actual Source ownership,
+cancellation, drain and moved-Catalog death-before/after-commit behavior. The
+three closed-reader functions passed on unchanged reader code. Independent final
+review verifies 96 committed source pins and 11 evidence artifacts; focused receipt
+SHA256 `634286acd0d9b54595d6c76fbbc246883f4bef236943802543d74b2ef98492b8`.
+Source v14 passes three maximal-buffer fixtures and uses exact two-pass encoding.
+The 16,777,214-byte issue-heavy Manifest yields 698,974 issues and a 75,497,472-byte
+issue Vec allocation; encoded output is 28,659,800 bytes. Those measurements
+supersede the provisional 64 MiB decoded estimate. Valid JSON property order can
+also cause intermediate Serde buffering. A Source-specific borrowed decoder and
+complete decoded/scratch capacity proof remain required before memory admission
+or full migration bridge acceptance can be claimed.
 
 Local `db023e1` (author `ef98f82e`) corrects preview cleanup and checked Quit.
 Failed native wait retains the active child, scheduler/encoded reservations,
