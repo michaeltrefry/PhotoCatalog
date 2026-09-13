@@ -1,5 +1,6 @@
 //! UI-independent catalog owner. Requests are bounded and native workers remain
 //! owned/reaped by PreviewService; no webview thread touches SQLite.
+pub mod backup;
 pub mod browse;
 mod dto;
 use crate::{
