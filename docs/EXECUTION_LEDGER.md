@@ -4,6 +4,24 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
+Mac v5 is an immutable local checkpoint of `4e409726c0cce5434e51e10ed730da77cba4da61`.
+Integrated worker/capture tests, strict Clippy/fmt, Tauri build/bundle and installed
+preview, edited-PNG export and Lightroom capture passed. Installed capture used a
+small synthetic committed-WAL fixture: original main/WAL/SHM/auxiliary hashes stayed
+unchanged, logical rating3 was recovered, and cancel/Drop/owner EOF all reaped.
+Root verified65 private evidence files and95 package/image-root files, including46
+app files. Receipt: private `sc-22847-mac-v5-build-mw_p9xb3/receipt.json`.
+The app/DMG under `sc-22847-mac-checkpoint-v5` require arm64 macOS26, use ad-hoc
+signing and are not notarized. The old user app49373 remains unchanged; the Mac is
+still locked, so actual user-catalog GUI acceptance has not occurred.
+
+CI repair `c96f063` is integrated as `7b84a86`: the three-command frontend step now
+explicitly selects Bash, so Windows stops at a failed install/test/build command.
+Four local command-exit fixtures and independent source review pass. Previous
+Windows advancement past this step is not proof that its frontend tests passed;
+terminal logs remain required. No jobs, runner matrix or additional workflows were added.
+
+
 Latest S12 integration: export path compatibility `1da8212` is integrated as
 `ed547a4`, backup lifecycle repairs are `58e3c78`, and owned Lightroom capture
 `ee83b33` is integrated as `cb10f73`. All three received independent source review.
@@ -183,10 +201,9 @@ settings, preview-cache/color settings, accessibility, user visual review, and c
 installed three-platform workflows remain in the agreed foundation scope. Existing
 organization, metadata, relink and adjustment-copy implementations still need integrated installed
 acceptance; their local tests do not close S12.
-The next independent export compatibility seam preserves non-UTF native paths in
-plans, receipts and worker staging results while retaining exact legacy authority bytes.
-It is under implementation in an isolated branch; this does not complete export UI,
-detached cancellable publication or Lightroom migration workflows.
+Export native-path compatibility is integrated as recorded above. Detached cancellable
+export execution and immutable Lightroom selection sealing are the next bounded
+implementation prerequisites; their actor/UI workflows remain unfinished.
 S13 remains the sole terminal integrated readiness/scale campaign after S12 is stable.
 
 ## S10 pre-merge checkpoint — 2026-09-13
