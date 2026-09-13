@@ -2,6 +2,7 @@
 //! owned/reaped by PreviewService; no webview thread touches SQLite.
 pub mod backup;
 pub mod browse;
+pub mod copy;
 mod dto;
 mod hydration;
 pub mod metadata;
@@ -235,6 +236,15 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
+            Work::Command(Request::EditCopy { request, .. }, _) => {
+                if matches!(request.as_ref(), copy::Request::Cancel { .. }) {
+                    0
+                } else if request.read_only() {
+                    2
+                } else {
+                    4
+                }
+            }
             Work::Command(Request::Metadata { request, .. }, _) => match request.as_ref() {
                 metadata::Request::Resolve { .. } => 1,
                 _ => 2,
@@ -279,6 +289,9 @@ impl Envelope {
             _ => 2,
         }
     }
+    fn before_copy(&self) -> bool {
+        self.priority() <= 3
+    }
     fn reject(self, code: ErrorCode, message: &str) {
         match self.work {
             Work::Command(_, tx) => {
@@ -306,6 +319,7 @@ struct Queue {
     ticket_foreground: HashMap<(String, String), TicketPriority>,
 }
 struct Shared {
+    copy: Arc<Mutex<copy::Control>>,
     relink: Arc<Mutex<relink::Control>>,
     backups: Mutex<backup::Coordinator>,
     queue: Mutex<Queue>,
@@ -344,6 +358,7 @@ impl Bridge {
         config.validate()?;
         let shared = Arc::new(Shared {
             relink: Arc::new(Mutex::new(relink::Control::default())),
+            copy: Arc::new(Mutex::new(copy::Control::default())),
             backups: Mutex::new(backup::Coordinator::new(Default::default())?),
             queue: Mutex::new(Queue {
                 pending: VecDeque::new(),
@@ -392,6 +407,52 @@ impl Bridge {
         let mut q = self.0.shared.queue.lock().unwrap();
         if q.stopping {
             return Err(error(ErrorCode::Closed, "catalog owner closed"));
+        }
+        if let Request::EditCopy { catalog, request } = &request
+            && matches!(
+                request.as_ref(),
+                copy::Request::Status { .. } | copy::Request::Cancel { .. }
+            )
+        {
+            if q.status.catalog.as_ref() != Some(catalog) {
+                return Err(error(ErrorCode::StaleSession, "catalog session changed"));
+            }
+            let direct = match request.as_ref() {
+                copy::Request::Status { operation } => Some(
+                    self.0
+                        .shared
+                        .copy
+                        .lock()
+                        .unwrap()
+                        .status(operation.as_deref())?,
+                ),
+                copy::Request::Cancel { job, operation } => self
+                    .0
+                    .shared
+                    .copy
+                    .lock()
+                    .unwrap()
+                    .cancel(job, operation.as_deref())?
+                    .map(Some),
+                _ => unreachable!(),
+            };
+            if let Some(status) = direct {
+                let out = Reply::Ok {
+                    value: Response::EditCopy(Box::new(copy::Response::Operation(status))),
+                };
+                let out = if serde_json::to_vec(&out)
+                    .map_err(|e| native(e.into()))?
+                    .len()
+                    <= self.0.shared.limits.reply_bytes
+                {
+                    out
+                } else {
+                    failure(ErrorCode::ResourceLimit, "response byte limit")
+                };
+                let _ = tx.send(out);
+                self.0.shared.wake.notify_one();
+                return Ok(Pending { receiver, cancel });
+            }
         }
         if let Request::Relink { catalog, request } = &request {
             let direct = match request.as_ref() {
@@ -806,6 +867,7 @@ fn during_relink_hold(request: &Request) -> bool {
         | Request::PreviewStatus { .. }
         | Request::ReleaseViewport { .. }
         | Request::CancelPreview { .. } => true,
+        Request::EditCopy { request, .. } => request.read_only(),
         Request::Metadata { request, .. } => {
             !matches!(request.as_ref(), metadata::Request::Resolve { .. })
         }
@@ -941,6 +1003,7 @@ impl Actor {
             // All readers and native consumers have received cancellation before
             // any join. Owners and the import lock remain held through native drain.
             open.relink.shutdown(&self.shared.relink);
+            copy::close(&mut open.catalog, &self.shared.copy);
             drop(open.hydration);
             if let Some(import) = &mut import {
                 import.preparation = None;
@@ -962,6 +1025,7 @@ impl Actor {
             .unwrap_or_else(|e| e.into_inner())
             .shutdown();
         *self.shared.relink.lock().unwrap() = relink::Control::default();
+        *self.shared.copy.lock().unwrap() = copy::Control::default();
         let mut q = self.shared.queue.lock().unwrap();
         q.viewport.clear();
         q.ticket_foreground.clear();
@@ -1140,6 +1204,17 @@ impl Actor {
             ));
         }
         match r {
+            Request::EditCopy { catalog, request } => {
+                let control = Arc::clone(&self.shared.copy);
+                let o = self.current(&catalog)?;
+                Ok(Response::EditCopy(Box::new(copy::execute(
+                    &mut o.catalog,
+                    *request,
+                    &limits,
+                    &control,
+                    o.jobs_held || o.relink.write_hold(),
+                )?)))
+            }
             Request::Relink { catalog, request } => {
                 let control = Arc::clone(&self.shared.relink);
                 #[cfg(test)]
@@ -1750,6 +1825,24 @@ impl Actor {
                     cancel_relink_consumers(o);
                 }
             }
+        }
+        let copy_foreground = self
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .any(Envelope::before_copy);
+        if copy::advance(
+            &mut o.catalog,
+            &self.shared.copy,
+            copy_foreground,
+            o.jobs_held || o.relink.write_hold(),
+            #[cfg(test)]
+            self.config.import_checkpoint.clone(),
+        ) {
+            o.index_pending = true;
         }
         if o.relink.write_hold() {
             if !o.relink.committing() {

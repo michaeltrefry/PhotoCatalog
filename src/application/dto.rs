@@ -35,6 +35,10 @@ decimal!(U64, u64);
     deny_unknown_fields
 )]
 pub enum Request {
+    EditCopy {
+        catalog: String,
+        request: Box<super::copy::Request>,
+    },
     Relink {
         catalog: String,
         request: Box<super::relink::Request>,
@@ -318,6 +322,7 @@ pub struct PreviewStatus {
 pub enum Response {
     Metadata(Box<super::metadata::Response>),
     Relink(Box<super::relink::Response>),
+    EditCopy(Box<super::copy::Response>),
     Organization(Box<super::organization::Response>),
     Backup(Option<super::backup::Snapshot>),
     Restore(Option<Restored>),

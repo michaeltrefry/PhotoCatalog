@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 #[path = "catalog_edits/copy.rs"]
 mod copy;
-pub use copy::{CopyItem, CopyJob, EditTarget};
+pub use copy::{CopyDescription, CopyItem, CopyJob, EditTarget};
 #[cfg(test)]
 #[path = "catalog_edits/tests.rs"]
 mod tests;
