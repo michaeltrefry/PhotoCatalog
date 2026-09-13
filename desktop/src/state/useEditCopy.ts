@@ -9,16 +9,17 @@ type Admission = { scope: Scope; previous: string | null; job: string; failed: b
 export function useEditCopy(catalog: string | null) {
   const [operation, setOperation] = useState<CopyOperation | null>(null);
   const [ready, setReady] = useState(false), [admitting, setAdmitting] = useState(false);
-  const [error, setError] = useState(''), [retry, setRetry] = useState(0);
+  const [error, setError] = useState('');
   const live = useRef<Scope>({ catalog, alive: false });
   const current = useRef<CopyOperation | null>(null);
   const admission = useRef<Admission | null>(null);
   const canceling = useRef<string | null>(null);
   const readEpoch = useRef(0);
+  const statusKnown = useRef(false);
   useEffect(() => {
     const context = { catalog, alive: true }; live.current = context;
     const abort = new AbortController(); let timer: ReturnType<typeof setTimeout>;
-    setReady(false); setOperation(null); current.current = null; setError(''); setAdmitting(false); admission.current = null; canceling.current = null;
+    statusKnown.current = false; setReady(false); setOperation(null); current.current = null; setError(''); setAdmitting(false); admission.current = null; canceling.current = null;
     const poll = async () => {
       const epoch = readEpoch.current;
       try {
@@ -27,7 +28,7 @@ export function useEditCopy(catalog: string | null) {
         // Only the serial polling loop publishes status. Late Run/Cancel replies
         // cannot regress completed work or replace a newer operation.
         if (JSON.stringify(current.current) !== JSON.stringify(value)) { current.current = value; setOperation(value); }
-        setReady(true); setError('');
+        statusKnown.current = true; setReady(true); setError('');
         const ticket = admission.current;
         if (value && ticket?.scope === context && value.id !== ticket.previous) {
           admission.current = null; setAdmitting(false);
@@ -39,7 +40,7 @@ export function useEditCopy(catalog: string | null) {
           admission.current = null; setAdmitting(false);
         }
         if (canceling.current && (value?.id !== canceling.current || copyTerminal(value) || value.phase === 'cancel_requested')) canceling.current = null;
-      } catch (e) { if (!abort.signal.aborted && epoch === readEpoch.current) { setReady(false); setError(errorText(e)); } }
+      } catch (e) { if (!abort.signal.aborted && epoch === readEpoch.current) { statusKnown.current = false; setReady(false); setError(errorText(e)); } }
       finally { if (!abort.signal.aborted) timer = setTimeout(() => void poll(), 500); }
     };
     if (catalog) void poll(); else setReady(true);
@@ -50,10 +51,11 @@ export function useEditCopy(catalog: string | null) {
         admission.current = null;
       }
     };
-  }, [catalog, retry]);
+  }, [catalog]);
   const run = async (job: string) => {
-    if (!catalog || !ready || admission.current || current.current && !copyTerminal(current.current)) throw new Error('Wait for the current adjustment copy to finish.');
     const context = live.current;
+    if (!context.alive || context.catalog !== catalog) throw new Error('Catalog session changed; reopen adjustment copying.');
+    if (!catalog || !statusKnown.current || admission.current || current.current && !copyTerminal(current.current)) throw new Error('Wait for the current adjustment copy to finish.');
     readEpoch.current += 1; // Ignore a status request sent before this admission.
     const observed = new Promise<void>((resolve, reject) => {
       const ticket = { scope: context, previous: current.current?.id ?? null, job, failed: false, resolve, reject };
@@ -64,7 +66,7 @@ export function useEditCopy(catalog: string | null) {
         // never arrives. The caller can then release its own action gate.
       }).catch(e => {
         if (context.alive && live.current === context && admission.current === ticket) {
-          readEpoch.current += 1; ticket.failed = true; setReady(false); setError(errorText(e)); ticket.reject(e);
+          readEpoch.current += 1; ticket.failed = true; statusKnown.current = false; setReady(false); setError(errorText(e)); ticket.reject(e);
         }
       });
     });
@@ -72,6 +74,7 @@ export function useEditCopy(catalog: string | null) {
   };
   const cancel = async () => {
     const target = current.current, context = live.current;
+    if (!context.alive || context.catalog !== catalog) throw new Error('Catalog session changed; reopen adjustment copying.');
     if (!catalog || !target || copyTerminal(target) || canceling.current === target.id) return;
     canceling.current = target.id;
     try { await editCopy(catalog, { command: 'cancel', args: { job: target.job.id, operation: target.id } }, 'operation'); }
@@ -81,5 +84,9 @@ export function useEditCopy(catalog: string | null) {
       }
     }
   };
-  return { operation, ready, busy: !ready || admitting || !!operation && !copyTerminal(operation), error, run, cancel, retry: () => setRetry(v => v + 1) };
+  const retry = () => {
+    if (!live.current.alive || live.current.catalog !== catalog) return;
+    readEpoch.current += 1; statusKnown.current = false; setReady(false); setError('Rechecking adjustment copy status…');
+  };
+  return { operation, ready, busy: !ready || admitting || !!operation && !copyTerminal(operation), error, run, cancel, retry };
 }

@@ -1,36 +1,84 @@
 import { useEffect, useRef, useState } from 'react';
 import { errorText } from '../bridge';
-import { relink, relinkTerminal, type RelinkOperation, type RelinkRequest } from '../relink';
+import { relink, relinkTerminal, type RelinkAction, type RelinkOperation, type RelinkRequest } from '../relink';
 
-/** Discover and observe an owned operation; reopening never starts saved work. */
+type Scope = { catalog: string | null; alive: boolean };
+type Admission = { scope: Scope; previous: string | null; action: RelinkAction; plan: string | null; failed: boolean; resolve: () => void; reject: (reason: unknown) => void };
+
+/** Catalog-owned status observation never replays a storage action. */
 export function useRelink(catalog: string | null) {
-  const [operation, setOperation] = useState<RelinkOperation | null>(null); const [ready, setReady] = useState(false); const [admitting, setAdmitting] = useState(false); const [error, setError] = useState('');
-  const [discovery, setDiscovery] = useState(0);
-  const session = useRef(catalog); session.current = catalog;
-  const admission = useRef(false); const alive = useRef(true);
-  useEffect(() => { const abort = new AbortController(); alive.current = true; setReady(false); setOperation(null); setError('');
-    if (!catalog) { setReady(true); return () => { alive.current = false; abort.abort(); }; }
-    void relink(catalog, { command: 'status', args: { operation: null } }, 'operation', abort.signal).then(value => { if (!abort.signal.aborted) { setOperation(value); setReady(true); } }).catch(e => { if (!abort.signal.aborted) setError(errorText(e)); });
-    return () => { alive.current = false; abort.abort(); };
-  }, [catalog, discovery]);
-  const currentOperation = useRef(operation); currentOperation.current = operation;
-  const id = operation?.id; const terminal = operation ? relinkTerminal(operation) : true;
+  const [operation, setOperation] = useState<RelinkOperation | null>(null);
+  const [ready, setReady] = useState(false), [admitting, setAdmitting] = useState(false), [error, setError] = useState('');
+  const scope = useRef<Scope>({ catalog, alive: false }), current = useRef<RelinkOperation | null>(null);
+  const admission = useRef<Admission | null>(null), canceling = useRef<string | null>(null);
+  const readEpoch = useRef(0), statusKnown = useRef(false);
   useEffect(() => {
-    if (!catalog || !id || terminal) return;
-    const abort = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
+    const context = { catalog, alive: true }; scope.current = context;
+    const abort = new AbortController(); let timer: ReturnType<typeof setTimeout>;
+    current.current = null; statusKnown.current = false; canceling.current = null;
+    setOperation(null); setReady(false); setAdmitting(false); setError('');
     const poll = async () => {
-      try { const current = await relink(catalog, { command: 'status', args: { operation: id } }, 'operation', abort.signal); if (abort.signal.aborted) return; setOperation(previous => previous?.id === id ? current : previous); if (currentOperation.current?.id === id) setError(''); if (current && !relinkTerminal(current)) timer = setTimeout(() => void poll(), 500); }
-      catch (e) { if (!abort.signal.aborted && currentOperation.current?.id === id) { setError(errorText(e)); timer = setTimeout(() => void poll(), 1500); } }
+      const epoch = readEpoch.current;
+      try {
+        const value = await relink(catalog!, { command: 'status', args: { operation: null } }, 'operation', abort.signal);
+        if (abort.signal.aborted || epoch !== readEpoch.current) return;
+        if (JSON.stringify(value) !== JSON.stringify(current.current)) { current.current = value; setOperation(value); }
+        statusKnown.current = true; setReady(true); setError('');
+        const ticket = admission.current;
+        if (value && ticket?.scope === context && value.id !== ticket.previous) {
+          admission.current = null; setAdmitting(false);
+          if (value.action === ticket.action && (ticket.plan === null || value.plan?.id === ticket.plan)) ticket.resolve();
+          else ticket.reject(new Error('Another storage operation became active. Inspect its result before retrying.'));
+        } else if (ticket?.scope === context && ticket.failed) {
+          // Only a read begun after the failed acknowledgement resolves this
+          // uncertainty; earlier in-flight status is fenced by readEpoch.
+          admission.current = null; setAdmitting(false);
+        }
+        if (canceling.current && (value?.id !== canceling.current || relinkTerminal(value) || value.phase === 'cancel_requested')) canceling.current = null;
+      } catch (e) {
+        if (!abort.signal.aborted && epoch === readEpoch.current) { statusKnown.current = false; setReady(false); setError(errorText(e)); }
+      } finally { if (!abort.signal.aborted) timer = setTimeout(() => void poll(), 500); }
     };
-    timer = setTimeout(() => void poll(), 250);
-    return () => { abort.abort(); clearTimeout(timer); };
-  }, [catalog, id, terminal]);
+    if (catalog) void poll(); else setReady(true);
+    return () => {
+      context.alive = false; abort.abort(); clearTimeout(timer);
+      if (admission.current?.scope === context) {
+        admission.current.reject(new Error('Catalog session changed; inspect saved relink work after reopening.'));
+        admission.current = null;
+      }
+    };
+  }, [catalog]);
   const start = async (request: RelinkRequest) => {
-    if (!catalog || !ready || admission.current || operation && !relinkTerminal(operation)) throw new Error('Wait for the current storage operation to finish.');
-    admission.current = true; setAdmitting(true); setError('');
-    try { const next = await relink(catalog, request, 'operation'); if (alive.current && session.current === catalog) { if (!next) throw new Error('Storage operation was not admitted.'); setOperation(next); } }
-    finally { admission.current = false; if (alive.current && session.current === catalog) setAdmitting(false); }
+    const context = scope.current;
+    if (!context.alive || context.catalog !== catalog) throw new Error('Catalog session changed; reopen Locate originals.');
+    if (!catalog || !statusKnown.current || admission.current || current.current && !relinkTerminal(current.current)) throw new Error('Wait for the current storage operation or recover its status.');
+    if (!['prepare', 'confirm', 'revise', 'apply', 'undo', 'mounts', 'original'].includes(request.command)) throw new Error('This request does not start a storage operation.');
+    const action = request.command as RelinkAction;
+    const plan = 'args' in request && 'plan' in request.args ? request.args.plan : null;
+    readEpoch.current += 1;
+    return new Promise<void>((resolve, reject) => {
+      const ticket: Admission = { scope: context, previous: current.current?.id ?? null, action, plan, failed: false, resolve, reject };
+      admission.current = ticket; setAdmitting(true); setError('');
+      void relink(catalog, request, 'operation').then(value => {
+        if (!value) throw new Error('Storage operation was not admitted.');
+      }).catch(e => {
+        if (context.alive && scope.current === context && admission.current === ticket) {
+          readEpoch.current += 1; ticket.failed = true; statusKnown.current = false; setReady(false); setError(errorText(e)); reject(e);
+        }
+      });
+    });
   };
-  const cancel = async () => { if (!catalog || !operation) return; try { const next = await relink(catalog, { command: 'cancel', args: { operation: operation.id } }, 'operation'); if (alive.current && session.current === catalog) setOperation(previous => previous?.id === operation.id ? next : previous); } catch (e) { if (alive.current && session.current === catalog && currentOperation.current?.id === operation.id) setError(errorText(e)); } };
-  return { operation, ready, retry: () => setDiscovery(v => v + 1), busy: admitting || !!operation && !relinkTerminal(operation), error, start, cancel };
+  const cancel = async () => {
+    const context = scope.current, target = current.current;
+    if (!context.alive || context.catalog !== catalog) throw new Error('Catalog session changed; reopen Locate originals.');
+    if (!catalog || !target || relinkTerminal(target) || canceling.current === target.id) return;
+    canceling.current = target.id;
+    try { await relink(catalog, { command: 'cancel', args: { operation: target.id } }, 'operation'); }
+    catch (e) { if (context.alive && scope.current === context && canceling.current === target.id) { canceling.current = null; setError(errorText(e)); } }
+  };
+  const retry = () => {
+    if (!scope.current.alive || scope.current.catalog !== catalog) return;
+    readEpoch.current += 1; statusKnown.current = false; setReady(false); setError('Rechecking storage operation status…');
+  };
+  return { operation, ready, retry, busy: !ready || admitting || !!operation && !relinkTerminal(operation), writeHeld: !ready || admitting || !!operation?.write_hold, error, start, cancel };
 }

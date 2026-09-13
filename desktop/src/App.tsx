@@ -8,6 +8,7 @@ import { CatalogActivity } from './components/CatalogActivity';
 import { OrganizationPanel } from './components/OrganizationPanel';
 import { RelinkPanel } from './components/RelinkPanel';
 import { useRelink } from './state/useRelink';
+import { relinkTerminal } from './relink';
 import { CopyPanel } from './components/CopyPanel';
 import { useEditCopy } from './state/useEditCopy';
 import { copyTerminal } from './editCopy';
@@ -79,7 +80,7 @@ export function App() {
   const copies = useEditCopy(catalog);
   const copyEditingHeld = copies.busy || copyRefreshing?.catalog === catalog;
   const copyRefreshed = useRef('');
-  const storageWriteHold = !!storage.operation?.write_hold;
+  const storageWriteHold = storage.writeHeld;
 
   useEffect(() => {
     if (!desktopAvailable) return;
@@ -257,7 +258,7 @@ export function App() {
         <form className="search-form" onSubmit={event => { event.preventDefault(); setAppliedSearch(search); setCursor(null); setPrevious([]); }}><input type="search" maxLength={1024} aria-label="Search photos" placeholder="Search photos" value={search} onChange={event => setSearch(event.target.value)} /><button type="submit">Search</button></form>
         <button disabled={transitioning || storageWriteHold || status.phase !== 'ready'} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowOrganization(true); })}>Organize…</button><button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowCopy(true); })}>Copy adjustments…</button><button onClick={() => setShowFilters(true)}>Filters…</button><button aria-pressed={showInspector} onClick={() => setShowInspector(value => !value)}>Inspector</button></div>
       {(filters.keyword || filters.collection) && <div className="activity">Organization filter: {organizationScopeName}<button onClick={() => { setFilters(value => ({ ...value, keyword: null, collection: null })); setCursor(null); setPrevious([]); }}>Clear organization filter</button></div>}
-      {storageWriteHold && <div className="activity" role="status">Storage operation in progress: catalog writes and new original rendering are held.<button onClick={() => setShowRelink(true)}>Review progress</button><button onClick={() => void storage.cancel()}>Cancel storage operation</button></div>}
+      {storageWriteHold && <div className="activity" role="status">{storage.ready ? 'Storage operation in progress: catalog writes and new original rendering are held.' : 'Checking storage operation status; catalog writes are held.'}<button onClick={() => setShowRelink(true)}>Review progress</button>{storage.operation && !relinkTerminal(storage.operation) && <button onClick={() => void storage.cancel()}>Cancel storage operation</button>}</div>}
       {copies.busy && <div className="activity" role="status">{copies.ready ? 'Copying adjustments' : 'Checking adjustment copy status'} · {copies.operation?.job.completed ?? '0'} of {copies.operation?.job.total ?? '…'} targets processed<button onClick={() => setShowCopy(true)}>Review copy progress</button><button disabled={!copies.operation || copyTerminal(copies.operation)} onClick={() => void copies.cancel()}>Cancel adjustment copy</button></div>}
       {copies.error && <div className="activity" role="alert">Adjustment copy: {copies.error}<button onClick={() => setShowCopy(true)}>Review copy status</button></div>}
       {status.jobs_held && <div className="activity">Restored catalog: pending external jobs are held for review. Browsing and editing are available.</div>}
