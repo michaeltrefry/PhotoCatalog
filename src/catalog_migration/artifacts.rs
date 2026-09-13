@@ -32,6 +32,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod preparation;
+pub use preparation::{MappingPreparation, prepare_mapping};
+
 const DESCRIPTOR_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,28 +104,31 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
 }
 
 fn mapping_path(mapping: &ArtifactMapping) -> Result<PathBuf> {
-    for native in [&mapping.root, &mapping.relative] {
+    mapping_path_parts(&mapping.root, &mapping.relative)
+}
+fn mapping_path_parts(root: &NativePath, relative: &NativePath) -> Result<PathBuf> {
+    for native in [root, relative] {
         let units = match native {
             NativePath::UnixBytes(v) => v.len(),
             NativePath::WindowsWide(v) => v.len(),
         };
         ensure!((1..=32768).contains(&units), "artifact mapping path length");
     }
-    let root = mapping.root.to_path()?;
-    let relative = mapping.relative.to_path()?;
+    let root_path = root.to_path()?;
+    let relative_path = relative.to_path()?;
     ensure!(
-        root.is_absolute() && !relative.is_absolute(),
+        root_path.is_absolute() && !relative_path.is_absolute(),
         "artifact mapping root/relative shape"
     );
     ensure!(
-        relative
+        relative_path
             .components()
             .all(|c| matches!(c, Component::Normal(_)))
-            && relative.components().count() <= 256,
+            && relative_path.components().count() <= 256,
         "artifact mapping contains non-normal component"
     );
     // components() normalizes a/./b; reject lexical dot components as well.
-    match &mapping.relative {
+    match relative {
         NativePath::UnixBytes(v) => ensure!(
             v.split(|b| *b == b'/')
                 .all(|p| !p.is_empty() && p != b"." && p != b".."),
@@ -134,12 +140,12 @@ fn mapping_path(mapping: &ArtifactMapping) -> Result<PathBuf> {
             "artifact relative path component"
         ),
     }
-    reject_links(&root)?;
+    reject_links(&root_path)?;
     ensure!(
-        fs::symlink_metadata(&root)?.is_dir(),
+        fs::symlink_metadata(&root_path)?.is_dir(),
         "artifact sealed root is not a directory"
     );
-    Ok(root.join(relative))
+    Ok(root_path.join(relative_path))
 }
 
 fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDescriptor> {

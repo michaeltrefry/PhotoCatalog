@@ -42,6 +42,8 @@ export type Query =
  | {kind:'GlobalIdConflicts';left:string;right:string;after_left:string;after_right:string;limit:Decimal}
  | {kind:'PathCollisions';left:string;right:string;after_left:Decimal;after_right:Decimal;limit:Decimal}
  | {kind:'Families'|'SelectionSummary'}
+ | {kind:'SelectionSources';review_token:string;revision:string;after:Decimal;limit:Decimal}
+ | {kind:'SelectionPreparation';review_token:string;document:{kind:'Manifest';revision:string}|{kind:'OriginalEvidence';revision:string;source_id:string};offset:Decimal;limit:Decimal}
  | {kind:'SelectionPage';review_token:string;collection:'Families'|'Captures'|'UninspectedCandidates'|'ConflictSample'|'PathCollisionSample';after:Decimal;limit:Decimal};
 export type Status = { attempt:string;workbench:string;generation:string;operation:string;phase:'Opening'|'Running'|'Complete'|'Failed'|'CancelRequested'|'Canceled'|'Closing'|'Closed';initialized:boolean;closed:boolean;root:NativePath;limits:WorkbenchLimits;processed:Decimal;result_token:string|null;result_bytes:Decimal;review_token:string|null;capture_pid:Decimal|null;capture_staging:NativePath|null;error:string|null };
 export type InputStatus = {guard:Guard;attempt:string;input:string;purpose:InputPurpose;total_bytes:Decimal;received_bytes:Decimal;blake3:string|null;expected_blake3:string|null;complete:boolean};

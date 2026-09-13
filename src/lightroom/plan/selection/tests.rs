@@ -557,3 +557,5 @@ fn sqlite_progress_hook_honors_atomic_cancel_during_vm_execution() {
         7
     );
 }
+
+mod preparation_tests;

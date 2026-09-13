@@ -230,6 +230,11 @@ struct ReviewEvidence {
     choices: Vec<(String, String, String, String)>,
     inventories: Vec<String>,
 }
+mod preparation;
+pub use preparation::{
+    PreparationChunk, PreparationDocument, PreparationSource, PreparationSources,
+};
+
 pub struct SelectionReview {
     // Close SQLite before the source descriptor. No writable Plan escapes.
     plan: Plan,

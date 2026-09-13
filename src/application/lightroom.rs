@@ -230,6 +230,18 @@ pub enum Query {
     },
     Families,
     SelectionSummary,
+    SelectionSources {
+        review_token: String,
+        revision: String,
+        after: I64,
+        limit: U64,
+    },
+    SelectionPreparation {
+        review_token: String,
+        document: selection::PreparationDocument,
+        offset: U64,
+        limit: U64,
+    },
     SelectionPage {
         review_token: String,
         collection: ReviewCollection,
@@ -239,7 +251,13 @@ pub enum Query {
 }
 impl Query {
     fn review(&self) -> bool {
-        matches!(self, Self::SelectionSummary | Self::SelectionPage { .. })
+        matches!(
+            self,
+            Self::SelectionSummary
+                | Self::SelectionPage { .. }
+                | Self::SelectionPreparation { .. }
+                | Self::SelectionSources { .. }
+        )
     }
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

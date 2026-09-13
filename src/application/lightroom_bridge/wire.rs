@@ -170,6 +170,18 @@ pub enum Query {
     },
     Families {},
     SelectionSummary {},
+    SelectionSources {
+        review_token: String,
+        revision: String,
+        after: I64,
+        limit: U64,
+    },
+    SelectionPreparation {
+        review_token: String,
+        document: crate::lightroom::selection::PreparationDocument,
+        offset: U64,
+        limit: U64,
+    },
     SelectionPage {
         review_token: String,
         collection: lw::ReviewCollection,
@@ -270,6 +282,28 @@ impl From<lw::Query> for Query {
             },
             lw::Query::Families => Self::Families {},
             lw::Query::SelectionSummary => Self::SelectionSummary {},
+            lw::Query::SelectionSources {
+                review_token,
+                revision,
+                after,
+                limit,
+            } => Self::SelectionSources {
+                review_token,
+                revision,
+                after,
+                limit,
+            },
+            lw::Query::SelectionPreparation {
+                review_token,
+                document,
+                offset,
+                limit,
+            } => Self::SelectionPreparation {
+                review_token,
+                document,
+                offset,
+                limit,
+            },
             lw::Query::SelectionPage {
                 review_token,
                 collection,
@@ -377,6 +411,28 @@ impl From<Query> for lw::Query {
             },
             Query::Families {} => Self::Families,
             Query::SelectionSummary {} => Self::SelectionSummary,
+            Query::SelectionSources {
+                review_token,
+                revision,
+                after,
+                limit,
+            } => Self::SelectionSources {
+                review_token,
+                revision,
+                after,
+                limit,
+            },
+            Query::SelectionPreparation {
+                review_token,
+                document,
+                offset,
+                limit,
+            } => Self::SelectionPreparation {
+                review_token,
+                document,
+                offset,
+                limit,
+            },
             Query::SelectionPage {
                 review_token,
                 collection,
