@@ -250,6 +250,25 @@ fn fts_query(text: &str) -> String {
         .join(" AND ")
 }
 fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result<Sql> {
+    sql_projection(query, cursor, high, scan, false)
+}
+fn sql_projection(
+    query: &Query,
+    cursor: Option<&Cursor>,
+    high: i64,
+    scan: usize,
+    compact: bool,
+) -> Result<Sql> {
+    sql_selection(query, cursor, high, scan, compact, None)
+}
+fn sql_selection(
+    query: &Query,
+    cursor: Option<&Cursor>,
+    high: i64,
+    scan: usize,
+    compact: bool,
+    sequence: Option<i64>,
+) -> Result<Sql> {
     validate(query)?;
     let mut params = Vec::new();
     let mut predicates = Vec::new();
@@ -306,6 +325,9 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     }
     let mut source = "organization_assets a".to_string();
     let mut driving = Vec::new();
+    if let Some(sequence) = sequence {
+        driving.push(format!("a.sequence={}", bind(&mut params, sequence)));
+    }
     let mut capture_bounds = Vec::new();
     let mut split_cursor = None;
     let mut local_text = query.text.is_some();
@@ -448,8 +470,11 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     };
     let text_column = if local_text { "a.search_text" } else { "NULL" };
     let limit = bind(&mut params, scan as i64);
+    // Compact grids never fetch or parse arbitrary stored provenance. Preserve
+    // the ordering key fields even when they are not shown by the grid.
+    let provenance = if compact { "'null'" } else { "a.provenance" };
     let projection = format!(
-        "a.sequence,ci.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched,{text_column},a.asset_id,ci.variant_id,(ci.applied_shared_epoch!=ss.epoch OR di.sequence IS NOT NULL OR se.asset_id IS NOT NULL)"
+        "a.sequence,ci.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,{provenance},({matched}) AS matched,{text_column},a.asset_id,ci.variant_id,(ci.applied_shared_epoch!=ss.epoch OR di.sequence IS NOT NULL OR se.asset_id IS NOT NULL)"
     );
     let source = format!(
         "{source} CROSS JOIN catalog_images ci ON ci.id=a.asset_id CROSS JOIN image_shared_state ss ON ss.asset_id=ci.asset_id LEFT JOIN organization_dirty di ON di.sequence=a.sequence LEFT JOIN image_storage_events se ON se.asset_id=ci.asset_id AND ci.sequence>se.cursor AND ci.sequence<=se.high_water"
@@ -548,6 +573,17 @@ fn page(
     scan: usize,
     text_limits: TextLimits,
 ) -> Result<Page> {
+    page_projection(db, query, cursor, limit, scan, text_limits, None)
+}
+fn page_projection(
+    db: &Connection,
+    query: &Query,
+    cursor: Option<&Cursor>,
+    limit: usize,
+    scan: usize,
+    text_limits: TextLimits,
+    compact_bytes: Option<usize>,
+) -> Result<Page> {
     organization::page_limit(limit)?;
     text_limits.validate()?;
     ensure!(
@@ -569,7 +605,8 @@ fn page(
         ensure!(c.high_water <= max, "cursor high-water exceeds catalog");
     }
     let high = cursor.map(|c| c.high_water).unwrap_or(max);
-    let query_sql = sql(query, cursor, high, scan)?;
+    let query_sql = sql_projection(query, cursor, high, scan, compact_bytes.is_some())?;
+    let mut returned_bytes = 0usize;
     let mut text_work = TextWork::default();
     let local_query = query
         .text
@@ -608,6 +645,27 @@ fn page(
             };
             text_work.candidate_rows_read += 1;
             let matched = r.get::<_, bool>(16)?;
+            if let Some(allowance) = compact_bytes {
+                // Borrow SQLite values before allocating String/JSON. Include
+                // ordering fields for unmatched candidates too; no huge cursor.
+                let mut bytes = 0usize;
+                for column in [1, 2, 5, 6, 7, 8, 9, 10, 12, 13, 14, 18, 19] {
+                    bytes = bytes
+                        .checked_add(r.get_ref(column)?.as_str()?.len())
+                        .context("compact search byte overflow")?;
+                }
+                ensure!(
+                    bytes <= allowance.min(16 * 1024),
+                    "compact search row exceeds byte admission"
+                );
+                returned_bytes = returned_bytes
+                    .checked_add(bytes)
+                    .context("compact search byte overflow")?;
+                ensure!(
+                    returned_bytes <= allowance,
+                    "compact search page exceeds byte admission"
+                );
+            }
             if matched && local_query.is_some() {
                 let text = r.get_ref(17)?.as_str()?;
                 ensure!(
@@ -711,6 +769,73 @@ impl Catalog {
     ) -> Result<Page> {
         let tx = self.db.transaction()?;
         let result = page(&tx, query, cursor, limit, scan, text_limits)?;
+        tx.commit()?;
+        Ok(result)
+    }
+    /// Compact bounded grid projection. Predicates/cursors/order match search;
+    /// provenance is deliberately null. The byte bound covers scanned display
+    /// fields before allocation, independently of candidate-local text admission.
+    pub fn search_grid(
+        &mut self,
+        query: &Query,
+        cursor: Option<&Cursor>,
+        limit: usize,
+        scan: usize,
+        page_bytes: usize,
+    ) -> Result<Page> {
+        ensure!(
+            (1..=1024 * 1024).contains(&page_bytes),
+            "compact search byte bounds"
+        );
+        let tx = self.db.transaction()?;
+        let result = page_projection(
+            &tx,
+            query,
+            cursor,
+            limit,
+            scan,
+            TextLimits::default(),
+            Some(page_bytes),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+    /// Exact logical image for a selected variant, independent of a grid page.
+    pub fn grid_image(
+        &self,
+        key: &crate::catalog_edits::VariantKey,
+        bytes: usize,
+    ) -> Result<SearchRow> {
+        ensure!(
+            (1..=16 * 1024).contains(&bytes),
+            "compact image byte bounds"
+        );
+        let tx = self.db.unchecked_transaction()?;
+        let sequence: i64 = tx.query_row(
+            "SELECT sequence FROM catalog_images WHERE asset_id=?1 AND variant_id=?2",
+            rusqlite::params![key.asset_id, key.variant_id],
+            |r| r.get(0),
+        )?;
+        let q = Query {
+            include_variants: true,
+            ..Query::default()
+        };
+        let sql = sql_selection(&q, None, i64::MAX, 1, true, Some(sequence))?;
+        let result = {
+            let mut statement = tx.prepare(&sql.text)?;
+            let mut rows = statement.query(params_from_iter(sql.params))?;
+            let row = rows
+                .next()?
+                .context("logical image organization index is pending")?;
+            let mut total = 0usize;
+            for column in [1, 2, 5, 6, 7, 8, 9, 10, 12, 13, 14, 18, 19] {
+                total = total
+                    .checked_add(row.get_ref(column)?.as_str()?.len())
+                    .context("compact image byte overflow")?;
+            }
+            ensure!(total <= bytes, "compact image row exceeds byte admission");
+            result_row(row)?
+        };
         tx.commit()?;
         Ok(result)
     }

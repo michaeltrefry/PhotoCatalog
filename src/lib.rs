@@ -2,6 +2,7 @@
 /// Current on-disk catalog schema; probes must preflight before timed opens.
 pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
+pub mod application;
 pub mod catalog_backup;
 pub mod catalog_edits;
 pub mod catalog_export_alias;
