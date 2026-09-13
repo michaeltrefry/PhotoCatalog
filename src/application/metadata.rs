@@ -90,6 +90,12 @@ pub enum Request {
         after_json: Option<String>,
         limit: u16,
     },
+    ImportColumns {
+        key: VariantKey,
+        anchor_json: String,
+        after: U64,
+        limit: u16,
+    },
     ImportFields {
         key: VariantKey,
         anchor_json: String,
@@ -337,6 +343,20 @@ pub struct ImportedField {
     pub scalar_json: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportedColumn {
+    pub ordinal: U64,
+    pub name: String,
+    pub cell_type: Option<String>,
+    pub bytes: Option<U64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnPage {
+    pub row: ImportedRow,
+    pub columns: Page<ImportedColumn>,
+    pub types_complete: bool,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdobeProperty {
     pub path_json: String,
     pub namespace: Option<String>,
@@ -377,6 +397,7 @@ pub enum Response {
     Chunk(Chunk),
     ImportHistory(ImportedPage),
     ImportFields(Page<ImportedField>),
+    ImportColumns(ColumnPage),
     AdobeProperties(AdobePage),
 }
 
@@ -1433,6 +1454,152 @@ fn field_description(
         scalar_json,
     })
 }
+// Bound the roster before a large run of tiny JSON cells can expand into an
+// oversized Vec. Individual strings/cells remain within the input byte cap.
+fn limited_list<T: serde::de::DeserializeOwned>(bytes: &[u8], maximum: usize) -> Result<Vec<T>> {
+    struct List<T> {
+        maximum: usize,
+        item: std::marker::PhantomData<T>,
+    }
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for List<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("bounded retained roster")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut rows = Vec::new();
+            while let Some(value) = seq.next_element()? {
+                if rows.len() == self.maximum {
+                    return Err(serde::de::Error::custom(
+                        "retained roster exceeds column bound",
+                    ));
+                }
+                rows.push(value);
+            }
+            Ok(rows)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let rows = serde::de::Deserializer::deserialize_seq(
+        &mut decoder,
+        List {
+            maximum,
+            item: std::marker::PhantomData,
+        },
+    )
+    .map_err(|e| native(e.into()))?;
+    decoder.end().map_err(|e| native(e.into()))?;
+    Ok(rows)
+}
+fn bounded_import_bytes(
+    catalog: &Catalog,
+    id: i64,
+    record: &crate::lightroom::migration_source::EvidenceRecord,
+    field: &str,
+    maximum: usize,
+) -> Result<Vec<u8>> {
+    if matches!(
+        record.fields.get(field),
+        Some(crate::lightroom::migration_source::Field::Bytes(_))
+    ) {
+        let descriptor=sql(catalog.db.query_row("SELECT length(e.descriptor) FROM migration_retained_fields f JOIN migration_evidence e ON e.id=f.evidence WHERE f.record=?1 AND f.field=?2",params![id,field],|r|unsigned(r,0)))?;
+        invalid(descriptor <= 16384, "retained field descriptor bytes")?;
+    }
+    crate::catalog_migration::retention::field_bytes(&catalog.db, id, record, field, maximum)
+        .map_err(native)
+}
+fn import_columns(
+    catalog: &Catalog,
+    key: &VariantKey,
+    raw: &str,
+    after: u64,
+    limit: usize,
+    bounds: &Limits,
+) -> Result<ColumnPage> {
+    use crate::lightroom::plan::Cell;
+    invalid(after <= 4096, "retained column cursor")?;
+    let a = anchor(raw, key, bounds)?;
+    let history = catalog
+        .migration_source_evidence(&a, history::Direction::Outgoing, None, 1)
+        .map_err(native)?;
+    let (table_id, table) = owned_import_record(catalog, key, raw, &RecordRole::Table, bounds)?;
+    let names: Vec<String> = limited_list(
+        &bounded_import_bytes(catalog, table_id, &table, "columns_json", 65536)?,
+        4096,
+    )?;
+    invalid(
+        after <= names.len() as u64,
+        "retained column cursor exceeds roster",
+    )?;
+    let mut reason =
+        "Exact retained column names and typed cells; interpretation never applies settings"
+            .to_string();
+    let cells: Option<Vec<Cell>> = if history.row.cells_json_bytes <= 8 * 1024 * 1024 {
+        let (row_id, row) = owned_import_record(catalog, key, raw, &RecordRole::Row, bounds)?;
+        let cells: Vec<Cell> = limited_list(
+            &bounded_import_bytes(catalog, row_id, &row, "cells_json", 8 * 1024 * 1024)?,
+            4096,
+        )?;
+        invalid(
+            cells.len() == names.len(),
+            "retained column/cell roster differs",
+        )?;
+        Some(cells)
+    } else {
+        reason="Typed cells exceed the 8 MiB interpretation limit; names remain available, types are unknown, and complete cells_json bytes remain accessible through import_chunk".into();
+        None
+    };
+    let mut result = ColumnPage {
+        row: imported_row(history.row, bounds)?,
+        columns: Page {
+            rows: Vec::new(),
+            next: None,
+            scanned: U64(0),
+        },
+        types_complete: cells.is_some(),
+        reason,
+    };
+    let total = names.len();
+    for (index, name) in names
+        .into_iter()
+        .enumerate()
+        .skip(after as usize)
+        .take(limit)
+    {
+        let (cell_type, bytes) = match cells.as_ref().map(|cells| &cells[index]) {
+            Some(Cell::Text(bytes)) => (Some("text".into()), Some(U64(bytes.len() as u64))),
+            Some(Cell::Blob(bytes)) => (Some("blob".into()), Some(U64(bytes.len() as u64))),
+            Some(Cell::Integer(_)) => (Some("integer".into()), None),
+            Some(Cell::RealBits(_)) => (Some("real_bits".into()), None),
+            Some(Cell::Null) => (Some("null".into()), None),
+            None => (None, None),
+        };
+        result.columns.rows.push(ImportedColumn {
+            ordinal: U64(index as u64),
+            name,
+            cell_type,
+            bytes,
+        });
+        result.columns.scanned.0 += 1;
+        result.columns.next = ((index + 1) < total).then(|| (index + 1).to_string());
+        if size(&result, budget(bounds).saturating_sub(64)).is_err() {
+            result.columns.rows.pop();
+            result.columns.next = Some(index.to_string());
+            if result.columns.rows.is_empty() {
+                return Err(error(
+                    ErrorCode::ResourceLimit,
+                    "retained column/header exceeds page bytes",
+                ));
+            }
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
 fn import_fields(
     catalog: &Catalog,
     key: &VariantKey,
@@ -1979,6 +2146,23 @@ pub fn execute_cancellable(
                 anchor_json.as_deref(),
                 direction,
                 after_json.as_deref(),
+                bounds,
+            )?)
+        }
+        Request::ImportColumns {
+            key,
+            anchor_json,
+            after,
+            limit,
+        } => {
+            let limit = count(limit, bounds)?;
+            owned_image(&tx, &key)?;
+            Response::ImportColumns(import_columns(
+                catalog,
+                &key,
+                &anchor_json,
+                after.0,
+                limit,
                 bounds,
             )?)
         }

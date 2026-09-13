@@ -871,3 +871,174 @@ fn copied_import_history_keeps_selected_authority_and_packet_snapshot() -> Resul
     assert!(failure.contains("cycle"), "{failure}");
     Ok(())
 }
+
+#[test]
+fn import_columns_lists_actual_names_types_and_oversized_unknowns() -> Result<()> {
+    let mut fixture = imported::ImportedFixture::new(false, true)?;
+    let key = fixture.keys[0].clone();
+    let other = fixture.keys[1].clone();
+    let c = &mut fixture.catalog;
+    let Response::ImportHistory(first) = run(
+        c,
+        Request::ImportHistory {
+            key: key.clone(),
+            anchor_json: None,
+            direction: history::Direction::Incoming,
+            after_json: None,
+            limit: 1,
+        },
+    )?
+    else {
+        unreachable!()
+    };
+    let root_anchor = first.anchor_json.clone();
+    let mut relations = first.relations;
+    let mut after = first.next;
+    while let Some(cursor) = after {
+        let Response::ImportHistory(page) = run(
+            c,
+            Request::ImportHistory {
+                key: key.clone(),
+                anchor_json: Some(root_anchor.clone()),
+                direction: history::Direction::Incoming,
+                after_json: Some(cursor),
+                limit: 1,
+            },
+        )?
+        else {
+            unreachable!()
+        };
+        relations.extend(page.relations);
+        after = page.next;
+        assert!(relations.len() < 100);
+    }
+    let find = |id: &str| {
+        relations
+            .iter()
+            .find(|r| r.source.as_ref().is_some_and(|s| s.source_id == id))
+            .unwrap()
+            .anchor_json
+            .clone()
+            .unwrap()
+    };
+    let anchor = find("h-40");
+    let huge = find("h-70");
+    let mut after = U64(0);
+    let mut columns = Vec::new();
+    loop {
+        let Response::ImportColumns(page) = run(
+            c,
+            Request::ImportColumns {
+                key: key.clone(),
+                anchor_json: anchor.clone(),
+                after,
+                limit: 1,
+            },
+        )?
+        else {
+            unreachable!()
+        };
+        assert!(page.types_complete);
+        assert_eq!(page.columns.rows.len(), 1);
+        columns.extend(page.columns.rows);
+        let Some(next) = page.columns.next else { break };
+        after = U64(next.parse()?);
+    }
+    assert_eq!(
+        columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["id_local", "image", "text"]
+    );
+    assert_eq!(
+        columns.iter().map(|c| c.ordinal.0).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert_eq!(
+        columns
+            .iter()
+            .map(|c| c.cell_type.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("integer"), Some("integer"), Some("text")]
+    );
+    assert!(columns[2].bytes.unwrap().0 > 0);
+    let Response::AdobeProperties(adobe) = run(
+        c,
+        Request::AdobeProperties {
+            key: key.clone(),
+            anchor_json: anchor.clone(),
+            column: columns[2].name.clone(),
+            settings_path_json: "[]".into(),
+            after: U64(0),
+            limit: 1,
+        },
+    )?
+    else {
+        unreachable!()
+    };
+    assert_eq!(adobe.properties.rows.len(), 1);
+    let Response::ImportColumns(page) = run(
+        c,
+        Request::ImportColumns {
+            key: key.clone(),
+            anchor_json: huge.clone(),
+            after: U64(0),
+            limit: 100,
+        },
+    )?
+    else {
+        unreachable!()
+    };
+    assert!(!page.types_complete);
+    assert!(page.reason.contains("8 MiB"));
+    assert_eq!(page.columns.rows.len(), 3);
+    assert!(
+        page.columns
+            .rows
+            .iter()
+            .all(|c| c.cell_type.is_none() && c.bytes.is_none())
+    );
+    let Response::Chunk(raw) = run(
+        c,
+        Request::ImportChunk {
+            key: key.clone(),
+            anchor_json: huge,
+            role: RecordRole::Row,
+            field: "cells_json".into(),
+            offset: U64(0),
+            length: 128,
+        },
+    )?
+    else {
+        unreachable!()
+    };
+    assert_eq!(raw.bytes.len(), 128);
+    assert!(raw.next.is_some());
+    assert!(
+        execute(
+            c,
+            Request::ImportColumns {
+                key: other,
+                anchor_json: anchor.clone(),
+                after: U64(0),
+                limit: 1
+            },
+            &Limits::default()
+        )
+        .is_err()
+    );
+    assert!(
+        execute(
+            c,
+            Request::ImportColumns {
+                key,
+                anchor_json: anchor,
+                after: U64(4),
+                limit: 1
+            },
+            &Limits::default()
+        )
+        .is_err()
+    );
+    let excessive = serde_json::to_vec(&vec![crate::lightroom::plan::Cell::Null; 4097])?;
+    assert!(limited_list::<crate::lightroom::plan::Cell>(&excessive, 4096).is_err());
+    Ok(())
+}

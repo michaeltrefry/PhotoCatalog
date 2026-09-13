@@ -29,6 +29,7 @@ encoding; importer-defined locators remain opaque bytes.
 | blob_chunk | key, packet observation/ordinal or model ID, byte offset, length | exact retained bytes, offset, total, digest, continuation |
 | text_chunk | identity, typed text reference, byte offset, length | exact UTF-8/locator bytes and continuation |
 | import_history | key, optional opaque anchor, direction, optional opaque cursor, limit | selected-image retained relations and coverage |
+| import_columns | key, opaque anchor, decimal ordinal cursor, limit | actual retained column names, cell types and interpretation bounds |
 | import_fields | key, opaque anchor, row/table/entity role, field cursor, limit | retained typed field descriptors |
 | import_chunk | key, opaque anchor, role, field, byte offset, length | retained typed field bytes and continuation |
 | adobe_properties | key, opaque anchor, column, opaque settings path, property cursor, limit | lexical properties and compatibility accounting |
@@ -130,3 +131,26 @@ all returned anchors and page keys remain bound to the selected copy. Parent
 and sibling anchors cannot be replayed for that selection. Packet inspection
 still uses the copy's retained observation associations: later parent packets
 do not become visible merely because imported history has a shared ancestor.
+
+## Choosing an imported settings column
+
+`import_columns` takes `{key,anchor_json,after,limit}` with decimal `after`
+initially `"0"`. Its response is `{row,columns,types_complete,reason}`, where
+`columns` is a page of `{ordinal,name,cell_type,bytes}`. Ordinals and byte counts
+are decimal strings. `cell_type` is `text`, `blob`, `integer`, `real_bits`, or
+`null`; `bytes` is populated for text/blob values. When a row exceeds the 8 MiB
+interpretation bound, both fields are null and `types_complete` is false; names
+still come from the retained table roster. That roster is bounded to 64 KiB and
+4096 columns. Cell parsing also stops at 4096 entries before an oversized array
+can expand into an unbounded collection. Names preserve their exact spelling and
+order. Pass a returned name to `adobe_properties.column`; custody fields such as
+`cells_json` are byte-access locators, not settings columns.
+
+The typed settings-path builder serializes core keys as
+`{"kind":"name","value":"exact name"}`,
+`{"kind":"index","value":123}`, or
+`{"kind":"xml","value":{"namespace":"uri","name":"local","ordinal":123}}`.
+The resulting array stays opaque JSON text. Build integer literals from
+validated decimal strings (or BigInt), preserving u64 exactly without converting
+them through JavaScript Number. The core still validates the 16-element path and
+requires explicit selected-image ownership before interpreting any property.
