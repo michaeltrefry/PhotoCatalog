@@ -4,6 +4,42 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
+Latest local integration includes detached export execution `18b6e9e` as `bbf1a67`,
+immutable Lightroom selection review/sealing `51a4fa0` as `b28cf67`, copy admission
+repair `3742163`, and output settings controls `2140721`. Export's48 distinct focused
+tests and strict Clippy/fmt pass; native service7 counts test functions, including
+one macOS EILSEQ92 early exit, not seven physical workflows. Root verified12 source
+and21 evidence hashes; independent final review is private
+`sc-22847-export-execution-independent-s5jqietk/review-final.json`.
+Selection passed11 new +17 reader +1 family tests and strict Clippy/fmt; root verified
+six source and20 evidence hashes, including the approved final rustdoc-only delta.
+It retains exact explicit approval bytes and all-family decisions, rejects observed
+source drift, and publishes a new immutable seal at a documented final-CAS decision
+point. Live SQLite SHM cache semantics and process-scoped lock ownership are explicit;
+the later workbench serializes inspection access. No canonical migration ran.
+
+Copy admission browser checks reproduce an accepted Run with an unresolved reply
+leaving Cancel unavailable. Independent status polling now settles UI admission,
+keeps late replies from replacing state, preserves stable identical terminal objects,
+and fences pre-admission/pre-error reads while retaining uncertainty until fresh
+status. Independent review found and verified repairs for both terminal-refresh and
+lost-error write-hold races. Evidence: private `sc-22847-copy-admission-ui-vvfj1300`.
+Output controls cover the complete current format/depth/size/profile/alpha surface;
+43 frontend tests/build and synthetic actual-component browser checks pass. Controls
+and controller/bridge integration remain unfinished, with no actual export UI claim.
+
+Draft PR16 remote head is `2698e8690d3daa47d73f7e4f6e5fcff6ede7081b` in the PUBLIC
+repository. CI34762593643 contracts passed; Mac/Linux failed and Windows remains
+running at last inspection. Both failed platforms expose an obsolete XMP version1
+fixture (new native-path version3); Linux additionally exposes a restore fixture
+that already rolled back automatically and a real Unicode-only preview-cache path
+restriction. Private logs: `sc-22847-ci-34762593643-hlby48a6`. The bounded fix preserves
+legacy cache rows/journals through native-path BLOB compatibility in cache schema5;
+implementation and hosted proof remain pending. Do not confuse this with a main
+catalog schema change. Full export actor/UI and serialized Lightroom workbench
+are active next slices; S12 remains In Progress and S13 has not started.
+
+
 Mac v5 is an immutable local checkpoint of `4e409726c0cce5434e51e10ed730da77cba4da61`.
 Integrated worker/capture tests, strict Clippy/fmt, Tauri build/bundle and installed
 preview, edited-PNG export and Lightroom capture passed. Installed capture used a
