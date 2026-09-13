@@ -130,13 +130,16 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 51
+            && receipt["added_tables"].as_array().unwrap().len() == 53
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .all(|row| row[1]
-                    == if row[0] == "export_alias_state" || row[0] == "migration_mapping_epoch" {
+                    == if row[0] == "export_alias_state"
+                        || row[0] == "migration_mapping_epoch"
+                        || row[0] == "organization_collection_zero_backfill"
+                    {
                         1
                     } else if row[0] == "catalog_images" || row[0] == "image_shared_state" {
                         1000
@@ -226,7 +229,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
     ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 51);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 53);
     ensure!(
         migrated["added_tables"]
             .as_array()
@@ -236,6 +239,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
                 == if row[0] == "export_alias_state"
                     || row[0] == "export_alias_dirty"
                     || row[0] == "migration_mapping_epoch"
+                    || row[0] == "organization_collection_zero_backfill"
                 {
                     1
                 } else if row[0] == "catalog_images" || row[0] == "image_shared_state" {
@@ -311,6 +315,7 @@ fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
 // while leaving schema7 columns, foreign keys, and triggers installed.
 fn remove_image_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+    conn.execute_batch("DROP TRIGGER organization_member_zero_insert; DROP TRIGGER organization_member_zero_update; DROP TRIGGER organization_order_zero_insert; DROP TRIGGER organization_order_zero_update; DROP TRIGGER organization_order_zero_delete; DROP TABLE organization_collection_zero; DROP TABLE organization_collection_zero_backfill;")?;
     conn.execute_batch("DROP TABLE migration_keyword_repair_items; DROP TABLE migration_keyword_repair_reports; DROP TABLE migration_keyword_repairs;")?;
     conn.execute_batch("DROP TABLE migration_current_repair_items; DROP TABLE migration_current_repair_reports; DROP TABLE migration_current_repairs;")?;
     let triggers=conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'image_%' OR name='organization_metadata_update')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -389,7 +394,7 @@ fn schema_six_adds_only_verified_image_state_and_rejects_legacy_sequence_spoof()
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION,
         "{receipt}"
     );
-    ensure!(receipt["added_tables"].as_array().unwrap().len() == 38);
+    ensure!(receipt["added_tables"].as_array().unwrap().len() == 40);
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
             && receipt["original_columns_preserved"] == true

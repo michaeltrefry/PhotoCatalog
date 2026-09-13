@@ -85,6 +85,7 @@ pub struct ImageRefreshProgress {
     pub pending: bool,
 }
 
+pub(crate) mod collection_order_index;
 pub mod organization;
 
 const SCHEMA: &str = r#"

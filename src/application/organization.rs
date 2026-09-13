@@ -630,6 +630,12 @@ pub fn execute(catalog: &mut Catalog, request: Request, bounds: &Limits) -> Resu
         } => {
             text(&collection, false)?;
             let limit = count(limit, bounds)?;
+            if !catalog.collection_order_index_ready().map_err(native)? {
+                return Err(error(
+                    ErrorCode::Busy,
+                    "collection order index is preparing; retry after catalog maintenance",
+                ));
+            }
             if let Some(v) = &after {
                 text(&v.collection, false)?;
                 invalid(
@@ -1378,11 +1384,16 @@ mod tests {
         else {
             panic!()
         };
-        assert!(first.rows.is_empty());
-        assert_eq!(first.scanned, U64(3));
-        assert!(!first.next.as_ref().unwrap().ordered);
+        assert_eq!(
+            first.rows.len(),
+            1,
+            "ready positive-only collection must return its first member immediately"
+        );
+        assert_eq!(first.rows[0].key, keys[0]);
+        assert!(first.scanned.0 <= 3);
+        assert!(first.next.as_ref().unwrap().ordered);
         let mut cursor = first.next;
-        let mut found = Vec::new();
+        let mut found = first.rows.into_iter().map(|v| v.key).collect::<Vec<_>>();
         let mut calls = 0;
         loop {
             let Response::Members(page) = execute(
@@ -1575,6 +1586,70 @@ mod tests {
                 .map(|v| v.key)
                 .collect::<Vec<_>>(),
             vec![master, copy, later]
+        );
+        Ok(())
+    }
+    #[test]
+    fn schema_eleven_prepares_old_memberships_in_existing_bounded_maintenance() -> anyhow::Result<()>
+    {
+        let (temp, mut c, master) = fixture()?;
+        let collection =
+            c.create_collection("old ordered", serde_json::json!({"source":"retained"}))?;
+        c.set_image_collection_membership(
+            &c.image_metadata_identity(&master)?,
+            &collection,
+            4,
+            &serde_json::json!({"original":"kept"}),
+        )?;
+        // Restore the exact v10 shape; a real upgrade has neither projection nor triggers.
+        c.db.execute_batch("DROP TRIGGER organization_member_zero_insert; DROP TRIGGER organization_member_zero_update;
+            DROP TRIGGER organization_order_zero_insert; DROP TRIGGER organization_order_zero_update;
+            DROP TRIGGER organization_order_zero_delete; DROP TABLE organization_collection_zero;
+            DROP TABLE organization_collection_zero_backfill; PRAGMA user_version=10;")?;
+        drop(c);
+        let mut c = Catalog::open(temp.path().join("catalog"))?;
+        assert_eq!(
+            c.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
+            11
+        );
+        assert!(!c.collection_order_index_ready()?);
+        let error = execute(
+            &mut c,
+            Request::Members {
+                collection: collection.clone(),
+                after: None,
+                limit: 1,
+            },
+            &Limits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::Busy));
+        while !c.collection_order_index_ready()? {
+            let progress = c.organization_index(1)?;
+            assert!(progress.processed <= 1);
+        }
+        let Response::Members(page) = call(
+            &mut c,
+            Request::Members {
+                collection: collection.clone(),
+                after: None,
+                limit: 1,
+            },
+        )?
+        else {
+            panic!()
+        };
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].key, master);
+        assert_eq!(page.scanned, U64(1));
+        drop(c);
+        let c = Catalog::open(temp.path().join("catalog"))?;
+        assert!(c.collection_order_index_ready()?);
+        assert_eq!(
+            c.image_collection_members(&collection, None, 1)?[0]
+                .1
+                .provenance,
+            serde_json::json!({"original":"kept"})
         );
         Ok(())
     }

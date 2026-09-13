@@ -1226,7 +1226,7 @@ mod tests {
                 .execute_batch(&format!("DROP INDEX migration_unavailable_{name}"))?;
         }
         f.catalog.db.execute_batch(
-            "PRAGMA user_version=8; CREATE TABLE migration_unavailable_reference(block_upgrade)",
+            "DROP TRIGGER organization_member_zero_insert; DROP TRIGGER organization_member_zero_update; DROP TRIGGER organization_order_zero_insert; DROP TRIGGER organization_order_zero_update; DROP TRIGGER organization_order_zero_delete; DROP TABLE organization_collection_zero; DROP TABLE organization_collection_zero_backfill; PRAGMA user_version=8; CREATE TABLE migration_unavailable_reference(block_upgrade)",
         )?;
         drop(f.catalog);
         assert!(Catalog::open(&path).is_err());

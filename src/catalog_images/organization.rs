@@ -12,8 +12,7 @@ pub struct ImageMembership {
     pub position: i64,
     pub provenance: serde_json::Value,
 }
-/// Cursor includes examined candidates, including positive-position members
-/// skipped while finding the default/zero-position prefix.
+/// Cursor binds both indexed order phases to the reviewed collection revision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionMemberCursor {
@@ -29,7 +28,7 @@ pub struct CollectionMemberStep {
     pub next: Option<CollectionMemberCursor>,
     pub scanned: usize,
 }
-const MEMBER_DEFAULT_CANDIDATES: &str = "SELECT m.sequence,COALESCE(o.position,0) FROM organization_collection_members m LEFT JOIN organization_collection_order o ON o.collection=m.collection AND o.image_sequence=m.sequence WHERE m.collection=?1 AND m.sequence>?2 ORDER BY m.sequence LIMIT ?3";
+const MEMBER_DEFAULT_CANDIDATES: &str = "SELECT image_sequence,0 FROM organization_collection_zero WHERE collection=?1 AND image_sequence>?2 ORDER BY image_sequence LIMIT ?3";
 const MEMBER_ORDERED_CANDIDATE: &str = "SELECT position,image_sequence FROM organization_collection_order INDEXED BY organization_collection_order_page WHERE collection=?1 AND position>0 AND (position,image_sequence)>(?2,?3) ORDER BY position,image_sequence LIMIT 1";
 
 fn member_at(
@@ -278,8 +277,8 @@ impl Catalog {
     }
     /// Read at most one member while examining at most `scan` indexed candidates.
     /// Empty results can carry progress; callers must follow `next` until None.
-    /// Default/zero positions precede positive positions. Completing that prefix
-    /// may require multiple bounded steps; no catalog-sized sort or backfill runs.
+    /// Default/zero positions precede positive positions. Both phases seek a
+    /// maintained index; old-catalog initialization is separate bounded maintenance.
     pub fn image_collection_member_step(
         &self,
         collection: &str,
@@ -293,6 +292,10 @@ impl Catalog {
             "membership scan/byte bounds"
         );
         let tx = self.db.unchecked_transaction()?;
+        ensure!(
+            super::collection_order_index::ready(&tx)?,
+            "collection order index is preparing; advance bounded organization maintenance"
+        );
         let revision: i64 = tx.query_row(
             "SELECT revision FROM organization_collections WHERE id=?",
             [collection],
@@ -465,9 +468,12 @@ mod bounded_member_tests {
         db.execute_batch("CREATE TABLE organization_collection_members(collection TEXT,sequence INTEGER,provenance TEXT,PRIMARY KEY(collection,sequence));
             CREATE TABLE organization_collection_order(collection TEXT,image_sequence INTEGER,position INTEGER,PRIMARY KEY(collection,image_sequence));
             CREATE INDEX organization_collection_order_page ON organization_collection_order(collection,position,image_sequence);
+            CREATE TABLE organization_collection_zero(collection TEXT,image_sequence INTEGER,PRIMARY KEY(collection,image_sequence)) WITHOUT ROWID;
             WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000)
             INSERT INTO organization_collection_members SELECT 'c',x,'{}' FROM n;
-            INSERT INTO organization_collection_order SELECT collection,sequence,10001-sequence FROM organization_collection_members;")?;
+            INSERT INTO organization_collection_order SELECT collection,sequence,10001-sequence FROM organization_collection_members;
+            UPDATE organization_collection_order SET position=0 WHERE image_sequence BETWEEN 5001 AND 5007;
+            INSERT INTO organization_collection_zero SELECT collection,image_sequence FROM organization_collection_order WHERE position=0;")?;
         let default_plan = db
             .prepare(&format!("EXPLAIN QUERY PLAN {MEMBER_DEFAULT_CANDIDATES}"))?
             .query_map(params!["c", 5000, 7], |r| r.get::<_, String>(3))?
@@ -486,7 +492,7 @@ mod bounded_member_tests {
         assert!(
             default_plan
                 .iter()
-                .any(|v| v.contains("collection=? AND sequence>?")),
+                .any(|v| v.contains("collection=? AND image_sequence>?")),
             "{default_plan:?}"
         );
         assert!(
@@ -505,6 +511,26 @@ mod bounded_member_tests {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
         assert_eq!(row, (4, 9997));
+        // A fresh page on a ready positive-only population performs two indexed
+        // seeks, without revisiting every member to prove the zero phase empty.
+        db.execute_batch("DELETE FROM organization_collection_zero; UPDATE organization_collection_order SET position=10001-image_sequence")?;
+        let mut zero = db.prepare(MEMBER_DEFAULT_CANDIDATES)?;
+        let missing = zero
+            .query_row(params!["c", 0, 7], |r| r.get::<_, i64>(0))
+            .optional()?;
+        assert_eq!(missing, None);
+        let mut positive = db.prepare(MEMBER_ORDERED_CANDIDATE)?;
+        let first: (i64, i64) =
+            positive.query_row(params!["c", 0, 0], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        assert_eq!(first, (1, 10000));
+        for statement in [&zero, &positive] {
+            assert_eq!(
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+                0
+            );
+            assert_eq!(statement.get_status(rusqlite::StatementStatus::Sort), 0);
+            assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 128);
+        }
         Ok(())
     }
 }
