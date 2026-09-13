@@ -134,7 +134,7 @@ python3 scripts/package_desktop.py audit --platform linux \
 
 Use `--platform windows`, the installed `.exe` relative path and a Windows
 policy for NSIS/MSI payloads. Both native normal and delay DLL imports are
-checked. The policies are explicit deployment contracts, for example:
+checked by LLVM's `--coff-imports` output (there is no separate delay-import flag). The policies are explicit deployment contracts, for example:
 
 ```json
 {
@@ -150,7 +150,9 @@ checked. The policies are explicit deployment contracts, for example:
 List exact native names, with a nonempty package/OS contract for every system
 exception. Do not label a build-only image library a system dependency merely
 to make the audit pass. On Linux every packaged non-system dependency must be
-reachable through that object's `$ORIGIN` RPATH/RUNPATH. Absolute build paths,
+reachable through that object's effective `$ORIGIN` search path. When DT_RUNPATH
+is present it supersedes DT_RPATH, including an empty RUNPATH; an empty entry
+is rejected because it depends on the working directory. Absolute build paths,
 relative CWD paths and escaping paths fail. This deliberately stricter local
 layout avoids depending on inherited ELF RPATH or the developer's loader cache.
 `library_directories` identifies payload directories for policy review; it does

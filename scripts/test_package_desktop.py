@@ -175,13 +175,42 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(p.elf_info('app'), (['libjxl.so.0.11'], ['$ORIGIN/../lib', '$ORIGIN'],
                                               'Advanced Micro Devices X86-64'))
 
+    def test_elf_runpath_presence_suppresses_rpath_even_when_empty(self):
+        for runpath, expected in [('$ORIGIN/run', ['$ORIGIN/run']), ('', [''])]:
+            with self.subTest(runpath=runpath):
+                dynamic = (' 0xf (RPATH) Library rpath: [$ORIGIN/old]\n'
+                           f' 0x1d (RUNPATH) Library runpath: [{runpath}]\n')
+                with patch.object(p, 'run', side_effect=[dynamic, ' Machine: X86-64\n']):
+                    self.assertEqual(p.elf_info('app')[1], expected)
+        with patch.object(p, 'run', side_effect=[' 0xf (RPATH) Library rpath: [$ORIGIN/old]\n',
+                                                ' Machine: X86-64\n']):
+            self.assertEqual(p.elf_info('app')[1], ['$ORIGIN/old'])
+
+    def test_linux_dependency_only_in_ignored_rpath_cannot_pass(self):
+        self.file('bin/app')
+        self.file('old/libjxl.so')
+        (self.root / 'run').mkdir()
+        manifest = self.manifest(['libjxl.so'])
+        policy = self.policy('linux')
+        # Exercise the real parser and complete audit, not a fabricated elf_info result.
+        for runpath, error in [('$ORIGIN/../run', 'unresolved dependency'), ('', 'external/relative')]:
+            with self.subTest(runpath=runpath):
+                dynamic = (' 0x1 (NEEDED) Shared library: [libjxl.so]\n'
+                           ' 0xf (RPATH) Library rpath: [$ORIGIN/../old]\n'
+                           f' 0x1d (RUNPATH) Library runpath: [{runpath}]\n')
+                def tool(*args):
+                    return dynamic if args[1] == '-dW' else ' Machine: X86-64\n'
+                with patch.object(p, 'run', side_effect=tool):
+                    with self.assertRaisesRegex(p.PackageError, error):
+                        p.audit_package('linux', self.root, 'bin/app', policy, manifest)
+
     def test_pe_includes_delay_imports(self):
         value = ('ImageFileHeader {\n Machine: IMAGE_FILE_MACHINE_AMD64 (0x8664)\n}\n'
                  'Import {\n Name: KERNEL32.dll\n}\nDelayImport {\n Name: WebView2Loader.dll\n}\n')
         with patch.object(p, 'run', return_value=value) as tool:
             names, _, _ = p.pe_info('app.exe')
         self.assertEqual(names, ['kernel32.dll', 'webview2loader.dll'])
-        self.assertIn('--coff-delay-imports', tool.call_args.args)
+        self.assertEqual(tool.call_args.args, ('llvm-readobj', '--file-headers', '--coff-imports', 'app.exe'))
 
     def test_linux_installed_origin_closure_with_explicit_system_contract(self):
         exe = self.file('bin/app')

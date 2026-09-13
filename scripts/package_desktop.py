@@ -248,7 +248,9 @@ def package_macos(source_app, output, manifest, dmg=False):
 def elf_info(path):
     output = run('readelf', '-dW', path)
     needed = re.findall(r'\(NEEDED\).*?\[(.*?)\]', output)
-    paths = re.findall(r'\((?:RPATH|RUNPATH)\).*?\[(.*?)\]', output)
+    # DT_RUNPATH suppresses DT_RPATH even when its string is empty.
+    runpaths = re.findall(r'\(RUNPATH\).*?\[(.*?)\]', output)
+    paths = runpaths if runpaths else re.findall(r'\(RPATH\).*?\[(.*?)\]', output)
     header = run('readelf', '-hW', path)
     machine = re.search(r'^\s*Machine:\s*(.+)$', header, re.M)
     require(machine is not None, f'ELF machine missing: {path}')
@@ -256,7 +258,8 @@ def elf_info(path):
 
 
 def pe_info(path):
-    output = run('llvm-readobj', '--file-headers', '--coff-imports', '--coff-delay-imports', path)
+    # LLVM's COFFImports dump includes both Import and DelayImport blocks.
+    output = run('llvm-readobj', '--file-headers', '--coff-imports', path)
     needed = re.findall(r'^\s*Name: (.+\.dll)\s*$', output, re.M | re.I)
     machine = re.search(r'^\s*Machine: (.+)$', output, re.M)
     require(machine is not None, f'PE machine missing: {path}')
