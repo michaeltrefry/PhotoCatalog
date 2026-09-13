@@ -25,14 +25,20 @@ describe('organization ownership in the actual App tree', () => {
     const indexingTree = render('indexing'); const indexing = find(indexingTree, OrganizationPanel)!;
     const resumed = find(render('ready'), OrganizationPanel)!;
     expect(ready).toBeDefined(); expect(indexing).toBeDefined(); expect(resumed).toBeDefined();
-    expect([ready.key, indexing.key, resumed.key]).toEqual(['same-catalog', 'same-catalog', 'same-catalog']);
-    expect([find(render('ready'), ImportPanel)?.key, find(indexingTree, ImportPanel)?.key, find(render('ready'), ImportPanel)?.key]).toEqual(['same-catalog', 'same-catalog', 'same-catalog']);
+    expect(ready.key).not.toBeNull();
+    expect([indexing.key, resumed.key]).toEqual([ready.key, ready.key]);
+    const importKey = find(render('ready'), ImportPanel)!.key;
+    expect(importKey).not.toBeNull(); expect(importKey).not.toBe(ready.key);
+    expect([find(indexingTree, ImportPanel)?.key, find(render('ready'), ImportPanel)?.key]).toEqual([importKey, importKey]);
     expect(indexing.props.phase).toBe('indexing'); expect(find(indexingTree, CatalogActivity)).toBeDefined();
   });
   it('removes ownership on close and replaces its key for a different catalog session', () => {
     expect(find(render('closed', null), OrganizationPanel)).toBeUndefined();
     expect(find(render('closed', null), ImportPanel)).toBeUndefined();
-    expect(find(render('ready', 'replacement-catalog'), ImportPanel)?.key).toBe('replacement-catalog');
-    expect(find(render('ready', 'replacement-catalog'), OrganizationPanel)?.key).toBe('replacement-catalog');
+    for (const panel of [ImportPanel, OrganizationPanel]) {
+      const before = find(render('ready'), panel)!;
+      const after = find(render('ready', 'replacement-catalog'), panel)!;
+      expect(after.key).not.toBeNull(); expect(after.key).not.toBe(before.key);
+    }
   });
 });
