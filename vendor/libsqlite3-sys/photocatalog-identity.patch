@@ -1,0 +1,26 @@
+--- a/sqlite3/sqlite3.c
++++ b/sqlite3/sqlite3.c
+@@ -43336,6 +43336,23 @@
+ static int unixFileControl(sqlite3_file *id, int op, void *pArg){
+   unixFile *pFile = (unixFile*)id;
+   switch( op ){
++    /* PhotoCatalog private ABI v1. pArg points to two sqlite3_uint64 values:
++    ** st_dev, st_ino. Observe the compiled unixFile's actual descriptor only;
++    ** never open, duplicate or close a descriptor here. Opcodes >100 are
++    ** reserved by SQLite for applications. See PHOTOCATALOG.md and the patch.
++    */
++    case 0x50434301: {
++      struct stat statbuf;
++      sqlite3_uint64 *identity = (sqlite3_uint64*)pArg;
++      if( identity==0 ) return SQLITE_MISUSE;
++      if( osFstat(pFile->h, &statbuf)!=0 ){
++        storeLastErrno(pFile, errno);
++        return SQLITE_IOERR_FSTAT;
++      }
++      identity[0] = (sqlite3_uint64)statbuf.st_dev;
++      identity[1] = (sqlite3_uint64)statbuf.st_ino;
++      return SQLITE_OK;
++    }
+ #if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
+     case SQLITE_FCNTL_BEGIN_ATOMIC_WRITE: {
+       int rc = osIoctl(pFile->h, F2FS_IOC_START_ATOMIC_WRITE);

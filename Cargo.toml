@@ -34,3 +34,6 @@ vcpkg = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
+
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }

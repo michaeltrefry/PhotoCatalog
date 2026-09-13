@@ -298,6 +298,11 @@ def collect(args):
     component('adobe-dng-sdk', [('Adobe DNG SDK', {'LICENSE.txt': (args.sdk/'LICENSE.txt').read_bytes()})])
     vendor = root/'vendor/xmp_toolkit'
     component('xmp-toolkit', [('xmp_toolkit 1.12.1 with source-preservation changes', local_notices(vendor))])
+    sqlite_vendor = root/'vendor/libsqlite3-sys'
+    sqlite_notices = local_notices(sqlite_vendor)
+    for name in ['UPSTREAM.json', 'PHOTOCATALOG.md', 'photocatalog-identity.patch']:
+        sqlite_notices[name] = (sqlite_vendor/name).read_bytes()
+    component('libsqlite3-sys', [('libsqlite3-sys 0.36.0 / SQLite 3.51.1 with opened-identity observation', sqlite_notices)])
     if args.native_input is not None:
         native_components, native_report = import_native_input(args.native_input, out)
         manifest['components'].extend(native_components)
