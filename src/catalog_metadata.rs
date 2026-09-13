@@ -559,15 +559,18 @@ pub(crate) fn rebuild(db: &Connection, asset: &str) -> Result<()> {
     Ok(())
 }
 fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
-    let (length, data): (i64, Vec<u8>) = db.query_row(
-        "SELECT raw_length,compressed FROM metadata_blobs WHERE hash=?1",
-        [hash],
+    // Admit both sizes in the same SQLite read before rusqlite allocates the
+    // compressed bytes. This matches the inspection bridge's retained-blob bound.
+    let (length, data): (i64, Option<Vec<u8>>) = db.query_row(
+        "SELECT raw_length,CASE WHEN raw_length BETWEEN 0 AND ?2 AND length(compressed)<=?3 THEN compressed END FROM metadata_blobs WHERE hash=?1",
+        params![hash, xmp::MAX_PACKET_BYTES as i64, (xmp::MAX_PACKET_BYTES + 65536) as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(
         (0..=xmp::MAX_PACKET_BYTES as i64).contains(&length),
         "invalid retained blob size"
     );
+    let data = data.context("invalid retained compressed blob size")?;
     let mut bytes = Vec::with_capacity(length as usize);
     ZlibDecoder::new(data.as_slice())
         .take(length as u64 + 1)
@@ -577,6 +580,64 @@ fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
         "retained metadata checksum mismatch"
     );
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod retained_blob_admission_tests {
+    use super::*;
+
+    #[test]
+    fn compressed_size_rejects_before_decoding_even_with_small_raw_claim() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE metadata_blobs(hash TEXT PRIMARY KEY,raw_length INTEGER,compressed BLOB);")?;
+        db.execute(
+            "INSERT INTO metadata_blobs VALUES('oversized',1,zeroblob(?1))",
+            [(xmp::MAX_PACKET_BYTES + 65537) as i64],
+        )?;
+        assert_eq!(
+            read_blob(&db, "oversized").unwrap_err().to_string(),
+            "invalid retained compressed blob size"
+        );
+        for length in [-1, xmp::MAX_PACKET_BYTES as i64 + 1] {
+            db.execute("UPDATE metadata_blobs SET raw_length=?1", [length])?;
+            assert_eq!(
+                read_blob(&db, "oversized").unwrap_err().to_string(),
+                "invalid retained blob size"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_blob_still_requires_exact_raw_length_and_digest() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE metadata_blobs(hash TEXT PRIMARY KEY,raw_length INTEGER,compressed BLOB);")?;
+        let bytes = b"retained exact packet bytes\0\xff";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes)?;
+        db.execute(
+            "INSERT INTO metadata_blobs VALUES(?1,?2,?3)",
+            params![hash, bytes.len() as i64, encoder.finish()?],
+        )?;
+        assert_eq!(read_blob(&db, &hash)?, bytes);
+        for length in [bytes.len() as i64 - 1, bytes.len() as i64 + 1] {
+            db.execute("UPDATE metadata_blobs SET raw_length=?1", [length])?;
+            assert_eq!(
+                read_blob(&db, &hash).unwrap_err().to_string(),
+                "retained metadata checksum mismatch"
+            );
+        }
+        db.execute(
+            "UPDATE metadata_blobs SET raw_length=?1,hash='wrong-digest'",
+            [bytes.len() as i64],
+        )?;
+        assert_eq!(
+            read_blob(&db, "wrong-digest").unwrap_err().to_string(),
+            "retained metadata checksum mismatch"
+        );
+        Ok(())
+    }
 }
 /// Commit a prepared metadata observation within the caller's writer transaction.
 /// Preparation parses and compresses outside the writer; migration proof and its
