@@ -45,6 +45,19 @@ fn post_hydration(
     identity_equal(&post, current)
 }
 impl State {
+    /// Drain a canceled reader without admitting another source or publishing.
+    pub(super) fn drain_canceled(&mut self) -> bool {
+        self.request_cancel();
+        if self
+            .preparing
+            .as_ref()
+            .is_some_and(|p| p.worker.is_finished())
+        {
+            self.preparing = None;
+        }
+        self.ready.clear();
+        self.preparing.is_none()
+    }
     pub(super) fn request_cancel(&mut self) {
         if let Some(preparing) = &mut self.preparing {
             preparing.canceling = true;

@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use photocatalog::{
     Catalog,
     application::*,
@@ -1242,6 +1242,12 @@ fn desktop_backup_restore_uses_selected_catalog_and_explicit_job_admission() -> 
 }
 
 fn pending_imported_fixture(base: &Path) -> Result<(PathBuf, PathBuf, VariantKey, VariantKey)> {
+    pending_imported_fixture_with_digest(base, true)
+}
+fn pending_imported_fixture_with_digest(
+    base: &Path,
+    inspect_original: bool,
+) -> Result<(PathBuf, PathBuf, VariantKey, VariantKey)> {
     let originals = base.join("originals");
     std::fs::create_dir(&originals)?;
     let originals = originals.canonicalize()?;
@@ -1250,8 +1256,31 @@ fn pending_imported_fixture(base: &Path) -> Result<(PathBuf, PathBuf, VariantKey
     std::fs::write(originals.join("source.xmp"), br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:custom="urn:retained:fixture" custom:opaque="retain original XMP"/></rdf:RDF></x:xmpmeta>"#)?;
     let root = base.join("catalog");
     let mut catalog = Catalog::open(&root)?;
-    catalog.import(&originals, None, |_| Ok(()))?;
-    let asset = catalog.browse(0, 1)?[0].id.clone();
+    let asset = if inspect_original {
+        catalog.import(&originals, None, |_| Ok(()))?;
+        catalog.browse(0, 1)?[0].id.clone()
+    } else {
+        // Metadata-only imported fixture: the original has never been inspected.
+        // Retain the sidecar packet without inventing a full original digest.
+        let asset = "pending-imported-original".to_owned();
+        let encoded = |path: &Path| match NativePath::from_path(path) {
+            NativePath::UnixBytes(bytes) => bytes,
+            NativePath::WindowsWide(units) => units.iter().flat_map(|u| u.to_le_bytes()).collect(),
+        };
+        let db = rusqlite::Connection::open(root.join("catalog.sqlite3"))?;
+        db.execute(
+            "INSERT INTO assets(id,location,path_display,state) VALUES(?1,?2,?3,'pending')",
+            rusqlite::params![asset, encoded(&path), path.to_string_lossy()],
+        )?;
+        drop(db);
+        catalog.record_storage_path(&asset, &NativePath::from_path(&path))?;
+        let sidecar = path.with_extension("xmp");
+        catalog.retain_metadata(&asset, &photocatalog::catalog_metadata::Source {
+            kind: "sidecar".into(), locator: encoded(&sidecar), display: sidecar.to_string_lossy().into_owned(), ambiguous: false,
+            provenance: serde_json::json!({"fixture":"retained sidecar; original never inspected"}),
+        }, &photocatalog::xmp_packets::inspect_sidecar(&sidecar, &photocatalog::xmp_packets::Limits::default())?)?;
+        asset
+    };
     let mut registration = photocatalog::catalog_images::ImportImageRequest {
         import_source: "hydration-fixture".into(),
         capture_revision: "1".into(),
@@ -1403,6 +1432,172 @@ fn pending_imported_variants_hydrate_on_demand_without_rewriting_recipes_or_xmp(
     assert_eq!(c.edit_variant(&copy)?.revision, 1);
     assert_eq!(std::fs::read(&path)?, original);
     assert_eq!(std::fs::read(path.with_extension("xmp"))?, sidecar);
+    Ok(())
+}
+
+#[test]
+fn desktop_relink_unverified_imported_variants_confirm_hydrate_and_undo() -> Result<()> {
+    use photocatalog::application::relink as r;
+    let temp = tempfile::tempdir()?;
+    let (root, path, master, copy) = pending_imported_fixture_with_digest(temp.path(), false)?;
+    let custody = |root: &Path| -> Result<serde_json::Value> {
+        let mut state = retained_state(root)?;
+        // Relink/undo intentionally append location history and advance metadata
+        // versions. Retained packets, decisions, observations and recipes stay exact.
+        state.as_object_mut().unwrap().retain(|name, _| {
+            matches!(
+                name.as_str(),
+                "edit_variants"
+                    | "edit_recipe_nodes"
+                    | "edit_redo_nodes"
+                    | "edit_changes"
+                    | "metadata_blobs"
+                    | "metadata_sources"
+                    | "metadata_observations"
+                    | "metadata_packets"
+                    | "metadata_models"
+                    | "metadata_values"
+                    | "metadata_choices"
+            )
+        });
+        Ok(state)
+    };
+    let retained = custody(&root)?;
+    let original = std::fs::read(&path)?;
+    let xmp = std::fs::read(path.with_extension("xmp"))?;
+    let relocated = temp.path().join("relocated");
+    std::fs::create_dir(&relocated)?;
+    let candidate = relocated.join("source.png");
+    std::fs::copy(&path, &candidate)?;
+    std::fs::copy(path.with_extension("xmp"), candidate.with_extension("xmp"))?;
+    let b = Bridge::spawn(config(path.parent().unwrap()))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    let relink = |request| -> Result<r::Response> {
+        let Response::Relink(response) = call(
+            &b,
+            Request::Relink {
+                catalog: token.clone(),
+                request: Box::new(request),
+            },
+        )?
+        else {
+            bail!("relink reply")
+        };
+        Ok(*response)
+    };
+    let await_plan = |response: r::Response| -> Result<r::Plan> {
+        let r::Response::Operation(Some(operation)) = response else {
+            bail!("operation reply")
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let r::Response::Operation(Some(s)) = relink(r::Request::Status {
+                operation: Some(operation.id.clone()),
+            })?
+            else {
+                bail!("status reply")
+            };
+            if s.phase == r::Phase::Complete {
+                return s.plan.ok_or_else(|| anyhow::anyhow!("missing final plan"));
+            }
+            ensure!(
+                !matches!(s.phase, r::Phase::Failed | r::Phase::Canceled),
+                "relink failed: {s:?}"
+            );
+            ensure!(Instant::now() < until, "relink deadline");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let r::Response::Plan(start) = relink(r::Request::Begin {
+        scope: r::Scope::Prefix {
+            from: photocatalog::catalog_storage::PathReference::native(path.parent().unwrap()),
+            destinations: vec![NativePath::from_path(&relocated)],
+        },
+    })?
+    else {
+        bail!("begin reply")
+    };
+    let reviewed = await_plan(relink(r::Request::Prepare {
+        plan: start.id.clone(),
+        revision: start.revision,
+        batch_rows: U64(1),
+    })?)?;
+    assert_eq!(reviewed.unverified, I64(1));
+    let r::Response::Items { rows, next } = relink(r::Request::Items {
+        plan: reviewed.id.clone(),
+        revision: reviewed.revision,
+        after: I64(0),
+        limit: U64(1),
+    })?
+    else {
+        bail!("items")
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(next.is_none());
+    assert_eq!(rows[0].identity_basis, "unverified");
+    let confirmation = reviewed.confirmation_token.context("confirmation token")?;
+    let wrong = relink(r::Request::Confirm {
+        plan: reviewed.id.clone(),
+        revision: reviewed.revision,
+        token: "stale".into(),
+        acknowledgement: "no_retained_original_digest".into(),
+    })?;
+    // Admission is asynchronous; token failure must leave a terminal failed operation.
+    assert!(await_plan(wrong).is_err());
+    let confirmed = await_plan(relink(r::Request::Confirm {
+        plan: reviewed.id,
+        revision: reviewed.revision,
+        token: confirmation,
+        acknowledgement: "no_retained_original_digest".into(),
+    })?)?;
+    assert_eq!(confirmed.user_confirmed, I64(1));
+    let applied = await_plan(relink(r::Request::Apply {
+        plan: confirmed.id,
+        revision: confirmed.revision,
+    })?)?;
+    assert_eq!(applied.state, "applied");
+    wait_ready(&b)?;
+    let preview =
+        request_initial_preview(&b, &token, &copy, "relinked-virtual", PreviewTier::Large)?;
+    let rendered = preview_ready(&b, &token, preview)?;
+    let bytes = b
+        .preview_bytes(token.clone(), rendered.ticket, true)?
+        .recv()?;
+    assert!(image::load_from_memory(bytes.bytes()).is_ok());
+    drop(bytes);
+    let undone = await_plan(relink(r::Request::Undo {
+        plan: applied.id,
+        revision: applied.revision,
+    })?)?;
+    assert_eq!(undone.state, "undone");
+    b.shutdown();
+    assert_eq!(custody(&root)?, retained);
+    let c = Catalog::open(&root)?;
+    assert_eq!(
+        c.storage_status(
+            &master.asset_id,
+            &photocatalog::storage_volume::MountSnapshot {
+                mounts: vec![],
+                complete: false,
+                issues: vec![]
+            }
+        )?
+        .current,
+        photocatalog::catalog_storage::PathReference::native(&path)
+    );
+    assert_eq!(c.edit_variant(&master)?.revision, 1);
+    assert_eq!(c.edit_variant(&copy)?.revision, 1);
+    assert_eq!(std::fs::read(&path)?, original);
+    assert_eq!(std::fs::read(path.with_extension("xmp"))?, xmp);
+    assert_eq!(std::fs::read(&candidate)?, original);
+    assert_eq!(std::fs::read(candidate.with_extension("xmp"))?, xmp);
     Ok(())
 }
 #[test]

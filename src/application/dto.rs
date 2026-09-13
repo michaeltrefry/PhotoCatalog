@@ -35,6 +35,10 @@ decimal!(U64, u64);
     deny_unknown_fields
 )]
 pub enum Request {
+    Relink {
+        catalog: String,
+        request: Box<super::relink::Request>,
+    },
     OpenExisting {
         path: NativePath,
     },
@@ -313,6 +317,7 @@ pub struct PreviewStatus {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Metadata(Box<super::metadata::Response>),
+    Relink(Box<super::relink::Response>),
     Organization(Box<super::organization::Response>),
     Backup(Option<super::backup::Snapshot>),
     Restore(Option<Restored>),
