@@ -4,6 +4,27 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
+The Mac is unlocked and the old v1 app49373 was closed through Close catalog,
+then normal Quit. Installed v5 app20724 now opens the selected16 TEST catalog.
+Its first-open preparation indicator reached Catalog ready; a known existing2017
+CR2 displayed a thumbnail and a large Develop preview. No editing controls were
+changed. Private visual evidence: `sc-22847-installed-gui-v5-125d2K/receipt.json`.
+The2014-02-21 folder exposes a separate stale-source issue: its catalog lists93
+photos, but its present filesystem directory contains two renamed DNG files and
+no `IMG_6997.CR2`. No automatic CR2-to-DNG association or relink was performed;
+the user was asked whether conversion/removal explains the difference.
+
+Cache native-path repair `1f51107` is integrated as `4a51c9c`. It preserves legacy
+TEXT rows, stored previews and both relocation phases while writing versioned
+native BLOB paths under cache schema5. All54 focused local test functions and
+strict Clippy/fmt pass; three physical nonUTF cases remain unqualified on this
+Mac due to filesystem EILSEQ92. Independent review verified7 source and14 evidence
+files: `sc-22847-ci-native-path-independent-rhr25ssc/review.json`.
+CI34762593643 is terminal: contracts passed, all three platform jobs failed.
+Windows reached the same obsolete version1 assertion; its log is retained with
+the Mac/Linux logs. That assertion and the premature-restore fixture are repaired;
+fresh hosted validation and installed Windows execution remain pending.
+
 Latest local integration includes detached export execution `18b6e9e` as `bbf1a67`,
 immutable Lightroom selection review/sealing `51a4fa0` as `b28cf67`, copy admission
 repair `3742163`, and output settings controls `2140721`. Export's48 distinct focused
@@ -29,13 +50,13 @@ Output controls cover the complete current format/depth/size/profile/alpha surfa
 and controller/bridge integration remain unfinished, with no actual export UI claim.
 
 Draft PR16 remote head is `2698e8690d3daa47d73f7e4f6e5fcff6ede7081b` in the PUBLIC
-repository. CI34762593643 contracts passed; Mac/Linux failed and Windows remains
-running at last inspection. Both failed platforms expose an obsolete XMP version1
+repository. CI34762593643 contracts passed; all three platforms failed.
+The platform jobs expose an obsolete XMP version1
 fixture (new native-path version3); Linux additionally exposes a restore fixture
 that already rolled back automatically and a real Unicode-only preview-cache path
 restriction. Private logs: `sc-22847-ci-34762593643-hlby48a6`. The bounded fix preserves
 legacy cache rows/journals through native-path BLOB compatibility in cache schema5;
-implementation and hosted proof remain pending. Do not confuse this with a main
+implementation is integrated above and hosted proof remains pending. This is not a main
 catalog schema change. Full export actor/UI and serialized Lightroom workbench
 are active next slices; S12 remains In Progress and S13 has not started.
 
@@ -48,8 +69,8 @@ unchanged, logical rating3 was recovered, and cancel/Drop/owner EOF all reaped.
 Root verified65 private evidence files and95 package/image-root files, including46
 app files. Receipt: private `sc-22847-mac-v5-build-mw_p9xb3/receipt.json`.
 The app/DMG under `sc-22847-mac-checkpoint-v5` require arm64 macOS26, use ad-hoc
-signing and are not notarized. The old user app49373 remains unchanged; the Mac is
-still locked, so actual user-catalog GUI acceptance has not occurred.
+signing and are not notarized. The old app49373 exited normally; bounded actual
+user-catalog GUI preview verification is recorded above. Full acceptance remains open.
 
 CI repair `c96f063` is integrated as `7b84a86`: the three-command frontend step now
 explicitly selects Bash, so Windows stops at a failed install/test/build command.
