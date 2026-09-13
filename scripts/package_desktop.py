@@ -158,6 +158,41 @@ def notices(manifest_path, libraries, destination=None):
     return result
 
 
+def version_tuple(value):
+    require(re.fullmatch(r'\d+\.\d+(?:\.\d+)?', value) is not None, 'invalid macOS version')
+    return tuple(int(n) for n in value.split('.')) + (0,) * (3 - len(value.split('.')))
+
+
+def mac_minimum(build_commands):
+    # Tool and SDK versions are not deployment targets.
+    platforms = re.findall(r'^\s*platform (\S+)', build_commands, re.M)
+    require(all(p == 'MACOS' for p in platforms), 'non-macOS native dependency')
+    versions = re.findall(r'^\s*minos (\d+\.\d+(?:\.\d+)?)\s*$', build_commands, re.M)
+    versions += re.findall(r'cmd LC_VERSION_MIN_MACOSX\s+cmdsize \d+\s+version (\d+\.\d+(?:\.\d+)?)', build_commands)
+    require(versions, 'native dependency lacks macOS deployment target')
+    return max(versions, key=version_tuple)
+
+
+def raise_mac_floor(app, native_files):
+    import plistlib
+    plist = regular(Path(app) / 'Contents/Info.plist')
+    with plist.open('rb') as stream:
+        values = plistlib.load(stream)
+    declared = values.get('LSMinimumSystemVersion', '10.0')
+    required = max((mac_minimum(run('vtool', '-show-build', p)) for p in native_files), key=version_tuple)
+    effective = max((declared, required), key=version_tuple)
+    values['LSMinimumSystemVersion'] = effective
+    # Architecture-specific lower overrides would otherwise undermine the global floor.
+    if 'LSMinimumSystemVersionByArchitecture' in values:
+        values['LSMinimumSystemVersionByArchitecture'] = {
+            arch: max((value, effective), key=version_tuple)
+            for arch, value in values['LSMinimumSystemVersionByArchitecture'].items()}
+    with plist.open('wb') as stream:
+        plistlib.dump(values, stream)
+    return {'source_declared_minimum': declared, 'native_required_minimum': required,
+            'finalized_minimum': effective}
+
+
 def mac_audit(app, executable):
     app = Path(app).resolve()
     closure = mac_closure(executable)
@@ -174,8 +209,17 @@ def mac_audit(app, executable):
         records.append({'path': str(path.relative_to(app)), 'sha256': sha256(path),
                         'dependencies': [str(p.relative_to(app)) for p in info['edges'].values()],
                         'build_version': run('vtool', '-show-build', path)})
+    import plistlib
+    with regular(app / 'Contents/Info.plist').open('rb') as stream:
+        plist = plistlib.load(stream)
+    minimum = max((mac_minimum(r['build_version']) for r in records), key=version_tuple)
+    declared = plist.get('LSMinimumSystemVersion', '10.0')
+    require(version_tuple(declared) >= version_tuple(minimum), 'declared macOS minimum below native closure')
+    for value in plist.get('LSMinimumSystemVersionByArchitecture', {}).values():
+        require(version_tuple(value) >= version_tuple(minimum), 'architecture macOS minimum below native closure')
     run('codesign', '--verify', '--deep', '--strict', '--verbose=2', app)
-    return {'platform': 'macos', 'architectures': sorted(arches), 'files': records}
+    return {'platform': 'macos', 'architectures': sorted(arches), 'files': records,
+            'native_required_minimum': minimum, 'declared_minimum': declared}
 
 
 def package_macos(source_app, output, manifest, dmg=False):
@@ -222,12 +266,13 @@ def package_macos(source_app, output, manifest, dmg=False):
     notice_dir.mkdir(parents=True, exist_ok=False)
     notice_records = notices(manifest, libraries, notice_dir)
     write_json(notice_dir / 'manifest.json', notice_records)
+    deployment = raise_mac_floor(app, relocated.values())
     # Sign individual dylibs and executable before sealing the app. No credentials.
     for target in relocated.values():
         run('codesign', '--force', '--sign', '-', '--timestamp=none', target)
     run('codesign', '--force', '--sign', '-', '--timestamp=none', app)
     report = mac_audit(app, executable)
-    report.update(protocol=1, status='PASS_DEPENDENCY_CLOSURE_ONLY', notices=notice_records,
+    report.update(deployment=deployment, protocol=1, status='PASS_DEPENDENCY_CLOSURE_ONLY', notices=notice_records,
                   source_executable_sha256=sha256(original), launch_tested=False,
                   distribution_signing='ad-hoc; not notarized')
     write_json(output / 'closure.json', report)

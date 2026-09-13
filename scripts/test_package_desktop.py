@@ -34,6 +34,25 @@ class PackagingTests(unittest.TestCase):
                  'system_dependencies': system or {}}
         return self.file('policy.json', json.dumps(value).encode())
 
+    def test_macos_floor_uses_deployment_not_sdk_or_linker_version(self):
+        output = ('cmd LC_BUILD_VERSION\n platform MACOS\n minos 12.0\n sdk 26.5\n'
+                  ' version 1267.0\ncmd LC_BUILD_VERSION\n platform MACOS\n minos 26.0\n')
+        self.assertEqual(p.mac_minimum(output), '26.0')
+        self.assertEqual(p.mac_minimum('cmd LC_VERSION_MIN_MACOSX\n cmdsize 16\n version 10.13\n sdk 26.5'), '10.13')
+        with self.assertRaises(p.PackageError):
+            p.mac_minimum('cmd LC_BUILD_VERSION\n platform IOS\n minos 26.0\n')
+        with self.assertRaises(p.PackageError):
+            p.mac_minimum('sdk 26.5\n version 1267.0')
+
+    def test_macos_audit_rejects_understated_plist_floor(self):
+        exe = self.file('App.app/Contents/MacOS/app')
+        self.file('App.app/Contents/Info.plist', plistlib.dumps({'LSMinimumSystemVersion': '12.0'}))
+        def tool(*args):
+            return 'arm64' if args[0] == 'lipo' else 'cmd LC_BUILD_VERSION\n platform MACOS\n minos 26.0\n'
+        with patch.object(p, 'mac_info', return_value=([], [])), patch.object(p, 'run', side_effect=tool):
+            with self.assertRaisesRegex(p.PackageError, 'below native closure'):
+                p.mac_audit(exe.parent.parent.parent, exe)
+
     def test_otool_id_is_not_an_edge_and_spaces_survive(self):
         def tool(*args):
             if args[1] == '-D':
@@ -112,7 +131,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_macos_failure_preserves_input_and_never_publishes_pass(self):
         exe = self.file('App.app/Contents/MacOS/app')
-        info = self.file('App.app/Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'app'}))
+        info = self.file('App.app/Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'app', 'LSMinimumSystemVersion': '12.0'}))
         input_hash = p.sha256(exe)
         output = self.root / 'packaged'
         with patch.object(p, 'mac_info', return_value=([], [])), \
@@ -128,7 +147,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_macos_finalizes_new_copy_before_dmg_and_signs_inside_out(self):
         exe = self.file('App.app/Contents/MacOS/app')
-        info = self.file('App.app/Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'app'}))
+        info = self.file('App.app/Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'app', 'LSMinimumSystemVersion': '12.0'}))
         lib = self.file('brew/liba.dylib')
         output = self.root / 'final'
         target_exe = output / 'App.app/Contents/MacOS/app'
@@ -148,6 +167,8 @@ class PackagingTests(unittest.TestCase):
                 states[target] = (deps, paths)
             if args[0] == 'lipo':
                 return 'arm64'
+            if args[0] == 'vtool':
+                return 'cmd LC_BUILD_VERSION\n platform MACOS\n minos 26.0\n sdk 26.5\n version 1267.0\n'
             if args[:2] == ('hdiutil', 'create'):
                 # Installer source is a directory containing the already sealed app.
                 image_root = args[args.index('-srcfolder') + 1]
@@ -161,6 +182,8 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(p.sha256(exe), before)
         self.assertEqual(result['status'], 'PASS_DEPENDENCY_CLOSURE_ONLY')
         self.assertTrue((output / 'dmg.json').is_file())
+        self.assertEqual(result['declared_minimum'], '26.0')
+        self.assertEqual(plistlib.loads(info.read_bytes())['LSMinimumSystemVersion'], '12.0')
         self.assertEqual(states[target_exe][0], ['@executable_path/../Frameworks/liba.dylib'])
         signatures = [args[-1] for args in commands if args[:2] == ('codesign', '--force')]
         self.assertEqual(set(signatures[:-1]), {target_exe, target_lib})

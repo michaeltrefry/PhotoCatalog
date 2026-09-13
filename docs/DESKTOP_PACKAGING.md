@@ -23,9 +23,14 @@ build's existing `RUSTFLAGS` (do not discard existing flags).
 From `desktop/`, after the frontend dependency install:
 
 ```sh
-npm exec tauri build -- --no-bundle
-npm exec tauri bundle -- --bundles app
+python3 ../scripts/desktop_tool.py --desktop . build
+python3 ../scripts/desktop_tool.py --desktop . bundle -- --bundles app
 ```
+
+The wrapper removes every ambient `APPLE_*` and `TAURI_SIGNING_*` variable and
+sets `APPLE_SIGNING_IDENTITY=-`. Use it for local and CI commands: merely omitting
+credentials from the command line does not prevent Tauri from discovering an
+ambient Developer ID/notarization configuration. No credential values are logged.
 
 Use the actual Cargo target directory from that build; it need not be the
 repository's default. Then, from the repository root:
@@ -55,9 +60,14 @@ framework bundles require explicit support and currently fail this finalizer;
 they are not flattened into fake dylibs.
 
 Every copied library must support every architecture in the main executable.
-The report preserves each file's `vtool -show-build` output: review the maximum
-native minimum-OS requirement before declaring a deployment baseline. It is
-not enough to read the executable's minimum OS alone. Missing or ambiguous
+The finalizer reads each file's `vtool -show-build` output and raises the copied
+app's `LSMinimumSystemVersion` (and any per-architecture overrides) to the maximum
+native deployment requirement before signing. The audit rejects an understated
+minimum. SDK/linker versions are not deployment requirements, and no Mach-O
+minimum is rewritten to manufacture compatibility. Source configuration remains
+unchanged. The report records both the source declaration and effective floor;
+for the initial reference Homebrew closure this is macOS 26.0, not the scaffold's
+prospective 12.0 declaration. Missing or ambiguous
 libraries, basename collisions, insufficient install-name space, escaping
 symlinks, external final load paths, and missing license coverage fail.
 
