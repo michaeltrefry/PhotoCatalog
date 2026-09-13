@@ -3,18 +3,22 @@
 import argparse
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import tempfile
 import package_desktop as package
 
 
 def environment(inherited, platform):
+    # Windows os.environ is case-insensitive; its plain-dict snapshot is not.
+    if platform == 'windows':
+        inherited = {key.upper(): value for key, value in inherited.items()}
     env = {k: v for k, v in inherited.items()
            if not k.startswith(('LD_', 'DYLD_', 'APPLE_', 'TAURI_SIGNING_'))
            and k not in {'LIBRARY_PATH', 'CPATH', 'PKG_CONFIG_PATH', 'VCPKG_ROOT'}}
     if platform == 'windows':
-        system = Path(env['SystemRoot'])
-        env['PATH'] = os.pathsep.join(str(system/p) for p in ('System32', ''))
+        package.require(env.get('SYSTEMROOT', '').strip(), 'Windows smoke environment missing SYSTEMROOT')
+        system = PureWindowsPath(env['SYSTEMROOT'])
+        env['PATH'] = ';'.join(str(system/p) for p in ('System32', ''))
     else:
         env['PATH'] = '/usr/bin:/bin:/usr/sbin:/sbin'
     return env
