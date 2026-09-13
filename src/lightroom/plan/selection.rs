@@ -232,7 +232,8 @@ struct ReviewEvidence {
 }
 mod preparation;
 pub use preparation::{
-    PreparationChunk, PreparationDocument, PreparationSource, PreparationSources,
+    PREPARATION_CHUNK_BYTES, PREPARATION_PAGE_ROWS, PreparationChunk, PreparationDocument,
+    PreparationSource, PreparationSources,
 };
 
 pub struct SelectionReview {

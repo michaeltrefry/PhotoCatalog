@@ -16,7 +16,7 @@ export type Request =
  | {kind:'InputAppend';guard:Guard;input:string;offset:Decimal;fragment:string}
  | {kind:'InputFinish'|'InputDiscard';guard:Guard;input:string}
  | {kind:'InputStatus';guard:Guard;input:string|null};
-export type Options={envelope_bytes:Decimal;chunk_bytes:Decimal;input_slots:Decimal;input_owned_factor:Decimal;minimum_nonfinal_chunk_bytes:Decimal;workbench:WorkbenchLimits;inspection:InspectionLimits;selection:SelectionLimits};
+export type Options={envelope_bytes:Decimal;chunk_bytes:Decimal;input_slots:Decimal;input_owned_factor:Decimal;minimum_nonfinal_chunk_bytes:Decimal;selection_preparation_chunk_bytes:Decimal;selection_preparation_page_rows:Decimal;workbench:WorkbenchLimits;inspection:InspectionLimits;selection:SelectionLimits};
 export type ResultPage=Guard & {attempt:string;token:string;offset:Decimal;next:Decimal|null;total_bytes:Decimal;json_fragment:string};
 export type WorkbenchLimits = { request_bytes: Decimal; result_bytes: Decimal; page_bytes: Decimal; row_bytes: Decimal; native_path_units: Decimal; vm_steps: Decimal; deadline_ms: Decimal };
 export type InspectionLimits = { max_files: Decimal; max_depth: Decimal; max_file_bytes: Decimal; max_total_bytes: Decimal; max_cell_bytes: Decimal };

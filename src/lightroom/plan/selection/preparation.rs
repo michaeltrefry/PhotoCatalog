@@ -3,6 +3,9 @@
 use super::*;
 use rusqlite::params;
 
+pub const PREPARATION_CHUNK_BYTES: usize = 64 * 1024;
+pub const PREPARATION_PAGE_ROWS: usize = 256;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum PreparationDocument {
@@ -34,7 +37,7 @@ impl SelectionReview {
         cancel: Arc<AtomicBool>,
     ) -> Result<PreparationChunk> {
         ensure!(
-            (1..=64 * 1024).contains(&limit),
+            (1..=PREPARATION_CHUNK_BYTES).contains(&limit),
             "selection preparation chunk byte admission"
         );
         let sql = SqlBudget::new(&self.plan.db, self.summary.limits, cancel);
@@ -119,7 +122,7 @@ impl SelectionReview {
         cancel: Arc<AtomicBool>,
     ) -> Result<PreparationSources> {
         ensure!(
-            after >= 0 && (1..=256).contains(&limit),
+            after >= 0 && (1..=PREPARATION_PAGE_ROWS).contains(&limit),
             "selection preparation source page bounds"
         );
         let sql = SqlBudget::new(&self.plan.db, self.summary.limits, cancel);

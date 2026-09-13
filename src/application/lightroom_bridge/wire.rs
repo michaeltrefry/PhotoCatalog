@@ -528,6 +528,8 @@ pub struct Options {
     pub input_slots: U64,
     pub input_owned_factor: U64,
     pub minimum_nonfinal_chunk_bytes: U64,
+    pub selection_preparation_chunk_bytes: U64,
+    pub selection_preparation_page_rows: U64,
     pub workbench: WorkbenchLimits,
     pub inspection: InspectionLimits,
     pub selection: SelectionLimits,

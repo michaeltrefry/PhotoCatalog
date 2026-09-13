@@ -196,6 +196,12 @@ fn options(envelope: usize) -> Options {
         input_slots: U64(1),
         input_owned_factor: U64(3),
         minimum_nonfinal_chunk_bytes: U64(4096),
+        selection_preparation_chunk_bytes: U64(
+            crate::lightroom::selection::PREPARATION_CHUNK_BYTES as u64,
+        ),
+        selection_preparation_page_rows: U64(
+            crate::lightroom::selection::PREPARATION_PAGE_ROWS as u64
+        ),
         workbench: lw::Limits::default().into(),
         inspection: crate::lightroom::Limits::default().into(),
         selection: crate::lightroom::selection::SelectionLimits::default().into(),
