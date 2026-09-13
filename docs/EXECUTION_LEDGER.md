@@ -183,16 +183,55 @@ population. Schema-9 adds seven partial indexes that retain unknown keys and
 checks at most eight exact value/NULL branches per query. All 36 focused tests,
 strict all-target Clippy, formatting and independent source review pass. The
 20,000-row regression checks bounded VM work across every lookup shape; migration
-failure rolls back both DDL and schema version. The actual TEST remains at its
-audited schema 8. A quiescent safety copy will precede the index-only upgrade.
+failure rolls back both DDL and schema version. Source `7fda5ebd` passed 627 release
+test instances and all four PR CI jobs. The actual TEST's quiescent schema-8 APFS
+safety copy remains preserved. Its shipping CLI completed the index-only upgrade
+in 147.409 seconds with 587,022,336 bytes sampled peak RSS. All seven index
+definitions match; pre-existing schema objects, import/repair checkpoints, mapping
+epoch and 16 report digests are unchanged. The schema-9 database grew by
+228,605,952 bytes. This reviewed DDL-path and checkpoint evidence is separate from
+the earlier full schema-8 audit; it is not a new complete payload hash.
 
 The organization audit accounts for 4,894 retained keyword memberships and 429
 retained collection memberships without native endpoints. A bounded dictionary
-diagnostic is being prepared to distinguish unsupported source structures from
-an import defect; those classifications alone do not prove native organization
-acceptance.
-Representative API readback, lookup-correction validation, final acceptance
-review, merge and terminal merged-head CI remain required for S10.
+diagnostic checked all 566 dictionary ledger rows: 390 native collections, 20
+retained collection types, and 156 retained keyword records. Exact retained-row
+proofs establish 16 typed Null-name/Null-parent keyword boundaries. Their rejection
+blocked 140 named keywords and the keyword memberships. A narrow boundary adapter
+is independently reviewed and locally committed as `0ec76399`, with 25 focused
+tests and strict Clippy passing. Atomic archived recovery of the completed TEST
+is source-qualified and awaiting actual execution; it must preserve original custody, current-settings repair
+archives, recipes and local choices, and publish fresh reconciliation reports.
+The 20 retained collection records are Lightroom print, slideshow, book and
+web-gallery constructs. An exact endpoint diagnostic verified all 429 memberships
+in 1.787 seconds: every image has a native mapping and every collection belongs
+to that unsupported roster. Its 9,090 queries processed 8,000,016 metadata bytes
+without changing the database stamp. No unresolved or missing image endpoint
+remains in this population; independent actual-result review passed. The affected
+memberships use two print collections (321) and one unsaved book collection (108).
+
+The schema-9 public API probe passed for three selected cases in 0.256 seconds:
+a translated master, virtual-copy history and earlier settings, with matching
+recipe identities and four literal filesystem folder pages. Independent review
+verified the exact source, selection, process cleanup and unchanged main database
+stamp. Empty WAL/SHM companions were removed on normal close. The history endpoint
+remained addressable but its selected payload was not parsed. Exact retained-cell
+inspection confirms a 14,760-byte Blob, which the text extractor preserves without
+interpretation. All 16 root-table digests are now available for recovery admission.
+A fresh schema-9 APFS safety copy passed exact checkpoint and epoch readback before
+keyword recovery; it is not a full restore or payload-hash qualification. Independent
+review verified the backup and retained-cell diagnostic. These bounded
+observations do not claim actual image rendering or complete migration acceptance.
+The atomic keyword recovery source is locally committed as `ee723c15` and has
+passed independent review, 154 distinct associated tests across preserved runs
+and focused corrections, strict Clippy and formatting. Tests cover exact master
+and virtual candidate terms, effective local choices, source-parent guards,
+reopen/resume, pending-operation fencing and atomic archive/ledger/report rollback.
+An actual read-only predecessor pass bound all 5,050 dictionary/membership records
+and 16 complete root proofs in 246 queries and 0.119 seconds. The recovery request
+is held pending full release qualification; no keyword replacement has run yet.
+Keyword recovery, full post-recovery audit and public readback, final acceptance review,
+merge and terminal merged-head CI remain required for S10.
 S11 backup/restore and S12 Tauri interface retain their S10 dependencies;
 S13 integrated readiness follows both.
 Fieldbook remains a design reference, not the product name.
