@@ -37,8 +37,15 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
   if (owner.current.open !== open) { owner.current.open = open; owner.current.generation += 1; }
   const activeAbort = useRef<AbortController | null>(null);
   const active = useRef(false), reading = useRef<AbortController | null>(null);
-  const pendingReview = useRef<{ generation: number; value: Omit<Review, 'token' | 'total'> } | null>(null);
-  const [availableReview, setAvailableReview] = useState<Review | null>(null);
+  const draftKey = JSON.stringify({ settings, budget, frozen, directory, prefix, suffix, variantSuffix, sequence, metadataMode, baseModel, chosen: [...chosen] });
+  const draftKeyRef = useRef(draftKey); draftKeyRef.current = draftKey;
+  const pendingReview = useRef<{ generation: number; draftKey: string; value: Omit<Review, 'token' | 'total'> } | null>(null);
+  const [availableReview, setAvailableReview] = useState<(Review & { draftKey: string }) | null>(null);
+  const adoptableReview = availableReview?.draftKey === draftKey ? availableReview : null;
+  useEffect(() => {
+    setAvailableReview(value => value?.draftKey === draftKey ? value : null);
+    if (pendingReview.current?.draftKey !== draftKey) pendingReview.current = null;
+  }, [draftKey]);
   useEffect(() => { owner.current.alive = true; return () => { owner.current.alive = false; activeAbort.current?.abort(); reading.current?.abort(); }; }, []);
   useEffect(() => { if (!open) { activeAbort.current?.abort(); reading.current?.abort(); } }, [open]);
   useEffect(() => {
@@ -57,7 +64,7 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
     if (op.result?.kind === 'destinations') {
       const { token, total } = op.result.value;
       setTokens(v => v.some(t => tokenId(t) === token) ? v : [...v, { kind: 'destinations', token }]);
-      if (pendingReview.current?.generation === owner.current.generation) setAvailableReview({ ...pendingReview.current.value, token, total });
+      if (pendingReview.current?.generation === owner.current.generation && pendingReview.current.draftKey === draftKeyRef.current) setAvailableReview({ ...pendingReview.current.value, draftKey: pendingReview.current.draftKey, token, total });
     }
     if (op.result?.kind === 'recovery') { setRecoveredKey(op.result.value.complete ? pendingRecovery.current : null); setRecovery(op.result.value.complete ? 'Recovery completed for this service session. Run remains explicit.' : `Recovery examined its budget (${op.result.value.fenced} fenced). Run recovery again explicitly to finish.`); }
     setEpoch(v => v + 1);
@@ -144,10 +151,13 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
     const output = exportOutput(settings) as Output;
     const frozenBudget = structuredClone(validateBudgets(budget));
     const value = { targets: frozen, output, budgets: frozenBudget };
-    pendingReview.current = { generation, value };
+    const requestedDraftKey = draftKey;
+    pendingReview.current = { generation, draftKey: requestedDraftKey, value };
     const result = await operation({ command: 'destinations', args: { directory, targets: frozen.map(v => v.target), format: output.format, naming: naming(prefix, suffix, variantSuffix, sequence, frozen.length) } }, generation);
     if (result.result?.kind !== 'destinations') throw new Error('Destination result missing. Inspect operation status.');
-    check(generation); setReview({ ...value, ...result.result.value }); setOverwrite(new Set()); setAppended(new Set());
+    check(generation);
+    if (draftKeyRef.current !== requestedDraftKey) throw new Error('Export settings or targets changed. Preview destination names again.');
+    setReview({ ...value, ...result.result.value }); setOverwrite(new Set()); setAppended(new Set());
   });
   const appendDestination = (destination: Destination) => attempt('Appending frozen output plan', async generation => {
     if (!job || !review || !destination.destination) return;
@@ -197,7 +207,7 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
       {!!frozen.length && <details><summary>{frozen.length} frozen logical targets</summary>{frozen.map(v => <p key={imageKey(v.target.key)}>{v.filename} · {v.label} · edit {v.target.expected_revision} · {v.metadata.mode === 'omit' ? 'metadata omitted' : `metadata ${v.metadata.expected_revision}, base ${v.metadata.base_model ?? 'default'}`}</p>)}</details>}
       <ExportSettings value={settings} onChange={setSettings} disabled={locked || !!review} choosingProfile={busy === 'Reading ICC profile'} chooseProfile={chooseProfile} />
       <fieldset disabled={locked || !!review}><legend>Destination naming</legend><button onClick={() => attempt('Choosing output directory', async generation => { const choice = await chooseLocation('export_directory'); check(generation); if (choice) setDirectory(choice.path); })}>Choose output directory</button>{directory && <ExportPath path={directory} />}<label>Prefix<input value={prefix} onChange={e => setPrefix(e.target.value)} /></label><label>Suffix<input value={suffix} onChange={e => setSuffix(e.target.value)} /></label><label className="checkbox"><input type="checkbox" checked={variantSuffix} onChange={e => setVariantSuffix(e.target.checked)} />Include the variant label in each filename</label><label>Optional starting filename sequence<input value={sequence} onChange={e => setSequence(e.target.value)} inputMode="numeric" /></label><p>No existence-based suffix or silent overwrite is added. Review the returned native paths and errors before each append.</p><button disabled={!frozen.length || !directory} onClick={previewNames}>Preview exact destination names</button></fieldset>
-      {availableReview && !review && <button disabled={locked} onClick={() => { setReview(availableReview); setOverwrite(new Set()); setAppended(new Set()); }}>Use completed naming review ({availableReview.total} targets)</button>}
+      {adoptableReview && !review && <button disabled={locked} onClick={() => { if (adoptableReview.draftKey !== draftKeyRef.current) return; setReview(adoptableReview); setAvailableReview(null); setOverwrite(new Set()); setAppended(new Set()); }}>Use completed naming review ({adoptableReview.total} targets)</button>}
       {review && <section><h4>Frozen destination review · {review.total} targets</h4><p>Each append freezes the reviewed output settings. Existing destinations require explicit authorization; collisions and changed identities reject. To change settings, release this naming review below.</p><ExportPage key={review.token} catalog={catalog} kind="destinations" owner={review.token} limit={pageLimit}>{row => <><strong>{row.name.filename} · {row.name.variant_label}</strong>{row.destination && <ExportPath path={row.destination} />}{row.error && <ErrorNotice message={row.error} />}<label className="checkbox"><input disabled={locked || appended.has(imageKey(row.target.key))} type="checkbox" checked={overwrite.has(imageKey(row.target.key))} onChange={e => setOverwrite(v => { const next = new Set(v); if (e.target.checked) next.add(imageKey(row.target.key)); else next.delete(imageKey(row.target.key)); return next; })} />Authorize replacement of this destination if it already exists, preserving its captured original</label><button disabled={locked || uncertain || !!row.error || !row.destination || appended.has(imageKey(row.target.key))} onClick={() => appendDestination(row)}>{appended.has(imageKey(row.target.key)) ? 'Appended to saved job' : 'Append this reviewed output'}</button></>}</ExportPage></section>}
     </section>}
     <details><summary>Imported path preparation</summary><p>Project bounded imported original paths when append reports unprepared paths. Unbound originals still require Locate originals; they are never skipped automatically.</p><label>Paths per step<input value={pathRows} onChange={e => setPathRows(e.target.value)} /></label><button disabled={locked} onClick={() => attempt('Preparing imported paths', async generation => { const result = await operation({ command: 'paths', args: { limit: decimal(pathRows, 'Paths per step', '1', '512') } }, generation); if (result.result?.kind === 'paths') { check(generation); const v = result.result.value; setPaths(`${v.projected} projected; ${v.pending ? 'more steps pending' : 'projection complete'}; ${v.unbound} unbound.`); } }, true)}>Prepare one path step</button><p role="status">{paths}</p></details>

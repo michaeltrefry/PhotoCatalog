@@ -17,7 +17,11 @@ restore, or resume saved work. Every publication-capable action is explicit.
   metadata revision with an optional explicit retained base-model ID.
 - Native destination selection and Destinations produce bounded named pages.
   The review retains the exact output settings, budgets and target identities.
-  Each Append uses the reviewed native destination, explicit overwrite choice,
+  A completed naming review is bound to its full draft settings, profile, budgets,
+  frozen targets/metadata, selection and native naming inputs. Any changed input
+  invalidates adoption, including when the result arrives after Stop waiting.
+  Preview names again to obtain a matching review; obsolete tokens remain
+  explicitly releasable. Each Append uses the reviewed native destination, explicit overwrite choice,
   frozen metadata and current expected job total. Targets can span library pages.
   Errors/collisions never trigger silent renaming, skipping or overwrite.
 - Seal checks the exact saved total. Run uses explicit attempt/time budgets;
