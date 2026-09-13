@@ -1122,55 +1122,230 @@ fn name_key(name: &std::ffi::OsStr) -> Vec<u8> {
         key
     }
 }
-impl Catalog {
-    pub(crate) fn begin_metadata_scan(&self) -> Result<()> {
-        self.db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS metadata_scan_dirs(directory BLOB PRIMARY KEY); CREATE TEMP TABLE IF NOT EXISTS metadata_scan_files(directory BLOB NOT NULL,name BLOB NOT NULL,stem BLOB NOT NULL,full_name BLOB NOT NULL,path BLOB NOT NULL,display TEXT NOT NULL,sidecar INTEGER NOT NULL,PRIMARY KEY(directory,name)); CREATE INDEX IF NOT EXISTS metadata_scan_stem ON metadata_scan_files(directory,stem); CREATE INDEX IF NOT EXISTS metadata_scan_name ON metadata_scan_files(directory,full_name); DELETE FROM metadata_scan_dirs; DELETE FROM metadata_scan_files;")?;
-        Ok(())
+pub(crate) fn set_import_source_unavailable(
+    tx: &Transaction<'_>,
+    asset: &str,
+    source: &Source,
+    reason: &str,
+) -> Result<bool> {
+    let previous:Option<String>=tx.query_row("SELECT availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![asset,source.kind,source.locator],|r|r.get(0)).optional()?;
+    if previous.as_deref() == Some(reason) {
+        return Ok(false);
     }
-    fn index_metadata_directory(&self, directory: &Path) -> Result<()> {
-        let key = location_bytes(directory);
-        let indexed: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM metadata_scan_dirs WHERE directory=?1)",
-            [&key],
-            |r| r.get(0),
-        )?;
-        if indexed {
-            return Ok(());
-        }
-        // One directory enumeration per import scan; disk-backed indexed joins avoid O(files²).
-        let tx = self.db.unchecked_transaction()?;
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if ext != "xmp" && !crate::media::supported_extension(&ext) {
-                continue;
-            }
-            let name = path.file_name().context("source has no filename")?;
-            let stem = path.file_stem().context("source has no stem")?;
-            tx.execute(
-                "INSERT INTO metadata_scan_files VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    key,
-                    location_bytes(Path::new(name)),
-                    name_key(stem),
-                    name_key(name),
-                    location_bytes(&path),
-                    path.to_string_lossy(),
-                    ext == "xmp"
-                ],
+    tx.execute("INSERT INTO metadata_sources(asset_id,kind,locator,display,association,availability) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(asset_id,kind,locator) DO UPDATE SET availability=excluded.availability",params![asset,source.kind,source.locator,source.display,if source.ambiguous {"ambiguous"} else {"confirmed"},reason])?;
+    // The foreground master receives this change now; the bounded queue
+    // propagates it to followers without advancing the master twice.
+    tx.execute("INSERT OR IGNORE INTO metadata_image_observations SELECT ?1,current_observation FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 AND current_observation IS NOT NULL",params![asset,source.kind,source.locator])?;
+    tx.execute("INSERT INTO metadata_image_sources SELECT ?1,id,current_observation,1,locator,association,availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 ON CONFLICT(image_id,source_id) DO UPDATE SET current_observation=excluded.current_observation,logical_locator=excluded.logical_locator,association=excluded.association,availability=excluded.availability",params![asset,source.kind,source.locator])?;
+    advance(
+        tx,
+        asset,
+        "source_unavailable",
+        &serde_json::json!({"kind":source.kind,"display":source.display,"reason":reason}),
+        true,
+    )?;
+    let source_id: i64 = tx.query_row(
+        "SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",
+        params![asset, source.kind, source.locator],
+        |r| r.get(0),
+    )?;
+    crate::catalog_images::enqueue_source_state(tx, source_id)?;
+    crate::catalog_images::step_refresh(tx, 32)?;
+    Ok(true)
+}
+
+pub(crate) fn apply_import_source(
+    tx: &Transaction<'_>,
+    asset: &str,
+    input: &PreparedImportSource,
+) -> Result<(bool, bool)> {
+    let changed = match &input.prepared {
+        Ok(prepared) => retain_prepared(tx, asset, &input.source, prepared, true)?.changed,
+        Err(reason) => set_import_source_unavailable(tx, asset, &input.source, reason)?,
+    };
+    crate::catalog_storage::record_metadata_path(
+        tx,
+        asset,
+        &input.source.kind,
+        &path_from_bytes(&input.source.locator)?,
+    )?;
+    Ok((changed, input.warning || input.source.ambiguous))
+}
+pub(crate) fn finish_import_sources(
+    tx: &Transaction<'_>,
+    asset: &str,
+    seen: &BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    let previous=tx.prepare("SELECT locator,display,association FROM metadata_sources WHERE asset_id=?1 AND kind='sidecar'")?.query_map([asset],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut changed = false;
+    for (locator, display, association) in previous {
+        if !seen.contains(&locator) {
+            changed |= set_import_source_unavailable(
+                tx,
+                asset,
+                &Source {
+                    kind: "sidecar".into(),
+                    locator,
+                    display,
+                    ambiguous: association == "ambiguous",
+                    provenance: serde_json::Value::Null,
+                },
+                "not found in current directory scan; retained metadata remains available",
             )?;
         }
-        tx.execute("INSERT INTO metadata_scan_dirs VALUES(?1)", [key])?;
-        tx.commit()?;
-        Ok(())
+    }
+    Ok(changed)
+}
+
+pub(crate) fn initialize_discovery(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS metadata_scan_dirs(directory BLOB PRIMARY KEY); CREATE TEMP TABLE IF NOT EXISTS metadata_scan_files(directory BLOB NOT NULL,name BLOB NOT NULL,stem BLOB NOT NULL,full_name BLOB NOT NULL,path BLOB NOT NULL,display TEXT NOT NULL,sidecar INTEGER NOT NULL,PRIMARY KEY(directory,name)); CREATE INDEX IF NOT EXISTS metadata_scan_stem ON metadata_scan_files(directory,stem); CREATE INDEX IF NOT EXISTS metadata_scan_name ON metadata_scan_files(directory,full_name); DELETE FROM metadata_scan_dirs; DELETE FROM metadata_scan_files;")?;
+    Ok(())
+}
+fn index_directory(
+    db: &Connection,
+    directory: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let key = location_bytes(directory);
+    let indexed: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata_scan_dirs WHERE directory=?1)",
+        [&key],
+        |r| r.get(0),
+    )?;
+    if indexed {
+        return Ok(());
+    }
+    // One directory enumeration per import scan; disk-backed indexed joins avoid O(files²).
+    let tx = db.unchecked_transaction()?;
+    let mut entries = 0usize;
+    for entry in fs::read_dir(directory)? {
+        if let Some(cancel) = cancel {
+            ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Acquire),
+                "metadata discovery canceled"
+            );
+            entries += 1;
+            ensure!(
+                entries <= xmp_packets::Limits::default().max_entries,
+                "directory metadata association entry limit exceeded; no truncated associations admitted"
+            );
+        }
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext != "xmp" && !crate::media::supported_extension(&ext) {
+            continue;
+        }
+        let name = path.file_name().context("source has no filename")?;
+        let stem = path.file_stem().context("source has no stem")?;
+        tx.execute(
+            "INSERT INTO metadata_scan_files VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                key,
+                location_bytes(Path::new(name)),
+                name_key(stem),
+                name_key(name),
+                location_bytes(&path),
+                path.to_string_lossy(),
+                ext == "xmp"
+            ],
+        )?;
+    }
+    tx.execute("INSERT INTO metadata_scan_dirs VALUES(?1)", [key])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Worker-owned directory facts; no catalog connection or authority is held.
+pub(crate) struct ImportDiscovery {
+    db: Connection,
+}
+impl ImportDiscovery {
+    pub(crate) fn new() -> Result<Self> {
+        let db = Connection::open("")?;
+        db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;")?;
+        initialize_discovery(&db)?;
+        db.execute_batch("PRAGMA temp.max_page_count=16384; PRAGMA temp.cache_size=-8192;")?;
+        Ok(Self { db })
+    }
+    pub(crate) fn sidecars(
+        &self,
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Source>> {
+        let directory = path.parent().context("original has no parent")?;
+        index_directory(&self.db, directory, Some(cancel))?;
+        let stem = name_key(path.file_stem().context("original has no stem")?);
+        let name = name_key(path.file_name().context("original has no filename")?);
+        let rows=self.db.prepare("SELECT path,display,stem FROM metadata_scan_files WHERE directory=?1 AND sidecar=1 AND (stem=?2 OR stem=?3) ORDER BY name LIMIT 1025")?.query_map(params![location_bytes(directory),stem,name],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            rows.len() <= 1024,
+            "sidecar association limit exceeded; no associations silently discarded"
+        );
+        let multiple = rows.len() > 1;
+        rows.into_iter().map(|(locator, display, key)| {
+            let matches:i64=self.db.query_row("SELECT count(*) FROM metadata_scan_files WHERE directory=?1 AND sidecar=0 AND (stem=?2 OR full_name=?2)",params![location_bytes(directory),key],|r|r.get(0))?;
+            Ok(Source {kind:"sidecar".into(), locator, display, ambiguous:multiple || matches!=1,
+                provenance:serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}})})
+        }).collect()
+    }
+}
+pub(crate) struct PreparedImportSource {
+    pub(crate) source: Source,
+    pub(crate) prepared: std::result::Result<Prepared, String>,
+    pub(crate) warning: bool,
+}
+pub(crate) fn prepare_import_source(
+    source: Source,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedImportSource> {
+    let path = path_from_bytes(&source.locator)?;
+    let inspected = xmp_packets::inspect_cancellable(
+        &path,
+        &Limits::default(),
+        source.kind == "sidecar",
+        cancel,
+    );
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    let (prepared, warning) = match inspected {
+        Ok(inspection) => {
+            let prepared = Prepared::new(&inspection, &source)?;
+            let warning = !matches!(inspection.status, Status::Complete | Status::Absent)
+                || prepared
+                    .models
+                    .iter()
+                    .any(|m| m.error.is_some() || !m.projection.issues.is_empty());
+            (Ok(prepared), warning)
+        }
+        Err(e) => (Err(format!("inspection failed: {e}")), true),
+    };
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    Ok(PreparedImportSource {
+        source,
+        prepared,
+        warning,
+    })
+}
+
+impl Catalog {
+    pub(crate) fn begin_metadata_scan(&self) -> Result<()> {
+        initialize_discovery(&self.db)
+    }
+    fn index_metadata_directory(&self, directory: &Path) -> Result<()> {
+        index_directory(&self.db, directory, None)
     }
     fn unavailable_metadata_source(
         &mut self,
@@ -1184,32 +1359,9 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let previous:Option<String>=tx.query_row("SELECT availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![asset,source.kind,source.locator],|r|r.get(0)).optional()?;
-        if previous.as_deref() == Some(reason) {
-            return Ok(false);
-        }
-        tx.execute("INSERT INTO metadata_sources(asset_id,kind,locator,display,association,availability) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(asset_id,kind,locator) DO UPDATE SET availability=excluded.availability",params![asset,source.kind,source.locator,source.display,if source.ambiguous {"ambiguous"} else {"confirmed"},reason])?;
-        // The foreground master receives this change now; the bounded queue
-        // propagates it to followers without advancing the master twice.
-        tx.execute("INSERT OR IGNORE INTO metadata_image_observations SELECT ?1,current_observation FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 AND current_observation IS NOT NULL",params![asset,source.kind,source.locator])?;
-        tx.execute("INSERT INTO metadata_image_sources SELECT ?1,id,current_observation,1,locator,association,availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 ON CONFLICT(image_id,source_id) DO UPDATE SET current_observation=excluded.current_observation,logical_locator=excluded.logical_locator,association=excluded.association,availability=excluded.availability",params![asset,source.kind,source.locator])?;
-        advance(
-            &tx,
-            asset,
-            "source_unavailable",
-            &serde_json::json!({"kind":source.kind,"display":source.display,"reason":reason}),
-            true,
-        )?;
-        let source_id: i64 = tx.query_row(
-            "SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",
-            params![asset, source.kind, source.locator],
-            |r| r.get(0),
-        )?;
-        crate::catalog_images::enqueue_source_state(&tx, source_id)?;
-        crate::catalog_images::step_refresh(&tx, 32)?;
+        let changed = set_import_source_unavailable(&tx, asset, source, reason)?;
         tx.commit()?;
-        drop(_write);
-        Ok(true)
+        Ok(changed)
     }
     fn inspect_metadata_source(
         &mut self,

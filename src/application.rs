@@ -10,7 +10,7 @@ use crate::{
     preview::{self, PreviewService},
     storage_volume::NativePath,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 pub use dto::*;
 use std::{
     collections::{HashMap, VecDeque},
@@ -75,6 +75,8 @@ pub struct Config {
     pub preview_policy: preview::PreviewPolicy,
     pub preview_limits: preview::ServiceLimits,
     pub limits: Limits,
+    #[cfg(test)]
+    import_checkpoint: Option<crate::import_preparation::Checkpoint>,
 }
 #[derive(Clone)]
 pub struct Limits {
@@ -273,6 +275,8 @@ struct Queue {
     viewport: HashMap<(String, String), u64>,
     status: Status,
     active_cancel: Option<Cancellation>,
+    import_status: Option<ImportStatus>,
+    import_cancel: Option<Cancellation>,
     ticket_foreground: HashMap<(String, String), TicketPriority>,
 }
 struct Shared {
@@ -325,6 +329,8 @@ impl Bridge {
                     message: None,
                 },
                 active_cancel: None,
+                import_status: None,
+                import_cancel: None,
                 ticket_foreground: HashMap::new(),
             }),
             wake: Condvar::new(),
@@ -356,6 +362,28 @@ impl Bridge {
         let mut q = self.0.shared.queue.lock().unwrap();
         if q.stopping {
             return Err(error(ErrorCode::Closed, "catalog owner closed"));
+        }
+        if let Request::ImportStatus { catalog } | Request::ImportCancel { catalog, .. } = &request
+        {
+            if q.status.catalog.as_ref() != Some(catalog) {
+                return Err(error(ErrorCode::StaleSession, "catalog session changed"));
+            }
+            if let Request::ImportCancel { import, .. } = &request {
+                if q.import_status.as_ref().map(|s| &s.id) != Some(import) {
+                    return Err(error(ErrorCode::StaleSession, "import attempt changed"));
+                }
+                if let Some(c) = &q.import_cancel {
+                    c.cancel();
+                    if let Some(s) = &mut q.import_status {
+                        s.phase = ImportPhase::CancelRequested;
+                    }
+                }
+            }
+            let _ = tx.send(Reply::Ok {
+                value: Response::Import(q.import_status.clone()),
+            });
+            self.0.shared.wake.notify_one();
+            return Ok(Pending { receiver, cancel });
         }
         if let Request::ReleaseViewport {
             catalog,
@@ -586,6 +614,42 @@ struct Open {
     tickets: HashMap<String, Ticket>,
     index_pending: bool,
     jobs_held: bool,
+    import: Option<ImportTask>,
+}
+struct ImportTask {
+    import_lock: Option<crate::ImportLock>,
+    preparation: Option<crate::import_preparation::Preparation>,
+    reference: Option<crate::import_preparation::Reference>,
+    status: ImportStatus,
+    consumers: Vec<(preview::Consumer, NativePath)>,
+    cancel: Cancellation,
+    discovery_finished: bool,
+    failure: bool,
+}
+impl ImportTask {
+    fn terminal(&self) -> bool {
+        matches!(
+            self.status.phase,
+            ImportPhase::Complete | ImportPhase::Canceled | ImportPhase::Failed
+        )
+    }
+    fn update_counts(&mut self) {
+        self.status.pending_previews = self.consumers.len() as u32;
+    }
+    fn cancel_owned(&mut self, service: &mut PreviewService) {
+        self.update_counts();
+        self.preparation = None; // Cancel, drop receiver, and join; keep the lock through drain.
+        self.reference = None;
+        for (consumer, _) in self.consumers.drain(..) {
+            if let Err(e) = service.cancel(consumer) {
+                self.failure = true;
+                self.status.error =
+                    Some(format!("cancel import: {e:#}").chars().take(2048).collect());
+            }
+        }
+        self.status.pending_previews = 0;
+        self.status.phase = ImportPhase::CancelRequested;
+    }
 }
 struct Actor {
     config: Config,
@@ -702,17 +766,30 @@ impl Actor {
     fn close(&mut self) {
         self.set_phase(Phase::Closing, None);
         if let Some(mut open) = self.open.take() {
+            let mut import = open.import.take();
+            if let Some(import) = &mut import {
+                import.cancel_owned(&mut open.service);
+            }
             for (_, t) in open.tickets.drain() {
                 if let Some(c) = t.consumer {
                     let _ = open.service.cancel(c);
                 }
             }
+            #[cfg(test)]
+            if let Some(checkpoint) = &self.config.import_checkpoint
+                && let Some(import) = &import
+            {
+                checkpoint("before_service_drop", &import.cancel.0);
+            }
             drop(open.service); // worker Drop kills/waits before cache lock release
+            drop(import); // Keep import ownership until every native worker is reaped.
             drop(open.catalog);
         }
         let mut q = self.shared.queue.lock().unwrap();
         q.viewport.clear();
         q.ticket_foreground.clear();
+        q.import_status = None;
+        q.import_cancel = None;
         q.status = Status {
             phase: Phase::Closed,
             catalog: None,
@@ -830,6 +907,7 @@ impl Actor {
                 tickets: HashMap::new(),
                 index_pending: true,
                 jobs_held,
+                import: None,
             })
         })();
         match opened {
@@ -887,6 +965,71 @@ impl Actor {
                 self.close();
                 Ok(Response::Status(self.status()))
             }
+            Request::ImportStart { catalog, source }
+            | Request::ImportResume { catalog, source } => {
+                let shared = Arc::clone(&self.shared);
+                #[cfg(test)]
+                let checkpoint = self.config.import_checkpoint.clone();
+                let o = self.current(&catalog)?;
+                if o.import.as_ref().is_some_and(|i| !i.terminal()) {
+                    return Err(error(
+                        ErrorCode::Busy,
+                        "an import is still running or canceling",
+                    ));
+                }
+                let path = source.to_path().map_err(|e| native(e.into()))?;
+                if !path.is_absolute() {
+                    return Err(error(
+                        ErrorCode::InvalidRequest,
+                        "import source must be absolute",
+                    ));
+                }
+                let path = std::fs::canonicalize(path).map_err(|e| native(e.into()))?;
+                // Both controls remain authoritative: restored-job hold and cache/source separation.
+                core!(o.service.ensure_original_separate(&path));
+                let import_lock = core!(crate::ImportLock::acquire(
+                    &o.catalog.root.join("import.lock")
+                ));
+                let preparation = core!(crate::import_preparation::Preparation::spawn(
+                    &o.catalog,
+                    &path,
+                    cancel.0.clone(),
+                    #[cfg(test)]
+                    checkpoint,
+                ));
+                let status = ImportStatus {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source: NativePath::from_path(&path),
+                    phase: ImportPhase::Discovering,
+                    imported: U64(0),
+                    unchanged: U64(0),
+                    failed: U64(0),
+                    skipped: U64(0),
+                    metadata_updated: U64(0),
+                    metadata_warnings: U64(0),
+                    awaiting_resources: U64(0),
+                    pending_previews: 0,
+                    error: None,
+                    error_source: None,
+                };
+                o.import = Some(ImportTask {
+                    import_lock: Some(import_lock),
+                    preparation: Some(preparation),
+                    reference: None,
+                    status: status.clone(),
+                    consumers: Vec::new(),
+                    cancel: cancel.clone(),
+                    discovery_finished: false,
+                    failure: false,
+                });
+                let mut queue = shared.queue.lock().unwrap();
+                queue.import_status = Some(status.clone());
+                queue.import_cancel = Some(cancel.clone());
+                Ok(Response::Import(Some(status)))
+            }
+            Request::ImportStatus { .. } | Request::ImportCancel { .. } => Ok(Response::Import(
+                self.shared.queue.lock().unwrap().import_status.clone(),
+            )),
             Request::Folders {
                 catalog,
                 parent,
@@ -1341,6 +1484,156 @@ impl Actor {
                 && o.service.native_work_drained()
             {
                 t.dto.state = PreviewState::Canceled;
+            }
+        }
+        if let Some(import) = &mut o.import
+            && !import.terminal()
+        {
+            let mut remaining = Vec::new();
+            for (consumer, path) in import.consumers.drain(..) {
+                if let Some(done) = o.service.take_completion(consumer) {
+                    match &done {
+                        preview::ServiceCompletion::Ready => import.status.imported.0 += 1,
+                        preview::ServiceCompletion::NeedsResources(_)
+                        | preview::ServiceCompletion::Unavailable(_) => {
+                            import.status.awaiting_resources.0 += 1
+                        }
+                        _ => import.status.failed.0 += 1,
+                    }
+                    let message = match &done {
+                        preview::ServiceCompletion::Failed(message)
+                        | preview::ServiceCompletion::NeedsResources(message)
+                        | preview::ServiceCompletion::Unavailable(message) => {
+                            Some(message.as_str())
+                        }
+                        preview::ServiceCompletion::Stale => {
+                            Some("preview changed during import; re-walk to refresh it")
+                        }
+                        preview::ServiceCompletion::Canceled => {
+                            Some("import preview canceled; re-walk to retry it")
+                        }
+                        preview::ServiceCompletion::Ready => None,
+                    };
+                    if let Some(message) = message {
+                        import.status.error = Some(message.chars().take(2048).collect());
+                        import.status.error_source = Some(path);
+                    }
+                    o.index_pending = true;
+                } else {
+                    remaining.push((consumer, path));
+                }
+            }
+            import.consumers = remaining;
+            if import.cancel.is_canceled()
+                && !matches!(import.status.phase, ImportPhase::CancelRequested)
+            {
+                import.cancel_owned(&mut o.service);
+            }
+            if matches!(import.status.phase, ImportPhase::CancelRequested) {
+                if o.service.native_work_drained() {
+                    import.status.phase = if import.failure {
+                        ImportPhase::Failed
+                    } else {
+                        ImportPhase::Canceled
+                    };
+                }
+            } else if !foreground
+                && !import.discovery_finished
+                && import.consumers.len() < 8
+                && o.service.available_request_slots() > 1
+            {
+                let applied = (|| -> Result<()> {
+                    let Some(event) = import
+                        .preparation
+                        .as_ref()
+                        .context("missing source preparation")?
+                        .poll()?
+                    else {
+                        return Ok(());
+                    };
+                    use crate::import_preparation::Event;
+                    match event {
+                        Event::Header(header) => {
+                            ensure!(import.reference.is_none(), "unfinished import reference");
+                            import.status.error_source = Some(NativePath::from_path(&header.path));
+                            import.reference = Some(crate::import_preparation::Reference::begin(
+                                &mut o.catalog,
+                                *header,
+                            )?);
+                        }
+                        Event::Source(source) => {
+                            import
+                                .reference
+                                .as_mut()
+                                .context("metadata without import reference")?
+                                .source(&mut o.catalog, &source)?;
+                        }
+                        Event::End => {
+                            let reference = import
+                                .reference
+                                .take()
+                                .context("missing import reference")?;
+                            let path = reference.source_path();
+                            let (consumer, changed, warnings) =
+                                reference.finish(&mut o.catalog, &mut o.service)?;
+                            import.status.metadata_updated.0 += u64::from(changed);
+                            import.status.metadata_warnings.0 += warnings;
+                            if let Some(consumer) = consumer {
+                                import.consumers.push((consumer, path));
+                            } else {
+                                import.status.unchanged.0 += 1;
+                            }
+                            if import.status.error.is_none() {
+                                import.status.error_source = None;
+                            }
+                        }
+                        Event::Skipped => import.status.skipped.0 += 1,
+                        Event::Finished => {
+                            ensure!(
+                                import.reference.is_none(),
+                                "source ended inside a prepared file"
+                            );
+                            import.discovery_finished = true;
+                            if let Some(preparation) = import.preparation.take() {
+                                preparation.finish();
+                            }
+                        }
+                        Event::Failed { source, message } => {
+                            import.status.error_source = Some(source);
+                            anyhow::bail!("{message}");
+                        }
+                    }
+                    o.index_pending = true;
+                    Ok(())
+                })();
+                if let Err(e) = applied {
+                    import.failure = true;
+                    import.status.failed.0 += 1;
+                    let message = format!("import stopped: {e:#}");
+                    if let Some(reference) = &import.reference {
+                        let _ = reference.fail(&mut o.catalog, &message);
+                    }
+                    import.status.error = Some(message.chars().take(2048).collect());
+                    import.cancel_owned(&mut o.service);
+                }
+            }
+            import.update_counts();
+            if import.discovery_finished
+                && matches!(
+                    import.status.phase,
+                    ImportPhase::Discovering | ImportPhase::Draining
+                )
+            {
+                import.status.phase = ImportPhase::Draining;
+                if import.consumers.is_empty() && !o.index_pending {
+                    import.status.phase = ImportPhase::Complete;
+                }
+            }
+            let mut queue = self.shared.queue.lock().unwrap();
+            queue.import_status = Some(import.status.clone());
+            if import.terminal() {
+                import.import_lock = None;
+                queue.import_cancel = None;
             }
         }
         if !foreground && o.index_pending {

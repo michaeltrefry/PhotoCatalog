@@ -159,7 +159,7 @@ fn modified(metadata: &fs::Metadata) -> Option<u128> {
 }
 /// Opens only regular files. Unix flags close the metadata/open race: a FIFO
 /// replacement cannot block, and a symlink replacement cannot be followed.
-fn open_regular(path: &Path, expected: &fs::Metadata) -> io::Result<File> {
+pub(crate) fn open_regular(path: &Path, expected: &fs::Metadata) -> io::Result<File> {
     if !expected.is_file() || expected.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -211,10 +211,13 @@ pub struct ReadWork {
 struct Counted<'a> {
     file: &'a mut File,
     bytes: &'a mut u64,
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 impl Read for Counted<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let n = self.file.read(buffer)?;
+        check_cancel(self.cancel)?;
+        let limit = buffer.len().min(64 * 1024);
+        let n = self.file.read(&mut buffer[..limit])?;
         *self.bytes += n as u64;
         Ok(n)
     }
@@ -346,6 +349,40 @@ fn inspect_observed(
     conservative: bool,
     checkpoint: &mut impl FnMut(&str) -> io::Result<()>,
 ) -> io::Result<(Inspection, ReadWork)> {
+    inspect_controlled(path, limits, sidecar, conservative, checkpoint, None)
+}
+fn check_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) -> io::Result<()> {
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(io::Error::other("metadata preparation canceled"));
+    }
+    Ok(())
+}
+pub(crate) fn inspect_cancellable(
+    path: &Path,
+    limits: &Limits,
+    sidecar: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> io::Result<Inspection> {
+    let result = inspect_controlled(
+        path,
+        limits,
+        sidecar,
+        false,
+        &mut |_| check_cancel(Some(cancel)),
+        Some(cancel),
+    );
+    check_cancel(Some(cancel))?;
+    result.map(|(inspection, _)| inspection)
+}
+fn inspect_controlled(
+    path: &Path,
+    limits: &Limits,
+    sidecar: bool,
+    conservative: bool,
+    checkpoint: &mut impl FnMut(&str) -> io::Result<()>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<(Inspection, ReadWork)> {
+    check_cancel(cancel)?;
     let path_before = fs::symlink_metadata(path)?;
     let (mut file, eligible) = open_stable(path, &path_before, conservative)?;
     let before = file.metadata()?;
@@ -378,6 +415,7 @@ fn inspect_observed(
         &mut Counted {
             file: &mut file,
             bytes: &mut work.hash_bytes,
+            cancel,
         },
         before.len(),
     )?;
@@ -395,6 +433,7 @@ fn inspect_observed(
     let mut counted = Counted {
         file: &mut file,
         bytes: &mut work.metadata_bytes,
+        cancel,
     };
     let mut parser = Parser::new(&mut counted, before.len(), limits);
     let parsed = if sidecar {
@@ -448,6 +487,7 @@ fn inspect_observed(
             &mut Counted {
                 file: &mut file,
                 bytes: &mut work.hash_bytes,
+                cancel,
             },
             before.len(),
         )?
@@ -500,6 +540,7 @@ fn inspect_observed(
             &mut Counted {
                 file: &mut current_file,
                 bytes: &mut work.hash_bytes,
+                cancel,
             },
             before.len(),
         )?;
@@ -2256,5 +2297,29 @@ mod stability_tests {
     fn other_unix_files_use_conservative_hash_verification() {
         let file = tempfile::tempfile().unwrap();
         assert!(!qualified_unix_file(&file));
+    }
+    #[test]
+    fn canceled_metadata_read_is_terminal_and_chunk_bounded() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut file, &vec![1u8; 128 * 1024]).unwrap();
+        std::io::Seek::rewind(&mut file).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut bytes = 0;
+        let mut reader = Counted {
+            file: &mut file,
+            bytes: &mut bytes,
+            cancel: Some(&cancel),
+        };
+        let mut buffer = vec![0u8; 128 * 1024];
+        assert_eq!(reader.read(&mut buffer).unwrap(), 64 * 1024);
+        cancel.store(true, Ordering::Release);
+        let error = reader.read_exact(&mut buffer[..1]).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(bytes, 64 * 1024);
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let error =
+            inspect_cancellable(source.path(), &Limits::default(), true, &cancel).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::Interrupted);
     }
 }

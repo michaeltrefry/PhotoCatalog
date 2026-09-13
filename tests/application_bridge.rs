@@ -74,6 +74,9 @@ fn preview(b: &Bridge, token: &str, key: &VariantKey, generation: u64) -> Result
     else {
         bail!("wrong preview")
     };
+    preview_ready(b, token, p)
+}
+fn preview_ready(b: &Bridge, token: &str, p: PreviewStatus) -> Result<PreviewStatus> {
     let until = Instant::now() + Duration::from_secs(20);
     loop {
         let Response::Preview(p) = call(
@@ -701,5 +704,386 @@ fn desktop_search_filters_keep_variant_identity_and_reject_changed_query_cursor(
         original_variant.revision
     );
     bridge.shutdown();
+    Ok(())
+}
+
+fn import_status(b: &Bridge, token: &str) -> Result<Option<ImportStatus>> {
+    let Response::Import(s) = call(
+        b,
+        Request::ImportStatus {
+            catalog: token.into(),
+        },
+    )?
+    else {
+        bail!("wrong import status")
+    };
+    Ok(s)
+}
+fn wait_import(b: &Bridge, token: &str, terminal: ImportPhase) -> Result<ImportStatus> {
+    let until = Instant::now() + Duration::from_secs(45);
+    loop {
+        let s = import_status(b, token)?.unwrap();
+        if s.phase == terminal {
+            return Ok(s);
+        }
+        ensure!(
+            !matches!(
+                s.phase,
+                ImportPhase::Failed | ImportPhase::Canceled | ImportPhase::Complete
+            ),
+            "unexpected import {:?}: {:?}",
+            s.phase,
+            s.error
+        );
+        ensure!(Instant::now() < until, "import deadline: {:?}", s);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn incremental_import_interleaves_edits_cancels_rewalks_and_preserves_originals() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir_all(originals.join("nested 雪/deeper"))?;
+    let seed_path = originals.join("seed.png");
+    image::RgbImage::from_pixel(32, 24, image::Rgb([20u8, 40, 70])).save(&seed_path)?;
+    let root = temp.path().join("catalog");
+    let mut c = Catalog::open(&root)?;
+    c.import(&originals, None, |_| Ok(()))?;
+    let seed = VariantKey::master(c.browse(0, 1)?[0].id.clone());
+    drop(c);
+    let mut originals_saved = vec![(seed_path.clone(), std::fs::read(&seed_path)?)];
+    let sidecar_path = originals.join("seed.xmp");
+    let sidecar = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:vendor="urn:private:fixture" vendor:opaque="preserve this exact packet"/></rdf:RDF></x:xmpmeta>"#;
+    std::fs::write(&sidecar_path, sidecar)?;
+    originals_saved.push((sidecar_path, sidecar.to_vec()));
+
+    for n in 0..48 {
+        let path = originals.join(format!("nested 雪/deeper/{n}.png"));
+        image::RgbImage::from_pixel(64, 48, image::Rgb([n as u8, 50, 80])).save(&path)?;
+        originals_saved.push((path.clone(), std::fs::read(&path)?));
+        let mut permissions = std::fs::metadata(&path)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions)?;
+    }
+    std::fs::write(originals.join("note.txt"), b"not imported")?;
+    let b = Bridge::spawn(config(&originals))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    let Response::Import(Some(start)) = call(
+        &b,
+        Request::ImportStart {
+            catalog: token.clone(),
+            source: NativePath::from_path(&originals),
+        },
+    )?
+    else {
+        bail!("wrong import start")
+    };
+    assert_eq!(
+        start.source,
+        NativePath::from_path(&originals.canonicalize()?)
+    );
+    // Real foreground query and edit complete while the incremental re-walk remains active.
+    let Response::Image(image) = call(
+        &b,
+        Request::Image {
+            catalog: token.clone(),
+            key: seed.clone(),
+        },
+    )?
+    else {
+        bail!("wrong image")
+    };
+    assert_eq!(image.key, seed);
+    let changed = Recipe::V1(RecipeV1 {
+        exposure_ev: 1.0,
+        ..RecipeV1::default()
+    });
+    let Response::Variant(saved) = call(
+        &b,
+        Request::SaveRecipe {
+            catalog: token.clone(),
+            key: seed.clone(),
+            expected_revision: I64(0),
+            recipe: changed,
+        },
+    )?
+    else {
+        bail!("wrong save")
+    };
+    assert!(matches!(
+        import_status(&b, &token)?.unwrap().phase,
+        ImportPhase::Discovering | ImportPhase::Draining
+    ));
+    let until = Instant::now() + Duration::from_secs(10);
+    while import_status(&b, &token)?.unwrap().pending_previews == 0 {
+        ensure!(Instant::now() < until, "no import work admitted");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // A visible preview has separate ownership from import consumers.
+    let Response::Preview(visible) = call(
+        &b,
+        Request::Preview {
+            catalog: token.clone(),
+            key: seed.clone(),
+            tier: PreviewTier::Large,
+            interactive: false,
+            viewport: "current".into(),
+            generation: U64(1),
+            foreground: true,
+        },
+    )?
+    else {
+        bail!("wrong visible preview")
+    };
+    let Response::Import(Some(cancel)) = call(
+        &b,
+        Request::ImportCancel {
+            catalog: token.clone(),
+            import: start.id.clone(),
+        },
+    )?
+    else {
+        bail!("wrong cancel")
+    };
+    assert_eq!(cancel.phase, ImportPhase::CancelRequested);
+    wait_import(&b, &token, ImportPhase::Canceled)?;
+    let visible = preview_ready(&b, &token, visible)?;
+    assert!(matches!(visible.state, PreviewState::Ready));
+    call(&b, Request::Close { catalog: token })?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    assert!(import_status(&b, &token)?.is_none());
+    let Response::Import(Some(resumed)) = call(
+        &b,
+        Request::ImportResume {
+            catalog: token.clone(),
+            source: NativePath::from_path(&originals),
+        },
+    )?
+    else {
+        bail!("wrong resume")
+    };
+    assert_ne!(resumed.id, start.id);
+    assert!(
+        call(
+            &b,
+            Request::ImportCancel {
+                catalog: token.clone(),
+                import: start.id
+            }
+        )
+        .is_err()
+    );
+    let complete = wait_import(&b, &token, ImportPhase::Complete)?;
+    assert_eq!(complete.imported.0 + complete.unchanged.0, 49);
+    assert_eq!(complete.failed.0, 0);
+    assert!(complete.skipped.0 >= 1);
+    assert_eq!(
+        variant(&b, &token, &seed)?.recipe_digest,
+        saved.recipe_digest
+    );
+    let Response::Images { rows, .. } = call(
+        &b,
+        Request::Images {
+            catalog: token.clone(),
+            folder: None,
+            recursive: true,
+            text: None,
+            cursor: None,
+            limit: 100,
+        },
+    )?
+    else {
+        bail!("wrong imported page")
+    };
+    assert_eq!(rows.len(), 49);
+    let Response::Folders { rows: folders, .. } = call(
+        &b,
+        Request::Folders {
+            catalog: token.clone(),
+            parent: None,
+            after: I64(0),
+            limit: 100,
+        },
+    )?
+    else {
+        bail!("wrong folders")
+    };
+    assert!(!folders.is_empty());
+    b.shutdown();
+    let c = Catalog::open(&root)?;
+    assert_eq!(c.browse(0, 100)?.len(), 49);
+    assert_eq!(c.edit_variant(&seed)?.revision, saved.revision.0);
+    assert!(c.edit_variant(&seed)?.can_undo);
+    assert_eq!(
+        c.render_identity(&seed.asset_id)?.fingerprint,
+        Some(
+            blake3::hash(&std::fs::read(&seed_path)?)
+                .to_hex()
+                .to_string()
+        )
+    );
+    let retained = c
+        .metadata_history(&seed.asset_id, 0, 100)?
+        .into_iter()
+        .map(|h| c.metadata_packets(&seed.asset_id, h.id))
+        .collect::<Result<Vec<_>>>()?;
+    assert!(
+        retained
+            .iter()
+            .flatten()
+            .any(|packet| packet.bytes == sidecar)
+    );
+
+    for (path, bytes) in originals_saved {
+        assert_eq!(std::fs::read(path)?, bytes);
+    }
+    // Restore fixture permissions for cross-platform temporary-directory cleanup.
+    for entry in std::fs::read_dir(originals.join("nested 雪/deeper"))? {
+        let path = entry?.path();
+        let permissions = std::fs::metadata(&seed_path)?.permissions();
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn imports_report_bad_files_and_respect_restored_job_hold() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    std::fs::write(originals.join("bad.png"), b"invalid png")?;
+    let root = temp.path().join("catalog");
+    drop(Catalog::open(&root)?);
+    let bundle = temp.path().join("bundle");
+    let restored = temp.path().join("restored");
+    let limits = photocatalog::catalog_backup::Limits::default();
+    photocatalog::catalog_backup::backup_catalog(&root, &bundle, &limits, |_| Ok(()))?;
+    photocatalog::catalog_backup::restore_catalog(&bundle, &restored, &limits, |_| Ok(()))?;
+    let b = Bridge::spawn(config(&originals))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&restored),
+        },
+    )?;
+    let token = status(&b)?.catalog.unwrap();
+    assert!(status(&b)?.jobs_held);
+    assert!(
+        call(
+            &b,
+            Request::ImportStart {
+                catalog: token.clone(),
+                source: NativePath::from_path(&originals)
+            }
+        )
+        .is_err()
+    );
+    assert!(import_status(&b, &token)?.is_none());
+    call(&b, Request::Close { catalog: token })?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    let token = status(&b)?.catalog.unwrap();
+    call(
+        &b,
+        Request::ImportStart {
+            catalog: token.clone(),
+            source: NativePath::from_path(&originals),
+        },
+    )?;
+    let report = wait_import(&b, &token, ImportPhase::Complete)?;
+    assert_eq!(report.failed.0, 1);
+    assert!(report.error.is_some());
+    assert_eq!(report.pending_previews, 0);
+    b.shutdown();
+    assert_eq!(std::fs::read(originals.join("bad.png"))?, b"invalid png");
+    Ok(())
+}
+
+#[test]
+fn changed_edited_original_import_fails_actionably_without_reset_or_duplicate() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    let path = originals.join("one.png");
+    image::RgbImage::from_pixel(24, 16, image::Rgb([10u8, 20, 30])).save(&path)?;
+    let root = temp.path().join("catalog");
+    let mut c = Catalog::open(&root)?;
+    c.import(&originals, None, |_| Ok(()))?;
+    let key = VariantKey::master(c.browse(0, 1)?[0].id.clone());
+    c.save_edit_recipe(
+        &key,
+        0,
+        &Recipe::V1(RecipeV1 {
+            exposure_ev: 1.0,
+            ..RecipeV1::default()
+        }),
+    )?;
+    let source_before = serde_json::to_value(c.render_identity(&key.asset_id)?)?;
+    let edit_before = serde_json::to_value(c.edit_variant(&key)?)?;
+    let history_before = serde_json::to_value(c.edit_history(&key, -1, 100)?)?;
+    let metadata_before = serde_json::to_value(c.metadata_history(&key.asset_id, 0, 100)?)?;
+    drop(c);
+    image::RgbImage::from_pixel(24, 16, image::Rgb([90u8, 80, 70])).save(&path)?;
+    let changed_original = std::fs::read(&path)?;
+    let b = Bridge::spawn(config(&originals))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    call(
+        &b,
+        Request::ImportStart {
+            catalog: token.clone(),
+            source: NativePath::from_path(&originals),
+        },
+    )?;
+    let failed = wait_import(&b, &token, ImportPhase::Failed)?;
+    assert_eq!(failed.failed.0, 1);
+    assert!(failed.error.unwrap().contains("source-changed"));
+    assert_eq!(
+        failed.error_source,
+        Some(NativePath::from_path(&path.canonicalize()?))
+    );
+    assert_eq!(failed.imported.0, 0);
+    b.shutdown();
+    let c = Catalog::open(&root)?;
+    assert_eq!(c.browse(0, 100)?.len(), 1);
+    assert_eq!(
+        serde_json::to_value(c.render_identity(&key.asset_id)?)?,
+        source_before
+    );
+    assert_eq!(serde_json::to_value(c.edit_variant(&key)?)?, edit_before);
+    assert_eq!(
+        serde_json::to_value(c.edit_history(&key, -1, 100)?)?,
+        history_before
+    );
+    assert_eq!(
+        serde_json::to_value(c.metadata_history(&key.asset_id, 0, 100)?)?,
+        metadata_before
+    );
+    assert_eq!(std::fs::read(&path)?, changed_original);
     Ok(())
 }

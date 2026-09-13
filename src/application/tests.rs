@@ -49,6 +49,8 @@ fn disconnected() -> Bridge {
                 message: None,
             },
             active_cancel: None,
+            import_status: None,
+            import_cancel: None,
         }),
         wake: Condvar::new(),
         limits: Limits::default(),
@@ -289,4 +291,295 @@ fn opaque_cursor_preserves_large_integers_and_rejects_noncanonical_or_wrong_sess
     assert!(decode_cursor(&"x".repeat(CURSOR_BYTES + 1), "session").is_err());
     let altered = s.replace("\"version\":1", "\"unexpected\":true,\"version\":1");
     assert!(decode_cursor(&altered, "session").is_err());
+}
+
+#[test]
+fn import_status_and_cancel_bypass_pending_foreground_work_and_bind_attempt() {
+    let b = disconnected();
+    let cancel = Cancellation::default();
+    {
+        let mut q = b.0.shared.queue.lock().unwrap();
+        q.status.catalog = Some("catalog".into());
+        q.import_cancel = Some(cancel.clone());
+        q.import_status = Some(ImportStatus {
+            id: "attempt".into(),
+            source: NativePath::from_path(std::path::Path::new("/photos")),
+            phase: ImportPhase::Discovering,
+            imported: U64(3),
+            unchanged: U64(2),
+            failed: U64(0),
+            skipped: U64(1),
+            metadata_updated: U64(4),
+            metadata_warnings: U64(0),
+            awaiting_resources: U64(0),
+            pending_previews: 2,
+            error: None,
+            error_source: None,
+        });
+    }
+    let _pending = b
+        .submit(Request::Undo {
+            catalog: "catalog".into(),
+            key: VariantKey::master("image"),
+            expected_revision: I64(0),
+        })
+        .unwrap();
+    assert!(
+        b.submit(Request::ImportCancel {
+            catalog: "catalog".into(),
+            import: "old".into()
+        })
+        .is_err()
+    );
+    assert!(!cancel.is_canceled());
+    let Reply::Ok {
+        value: Response::Import(Some(s)),
+    } = b
+        .submit(Request::ImportCancel {
+            catalog: "catalog".into(),
+            import: "attempt".into(),
+        })
+        .unwrap()
+        .recv()
+    else {
+        panic!("wrong cancellation status")
+    };
+    assert_eq!(s.phase, ImportPhase::CancelRequested);
+    assert_eq!(s.imported, U64(3));
+    assert!(cancel.is_canceled());
+    assert_eq!(b.0.shared.queue.lock().unwrap().pending.len(), 1);
+}
+
+#[test]
+fn held_source_hash_allows_foreground_edit_query_cancel_and_close_reopen() -> Result<()> {
+    use crate::edit::{Recipe, RecipeV1};
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    let path = originals.join("seed.png");
+    image::RgbImage::from_pixel(32, 24, image::Rgb([20u8, 40, 70])).save(&path)?;
+    let source_before = std::fs::read(&path)?;
+    let root = temp.path().join("catalog");
+    let mut catalog = Catalog::open(&root)?;
+    catalog.import(&originals, None, |_| Ok(()))?;
+    let key = VariantKey::master(catalog.browse(0, 1)?[0].id.clone());
+    let identity_before = catalog.render_identity(&key.asset_id)?;
+    drop(catalog);
+    let (entered, events) = std::sync::mpsc::channel();
+    let chunks = Arc::new(AtomicUsize::new(0));
+    let counted = chunks.clone();
+    let bridge = Bridge::spawn(Config {
+        worker_executable: std::env::current_exe()?,
+        cache_root: None,
+        original_roots: vec![originals.clone()],
+        preview_policy: preview::PreviewPolicy::default(),
+        preview_limits: preview::ServiceLimits::default(),
+        limits: Limits::default(),
+        import_checkpoint: Some(Arc::new(move |stage, cancel| {
+            if stage == "hash_chunk" {
+                counted.fetch_add(1, Ordering::AcqRel);
+                let _ = entered.send(thread::current().name().unwrap_or_default().to_owned());
+                // Preparation cannot proceed until an actual cancel or close signal.
+                while !cancel.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        })),
+    })?;
+    let call = |request| -> Result<Response> {
+        let pending = bridge.submit(request)?;
+        match pending.receiver.recv_timeout(Duration::from_secs(5))? {
+            Reply::Ok { value } => Ok(value),
+            Reply::Error { error } => Err(error.into()),
+        }
+    };
+    let Response::Status(opened) = call(Request::OpenExisting {
+        path: NativePath::from_path(&root),
+    })?
+    else {
+        anyhow::bail!("open reply")
+    };
+    let token = opened.catalog.context("catalog token")?;
+    let Response::Import(Some(start)) = call(Request::ImportStart {
+        catalog: token.clone(),
+        source: NativePath::from_path(&originals),
+    })?
+    else {
+        anyhow::bail!("start reply")
+    };
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(5))?,
+        "catalog-source-preparation"
+    );
+    assert!(crate::ImportLock::acquire(&root.join("import.lock")).is_err());
+    assert!(matches!(
+        call(Request::Image {
+            catalog: token.clone(),
+            key: key.clone()
+        })?,
+        Response::Image(_)
+    ));
+    let recipe = Recipe::V1(RecipeV1 {
+        exposure_ev: 1.0,
+        ..RecipeV1::default()
+    });
+    let Response::Variant(saved) = call(Request::SaveRecipe {
+        catalog: token.clone(),
+        key: key.clone(),
+        expected_revision: I64(0),
+        recipe,
+    })?
+    else {
+        anyhow::bail!("save reply")
+    };
+    assert_eq!(chunks.load(Ordering::Acquire), 1);
+    assert!(
+        matches!(call(Request::Variant { catalog: token.clone(), key: key.clone() })?, Response::Variant(v) if v.recipe_digest == saved.recipe_digest)
+    );
+    call(Request::ImportCancel {
+        catalog: token.clone(),
+        import: start.id,
+    })?;
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(call(Request::ImportStatus { catalog: token.clone() })?, Response::Import(Some(s)) if s.phase == ImportPhase::Canceled)
+        {
+            break;
+        }
+        ensure!(Instant::now() < until, "cancel did not stop source hash");
+        thread::sleep(Duration::from_millis(2));
+    }
+    drop(crate::ImportLock::acquire(&root.join("import.lock"))?);
+    call(Request::ImportResume {
+        catalog: token.clone(),
+        source: NativePath::from_path(&originals),
+    })?;
+    events.recv_timeout(Duration::from_secs(5))?;
+    call(Request::Close { catalog: token })?;
+    drop(crate::ImportLock::acquire(&root.join("import.lock"))?);
+    let Response::Status(opened) = call(Request::OpenExisting {
+        path: NativePath::from_path(&root),
+    })?
+    else {
+        anyhow::bail!("reopen reply")
+    };
+    assert!(matches!(
+        call(Request::ImportStatus {
+            catalog: opened.catalog.context("reopened token")?
+        })?,
+        Response::Import(None)
+    ));
+    bridge.shutdown();
+    let catalog = Catalog::open(&root)?;
+    let after = catalog.render_identity(&key.asset_id)?;
+    assert_eq!(after.fingerprint, identity_before.fingerprint);
+    assert_eq!(after.state, "ready");
+    assert_eq!(
+        catalog.edit_variant(&key)?.recipe_digest,
+        saved.recipe_digest
+    );
+    assert_eq!(std::fs::read(path)?, source_before);
+    assert_eq!(chunks.load(Ordering::Acquire), 2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn close_holds_import_lock_until_owned_native_child_is_drained() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    image::RgbImage::from_pixel(32, 24, image::Rgb([20u8, 40, 70]))
+        .save(originals.join("source.png"))?;
+    let root = temp.path().join("catalog");
+    drop(Catalog::open(&root)?);
+    // A non-returning owned executable makes the worker's lifetime deterministic.
+    // exec replaces the shell, so cancellation owns and reaps the only child.
+    let worker = temp.path().join("held-worker");
+    let pid_path = temp.path().join("held-worker.pid");
+    std::fs::write(
+        &worker,
+        br#"#!/bin/sh
+printf '%s' "$$" > "$0.pid"
+exec /bin/sleep 60
+"#,
+    )?;
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700))?;
+    let released = Arc::new(AtomicBool::new(false));
+    let release = released.clone();
+    let (entered, events) = std::sync::mpsc::channel();
+    let bridge = Bridge::spawn(Config {
+        worker_executable: worker,
+        cache_root: None,
+        original_roots: vec![originals.clone()],
+        preview_policy: preview::PreviewPolicy::default(),
+        preview_limits: preview::ServiceLimits::default(),
+        limits: Limits::default(),
+        import_checkpoint: Some(Arc::new(move |stage, _| {
+            if stage == "before_service_drop" {
+                let _ = entered.send(());
+                let until = Instant::now() + Duration::from_secs(5);
+                while !release.load(Ordering::Acquire) && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        })),
+    })?;
+    let call = |request| -> Result<Response> {
+        match bridge
+            .submit(request)?
+            .receiver
+            .recv_timeout(Duration::from_secs(5))?
+        {
+            Reply::Ok { value } => Ok(value),
+            Reply::Error { error } => Err(error.into()),
+        }
+    };
+    let Response::Status(opened) = call(Request::OpenExisting {
+        path: NativePath::from_path(&root),
+    })?
+    else {
+        anyhow::bail!("open reply")
+    };
+    let token = opened.catalog.context("catalog token")?;
+    call(Request::ImportStart {
+        catalog: token.clone(),
+        source: NativePath::from_path(&originals),
+    })?;
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(call(Request::Status)?, Response::Status(s) if s.active_previews > 0) {
+            break;
+        }
+        ensure!(Instant::now() < until, "owned child never became active");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let child: i32 = loop {
+        if let Some(child) = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|text| text.parse().ok())
+        {
+            break child;
+        }
+        ensure!(Instant::now() < until, "owned child did not report its pid");
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(unsafe { libc::kill(child, 0) }, 0);
+    let close = bridge.submit(Request::Close { catalog: token })?;
+    events.recv_timeout(Duration::from_secs(5))?;
+    assert!(crate::ImportLock::acquire(&root.join("import.lock")).is_err());
+    assert_eq!(unsafe { libc::kill(child, 0) }, 0);
+    released.store(true, Ordering::Release);
+    assert!(
+        matches!(close.receiver.recv_timeout(Duration::from_secs(5))?, Reply::Ok { value: Response::Status(s) } if matches!(s.phase, Phase::Closed) && s.active_previews == 0)
+    );
+    assert_eq!(unsafe { libc::kill(child, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    drop(crate::ImportLock::acquire(&root.join("import.lock"))?);
+    bridge.shutdown();
+    Ok(())
 }

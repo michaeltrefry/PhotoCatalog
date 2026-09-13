@@ -45,6 +45,21 @@ pub enum Request {
     Close {
         catalog: String,
     },
+    ImportStart {
+        catalog: String,
+        source: NativePath,
+    },
+    ImportResume {
+        catalog: String,
+        source: NativePath,
+    },
+    ImportStatus {
+        catalog: String,
+    },
+    ImportCancel {
+        catalog: String,
+        import: String,
+    },
     Folders {
         catalog: String,
         parent: Option<I64>,
@@ -174,6 +189,32 @@ pub struct Status {
     pub cancel_requested: bool,
     pub message: Option<String>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPhase {
+    Discovering,
+    Draining,
+    Complete,
+    CancelRequested,
+    Canceled,
+    Failed,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportStatus {
+    pub id: String,
+    pub source: NativePath,
+    pub phase: ImportPhase,
+    pub imported: U64,
+    pub unchanged: U64,
+    pub failed: U64,
+    pub skipped: U64,
+    pub metadata_updated: U64,
+    pub metadata_warnings: U64,
+    pub awaiting_resources: U64,
+    pub pending_previews: u32,
+    pub error: Option<String>,
+    pub error_source: Option<NativePath>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Folder {
     pub id: I64,
@@ -239,6 +280,7 @@ pub struct PreviewStatus {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Status(Status),
+    Import(Option<ImportStatus>),
     Folders {
         rows: Vec<Folder>,
         next: Option<I64>,
