@@ -10,11 +10,12 @@ into one scratch catalog and preserves the existing filesystem folder hierarchy.
 The 32 excluded catalog candidates remain excluded. Canonical-library migration
 has not been authorized.
 
-PR #14 remains draft. Head `33b242f8` passed all four applicable CI jobs,
-including the corrected Linux preview-cache restart check. The reconciliation
-repairs through `5b54d2b9` passed 609 optimized all-target test instances, strict
-all-target Clippy, formatting and independent source review; five existing tests
-remain ignored. The current-settings defect below blocks final acceptance.
+PR #14 remains draft. Source `063d011a` passed all four applicable CI jobs in
+run 34724636005, including macOS, Windows and Linux. The original import and
+subsequent current-settings repair have both reached native Complete. The fresh
+independent repair audit passed. A subsequent public-API lookup defect and the
+representative API checks still block final acceptance; earlier qualification
+and execution receipts retain their own source identities below.
 
 The selected TEST has reached native Complete in one scratch catalog: all 16
 capture reports, 22 source-walk stages and 171 companion artifacts reconciled.
@@ -143,9 +144,54 @@ warm Python diagnostic). The query now selects that existing exact-source index
 without changing schema, predicates, limits or checkpoint semantics. Seven
 reconciliation, five supplemental and eleven importer regression tests passed; the native
 VM-step test stayed at 38 steps with 8 and 4,096 unrelated files, while the old
-index plan grew to 20,517 steps. Actual native reconciliation remains pending.
-The repair is not Complete. Source catalogs and originals remain untouched.
-Representative API readback, post-repair audit, final acceptance
+index plan grew to 20,517 steps. Qualified source `063d011a` then completed actual
+native reconciliation: repair 05 finished all 16 report positions in 116.259 seconds,
+with 215,708 examined, 215,671 container-rebound and 37 unchanged records. The owner
+reaped the native worker at exit zero with no cleanup events or resource stop.
+Container-rebound counts are not translated-recipe counts. Source catalogs and
+originals remain untouched.
+
+The full post-repair v20 audit stopped cleanly at its 900-second observer deadline,
+after base custody and native-relation checks but before finishing archived recipe
+verification. Its failed receipt remains preserved: 1,649 queries, approximately
+2.827 billion VM steps, 17,058,440,223 processed metadata bytes and 864,010,240 bytes
+peak RSS. Completed report observations classify 215 current results as
+translated-with-appearance-gaps and 215,493 as retained-only; they are not a full
+repair-audit PASS. The finite 48 GiB cumulative processing allowance was based on
+measured archive charges and is distinct from the unchanged 1 GiB memory limit.
+A bounded sample of 32 archive rows from each selected revision confirmed exact
+composite indexed lookups and unchanged database content. It identified redundant
+JSON parsing in recipe validation. The reviewed successor reuses parsed values
+without changing validation and adds bounded timing/progress telemetry. Its full
+v22 audit passed in 853.453 seconds: 1,650 queries, 43,212,343,101 cumulative metadata
+bytes, approximately 2.864 billion VM steps and 992,329,728 bytes peak RSS. All
+215,708 archives, 16 predecessor/fresh reports, stored recipes and custody/relationship
+checks passed; the worker exited cleanly. The exact current classifications are
+215 translated-with-appearance-gaps and 215,493 retained-only. The reviewed walltime
+allowance was 1,800 seconds; the audit finished within the earlier 900-second limit
+on this run. Neither warm timing nor parsing improvements alone are asserted as
+the complete explanation for the prior timeout.
+
+Actual API case selection exposed a separate lookup defect: every selected capture
+has ancillary entity records with a non-text local key. The prior public lookup
+used collection-wide key availability, allowing unrelated records to block valid
+image/history anchors. A bounded census confirms those rows have known source and
+table keys, so a known mismatch can safely exclude them from a queried endpoint's
+completeness proof. The correction must retain unknown possible matches, snapshot
+and ambiguity checks, and use indexes to avoid repeatedly scanning the unavailable
+population. Schema-9 adds seven partial indexes that retain unknown keys and
+checks at most eight exact value/NULL branches per query. All 36 focused tests,
+strict all-target Clippy, formatting and independent source review pass. The
+20,000-row regression checks bounded VM work across every lookup shape; migration
+failure rolls back both DDL and schema version. The actual TEST remains at its
+audited schema 8. A quiescent safety copy will precede the index-only upgrade.
+
+The organization audit accounts for 4,894 retained keyword memberships and 429
+retained collection memberships without native endpoints. A bounded dictionary
+diagnostic is being prepared to distinguish unsupported source structures from
+an import defect; those classifications alone do not prove native organization
+acceptance.
+Representative API readback, lookup-correction validation, final acceptance
 review, merge and terminal merged-head CI remain required for S10.
 S11 backup/restore and S12 Tauri interface retain their S10 dependencies;
 S13 integrated readiness follows both.

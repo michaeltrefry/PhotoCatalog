@@ -37,6 +37,20 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Schema 9 companion indexes retain NULL keys: an unavailable key can still
+/// hide a match. Collection predicates avoid copying ancillary entity rows into
+/// reference, packet, or table-name indexes.
+pub(crate) fn install_availability_indexes(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE INDEX IF NOT EXISTS migration_unavailable_source ON migration_record_lookup(input,revision,collection,source_id,record) WHERE unavailable!='[]' AND collection IN (3,4,6);
+      CREATE INDEX IF NOT EXISTS migration_unavailable_table ON migration_record_lookup(input,revision,collection,table_name,local_key,record) WHERE unavailable!='[]' AND collection IN (3,4);
+      CREATE INDEX IF NOT EXISTS migration_unavailable_reference ON migration_record_lookup(input,revision,collection,source_id,field,target_table,record) WHERE unavailable!='[]' AND collection=5;
+      CREATE INDEX IF NOT EXISTS migration_unavailable_source_target ON migration_record_lookup(input,revision,collection,source_id,target_table,record) WHERE unavailable!='[]' AND collection=5;
+      CREATE INDEX IF NOT EXISTS migration_unavailable_target ON migration_record_lookup(input,revision,collection,target_table,target_key,record) WHERE unavailable!='[]' AND collection=5;
+      CREATE INDEX IF NOT EXISTS migration_unavailable_packet ON migration_record_lookup(input,revision,collection,source_id,origin,record) WHERE unavailable!='[]' AND collection=7;
+      CREATE INDEX IF NOT EXISTS migration_unavailable_name ON migration_record_lookup(input,revision,collection,name,record) WHERE unavailable!='[]' AND collection=2;")?;
+    Ok(())
+}
+
 fn ordinal(collection: Collection) -> i64 {
     match collection {
         Collection::Captures => 0,
@@ -313,6 +327,28 @@ impl Lookup {
             Self::Unavailable(_) => "migration_lookup_unavailable",
         }
     }
+    fn availability_index(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::RowsBySource(_) | Self::EntitiesBySource(_) | Self::PathsBySource(_) => {
+                ("migration_unavailable_source", "l.collection IN (3,4,6)")
+            }
+            Self::RowsByTable(_) | Self::EntitiesByTable(_) | Self::EntitiesByLocalKey { .. } => {
+                ("migration_unavailable_table", "l.collection IN (3,4)")
+            }
+            Self::References {
+                field: None,
+                target_table: Some(_),
+                ..
+            } => ("migration_unavailable_source_target", "l.collection=5"),
+            Self::References { .. } => ("migration_unavailable_reference", "l.collection=5"),
+            Self::ReferencesByTarget(_) | Self::ReferencesByTargetKey { .. } => {
+                ("migration_unavailable_target", "l.collection=5")
+            }
+            Self::Packets { .. } => ("migration_unavailable_packet", "l.collection=7"),
+            Self::TableByName(_) => ("migration_unavailable_name", "l.collection=2"),
+            Self::Unavailable(_) => ("migration_lookup_unavailable", "1"),
+        }
+    }
     fn spec(&self) -> (Collection, Vec<(&'static str, &str)>) {
         match self {
             Self::RowsBySource(v) => (Collection::Rows, vec![("source_id", v)]),
@@ -380,9 +416,49 @@ pub struct LookupPage {
     /// True only when all retained records through this page's snapshot have an
     /// index and retention has completed. False never proves a missing target.
     pub coverage_complete: bool,
-    /// Conservatively false if any expected key in this collection is unavailable.
+    /// Conservatively false if a record that could match this query has any
+    /// unavailable expected key. Known mismatches exclude unrelated records;
+    /// NULL keys remain possible matches, including outside the current page.
     /// Use Unavailable(collection) to inspect all classifications and raw custody.
     pub keys_complete: bool,
+}
+
+// At most three filters: enumerate the disjoint known-value/unknown-key cases
+// as exact index seeks, rather than scanning the collection's unavailable rows.
+// Availability covers the whole query snapshot, not only the returned page.
+fn availability_query(
+    input: &str,
+    revision: &str,
+    query: &Lookup,
+    high: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (collection, filters) = query.spec();
+    let (index, predicate) = query.availability_index();
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        input.to_owned().into(),
+        revision.to_owned().into(),
+        ordinal(collection).into(),
+        high.into(),
+    ];
+    let mut branches = Vec::new();
+    for unknown in 0..(1 << filters.len()) {
+        let mut sql = format!(
+            "SELECT 1 FROM migration_record_lookup l INDEXED BY {index} JOIN migration_retained_records r ON r.sequence=l.record AND r.complete=1 WHERE l.input=?1 AND l.revision=?2 AND l.collection=?3 AND l.record<=?4 AND l.unavailable!='[]' AND {predicate}"
+        );
+        for (bit, (field, value)) in filters.iter().enumerate() {
+            if unknown & (1 << bit) == 0 {
+                values.push((*value).to_owned().into());
+                sql.push_str(&format!(" AND l.{field}=?{}", values.len()));
+            } else {
+                sql.push_str(&format!(" AND l.{field} IS NULL"));
+            }
+        }
+        branches.push(sql);
+    }
+    (
+        format!("SELECT EXISTS({})", branches.join(" UNION ALL ")),
+        values,
+    )
 }
 
 fn page(
@@ -485,7 +561,12 @@ fn page(
         ensure!(bytes <= MAX_BYTES, "lookup output bound");
         records.push(hit);
     }
-    let unavailable:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM migration_record_lookup l JOIN migration_retained_records r ON r.sequence=l.record AND r.complete=1 WHERE l.input=?1 AND l.revision=?2 AND l.collection=?3 AND l.unavailable!='[]' AND l.record<=?4)",params![input,revision,ordinal(collection),high],|r|r.get(0))?;
+    let (availability_sql, availability_values) = availability_query(input, revision, query, high);
+    let unavailable: bool = db.query_row(
+        &availability_sql,
+        rusqlite::params_from_iter(availability_values),
+        |r| r.get(0),
+    )?;
     let next = if more {
         Some(LookupCursor {
             query_blake3: hash,
@@ -927,6 +1008,310 @@ mod tests {
             [],
         )?;
         assert!(f.catalog.migration_lookup_record(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn availability_excludes_known_mismatches_but_preserves_possible_matches() -> Result<()> {
+        let f = TestCatalog::new()?;
+        for id in 1..=2 {
+            f.index(
+                &f.record(
+                    Collection::Entities,
+                    id,
+                    &[
+                        ("source_id", "image"),
+                        ("table_name", "Adobe_images"),
+                        ("local_key", "key"),
+                    ],
+                ),
+                true,
+            )?;
+        }
+        let mut ancillary = f.record(
+            Collection::Entities,
+            3,
+            &[
+                ("source_id", "ancillary"),
+                ("table_name", "ImageChangeCounter"),
+            ],
+        );
+        ancillary
+            .fields
+            .insert("local_key".into(), Field::Inline(Cell::Integer(17)));
+        f.index(&ancillary, true)?;
+        let query = Lookup::EntitiesBySource("image".into());
+        let first = f.query(&query, None, 1)?;
+        assert!(first.keys_complete && first.next.is_some());
+        assert_eq!(f.query(&query, first.next.as_ref(), 1)?.records.len(), 1);
+        assert!(
+            f.query(
+                &Lookup::EntitiesByLocalKey {
+                    table_name: "Adobe_images".into(),
+                    local_key: "key".into()
+                },
+                None,
+                2
+            )?
+            .keys_complete
+        );
+        let unknown = f.query(&Lookup::EntitiesBySource("ancillary".into()), None, 2)?;
+        assert!(!unknown.keys_complete);
+        assert_eq!(
+            unknown.records[0].unavailable[0].reason,
+            UnavailableReason::NonText
+        );
+        assert!(
+            !f.query(&Lookup::Unavailable(Collection::Entities), None, 100)?
+                .keys_complete
+        );
+        // A later unknown source could hide this image. It affects a new query,
+        // but must not alter the earlier cursor's high-water snapshot.
+        f.index(
+            &f.record(
+                Collection::Entities,
+                4,
+                &[("table_name", "Adobe_images"), ("local_key", "other")],
+            ),
+            true,
+        )?;
+        assert!(!f.query(&query, None, 2)?.keys_complete);
+        assert!(f.query(&query, first.next.as_ref(), 1)?.keys_complete);
+        // A known table mismatch excludes the same unknown source for this query.
+        assert!(
+            f.query(
+                &Lookup::EntitiesByLocalKey {
+                    table_name: "Elsewhere".into(),
+                    local_key: "key".into()
+                },
+                None,
+                2
+            )?
+            .keys_complete
+        );
+        Ok(())
+    }
+
+    fn scoped_queries() -> Vec<Lookup> {
+        vec![
+            Lookup::RowsBySource("s".into()),
+            Lookup::RowsByTable("t".into()),
+            Lookup::EntitiesBySource("s".into()),
+            Lookup::EntitiesByTable("t".into()),
+            Lookup::EntitiesByLocalKey {
+                table_name: "t".into(),
+                local_key: "k".into(),
+            },
+            Lookup::References {
+                source_id: "s".into(),
+                field: None,
+                target_table: None,
+            },
+            Lookup::References {
+                source_id: "s".into(),
+                field: Some("f".into()),
+                target_table: None,
+            },
+            Lookup::References {
+                source_id: "s".into(),
+                field: None,
+                target_table: Some("t".into()),
+            },
+            Lookup::References {
+                source_id: "s".into(),
+                field: Some("f".into()),
+                target_table: Some("t".into()),
+            },
+            Lookup::ReferencesByTarget("t".into()),
+            Lookup::ReferencesByTargetKey {
+                target_table: "t".into(),
+                target_key: "k".into(),
+            },
+            Lookup::PathsBySource("s".into()),
+            Lookup::Packets {
+                source_id: "s".into(),
+                origin: None,
+            },
+            Lookup::Packets {
+                source_id: "s".into(),
+                origin: Some("o".into()),
+            },
+            Lookup::TableByName("n".into()),
+        ]
+    }
+
+    #[test]
+    fn availability_all_filter_shapes_match_possible_key_oracle_and_scope() -> Result<()> {
+        let f = TestCatalog::new()?;
+        // Installed production DDL; payload interpretation is tested separately.
+        // Every filter can be known-equal, unknown, or a known mismatch.
+        for query in scoped_queries() {
+            let (collection, filters) = query.spec();
+            for combination in 0..3usize.pow(filters.len() as u32) {
+                let tx = f.catalog.db.unchecked_transaction()?;
+                let r = f.record(collection, 1, &[]);
+                let id = f.index(&r, true)?;
+                let mut state = combination;
+                let mut possible = true;
+                for (field, value) in &filters {
+                    let choice = state % 3;
+                    state /= 3;
+                    let value = match choice {
+                        0 => Some(*value),
+                        1 => None,
+                        _ => {
+                            possible = false;
+                            Some("mismatch")
+                        }
+                    };
+                    tx.execute(
+                        &format!("UPDATE migration_record_lookup SET {field}=?1 WHERE record=?2"),
+                        params![value, id],
+                    )?;
+                }
+                let (sql, values) = availability_query(&f.input, &f.revision, &query, id);
+                let result: bool =
+                    tx.query_row(&sql, rusqlite::params_from_iter(values), |r| r.get(0))?;
+                assert_eq!(result, possible, "{query:?} combination {combination}");
+                for (input, revision, high) in [
+                    ("other", f.revision.as_str(), id),
+                    (f.input.as_str(), "other", id),
+                    (f.input.as_str(), f.revision.as_str(), id - 1),
+                ] {
+                    let (sql, values) = availability_query(input, revision, &query, high);
+                    assert!(!tx.query_row::<bool, _, _>(
+                        &sql,
+                        rusqlite::params_from_iter(values),
+                        |r| r.get(0)
+                    )?);
+                }
+                tx.execute(
+                    "UPDATE migration_retained_records SET complete=0 WHERE sequence=?1",
+                    [id],
+                )?;
+                let (sql, values) = availability_query(&f.input, &f.revision, &query, id);
+                assert!(!tx.query_row::<bool, _, _>(
+                    &sql,
+                    rusqlite::params_from_iter(values),
+                    |r| r.get(0)
+                )?);
+                tx.rollback()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn availability_index_upgrade_is_atomic_and_reopens_existing_catalog() -> Result<()> {
+        let f = TestCatalog::new()?;
+        let path = f.catalog.root.clone();
+        let r = f.record(
+            Collection::Entities,
+            1,
+            &[("source_id", "s"), ("table_name", "t"), ("local_key", "k")],
+        );
+        let id = f.index(&r, true)?;
+        let indexes = [
+            "source",
+            "table",
+            "reference",
+            "source_target",
+            "target",
+            "packet",
+            "name",
+        ];
+        for name in indexes {
+            f.catalog
+                .db
+                .execute_batch(&format!("DROP INDEX migration_unavailable_{name}"))?;
+        }
+        f.catalog.db.execute_batch(
+            "PRAGMA user_version=8; CREATE TABLE migration_unavailable_reference(block_upgrade)",
+        )?;
+        drop(f.catalog);
+        assert!(Catalog::open(&path).is_err());
+        let db = Connection::open(path.join("catalog.sqlite3"))?;
+        assert_eq!(
+            db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))?,
+            8
+        );
+        assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'migration_unavailable_%'", [], |r| r.get(0))?, 0);
+        db.execute_batch("DROP TABLE migration_unavailable_reference")?;
+        drop(db);
+        let catalog = Catalog::open(&path)?;
+        assert_eq!(
+            catalog
+                .db
+                .query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))?,
+            9
+        );
+        assert_eq!(catalog.migration_lookup_record(id)?.rowid, r.rowid);
+        assert!(
+            catalog
+                .migration_lookup(
+                    &f.input,
+                    &f.revision,
+                    &Lookup::EntitiesBySource("s".into()),
+                    None,
+                    1
+                )?
+                .keys_complete
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn availability_seeks_do_not_visit_unrelated_unavailable_population() -> Result<()> {
+        use rusqlite::StatementStatus;
+        let f = TestCatalog::new()?;
+        let record = f.record(
+            Collection::Entities,
+            1,
+            &[("source_id", "ancillary"), ("table_name", "Other")],
+        );
+        let first = f.index(&record, true)?;
+        let tx = f.catalog.db.unchecked_transaction()?;
+        tx.execute("WITH RECURSIVE n(x) AS (VALUES(2) UNION ALL SELECT x+1 FROM n WHERE x<20000) INSERT INTO migration_retained_records(input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete) SELECT input,revision,collection,n.x,compressed,raw_length,digest,next_cursor,complete FROM migration_retained_records,n WHERE sequence=?1", [first])?;
+        tx.execute("INSERT INTO migration_record_lookup(record,input,revision,collection,digest,raw_length,source_id,table_name,unavailable) SELECT sequence,input,revision,collection,digest,raw_length,'ancillary','Other',(SELECT unavailable FROM migration_record_lookup WHERE record=?1) FROM migration_retained_records WHERE sequence>?1", [first])?;
+        tx.commit()?;
+        for query in scoped_queries() {
+            let (sql, values) = availability_query(&f.input, &f.revision, &query, i64::MAX);
+            let plan = f
+                .catalog
+                .db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                .query_map(rusqlite::params_from_iter(values.clone()), |r| {
+                    r.get::<_, String>(3)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                plan.iter()
+                    .any(|p| p.contains("SEARCH l USING")
+                        && p.contains(query.availability_index().0)),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|p| p.contains("SCAN l") || p.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+            let mut statement = f.catalog.db.prepare(&sql)?;
+            assert!(
+                !statement
+                    .query_row(rusqlite::params_from_iter(values), |r| r.get::<_, bool>(0))?
+            );
+            assert!(
+                statement.get_status(StatementStatus::VmStep) < 1000,
+                "{query:?}: {}",
+                statement.get_status(StatementStatus::VmStep)
+            );
+        }
+        let mut old = f.catalog.db.prepare("SELECT EXISTS(SELECT 1 FROM migration_record_lookup l INDEXED BY migration_lookup_unavailable JOIN migration_retained_records r ON r.sequence=l.record AND r.complete=1 WHERE l.input=?1 AND l.revision=?2 AND l.collection=4 AND l.unavailable!='[]' AND l.record<=?3 AND (l.source_id IS NULL OR l.source_id='s'))")?;
+        assert!(!old.query_row(params![f.input, f.revision, i64::MAX], |r| {
+            r.get::<_, bool>(0)
+        })?);
+        assert!(old.get_status(StatementStatus::VmStep) > 100_000);
         Ok(())
     }
 

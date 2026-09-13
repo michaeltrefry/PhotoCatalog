@@ -1,6 +1,6 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 /// Current on-disk catalog schema; probes must preflight before timed opens.
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 pub mod catalog_edits;
 pub mod catalog_export_alias;
@@ -313,6 +313,10 @@ impl Catalog {
             if version < 8 {
                 catalog_migration::current_repair::install(&tx)?;
                 tx.pragma_update(None, "user_version", 8)?;
+            }
+            if version < 9 {
+                catalog_migration::lookup::install_availability_indexes(&tx)?;
+                tx.pragma_update(None, "user_version", 9)?;
             }
             tx.commit()?;
             db.pragma_update(None, "foreign_keys", true)?;

@@ -802,6 +802,9 @@ mod tests {
                 rows.push((80,"UnknownHistory",vec![Cell::Integer(80),Cell::Integer(20),Cell::Blob(vec![0,255,7])]));
                 if huge {rows.push((70,"Adobe_libraryImageDevelopHistoryStep",vec![Cell::Integer(70),Cell::Integer(20),Cell::Text(vec![b'x';9*1024*1024])]));}
                 if duplicate {rows.push((300,"Adobe_imageDevelopSettings",vec![Cell::RealBits(30.0f64.to_bits()),Cell::Integer(20),payload]));}
+                // Real catalogs also contain ancillary entities with non-text local
+                // keys. They must not poison independent image/history navigation.
+                db.execute("INSERT INTO entities VALUES(?1,'ancillary','ImageChangeCounter',NULL,NULL,'{}')", [&revision]).unwrap();
                 for (id,table,cells) in rows {
                     let source=format!("h-{id}");
                     db.execute("INSERT INTO rows(revision,source_id,table_name,key_json,cells_json) VALUES(?1,?2,?3,?4,?5)",params![revision,source,table,serde_json::to_string(&vec![Cell::Integer(id)]).unwrap(),serde_json::to_string(&cells).unwrap()]).unwrap();
@@ -978,6 +981,24 @@ mod tests {
     #[test]
     fn offline_variant_history_is_paged_distinct_and_preserves_unknowns() -> Result<()> {
         let t = Test::new(false, false)?;
+        let revision: String = t.catalog.db.query_row(
+            "SELECT revision FROM migration_record_lookup WHERE input=?1 AND collection=4 LIMIT 1",
+            [&t.input],
+            |r| r.get(0),
+        )?;
+        let unavailable = t.catalog.migration_lookup(
+            &t.input,
+            &revision,
+            &Lookup::Unavailable(Collection::Entities),
+            None,
+            100,
+        )?;
+        assert_eq!(unavailable.records.len(), 1);
+        assert_eq!(unavailable.records[0].unavailable[0].field, "local_key");
+        assert_eq!(
+            unavailable.records[0].unavailable[0].reason,
+            super::super::lookup::UnavailableReason::NonText
+        );
         for (index, key) in t.keys.iter().enumerate() {
             let mut cursor = None;
             let mut seen = Vec::new();

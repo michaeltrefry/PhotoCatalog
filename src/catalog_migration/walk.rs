@@ -484,9 +484,11 @@ mod tests {
             LinkResolution::Unavailable { reason } => assert!(reason.contains("key unavailable")),
             _ => anyhow::bail!("oversized key acquired interpreted link"),
         }
+        // The oversized key belongs to the known field "parent". It cannot
+        // hide a match for this different field, also absent in live source truth.
         assert!(matches!(
             t.walk()?.link(&t.child()?, "not-a-field", "walk_parent")?,
-            LinkResolution::Unavailable { .. }
+            LinkResolution::Missing
         ));
         Ok(())
     }

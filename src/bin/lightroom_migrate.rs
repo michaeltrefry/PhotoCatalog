@@ -258,7 +258,7 @@ fn preflight_repair_upgrade(
     let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     ensure!(
-        app == 0x50484341 && (schema == 7 || schema == photocatalog::CURRENT_SCHEMA_VERSION),
+        app == 0x50484341 && (7..=photocatalog::CURRENT_SCHEMA_VERSION).contains(&schema),
         "repair requires a completed-import catalog schema"
     );
     if schema == 7 {
@@ -628,13 +628,32 @@ mod tests {
                 rusqlite::params![progress.id, raw],
             )?;
         }
-        let before = fs::read(&path)?;
         let mut request = current_repair::Request {
             run: progress.id,
             expected_complete_progress_blake3: blake3::hash(&raw).to_hex().to_string(),
             expected_mapping_epoch: 3,
             reason: "Correct parsed container".into(),
         };
+        // Both pre-repair schema 7 and completed-repair schema 8 must be
+        // admitted read-only before an upgrade. Schema 7 also checks the original
+        // Complete predecessor; later schemas use the resume-aware core guards.
+        for version in [7, 8] {
+            {
+                let db = rusqlite::Connection::open(&path)?;
+                db.pragma_update(None, "user_version", version)?;
+            }
+            let snapshot = fs::read(&path)?;
+            preflight_repair_upgrade(temp.path(), &progress.input, &request)?;
+            if version == 7 {
+                assert!(preflight_repair_upgrade(temp.path(), &"c".repeat(64), &request).is_err());
+            }
+            assert_eq!(snapshot, fs::read(&path)?);
+        }
+        {
+            let db = rusqlite::Connection::open(&path)?;
+            db.pragma_update(None, "user_version", 7)?;
+        }
+        let before = fs::read(&path)?;
         preflight_repair_upgrade(temp.path(), &progress.input, &request)?;
         assert!(preflight_repair_upgrade(temp.path(), &"c".repeat(64), &request).is_err());
         request.expected_mapping_epoch = 4;
