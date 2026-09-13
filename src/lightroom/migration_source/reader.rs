@@ -388,6 +388,22 @@ impl MigrationSource {
         limits: ReadLimits,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
+        Self::open_with_connection(seal, limits, cancel, |path| {
+            Ok(Connection::open_with_flags(
+                plan::uri(path)?,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?)
+        })
+    }
+
+    fn open_with_connection(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+        open: impl FnOnce(&Path) -> Result<Connection>,
+    ) -> Result<Self> {
         ensure!(
             !cancel.load(Ordering::Relaxed),
             "inspection-source read canceled"
@@ -437,12 +453,9 @@ impl MigrationSource {
         );
         guard.verify()?;
         no_companions(&path)?;
-        let db = Connection::open_with_flags(
-            plan::uri(&path)?,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let db = open(&path)?;
+        crate::catalog_storage::verify_database_object(&db, &guard.file)
+            .context("sealed inspection opened object")?;
         db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
         db.busy_timeout(Duration::ZERO)?;
         let namespace = seal.binding_blake3()?;
@@ -481,7 +494,10 @@ impl MigrationSource {
         let result = self
             .guard
             .verify()
-            .and_then(|()| no_companions(&self.guard.path));
+            .and_then(|()| no_companions(&self.guard.path))
+            .and_then(|()| {
+                crate::catalog_storage::verify_database_object(&self.db, &self.guard.file)
+            });
         if result.is_err() {
             self.poisoned.set(true);
         }
@@ -1001,3 +1017,7 @@ impl MigrationSource {
         Ok(ImageLinks { image_source_id:source_id.into(), file:self.resolve(revision,source_id,"rootFile","AgLibraryFile")?, master:self.resolve(revision,source_id,"masterImage","Adobe_images")?, current_develop:self.resolve(revision,source_id,"developSettingsIDCache","Adobe_imageDevelopSettings")?, limitations:"Only exact unique retained schema3 links; missing is not proof of a master sentinel or current settings. History/snapshots and unknown tables remain separately retained.".into() })
     }
 }
+
+#[cfg(test)]
+#[path = "reader_identity_tests.rs"]
+mod identity_tests;
