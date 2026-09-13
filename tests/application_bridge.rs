@@ -1524,3 +1524,150 @@ fn translated_import_recipes_hydrate_without_losing_import_history() -> Result<(
     assert_eq!(catalog.render_identity(&master.asset_id)?.state, "ready");
     Ok(())
 }
+
+#[test]
+fn desktop_organization_scopes_changes_to_selected_variant_and_catalog() -> Result<()> {
+    use photocatalog::organization::{KeywordKind, Operation};
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    image::RgbImage::from_pixel(8, 8, image::Rgb([20u8, 40, 80]))
+        .save(originals.join("photo.png"))?;
+    let root = temp.path().join("catalog");
+    let mut c = Catalog::open(&root)?;
+    c.import(&originals, None, |_| Ok(()))?;
+    let master = VariantKey::master(c.browse(0, 1)?[0].id.clone());
+    let original = c.edit_variant(&master)?;
+    let copy = c.create_edit_variant(&master, original.revision, "Selected copy")?;
+    drop(c);
+    let b = Bridge::spawn(config(&originals))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    let request = |catalog: &str, request| Request::Organization {
+        catalog: catalog.into(),
+        request: Box::new(request),
+    };
+    assert!(
+        call(
+            &b,
+            request(
+                "stale",
+                organization::Request::CreateCollection {
+                    name: "Must not exist".into(),
+                }
+            )
+        )
+        .is_err()
+    );
+    let Response::Organization(response) = call(
+        &b,
+        request(
+            &token,
+            organization::Request::Identity {
+                key: copy.key.clone(),
+            },
+        ),
+    )?
+    else {
+        bail!("organization identity response");
+    };
+    let organization::Response::Identity(identity) = *response else {
+        bail!("identity payload");
+    };
+    call(
+        &b,
+        request(
+            &token,
+            organization::Request::Apply {
+                key: copy.key.clone(),
+                expected_revision: identity.metadata_revision,
+                operation: Operation::AddKeyword {
+                    kind: KeywordKind::Hierarchical,
+                    path: vec!["Travel".into(), "Festival".into()],
+                },
+            },
+        ),
+    )?;
+    let Response::Organization(response) = call(
+        &b,
+        request(
+            &token,
+            organization::Request::Keywords {
+                kind: KeywordKind::Hierarchical,
+                parent: None,
+                after: I64(0),
+                limit: 100,
+            },
+        ),
+    )?
+    else {
+        bail!("keyword response");
+    };
+    let organization::Response::Keywords(page) = *response else {
+        bail!("keyword payload");
+    };
+    let parent = page.rows.iter().find(|k| k.name == "Travel").unwrap().id;
+    let Response::Organization(response) = call(
+        &b,
+        request(
+            &token,
+            organization::Request::Keywords {
+                kind: KeywordKind::Hierarchical,
+                parent: Some(parent),
+                after: I64(0),
+                limit: 100,
+            },
+        ),
+    )?
+    else {
+        bail!("child response");
+    };
+    let organization::Response::Keywords(page) = *response else {
+        bail!("child payload");
+    };
+    let keyword = page.rows.iter().find(|k| k.name == "Festival").unwrap().id;
+    wait_ready(&b)?;
+    let Response::Images { rows, .. } = call(
+        &b,
+        Request::Search {
+            catalog: token.clone(),
+            options: Box::new(browse::Options {
+                keyword: Some(keyword),
+                ..Default::default()
+            }),
+            cursor: None,
+            limit: 100,
+        },
+    )?
+    else {
+        bail!("search response");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, copy.key);
+    assert_eq!(variant(&b, &token, &master)?.revision.0, original.revision);
+    let Response::Organization(response) = call(
+        &b,
+        request(
+            &token,
+            organization::Request::Collections {
+                after: String::new(),
+                limit: 100,
+            },
+        ),
+    )?
+    else {
+        bail!("collections response");
+    };
+    let organization::Response::Collections(page) = *response else {
+        bail!("collections payload");
+    };
+    assert!(page.rows.is_empty());
+    b.shutdown();
+    Ok(())
+}

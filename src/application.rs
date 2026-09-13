@@ -2,9 +2,9 @@
 //! owned/reaped by PreviewService; no webview thread touches SQLite.
 pub mod backup;
 pub mod browse;
-pub mod organization;
 mod dto;
 mod hydration;
+pub mod organization;
 use crate::{
     Catalog,
     catalog_edits::{VariantKey, VariantView},
@@ -233,6 +233,17 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
+            Work::Command(Request::Organization { request, .. }, _) => match request.as_ref() {
+                organization::Request::Cancel { .. } => 0,
+                organization::Request::Apply { .. }
+                | organization::Request::SetMember { .. }
+                | organization::Request::PlaceCollection { .. }
+                | organization::Request::RenameCollection { .. } => 1,
+                organization::Request::Step { .. }
+                | organization::Request::Append { .. }
+                | organization::Request::Seal { .. } => 4,
+                _ => 2,
+            },
             Work::Command(Request::Close { .. }, _) => 0,
             Work::Command(
                 Request::SaveRecipe { .. }
@@ -768,6 +779,7 @@ impl Actor {
                                     | Request::Cull { .. }
                                     | Request::Images { .. }
                                     | Request::Search { .. }
+                                    | Request::Organization { .. }
                             );
                             let result = self.command(r, &e.cancel);
                             if reindex && let Some(o) = self.open.as_mut() {
@@ -1019,6 +1031,9 @@ impl Actor {
                 self.close();
                 Ok(Response::Status(self.status()))
             }
+            Request::Organization { catalog, request } => Ok(Response::Organization(Box::new(
+                organization::execute(&mut self.current(&catalog)?.catalog, *request, &limits)?,
+            ))),
             Request::ImportStart { catalog, source }
             | Request::ImportResume { catalog, source } => {
                 let shared = Arc::clone(&self.shared);

@@ -3,6 +3,7 @@
 //! Provenance is an opaque JSON string so retained integers survive JavaScript.
 use super::{BridgeError, ErrorCode, I64, Limits, U64, error, native};
 use crate::{Catalog, catalog_edits::VariantKey, organization as core};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -41,6 +42,9 @@ pub enum Request {
     Collections {
         after: String,
         limit: u16,
+    },
+    Collection {
+        id: String,
     },
     CreateCollection {
         name: String,
@@ -275,6 +279,7 @@ pub enum Response {
     KeywordCreated { id: I64 },
     Synonyms(Page<Synonym, String>),
     Collections(Page<Collection, String>),
+    Collection(Option<Collection>),
     CollectionCreated { id: String },
     Placement(Placement),
     Members(MembershipPage),
@@ -543,6 +548,34 @@ pub fn execute(catalog: &mut Catalog, request: Request, bounds: &Limits) -> Resu
                 })
                 .collect::<Result<_>>()?;
             Response::Collections(page(rows, limit, bounds, |v| v.id.clone())?)
+        }
+        Request::Collection { id } => {
+            text(&id, false)?;
+            let tx = catalog
+                .db
+                .unchecked_transaction()
+                .map_err(|e| native(e.into()))?;
+            let bytes: Option<i64> = tx.query_row(
+                "SELECT length(CAST(id AS BLOB))+length(CAST(name AS BLOB))+length(CAST(provenance AS BLOB)) FROM organization_collections WHERE id=?1",
+                [&id], |r| r.get(0),
+            ).optional().map_err(|e| native(e.into()))?;
+            let value = if let Some(bytes) = bytes {
+                if u64::try_from(bytes).unwrap_or(u64::MAX) > bounds.page_bytes as u64 {
+                    return Err(error(
+                        ErrorCode::ResourceLimit,
+                        "collection message byte limit",
+                    ));
+                }
+                Some(tx.query_row(
+                    "SELECT id,name,revision,provenance FROM organization_collections WHERE id=?1",
+                    [&id], |r| Ok(Collection { id: r.get(0)?, name: r.get(1)?, revision: I64(r.get(2)?), provenance_json: r.get(3)? }),
+                ).map_err(|e| native(e.into()))?)
+            } else {
+                None
+            };
+            tx.commit().map_err(|e| native(e.into()))?;
+            size(&value, bounds.page_bytes)?;
+            Response::Collection(value)
         }
         Request::CreateCollection { name } => {
             text(&name, false)?;
@@ -1280,6 +1313,48 @@ mod tests {
                 expected_revision: I64(latest),
             },
         )?;
+        Ok(())
+    }
+    #[test]
+    fn collection_lookup_preserves_exact_values_and_bounds_retained_payload() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let mut c = Catalog::open(temp.path().join("catalog"))?;
+        let id = c.create_collection("Festival", serde_json::json!({"source":"test"}))?;
+        let provenance = r#"{"retained":9007199254740993}"#;
+        c.db.execute(
+            "UPDATE organization_collections SET revision=?1,provenance=?2 WHERE id=?3",
+            rusqlite::params![i64::MAX, provenance, id],
+        )?;
+        let Response::Collection(Some(value)) =
+            call(&mut c, Request::Collection { id: id.clone() })?
+        else {
+            panic!("lookup payload")
+        };
+        assert_eq!(value.name, "Festival");
+        assert_eq!(value.revision, I64(i64::MAX));
+        assert_eq!(value.provenance_json, provenance);
+        assert!(serde_json::to_string(&value)?.contains("\"9223372036854775807\""));
+        c.db.execute(
+            "UPDATE organization_collections SET provenance=?1 WHERE id=?2",
+            rusqlite::params!["é".repeat(1024), id],
+        )?;
+        let limits = Limits {
+            page_bytes: 1024,
+            ..Default::default()
+        };
+        assert!(matches!(
+            execute(&mut c, Request::Collection { id: id.clone() }, &limits),
+            Err(BridgeError {
+                code: ErrorCode::ResourceLimit,
+                ..
+            })
+        ));
+        c.db.execute("DELETE FROM organization_collections WHERE id=?1", [&id])?;
+        assert!(matches!(
+            call(&mut c, Request::Collection { id })?,
+            Response::Collection(None)
+        ));
         Ok(())
     }
     #[test]

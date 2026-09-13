@@ -4,25 +4,68 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
-S1–S10 are Done. S10 PR #14 merged as
-`287d3382538b10717bf943553c73fc29a300ffd6`, with identical content to independently
-reviewed final head `81f931`. Final-head CI `34739779088` and merged-head CI
-`34740733892` passed all four jobs: macOS, Windows, Linux, and benchmark contracts.
-Shortcut sc-22845 and all four tasks were read back as complete; comment 23281
-records acceptance and limits. The selected16 result remains a scratch TEST.
-Canonical migration, Adobe renderer parity, and terminal performance are not
-claimed. No actual catalog or RAID worker remains active.
+S1–S11 are Done. S10 PR #14 merged as
+`287d3382538b10717bf943553c73fc29a300ffd6`; final and merged CI passed.
+The selected16 migration remains a scratch TEST, with no canonical migration
+or Adobe renderer parity claim. The user has opened this TEST in the first local
+Mac checkpoint app. Read-only diagnosis verified a selected original exists at
+its recorded path while its migrated physical asset remains pending.
 
-S11 sc-22846 local implementation and acceptance checks are complete on
-`codex/sc-22846-backup-restore`, based on merged S10. The production source passed
-662 release tests (five existing ignored), with one additional real running-job
-backup test subsequently passing; that addition changed tests only. Strict
-all-target Clippy and formatting passed. Whole-database backup, verified restore
-to a new destination, incomplete-output protection, exact XMP/migration retention,
-explicit restored-job holds, and relink/preview regeneration are covered.
-See [Catalog backup and restore](CATALOG_BACKUP.md). Final review, PR/platform CI,
-merge and tracker closeout remain delivery gates; Shortcut holds their live state.
-S12 desktop packaging and S13 integrated readiness remain required.
+S11 PR #15 merged as `e43997aad29bafc90f079fa2954df9f6db084266`, identical
+to independently reviewed `6105679`. Final PR CI `34742822480` and merged CI
+`34743768864` passed all four jobs (macOS, Windows, Linux, evidence contracts).
+Shortcut sc-22846 was read back Done; comment23286 records acceptance and limits.
+Its whole-database backup, verified new-destination restore, interruption safety,
+XMP/migration retention, restored-job holds, relink and preview regeneration are
+covered by [Catalog backup and restore](CATALOG_BACKUP.md). This does not claim a
+measured backup of the73GB TEST catalog.
+
+S12 sc-22847 is In Progress on `codex/sc-22847-desktop`. React/TypeScript/Vite
+and Tauri implement the first grid/editor integration; PhotoCatalog remains the
+working name. Actual filesystem folders across all years share one catalog.
+The UI-independent Rust application actor owns typed bounded commands, precise
+paths/revisions, foreground priority, preview scheduling and worker lifecycle.
+Draft PR #16 is open at `27860290ce5e00d55fa83fcaa80fb1b08909574d` on the
+PUBLIC repository. Run `34751855171` finished: contracts passed; Linux failed
+late JPEG XL discovery after Python setup replaced PKG_CONFIG_PATH; Windows failed
+notice collection; macOS package/installed-worker checks passed but evidence upload
+failed. Linux environment repair `d242842` is local; remaining platform failures are
+being repaired without adding CI lanes. Local import `557c0ff` is integrated as
+`eebc6e5` after 85 focused tests, strict Clippy and independent source review.
+Root backup dispatch/UI, search/import controls and loading feedback `6e21ff0`
+passed 24 native bridge/actor tests, strict Clippy, Tauri check, frontend build and
+seven frontend tests with an independent source review.
+
+The actual macOS checkpoint's dependency closure and installed preview/export
+workers passed local validation. Its linked native libraries require macOS 26;
+macOS 12 compatibility is not established. Signing-sanitized tooling now forces
+ad-hoc local builds; two earlier unintended signing/notarization attempts are
+recorded in Shortcut comment23288. No GitHub release was published.
+
+User testing reached Catalog ready after initial indexing, but exposed pending
+Lightroom originals being called unavailable. Initial physical preparation
+`a1d5500` is integrated as `47551b4`: 46 distinct focused tests passed, including
+variant-specific pixels, translated import recipe history, retained metadata/XMP,
+missing originals, held-reader cancellation and seven crash cases. Exact v4 source
+review passed independently. Preparation reads one selected original at a time;
+its result establishes physical readiness without replacing recipes or paths.
+Root integrated bridge tests now pass; final organization/Clippy gates and the new
+Mac package are in progress. Actual RAW GUI validation is still pending; the Mac
+was locked when Computer Use attempted it, and the user has an unlock request.
+
+Schema11 durable zero-position collection projection `97e0394` is integrated as
+`01af9b4`: 50 focused tests plus query-counter fixture and strict Clippy passed;
+independent review verified all source/log hashes. Bounded persistent initialization
+prevents a full membership scan before a positive-only first page. Root dispatcher
+and bounded single-collection lookup are under integrated gates and passed source
+review. Organization UI review identified transient-indexing unmount and false
+end-of-page on errors; both are being repaired before integration. Older recorded
+drive paths still need the planned relink UI; no path rewrite was performed.
+
+The first grid/editor checkpoint remains incomplete: full organization, conflicts,
+Lightroom migration/reconciliation, import/export, relink, backup/restore, settings,
+accessibility, user visual review and installed three-platform workflows remain S12.
+S13 remains the sole terminal integrated readiness/scale campaign after S12 is stable.
 
 ## S10 pre-merge checkpoint — 2026-09-13
 
