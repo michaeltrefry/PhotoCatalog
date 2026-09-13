@@ -488,6 +488,16 @@ fn preadmit(db: &Connection, limits: SelectionLimits) -> Result<()> {
 }
 
 impl SelectionReview {
+    /// Bind both this review's held source and SQLite's actually opened object
+    /// to the workbench's existing descriptor. No incidental same-inode FD is
+    /// opened/closed here (important for POSIX process-scoped SQLite locks).
+    pub(crate) fn verify_inspection_owner(&self, expected: &Source) -> Result<()> {
+        ensure!(
+            self.guard.before.object == expected.before.object,
+            "selection opened a different inspection object; reopen workbench explicitly"
+        );
+        crate::catalog_storage::verify_database_object(&self.plan.db, &expected.file)
+    }
     pub fn open(
         request: SelectionRequest,
         limits: SelectionLimits,
@@ -528,6 +538,7 @@ impl SelectionReview {
         let baseline = version(&db)?;
         let plan = Plan {
             db,
+            execution: None,
             root: path
                 .parent()
                 .context("inspection parent absent")?

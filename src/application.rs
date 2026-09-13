@@ -5,6 +5,7 @@ pub mod browse;
 pub mod copy;
 mod dto;
 mod hydration;
+pub mod lightroom;
 pub mod metadata;
 pub mod organization;
 pub mod relink;

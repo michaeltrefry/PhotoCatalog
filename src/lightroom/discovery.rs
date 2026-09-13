@@ -42,6 +42,15 @@ pub fn filename_hint(stem: &str) -> (String, Option<u32>) {
     (name, version)
 }
 pub fn discover(root: &Path, limits: &Limits) -> Result<Inventory> {
+    discover_controlled(root, limits, None, || Ok(()))
+}
+pub(crate) fn discover_controlled(
+    root: &Path,
+    limits: &Limits,
+    admission: Option<(usize, usize)>,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<Inventory> {
+    check()?;
     limits.validate()?;
     reject_links(root)?;
     let root = fs::canonicalize(root)?;
@@ -55,9 +64,36 @@ pub fn discover(root: &Path, limits: &Limits) -> Result<Inventory> {
         complete: true,
         entries: 0,
     };
+    let mut retained = 0usize;
+    let mut admit = |path: &Path| -> Result<()> {
+        if let Some((bytes, units)) = admission {
+            let native = NativePath::from_path(path);
+            let n = match &native {
+                NativePath::UnixBytes(v) => v.len(),
+                NativePath::WindowsWide(v) => v.len(),
+            };
+            ensure!(n <= units, "discovery native path admission exceeded");
+            // Charge every visited path before any pending/seen/result copies;
+            // covers path arrays, escaped hints, and issue/object overhead.
+            let charge = n
+                .checked_mul(32)
+                .and_then(|n| n.checked_add(2048))
+                .ok_or_else(|| anyhow::anyhow!("discovery byte admission overflow"))?;
+            retained = retained
+                .checked_add(charge)
+                .ok_or_else(|| anyhow::anyhow!("discovery byte admission overflow"))?;
+            ensure!(
+                retained <= bytes,
+                "discovery aggregate byte admission exceeded; use a narrower explicit root or larger result budget"
+            );
+        }
+        Ok(())
+    };
+    admit(&root)?;
     let mut pending = vec![(root, 0)];
     let mut seen = BTreeSet::new();
     while let Some((directory, depth)) = pending.pop() {
+        check()?;
         if !seen.insert(directory.clone()) {
             continue;
         }
@@ -73,9 +109,11 @@ pub fn discover(root: &Path, limits: &Limits) -> Result<Inventory> {
             }
         };
         for entry in entries {
+            check()?;
             let entry = match entry {
                 Ok(v) => v,
                 Err(e) => {
+                    admit(&directory)?;
                     result
                         .issues
                         .push(Issue::new("unreadable_entry", e.to_string()));
@@ -93,6 +131,7 @@ pub fn discover(root: &Path, limits: &Limits) -> Result<Inventory> {
                 return Ok(result);
             }
             let path = entry.path();
+            admit(&path)?;
             let kind = entry.file_type()?;
             if kind.is_symlink() {
                 result.exclusions.push(NativePath::from_path(&path));

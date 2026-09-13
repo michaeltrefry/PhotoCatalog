@@ -151,12 +151,21 @@ impl Source {
         }
         Ok(())
     }
-    pub fn copy_and_hash(&mut self, mut output: Option<&mut File>) -> Result<String> {
+    pub fn copy_and_hash(&mut self, output: Option<&mut File>) -> Result<String> {
+        self.copy_and_hash_controlled(output, || Ok(()))
+    }
+    pub fn copy_and_hash_controlled(
+        &mut self,
+        mut output: Option<&mut File>,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<String> {
+        check()?;
         self.file.seek(SeekFrom::Start(0))?;
         let mut remaining = self.before.bytes;
         let mut hash = blake3::Hasher::new();
         let mut bytes = [0u8; 128 * 1024];
         while remaining > 0 {
+            check()?;
             let count = remaining.min(bytes.len() as u64) as usize;
             self.file
                 .read_exact(&mut bytes[..count])
@@ -168,6 +177,7 @@ impl Source {
             remaining -= count as u64;
         }
         self.verify()?;
+        check()?;
         Ok(hash.finalize().to_hex().to_string())
     }
 }

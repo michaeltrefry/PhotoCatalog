@@ -2,6 +2,7 @@
 //! into the application catalog or executes Adobe develop/plug-in instructions.
 pub mod adobe;
 pub mod capture;
+pub(crate) mod control;
 pub mod discovery;
 pub mod migration_source;
 pub mod plan;
