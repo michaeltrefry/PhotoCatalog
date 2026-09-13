@@ -13,6 +13,8 @@ import { CopyPanel } from './components/CopyPanel';
 import { useEditCopy } from './state/useEditCopy';
 import { copyTerminal } from './editCopy';
 import { usePhotoExport } from './state/usePhotoExport';
+import { useLightroom } from './state/useLightroom';
+import { LightroomPanel, LightroomActivity } from './components/LightroomPanel';
 import { terminal as exportTerminal } from './photoExport';
 import { ExportPanel, type ExportGate } from './components/ExportPanel';
 import { MetadataPanel } from './components/MetadataPanel';
@@ -49,6 +51,7 @@ export function App() {
   const [showRelink, setShowRelink] = useState(false);
   const [showCopy, setShowCopy] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [showLightroom, setShowLightroom] = useState(false);
   const [copyRefreshing, setCopyRefreshing] = useState<{ catalog: string; stamp: string } | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
   const [organizationScopeName, setOrganizationScopeName] = useState('');
@@ -83,6 +86,7 @@ export function App() {
   const storage = useRelink(catalog);
   const copies = useEditCopy(catalog);
   const outputs = usePhotoExport(catalog);
+  const inspection = useLightroom(desktopAvailable);
   const [exportPending, setExportPending] = useState<string | null>(null);
   const exportDirectHeld = catalog !== null && exportPending === catalog;
   const copyEditingHeld = copies.busy || copyRefreshing?.catalog === catalog;
@@ -284,8 +288,10 @@ export function App() {
       <span className="catalog-name" title={catalogName}>{catalog ? catalogName.split(/[\\/]/).filter(Boolean).at(-1) || 'Catalog' : 'Local photo library'}</span>
       {catalog && <nav aria-label="Workspace">{(['library', 'cull', 'develop'] as const).map(value => <button key={value} aria-current={mode === value ? 'page' : undefined} onClick={() => setMode(value)}>{value}</button>)}</nav>}
       {desktopAvailable && <button className="quiet" disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowBackup(true); })}>Backups…</button>}
+      {desktopAvailable && <button className="quiet" onClick={() => setShowLightroom(true)}>Inspect Lightroom…</button>}
       {catalog && <button className="quiet" onClick={() => void close()} disabled={!!busy || transitioning}>Close catalog</button>}
     </header>
+    {desktopAvailable && <LightroomActivity controller={inspection} onOpen={() => setShowLightroom(true)} />}
     {error && <ErrorNotice message={error} dismiss={() => setError('')} />}
     {busy && <div className="activity" role="status">{busy}… {operationAbort.current && <button onClick={() => operationAbort.current?.abort()}>Cancel</button>}</div>}
     {!catalog ? <main className="welcome"><div className="welcome-mark" aria-hidden="true">▧</div><h1>Your photographs.<br />One library.</h1><p>Keep every year together. Browse your folders, preserve your originals, and edit without losing where you started.</p>
@@ -324,6 +330,7 @@ export function App() {
         </> : <div className="empty-state"><p>Select a photo to inspect its metadata and edits.</p></div>}</aside>}
       </main><footer className="app-status"><span>{status.phase === 'ready' ? 'Catalog ready' : status.phase}</span><span>{importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase) ? `Import ${importStatus.phase.replaceAll('_', ' ')} · ${importStatus.imported} added` : status.message}</span><span>{backupStatus && ['running', 'cancel_requested'].includes(backupStatus.state) ? `Backup ${backupStatus.state.replaceAll('_', ' ')}` : ''}</span><span>{status.active_previews > 0 ? `${status.active_previews} preview requests` : 'Local catalog'}</span></footer>
     </>}
+    {desktopAvailable && <LightroomPanel controller={inspection} open={showLightroom} onClose={() => setShowLightroom(false)} />}
     {catalog && <ExportPanel key={`export:${catalog}`} catalog={catalog} open={showExport} rows={page.rows} controller={outputs} gate={exportGate} blocked={exportBlocked} onDirectPending={pending => setExportPending(pending ? catalog : null)} onClose={() => setShowExport(false)} />}
     {catalog && <CopyPanel key={`copy:${catalog}`} catalog={catalog} open={showCopy} selected={selected} rows={page.rows} source={() => queueRef.current?.value.variant ?? null} controller={copies} mutate={organizationMutation} jobsHeld={status.jobs_held} writeHeld={storageWriteHold} onClose={() => setShowCopy(false)} />}
     {catalog && <RelinkPanel key={`relink:${catalog}`} catalog={catalog} selected={selected} open={showRelink} onClose={() => setShowRelink(false)} controller={storage} mutate={organizationMutation} changed={() => { setPreviewEpoch(v => v + 1); setFolderEpoch(v => v + 1); setCursor(null); setPrevious([]); setRefresh(v => v + 1); const selection = selectedRef.current; const generation = ++storageRefresh.current; const current = () => catalogRef.current === catalog && storageRefresh.current === generation && selectedRef.current === selection; if (selection) void command({ command: 'image', args: { catalog, key: selection.key } }, 'image').then(row => { if (current()) setSelected(row); }).catch(e => { if (current()) setError(errorText(e)); }); }} />}
