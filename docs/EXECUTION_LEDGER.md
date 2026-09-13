@@ -5,7 +5,8 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 ## Current delivery — 2026-09-13
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
-PR16 is at `d62fe14030213e19b533429758591af919d8c793`. The reviewed batch
+PR16 is at `00463417af8ee8e0ce10c775ba11aea270bdc9c6`; CI34773173909 is
+still running (Linux/contracts passed, Mac failed, Windows building). The earlier reviewed batch
 includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
 Lightroom inspection workbench `9deedea`, and Windows boundary repair `e239268`.
 The full export frontend is integrated as `c74e9aa` plus `eb0ef3c`. Independent
@@ -65,15 +66,19 @@ TypeScript/Vite and 18 actual-App synthetic snapshots pass. Eleven source/depend
 hashes match the reviewed tree. Review SHA256:
 `2de77e3f54b60dd634046f19fd42d8d2d45e15c67569a39bf3267111acd497df`.
 
-The complete seven-command migration PLANv3/WIREv3 passed independent design review
-and was recorded verbatim in Shortcut comment23313 with read-back verification.
-Implementation is active in an isolated worktree. It covers target-free preparation,
-all saved stages and repairs, exact approval authority, parent-managed cancellable
-writer grants, handle transfer/quarantine and bootstrap recovery. Early source
-review identified a Windows path reopen under the inspection fence and a Linux
-received-descriptor inheritance window; both require correction before that source
-can qualify. Migration execution, reconciliation and repair remain required S12
-work. No canonical user migration occurred.
+The complete seven-command migration PLAN/WIREv4 now supersedes the v3 transfer
+mechanism. Exact documents/source delta were recorded in Shortcut comment23315 and
+read back (64,147 characters). Independent v4 readback passed, SHA256
+`898e6976ceaf7a7c891d6f2d9f6a9ab75c13a54788ad6a9d8510ea183c252b26`.
+Pinned XNU source shows that malformed descriptor receipt under FD exhaustion can
+release GUI POSIX locks before quarantine exists. V4 removes GUI descriptor receipt:
+one owned helper holds the physical import lock and sole SQL executor; GUI owns
+process/reap and exact cancellable Writers grants. Source/reader lifetime, alias
+poisoning, separate bootstrap grants and complete seven-command/two-repair scope
+remain mandatory. Unqualified transfer/fence/spawn drafts were preserved before
+removal. The first source compile succeeded; six fixture tests hit macOS temporary
+path symlinks before intended assertions. Fixture correction and full implementation
+remain in progress. No canonical user migration occurred.
 
 The old v1 app was closed normally. Installed v5 opens the selected16 TEST catalog:
 preparation reached Catalog ready, and a known existing 2017 CR2 displayed both a
@@ -146,6 +151,47 @@ Receipt `sc-22847-lightroom-ui-integrated-rzlpj9m6/receipt.json`, SHA256
 Independent exact-head integration review passed with no findings, SHA256
 `e1552e3321ce00601ee3c5cc8be4bb694edd2c23dd5a02930e419754bfe3a378`.
 This is combined source validation; installed GUI and fresh hosted CI remain open.
+
+CI34773173909 exposed a close/reopen race at application_lightroom_bridge.rs394:
+cached Closed preceded coordinator join and release of the process inspection lease.
+Reviewed local repair `716b2ad` keeps Closing until both complete. Its deterministic
+regression failed on old code, then seven bridge tests, the complete synthetic
+capture/resume/close/reopen integration, strict Clippy and formatting passed.
+Final receipt SHA256:
+`6525e1d2fbb115d0a5207077f461f29867d08f5c530abeae81e2215b95285ab3`;
+independent source review:
+`f2c27c32fdfc49dc86a0f2eb2cfc501dbe226f4caca781cce279e76ebf18abf9`.
+Native baseline62974 and repaired76727 are terminal/reaped. No retry push yet.
+Downloaded Linux installer, executable, observer and worker receipts at0046341
+verified; readback SHA256:
+`e36b3c99c5db1986138109f5ee991357e84cccaa3f1ff40547a3fd6ea54ba2e1`.
+
+New custody findings qualify the earlier integration PASS. Same-process photo
+export destination snapshot opens/closes can release a live Workbench Source lock
+if a destination aliases its SQLite object; the proposed metadata filesystem paths
+share that defect. Review addendum SHA256:
+`11a711cad6ce858384237d216e04ec288c24638157a0176a50e185e94c701892`.
+A separately owned filesystem executor with the parent SQL transaction/permit held
+through child drain is being planned. RelinkWorkerHandle::open_with also opens and
+closes three raw catalog descriptors outside SQLite's deferred-close ownership;
+existing export/relink callers and new metadata are affected. Unix HAS_MOVED alone
+does not compare the expected held inode. The safe shared connection admission
+replacement is a required unresolved prerequisite, not permission to remove identity
+checks or assume startup is quiescent. Assessment SHA256:
+`814a2783399c3cb8a16c7cffb52eb20e2ad98d1783da6511564ce5ed87a71e14`.
+Metadata plan v3 remains unimplemented pending that design, including all four
+edit forms, sidecars, durable receipts and explicit evidence reconciliation. The
+complete final documents were recorded/read back in comment23322 (55,179
+characters); schema13 is reserved. Qualified design review SHA256:
+`7626b0a77316d6633d83c34640a2b70b8f4d3583b3349d15596aaba56599f768`.
+The shared actual-opened identity slice is recorded/read back in comment23321:
+one custom opcode in the pinned bundled SQLite returns actual Unix dev/inode
+without another descriptor; Windows keeps its supported native-handle check.
+This addresses migration LM-F4 and does not by itself solve GUI wrong-object
+cleanup. Its isolated implementation and the complete custody design are active.
+The migration lock-name finding was retracted after verifying the existing CLI
+uses `.lightroom-import.lock`; no desktop-only rename is planned. These findings
+are tracked on S12 comment23317; S12/epic remain In Progress, S13 unstarted.
 
 ## Earlier integration checkpoints
 
