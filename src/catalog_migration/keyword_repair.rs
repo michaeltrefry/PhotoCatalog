@@ -1237,3 +1237,7 @@ pub(crate) fn finish(tx: &Transaction<'_>, id: &str) -> Result<()> {
     n.complete = true;
     advance(tx, &p, &n)
 }
+
+#[cfg(test)]
+#[path = "keyword_repair_wire_tests.rs"]
+mod wire_tests;

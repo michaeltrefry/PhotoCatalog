@@ -1,0 +1,126 @@
+{
+  "protocol": 1,
+  "scope": "Synthetic wire compatibility only; no actual source data or execution admission.",
+  "receipt": {
+    "value": {
+      "source_identity": "2222222222222222222222222222222222222222222222222222222222222222",
+      "slot": "dictionary",
+      "owner": "synthetic café / Ω",
+      "adapter": "lightroom-organization-columns-v2",
+      "input_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "result": " {\"text\":\"café \\\"Ω\\\"\", \"literal\":\"\\\\n\"} ",
+      "retained_record": 17,
+      "proof": "{\"literal\":\"line\\nsecond\",\"unicode\":\"日本語\",\"quote\":\"\\\"\",\"slash\":\"\\\\\"}\n"
+    },
+    "json": "{\"source_identity\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"slot\":\"dictionary\",\"owner\":\"synthetic café / Ω\",\"adapter\":\"lightroom-organization-columns-v2\",\"input_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"result\":\" {\\\"text\\\":\\\"café \\\\\\\"Ω\\\\\\\"\\\", \\\"literal\\\":\\\"\\\\\\\\n\\\"} \",\"retained_record\":17,\"proof\":\"{\\\"literal\\\":\\\"line\\\\nsecond\\\",\\\"unicode\\\":\\\"日本語\\\",\\\"quote\\\":\\\"\\\\\\\"\\\",\\\"slash\\\":\\\"\\\\\\\\\\\"}\\n\"}",
+    "blake3": "dabf29d718e540497e78c733989955ab0c2b90e6a9c264759745aa6293cb528d"
+  },
+  "binding": {
+    "value": {
+      "adapter": "lightroom-keyword-repair-v1",
+      "request": {
+        "expected_dictionaries": 1,
+        "expected_memberships": 1,
+        "expected_synonyms": 0,
+        "expected_captures": 1,
+        "run": "6666666666666666666666666666666666666666666666666666666666666666",
+        "expected_complete_progress_blake3": "7777777777777777777777777777777777777777777777777777777777777777",
+        "expected_mapping_epoch": 19,
+        "current_repair": "8888888888888888888888888888888888888888888888888888888888888888",
+        "expected_current_repair_progress_blake3": "9999999999999999999999999999999999999999999999999999999999999999",
+        "expected_roster_blake3": "382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb",
+        "predecessor_evidence_blake3": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "roots": [
+          {
+            "origin": {
+              "retained_record": 17,
+              "source": {
+                "capture_revision": "1111111111111111111111111111111111111111111111111111111111111111",
+                "table": "AgLibraryKeyword",
+                "key": [
+                  {
+                    "Integer": 99
+                  }
+                ]
+              }
+            },
+            "raw_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+            "retained_table": 5,
+            "table_digest": "5555555555555555555555555555555555555555555555555555555555555555"
+          }
+        ],
+        "reason": "Synthetic café Ω; literal \\n, quote \" and newline\n"
+      },
+      "input": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policy_blake3": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "json": "{\"adapter\":\"lightroom-keyword-repair-v1\",\"request\":{\"expected_dictionaries\":1,\"expected_memberships\":1,\"expected_synonyms\":0,\"expected_captures\":1,\"run\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"expected_complete_progress_blake3\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"expected_mapping_epoch\":19,\"current_repair\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"expected_current_repair_progress_blake3\":\"9999999999999999999999999999999999999999999999999999999999999999\",\"expected_roster_blake3\":\"382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb\",\"predecessor_evidence_blake3\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"roots\":[{\"origin\":{\"retained_record\":17,\"source\":{\"capture_revision\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"table\":\"AgLibraryKeyword\",\"key\":[{\"Integer\":99}]}},\"raw_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"retained_table\":5,\"table_digest\":\"5555555555555555555555555555555555555555555555555555555555555555\"}],\"reason\":\"Synthetic café Ω; literal \\\\n, quote \\\" and newline\\n\"},\"input\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_blake3\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}",
+    "blake3": "f057b955ce23eca32205792207f59316fc894f460f704e1afc937aa390345f9f"
+  },
+  "progress": {
+    "value": {
+      "id": "f057b955ce23eca32205792207f59316fc894f460f704e1afc937aa390345f9f",
+      "run": "6666666666666666666666666666666666666666666666666666666666666666",
+      "input": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "phase": "PlanMemberships",
+      "report_index": 1,
+      "after_record": 29,
+      "order_index": 0,
+      "planned": 2,
+      "examined": 0,
+      "repaired": 0,
+      "retained": 0,
+      "verified": 0,
+      "roster_blake3": "382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb",
+      "complete": false
+    },
+    "json": "{\"id\":\"f057b955ce23eca32205792207f59316fc894f460f704e1afc937aa390345f9f\",\"run\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"input\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"phase\":\"PlanMemberships\",\"report_index\":1,\"after_record\":29,\"order_index\":0,\"planned\":2,\"examined\":0,\"repaired\":0,\"retained\":0,\"verified\":0,\"roster_blake3\":\"382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb\",\"complete\":false}",
+    "blake3": "147118fe528532a33a55904d1c3aca7c011b523831610f4e98c85908613371c1"
+  },
+  "new_receipts": {
+    "value": [
+      [
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "dictionary",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dabf29d718e540497e78c733989955ab0c2b90e6a9c264759745aa6293cb528d"
+      ],
+      [
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "keyword_behavior",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      ]
+    ],
+    "json": "[[\"2222222222222222222222222222222222222222222222222222222222222222\",\"dictionary\",\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"dabf29d718e540497e78c733989955ab0c2b90e6a9c264759745aa6293cb528d\"],[\"2222222222222222222222222222222222222222222222222222222222222222\",\"keyword_behavior\",\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"]]",
+    "blake3": "51a67f864efdd5a2db49c3b166013c5ff5a59b997955b1cd02566689451f6d57"
+  },
+  "roster": [
+    {
+      "old_outcome": "{\"Organization\":[{\"source_identity\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"slot\":\"dictionary\",\"input_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"target\":{\"kind\":\"Retained\",\"compatibility\":\"Unsupported\"}}]}",
+      "with_receipt": true,
+      "value": [
+        "e7cefd8c37d3bf380d7d3da6f362ecae390dce372af462ee8a2b503126319358",
+        "\"Keywords\"",
+        17,
+        "d9eff1daf9f964d0382153f033e970b183c23801b341696e6351b2793956c10c",
+        "dabf29d718e540497e78c733989955ab0c2b90e6a9c264759745aa6293cb528d"
+      ],
+      "json": "[\"e7cefd8c37d3bf380d7d3da6f362ecae390dce372af462ee8a2b503126319358\",\"\\\"Keywords\\\"\",17,\"d9eff1daf9f964d0382153f033e970b183c23801b341696e6351b2793956c10c\",\"dabf29d718e540497e78c733989955ab0c2b90e6a9c264759745aa6293cb528d\"]",
+      "blake3": "0a94aaa12de5436224ffcf371990641fb846adcd9837e1000b90bde649707efc"
+    },
+    {
+      "old_outcome": "{\"Retained\":{\"reason\":\"missing café \\\"Ω\\\"; literal \\\\n\"}}",
+      "with_receipt": false,
+      "value": [
+        "0a94aaa12de5436224ffcf371990641fb846adcd9837e1000b90bde649707efc",
+        "\"KeywordMemberships\"",
+        29,
+        "4c4395b5e053c0667d759f091732f1af775362c38242f8be9a9490f297e94e23",
+        null
+      ],
+      "json": "[\"0a94aaa12de5436224ffcf371990641fb846adcd9837e1000b90bde649707efc\",\"\\\"KeywordMemberships\\\"\",29,\"4c4395b5e053c0667d759f091732f1af775362c38242f8be9a9490f297e94e23\",null]",
+      "blake3": "382ec9e81d86f3b2244db23b59947731aa4e306ad2b4001edde7562ec38fadcb"
+    }
+  ]
+}
