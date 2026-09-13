@@ -6,9 +6,30 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
 PR16 is at `3bd92ded58bd00ecd5701e8114fa13a3bf91f60f`; CI34776023414 is
-running for the reviewed Close/lease and SQLite identity batch. Previous
+terminal SUCCESS for contracts, macOS, Linux and Windows. All three installers,
+executables, provider archive digests, native closure files and notices were
+independently verified, with known preview/export children reaped and temporary
+state removed. Linux/Windows observer executables were uploaded and rehashed;
+macOS observer identity is receipt-only. No GUI acceptance is claimed. Receipt:
+`sc-22847-ci-34776023414-rpz2s9uc/receipt.json`, SHA256
+`6262fc93428aee1081c9187cf3dfb3f0922772deb29c871be105835e1b3b1f51`;
+terminal run snapshot SHA256
+`04f272339c8b14311390ef8f37961621c96aed29c25b64fd88a3eeef788c372a`.
+Shortcut comment23329 and In Progress state were read back exactly. Previous
 CI34773173909 is terminal (Windows/Linux/contracts passed; Mac failed on the
-repaired close race). Shortcut comment23323 and exact PR body/head read back.
+repaired close race). This successful run predates the following local reader
+repair and the unfinished preview-drain/owned-process integration.
+
+The complete custody design, call-site inventory and additive desktop transport
+slice were accepted and read back in comment23326. The transport remains
+unselected. Comment23328 records the complete Source reader/lock protocol,
+including finite admission, all existing reader methods, consumption ownership,
+and the explicit commit-winning reader-death rule. The migration foundation
+checkpoint `41fdc91` passed 31 focused functions and independent review of
+attempted writer-hold retirement; it does not qualify the whole migration bridge.
+The raw-file executor, managed SQL roles and integration/installed parity remain
+required. Preview drain repairs from comment23327 are undergoing local runtime
+qualification; no unverified worker exit may authorize resource release or Closed.
 
 Local `298b03c` also binds the sealed Lightroom reader's actual opened SQLite
 object to its retained Source before any PRAGMA and on every verification.
@@ -33,9 +54,9 @@ all-platform qualification is inferred. Independent review:
 `sc-22847-sqlite-identity-independent-c78ncxhr/review-final.json`, SHA256
 `ad4d492da6feea7f77e621a464a52ed61cd6e93f6c7b6469786ecedf22f9ba79`.
 This is a narrow identity prerequisite. Shared connection/raw-descriptor custody
-remains open; the complete catalog-session helper and filesystem executor design
-is under independent review and exact call-site inventory before implementation.
-Fresh hosted CI is required for this batch.
+remains open; the accepted catalog-session helper and filesystem executor plan
+is being implemented in isolated worktrees. Hosted identity/Close qualification
+is provided by CI34776023414 above.
 
 The earlier reviewed batch
 includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
@@ -81,7 +102,7 @@ owned discovery/capture/inspection, exact result chunks, explicit family decisio
 and selection sealing. The complete desktop bridge `a6dad4e` passed independent review and 29 distinct
 focused functions plus strict Clippy, formatting and TypeScript. Reviewed local desktop integration is `ab7a6e1`/
 `ff2bf93`/`d2c53dc`, byte-identical to the isolated reviewed UI tree apart from this
-ledger. This bridge is not in PR16 or v6 yet. Root controller
+ledger. This bridge is in the current PR16 checkpoint but remains absent from v6. Root controller
 `0f84f56` passed 54 frontend functions and synthetic actual-hook lifecycle checks:
 same-generation reads, hidden panel/catalog changes, stale callbacks, lost starts,
 exact Cancel, and ambiguous or typed Close replies. Final delta keeps an accepted
