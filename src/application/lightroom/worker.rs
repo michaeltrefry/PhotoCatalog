@@ -185,7 +185,7 @@ pub(super) fn run(
                 }
             }
             match request {
-                Ok(action) => owner.action(action, &control, &shared),
+                Ok(action) => owner.action(action.decode(&control)?, &control, &shared),
                 Err(query) => owner.query(query, &control),
             }
         })();

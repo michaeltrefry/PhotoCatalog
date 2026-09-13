@@ -1,3 +1,4 @@
+import type {Request as LightroomRequest,Response as LightroomResponse} from './lightroom';
 import type { Request as ExportRequest, Response as ExportResponse } from './photoExport';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Recipe } from './recipe';
@@ -26,6 +27,7 @@ type AtCatalog = { catalog: string };
 type AtVariant = AtCatalog & { key: VariantKey };
 type AtRevision = AtVariant & { expected_revision: Decimal };
 export type Request =
+  | {command: 'lightroom';args:{request:LightroomRequest}}
   | { command: 'export'; args: AtCatalog & { request: ExportRequest } }
   | { command: 'edit_copy'; args: AtCatalog & { request: CopyRequest } }
   | { command: 'relink'; args: AtCatalog & { request: RelinkRequest } }
@@ -56,6 +58,7 @@ export type Request =
   | { command: 'release_viewport'; args: AtCatalog & { viewport: string; generation: Decimal } }
   | { command: 'preview_status' | 'cancel_preview'; args: AtCatalog & { ticket: string } };
 export interface Data {
+  lightroom: LightroomResponse;
   export: ExportResponse;
   edit_copy: CopyResponse;
   relink: RelinkResponse;

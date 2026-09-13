@@ -7,6 +7,7 @@ mod dto;
 pub mod exports;
 mod hydration;
 pub mod lightroom;
+pub mod lightroom_bridge;
 pub mod metadata;
 pub mod organization;
 pub mod relink;
@@ -238,6 +239,7 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
+            Work::Command(Request::Lightroom { .. }, _) => 4,
             Work::Command(Request::Export { request, .. }, _) => {
                 if matches!(
                     request.as_ref(),
@@ -333,6 +335,7 @@ struct Queue {
     ticket_foreground: HashMap<(String, String), TicketPriority>,
 }
 struct Shared {
+    lightroom: Arc<Mutex<lightroom_bridge::Control>>,
     exports: Arc<Mutex<exports::Control>>,
     copy: Arc<Mutex<copy::Control>>,
     relink: Arc<Mutex<relink::Control>>,
@@ -356,6 +359,11 @@ impl Handle {
             }
             self.shared.wake.notify_all();
         }
+        self.shared
+            .lightroom
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signal_shutdown();
         if let Some(t) = self.thread.lock().unwrap().take() {
             let _ = t.join();
         }
@@ -372,6 +380,7 @@ impl Bridge {
     pub fn spawn(config: Config) -> Result<Self> {
         config.validate()?;
         let shared = Arc::new(Shared {
+            lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),
             exports: Arc::new(Mutex::new(exports::Control::default())),
             relink: Arc::new(Mutex::new(relink::Control::default())),
             copy: Arc::new(Mutex::new(copy::Control::default())),
@@ -415,7 +424,9 @@ impl Bridge {
         let size = serde_json::to_vec(&request)
             .map_err(|e| error(ErrorCode::InvalidRequest, e.to_string()))?
             .len();
-        if size > self.0.shared.limits.request_bytes {
+        if size > self.0.shared.limits.request_bytes
+            || (matches!(&request, Request::Lightroom { .. }) && size > 128 * 1024)
+        {
             return Err(error(ErrorCode::ResourceLimit, "request byte limit"));
         }
         let cancel = Cancellation::default();
@@ -423,6 +434,40 @@ impl Bridge {
         let mut q = self.0.shared.queue.lock().unwrap();
         if q.stopping {
             return Err(error(ErrorCode::Closed, "catalog owner closed"));
+        }
+        if let Request::Lightroom { request } = &request
+            && request.direct()
+        {
+            let budget = self
+                .0
+                .shared
+                .limits
+                .reply_bytes
+                .min(self.0.shared.limits.request_bytes)
+                .min(128 * 1024);
+            let response = self
+                .0
+                .shared
+                .lightroom
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .direct((**request).clone(), budget)
+                .map_err(native)?;
+            let out = Reply::Ok {
+                value: Response::Lightroom(Box::new(response)),
+            };
+            let out = if serde_json::to_vec(&out)
+                .map_err(|e| native(e.into()))?
+                .len()
+                <= budget
+            {
+                out
+            } else {
+                failure(ErrorCode::ResourceLimit, "inspection response byte limit")
+            };
+            let _ = tx.send(out);
+            self.0.shared.wake.notify_one();
+            return Ok(Pending { receiver, cancel });
         }
         if let Request::Export { catalog, request } = &request
             && matches!(
@@ -887,6 +932,7 @@ impl ImportTask {
     }
 }
 struct Actor {
+    lightroom: lightroom_bridge::Coordinator,
     config: Config,
     shared: Arc<Shared>,
     open: Option<Open>,
@@ -972,6 +1018,7 @@ fn during_relink_hold(request: &Request) -> bool {
 impl Actor {
     fn new(config: Config, shared: Arc<Shared>) -> Self {
         Self {
+            lightroom: lightroom_bridge::Coordinator::new(shared.lightroom.clone()),
             config,
             shared,
             open: None,
@@ -1044,13 +1091,22 @@ impl Actor {
                                     | Request::Search { .. }
                                     | Request::Organization { .. }
                             ) || matches!(&r, Request::Metadata { request, .. } if matches!(request.as_ref(), metadata::Request::Resolve { .. }));
+                            let reply_limit = if matches!(&r, Request::Lightroom { .. }) {
+                                self.config
+                                    .limits
+                                    .reply_bytes
+                                    .min(self.config.limits.request_bytes)
+                                    .min(128 * 1024)
+                            } else {
+                                self.config.limits.reply_bytes
+                            };
                             let result = self.command(r, &e.cancel);
                             if reindex && let Some(o) = self.open.as_mut() {
                                 o.index_pending = true;
                             }
                             let out = reply(result);
                             let out = match serde_json::to_vec(&out) {
-                                Ok(bytes) if bytes.len() <= self.config.limits.reply_bytes => out,
+                                Ok(bytes) if bytes.len() <= reply_limit => out,
                                 _ => failure(ErrorCode::ResourceLimit, "response byte limit"),
                             };
                             let _ = tx.send(out);
@@ -1076,7 +1132,13 @@ impl Actor {
                 self.maintain();
             }
         }
+        self.shared
+            .lightroom
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signal_shutdown();
         self.close();
+        self.lightroom.shutdown();
     }
     fn close(&mut self) {
         self.set_phase(Phase::Closing, None);
@@ -1336,6 +1398,21 @@ impl Actor {
         r: Request,
         cancel: &Cancellation,
     ) -> std::result::Result<Response, BridgeError> {
+        if let Request::Lightroom { request } = r {
+            return self
+                .lightroom
+                .request(
+                    *request,
+                    &self.config.worker_executable,
+                    self.config
+                        .limits
+                        .reply_bytes
+                        .min(self.config.limits.request_bytes)
+                        .min(128 * 1024),
+                )
+                .map(|r| Response::Lightroom(Box::new(r)))
+                .map_err(native);
+        }
         let limits = self.config.limits.clone();
         macro_rules! core {
             ($e:expr) => {
@@ -1382,6 +1459,7 @@ impl Actor {
             ));
         }
         match r {
+            Request::Lightroom { .. } => unreachable!("inspection dispatched independently"),
             Request::Export { catalog, request } => self.export_request(&catalog, *request, None),
             Request::EditCopy { catalog, request } => {
                 let control = Arc::clone(&self.shared.copy);
@@ -1969,6 +2047,7 @@ impl Actor {
         })
     }
     fn maintain(&mut self) {
+        self.lightroom.maintain();
         let Some(o) = self.open.as_mut() else { return };
         let hold_since = o.exports.hold_since(&self.shared.exports);
         let prior_foreground = self

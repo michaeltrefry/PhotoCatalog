@@ -35,6 +35,9 @@ decimal!(U64, u64);
     deny_unknown_fields
 )]
 pub enum Request {
+    Lightroom {
+        request: Box<super::lightroom_bridge::Request>,
+    },
     Export {
         catalog: String,
         request: Box<super::exports::Request>,
@@ -324,6 +327,7 @@ pub struct PreviewStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
+    Lightroom(Box<super::lightroom_bridge::Response>),
     Export(Box<super::exports::Response>),
     Metadata(Box<super::metadata::Response>),
     Relink(Box<super::relink::Response>),

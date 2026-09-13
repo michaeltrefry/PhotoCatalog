@@ -299,7 +299,7 @@ enum Message {
     Action {
         operation: String,
         generation: String,
-        action: Action,
+        action: PendingAction,
         control: Control,
     },
     Read {
@@ -310,12 +310,106 @@ enum Message {
     },
     Close,
 }
-pub struct Workbench {
+/// Cloneable cached control; owns no join handle or SQLite connection.
+#[derive(Clone)]
+pub struct WorkbenchControl {
     shared: Arc<Mutex<Shared>>,
     closing: Arc<AtomicBool>,
     sender: mpsc::SyncSender<Message>,
+}
+pub struct Workbench {
+    control: WorkbenchControl,
     join: Option<JoinHandle<()>>,
 }
+impl std::ops::Deref for Workbench {
+    type Target = WorkbenchControl;
+    fn deref(&self) -> &Self::Target {
+        &self.control
+    }
+}
+/// Only these bounded transport payloads are decoded on the inspection owner.
+/// The enum fixes generation/review authority; callers cannot supply flags.
+pub(crate) struct Payload {
+    pub chunks: Arc<Vec<String>>,
+    pub bytes: usize,
+}
+impl Payload {
+    fn json(&self, control: &Control) -> Result<String> {
+        let mut json = String::new();
+        json.try_reserve_exact(self.bytes)?;
+        for chunk in self.chunks.iter() {
+            control.check()?;
+            json.push_str(chunk);
+        }
+        ensure!(
+            json.len() == self.bytes,
+            "inspection payload byte count differs"
+        );
+        Ok(json)
+    }
+}
+pub(crate) enum DeferredAction {
+    Inventory(Payload),
+    Selection {
+        json: Payload,
+        limits: selection::SelectionLimits,
+    },
+    Seal {
+        json: Payload,
+        review_token: String,
+        approval_blake3: String,
+        output: NativePath,
+    },
+}
+enum PendingAction {
+    Typed(Action),
+    Deferred(DeferredAction),
+}
+impl PendingAction {
+    fn writes(&self) -> bool {
+        match self {
+            Self::Typed(a) => a.writes(),
+            Self::Deferred(DeferredAction::Inventory(_)) => true,
+            _ => false,
+        }
+    }
+    fn allowed_during_review(&self) -> bool {
+        match self {
+            Self::Typed(a) => a.allowed_during_review(),
+            Self::Deferred(DeferredAction::Seal { .. }) => true,
+            _ => false,
+        }
+    }
+    fn decode(self, control: &Control) -> Result<Action> {
+        control.check()?;
+        let action = match self {
+            Self::Typed(a) => a,
+            Self::Deferred(DeferredAction::Inventory(json)) => Action::RegisterInventory {
+                inventory: serde_json::from_str(&json.json(control)?)?,
+            },
+            Self::Deferred(DeferredAction::Selection { json, limits }) => {
+                Action::PrepareSelection {
+                    request: serde_json::from_str(&json.json(control)?)?,
+                    limits,
+                }
+            }
+            Self::Deferred(DeferredAction::Seal {
+                json,
+                review_token,
+                approval_blake3,
+                output,
+            }) => Action::Seal {
+                approval_json: json.json(control)?,
+                review_token,
+                approval_blake3,
+                output,
+            },
+        };
+        control.check()?;
+        Ok(action)
+    }
+}
+
 fn token() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -339,6 +433,13 @@ fn native(path: &NativePath, maximum: usize) -> Result<std::path::PathBuf> {
 impl Workbench {
     pub fn spawn(config: Config) -> Result<Self> {
         Self::spawn_inner(config, || {})
+    }
+    #[cfg(test)]
+    pub(crate) fn spawn_held(
+        config: Config,
+        before: impl FnOnce() + Send + 'static,
+    ) -> Result<Self> {
+        Self::spawn_inner(config, before)
     }
     fn spawn_inner(config: Config, before: impl FnOnce() + Send + 'static) -> Result<Self> {
         config.limits.validate()?;
@@ -399,12 +500,19 @@ impl Workbench {
                 }
             })?;
         Ok(Self {
-            shared,
-            closing,
-            sender,
+            control: WorkbenchControl {
+                shared,
+                closing,
+                sender,
+            },
             join: Some(join),
         })
     }
+    pub fn control(&self) -> WorkbenchControl {
+        self.control.clone()
+    }
+}
+impl WorkbenchControl {
     pub fn status(&self) -> Status {
         let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = s.status.clone();
@@ -412,19 +520,43 @@ impl Workbench {
         out
     }
     pub fn start(&self, expected_generation: &str, action: Action) -> Result<String> {
-        self.submit(expected_generation, Some(action), None)
+        self.submit(
+            expected_generation,
+            Some(PendingAction::Typed(action)),
+            None,
+            None,
+        )
     }
     pub fn read(&self, expected_generation: &str, query: Query) -> Result<String> {
-        self.submit(expected_generation, None, Some(query))
+        self.submit(expected_generation, None, Some(query), None)
     }
     fn submit(
         &self,
         expected: &str,
-        action: Option<Action>,
+        action: Option<PendingAction>,
         query: Option<Query>,
+        expected_operation: Option<&str>,
     ) -> Result<String> {
         let limits = self.status().limits;
-        core::bounded_json(&(&action, &query), limits.request_bytes)?;
+        match &action {
+            Some(PendingAction::Typed(a)) => {
+                core::bounded_json(a, limits.request_bytes)?;
+            }
+            Some(PendingAction::Deferred(a)) => {
+                let json = match a {
+                    DeferredAction::Inventory(j)
+                    | DeferredAction::Selection { json: j, .. }
+                    | DeferredAction::Seal { json: j, .. } => j,
+                };
+                ensure!(
+                    json.bytes <= limits.request_bytes,
+                    "workbench deferred input byte limit"
+                );
+            }
+            None => {
+                core::bounded_json(&query, limits.request_bytes)?;
+            }
+        }
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(
             !self.closing.load(Ordering::Acquire) && !s.status.closed,
@@ -442,19 +574,25 @@ impl Workbench {
             "workbench is busy; no operation backlog"
         );
         ensure!(
+            expected_operation.is_none_or(|op| s.status.operation == op),
+            "stale workbench operation"
+        );
+        ensure!(
             s.status.generation == expected,
             "stale workbench generation"
         );
         if s.status.review_token.is_some() {
             ensure!(
-                action.as_ref().is_some_and(Action::allowed_during_review)
+                action
+                    .as_ref()
+                    .is_some_and(PendingAction::allowed_during_review)
                     || query.as_ref().is_some_and(Query::review),
                 "explicit ReleaseReview is required before ordinary Plan access"
             );
         }
         let operation = token();
         let control = limits.control(Arc::new(AtomicBool::new(false)))?;
-        let generation = if action.as_ref().is_some_and(Action::writes) {
+        let generation = if action.as_ref().is_some_and(PendingAction::writes) {
             token()
         } else {
             s.status.generation.clone()
@@ -488,6 +626,50 @@ impl Workbench {
         s.result = None;
         s.control = control;
         Ok(operation)
+    }
+    pub(crate) fn bridge_start(
+        &self,
+        generation: &str,
+        operation: &str,
+        action: Action,
+    ) -> Result<String> {
+        self.submit(
+            generation,
+            Some(PendingAction::Typed(action)),
+            None,
+            Some(operation),
+        )
+    }
+    pub(crate) fn bridge_read(
+        &self,
+        generation: &str,
+        operation: &str,
+        query: Query,
+    ) -> Result<String> {
+        self.submit(generation, None, Some(query), Some(operation))
+    }
+    pub(crate) fn bridge_deferred(
+        &self,
+        generation: &str,
+        operation: &str,
+        action: DeferredAction,
+    ) -> Result<String> {
+        self.submit(
+            generation,
+            Some(PendingAction::Deferred(action)),
+            None,
+            Some(operation),
+        )
+    }
+    pub(crate) fn bridge_cancel(&self, generation: &str, operation: &str) -> Result<Status> {
+        let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            s.status.generation == generation && s.status.operation == operation,
+            "stale workbench cancellation"
+        );
+        s.control.cancel.store(true, Ordering::Release);
+        drop(s);
+        self.cancel(operation)
     }
     pub fn result(
         &self,
@@ -569,6 +751,8 @@ impl Workbench {
         let _ = self.sender.try_send(Message::Close);
         self.status()
     }
+}
+impl Workbench {
     pub fn poll_closed(&mut self) -> Result<bool> {
         if self.join.as_ref().is_some_and(|j| !j.is_finished()) {
             return Ok(false);

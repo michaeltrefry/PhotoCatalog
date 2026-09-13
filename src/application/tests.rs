@@ -34,6 +34,7 @@ fn decimal_and_native_path_wire_are_lossless() {
 
 fn disconnected() -> Bridge {
     let shared = Arc::new(Shared {
+        lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),
         exports: Arc::new(Mutex::new(exports::Control::default())),
         relink: Arc::new(Mutex::new(relink::Control::default())),
         copy: Arc::new(Mutex::new(copy::Control::default())),
