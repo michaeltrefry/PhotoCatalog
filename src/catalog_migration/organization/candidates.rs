@@ -2,6 +2,7 @@
 //! isolated field packets; keyword memberships accumulate only this import's
 //! proven terms. Existing interactive edits and successful receipts are unchanged.
 use super::*;
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     catalog_metadata::{self, Prepared, Source},
     catalog_migration::{lookup::Lookup, walk::Walk},
@@ -93,7 +94,7 @@ pub(super) fn inspection(bytes: Vec<u8>, limited: bool) -> Inspection {
 /// Bounds fail closed before any new observation; unavailable keys prove nothing.
 fn seed(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     request: &Projection,
     image_ref: &SourceRecord,
     kind: KeywordKind,
@@ -243,7 +244,7 @@ fn seed(
 
 pub(super) fn prepare(
     catalog: &Catalog,
-    source: Option<&MigrationSource>,
+    source: Option<&dyn MigrationRead>,
     request: &Projection,
     image_ref: &SourceRecord,
     expected: &ImageMetadataIdentity,

@@ -1,11 +1,8 @@
 //! Capture-level reconciliation is a separate durable stage. It compares the
 //! sealed source roster with completed destination custody and every native walk.
 use super::importer::{self, Progress, Stage, Step};
-use crate::{
-    Catalog,
-    catalog_writer::Priority,
-    lightroom::migration_source::{Collection, MigrationSource},
-};
+use crate::lightroom::migration_source::MigrationRead;
+use crate::{Catalog, catalog_writer::Priority, lightroom::migration_source::Collection};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -50,7 +47,7 @@ const CLASSIFICATIONS: &str = "WITH classes AS MATERIALIZED (
 /// reported projection state. Unprojected evidence is explicit, never omitted.
 pub(crate) fn supplement_reports(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     policy: &importer::Policy,
     revision: &str,
@@ -231,14 +228,14 @@ fn validate_retained_roster(
 
 pub(crate) fn step(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
 ) -> Result<Step> {
     step_owned(catalog, source, before, None)
 }
 pub(crate) fn step_keyword(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     owner: &str,
 ) -> Result<Step> {
@@ -246,7 +243,7 @@ pub(crate) fn step_keyword(
 }
 fn step_owned(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     owner: Option<&str>,
 ) -> Result<Step> {
@@ -293,7 +290,7 @@ fn epoch(db: &Connection) -> Result<i64> {
 }
 fn step_inner(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     owner: Option<&str>,
 ) -> Result<Step> {

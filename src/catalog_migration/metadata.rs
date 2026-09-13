@@ -5,6 +5,7 @@ use super::{
     organization::{Evidence, Link, SourceRecord, verify_unique_link},
     retention,
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_images::{self, TranslationState},
@@ -219,6 +220,16 @@ impl Catalog {
     pub fn project_migration_catalog_xmp(
         &mut self,
         source: Option<&MigrationSource>,
+        request: &CatalogXmp,
+    ) -> Result<ResultRecord> {
+        self.project_migration_catalog_xmp_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_catalog_xmp_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
         request: &CatalogXmp,
     ) -> Result<ResultRecord> {
         owner(&request.import_source)?;
@@ -465,6 +476,16 @@ impl Catalog {
         source: Option<&MigrationSource>,
         request: &CurrentDevelop,
     ) -> Result<ResultRecord> {
+        self.project_migration_current_develop_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_current_develop_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
+        request: &CurrentDevelop,
+    ) -> Result<ResultRecord> {
         validate_current_develop(request)?;
         let image = request.image.source.identity()?;
         let payload = request.settings.target.source.identity()?;
@@ -513,7 +534,7 @@ impl Catalog {
     /// preserve the exact request and commit through the guarded helper below.
     pub(crate) fn prepare_current_develop_projection(
         &self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         request: &CurrentDevelop,
     ) -> Result<PreparedCurrentDevelop> {
         validate_current_develop(request)?;

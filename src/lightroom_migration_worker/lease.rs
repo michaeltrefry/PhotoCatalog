@@ -219,6 +219,24 @@ impl DestinationLease {
     /// The external Writers adapter obtains an exact parent grant before even
     /// writable SQLite configuration. Existing schema is never upgraded here.
     pub(crate) fn open_current(&self, writers: Arc<Writers>) -> Result<LockedCatalog<'_>> {
+        self.open_current_inner(writers, None)
+    }
+    pub(crate) fn open_current_with_sources(
+        &self,
+        writers: Arc<Writers>,
+        sources: Arc<super::source_reader::CommitHealth>,
+    ) -> Result<LockedCatalog<'_>> {
+        ensure!(
+            !sources.failed(),
+            "source unavailable before writable admission"
+        );
+        self.open_current_inner(writers, Some(sources))
+    }
+    fn open_current_inner(
+        &self,
+        writers: Arc<Writers>,
+        sources: Option<Arc<super::source_reader::CommitHealth>>,
+    ) -> Result<LockedCatalog<'_>> {
         self.verify()?;
         ensure!(
             self.pin().schema.0 == crate::CURRENT_SCHEMA_VERSION,
@@ -239,6 +257,16 @@ impl DestinationLease {
                 app == 0x50484341 && schema == self.pin().schema.0,
                 "destination schema changed after reviewed admission"
             );
+            // Fresh connection only: no preexisting callback owner is replaced.
+            // rusqlite keeps the captured Arc with the Connection itself, even
+            // if an internal caller moves Catalog out of this borrowing wrapper.
+            if let Some(health) = sources {
+                ensure!(!health.failed(), "source unavailable before configuration");
+                db.commit_hook(Some(move || {
+                    // Nonblocking observation; a panic must not authorize commit.
+                    std::panic::catch_unwind(|| health.failed()).unwrap_or(true)
+                }))?;
+            }
             crate::configure_catalog_connection(&db)?;
             catalog_storage::verify_database_object(&db, &self.review.database.file)?;
             self.verify()?;
@@ -259,8 +287,9 @@ impl DestinationLease {
     }
 }
 
-/// Borrowing the outer lease prevents callers from dropping its lock while this
-/// executor connection can still issue SQL. No API extracts the owned Catalog.
+/// Normal borrowed access retains the outer lease. The process supervisor must
+/// still keep that lease outermost through every Catalog/connection drop; safe
+/// internal moves through DerefMut do not transfer the physical lock owner.
 pub(crate) struct LockedCatalog<'a> {
     catalog: Catalog,
     lease: &'a DestinationLease,

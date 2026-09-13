@@ -7,6 +7,7 @@ use super::{
     organization_walk,
     walk::Walk,
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{Catalog, catalog_writer::Priority, lightroom::migration_source::MigrationSource};
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -437,7 +438,7 @@ fn roster_next(prior: &str, stage: &str, record: i64, a: &Archive) -> Result<Str
 #[cfg(test)]
 pub(crate) fn predecessor_roster_blake3(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     run: &str,
 ) -> Result<String> {
     let mut chain = digest(ADAPTER.as_bytes());
@@ -478,6 +479,13 @@ impl Catalog {
     pub fn begin_keyword_repair(
         &mut self,
         source: &MigrationSource,
+        r: &Request,
+    ) -> Result<Progress> {
+        self.begin_keyword_repair_reader(source, r)
+    }
+    pub(crate) fn begin_keyword_repair_reader(
+        &mut self,
+        source: &dyn MigrationRead,
         r: &Request,
     ) -> Result<Progress> {
         crate::catalog_backup::require_jobs_released(&self.root)?;
@@ -612,6 +620,13 @@ impl Catalog {
         read_progress(&self.db, id)
     }
     pub fn step_keyword_repair(&mut self, source: &MigrationSource, id: &str) -> Result<Step> {
+        self.step_keyword_repair_reader(source, id)
+    }
+    pub(crate) fn step_keyword_repair_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        id: &str,
+    ) -> Result<Step> {
         crate::catalog_backup::require_jobs_released(&self.root)?;
         let (b, p) = read(&self.db, id)?;
         ensure!(
@@ -658,7 +673,7 @@ impl Catalog {
     }
     fn keyword_archive_report(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         p: &Progress,
     ) -> Result<Step> {
@@ -701,7 +716,7 @@ impl Catalog {
     }
     fn keyword_plan(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         p: &Progress,
     ) -> Result<Step> {
@@ -897,7 +912,7 @@ impl Catalog {
     }
     fn keyword_project(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         p: &Progress,
     ) -> Result<Step> {

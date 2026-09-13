@@ -2,6 +2,7 @@
 //! One step retains up to 64 small records or one evidence chunk. It never opens an
 //! original image, capture artifact path, or excluded capture.
 use super::evidence::{self, PreparedChunk};
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_writer::Priority,
@@ -445,6 +446,13 @@ impl Catalog {
         source: &MigrationSource,
         approval: &[u8],
     ) -> Result<RetentionProgress> {
+        self.begin_migration_retention_reader(source, approval)
+    }
+    pub(crate) fn begin_migration_retention_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        approval: &[u8],
+    ) -> Result<RetentionProgress> {
         ensure!(
             approval.len() <= RECORD_LIMIT,
             "selection approval size limit"
@@ -485,6 +493,12 @@ impl Catalog {
     pub fn step_migration_retention(
         &mut self,
         source: &MigrationSource,
+    ) -> Result<RetentionProgress> {
+        self.step_migration_retention_reader(source)
+    }
+    pub(crate) fn step_migration_retention_reader(
+        &mut self,
+        source: &dyn MigrationRead,
     ) -> Result<RetentionProgress> {
         let id = source.binding_blake3();
         let before = progress(&self.db, id)?;

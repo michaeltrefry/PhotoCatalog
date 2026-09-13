@@ -6,6 +6,7 @@ use super::{
     organization::{Evidence, SourceRecord},
     retention,
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_metadata::{self, Prepared, Source},
@@ -371,7 +372,7 @@ fn historical_content(
 }
 fn roster_admission(
     db: &Connection,
-    source: Option<&MigrationSource>,
+    source: Option<&dyn MigrationRead>,
     request: &Projection,
     binding: &str,
     supplement: &str,
@@ -1050,6 +1051,16 @@ impl Catalog {
     pub fn project_migration_file_metadata(
         &mut self,
         source: Option<&MigrationSource>,
+        request: &Projection,
+    ) -> Result<ProjectionResult> {
+        self.project_migration_file_metadata_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_file_metadata_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
         request: &Projection,
     ) -> Result<ProjectionResult> {
         request.file.source.identity()?;

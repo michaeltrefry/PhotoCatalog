@@ -7,6 +7,7 @@ use super::{
     originals::SourceKey,
     retention,
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     lightroom::{
@@ -27,13 +28,13 @@ pub(crate) enum LinkResolution {
 
 pub(crate) struct Walk<'a> {
     catalog: &'a Catalog,
-    source: &'a MigrationSource,
+    source: &'a dyn MigrationRead,
     revision: &'a str,
 }
 impl<'a> Walk<'a> {
     pub(crate) fn new(
         catalog: &'a Catalog,
-        source: &'a MigrationSource,
+        source: &'a dyn MigrationRead,
         revision: &'a str,
     ) -> Result<Self> {
         ensure!(

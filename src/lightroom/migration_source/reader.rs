@@ -1,7 +1,7 @@
 use super::*;
 use crate::lightroom::{bounded_json, capture::Manifest, digest, plan, source::Source};
 use anyhow::bail;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use std::{
     cell::Cell as Flag,
     collections::BTreeSet,
@@ -404,12 +404,48 @@ impl MigrationSource {
         cancel: Arc<AtomicBool>,
         open: impl FnOnce(&Path) -> Result<Connection>,
     ) -> Result<Self> {
+        Self::open_ordered(seal, limits, cancel, None, open)
+    }
+
+    /// Only for the dedicated closed-roster process. All handles are opened and
+    /// identified before acquiring the first custom Source lock. No new source,
+    /// destination, output, diagnostic or SQLite opener may run in that process
+    /// after this returns until the entire reader is retired.
+    pub(crate) fn open_closed_roster(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+    ) -> Result<Self> {
+        Self::open_ordered(seal, limits, cancel, Some(protected), |path| {
+            Ok(Connection::open_with_flags(
+                plan::uri(path)?,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?)
+        })
+    }
+
+    fn open_ordered(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+        protected: Option<&[crate::lightroom_migration_worker::identity::FileKey]>,
+        open: impl FnOnce(&Path) -> Result<Connection>,
+    ) -> Result<Self> {
         ensure!(
             !cancel.load(Ordering::Relaxed),
             "inspection-source read canceled"
         );
         limits.validate()?;
         seal.validate()?;
+        if let Some(protected) = protected {
+            ensure!(
+                protected.len() <= 4096,
+                "sealed reader protected identity bound"
+            );
+        }
         let path = seal.database.to_path()?;
         ensure!(path.is_absolute(), "sealed database path must be absolute");
         no_companions(&path)?;
@@ -427,6 +463,29 @@ impl MigrationSource {
             guard.before == seal.identity,
             "sealed inspection file identity differs"
         );
+        let mut open = Some(open);
+        let admitted = if let Some(protected) = protected {
+            let identity = crate::lightroom_migration_worker::identity::FileKey::of(&guard.file)?;
+            ensure!(
+                !protected.contains(&identity),
+                "sealed reader aliases a protected object"
+            );
+            #[cfg(windows)]
+            ensure!(
+                crate::lightroom_migration_worker::identity::FileKey::of(&lease)? == identity,
+                "sealed deny-write handle differs from Source"
+            );
+            let db = open.take().expect("one sealed SQL opener")(&path)?;
+            crate::catalog_storage::verify_database_object(&db, &guard.file)
+                .context("closed-roster sealed inspection opened object")?;
+            db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
+            db.busy_timeout(Duration::ZERO)?;
+            guard.verify()?;
+            no_companions(&path)?;
+            Some(db)
+        } else {
+            None
+        };
         guard.lock(0x4000_0000, 512)?;
         let deadline = Instant::now() + Duration::from_millis(limits.open_deadline_ms);
         guard.file.seek(SeekFrom::Start(0))?;
@@ -453,11 +512,20 @@ impl MigrationSource {
         );
         guard.verify()?;
         no_companions(&path)?;
-        let db = open(&path)?;
-        crate::catalog_storage::verify_database_object(&db, &guard.file)
-            .context("sealed inspection opened object")?;
-        db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
-        db.busy_timeout(Duration::ZERO)?;
+        let db = if let Some(db) = admitted {
+            // Re-identify the already-open descriptor; never reopen after lock.
+            crate::catalog_storage::verify_database_object(&db, &guard.file)
+                .context("locked sealed inspection opened object")?;
+            db
+        } else {
+            // Keep the historical synchronous CLI ordering unchanged.
+            let db = open.take().expect("one legacy sealed SQL opener")(&path)?;
+            crate::catalog_storage::verify_database_object(&db, &guard.file)
+                .context("sealed inspection opened object")?;
+            db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
+            db.busy_timeout(Duration::ZERO)?;
+            db
+        };
         let namespace = seal.binding_blake3()?;
         let value = Self {
             db,
@@ -989,29 +1057,29 @@ impl MigrationSource {
         );
         self.operation(|| {
             // Same schema3 numeric keys and join order as Plan::unique_target.
-            let mut stmt = self.db.prepare("SELECT target.source_id FROM references_out reference CROSS JOIN entities target ON target.revision=reference.revision AND target.table_name=reference.target_table AND target.local_key=reference.target_key WHERE reference.revision=? AND reference.source_id=? AND reference.field=? AND reference.target_table=? LIMIT 2")?;
+            let mut stmt = self.db.prepare("SELECT CASE WHEN typeof(target.source_id)='text' AND length(CAST(target.source_id AS BLOB))<=4096 THEN target.source_id END FROM references_out reference CROSS JOIN entities target ON target.revision=reference.revision AND target.table_name=reference.target_table AND target.local_key=reference.target_key WHERE reference.revision=? AND reference.source_id=? AND reference.field=? AND reference.target_table=? LIMIT 2")?;
             let mut rows = stmt.query(params![revision,source_id,field,target_table])?;
-            let first = rows.next()?.map(|r| r.get::<_,String>(0)).transpose()?;
+            let first = rows.next()?.map(|r| r.get::<_,Option<String>>(0)).transpose()?;
             if rows.next()?.is_some() { return Ok(Resolution::Ambiguous); }
-            Ok(first.map_or(Resolution::Missing,Resolution::Unique))
+            match first {
+                None => Ok(Resolution::Missing),
+                Some(Some(value)) => Ok(Resolution::Unique(value)),
+                Some(None) => bail!("resolved source ID must be TEXT within 4096 bytes; retain complete identity evidence through pages/chunks"),
+            }
         })
     }
 
     pub fn image_links(&self, revision: &str, source_id: &str) -> Result<ImageLinks> {
         self.selected(revision)?;
+        ensure!(
+            !source_id.is_empty() && source_id.len() <= 4096,
+            "source ID limit"
+        );
         self.operation(|| {
-            let table: Option<String> = self
-                .db
-                .query_row(
-                    "SELECT table_name FROM entities WHERE revision=? AND source_id=?",
-                    params![revision, source_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            ensure!(
-                table.as_deref() == Some("Adobe_images"),
-                "not an observed Adobe image record"
-            );
+            let observed: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entities WHERE revision=? AND source_id=? AND table_name='Adobe_images')",
+                params![revision, source_id], |r| r.get(0))?;
+            ensure!(observed, "not an observed Adobe image record");
             Ok(())
         })?;
         Ok(ImageLinks { image_source_id:source_id.into(), file:self.resolve(revision,source_id,"rootFile","AgLibraryFile")?, master:self.resolve(revision,source_id,"masterImage","Adobe_images")?, current_develop:self.resolve(revision,source_id,"developSettingsIDCache","Adobe_imageDevelopSettings")?, limitations:"Only exact unique retained schema3 links; missing is not proof of a master sentinel or current settings. History/snapshots and unknown tables remain separately retained.".into() })
@@ -1021,3 +1089,7 @@ impl MigrationSource {
 #[cfg(test)]
 #[path = "reader_identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+#[path = "reader_closed_tests.rs"]
+mod closed_tests;

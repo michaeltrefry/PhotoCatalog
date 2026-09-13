@@ -246,53 +246,42 @@ pub struct ArtifactReader {
     poisoned: bool,
 }
 impl ArtifactReader {
-    pub fn descriptor(&self) -> &ArtifactDescriptor {
-        &self.descriptor
-    }
-    fn verify(&mut self) -> Result<()> {
-        ensure!(!self.poisoned, "artifact reader previously invalidated");
-        let result = self.source.verify();
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
-    }
-    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>> {
-        self.verify()?;
-        ensure!(!stop(), "artifact custody stopped");
-        let deadline = Instant::now() + Duration::from_millis(self.limits.chunk_deadline_ms);
-        ensure!(
-            offset <= self.source.before.bytes,
-            "artifact offset exceeds source"
-        );
-        let size = (self.source.before.bytes - offset).min(self.limits.chunk_bytes as u64) as usize;
-        let mut bytes = vec![0; size];
-        self.source.file.seek(SeekFrom::Start(offset))?;
-        self.source.file.read_exact(&mut bytes)?;
-        self.verify()?;
-        ensure!(
-            Instant::now() < deadline && !stop(),
-            "artifact chunk deadline/stop"
-        );
-        Ok(bytes)
-    }
-}
-
-impl Catalog {
-    /// Full-file verification is outside the destination writer. A resumed
-    /// reader repeats this admission hash once; individual chunks do not.
-    pub fn open_migration_artifact(
-        &self,
-        request: ArtifactRequest,
+    pub(crate) fn open_descriptor(
+        descriptor: ArtifactDescriptor,
         limits: ArtifactLimits,
         stop: &dyn Fn() -> bool,
-    ) -> Result<ArtifactReader> {
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+    ) -> Result<Self> {
         limits.validate()?;
         ensure!(!stop(), "artifact custody stopped");
+        ensure!(protected.len() <= 4096, "artifact protected identity bound");
         let deadline = Instant::now() + Duration::from_millis(limits.open_deadline_ms);
-        let descriptor = descriptor(&self.db, &request)?;
         let encoded = crate::lightroom::bounded_json(&descriptor, DESCRIPTOR_LIMIT)?;
-        existing(&self.db, &encoded, &request)?;
+        let request = &descriptor.request;
+        ensure!(
+            descriptor.protocol == 1
+                && request.retained_capture_record > 0
+                && i64::try_from(request.member_index).is_ok(),
+            "artifact descriptor protocol/member bounds"
+        );
+        ensure!(
+            descriptor.artifact.revision.bytes == request.mapping.copy_identity.bytes,
+            "artifact copy length differs from descriptor"
+        );
+        for hash in [
+            &descriptor.selected_input,
+            &descriptor.capture_revision,
+            &descriptor.manifest_blake3,
+            &descriptor.artifact.blake3,
+        ] {
+            ensure!(
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "artifact descriptor digest bounds"
+            );
+        }
         ensure!(
             descriptor.artifact.revision.bytes <= limits.maximum_bytes,
             "artifact exceeds declared maximum bytes"
@@ -311,6 +300,16 @@ impl Catalog {
         ensure!(
             source.before == request.mapping.copy_identity,
             "artifact sealed copy identity differs"
+        );
+        let key = crate::lightroom_migration_worker::identity::FileKey::of(&source.file)?;
+        ensure!(
+            !protected.contains(&key),
+            "artifact aliases a protected object"
+        );
+        #[cfg(windows)]
+        ensure!(
+            crate::lightroom_migration_worker::identity::FileKey::of(&lease)? == key,
+            "artifact deny-write handle differs"
         );
         source.lock(0, 0)?;
         let mut remaining = source.before.bytes;
@@ -346,9 +345,100 @@ impl Catalog {
         })
     }
 
+    pub fn descriptor(&self) -> &ArtifactDescriptor {
+        &self.descriptor
+    }
+    fn verify(&mut self) -> Result<()> {
+        ensure!(!self.poisoned, "artifact reader previously invalidated");
+        let result = self.source.verify();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>> {
+        self.verify()?;
+        ensure!(!stop(), "artifact custody stopped");
+        let deadline = Instant::now() + Duration::from_millis(self.limits.chunk_deadline_ms);
+        ensure!(
+            offset <= self.source.before.bytes,
+            "artifact offset exceeds source"
+        );
+        let size = (self.source.before.bytes - offset).min(self.limits.chunk_bytes as u64) as usize;
+        let mut bytes = vec![0; size];
+        self.source.file.seek(SeekFrom::Start(offset))?;
+        self.source.file.read_exact(&mut bytes)?;
+        self.verify()?;
+        ensure!(
+            Instant::now() < deadline && !stop(),
+            "artifact chunk deadline/stop"
+        );
+        Ok(bytes)
+    }
+}
+
+/// Internal transport implementations must bind all returned bytes to the
+/// admitted descriptor and retain their reader epoch through transaction drain.
+/// Public callers cannot construct a reader from untrusted digest claims.
+pub(crate) trait ArtifactRead {
+    fn descriptor(&self) -> &ArtifactDescriptor;
+    fn encoded(&self) -> &[u8];
+    fn length(&self) -> u64;
+    fn verify(&mut self) -> Result<()>;
+    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>>;
+}
+impl ArtifactRead for ArtifactReader {
+    fn descriptor(&self) -> &ArtifactDescriptor {
+        &self.descriptor
+    }
+    fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+    fn length(&self) -> u64 {
+        self.source.before.bytes
+    }
+    fn verify(&mut self) -> Result<()> {
+        ArtifactReader::verify(self)
+    }
+    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>> {
+        ArtifactReader::chunk(self, offset, stop)
+    }
+}
+
+impl Catalog {
+    /// Full-file verification is outside the destination writer. A resumed
+    /// reader repeats this admission hash once; individual chunks do not.
+    pub fn open_migration_artifact(
+        &self,
+        request: ArtifactRequest,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<ArtifactReader> {
+        limits.validate()?;
+        ensure!(!stop(), "artifact custody stopped");
+        let descriptor = self.migration_artifact_reader_descriptor(&request)?;
+        ArtifactReader::open_descriptor(descriptor, limits, stop, &[])
+    }
+    /// Resolve immutable destination authority without opening the raw copy.
+    pub(crate) fn migration_artifact_reader_descriptor(
+        &self,
+        request: &ArtifactRequest,
+    ) -> Result<ArtifactDescriptor> {
+        let descriptor = descriptor(&self.db, request)?;
+        let encoded = crate::lightroom::bounded_json(&descriptor, DESCRIPTOR_LIMIT)?;
+        existing(&self.db, &encoded, request)?;
+        Ok(descriptor)
+    }
+
     pub fn begin_migration_artifact(
         &mut self,
         reader: &mut ArtifactReader,
+    ) -> Result<EvidenceState> {
+        self.begin_migration_artifact_reader(reader)
+    }
+    pub(crate) fn begin_migration_artifact_reader(
+        &mut self,
+        reader: &mut dyn ArtifactRead,
     ) -> Result<EvidenceState> {
         reader.verify()?;
         let _permit = self.writers.enter(Priority::Background)?;
@@ -359,25 +449,25 @@ impl Catalog {
         // cannot authorize a coincidentally equal retained-record sequence.
         ensure!(
             crate::lightroom::bounded_json(
-                &descriptor(&tx, &reader.descriptor.request)?,
+                &descriptor(&tx, &reader.descriptor().request)?,
                 DESCRIPTOR_LIMIT
-            )? == reader.encoded,
+            )? == reader.encoded(),
             "artifact destination authority differs"
         );
-        existing(&tx, &reader.encoded, &reader.descriptor.request)?;
+        existing(&tx, reader.encoded(), &reader.descriptor().request)?;
         reader.verify()?;
         let result = evidence::begin_owned(
             &tx,
-            &reader.encoded,
-            reader.source.before.bytes,
+            reader.encoded(),
+            reader.length(),
             evidence::Authority::CapturedArtifact,
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO migration_artifacts VALUES(?1,?2,?3,?4)",
             params![
-                reader.descriptor.request.retained_capture_record,
-                i64::try_from(reader.descriptor.request.member_index)?,
-                reader.encoded,
+                reader.descriptor().request.retained_capture_record,
+                i64::try_from(reader.descriptor().request.member_index)?,
+                reader.encoded(),
                 result.id
             ],
         )?;
@@ -392,9 +482,16 @@ impl Catalog {
         reader: &mut ArtifactReader,
         stop: &dyn Fn() -> bool,
     ) -> Result<EvidenceState> {
+        self.step_migration_artifact_reader(reader, stop)
+    }
+    pub(crate) fn step_migration_artifact_reader(
+        &mut self,
+        reader: &mut dyn ArtifactRead,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<EvidenceState> {
         reader.verify()?;
         ensure!(!stop(), "artifact custody stopped");
-        let id = existing(&self.db, &reader.encoded, &reader.descriptor.request)?
+        let id = existing(&self.db, reader.encoded(), &reader.descriptor().request)?
             .context("artifact custody has not begun")?;
         let before = self.migration_evidence(&id)?;
         if before.complete {
@@ -407,7 +504,7 @@ impl Catalog {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(
-            existing(&tx, &reader.encoded, &reader.descriptor.request)?.as_deref()
+            existing(&tx, reader.encoded(), &reader.descriptor().request)?.as_deref()
                 == Some(id.as_str()),
             "artifact custody changed"
         );

@@ -8,6 +8,7 @@ use super::{
     },
     walk::{LinkResolution, Walk},
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     lightroom::{
@@ -67,7 +68,7 @@ fn name(value: &Cell) -> Option<String> {
 }
 fn unsupported_row(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     construct: &str,
@@ -84,7 +85,7 @@ fn unsupported_row(
 }
 fn behavior(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<ProjectionResult> {
@@ -130,12 +131,12 @@ fn text(value: &Cell) -> Option<String> {
 }
 fn project_one(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     decision: Decision,
 ) -> Result<ProjectionResult> {
-    catalog.project_migration_organization(
+    catalog.project_migration_organization_reader(
         Some(source),
         &Projection {
             origin: origin.clone(),
@@ -147,7 +148,7 @@ fn project_one(
 }
 fn preserve(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     construct: &str,
@@ -196,7 +197,7 @@ fn existing_slot(
 }
 pub(crate) fn project(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     stage: Stage,
@@ -427,7 +428,7 @@ pub(crate) fn project(
 }
 fn dictionary(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<RowResult> {
@@ -648,7 +649,7 @@ fn dictionary(
 /// Source-only single-row decisions for the explicit repair; never commits ancestors.
 pub(crate) fn keyword_row(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     origin: &SourceRecord,
 ) -> Result<Decision> {
     ensure!(
@@ -748,7 +749,7 @@ pub(crate) fn keyword_overlap(
 }
 pub(crate) fn keyword_member(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<Result<Projection, String>> {

@@ -9,3 +9,7 @@ pub mod protocol;
 pub(crate) mod input;
 pub(crate) mod process;
 pub(crate) mod supervisor;
+
+pub(crate) mod source_reader;
+
+pub use source_reader::source_reader_main;

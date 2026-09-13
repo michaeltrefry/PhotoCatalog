@@ -4,7 +4,9 @@
 //! treats retained Adobe instructions as executable recipes. The caller owns the
 //! seal and the exclusion of other writers for the entire adapter lifetime.
 
+mod access;
 mod reader;
+pub(crate) use access::MigrationRead;
 pub use reader::MigrationSource;
 
 use super::plan::{Cell, RetainedRow};

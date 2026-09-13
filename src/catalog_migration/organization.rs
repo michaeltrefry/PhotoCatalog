@@ -7,6 +7,7 @@
 //! of internal SQLite rows refreshed by the existing per-image organization
 //! engine. Original paths are never opened by this component.
 use super::{originals::SourceKey, retention};
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_edits::VariantKey,
@@ -419,7 +420,7 @@ fn verify_link(
     evidence: &mut Evidence,
     origin: &SourceRecord,
     link: &Link,
-    source: Option<&MigrationSource>,
+    source: Option<&dyn MigrationRead>,
     live: bool,
 ) -> Result<()> {
     text(&link.field, 1024)?;
@@ -483,7 +484,7 @@ pub(crate) fn verify_unique_link(
     evidence: &mut Evidence,
     origin: &SourceRecord,
     link: &Link,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
 ) -> Result<()> {
     verify_link(db, evidence, origin, link, Some(source), true)
 }
@@ -770,7 +771,7 @@ pub(crate) fn commit_keyword_projection(
 impl Catalog {
     pub(crate) fn prepare_keyword_projection(
         &self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         request: &Projection,
     ) -> Result<PreparedKeywordProjection> {
         ensure!(
@@ -847,6 +848,16 @@ impl Catalog {
     pub fn project_migration_organization(
         &mut self,
         source: Option<&MigrationSource>,
+        request: &Projection,
+    ) -> Result<ProjectionResult> {
+        self.project_migration_organization_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_organization_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
         request: &Projection,
     ) -> Result<ProjectionResult> {
         // Bound serialization before preparing variable-size evidence or native work.

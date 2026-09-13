@@ -1,6 +1,6 @@
 //! The supervisor owns this object. It never opens a source, destination, or
 //! lock pathname; only the configured executable and anonymous byte pipes.
-use super::protocol::{ChildFrame, ParentFrame, read_frame_optional};
+use super::protocol::{ChildFrame, read_frame_optional};
 use anyhow::{Context, Result, ensure};
 use std::{
     io::{Read, Write},
@@ -17,10 +17,10 @@ use std::{
 
 /// At most one encoded input and one decoded output are queued, in addition to
 /// the frame currently owned by each I/O thread. Joining is supervisor-only.
-pub(crate) struct Process {
+pub(crate) struct Process<T = ChildFrame> {
     child: Child,
     input: Option<SyncSender<Vec<u8>>>,
-    output: Option<Receiver<Result<Option<ChildFrame>>>>,
+    output: Option<Receiver<Result<Option<T>>>>,
     writer: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
     input_error: Arc<Mutex<Option<String>>>,
@@ -43,19 +43,30 @@ impl Stop {
         &self.admission
     }
 }
-pub(crate) enum Output {
+pub(crate) enum Output<T = ChildFrame> {
     Pending,
-    Frame(ChildFrame),
+    Frame(T),
     End,
 }
-impl Process {
+impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     pub(crate) fn spawn(executable: &Path, stop: Arc<Stop>) -> Result<Self> {
         ensure!(
             executable.is_absolute(),
             "absolute configured migration executable required"
         );
+        Self::spawn_role(executable, "--lightroom-migration-worker", stop)
+    }
+    pub(crate) fn spawn_role(
+        executable: &Path,
+        role: &'static str,
+        stop: Arc<Stop>,
+    ) -> Result<Self> {
+        ensure!(
+            executable.is_absolute(),
+            "absolute configured worker required"
+        );
         let mut command = Command::new(executable);
-        command.arg("--lightroom-migration-worker");
+        command.arg(role);
         Self::spawn_command(command, stop)
     }
     fn spawn_command(mut command: Command, stop: Arc<Stop>) -> Result<Self> {
@@ -126,7 +137,7 @@ impl Process {
                 .name("migration-output".into())
                 .spawn(move || {
                     loop {
-                        let frame = read_frame_optional::<ChildFrame>(&mut stdout);
+                        let frame = read_frame_optional::<T>(&mut stdout);
                         let failed = !matches!(&frame, Ok(Some(_)));
                         if failed {
                             stop.admission.store(true, Ordering::Release);
@@ -145,7 +156,7 @@ impl Process {
 
     /// Encode with the whole-frame bound before queuing. On a full queue the
     /// caller retains the exact frame and may retry after checking cancel/time.
-    pub(crate) fn try_send(&self, frame: ParentFrame) -> Result<Option<ParentFrame>> {
+    pub(crate) fn try_send<F: serde::Serialize>(&self, frame: F) -> Result<Option<F>> {
         if let Some(error) = self
             .input_error
             .lock()
@@ -167,7 +178,7 @@ impl Process {
             Err(TrySendError::Disconnected(_)) => anyhow::bail!("migration input disconnected"),
         }
     }
-    pub(crate) fn try_receive(&self) -> Result<Output> {
+    pub(crate) fn try_receive(&self) -> Result<Output<T>> {
         match self
             .output
             .as_ref()
@@ -185,6 +196,8 @@ impl Process {
         }
         Ok(self.reaped)
     }
+}
+impl<T> Process<T> {
     /// Revokes both channels before kill/wait, so a reader blocked on its
     /// bounded output queue cannot obstruct cleanup. Never called on the actor.
     pub(crate) fn terminate(&mut self) {
@@ -214,7 +227,7 @@ impl Process {
         }
     }
 }
-impl Drop for Process {
+impl<T> Drop for Process<T> {
     fn drop(&mut self) {
         self.terminate();
     }
