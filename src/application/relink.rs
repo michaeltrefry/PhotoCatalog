@@ -1486,10 +1486,12 @@ fn rules(
                 }
             }
             RuleStage::ExcludedAsset => {
-                let row:Option<(i64,String,bool)>=catalog.db.query_row("SELECT i.sequence,i.asset_id,EXISTS(SELECT 1 FROM storage_exceptions e WHERE e.plan=i.plan AND e.kind='asset' AND e.entity=i.asset_id) FROM storage_items i WHERE i.plan=?1 AND i.status='excluded' AND i.sequence>?2 ORDER BY i.sequence LIMIT 1",params![plan,cursor.position.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|native(e.into()))?;
-                if let Some((sequence, asset_id, listed)) = row {
+                // Charge every indexed candidate, including nonexcluded rows.
+                // Filtering in SQL would scan arbitrarily far for a rare exclusion.
+                let row:Option<(i64,String,bool,bool)>=catalog.db.query_row("SELECT i.sequence,i.asset_id,i.status='excluded',EXISTS(SELECT 1 FROM storage_exceptions e WHERE e.plan=i.plan AND e.kind='asset' AND e.entity=i.asset_id) FROM storage_items i WHERE i.plan=?1 AND i.sequence>?2 ORDER BY i.sequence LIMIT 1",params![plan,cursor.position.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|native(e.into()))?;
+                if let Some((sequence, asset_id, excluded, listed)) = row {
                     cursor.position = I64(sequence);
-                    if listed {
+                    if !excluded || listed {
                         None
                     } else {
                         Some(Rule::Override(Override::Asset {

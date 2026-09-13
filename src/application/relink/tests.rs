@@ -286,6 +286,97 @@ fn review_pages_bind_revision_and_do_not_skip_byte_rejected_rows() -> Result<()>
 }
 
 #[test]
+fn legacy_asset_exclusions_charge_sparse_indexed_scan_work() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut c = Catalog::open(temp.path())?;
+    let p = c.begin_relink_review(core::RelinkScope::Prefix {
+        from: core::PathReference::native(&temp.path().join("old")),
+        destinations: vec![NativePath::from_path(&temp.path().join("new"))],
+    })?;
+    let tx = c.db.transaction()?;
+    for n in 1..=10_000 {
+        let id = format!("sparse-{n}");
+        tx.execute(
+            "INSERT INTO assets(id,location,path_display,state) VALUES(?1,?2,?1,'pending')",
+            rusqlite::params![id, format!("/synthetic/{n}").as_bytes()],
+        )?;
+        tx.execute("INSERT INTO storage_items(plan,sequence,asset_id,status,detail,data) VALUES(?1,?2,?3,'matched','fixture','{}')",rusqlite::params![p.id,n,id])?;
+    }
+    tx.commit()?;
+    let limits = Limits {
+        scan_rows: 3,
+        ..Limits::default()
+    };
+    let measured = |position| -> Result<(Vec<RuleRow>, Option<RuleCursor>)> {
+        let work = Arc::new(AtomicUsize::new(0));
+        let counter = work.clone();
+        c.db.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )?;
+        let result = rules(
+            &c,
+            &p.id,
+            I64(p.revision),
+            Some(RuleCursor {
+                plan: p.id.clone(),
+                revision: I64(p.revision),
+                stage: RuleStage::ExcludedAsset,
+                position: I64(position),
+                source: I64(0),
+                entity: String::new(),
+            }),
+            U64(10),
+            &limits,
+        );
+        c.db.progress_handler(0, None::<fn() -> bool>)?;
+        let Response::Rules {
+            rows,
+            next,
+            scanned,
+        } = result?
+        else {
+            panic!("rules")
+        };
+        assert!(scanned.0 <= 3);
+        assert!(
+            work.load(Ordering::Relaxed) < 2000,
+            "sparse rule page performed {} VM steps",
+            work.load(Ordering::Relaxed)
+        );
+        Ok((rows, next))
+    };
+    // No exclusions still yields exact scan progress, without scanning the plan.
+    let (rows, next) = measured(0)?;
+    assert!(rows.is_empty());
+    assert_eq!(next.unwrap().position, I64(3));
+    let (rows, next) = measured(9_997)?;
+    assert!(rows.is_empty());
+    assert_eq!(next.unwrap().position, I64(10_000));
+    assert!(measured(10_000)?.1.is_none());
+    // An exclusion at the end cannot make an initial page jump across candidates.
+    c.db.execute(
+        "UPDATE storage_items SET status='excluded' WHERE plan=?1 AND sequence=10000",
+        [&p.id],
+    )?;
+    let (rows, next) = measured(0)?;
+    assert!(rows.is_empty());
+    assert_eq!(next.unwrap().position, I64(3));
+    let (rows, next) = measured(9_997)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label.as_deref(), Some("sparse-10000"));
+    assert!(
+        matches!(&rows[0].rule,Rule::Override(Override::Asset{asset_id,candidates}) if asset_id=="sparse-10000" && candidates.is_empty())
+    );
+    assert_eq!(next.unwrap().position, I64(10_000));
+    assert!(measured(10_000)?.1.is_none());
+    Ok(())
+}
+
+#[test]
 fn saved_rules_include_legacy_exclusions_with_bounded_empty_continuations() -> Result<()> {
     let f = fixture()?;
     let p = ready(&f)?;
