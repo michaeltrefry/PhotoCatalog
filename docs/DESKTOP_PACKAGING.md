@@ -221,3 +221,71 @@ Run the script checks without native builds:
 ```sh
 python3 -m unittest discover -s scripts -p test_package_desktop.py -v
 ```
+
+## Hosted three-platform qualification
+
+The existing `test` matrix runs the frontend tests/build, a locked Tauri build,
+then packaging and installed-worker observation in the same OS lane. It reuses
+that lane's DNG SDK, native libraries and Cargo cache. The finite job deadline
+includes package preparation; failures retain their output instead of publishing
+a partial installer. Artifact upload is CI evidence, not a release publication.
+
+`desktop_ci_stage.py` prepares Linux and Windows native inputs **before** Tauri
+bundling. `desktop_ci_package.py` supplies a generated bundle config and reads the
+resulting installed payload. These commands are intended for disposable hosted
+runners; the Windows command actually runs the per-user NSIS installer into a new
+temporary directory. Never aim it at an existing installation.
+
+* macOS uses the reviewed finalizer, mounts the resulting DMG read-only, copies
+  the app outside the checkout, then repeats closure/signature/deployment-floor
+  inspection. Ambient Apple/updater signing credentials are removed from both
+  Tauri invocations. This is an ad-hoc checkpoint, without a release signature or
+  notarization claim.
+* Linux qualifies a DEB. The SDK's JPEG XL shared libraries ship under
+  `/usr/lib/photocatalog-desktop/native`, with `$ORIGIN` paths. Other native
+  SONAMEs must resolve to a unique installed Debian package; exact versions
+  become declared minimum dependencies. The DEB is extracted outside the
+  checkout and its actual loader paths are checked. It is not an AppImage test.
+* Windows walks regular **and delay** imports. Vcpkg libraries and MSVC runtime
+  DLLs are copied beside the executable; the latter must come from the installed
+  Visual Studio `VC/Redist/MSVC/.../x64/*.CRT` directory. Only an explicit set of
+  Windows OS imports/API contracts may remain external. An unknown import fails.
+  The NSIS payload is installed into a fresh directory before inspection.
+  WebView2 uses the configured bootstrapper; its actual GUI startup is a distinct
+  acceptance check.
+
+The public service probe `examples/desktop_worker_smoke.rs` creates a small PNG,
+imports it into a temporary catalog, commits an exposure edit, and requests a
+real preview and PNG export from the **installed desktop executable**. It checks
+child metrics, output dimensions/edited pixels, unchanged original bytes and
+cleanup. `installed_worker_smoke.py` reuses `edit_campaign.invoke` unchanged for
+bounded process-tree observation (120 seconds, 1 GiB per process, 2 GiB group,
+64 MiB free reserve). Loader/signing/developer environment variables are removed;
+PATH is reduced to system directories and the working directory is outside the
+checkout. The Linux observation tool gets a private explicit SDK RPATH; that
+observer is not distributed and is not substituted for the installed executable.
+The Windows observer gets its own directory with the installed runtime DLLs.
+Linux/Windows executable and native bytes must match the staged hashes after
+installer extraction/installation. The installed tree is retained with CI
+evidence even when qualification fails.
+
+Notices are collected from each platform's actual sources. The collector's
+`--native-input` accepts only an explicit Linux/Windows manifest with bounded,
+contained, checksum-verified files. Linux includes the SDK JPEG XL and nested
+third-party notices; Debian manages notices for its own libraries. Windows
+includes installed vcpkg copyright/SPDX records and checksum-verified LibRaw
+source archives plus the exact port/patch/build files; MSVC runtime notices come
+from that Visual Studio installation. No macOS Homebrew receipt is used as
+Windows or Linux evidence. A missing license/source input fails preparation;
+new license choices or redistribution restrictions require review before a
+release. The application itself has no invented license grant.
+
+Relevant primary references: [Tauri bundle configuration](https://v2.tauri.app/reference/config/),
+[Tauri Windows installer](https://v2.tauri.app/distribute/windows-installer/),
+[Microsoft runtime redistribution](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files?view=msvc-170),
+and [Microsoft application-local deployment](https://learn.microsoft.com/en-us/cpp/windows/choosing-a-deployment-method?view=msvc-170).
+
+A successful `qualification.json` means installed dependency closure and actual
+worker dispatch passed on that particular CI platform. It does **not** certify
+interactive GUI behavior, all desktop workflows, signing/notarization, older OS
+compatibility, or S12 as a whole. Those acceptance observations remain required.

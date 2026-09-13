@@ -62,6 +62,19 @@ def unpack_crate(data, checksum):
     return files
 
 
+def locked_crate(package, cargo_home, fetch):
+    filename = f"{package['name']}-{package['version']}.crate"
+    archive = cargo_home/'registry/cache/index.crates.io-1949cf8c6b5b557f'/filename
+    url = f"https://static.crates.io/crates/{package['name']}/{filename}"
+    if archive.is_file():
+        data = archive.read_bytes()
+    elif fetch:
+        data = download(url, 64 * 1024 * 1024)
+    else:
+        raise FileNotFoundError('no exact cached crate archive')
+    return data, unpack_crate(data, package['checksum']), url
+
+
 def verify_npm_runtime(data, integrity, directory):
     algorithm, encoded = integrity.split('-', 1)
     if algorithm not in {'sha512', 'sha256'}:
@@ -134,12 +147,50 @@ def aggregate(items):
     return bytes(stream)
 
 
+def import_native_input(path, output):
+    """Copy explicit platform-native notices; this never infers license grants."""
+    path = Path(path).resolve(strict=True)
+    if path.stat().st_size > 4 * 1024 * 1024:
+        raise ValueError('native input control too large')
+    value = json.loads(path.read_text())
+    if value.get('protocol') != 1 or value.get('platform') not in {'linux', 'windows'}:
+        raise ValueError('native input platform/protocol')
+    entries = value.get('components')
+    if not isinstance(entries, list) or not 0 < len(entries) <= 256:
+        raise ValueError('native component bounds')
+    copied, names = [], set()
+    for entry in entries:
+        name = entry['component']
+        if not re.fullmatch(r'[a-zA-Z0-9._-]+', name) or name in names:
+            raise ValueError('native component name/duplicate')
+        names.add(name)
+        if not entry.get('files') or len(entry['files']) > 1024:
+            raise ValueError('native notice file bounds')
+        files = []
+        for index, item in enumerate(entry['files']):
+            source = path.parent / item['path']
+            if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(path.parent):
+                raise ValueError('native notice path escapes input')
+            if source.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError('native notice file too large')
+            data = source.read_bytes()
+            if digest(data) != item['sha256']:
+                raise ValueError('native notice digest mismatch')
+            target = output / f'native-{name}-{index}-{source.name}'
+            with target.open('xb') as stream:
+                stream.write(data)
+            files.append({'path': target.name, 'sha256': digest(data)})
+        copied.append({'component': name, 'libraries': entry['libraries'], 'files': files})
+    return copied, {'input': file_ref(path), 'platform': value['platform'],
+                    'provenance': value.get('provenance'), 'claim': 'Exact native notice inputs; final closure must match'}
+
+
 def collect(args):
     root, out = args.checkout.resolve(), args.output.absolute()
     out.mkdir(parents=True, exist_ok=False)
     report = {'protocol': 1, 'status': 'NOTICE_INVENTORY_PENDING', 'inputs': {}, 'rust': [],
               'frontend': [], 'native': [], 'missing': [], 'claim':
-              'Source notice inventory; exact desktop Mach-O closure and redistribution/source obligations require final package review.'}
+              'Source notice inventory; exact desktop native closure and redistribution/source obligations require final package review.'}
     manifest = {'protocol': 1, 'components': []}
     def component(name, items, libraries=()):
         data = aggregate(items)
@@ -165,16 +216,8 @@ def collect(args):
             continue
         if not package['source'].startswith('registry+'):
             raise ValueError('unsupported non-registry source: ' + identity)
-        archive = args.cargo_home/'registry/cache/index.crates.io-1949cf8c6b5b557f'/f"{package['name']}-{package['version']}.crate"
-        url = f"https://static.crates.io/crates/{package['name']}/{package['name']}-{package['version']}.crate"
         try:
-            if archive.is_file():
-                data = archive.read_bytes()
-            elif args.fetch:
-                data = download(url, 64 * 1024 * 1024)
-            else:
-                raise FileNotFoundError('no exact cached crate archive')
-            files = unpack_crate(data, package['checksum'])
+            data, files, url = locked_crate(package, args.cargo_home, args.fetch)
             meta = tomllib.loads(files['Cargo.toml'].decode())['package']
             notices = {name: data for name, data in files.items() if NOTICE.fullmatch(Path(name).name)}
             entry.update(license=meta.get('license'), repository=meta.get('repository'), archive=url)
@@ -194,8 +237,7 @@ def collect(args):
                 # Both import-library crates direct users to the locked winapi parent.
                 # Carry its actual license texts; retain the explicit family attribution.
                 parent = next(p for p in cargo['package'] if p['name'] == 'winapi')
-                parent_archive = args.cargo_home/'registry/cache/index.crates.io-1949cf8c6b5b557f'/f"winapi-{parent['version']}.crate"
-                parent_files = unpack_crate(parent_archive.read_bytes(), parent['checksum'])
+                _, parent_files, _ = locked_crate(parent, args.cargo_home, args.fetch)
                 notices = {n: b for n,b in parent_files.items() if NOTICE.fullmatch(Path(n).name)}
                 entry['parent_project_notices'] = {'identity': f"winapi@{parent['version']}", 'checksum': parent['checksum'], 'basis': meta['description']}
             if not notices:
@@ -256,7 +298,11 @@ def collect(args):
     component('adobe-dng-sdk', [('Adobe DNG SDK', {'LICENSE.txt': (args.sdk/'LICENSE.txt').read_bytes()})])
     vendor = root/'vendor/xmp_toolkit'
     component('xmp-toolkit', [('xmp_toolkit 1.12.1 with source-preservation changes', local_notices(vendor))])
-    for name in NATIVE:
+    if args.native_input is not None:
+        native_components, native_report = import_native_input(args.native_input, out)
+        manifest['components'].extend(native_components)
+        report['native'].append(native_report)
+    for name in ([] if args.native_input is not None else NATIVE):
         directory = (args.brew/'opt'/name).resolve()
         files = local_notices(directory)
         if name == 'jpeg-turbo':
@@ -334,6 +380,7 @@ def main():
     parser.add_argument('--cargo-home', type=Path, default=Path.home()/'.cargo')
     parser.add_argument('--brew', type=Path, default=Path('/opt/homebrew'))
     parser.add_argument('--rust-sysroot', type=Path, required=True)
+    parser.add_argument('--native-input', type=Path, help='Explicit Linux/Windows native notice manifest; replaces Homebrew inventory')
     parser.add_argument('--fetch', action='store_true')
     report = collect(parser.parse_args())
     raise SystemExit(bool(report['missing']))
