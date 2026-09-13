@@ -72,9 +72,16 @@ pub(crate) struct Source {
     pub file: File,
     pub before: Revision,
     locks: Vec<(u64, u64)>,
+    _migration_role: Option<crate::lightroom_migration_worker::identity::RoleLease>,
 }
 impl Source {
     pub fn open(path: &Path, maximum: u64) -> Result<Self> {
+        Self::open_impl(path, maximum, true)
+    }
+    fn open_impl(path: &Path, maximum: u64, audit: bool) -> Result<Self> {
+        if audit {
+            crate::lightroom_migration_worker::identity::before_source_open()?;
+        }
         reject_links(path)?;
         let metadata = fs::symlink_metadata(path)?;
         ensure!(metadata.is_file(), "source is not a regular file");
@@ -94,6 +101,11 @@ impl Source {
             options.custom_flags(0x0020_0000).share_mode(0x1 | 0x2);
         }
         let file = options.open(path)?;
+        let migration_role = if audit {
+            crate::lightroom_migration_worker::identity::source_open(&file)?
+        } else {
+            None
+        };
         let before = revision(&file)?;
         ensure!(
             before.bytes <= maximum,
@@ -112,6 +124,7 @@ impl Source {
             file,
             before,
             locks: vec![],
+            _migration_role: migration_role,
         })
     }
     pub fn lock(&mut self, start: u64, length: u64) -> Result<()> {
@@ -121,6 +134,7 @@ impl Source {
         Ok(())
     }
     pub fn verify(&self) -> Result<()> {
+        crate::lightroom_migration_worker::identity::check_source()?;
         ensure!(
             revision(&self.file)? == self.before,
             "source handle revision changed"
@@ -146,7 +160,10 @@ impl Source {
         {
             // Windows locks are handle scoped, so closing this additional identity
             // handle cannot release the capture handle's byte-range locks.
-            let path_handle = Source::open(&self.path, self.before.bytes)?;
+            // This private verifier takes no byte lock. Windows locks are
+            // handle-scoped, so its close cannot release the held Source lock.
+            // Unix never uses this verifier or suppresses role admission.
+            let path_handle = Self::open_impl(&self.path, self.before.bytes, false)?;
             ensure!(path_handle.before == self.before, "source path replaced");
         }
         Ok(())
