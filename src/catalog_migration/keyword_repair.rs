@@ -480,6 +480,7 @@ impl Catalog {
         source: &MigrationSource,
         r: &Request,
     ) -> Result<Progress> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         preflight(&self.db, source.binding_blake3(), r)?;
         let (before, policy) = importer::read(&self.db, &r.run)?;
         ensure!(
@@ -611,6 +612,7 @@ impl Catalog {
         read_progress(&self.db, id)
     }
     pub fn step_keyword_repair(&mut self, source: &MigrationSource, id: &str) -> Result<Step> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let (b, p) = read(&self.db, id)?;
         ensure!(
             source.binding_blake3() == b.input,

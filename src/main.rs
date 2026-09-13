@@ -11,6 +11,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
 };
+mod cli_backup;
 mod cli_edits;
 mod cli_exports;
 #[derive(Parser)]
@@ -59,6 +60,8 @@ impl From<PreviewTier> for photocatalog::preview::Tier {
 // generated debug-mode argument builders out of a single large stack frame.
 #[derive(Subcommand)]
 enum Command {
+    #[command(flatten)]
+    Backup(cli_backup::BackupCommand),
     #[command(flatten)]
     Edits(cli_edits::EditCommand),
     #[command(flatten)]
@@ -488,6 +491,7 @@ fn main() -> Result<()> {
 // Windows executable main stacks are smaller than Rust's test-thread stacks.
 fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Backup(command) => cli_backup::run(&cli.catalog, command),
         Command::Exports(command) => {
             let mut catalog = Catalog::open(&cli.catalog)?;
             cli_exports::run(&mut catalog, cli.preview_config, command)
@@ -832,6 +836,7 @@ fn run_catalog_command(
         Command::Import { .. } => unreachable!("import uses its isolated dispatch path"),
         Command::Exports(_) => unreachable!("exports use their isolated dispatch path"),
         Command::Edits(_) => unreachable!("edits use their isolated dispatch path"),
+        Command::Backup(_) => unreachable!("backup uses its isolated dispatch path"),
         Command::Browse { after, limit } => println!(
             "{}",
             serde_json::to_string_pretty(&catalog.browse(after, limit)?)?

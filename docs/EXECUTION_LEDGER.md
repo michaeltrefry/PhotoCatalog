@@ -2,6 +2,28 @@
 
 Source of truth: https://app.shortcut.com/trefry/epic/22835
 
+## Current delivery — 2026-09-13
+
+S1–S10 are Done. S10 PR #14 merged as
+`287d3382538b10717bf943553c73fc29a300ffd6`, with identical content to independently
+reviewed final head `81f931`. Final-head CI `34739779088` and merged-head CI
+`34740733892` passed all four jobs: macOS, Windows, Linux, and benchmark contracts.
+Shortcut sc-22845 and all four tasks were read back as complete; comment 23281
+records acceptance and limits. The selected16 result remains a scratch TEST.
+Canonical migration, Adobe renderer parity, and terminal performance are not
+claimed. No actual catalog or RAID worker remains active.
+
+S11 sc-22846 local implementation and acceptance checks are complete on
+`codex/sc-22846-backup-restore`, based on merged S10. The production source passed
+662 release tests (five existing ignored), with one additional real running-job
+backup test subsequently passing; that addition changed tests only. Strict
+all-target Clippy and formatting passed. Whole-database backup, verified restore
+to a new destination, incomplete-output protection, exact XMP/migration retention,
+explicit restored-job holds, and relink/preview regeneration are covered.
+See [Catalog backup and restore](CATALOG_BACKUP.md). Final review, PR/platform CI,
+merge and tracker closeout remain delivery gates; Shortcut holds their live state.
+S12 desktop packaging and S13 integrated readiness remain required.
+
 ## S10 pre-merge checkpoint — 2026-09-13
 
 This section records pre-merge evidence; Shortcut holds the live delivery state.

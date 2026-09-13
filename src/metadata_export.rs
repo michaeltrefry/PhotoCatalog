@@ -959,7 +959,7 @@ fn revision(path: &Path) -> Result<FileRevision> {
     })
 }
 
-fn open_regular(path: &Path) -> Result<File> {
+pub(crate) fn open_regular(path: &Path) -> Result<File> {
     open_regular_options(path, false)
 }
 
@@ -1041,7 +1041,7 @@ fn sync_regular(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync_file(file: &File) -> Result<()> {
+pub(crate) fn sync_file(file: &File) -> Result<()> {
     file.sync_all()?;
     #[cfg(target_os = "macos")]
     {
@@ -1081,7 +1081,7 @@ fn sync_directory(_: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn move_to_private(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn move_to_private(from: &Path, to: &Path) -> Result<()> {
     ensure!(
         fs::symlink_metadata(to).is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
         "private capture already exists"
@@ -1090,7 +1090,7 @@ fn move_to_private(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 #[cfg(windows)]
-fn move_to_private(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn move_to_private(from: &Path, to: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {

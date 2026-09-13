@@ -12,6 +12,9 @@ use crate::catalog_migration::{
 use crate::lightroom::migration_source::MigrationSource;
 use anyhow::Context;
 
+#[path = "catalog_backup_keyword_tests.rs"]
+mod catalog_backup_tests;
+
 fn fixture() -> Result<ImportFixture> {
     let mut f = ImportFixture::with_wrapper(false, true)?;
     let revisions = f

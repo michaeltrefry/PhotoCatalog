@@ -2,6 +2,7 @@
 /// Current on-disk catalog schema; probes must preflight before timed opens.
 pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
+pub mod catalog_backup;
 pub mod catalog_edits;
 pub mod catalog_export_alias;
 pub mod catalog_exports;
@@ -219,11 +220,28 @@ impl Catalog {
         Self::open(root)
     }
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        fs::create_dir_all(root.as_ref())?;
+        Self::open_impl(root.as_ref(), false, |_| Ok(()))
+    }
+    pub(crate) fn open_restoring(
+        root: &Path,
+        setup: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_impl(root, true, setup)
+    }
+    fn open_impl(
+        root: &Path,
+        restoring: bool,
+        setup: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Self> {
+        if !restoring {
+            catalog_backup::check_catalog_root(root)?;
+        }
+        fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
         let writers = catalog_writer::for_catalog(&root);
         fs::create_dir_all(root.join("previews"))?;
         let mut db = Connection::open(root.join("catalog.sqlite3"))?;
+        setup(&db)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
@@ -358,6 +376,7 @@ impl Catalog {
         folder: impl AsRef<Path>,
         max_files: Option<usize>,
     ) -> Result<ImportSession> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let folder = fs::canonicalize(folder)?;
         ensure!(folder.is_dir(), "import source must be a folder");
         ensure!(
@@ -388,6 +407,7 @@ impl Catalog {
         mut observer: impl FnMut(ImportEvent) -> Result<()>,
         mut service: Option<&mut preview::PreviewService>,
     ) -> Result<ImportReport> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let mut session = self.begin_import(folder, max_files)?;
         loop {
             let advance = session.advance_inner(self, &mut service, &mut observer)?;

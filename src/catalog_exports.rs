@@ -331,6 +331,7 @@ impl Catalog {
         &mut self,
         limit: usize,
     ) -> Result<crate::catalog_export_alias::AliasProgress> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let _write = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
@@ -412,6 +413,7 @@ impl Catalog {
     /// Explicitly retry publication of an already accepted seal. A canceled job
     /// remains canceled. This never promotes a worker-discovered orphan.
     pub fn retry_sealed_photo_export(&mut self, id: &str, sequence: i64) -> Result<()> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let _write = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
@@ -432,6 +434,7 @@ impl Catalog {
     /// Bulk verification/durability happen outside the writer; namespace restoration
     /// is guarded by the current alias index and exact accepted operation identity.
     pub fn restore_photo_export_item(&mut self, id: &str, sequence: i64) -> Result<ExportReceipt> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let (plan, authority) = self.photo_export_plan(id, sequence)?;
         let (state,encoded,intent):(String,Option<String>,Option<String>)=self.db.query_row(
             "SELECT state,seal,publication FROM photo_export_items WHERE job=?1 AND sequence=?2 AND authority=?3",params![id,sequence,authority],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -524,6 +527,7 @@ impl Catalog {
             .query_map([limit as i64],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     }
     pub fn begin_photo_export(&mut self) -> Result<ExportJob> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let id = uuid::Uuid::new_v4().to_string();
         let _write = self.writers.enter(Priority::Foreground)?;
         self.db.execute(
@@ -564,6 +568,7 @@ impl Catalog {
         max_payload_bytes: u64,
         alias_limits: crate::catalog_export_alias::AliasLimits,
     ) -> Result<ExportItem> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         // One bounded catch-up handles newly imported assets; large catalogs use
         // explicit pages through reconcile_export_paths before planning.
         self.reconcile_export_paths(512)?;
@@ -740,6 +745,7 @@ impl Catalog {
     /// Fence a stopped attempt. The executor must reap its worker before launching
     /// another; a late result with the old token can never be accepted afterward.
     pub fn requeue_photo_export_attempt(&mut self, work: &ExportWork) -> Result<()> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let _write = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
@@ -758,6 +764,7 @@ impl Catalog {
         &self,
         plan: &PhotoExportPlan,
     ) -> Result<(OutputSpec, Option<Vec<u8>>)> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let profile = match &plan.output.profile {
             StoredProfile::Srgb => OutputProfile::Srgb,
             StoredProfile::LinearSrgb => OutputProfile::LinearSrgb,
@@ -779,6 +786,7 @@ impl Catalog {
         ))
     }
     pub fn claim_photo_export(&mut self, id: &str) -> Result<Option<ExportWork>> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let _write = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
@@ -820,6 +828,7 @@ impl Catalog {
         seal: &SealedPhotoExport,
         mut hook: impl FnMut(PhotoExportBoundary) -> Result<()>,
     ) -> Result<()> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         checked_plan(&serde_json::to_string(&work.plan)?, &work.authority)?;
         require_current_renderer(&work.plan)?;
         ensure!(
@@ -862,6 +871,7 @@ impl Catalog {
         sequence: i64,
         mut hook: impl FnMut(PhotoExportBoundary) -> Result<()>,
     ) -> Result<(ExportReceipt, ExportPublicationMetrics)> {
+        crate::catalog_backup::require_jobs_released(&self.root)?;
         let started = std::time::Instant::now();
         let mut metrics = ExportPublicationMetrics::default();
         let (plan, authority) = self.photo_export_plan(id, sequence)?;
