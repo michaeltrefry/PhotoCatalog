@@ -71,7 +71,7 @@ impl Session {
         read_ms: u64,
     ) -> Result<Self> {
         epoch.validate()?;
-        let encoded = crate::lightroom::bounded_json(&authority, AUTHORITY_BYTES)?;
+        let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
         let binding = authority.binding()?;
         let process_stop = Arc::new(Stop::default());
         let process = Process::spawn_role(
@@ -575,3 +575,6 @@ impl ArtifactRead for RawReader {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod budget_tests;

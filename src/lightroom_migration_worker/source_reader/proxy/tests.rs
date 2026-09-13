@@ -26,9 +26,16 @@ fn epoch() -> Epoch {
         reader: "reader-1".into(),
     }
 }
-fn session(authority: Authority, cancel: Arc<AtomicBool>) -> Result<Session> {
+pub(super) fn session(authority: Authority, cancel: Arc<AtomicBool>) -> Result<Session> {
+    session_with_deadline(authority, cancel, 10_000)
+}
+pub(super) fn session_with_deadline(
+    authority: Authority,
+    cancel: Arc<AtomicBool>,
+    read_ms: u64,
+) -> Result<Session> {
     let binding = authority.binding()?;
-    let encoded = crate::lightroom::bounded_json(&authority, AUTHORITY_BYTES)?;
+    let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
     let stop = Arc::new(Stop::default());
     let mut command = Command::new(std::env::current_exe()?);
     command
@@ -43,10 +50,10 @@ fn session(authority: Authority, cancel: Arc<AtomicBool>) -> Result<Session> {
         encoded,
         cancel,
         15_000,
-        10_000,
+        read_ms,
     )
 }
-fn sql(fixture: &Fixture, cancel: Arc<AtomicBool>) -> Result<SqlReader> {
+pub(super) fn sql(fixture: &Fixture, cancel: Arc<AtomicBool>) -> Result<SqlReader> {
     let session = session(
         Authority::Sql {
             seal: fixture.seal.clone(),

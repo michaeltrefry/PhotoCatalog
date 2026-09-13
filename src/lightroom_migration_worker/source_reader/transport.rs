@@ -259,3 +259,76 @@ impl Read {
         )
     }
 }
+
+/// Two passes over an already-owned typed value: count without allocating an
+/// output buffer, then fill exactly that admitted byte allocation. A geometric
+/// Vec writer's capacity is not bounded by its serialized-length check.
+/// This accounts for requested Rust payload bytes, not allocator metadata/RSS.
+pub(super) fn exact_json<T: Serialize>(
+    value: &T,
+    maximum: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>> {
+    use std::{io, sync::atomic::Ordering};
+    struct Count<'a> {
+        length: usize,
+        maximum: usize,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    }
+    impl io::Write for Count<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(io::Error::other("source encoding canceled"));
+            }
+            if bytes.len() > self.maximum.saturating_sub(self.length) {
+                return Err(io::Error::other("source encoded byte limit exceeded"));
+            }
+            self.length += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count {
+        length: 0,
+        maximum,
+        cancel,
+    };
+    serde_json::to_writer(&mut count, value)?;
+    // Check again before the sole output allocation, including empty values.
+    ensure!(!cancel.load(Ordering::Acquire), "source encoding canceled");
+    let mut bytes = vec![0; count.length];
+    struct Fill<'a> {
+        remaining: &'a mut [u8],
+        cancel: &'a std::sync::atomic::AtomicBool,
+    }
+    impl io::Write for Fill<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(io::Error::other("source encoding canceled"));
+            }
+            if bytes.len() > self.remaining.len() {
+                return Err(io::Error::other("source serializer changed between passes"));
+            }
+            let remaining = std::mem::take(&mut self.remaining);
+            let (target, rest) = remaining.split_at_mut(bytes.len());
+            target.copy_from_slice(bytes);
+            self.remaining = rest;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut fill = Fill {
+        remaining: &mut bytes,
+        cancel,
+    };
+    serde_json::to_writer(&mut fill, value)?;
+    ensure!(
+        fill.remaining.is_empty(),
+        "source serializer changed between passes"
+    );
+    Ok(bytes)
+}

@@ -176,16 +176,16 @@ impl Roster {
         ensure!(!cancel.load(Ordering::Acquire), "source read canceled");
         match (self, query) {
             (Self::Sql(source), Read::Sql(query)) => {
-                crate::lightroom::bounded_json(&query.read(source)?, RESULT_BYTES)
+                exact_json(&query.read(source)?, RESULT_BYTES, cancel)
             }
             (Self::Artifact(source), Read::ArtifactVerify) => {
                 ArtifactRead::verify(source)?;
-                crate::lightroom::bounded_json(&wire::Value::Verified, RESULT_BYTES)
+                exact_json(&wire::Value::Verified, RESULT_BYTES, cancel)
             }
             (Self::Artifact(source), Read::ArtifactChunk { offset }) => {
                 let bytes =
                     ArtifactRead::chunk(source, offset.0, &|| cancel.load(Ordering::Acquire))?;
-                crate::lightroom::bounded_json(&wire::Value::Chunk(bytes), RESULT_BYTES)
+                exact_json(&wire::Value::Chunk(bytes), RESULT_BYTES, cancel)
             }
             _ => anyhow::bail!("query does not belong to admitted source mode"),
         }
