@@ -584,3 +584,107 @@ exec /bin/sleep 60
     bridge.shutdown();
     Ok(())
 }
+
+#[test]
+fn canceled_hydration_keeps_blocked_reader_owned_without_blocking_foreground() -> Result<()> {
+    use crate::edit::{Recipe, RecipeV1};
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    let path = originals.join("source.png");
+    image::RgbImage::from_pixel(32, 24, image::Rgb([20u8, 40, 70])).save(&path)?;
+    let root = temp.path().join("catalog");
+    let mut c = Catalog::open(&root)?;
+    c.import(&originals, None, |_| Ok(()))?;
+    let key = VariantKey::master(c.browse(0, 1)?[0].id.clone());
+    c.db.execute(
+        "UPDATE assets SET state='pending',fingerprint=NULL,metadata=NULL,preview_hash=NULL",
+        [],
+    )?;
+    drop(c);
+    let release = Arc::new(AtomicBool::new(false));
+    let released = release.clone();
+    let (entered, events) = mpsc::channel();
+    let bridge = Bridge::spawn(Config {
+        worker_executable: std::env::current_exe()?,
+        cache_root: None,
+        original_roots: vec![originals],
+        preview_policy: preview::PreviewPolicy::default(),
+        preview_limits: preview::ServiceLimits::default(),
+        limits: Limits::default(),
+        import_checkpoint: Some(Arc::new(move |stage, _| {
+            if stage == "hydration_hash_chunk" {
+                let _ = entered.send(());
+                let until = Instant::now() + Duration::from_secs(10);
+                // Simulate an OS read that does not return immediately on cancellation.
+                while !released.load(Ordering::Acquire) && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        })),
+    })?;
+    let call = |request| -> Result<Response> {
+        match bridge
+            .submit(request)?
+            .receiver
+            .recv_timeout(Duration::from_secs(3))?
+        {
+            Reply::Ok { value } => Ok(value),
+            Reply::Error { error } => Err(error.into()),
+        }
+    };
+    let Response::Status(opened) = call(Request::OpenExisting {
+        path: NativePath::from_path(&root),
+    })?
+    else {
+        anyhow::bail!("open")
+    };
+    let token = opened.catalog.context("token")?;
+    let Response::Preview(ticket) = call(Request::Preview {
+        catalog: token.clone(),
+        key: key.clone(),
+        tier: PreviewTier::Large,
+        interactive: false,
+        viewport: "selected".into(),
+        generation: U64(1),
+        foreground: true,
+    })?
+    else {
+        anyhow::bail!("preview")
+    };
+    events.recv_timeout(Duration::from_secs(3))?;
+    call(Request::CancelPreview {
+        catalog: token.clone(),
+        ticket: ticket.ticket,
+    })?;
+    let Response::Variant(saved) = call(Request::SaveRecipe {
+        catalog: token.clone(),
+        key: key.clone(),
+        expected_revision: I64(0),
+        recipe: Recipe::V1(RecipeV1 {
+            exposure_ev: 1.0,
+            ..RecipeV1::default()
+        }),
+    })?
+    else {
+        anyhow::bail!("save")
+    };
+    assert!(matches!(call(Request::Status)?, Response::Status(_)));
+    assert!(!release.load(Ordering::Acquire));
+    let close = bridge.submit(Request::Close { catalog: token })?;
+    assert!(matches!(
+        close.receiver.recv_timeout(Duration::from_millis(30)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    release.store(true, Ordering::Release);
+    assert!(matches!(
+        close.receiver.recv_timeout(Duration::from_secs(3))?,
+        Reply::Ok { .. }
+    ));
+    bridge.shutdown();
+    let c = Catalog::open(&root)?;
+    assert_eq!(c.edit_variant(&key)?.recipe_digest, saved.recipe_digest);
+    assert_eq!(c.render_identity(&key.asset_id)?.state, "pending");
+    assert!(c.render_identity(&key.asset_id)?.fingerprint.is_none());
+    Ok(())
+}

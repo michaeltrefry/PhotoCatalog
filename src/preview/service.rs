@@ -94,6 +94,14 @@ impl Default for ServiceLimits {
         }
     }
 }
+pub struct HydrationRequest<'a> {
+    pub variant: &'a VariantKey,
+    pub source: &'a NativePath,
+    pub fingerprint: &'a str,
+    pub tier: Tier,
+    pub priority: Priority,
+    pub interactive: bool,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedJob {
     request: RenderWork,
@@ -102,6 +110,8 @@ struct SavedJob {
     edit: Option<EditRenderIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     import_image: Option<EditRenderIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hydration: Option<EditRenderIdentity>,
     import: bool,
     state: JobState,
 }
@@ -339,6 +349,51 @@ fn import_image_current(
 impl SavedJob {
     fn validate(&self) -> Result<()> {
         self.request.validate_persisted()?;
+        if let Some(image) = &self.hydration {
+            ensure!(
+                !self.import
+                    && self.edit.is_none()
+                    && self.import_image.is_none()
+                    && image
+                        .image_identity
+                        .as_ref()
+                        .is_some_and(|i| i.key == image.key
+                            && i.physical_generation == image.source.generation)
+                    && image.source.state == "pending"
+                    && image.source.fingerprint.is_none()
+                    && same_pixels(&image.source, &self.expected)
+                    && self.request.keys.len() == 1,
+                "mixed initial hydration authority"
+            );
+            let key = &self.request.keys[0];
+            ensure!(
+                key.asset_id == image.key.asset_id
+                    && key.variant_id == image.key.variant_id
+                    && key.edit_revision == u64::try_from(image.revision)?
+                    && key.image_pixel_generation
+                        == image
+                            .image_identity
+                            .as_ref()
+                            .map(|i| i.pixel_generation as u64)
+                    && key.generation
+                        == u64::try_from(image.source.generation)?
+                            .checked_add(1)
+                            .context("hydration generation overflow")?,
+                "hydration key identity differs"
+            );
+            if let Some(work) = &self.request.edit {
+                ensure!(
+                    work.recipe_digest == image.recipe_digest,
+                    "hydration recipe differs"
+                );
+            } else {
+                ensure!(
+                    image.key.variant_id == MASTER && image.revision == 0,
+                    "missing hydration recipe"
+                );
+            }
+            return Ok(());
+        }
         if let Some(image) = &self.import_image {
             ensure!(
                 self.import
@@ -419,6 +474,13 @@ impl SavedJob {
         Ok(())
     }
     fn current(&self, catalog: &Catalog) -> Result<bool> {
+        if let Some(image) = &self.hydration {
+            return Ok(crate::initial_hydration_source(
+                &catalog.db,
+                &image.key.asset_id,
+                &self.request.source,
+            )? && same_edit(image, &current_edit(catalog, image)?));
+        }
         if let Some(edit) = &self.edit {
             Ok(same_edit(edit, &current_edit(catalog, edit)?))
         } else {
@@ -884,10 +946,69 @@ impl PreviewService {
                 expected,
                 edit: None,
                 import_image: Some(import_image),
+                hydration: None,
                 import: true,
                 state: JobState::Queued,
             },
             Priority::Background,
+        )
+    }
+    pub fn submit_hydration(
+        &mut self,
+        catalog: &mut Catalog,
+        request: HydrationRequest<'_>,
+    ) -> Result<Consumer> {
+        let image = catalog.edit_render_identity(request.variant)?;
+        ensure!(
+            crate::initial_hydration_source(&catalog.db, &image.key.asset_id, request.source)?,
+            "original is not an initial metadata-only source at this path"
+        );
+        let view = catalog.edit_variant(request.variant)?;
+        ensure!(
+            view.revision == image.revision && view.recipe_digest == image.recipe_digest,
+            "hydration edit changed"
+        );
+        let mut key = if request.interactive {
+            self.interactive_key(&image, request.tier)?
+        } else {
+            self.variant_key(&image, request.tier)?
+        };
+        key.generation = key
+            .generation
+            .checked_add(1)
+            .context("hydration generation overflow")?;
+        key.fingerprint = request.fingerprint.to_owned();
+        let edit = if !request.interactive && image.key.variant_id == MASTER && image.revision == 0
+        {
+            None
+        } else {
+            Some(super::worker::EditWork {
+                recipe: view.recipe,
+                recipe_digest: view.recipe_digest,
+                limits: self.edit_limits(),
+                interactive: request.interactive,
+                prepared_bytes: 0,
+                prepared: None,
+            })
+        };
+        self.submit(
+            catalog,
+            SavedJob {
+                expected: image.source.clone(),
+                hydration: Some(image),
+                edit: None,
+                import_image: None,
+                import: false,
+                state: JobState::Queued,
+                request: RenderWork {
+                    source: request.source.clone(),
+                    keys: vec![key],
+                    encoded_limit: self.limits.per_worker_encoded_bytes,
+                    decode_limits: self.limits.decode_limits,
+                    edit,
+                },
+            },
+            request.priority,
         )
     }
     pub fn request(
@@ -973,6 +1094,7 @@ impl PreviewService {
                 expected: expected.source.clone(),
                 edit: Some(expected),
                 import_image: None,
+                hydration: None,
                 import: false,
                 state: JobState::Queued,
             },
@@ -1011,7 +1133,15 @@ impl PreviewService {
             }
             Ok(())
         };
-        let admitted = if let Some(edit) = &job.edit {
+        let admitted = if let Some(image) = &job.hydration {
+            with_preview_transaction(catalog, image, writer_priority, |tx| {
+                ensure!(
+                    crate::initial_hydration_source(tx, &image.key.asset_id, &job.request.source)?,
+                    "initial hydration source changed"
+                );
+                persist()
+            })?
+        } else if let Some(edit) = &job.edit {
             with_preview_transaction(catalog, edit, writer_priority, |_| persist())?
         } else {
             catalog.with_render_transaction(&job.expected, writer_priority, |tx| {
@@ -1210,7 +1340,7 @@ impl PreviewService {
         batch: RenderedPreviewBatch,
     ) -> Result<ServiceCompletion> {
         ensure!(
-            !job.import || batch.objects.len() == 1,
+            !(job.import || job.hydration.is_some()) || batch.objects.len() == 1,
             "import publication requires one retained tier"
         );
         let mut stale = false;
@@ -1228,7 +1358,23 @@ impl PreviewService {
             let publication =
                 self.store
                     .publish_record(&object.key, &object.encoded, &record, |attach| {
-                        let result = if job.import {
+                        let result = if let Some(image) = &job.hydration {
+                            catalog.commit_preview_hydration(
+                                image,
+                                crate::HydrationPublication {
+                                    source: &job.request.source,
+                                    fingerprint: &object.key.fingerprint,
+                                    metadata: &batch.metadata,
+                                    preview_key: &object.key.digest()?,
+                                },
+                                || {
+                                    let publication = attach()?;
+                                    self.observe(ServiceEvent::ManifestAttached)?;
+                                    Ok(publication)
+                                },
+                                || self.observe(ServiceEvent::BeforeCatalogCommit),
+                            )?
+                        } else if job.import {
                             catalog.commit_preview_import_guarded(
                                 &job.expected,
                                 &object.key.fingerprint,
@@ -1276,7 +1422,7 @@ impl PreviewService {
                                 )?
                             }
                         };
-                        if job.import && result.is_some() {
+                        if (job.import || job.hydration.is_some()) && result.is_some() {
                             self.observe(ServiceEvent::CatalogCommitted)?;
                         }
                         Ok(result.unwrap_or(Publication::Stale))
@@ -1403,6 +1549,9 @@ impl PreviewService {
                     self.store.finish_job(&id)?;
                     continue;
                 }
+                // A hydration journal always re-renders while its source is pending.
+                // A retained attachment alone cannot prove the original bytes are
+                // still the fingerprint captured before the crash.
                 // Crash after manifest attachment but before catalog ready commit.
                 if job.import
                     && self.store.current_is_intact(key)?
@@ -1440,7 +1589,24 @@ impl PreviewService {
                     .keys
                     .iter()
                     .map(|key| {
-                        if let Some(edit) = &job.edit {
+                        if let Some(image) = &job.hydration {
+                            let interactive = job
+                                .request
+                                .edit
+                                .as_ref()
+                                .is_some_and(|work| work.interactive);
+                            let mut key = if interactive {
+                                self.interactive_key(image, key.tier)?
+                            } else {
+                                self.variant_key(image, key.tier)?
+                            };
+                            key.generation = key
+                                .generation
+                                .checked_add(1)
+                                .context("hydration generation overflow")?;
+                            key.fingerprint = fingerprint.clone();
+                            Ok(key)
+                        } else if let Some(edit) = &job.edit {
                             if job
                                 .request
                                 .edit

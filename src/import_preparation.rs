@@ -106,11 +106,14 @@ impl Preparation {
             let _ = worker.join();
         }
     }
-    pub(crate) fn stop(&mut self) {
+    pub(crate) fn request_cancel(&mut self) {
         if self.thread.is_some() {
             self.cancel.store(true, Ordering::Release);
         }
         self.receiver.take(); // Unblock a rendezvous send before joining.
+    }
+    pub(crate) fn stop(&mut self) {
+        self.request_cancel();
         if let Some(worker) = self.thread.take() {
             let _ = worker.join();
         }
@@ -431,6 +434,98 @@ impl Reference {
             catalog.fail(&location_bytes(&self.path), &anyhow::anyhow!("{reason}"))?;
         }
         Ok(())
+    }
+}
+
+/// One selected-file read slot, independent of the folder walk. No directory
+/// association, XMP refresh, renderer, or catalog writer runs on this thread.
+pub(crate) struct SinglePreparation {
+    receiver: Option<mpsc::Receiver<std::result::Result<String, String>>>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+    result: Option<std::result::Result<String, String>>,
+}
+impl SinglePreparation {
+    pub(crate) fn spawn(
+        path: PathBuf,
+        #[cfg(test)] checkpoint: Option<Checkpoint>,
+    ) -> Result<Self> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let worker = thread::Builder::new()
+            .name("catalog-original-preparation".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let checkpoint: Option<Checkpoint> = checkpoint.map(|callback| {
+                    Arc::new(move |stage: &str, cancel: &AtomicBool| {
+                        if stage == "hash_chunk" {
+                            callback("hydration_hash_chunk", cancel);
+                        }
+                    }) as Checkpoint
+                });
+                let result = fingerprint(
+                    &path,
+                    &stop,
+                    #[cfg(test)]
+                    checkpoint.as_ref(),
+                )
+                .map(|(digest, _, _)| digest)
+                .map_err(|e| format!("prepare original: {e:#}"));
+                if !stop.load(Ordering::Acquire) {
+                    let _ = sender.send(result);
+                }
+            })?;
+        Ok(Self {
+            receiver: Some(receiver),
+            cancel,
+            worker: Some(worker),
+            result: None,
+        })
+    }
+    pub(crate) fn request_cancel(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.receiver.take();
+    }
+    pub(crate) fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+    }
+    pub(crate) fn poll(&mut self) -> Result<Option<std::result::Result<String, String>>> {
+        if self.result.is_none() {
+            match self
+                .receiver
+                .as_ref()
+                .context("original preparation stopped")?
+                .try_recv()
+            {
+                Ok(result) => {
+                    self.result = Some(result);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.result = Some(Err("original preparation stopped without a result".into()));
+                }
+            }
+        }
+        if self.is_finished() {
+            self.receiver.take();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            return Ok(self.result.take());
+        }
+        Ok(None)
+    }
+}
+impl Drop for SinglePreparation {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.receiver.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 

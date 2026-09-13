@@ -717,6 +717,42 @@ impl Catalog {
             Ok(Some(result))
         }).map(Option::flatten)
     }
+    /// First decode of a metadata-only original. Recipes, XMP and logical images
+    /// remain authoritative; only physical source readiness is established here.
+    pub(crate) fn commit_preview_hydration<T>(
+        &mut self,
+        expected: &catalog_edits::EditRenderIdentity,
+        publication: HydrationPublication<'_>,
+        attach: impl FnOnce() -> Result<T>,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<T>> {
+        ensure!(
+            expected.source.state == "pending"
+                && expected.source.fingerprint.is_none()
+                && expected.image_identity.is_some(),
+            "hydration requires scoped initial source identity"
+        );
+        for digest in [publication.fingerprint, publication.preview_key] {
+            ensure!(
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid hydration digest"
+            );
+        }
+        let metadata = serde_json::to_string(publication.metadata)?;
+        self.with_edit_transaction(expected, catalog_writer::Priority::Foreground, |tx| {
+            if !initial_hydration_source(tx, &expected.key.asset_id, publication.source)? { return Ok(None); }
+            // The schema's readiness reference uses a native manifest key, as
+            // service imports do. No edited bytes enter the master legacy store.
+            tx.execute("UPDATE assets SET state='ready',fingerprint=?1,metadata=?2,preview_hash=?3,error=NULL WHERE id=?4", params![publication.fingerprint,metadata,publication.preview_key,expected.key.asset_id])?;
+            let mut image = expected.image_identity.clone().context("missing hydration image")?;
+            image.physical_generation = image.physical_generation.checked_add(1).context("hydration generation overflow")?;
+            catalog_images::require_image_metadata_identity(tx, &image)?;
+            let result = attach()?;
+            organization::refresh(tx, &expected.key.asset_id)?;
+            before_commit()?;
+            Ok(Some(result))
+        }).map(Option::flatten)
+    }
     /// A failed/retried import retains its last valid legacy thumbnail until the
     /// service replaces it. This read never assigns current-render provenance.
     pub(crate) fn retained_legacy_preview(
@@ -1087,6 +1123,93 @@ fn measured_settings_preserve_existing_nonempty_v1_catalog() -> Result<()> {
             )?,
             80
         );
+    }
+    Ok(())
+}
+
+/// No locator rewriting or previous identity replacement is permitted during first hydration.
+pub(crate) fn initial_hydration_source(
+    db: &rusqlite::Connection,
+    asset: &str,
+    source: &storage_volume::NativePath,
+) -> Result<bool> {
+    let native: Option<String> = db.query_row(
+        "SELECT b.native_path FROM assets a JOIN storage_bindings b ON b.asset_id=a.id WHERE a.id=?1 AND a.state='pending' AND a.fingerprint IS NULL AND a.metadata IS NULL AND a.location=?2",
+        params![asset,catalog_storage::encoded_bytes(source)], |r| r.get(0)
+    ).optional()?;
+    Ok(native
+        .and_then(|value| serde_json::from_str::<storage_volume::NativePath>(&value).ok())
+        .as_ref()
+        == Some(source))
+}
+
+pub(crate) struct HydrationPublication<'a> {
+    pub source: &'a storage_volume::NativePath,
+    pub fingerprint: &'a str,
+    pub metadata: &'a Metadata,
+    pub preview_key: &'a str,
+}
+
+#[test]
+fn hydration_publication_rejects_stale_recipe_and_exact_path_before_attachment() -> Result<()> {
+    use catalog_edits::VariantKey;
+    use storage_volume::NativePath;
+    for change in ["edit", "path"] {
+        let root = tempfile::tempdir()?;
+        let originals = root.path().join("originals");
+        std::fs::create_dir(&originals)?;
+        let source = originals.join("source.png");
+        image::RgbImage::from_pixel(8, 6, image::Rgb([40u8, 70, 100])).save(&source)?;
+        let source = source.canonicalize()?;
+        let mut catalog = Catalog::open(root.path().join("catalog"))?;
+        catalog.import(&originals, None, |_| Ok(()))?;
+        let key = VariantKey::master(catalog.browse(0, 1)?[0].id.clone());
+        catalog.db.execute(
+            "UPDATE assets SET state='pending',fingerprint=NULL,metadata=NULL,preview_hash=NULL",
+            [],
+        )?;
+        let expected = catalog.edit_render_identity(&key)?;
+        if change == "edit" {
+            catalog.save_edit_recipe(
+                &key,
+                0,
+                &edit::Recipe::V1(edit::RecipeV1 {
+                    exposure_ev: 1.0,
+                    ..Default::default()
+                }),
+            )?;
+        } else {
+            catalog.db.execute(
+                "UPDATE storage_bindings SET native_path=?1 WHERE asset_id=?2",
+                params![
+                    serde_json::to_string(&NativePath::from_path(
+                        &source.with_file_name("moved.png")
+                    ))?,
+                    key.asset_id
+                ],
+            )?;
+        }
+        let mut attached = false;
+        let metadata = media::decode_full(&source)?.metadata;
+        let result = catalog.commit_preview_hydration(
+            &expected,
+            HydrationPublication {
+                source: &NativePath::from_path(&source),
+                fingerprint: &fingerprint(&source)?,
+                metadata: &metadata,
+                preview_key: &"a".repeat(64),
+            },
+            || {
+                attached = true;
+                Ok(())
+            },
+            || Ok(()),
+        )?;
+        assert!(result.is_none());
+        assert!(!attached);
+        let current = catalog.render_identity(&key.asset_id)?;
+        assert_eq!(current.state, "pending");
+        assert!(current.fingerprint.is_none());
     }
     Ok(())
 }

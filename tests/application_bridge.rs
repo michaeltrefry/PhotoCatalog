@@ -1240,3 +1240,287 @@ fn desktop_backup_restore_uses_selected_catalog_and_explicit_job_admission() -> 
     bridge.shutdown();
     Ok(())
 }
+
+fn pending_imported_fixture(base: &Path) -> Result<(PathBuf, PathBuf, VariantKey, VariantKey)> {
+    let originals = base.join("originals");
+    std::fs::create_dir(&originals)?;
+    let originals = originals.canonicalize()?;
+    let path = originals.join("source.png");
+    image::RgbImage::from_pixel(48, 32, image::Rgb([30u8, 55, 80])).save(&path)?;
+    std::fs::write(originals.join("source.xmp"), br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:custom="urn:retained:fixture" custom:opaque="retain original XMP"/></rdf:RDF></x:xmpmeta>"#)?;
+    let root = base.join("catalog");
+    let mut catalog = Catalog::open(&root)?;
+    catalog.import(&originals, None, |_| Ok(()))?;
+    let asset = catalog.browse(0, 1)?[0].id.clone();
+    let mut registration = photocatalog::catalog_images::ImportImageRequest {
+        import_source: "hydration-fixture".into(),
+        capture_revision: "1".into(),
+        source_table: "Adobe_images".into(),
+        source_id: "master".into(),
+        input_digest: "fixture-master".into(),
+        adapter_version: "fixture-1".into(),
+        asset_id: asset,
+        claim_reserved_master: false,
+        role: photocatalog::catalog_images::ImageRole::Master,
+        master: None,
+        label: "translated source master".into(),
+    };
+    let master = catalog.register_import_image(&registration)?.key;
+    catalog.save_edit_recipe(
+        &master,
+        0,
+        &Recipe::V1(RecipeV1 {
+            exposure_ev: 0.5,
+            ..RecipeV1::default()
+        }),
+    )?;
+    registration.source_id = "copy".into();
+    registration.input_digest = "fixture-copy".into();
+    registration.role = photocatalog::catalog_images::ImageRole::Virtual;
+    registration.master = Some(master.clone());
+    registration.label = "translated virtual copy".into();
+    let copy = catalog.register_import_image(&registration)?.key;
+    catalog.save_edit_recipe(
+        &copy,
+        0,
+        &Recipe::V1(RecipeV1 {
+            exposure_ev: 1.5,
+            ..RecipeV1::default()
+        }),
+    )?;
+    drop(catalog);
+    let db = rusqlite::Connection::open(root.join("catalog.sqlite3"))?;
+    // Reproduce the exact metadata-only physical state after supported imported
+    // master/virtual registration. Logical identities remain immutable.
+    db.execute("UPDATE assets SET state='pending',fingerprint=NULL,metadata=NULL,preview_hash=NULL WHERE id=?1",[&master.asset_id])?;
+    Ok((root, path, master, copy))
+}
+fn retained_state(root: &Path) -> Result<serde_json::Value> {
+    let db = rusqlite::Connection::open_with_flags(
+        root.join("catalog.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut state = std::collections::BTreeMap::new();
+    for table in [
+        "catalog_images",
+        "edit_variants",
+        "edit_recipe_nodes",
+        "edit_redo_nodes",
+        "edit_changes",
+        "metadata_assets",
+        "metadata_history",
+        "metadata_effective",
+        "metadata_blobs",
+        "metadata_sources",
+        "metadata_observations",
+        "metadata_packets",
+        "metadata_models",
+        "metadata_values",
+        "metadata_choices",
+        "metadata_image_sources",
+        "metadata_image_observations",
+    ] {
+        let mut query = db.prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))?;
+        let columns = query.column_count();
+        let rows = query
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get_ref(i).map(|value| format!("{value:?}")))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        state.insert(table, rows);
+    }
+    Ok(serde_json::to_value(state)?)
+}
+fn request_initial_preview(
+    b: &Bridge,
+    token: &str,
+    key: &VariantKey,
+    viewport: &str,
+    tier: PreviewTier,
+) -> Result<PreviewStatus> {
+    let Response::Preview(ticket) = call(
+        b,
+        Request::Preview {
+            catalog: token.into(),
+            key: key.clone(),
+            tier,
+            interactive: false,
+            viewport: viewport.into(),
+            generation: U64(1),
+            foreground: true,
+        },
+    )?
+    else {
+        bail!("preview reply")
+    };
+    Ok(ticket)
+}
+#[test]
+fn pending_imported_variants_hydrate_on_demand_without_rewriting_recipes_or_xmp() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (root, path, master, copy) = pending_imported_fixture(temp.path())?;
+    let retained = retained_state(&root)?;
+    let original = std::fs::read(&path)?;
+    let sidecar = std::fs::read(path.with_extension("xmp"))?;
+    let b = Bridge::spawn(config(path.parent().unwrap()))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    let selected = request_initial_preview(&b, &token, &copy, "selected", PreviewTier::Large)?;
+    assert!(matches!(selected.state, PreviewState::Queued));
+    assert_eq!(selected.message.as_deref(), Some("preparing original"));
+    let thumbnail = request_initial_preview(&b, &token, &master, "master", PreviewTier::Thumbnail)?;
+    let selected = preview_ready(&b, &token, selected)?;
+    let thumbnail = preview_ready(&b, &token, thumbnail)?;
+    let selected_bytes = b
+        .preview_bytes(token.clone(), selected.ticket, true)?
+        .recv()?;
+    let master_bytes = b
+        .preview_bytes(token.clone(), thumbnail.ticket, true)?
+        .recv()?;
+    let selected = image::load_from_memory(selected_bytes.bytes())?.to_rgb8();
+    let master_pixels = image::load_from_memory(master_bytes.bytes())?.to_rgb8();
+    assert!(selected.get_pixel(0, 0).0[0] > master_pixels.get_pixel(0, 0).0[0]);
+    drop(selected_bytes);
+    drop(master_bytes);
+    b.shutdown();
+    assert_eq!(retained_state(&root)?, retained);
+    let c = Catalog::open(&root)?;
+    let source = c.render_identity(&master.asset_id)?;
+    assert_eq!(source.state, "ready");
+    assert_eq!(
+        source.fingerprint,
+        Some(blake3::hash(&original).to_hex().to_string())
+    );
+    assert_eq!(c.edit_variant(&master)?.revision, 1);
+    assert_eq!(c.edit_variant(&copy)?.revision, 1);
+    assert_eq!(std::fs::read(&path)?, original);
+    assert_eq!(std::fs::read(path.with_extension("xmp"))?, sidecar);
+    Ok(())
+}
+#[test]
+fn restored_pending_preview_keeps_external_job_hold_and_missing_source_is_truthful() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (root, path, master, copy) = pending_imported_fixture(temp.path())?;
+    let bundle = temp.path().join("backup");
+    let restored = temp.path().join("restored");
+    let limits = photocatalog::catalog_backup::Limits::default();
+    photocatalog::catalog_backup::backup_catalog(&root, &bundle, &limits, |_| Ok(()))?;
+    photocatalog::catalog_backup::restore_catalog(&bundle, &restored, &limits, |_| Ok(()))?;
+    let retained = retained_state(&restored)?;
+    let b = Bridge::spawn(config(path.parent().unwrap()))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&restored),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    assert!(status(&b)?.jobs_held);
+    let preview = request_initial_preview(&b, &token, &copy, "selected", PreviewTier::Large)?;
+    preview_ready(&b, &token, preview)?;
+    assert!(status(&b)?.jobs_held);
+    assert!(
+        photocatalog::catalog_backup::restore_status(&restored)?
+            .unwrap()
+            .jobs_held
+    );
+    b.shutdown();
+    assert_eq!(retained_state(&restored)?, retained);
+    std::fs::rename(&path, path.with_extension("moved"))?;
+    let b = Bridge::spawn(config(path.parent().unwrap()))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    let token = status(&b)?.catalog.unwrap();
+    let mut ticket = request_initial_preview(&b, &token, &master, "missing", PreviewTier::Large)?;
+    let until = Instant::now() + Duration::from_secs(10);
+    while matches!(ticket.state, PreviewState::Queued) {
+        ensure!(Instant::now() < until, "missing source never resolved");
+        std::thread::sleep(Duration::from_millis(2));
+        let Response::Preview(next) = call(
+            &b,
+            Request::PreviewStatus {
+                catalog: token.clone(),
+                ticket: ticket.ticket.clone(),
+            },
+        )?
+        else {
+            bail!("status reply")
+        };
+        ticket = next;
+    }
+    assert!(matches!(ticket.state, PreviewState::Unavailable));
+    assert!(ticket.message.is_some());
+    b.shutdown();
+    let c = Catalog::open(&root)?;
+    assert_eq!(c.render_identity(&master.asset_id)?.state, "pending");
+    assert!(c.render_identity(&master.asset_id)?.fingerprint.is_none());
+    Ok(())
+}
+
+#[test]
+fn translated_import_recipes_hydrate_without_losing_import_history() -> Result<()> {
+    use photocatalog::{catalog_edits::install_import_recipe, catalog_images::TranslationState};
+    let temp = tempfile::tempdir()?;
+    let (root, path, master, copy) = pending_imported_fixture(temp.path())?;
+    {
+        let mut db = rusqlite::Connection::open(root.join("catalog.sqlite3"))?;
+        let tx = db.transaction()?;
+        for (key, exposure) in [(&master, 0.75), (&copy, 1.75)] {
+            let recipe = Recipe::V1(RecipeV1 {
+                exposure_ev: exposure,
+                ..Default::default()
+            })
+            .validate()?;
+            install_import_recipe(
+                &tx,
+                key,
+                1,
+                &recipe,
+                &serde_json::json!({"import_source":"hydration-fixture","translation":"supported"}),
+                TranslationState::Translated,
+            )?;
+        }
+        tx.commit()?;
+    }
+    let retained = retained_state(&root)?;
+    let original = std::fs::read(&path)?;
+    let b = Bridge::spawn(config(path.parent().unwrap()))?;
+    call(
+        &b,
+        Request::OpenExisting {
+            path: NativePath::from_path(&root),
+        },
+    )?;
+    wait_ready(&b)?;
+    let token = status(&b)?.catalog.unwrap();
+    for (key, viewport, tier) in [
+        (&copy, "selected", PreviewTier::Large),
+        (&master, "master", PreviewTier::Thumbnail),
+    ] {
+        let ticket = request_initial_preview(&b, &token, key, viewport, tier)?;
+        preview_ready(&b, &token, ticket)?;
+    }
+    b.shutdown();
+    assert_eq!(retained_state(&root)?, retained);
+    let catalog = Catalog::open(&root)?;
+    for key in [&master, &copy] {
+        assert_eq!(catalog.image(key)?.translation_state, "translated");
+        assert_eq!(catalog.edit_variant(key)?.revision, 2);
+    }
+    assert_eq!(std::fs::read(&path)?, original);
+    assert_eq!(catalog.render_identity(&master.asset_id)?.state, "ready");
+    Ok(())
+}

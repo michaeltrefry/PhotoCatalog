@@ -4,6 +4,7 @@ pub mod backup;
 pub mod browse;
 pub mod organization;
 mod dto;
+mod hydration;
 use crate::{
     Catalog,
     catalog_edits::{VariantKey, VariantView},
@@ -633,6 +634,8 @@ struct Ticket {
     consumer: Option<preview::Consumer>,
     tier: preview::Tier,
     interactive: bool,
+    foreground: bool,
+    hydration: bool,
     touched: Instant,
     cancel: Cancellation,
 }
@@ -644,6 +647,7 @@ struct Open {
     index_pending: bool,
     jobs_held: bool,
     import: Option<ImportTask>,
+    hydration: hydration::State,
 }
 struct ImportTask {
     import_lock: Option<crate::ImportLock>,
@@ -665,9 +669,12 @@ impl ImportTask {
     fn update_counts(&mut self) {
         self.status.pending_previews = self.consumers.len() as u32;
     }
-    fn cancel_owned(&mut self, service: &mut PreviewService) {
+    fn request_cancel_owned(&mut self, service: &mut PreviewService) {
         self.update_counts();
-        self.preparation = None; // Cancel, drop receiver, and join; keep the lock through drain.
+        self.cancel.0.store(true, Ordering::Release);
+        if let Some(preparation) = &mut self.preparation {
+            preparation.request_cancel();
+        }
         self.reference = None;
         for (consumer, _) in self.consumers.drain(..) {
             if let Err(e) = service.cancel(consumer) {
@@ -678,6 +685,10 @@ impl ImportTask {
         }
         self.status.pending_previews = 0;
         self.status.phase = ImportPhase::CancelRequested;
+    }
+    fn cancel_owned(&mut self, service: &mut PreviewService) {
+        self.request_cancel_owned(service);
+        self.preparation = None; // Join after signaling every owned consumer.
     }
 }
 struct Actor {
@@ -801,14 +812,21 @@ impl Actor {
             .unwrap_or_else(|e| e.into_inner())
             .shutdown();
         if let Some(mut open) = self.open.take() {
+            open.hydration.request_cancel();
             let mut import = open.import.take();
             if let Some(import) = &mut import {
-                import.cancel_owned(&mut open.service);
+                import.request_cancel_owned(&mut open.service);
             }
             for (_, t) in open.tickets.drain() {
                 if let Some(c) = t.consumer {
                     let _ = open.service.cancel(c);
                 }
+            }
+            // All readers and native consumers have received cancellation before
+            // any join. Owners and the import lock remain held through native drain.
+            drop(open.hydration);
+            if let Some(import) = &mut import {
+                import.preparation = None;
             }
             #[cfg(test)]
             if let Some(checkpoint) = &self.config.import_checkpoint
@@ -943,6 +961,7 @@ impl Actor {
                 index_pending: true,
                 jobs_held,
                 import: None,
+                hydration: hydration::State::default(),
             })
         })();
         match opened {
@@ -1338,8 +1357,22 @@ impl Actor {
                 } else {
                     core!(o.service.cached_variant(&o.catalog, &key, tier, false))
                 };
+                let needs_hydration = identity.source.state == "pending"
+                    && identity.source.fingerprint.is_none()
+                    && o.catalog
+                        .preview_original_path(&key.asset_id)
+                        .is_ok_and(|path| {
+                            crate::initial_hydration_source(&o.catalog.db, &key.asset_id, &path)
+                                .unwrap_or(false)
+                        });
                 let (state, consumer, message) = if cached.is_some() {
                     (PreviewState::Ready, None, None)
+                } else if needs_hydration {
+                    (
+                        PreviewState::Queued,
+                        None,
+                        Some("preparing original".into()),
+                    )
                 } else if identity.source.state != "ready" {
                     (
                         PreviewState::Unavailable,
@@ -1392,6 +1425,8 @@ impl Actor {
                         consumer,
                         tier,
                         interactive,
+                        foreground,
+                        hydration: needs_hydration && cached.is_none(),
                         touched: Instant::now(),
                         cancel: cancel.clone(),
                     },
@@ -1557,6 +1592,11 @@ impl Actor {
             if let Some(c) = t.consumer {
                 if let Some(done) = o.service.take_completion(c) {
                     t.consumer = None;
+                    if t.hydration && o.hydration.completed(&o.catalog, t, &done) {
+                        o.index_pending = true;
+                        continue;
+                    }
+                    t.hydration = false;
                     let (state, message) = match done {
                         preview::ServiceCompletion::Ready => (PreviewState::Ready, None),
                         preview::ServiceCompletion::Stale => (PreviewState::Stale, None),
@@ -1578,6 +1618,13 @@ impl Actor {
                 t.dto.state = PreviewState::Canceled;
             }
         }
+        o.hydration.advance(
+            &mut o.catalog,
+            &mut o.service,
+            &mut o.tickets,
+            #[cfg(test)]
+            self.config.import_checkpoint.clone(),
+        );
         if let Some(import) = &mut o.import
             && !import.terminal()
         {
