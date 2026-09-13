@@ -11,6 +11,7 @@ pub mod catalog_image_exports;
 pub mod catalog_images;
 pub mod catalog_metadata;
 pub mod catalog_migration;
+pub mod catalog_session;
 pub mod catalog_storage;
 mod catalog_writer;
 pub mod edit;

@@ -2300,44 +2300,55 @@ pub(crate) fn relink_hydration_state(db: &Connection, asset: &str) -> Result<Opt
 }
 
 /// Verify SQLite's actual open object, not merely the pathname before/after open.
+pub(crate) fn physical_object_id(held: &File) -> Result<crate::catalog_session::PhysicalObjectId> {
+    use crate::{application::U64, catalog_session::PhysicalObjectId};
+    let (first, second) = object_key(held)?;
+    #[cfg(unix)]
+    { Ok(PhysicalObjectId::Unix { device: U64(first), inode: U64(second) }) }
+    #[cfg(windows)]
+    { Ok(PhysicalObjectId::Windows { volume_serial: U64(first), file_index: U64(second) }) }
+}
+
 pub(crate) fn verify_database_object(db: &Connection, held: &File) -> Result<()> {
+    verify_database_identity(db, &physical_object_id(held)?)
+}
+
+/// Borrow SQLite's actual native object. No raw open, duplicate or close.
+pub(crate) fn opened_database_identity(db: &Connection) -> Result<crate::catalog_session::PhysicalObjectId> {
+    use crate::{application::U64, catalog_session::PhysicalObjectId};
     #[cfg(unix)]
     {
-        ensure!(
-            sqlite_opened_object(db)? == object_key(held)?,
-            "SQLite selected database object changed: opened identity differs from retained pin"
-        );
-        let mut moved = 0i32;
-        let code = unsafe {
-            rusqlite::ffi::sqlite3_file_control(
-                db.handle(),
-                c"main".as_ptr(),
-                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
-                (&mut moved as *mut i32).cast(),
-            )
-        };
-        ensure!(
-            code == rusqlite::ffi::SQLITE_OK && moved == 0,
-            "SQLite selected database object changed or cannot be verified"
-        );
+        let (device, inode) = sqlite_opened_object(db)?;
+        Ok(PhysicalObjectId::Unix { device: U64(device), inode: U64(inode) })
     }
     #[cfg(windows)]
     {
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
         let code = unsafe {
-            rusqlite::ffi::sqlite3_file_control(
-                db.handle(),
-                c"main".as_ptr(),
+            rusqlite::ffi::sqlite3_file_control(db.handle(), c"main".as_ptr(),
                 rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
-                (&mut handle as *mut *mut std::ffi::c_void).cast(),
-            )
+                (&mut handle as *mut *mut std::ffi::c_void).cast())
         };
-        ensure!(
-            code == rusqlite::ffi::SQLITE_OK
-                && !handle.is_null()
-                && object_key_handle(handle)? == object_key(held)?,
-            "SQLite selected database object changed or cannot be verified"
-        );
+        ensure!(code == rusqlite::ffi::SQLITE_OK && !handle.is_null(),
+            "SQLite opened database identity unavailable");
+        let (volume, index) = object_key_handle(handle)?;
+        Ok(PhysicalObjectId::Windows { volume_serial: U64(volume), file_index: U64(index) })
+    }
+}
+
+pub(crate) fn verify_database_identity(db: &Connection, expected: &crate::catalog_session::PhysicalObjectId) -> Result<()> {
+    expected.validate()?;
+    ensure!(opened_database_identity(db)? == *expected,
+        "SQLite selected database object changed: opened identity differs from retained pin");
+    #[cfg(unix)]
+    {
+        let mut moved = 0i32;
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_file_control(db.handle(), c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED, (&mut moved as *mut i32).cast())
+        };
+        ensure!(code == rusqlite::ffi::SQLITE_OK && moved == 0,
+            "SQLite selected database object changed or cannot be verified");
     }
     Ok(())
 }
