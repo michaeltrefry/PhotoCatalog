@@ -209,3 +209,5 @@ fn input_guard_result_digest_and_terminal_order_are_enforced() -> Result<()> {
     assert!(state.accept(need(), &stop, until).is_err());
     Ok(())
 }
+
+mod process_tests;

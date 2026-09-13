@@ -287,6 +287,23 @@ pub(crate) fn execute<A: Admission>(
     until: Instant,
     admission: A,
 ) -> Result<String> {
+    execute_owned(
+        |stop| Process::spawn(executable, stop),
+        guard,
+        request,
+        stop,
+        until,
+        admission,
+    )
+}
+fn execute_owned<A: Admission>(
+    spawn: impl FnOnce(Arc<Stop>) -> Result<Process>,
+    guard: Guard,
+    request: &str,
+    stop: Arc<Stop>,
+    until: Instant,
+    admission: A,
+) -> Result<String> {
     guard.validate()?;
     ensure!(
         request.len() <= INPUT_BYTES,
@@ -298,7 +315,7 @@ pub(crate) fn execute<A: Admission>(
     );
     let input_digest = blake3::hash(request.as_bytes()).to_hex().to_string();
     let mut owner = Owned {
-        process: Process::spawn(executable, stop.clone())?,
+        process: spawn(stop.clone())?,
         state: State::new(admission, guard.clone(), input_digest.clone()),
     };
     send(

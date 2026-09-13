@@ -3,7 +3,7 @@
 use super::protocol::{ChildFrame, ParentFrame, read_frame_optional};
 use anyhow::{Context, Result, ensure};
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -59,10 +59,31 @@ impl Process {
         Self::spawn_command(command, stop)
     }
     fn spawn_command(mut command: Command, stop: Arc<Stop>) -> Result<Self> {
+        command.stdout(Stdio::piped()).stderr(Stdio::null());
+        Self::spawn_configured(command, stop, |child| {
+            Ok(Box::new(
+                child.stdout.take().context("migration output pipe")?,
+            ))
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn spawn_test_command(mut command: Command, stop: Arc<Stop>) -> Result<Self> {
+        // Unit-test harness chatter stays on discarded stdout. The same
+        // bounded protocol and process owner read direct helper stderr bytes.
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        Self::spawn_configured(command, stop, |child| {
+            Ok(Box::new(
+                child.stderr.take().context("test helper output pipe")?,
+            ))
+        })
+    }
+    fn spawn_configured(
+        mut command: Command,
+        stop: Arc<Stop>,
+        output: impl FnOnce(&mut Child) -> Result<Box<dyn Read + Send>>,
+    ) -> Result<Self> {
         let child = command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
             .spawn()
             .context("start owned migration helper")?;
         // Establish the kill/reap owner before any fallible thread creation.
@@ -76,7 +97,7 @@ impl Process {
             reaped: None,
         };
         let mut stdin = owner.child.stdin.take().context("migration input pipe")?;
-        let mut stdout = owner.child.stdout.take().context("migration output pipe")?;
+        let mut stdout = output(&mut owner.child)?;
         let (input, incoming) = mpsc::sync_channel::<Vec<u8>>(1);
         let (outgoing, output) = mpsc::sync_channel(1);
         owner.input = Some(input);
