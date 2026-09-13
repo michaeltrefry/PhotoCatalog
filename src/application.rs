@@ -4,6 +4,7 @@ pub mod backup;
 pub mod browse;
 mod dto;
 mod hydration;
+pub mod metadata;
 pub mod organization;
 use crate::{
     Catalog,
