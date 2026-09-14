@@ -125,6 +125,22 @@ relay chunks, with independent health/cancel controls and cancel-all-before-join
 ordering. The shared pool cannot retire until LM and both Source process/I/O
 owners drain. Direction and API review passed (`fb85126a3ae17944d77b15fe106708baaa20b3076a7b7c669837bcf1738e8ea5`);
 implementation, simultaneous-copy accounting and abrupt-death tests are pending.
+V47 relay/permit source passed 17 exact in-process tests and formatting; all 18
+commands were waited and 22 artifacts verified, with no observed survivors.
+Receipt `58ebffd07ec519c4f715771a8a6ae9bfe878604779aca4714fdb2ff746a4d5b3`
+preserves the thread-affine real writer permit, cancellation/replay and reserved
+listener-failure cases. The earlier v44 non-Send Permit compile failure remains
+retained. V47 actual-process qualification passed its first four broker cases, then stopped
+on fixture EAGAIN in the fifth case. Root verified nine artifacts and all five
+waited commands, with no observed survivors; receipt
+`caf8378944e0caed4835ca5063f493987a90fee514709736fa18dfee0ed7ba86`.
+V48 changes only that fixture to set an accepted socket explicitly blocking with
+finite timeouts and contextual errors. The exact failed case will run first; six
+unrun process cases and formatting remain. The original EAGAIN attribution is
+an inference pending the corrective result.
+Source-scoped allocation retirement design passed independent review, requiring
+both G process/pipe/relay drain and LM proxy quiescence; its enforcement is not yet
+implemented, and operation/caller allocations remain charged separately.
 Remaining
 filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
 the full tracked scope. Current local tests use synthetic files without RAID/GPU.
