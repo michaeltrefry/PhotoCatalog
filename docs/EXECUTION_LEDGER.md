@@ -19,7 +19,8 @@ Combined gate `sc-22847-facts-lm2-integration-dymsh3u7` passed package formattin
 fresh CLI build, actual managed startup and cold/warm render (each1), and Tauri
 release check. Session94548 completed/reaped0, source_changed=[]. Logs: CLI
 021eed03, startup29dd7945, rendera502ec36, Tauridda8d981; independent integrated
-evidence audit is pending. This remains synthetic local integration, not release
+evidence audit PASS0.99 c9567d9e verifies all384 source hashes and current child
+retirement. This remains synthetic local integration, not release
 or complete S12 acceptance. Shortcut23433 read back.
 
 Process audit found old orphaned synthetic pairs34004/34005 and50122/50123 from
