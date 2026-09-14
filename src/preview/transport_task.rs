@@ -8,8 +8,134 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[derive(Clone, Copy, Debug)]
+enum RetainedErrorKind {
+    Failure(
+        crate::filesystem_worker::wire::FailureKind,
+        Option<crate::catalog_session::preview_io::FailureReceipt>,
+    ),
+    Worker(Option<crate::media::DecodeStatus>),
+    Decode(crate::media::DecodeStatus),
+    CacheQuota,
+    EncodedBudget,
+    DecodedBudget,
+    StoreResource,
+    Io(std::io::ErrorKind),
+    Busy,
+    Other,
+}
+#[derive(Debug)]
+pub(crate) struct RetainedError {
+    kind: RetainedErrorKind,
+    encoded_budget: bool,
+    busy: bool,
+    message: String,
+}
+impl RetainedError {
+    pub(crate) fn new(error: anyhow::Error) -> Self {
+        let encoded_budget = error
+            .downcast_ref::<super::EncodedBudgetExceeded>()
+            .is_some();
+        let busy = error.downcast_ref::<super::stage_io::Busy>().is_some();
+        let kind =
+            if let Some(error) = error.downcast_ref::<crate::filesystem_worker::wire::Failure>() {
+                RetainedErrorKind::Failure(error.kind, error.object_receipt)
+            } else if let Some(error) = error.downcast_ref::<super::WorkerFailure>() {
+                RetainedErrorKind::Worker(error.decode_status)
+            } else if let Some(error) = error.downcast_ref::<crate::media::DecodeError>() {
+                RetainedErrorKind::Decode(error.status)
+            } else if error.downcast_ref::<super::CacheQuotaExceeded>().is_some() {
+                RetainedErrorKind::CacheQuota
+            } else if error
+                .downcast_ref::<super::EncodedBudgetExceeded>()
+                .is_some()
+            {
+                RetainedErrorKind::EncodedBudget
+            } else if error
+                .downcast_ref::<super::DecodedBudgetExceeded>()
+                .is_some()
+            {
+                RetainedErrorKind::DecodedBudget
+            } else if error
+                .downcast_ref::<crate::catalog_session::store::ResourceLimit>()
+                .is_some()
+            {
+                RetainedErrorKind::StoreResource
+            } else if let Some(error) = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            {
+                RetainedErrorKind::Io(error.kind())
+            } else if busy {
+                RetainedErrorKind::Busy
+            } else {
+                RetainedErrorKind::Other
+            };
+        let message = crate::filesystem_worker::wire::Failure::new(
+            crate::filesystem_worker::wire::FailureKind::Unknown,
+            format_args!("{error:#}"),
+        )
+        .message;
+        Self {
+            kind,
+            encoded_budget,
+            busy,
+            message,
+        }
+    }
+
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        let mut error = match self.kind {
+            RetainedErrorKind::Failure(kind, object_receipt) => {
+                anyhow::Error::new(crate::filesystem_worker::wire::Failure {
+                    object_receipt,
+                    kind,
+                    message: self.message,
+                })
+            }
+            RetainedErrorKind::Worker(decode_status) => anyhow::Error::new(super::WorkerFailure {
+                decode_status,
+                message: self.message,
+            }),
+            RetainedErrorKind::Decode(status) => anyhow::Error::new(crate::media::DecodeError {
+                status,
+                message: self.message,
+            }),
+            RetainedErrorKind::CacheQuota => anyhow::Error::new(super::CacheQuotaExceeded(
+                "bounded retained transport failure",
+            ))
+            .context(self.message),
+            RetainedErrorKind::EncodedBudget => {
+                anyhow::Error::new(super::EncodedBudgetExceeded).context(self.message)
+            }
+            RetainedErrorKind::DecodedBudget => {
+                anyhow::Error::new(super::DecodedBudgetExceeded).context(self.message)
+            }
+            RetainedErrorKind::StoreResource => anyhow::Error::new(
+                crate::catalog_session::store::ResourceLimit("bounded retained transport failure"),
+            )
+            .context(self.message),
+            RetainedErrorKind::Io(kind) => {
+                anyhow::Error::new(std::io::Error::new(kind, self.message))
+            }
+            RetainedErrorKind::Busy => {
+                anyhow::Error::new(super::stage_io::Busy("bounded retained transport failure"))
+                    .context(self.message)
+            }
+            RetainedErrorKind::Other => anyhow::anyhow!(self.message),
+        };
+        if self.encoded_budget && !matches!(self.kind, RetainedErrorKind::EncodedBudget) {
+            error = error.context(super::EncodedBudgetExceeded);
+        }
+        if self.busy && !matches!(self.kind, RetainedErrorKind::Busy) {
+            error = error.context(super::stage_io::Busy("bounded retained transport failure"));
+        }
+        error
+    }
+}
+
 pub(crate) struct Task<T: Send + 'static> {
-    handle: Option<JoinHandle<Result<T>>>,
+    handle: Option<JoinHandle<std::result::Result<T, RetainedError>>>,
     cancel: Arc<AtomicBool>,
 }
 impl<T: Send + 'static> Task<T> {
@@ -21,7 +147,7 @@ impl<T: Send + 'static> Task<T> {
         let task_cancel = cancel.clone();
         let handle = thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || work(task_cancel))
+            .spawn(move || work(task_cancel).map_err(RetainedError::new))
             .context("transport task thread creation failed")?;
         Ok(Self {
             handle: Some(handle),
@@ -73,6 +199,7 @@ impl<T: Send + 'static> Task<T> {
                     "transport task panicked; operation outcome requires reconciliation"
                 )
             })?
+            .map_err(RetainedError::into_error)
     }
 }
 impl<T: Send + 'static> Drop for Task<T> {
@@ -210,5 +337,59 @@ mod tests {
         assert_eq!(result, Some(()));
         assert!(weak.upgrade().is_none());
         Ok(())
+    }
+
+    #[test]
+    fn retained_error_is_bounded_and_preserves_classification() {
+        let retained = RetainedError::new(anyhow::anyhow!("x".repeat(10_000)));
+        assert!(retained.message.len() <= crate::filesystem_worker::wire::ERROR_BYTES);
+
+        let receipt = crate::catalog_session::preview_io::FailureReceipt {
+            operation: crate::application::U64(7),
+            step: crate::application::U64(3),
+            request_digest: [9; 32],
+        };
+        let mut failure = crate::filesystem_worker::wire::Failure::new(
+            crate::filesystem_worker::wire::FailureKind::ResourceLimit,
+            "resource",
+        );
+        failure.object_receipt = Some(receipt);
+        let retained = RetainedError::new(
+            anyhow::Error::new(failure)
+                .context(super::super::EncodedBudgetExceeded)
+                .context(super::super::stage_io::Busy("stopping")),
+        );
+        assert!(retained.message.len() <= crate::filesystem_worker::wire::ERROR_BYTES);
+        let restored = retained.into_error();
+        let failure = restored
+            .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+            .unwrap();
+        assert_eq!(
+            failure.kind,
+            crate::filesystem_worker::wire::FailureKind::ResourceLimit
+        );
+        assert_eq!(failure.object_receipt, Some(receipt));
+        assert!(
+            restored
+                .downcast_ref::<super::super::EncodedBudgetExceeded>()
+                .is_some()
+        );
+        assert!(
+            restored
+                .downcast_ref::<super::super::stage_io::Busy>()
+                .is_some()
+        );
+
+        let restored = RetainedError::new(anyhow::Error::new(super::super::WorkerFailure {
+            decode_status: Some(crate::media::DecodeStatus::ResourceLimit),
+            message: "resource".into(),
+        }))
+        .into_error();
+        assert!(
+            restored
+                .downcast_ref::<super::super::WorkerFailure>()
+                .is_some_and(|failure| failure.decode_status
+                    == Some(crate::media::DecodeStatus::ResourceLimit))
+        );
     }
 }

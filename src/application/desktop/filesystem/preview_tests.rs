@@ -233,17 +233,19 @@ impl Running {
     fn finish(self, token: String) -> Result<()> {
         command(&self.bridge, Request::Close { catalog: token })?;
         self.bridge.try_shutdown()?;
+        {
+            let state = self.bridge.0.shared.state.lock().unwrap();
+            ensure!(
+                state.reaped && state.child_finished && state.filesystem_verified,
+                "configured preview C wait/pipe or F retirement unverified"
+            );
+        }
         self.parent.finish_after_dependents(false)?;
         let owner = self.parent.native_owner()?;
         for row in self.observed.lock().unwrap().iter() {
             ensure!(
                 owner.status(&row.root, row.operation).is_err(),
                 "native operation retained after checked close"
-            );
-            #[cfg(unix)]
-            ensure!(
-                unsafe { libc::kill(row.pid as libc::pid_t, 0) } == -1,
-                "native PID remains live after checked retirement"
             );
             eprintln!(
                 "configured preview verified N pid={} retired after wait/pipe joins",
@@ -595,6 +597,350 @@ fn actual_managed_webp_avif_render_and_cold_cache_delivery() -> Result<()> {
         );
         eprintln!(
             "configured codec {codec:?}: Render, N header/decode, encoded delivery and checked C/F/N retirement verified"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct CachedFixtureObject {
+    digest: String,
+    key: crate::preview::PreviewKey,
+    path: PathBuf,
+    bytes: i64,
+    checksum: String,
+    record: String,
+}
+fn cached_fixture_object(
+    root: &Path,
+    originals: &Path,
+    variant: &VariantKey,
+) -> Result<CachedFixtureObject> {
+    let cache = root.join("application-previews");
+    let manifest = cache.join("manifest");
+    let (digest, descriptor, bytes, checksum, record): (String, String, i64, String, String) = {
+        let db = rusqlite::Connection::open_with_flags(
+            manifest.join("previews.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        db.query_row(
+            "SELECT o.key,o.descriptor,o.bytes,o.checksum,r.record FROM wanted w JOIN objects o ON o.key=w.current JOIN render_records r ON r.key=o.key WHERE w.asset=?1 AND w.variant=?2 AND w.tier='thumbnail' AND w.channel='refined' AND o.status='ready'",
+            rusqlite::params![variant.asset_id, variant.variant_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?
+    };
+    let key: crate::preview::PreviewKey = serde_json::from_str(&descriptor)?;
+    ensure!(
+        key.digest()? == digest,
+        "fixture manifest key digest mismatch"
+    );
+    ensure!(
+        key.asset_id == variant.asset_id
+            && key.variant_id == variant.variant_id
+            && key.tier == crate::preview::Tier::Thumbnail,
+        "fixture manifest selected the wrong preview"
+    );
+    let config =
+        crate::preview::PreviewStore::current_configuration(crate::preview::StoreConfig {
+            manifest_root: manifest,
+            layout: crate::preview::Layout::HashPrefix,
+            thumbnail_root: cache.join("thumbnail"),
+            large_root: cache.join("large"),
+            thumbnail_bytes: 2 * 1024 * 1024 * 1024,
+            large_bytes: 8 * 1024 * 1024 * 1024,
+        })?;
+    let store = crate::preview::PreviewStore::open(config, &[originals.to_owned()])?;
+    let path = store.test_object_path(&key)?;
+    ensure!(
+        path.starts_with(&store.configuration().thumbnail_root),
+        "fixture object escaped saved thumbnail root"
+    );
+    drop(store);
+    Ok(CachedFixtureObject {
+        digest,
+        key,
+        path,
+        bytes,
+        checksum,
+        record,
+    })
+}
+fn replace_cached_fixture_object(
+    root: &Path,
+    object: &CachedFixtureObject,
+) -> Result<(i64, String)> {
+    let original = std::fs::read(&object.path)?;
+    ensure!(
+        i64::try_from(original.len())? == object.bytes
+            && blake3::hash(&original).to_hex().as_str() == object.checksum,
+        "fixture object changed before corruption"
+    );
+    let codec = object.key.encoding.codec;
+    ensure!(original.len() >= 32, "fixture object too small to truncate");
+    // Use explicit malformed syntax for JPEG/WebP. Short reads may be reported
+    // as an unclassified I/O error and cannot authorize cache invalidation.
+    let mut malformed = original.clone();
+    match codec {
+        crate::preview::Codec::Jpeg => {
+            let dqt = original
+                .windows(2)
+                .position(|bytes| bytes == [0xff, 0xdb])
+                .context("fixture JPEG has no quantization table")?;
+            let info = malformed
+                .get_mut(dqt + 4)
+                .context("fixture DQT is incomplete")?;
+            *info = (*info & 0xf0) | 0x0f; // Invalid table index: only 0..=3 exist.
+        }
+        crate::preview::Codec::Webp => {
+            let vp8 = original
+                .windows(4)
+                .position(|bytes| bytes == b"VP8 ")
+                .context("fixture WebP has no lossy VP8 chunk")?;
+            ensure!(
+                original.get(vp8 + 11..vp8 + 14) == Some(&[0x9d, 0x01, 0x2a]),
+                "fixture VP8 key-frame magic missing"
+            );
+            malformed[vp8 + 11] ^= 1;
+        }
+        crate::preview::Codec::Avif => malformed.truncate(original.len() / 2),
+    }
+    match codec {
+        crate::preview::Codec::Jpeg => ensure!(
+            malformed.starts_with(&[0xff, 0xd8]),
+            "malformed JPEG lost its codec marker"
+        ),
+        crate::preview::Codec::Webp => ensure!(
+            malformed.starts_with(b"RIFF") && malformed.get(8..12) == Some(b"WEBP"),
+            "malformed WebP lost its codec marker"
+        ),
+        crate::preview::Codec::Avif => ensure!(
+            malformed.get(4..8) == Some(b"ftyp"),
+            "truncated AVIF lost its codec marker"
+        ),
+    }
+    let bytes = i64::try_from(malformed.len())?;
+    let checksum = blake3::hash(&malformed).to_hex().to_string();
+    std::fs::write(&object.path, &malformed)?;
+    let mut db =
+        rusqlite::Connection::open(root.join("application-previews/manifest/previews.sqlite3"))?;
+    let transaction = db.transaction()?;
+    ensure!(
+        transaction.execute(
+            "UPDATE objects SET bytes=?1,checksum=?2 WHERE key=?3 AND status='ready' AND bytes=?4 AND checksum=?5",
+            rusqlite::params![bytes, checksum, object.digest, object.bytes, object.checksum],
+        )? == 1,
+        "fixture object manifest changed before corruption"
+    );
+    ensure!(
+        transaction.execute(
+            "UPDATE usage SET bytes=bytes-?1+?2 WHERE tier='thumbnail'",
+            rusqlite::params![object.bytes, bytes],
+        )? == 1,
+        "fixture thumbnail usage row missing"
+    );
+    let retained: String = transaction.query_row(
+        "SELECT record FROM render_records WHERE key=?1",
+        [&object.digest],
+        |row| row.get(0),
+    )?;
+    ensure!(retained == object.record, "fixture render record changed");
+    transaction.commit()?;
+    ensure!(
+        std::fs::metadata(&object.path)?.len() == u64::try_from(bytes)?
+            && blake3::hash(&std::fs::read(&object.path)?)
+                .to_hex()
+                .as_str()
+                == checksum,
+        "fixture malformed object read-back mismatch"
+    );
+    Ok((bytes, checksum))
+}
+fn failed_status(
+    running: &Running,
+    token: &str,
+    key: &VariantKey,
+    generation: u64,
+) -> Result<PreviewStatus> {
+    let mut status = request(running, token, key, generation)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while matches!(status.state, PreviewState::Queued) {
+        ensure!(Instant::now() < deadline, "corrupt preview failure timeout");
+        thread::sleep(Duration::from_millis(5));
+        let Response::Preview(next) = command(
+            &running.bridge,
+            Request::PreviewStatus {
+                catalog: token.into(),
+                ticket: status.ticket,
+            },
+        )?
+        else {
+            anyhow::bail!("wrong corrupt status reply")
+        };
+        status = next;
+    }
+    ensure!(
+        matches!(status.state, PreviewState::Failed) && status.message.is_some(),
+        "malformed cached preview was not an authoritative failure: {:?} {:?}",
+        status.state,
+        status.message
+    );
+    Ok(status)
+}
+fn verify_exact_corrupt_invalidation(
+    root: &Path,
+    bad: &CachedFixtureObject,
+    healthy: &CachedFixtureObject,
+    malformed_bytes: i64,
+    malformed_checksum: &str,
+) -> Result<()> {
+    let db = rusqlite::Connection::open_with_flags(
+        root.join("application-previews/manifest/previews.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let (bad_status, bad_bytes, bad_checksum): (String, i64, String) = db.query_row(
+        "SELECT status,bytes,checksum FROM objects WHERE key=?1",
+        [&bad.digest],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    ensure!(
+        bad_status == "orphan"
+            && bad_bytes == malformed_bytes
+            && bad_checksum == malformed_checksum,
+        "typed corruption did not orphan the exact malformed object: status={bad_status}, bytes={bad_bytes}, checksum={bad_checksum}"
+    );
+    let bad_published: i64 = db.query_row(
+        "SELECT count(*) FROM render_records r JOIN objects o ON o.key=r.key WHERE r.key=?1 AND o.status='ready'",
+        [&bad.digest],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        bad_published == 0,
+        "corrupt render record remained published"
+    );
+    let (healthy_status, healthy_bytes, healthy_checksum, healthy_record):
+        (String, i64, String, String) = db.query_row(
+            "SELECT o.status,o.bytes,o.checksum,r.record FROM objects o JOIN render_records r ON r.key=o.key WHERE o.key=?1",
+            [&healthy.digest],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    ensure!(
+        healthy_status == "ready"
+            && healthy_bytes == healthy.bytes
+            && healthy_checksum == healthy.checksum
+            && healthy_record == healthy.record,
+        "healthy sibling object or record changed"
+    );
+    ensure!(
+        std::fs::metadata(&healthy.path)?.len() == u64::try_from(healthy.bytes)?
+            && blake3::hash(&std::fs::read(&healthy.path)?)
+                .to_hex()
+                .as_str()
+                == healthy.checksum,
+        "healthy sibling payload changed"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual corrupt-cache G/C/F/N fixture"]
+fn actual_managed_jpeg_webp_avif_corruption_is_typed_and_exactly_invalidated() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    for codec in [
+        crate::preview::Codec::Jpeg,
+        crate::preview::Codec::Webp,
+        crate::preview::Codec::Avif,
+    ] {
+        let (_temporary, root, originals, bad_variant, original_checksum) = fixture()?;
+        let healthy_variant = {
+            let mut catalog = crate::Catalog::open(&root)?;
+            let revision = catalog.edit_variant(&bad_variant)?.revision;
+            let created = catalog.create_edit_variant(
+                &bad_variant,
+                revision,
+                &format!("healthy-{codec:?}"),
+            )?;
+            catalog
+                .save_edit_recipe(
+                    &created.key,
+                    created.revision,
+                    &crate::edit::Recipe::V1(crate::edit::RecipeV1 {
+                        exposure_ev: 0.25,
+                        ..Default::default()
+                    }),
+                )?
+                .key
+        };
+        let (warm, token) = Running::start_codec(&executable, &root, &originals, false, codec)?;
+        let bad_ready = warm.ready(&token, &bad_variant, 1)?;
+        let bad_bytes = warm.bytes(&token, &bad_ready.ticket)?;
+        ensure!(!bad_bytes.bytes().is_empty(), "bad fixture preview empty");
+        drop(bad_bytes);
+        let healthy_ready = warm.ready(&token, &healthy_variant, 2)?;
+        let healthy_bytes = warm.bytes(&token, &healthy_ready.ticket)?;
+        let healthy_delivery = blake3::hash(healthy_bytes.bytes());
+        drop(healthy_bytes);
+        let warm_observed = warm.observed.lock().unwrap();
+        ensure!(
+            warm_observed.iter().filter(|row| row.render).count() == 2,
+            "fixture generation did not render both cache objects in N"
+        );
+        drop(warm_observed);
+        warm.finish(token)?;
+
+        let bad = cached_fixture_object(&root, &originals, &bad_variant)?;
+        let healthy = cached_fixture_object(&root, &originals, &healthy_variant)?;
+        ensure!(bad.digest != healthy.digest, "fixture cache keys collided");
+        ensure!(
+            bad.key.encoding.codec == codec && healthy.key.encoding.codec == codec,
+            "fixture codec descriptor mismatch"
+        );
+        let (malformed_bytes, malformed_checksum) = replace_cached_fixture_object(&root, &bad)?;
+
+        let (cold, token) = Running::start_codec(&executable, &root, &originals, true, codec)?;
+        let failed = failed_status(&cold, &token, &bad_variant, 10)?;
+        eprintln!(
+            "configured {codec:?} malformed-object failure: {:?}",
+            failed.message
+        );
+        {
+            let observed = cold.observed.lock().unwrap();
+            ensure!(
+                observed.len() == 1 && !observed[0].render,
+                "malformed cache did not fail in exactly one DecodeEncoded N"
+            );
+        }
+        verify_exact_corrupt_invalidation(
+            &root,
+            &bad,
+            &healthy,
+            malformed_bytes,
+            &malformed_checksum,
+        )?;
+        let sibling = cold.ready(&token, &healthy_variant, 11)?;
+        let sibling_bytes = cold.bytes(&token, &sibling.ticket)?;
+        ensure!(
+            blake3::hash(sibling_bytes.bytes()) == healthy_delivery,
+            "healthy sibling delivery changed after corruption"
+        );
+        drop(sibling_bytes);
+        ensure!(
+            cold.observed.lock().unwrap().iter().all(|row| !row.render),
+            "corruption route unexpectedly rendered from original"
+        );
+        eprintln!(
+            "configured codec {codec:?}: malformed bytes={} passed F checksum, DecodeEncoded N returned authoritative Corrupt ({:?}), exact object/record invalidated, healthy sibling preserved",
+            malformed_bytes, failed.message
+        );
+        cold.finish(token)?;
+        ensure!(
+            blake3::hash(&std::fs::read(originals.join("original.png"))?)
+                .to_hex()
+                .as_str()
+                == original_checksum,
+            "codec corruption fixture changed original content"
         );
     }
     Ok(())

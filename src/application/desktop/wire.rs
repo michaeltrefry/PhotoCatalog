@@ -264,6 +264,7 @@ pub(super) fn build_identity() -> String {
             include_str!("../../preview/memory.rs"),
             include_str!("../../preview/scheduler.rs"),
             include_str!("../../preview/codec.rs"),
+            include_str!("preview_metadata_capacity.rs"),
             include_str!("../../../native/preview.cpp"),
             include_str!("../../../native/preview.h"),
             include_str!("../../catalog_session.rs"),

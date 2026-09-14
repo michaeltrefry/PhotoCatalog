@@ -1,7 +1,7 @@
 //! An admitted encoded cache transfer. SQL remains on the service actor.
 use super::*;
 use crate::catalog_session::preview_io::Integrity;
-use crate::preview::transport_task::Task;
+use crate::preview::transport_task::{RetainedError, Task};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct IoLease(Arc<AtomicBool>);
@@ -31,7 +31,7 @@ pub(crate) struct Transfer {
 }
 pub(crate) struct Output {
     pub key: PreviewKey,
-    pub result: Result<(Integrity, Vec<u8>)>,
+    pub result: std::result::Result<(Integrity, Vec<u8>), RetainedError>,
     _reservation: ByteReservation,
     _io: IoLease,
 }
@@ -57,7 +57,7 @@ impl Plan {
                 });
             Ok(Output {
                 key: self.key,
-                result,
+                result: result.map_err(RetainedError::new),
                 _reservation: self.reservation,
                 _io: self.io,
             })
@@ -78,7 +78,7 @@ impl Transfer {
 }
 impl Output {
     pub fn finish(self, service: &PreviewService) -> Result<Vec<u8>> {
-        let (integrity, bytes) = self.result?;
+        let (integrity, bytes) = self.result.map_err(RetainedError::into_error)?;
         service.store.finish_managed_read(&self.key, integrity)?;
         ensure!(
             integrity == Integrity::Intact,

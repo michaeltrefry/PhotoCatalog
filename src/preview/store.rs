@@ -661,6 +661,11 @@ impl PreviewStore {
             Layout::HashPrefix => self.root(tier).join(&key[..2]).join(&key[2..4]).join(key),
         })
     }
+    #[cfg(test)]
+    pub(crate) fn test_object_path(&self, key: &PreviewKey) -> Result<PathBuf> {
+        key.validate()?;
+        self.path(&key.digest()?, key.tier)
+    }
     fn cache_object(
         &self,
         key: &str,

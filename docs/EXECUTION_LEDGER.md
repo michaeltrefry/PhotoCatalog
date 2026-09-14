@@ -6,15 +6,31 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
-Active next wave: C preview metadata aggregate assembly (Sol/high, cross-module
-ownership arithmetic), managed SqlReader selected-XMP denial/retry fixture
-(Sol/high, same subsystem context), and a private actual-native corruption/cache
-fixture (Sol/medium, after Terra/medium returned planning without implementation).
-Native execution is serialized under
-root grants; proof-only and private fixture work can proceed together. Existing
-verified checkpoints are retained rather than re-audited. These are model choices
-for this wave, not a permanent mapping. Live read-back confirms sc-22847 In
-Progress, sc-22848 To Do, and the remaining epic stories Done.
+The bounded wave is integrated locally: metadata aggregate (Sol/high), managed
+SqlReader selected-XMP proof (Sol/high with existing subsystem context), and
+actual-native corrupt-cache fixture (Sol/medium after Terra/medium returned
+planning without implementation). Independent Sol/high reviews checked ownership
+and merge interactions; root repaired issues exposed by integrated tests. Native
+execution remained serialized. Existing unchanged results were retained.
+S12 remains In Progress; full process admission and the remaining desktop
+capabilities are still open, and S13 has not started.
+
+- Desktop LM integration is committed at `f64f6fc`; selected-XMP proof is merged
+  at `2f21444`. The preview aggregate and bounded error storage derive from
+  `1244cae` plus `0cd5078`, with a reviewed root correction using direct anyhow
+  downcasts for typed context markers. Final preview validation passes 24 tests
+  and a fresh CLI build, plus the macOS Tauri release compile check. Evidence is
+  `sc-22847-desktop-lm-integration-q8yn11ac/passing-preview-receipt.json` and
+  `tauri-check-1789390790674933000/receipt.json`; all direct processes were waited.
+  Actual JPEG/WebP/AVIF corruption invalidates only the bad entry, preserves the
+  healthy sibling and verifies C/F/N retirement. Delivery, cancellation and native
+  resource refusal/retry also pass. Earlier fixture SQL-type, warm-decoder-count,
+  permissive truncated-JPEG and unclassified-short-read negatives are retained.
+  The fixture now uses explicit invalid JPEG/WebP syntax and truncated AVIF.
+  The aggregate's 3 passing arithmetic tests are retained across the unrelated
+  typed-context repair; final owner counts are documented in
+  `docs/PREVIEW_METADATA_CAPACITY.md`. This reports requested metadata backing;
+  it neither reserves that capacity nor establishes whole-process/RSS admission.
 
 - LM retained-core admission is committed at `2b742e8568055b104b9235994cde594f5f6a22c7`.
   v55 passed 16 functional tests and three formatting checks; independent evidence

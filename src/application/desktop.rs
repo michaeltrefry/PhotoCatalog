@@ -19,6 +19,7 @@ mod filesystem;
 #[cfg(test)]
 mod filesystem_tests;
 mod native;
+pub(crate) mod preview_metadata_capacity;
 mod process;
 #[cfg(test)]
 mod tests;

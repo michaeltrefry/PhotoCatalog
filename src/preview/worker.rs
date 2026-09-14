@@ -177,6 +177,18 @@ struct RenderReceipt {
     objects: Vec<ObjectReceipt>,
     prepared: Option<(crate::edit::PreparedProxyReceipt, SourceInstance)>,
 }
+pub(crate) fn receipt_metadata_layouts() -> [(usize, usize); 2] {
+    [
+        (
+            std::mem::size_of::<RenderReceipt>(),
+            std::mem::align_of::<RenderReceipt>(),
+        ),
+        (
+            std::mem::size_of::<ObjectReceipt>(),
+            std::mem::align_of::<ObjectReceipt>(),
+        ),
+    ]
+}
 pub struct ProducedPreview {
     pub key: PreviewKey,
     pub pixels: PreparedRgb,

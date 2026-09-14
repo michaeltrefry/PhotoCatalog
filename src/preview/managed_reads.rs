@@ -38,7 +38,13 @@ pub(super) struct ManagedRead {
     launched: bool,
     cleanup_started: bool,
     pub cancel: Arc<AtomicBool>,
-    failure: Option<anyhow::Error>,
+    failure: Option<crate::preview::transport_task::RetainedError>,
+}
+pub(crate) fn metadata_root_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<ManagedRead>(),
+        std::mem::align_of::<ManagedRead>(),
+    )
 }
 /// SQL-only reference selection. File custody and bytes stay in F.
 fn legacy_reference(catalog: &Catalog, asset: &str) -> Result<Option<String>> {
@@ -263,7 +269,9 @@ impl PreviewService {
                         crate::catalog_session::preview_io::Integrity::Corrupt,
                     );
                 }
-                read.failure.get_or_insert(error);
+                read.failure.get_or_insert_with(|| {
+                    crate::preview::transport_task::RetainedError::new(error)
+                });
                 read.cancel.store(true, Ordering::Release);
                 Ok(None)
             }
@@ -361,7 +369,7 @@ impl PreviewService {
             read.release_scheduler(&mut self.scheduler)?;
             read.rgb.take();
             return match read.failure.take() {
-                Some(error) => Err(error),
+                Some(error) => Err(error.into_error()),
                 None => Ok(Some(None)),
             };
         }

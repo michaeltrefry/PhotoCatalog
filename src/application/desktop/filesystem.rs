@@ -110,6 +110,21 @@ impl Call {
         }
     }
 }
+pub(super) fn maximum_boxed_call_root_bytes() -> usize {
+    let single = [
+        std::mem::size_of::<ConfirmSqlAdmission>(),
+        std::mem::size_of::<store::Request>(),
+        std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
+        std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap();
+    single.max(
+        std::mem::size_of::<crate::catalog_session::native::Request>()
+            + std::mem::size_of::<crate::preview::RenderWork>(),
+    )
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(super) enum Value {
@@ -1170,6 +1185,9 @@ pub(super) struct Proxy {
     binding: Binding,
     state: Mutex<ChildState>,
     wake: Condvar,
+}
+pub(super) fn metadata_proxy_layout() -> (usize, usize) {
+    (std::mem::size_of::<Proxy>(), std::mem::align_of::<Proxy>())
 }
 impl Proxy {
     pub fn binding(&self) -> &Binding {

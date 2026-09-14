@@ -4,7 +4,10 @@ use super::*;
 use crate::{
     application::U64,
     catalog_session::{native as n, preview_stage as f},
-    preview::{stage_io::Calls, transport_task::Task},
+    preview::{
+        stage_io::Calls,
+        transport_task::{RetainedError, Task},
+    },
 };
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +19,7 @@ pub(crate) enum Event {
 pub(crate) struct Read {
     owner: Arc<Mutex<Option<Job>>>,
     calls: Arc<Calls>,
-    task: Option<Task<Result<Event>>>,
+    task: Option<Task<std::result::Result<Event, RetainedError>>>,
     pub cancel: Arc<AtomicBool>,
 }
 impl Read {
@@ -61,7 +64,7 @@ impl Read {
             self.cancel.clone(),
             move |cancel| {
                 let mut state = owner.lock().unwrap_or_else(|p| p.into_inner());
-                Ok(work(&mut state, cancel))
+                Ok(work(&mut state, cancel).map_err(RetainedError::new))
             },
         )?);
         Ok(())
@@ -174,7 +177,7 @@ impl Read {
             Ok(None) => Ok(None),
             Ok(Some(value)) => {
                 self.task = None;
-                Ok(Some(value))
+                Ok(Some(value.map_err(RetainedError::into_error)))
             }
             Err(error) => {
                 self.task = None;

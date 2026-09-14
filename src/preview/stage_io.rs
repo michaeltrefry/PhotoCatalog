@@ -33,6 +33,15 @@ pub(crate) struct Calls {
     legacy_transfer: Mutex<Option<LeaseId>>,
     state: Arc<Mutex<State>>,
 }
+pub(crate) fn metadata_layouts() -> [(usize, usize); 2] {
+    [
+        (std::mem::size_of::<Calls>(), std::mem::align_of::<Calls>()),
+        (
+            std::mem::size_of::<Mutex<State>>(),
+            std::mem::align_of::<Mutex<State>>(),
+        ),
+    ]
+}
 pub(crate) fn retry_busy<T>(mut work: impl FnMut() -> Result<T>) -> Result<T> {
     loop {
         match work() {
