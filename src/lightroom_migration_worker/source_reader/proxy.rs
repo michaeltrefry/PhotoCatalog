@@ -3,7 +3,7 @@
 //! drained. It is never stored on or joined by the foreground actor.
 use super::{
     transport::*,
-    wire::{Query, Value},
+    wire::{Budget, Expected, Query, Value},
 };
 use crate::{
     application::U64,
@@ -60,6 +60,7 @@ struct Session {
     deadline: Duration,
     canceled: bool,
     retired: bool,
+    budget: Budget,
 }
 impl Session {
     fn open(
@@ -71,6 +72,7 @@ impl Session {
         read_ms: u64,
     ) -> Result<Self> {
         epoch.validate()?;
+        let budget = Budget::from_authority(&authority)?;
         let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
         let binding = authority.binding()?;
         let process_stop = Arc::new(Stop::default());
@@ -88,6 +90,7 @@ impl Session {
             cancel,
             open_ms,
             read_ms,
+            budget,
         )
     }
     fn admit(
@@ -99,6 +102,7 @@ impl Session {
         cancel: Arc<AtomicBool>,
         open_ms: u64,
         read_ms: u64,
+        budget: Budget,
     ) -> Result<Self> {
         ensure!(
             (1..=3_600_000).contains(&open_ms) && (1..=120_000).contains(&read_ms),
@@ -120,6 +124,7 @@ impl Session {
             deadline: Duration::from_millis(read_ms),
             canceled: false,
             retired: false,
+            budget,
         };
         let digest = crate::lightroom::digest(&encoded);
         session.send(
@@ -295,7 +300,15 @@ impl Session {
         // Even when cancellation arrived during streaming, consume its complete
         // ticket before returning the cancellation. Keep the process alive.
         self.check()?;
-        Value::decode(&encoded, expected.expected_kind())
+        Value::decode_checked(
+            &encoded,
+            Expected {
+                read: &expected,
+                budget: self.budget,
+                binding: &self.binding,
+            },
+            &|| self.health.failed(),
+        )
     }
     fn retire(&mut self) -> Result<()> {
         if self.retired {

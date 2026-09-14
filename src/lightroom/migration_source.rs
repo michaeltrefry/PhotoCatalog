@@ -8,6 +8,7 @@ mod access;
 pub(crate) mod manifest_json;
 mod reader;
 pub(crate) use access::MigrationRead;
+pub(crate) use reader::IMAGE_LINK_LIMITATIONS;
 pub use reader::MigrationSource;
 
 use super::plan::{Cell, RetainedRow};

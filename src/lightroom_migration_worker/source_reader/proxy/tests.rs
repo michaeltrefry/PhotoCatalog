@@ -42,6 +42,7 @@ pub(super) fn session_with_deadline(
         .args(["--exact", HELPER, "--nocapture"])
         .env(FIXTURE, "1");
     let process = Process::spawn_test_command(command, stop.clone())?;
+    let budget = super::super::wire::Budget::from_authority(&authority)?;
     Session::admit(
         process,
         stop,
@@ -51,6 +52,7 @@ pub(super) fn session_with_deadline(
         cancel,
         15_000,
         read_ms,
+        budget,
     )
 }
 pub(super) fn sql(fixture: &Fixture, cancel: Arc<AtomicBool>) -> Result<SqlReader> {

@@ -1,3 +1,4 @@
+mod preflight;
 use crate::{
     application::U64,
     lightroom::{
@@ -8,6 +9,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, ensure};
+pub(super) use preflight::{Budget, Expected};
 use serde::{Deserialize, Serialize};
 
 /// The three remaining MigrationRead methods (seal, binding and chunk budget)
@@ -138,6 +140,7 @@ impl Value {
     /// Inspect the borrowed envelope and expected method before allocating its
     /// typed body. A content-before-tag reply must not build a generic Content
     /// graph (or route a different large variant through a small query).
+    #[cfg(test)]
     pub(super) fn decode(bytes: &[u8], expected: Kind) -> Result<Self> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -161,7 +164,10 @@ impl Value {
         let body = envelope.value.context("source result body required")?.get();
         Ok(match expected {
             Kind::Manifest => Self::Manifest(
-                crate::lightroom::migration_source::manifest_json::decode(body.as_bytes())?,
+                crate::lightroom::migration_source::manifest_json::decode_reply(
+                    body.as_bytes(),
+                    &|| false,
+                )?,
             ),
             Kind::StableSource => Self::StableSource(serde_json::from_str(body)?),
             Kind::OriginPacketRoster => Self::OriginPacketRoster(serde_json::from_str(body)?),
@@ -172,5 +178,42 @@ impl Value {
             Kind::ImageLinks => Self::ImageLinks(serde_json::from_str(body)?),
             Kind::Verified => unreachable!("verified unit handled before body admission"),
         })
+    }
+    pub(super) fn decode_checked(
+        bytes: &[u8],
+        expected: Expected<'_>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope<'a> {
+            kind: Kind,
+            #[serde(borrow)]
+            value: Option<&'a serde_json::value::RawValue>,
+        }
+        ensure!(
+            bytes.len() <= super::transport::RESULT_BYTES,
+            "source reply transport bound"
+        );
+        ensure!(!stop(), "source decoding canceled");
+        let envelope: Envelope<'_> = serde_json::from_slice(bytes)?;
+        ensure!(
+            envelope.kind == expected.read.expected_kind(),
+            "source reply does not match requested method"
+        );
+        if envelope.kind == Kind::Verified {
+            ensure!(
+                envelope.value.is_none(),
+                "verified source reply must be unit"
+            );
+            return Ok(Self::Verified);
+        }
+        let result = preflight::project(
+            envelope.value.context("source result body required")?,
+            expected,
+            stop,
+        )?;
+        ensure!(!stop(), "source decoding canceled");
+        Ok(result)
     }
 }

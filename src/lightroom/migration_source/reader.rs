@@ -19,6 +19,8 @@ use std::{
 #[path = "supplement_json.rs"]
 mod supplement_json;
 
+pub(crate) const IMAGE_LINK_LIMITATIONS: &str = "Only exact unique retained schema3 links; missing is not proof of a master sentinel or current settings. History/snapshots and unknown tables remain separately retained.";
+
 struct Spec {
     table: &'static str,
     keys: &'static [&'static str],
@@ -26,6 +28,12 @@ struct Spec {
     numeric_key: bool,
 }
 impl Collection {
+    pub(crate) fn transport_shape(
+        self,
+    ) -> (&'static [&'static str], &'static [&'static str], bool) {
+        let spec = self.spec();
+        (spec.keys, spec.fields, spec.numeric_key)
+    }
     fn spec(self) -> Spec {
         match self {
             Self::Captures => Spec {
@@ -727,7 +735,9 @@ impl MigrationSource {
             digest(&bytes) == selected.manifest_blake3,
             "capture manifest differs from seal"
         );
-        let manifest = super::manifest_json::decode(&bytes)?;
+        let manifest = super::manifest_json::decode_cancellable(&bytes, &|| {
+            self.cancel.load(Ordering::Relaxed)
+        })?;
         ensure!(
             manifest.revision_id.as_deref() == Some(revision)
                 && manifest.state == "captured"
@@ -1070,7 +1080,18 @@ impl MigrationSource {
             ensure!(observed, "not an observed Adobe image record");
             Ok(())
         })?;
-        Ok(ImageLinks { image_source_id:source_id.into(), file:self.resolve(revision,source_id,"rootFile","AgLibraryFile")?, master:self.resolve(revision,source_id,"masterImage","Adobe_images")?, current_develop:self.resolve(revision,source_id,"developSettingsIDCache","Adobe_imageDevelopSettings")?, limitations:"Only exact unique retained schema3 links; missing is not proof of a master sentinel or current settings. History/snapshots and unknown tables remain separately retained.".into() })
+        Ok(ImageLinks {
+            image_source_id: source_id.into(),
+            file: self.resolve(revision, source_id, "rootFile", "AgLibraryFile")?,
+            master: self.resolve(revision, source_id, "masterImage", "Adobe_images")?,
+            current_develop: self.resolve(
+                revision,
+                source_id,
+                "developSettingsIDCache",
+                "Adobe_imageDevelopSettings",
+            )?,
+            limitations: IMAGE_LINK_LIMITATIONS.into(),
+        })
     }
 }
 

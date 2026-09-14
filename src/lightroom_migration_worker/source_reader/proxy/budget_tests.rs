@@ -5,11 +5,12 @@ use super::*;
 use crate::lightroom::{Issue, MANIFEST_BYTES, PAGE_BYTES, migration_source::tests::Fixture};
 
 #[test]
-fn maximal_short_issue_manifest_exceeds_old_estimate_and_preserves_every_member() -> Result<()> {
+fn large_object_issue_manifest_now_has_exact_capacity_and_preserves_every_member() -> Result<()> {
     maximal_issue_manifest(
         br#"{"code":"","detail":""}"#,
         "maximal_short_issue_manifest",
-        64 * 1024 * 1024,
+        None,
+        Some(64 * 1024 * 1024),
     )
 }
 
@@ -18,11 +19,27 @@ fn maximal_sequence_issue_manifest_preserves_more_members_than_object_case() -> 
     maximal_issue_manifest(
         br#"["",null,""]"#,
         "maximal_sequence_issue_manifest",
-        128 * 1024 * 1024,
+        None,
+        Some(128 * 1024 * 1024),
     )
 }
 
-fn maximal_issue_manifest(item: &[u8], label: &str, old_capacity_estimate: usize) -> Result<()> {
+#[test]
+fn shortest_some_empty_issue_manifest_preserves_the_full_retained_limit() -> Result<()> {
+    maximal_issue_manifest(
+        br#"["","",""]"#,
+        "shortest_some_empty_issue_manifest",
+        Some(""),
+        None,
+    )
+}
+
+fn maximal_issue_manifest(
+    item: &[u8],
+    label: &str,
+    expected_source_id: Option<&str>,
+    old_capacity_estimate: Option<usize>,
+) -> Result<()> {
     let mut fixture = Fixture::new();
     let manifest = fixture.open().capture_manifest(fixture.revision())?;
     let template = serde_json::to_vec(&manifest)?;
@@ -60,21 +77,19 @@ fn maximal_issue_manifest(item: &[u8], label: &str, old_capacity_estimate: usize
     let remote = maximal_sql(&fixture, ReadLimits::default().inline_bytes)?;
     let value = remote.capture_manifest(&revision)?;
     assert_eq!(value.issues.len(), count);
-    assert!(
-        value
-            .issues
-            .iter()
-            .all(|i| i.code.is_empty() && i.detail.is_empty() && i.source_id.is_none())
-    );
+    assert!(value.issues.iter().all(|i| i.code.is_empty()
+        && i.detail.is_empty()
+        && i.source_id.as_deref() == expected_source_id));
     let issue_capacity_bytes = value
         .issues
         .capacity()
         .checked_mul(std::mem::size_of::<Issue>())
         .context("issue capacity overflow")?;
-    // This was the invalid v10 estimate. No allocation ceiling can be inferred
-    // from16MiB raw JSON alone or only the currently occupied Vec elements.
-    #[cfg(target_pointer_width = "64")]
-    assert!(issue_capacity_bytes > old_capacity_estimate);
+    // v22 logs retain the former geometric capacities. After B, each vector
+    // reserves the validated count exactly; neither historical estimate is an
+    // admission constant or a requirement to waste that amount of memory.
+    assert_eq!(value.issues.capacity(), count);
+    assert!(issue_capacity_bytes <= (72 * (MANIFEST_BYTES + 4)).div_ceil(11));
     let encoded = exact_json(
         &Value::Manifest(value),
         RESULT_BYTES,
@@ -82,7 +97,7 @@ fn maximal_issue_manifest(item: &[u8], label: &str, old_capacity_estimate: usize
     )?;
     eprintln!(
         "{}",
-        serde_json::json!({"fixture":label,"source_bytes":raw.len(),"issues":count,"issue_capacity_bytes":issue_capacity_bytes,"encoded_result_bytes":encoded.len()})
+        serde_json::json!({"fixture":label,"source_bytes":raw.len(),"issues":count,"issue_capacity_bytes":issue_capacity_bytes,"encoded_result_bytes":encoded.len(),"historical_capacity_estimate":old_capacity_estimate})
     );
     // Its full result traversed the actual reader, ticket stream and proxy; the
     // original source table remains exactly the admitted retained bytes.
@@ -255,6 +270,7 @@ fn maximal_units_first_manifest_preserves_foreign_evidence_and_rejects_tamper() 
         anyhow::bail!("foreign output evidence must retain its units")
     };
     assert_eq!(units.len(), count);
+    assert_eq!(units.capacity(), count);
     assert!(units.iter().all(|v| *v == 0));
     eprintln!(
         "{}",
