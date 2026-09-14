@@ -452,6 +452,10 @@ fn execute_with_broker<A: Admission>(
         backing = add(backing, path.as_os_str().len())?;
     }
     memory.grow(backing)?;
+    // Every pipe/parser/relay owner is funded before any helper or broker can
+    // read bytes. This operation reservation survives all physical and logical
+    // Source retirement; it is separate from per-query/result/core phases.
+    memory.grow(super::memory::transport::payloads(source_executable.is_some())?.total()?)?;
     let mut result_memory = budget.reservation();
     result_memory.grow(RESULT_BYTES)?;
     let input_digest = blake3::hash(request.as_bytes()).to_hex().to_string();

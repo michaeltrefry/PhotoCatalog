@@ -184,15 +184,23 @@ fn existing_slot(
     origin: &SourceRecord,
     slot: &str,
 ) -> Result<Option<ProjectionResult>> {
-    let old:Option<(String,String,String)>=catalog.db.query_row("SELECT owner,adapter,result FROM migration_organization WHERE source_identity=? AND slot=?",params![origin.source.identity()?,slot],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    old.map(|(owner, adapter, value)| {
-        ensure!(
-            owner == policy.import_source && adapter == ADAPTER && value.len() <= 65536,
-            "dictionary owner/result differs"
-        );
-        Ok(serde_json::from_str(&value)?)
-    })
-    .transpose()
+    let mut statement = catalog.db.prepare(
+        "SELECT owner,adapter,result FROM migration_organization WHERE source_identity=? AND slot=?",
+    )?;
+    let mut rows = statement.query(params![origin.source.identity()?, slot])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    ensure!(
+        organization::stored_text_matches(row, 0, &policy.import_source)?
+            && organization::stored_text_matches(row, 1, ADAPTER)?,
+        "dictionary owner/result differs"
+    );
+    Ok(Some(organization::stored_projection_result(
+        row,
+        2,
+        "dictionary owner/result differs",
+    )?))
 }
 pub(crate) fn project(
     catalog: &mut Catalog,
@@ -788,6 +796,7 @@ pub(crate) fn keyword_member(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod saved_query_tests;
     use crate::{
         catalog_images::{ImageRole, ImportImageRequest},
         catalog_migration::{lookup::Lookup, organization::Link},

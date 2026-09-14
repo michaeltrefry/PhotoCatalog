@@ -495,27 +495,56 @@ pub(crate) fn verify_unique_link(
     verify_link(db, evidence, origin, link, Some(source), true)
 }
 
+// Compare SQLite-owned identity bytes before creating any application-owned
+// strings. Only TEXT can match the already validated expected identity.
+pub(super) fn stored_text_matches(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    expected: &str,
+) -> Result<bool> {
+    Ok(
+        matches!(row.get_ref(index)?, rusqlite::types::ValueRef::Text(bytes) if bytes == expected.as_bytes()),
+    )
+}
+
+// The schema has no result byte constraint. Bound the borrowed value before
+// UTF-8 validation and JSON decoding; no intermediate owned JSON string is needed.
+pub(super) fn stored_projection_result(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    limit_message: &str,
+) -> Result<ProjectionResult> {
+    let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(index)? else {
+        anyhow::bail!("stored organization result must be TEXT");
+    };
+    ensure!(bytes.len() <= 65536, "{limit_message}");
+    Ok(serde_json::from_str(std::str::from_utf8(bytes)?)?)
+}
+
 fn existing(
     db: &Connection,
     request: &Projection,
     digest: &str,
 ) -> Result<Option<ProjectionResult>> {
     let identity = request.origin.source.identity()?;
-    let value: Option<(String,String,String,String)> = db.query_row(
+    let mut statement = db.prepare(
         "SELECT owner,adapter,input_digest,result FROM migration_organization WHERE source_identity=? AND slot=?",
-        params![identity,request.decision.slot()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    value
-        .map(|(owner, adapter, stored, result)| {
-            ensure!(
-                owner == request.import_source
-                    && adapter == request.adapter_version
-                    && stored == digest,
-                "organization mapping decision changed; explicit reconciliation required"
-            );
-            ensure!(result.len() <= 65536, "stored organization result limit");
-            Ok(serde_json::from_str(&result)?)
-        })
-        .transpose()
+    )?;
+    let mut rows = statement.query(params![identity, request.decision.slot()])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    ensure!(
+        stored_text_matches(row, 0, &request.import_source)?
+            && stored_text_matches(row, 1, &request.adapter_version)?
+            && stored_text_matches(row, 2, digest)?,
+        "organization mapping decision changed; explicit reconciliation required"
+    );
+    Ok(Some(stored_projection_result(
+        row,
+        3,
+        "stored organization result limit",
+    )?))
 }
 fn save(
     db: &Connection,
@@ -546,9 +575,10 @@ fn save(
     Ok(result)
 }
 fn mapped(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<NativeTarget> {
-    let result:String=db.query_row("SELECT result FROM migration_organization WHERE source_identity=? AND slot='dictionary' AND owner=?",params![reference.source.identity()?,owner],|r|r.get(0))?;
-    ensure!(result.len() <= 65536, "dictionary mapping size limit");
-    Ok(serde_json::from_str::<ProjectionResult>(&result)?.target)
+    let mut statement = db.prepare("SELECT result FROM migration_organization WHERE source_identity=? AND slot='dictionary' AND owner=?")?;
+    let mut rows = statement.query(params![reference.source.identity()?, owner])?;
+    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    Ok(stored_projection_result(row, 0, "dictionary mapping size limit")?.target)
 }
 fn image(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<ImageMetadataIdentity> {
     ensure!(
@@ -1077,19 +1107,12 @@ impl Catalog {
         slot: &str,
     ) -> Result<Option<ProjectionResult>> {
         text(slot, 128)?;
-        let result: Option<String> = self
-            .db
-            .query_row(
-                "SELECT result FROM migration_organization WHERE source_identity=? AND slot=?",
-                params![source.identity()?, slot],
-                |r| r.get(0),
-            )
-            .optional()?;
-        result
-            .map(|s| {
-                ensure!(s.len() <= 65536, "organization result limit");
-                Ok(serde_json::from_str(&s)?)
-            })
+        let mut statement = self.db.prepare(
+            "SELECT result FROM migration_organization WHERE source_identity=? AND slot=?",
+        )?;
+        let mut rows = statement.query(params![source.identity()?, slot])?;
+        rows.next()?
+            .map(|row| stored_projection_result(row, 0, "organization result limit"))
             .transpose()
     }
 }
@@ -1247,6 +1270,7 @@ mod tests {
     use crate::lightroom::migration_source::tests::Fixture;
 
     mod candidate_tests;
+    mod saved_query_tests;
 
     struct Bed {
         _temp: tempfile::TempDir,

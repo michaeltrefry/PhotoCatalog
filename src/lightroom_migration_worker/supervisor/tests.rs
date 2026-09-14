@@ -386,3 +386,44 @@ fn real_thread_affine_permit_stays_on_waiter_until_explicit_retirement() -> Resu
     assert_eq!(releases.lock().unwrap().len(), 1);
     Ok(())
 }
+
+#[test]
+fn transport_payload_denial_precedes_child_creation_and_retires_all_charges() -> Result<()> {
+    use crate::lightroom_migration_worker::memory::{layout::add, transport};
+    let payload = transport::payloads(false)?;
+    assert!(
+        payload.typed > 0 && payload.parser > 0 && payload.encoded > 0 && payload.diagnostics > 0
+    );
+    assert!(transport::payloads(true)?.total()? > payload.total()?);
+    let backing = Process::<ChildFrame>::allocation_backing()?;
+    let budget = MemoryBudget::new(add(add(INPUT_BYTES, backing)?, payload.total()? - 1)?)?;
+    let spawned = std::cell::Cell::new(false);
+    let result = execute_owned(
+        |_| {
+            spawned.set(true);
+            anyhow::bail!("must not spawn without transport allowance")
+        },
+        guard(),
+        "{}",
+        Arc::new(Stop::default()),
+        Instant::now() + Duration::from_secs(5),
+        Admit {
+            writers: Arc::new(Writers::default()),
+            releases: Arc::new(Mutex::new(vec![])),
+        },
+        budget.clone(),
+    );
+    let error = result.err().context("transport budget should deny")?;
+    let limit = error
+        .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+        .context("structured ResourceLimit required")?;
+    assert_eq!(limit.required, payload.total()?);
+    assert_eq!(limit.available, payload.total()? - 1);
+    assert!(!spawned.get());
+    assert_eq!(budget.used(), 0);
+    println!(
+        "TRANSPORT_PRESPAWN_DENIED requested={} available={} no_child=true retired=0",
+        limit.required, limit.available
+    );
+    Ok(())
+}

@@ -2,6 +2,7 @@
 //! A configured allowance is a resource decision, never a data-format ceiling.
 pub(crate) mod channels;
 pub(crate) mod layout;
+pub(crate) mod transport;
 
 use anyhow::{Context, Result, ensure};
 use std::{
