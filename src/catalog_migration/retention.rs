@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn batches_stop_before_uncustodied_bytes_and_resume_without_skips() -> Result<()> {
+    pub(super) fn batches_stop_before_uncustodied_bytes_and_resume_without_skips() -> Result<()> {
         use crate::lightroom::plan::Cell;
         let mut fixture = Fixture::new();
         let revision = fixture.revision().to_owned();
@@ -701,12 +701,24 @@ impl Catalog {
             "source exceeded retention batch limit"
         );
         let mut staged = Vec::new();
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::STAGED_READY);
         let mut staged_bytes = 0usize;
         for record in &page.records {
             let index = super::lookup::PreparedIndex::new(record)?;
+            #[cfg(all(test, feature = "internal-capacity-probes"))]
+            crate::capacity_probes::observe(
+                crate::capacity_probes::STAGED_NEXT,
+                index.probe_capacity(),
+            );
             let raw = index.canonical_bytes();
             ensure!(raw.len() <= RECORD_LIMIT, "retained record size limit");
             if !staged.is_empty() && staged_bytes.saturating_add(raw.len()) > RECORD_LIMIT {
+                #[cfg(all(test, feature = "internal-capacity-probes"))]
+                crate::capacity_probes::observe(
+                    crate::capacity_probes::STAGED_BREAK,
+                    staged_bytes + index.probe_capacity(),
+                );
                 break;
             }
             staged_bytes += raw.len();
@@ -734,6 +746,20 @@ impl Catalog {
                 break;
             }
         }
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(
+            crate::capacity_probes::STAGED_READY,
+            staged.capacity() * staged.first().map_or(0, std::mem::size_of_val)
+                + staged
+                    .iter()
+                    .map(|(_, compressed, _, digest, cursor, _, index)| {
+                        compressed.capacity()
+                            + digest.capacity()
+                            + cursor.capacity()
+                            + index.probe_capacity()
+                    })
+                    .sum::<usize>(),
+        );
         ensure!(
             !staged.is_empty() || page.exhausted,
             "empty source page without exhaustion"
@@ -850,3 +876,7 @@ impl Catalog {
         self.migration_evidence(&id)
     }
 }
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[path = "retention_capacity_tests.rs"]
+mod capacity_tests;

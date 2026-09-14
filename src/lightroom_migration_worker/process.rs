@@ -81,7 +81,11 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     pub(crate) fn spawn_test_command(mut command: Command, stop: Arc<Stop>) -> Result<Self> {
         // Unit-test harness chatter stays on discarded stdout. The same
         // bounded protocol and process owner read direct helper stderr bytes.
-        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        #[cfg(not(feature = "internal-capacity-probes"))]
+        command.stdout(Stdio::null());
+        #[cfg(feature = "internal-capacity-probes")]
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::piped());
         Self::spawn_configured(command, stop, |child| {
             Ok(Box::new(
                 child.stderr.take().context("test helper output pipe")?,
@@ -138,6 +142,11 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
                 .spawn(move || {
                     loop {
                         let frame = read_frame_optional::<T>(&mut stdout);
+                        #[cfg(all(test, feature = "internal-capacity-probes"))]
+                        crate::capacity_probes::observe(
+                            crate::capacity_probes::FRAME_OUTPUT,
+                            std::mem::size_of_val(&frame),
+                        );
                         let failed = !matches!(&frame, Ok(Some(_)));
                         if failed {
                             stop.admission.store(true, Ordering::Release);
@@ -167,6 +176,9 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         }
         let mut bytes = Vec::new();
         super::protocol::write_frame(&mut bytes, &frame)?;
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(crate::capacity_probes::FRAME_INPUT, bytes.capacity());
+
         match self
             .input
             .as_ref()
@@ -232,3 +244,7 @@ impl<T> Drop for Process<T> {
         self.terminate();
     }
 }
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[path = "process_capacity_tests.rs"]
+mod capacity_tests;

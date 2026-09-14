@@ -232,6 +232,8 @@ fn run(controls: &Controls, output: &mut impl Write) -> Result<()> {
     );
     let authority =
         super::authority_json::decode(&encoded, &|| controls.cancel.load(Ordering::Acquire))?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(crate::capacity_probes::OPEN_DECODED, encoded.capacity());
     drop(encoded);
     let binding = authority.binding()?;
     let mut roster = Roster::open(authority, controls.cancel.clone())?;

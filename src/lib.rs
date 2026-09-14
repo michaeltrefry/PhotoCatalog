@@ -2,6 +2,9 @@
 /// Current on-disk catalog schema; probes must preflight before timed opens.
 pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+mod capacity_probes;
+
 pub mod application;
 pub mod catalog_backup;
 pub mod catalog_edits;

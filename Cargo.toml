@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 
+[features]
+internal-capacity-probes = []
+
 [dependencies]
 anyhow = "1"
 blake3 = "1"

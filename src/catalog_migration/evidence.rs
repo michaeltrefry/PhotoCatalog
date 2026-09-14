@@ -142,6 +142,10 @@ pub(crate) struct PreparedChunk {
     compressed: Vec<u8>,
 }
 impl PreparedChunk {
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    pub(crate) fn probe_capacity(&self) -> usize {
+        self.hash.capacity() + self.compressed.capacity()
+    }
     pub(crate) fn new(bytes: &[u8]) -> Result<Self> {
         ensure!(
             !bytes.is_empty() && bytes.len() <= CHUNK_BYTES,

@@ -22,6 +22,11 @@ fn request(
         return Ok(None);
     };
     let manifest = source.capture_manifest(&capture.revision)?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::REQUEST_MANIFEST);
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::request_manifest(crate::capacity_probes::manifest(&manifest));
+
     if progress.artifact_index >= manifest.artifacts.len() {
         return Ok(None);
     }
@@ -72,6 +77,11 @@ pub(crate) fn pending(
         });
     };
     let manifest = source.capture_manifest(&capture.revision)?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::PENDING_MANIFEST,
+        crate::capacity_probes::manifest(&manifest),
+    );
     if before.artifact_index == manifest.artifacts.len() {
         after.capture_index += 1;
         after.artifact_index = 0;
@@ -100,6 +110,8 @@ pub(crate) fn pending(
             )),
         });
     }
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    let _capacity_pending = crate::capacity_probes::phase(crate::capacity_probes::PENDING_MANIFEST);
     let request = request(catalog, source, before, policy)?.context("artifact request absent")?;
     let found:Option<String>=catalog.db.query_row("SELECT evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2",rusqlite::params![request.retained_capture_record,i64::try_from(request.member_index)?],|r|r.get(0)).optional()?;
     if found.is_some() {

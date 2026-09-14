@@ -106,6 +106,19 @@ pub struct PreparedIndex {
     unavailable: String,
 }
 impl PreparedIndex {
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    pub(crate) fn probe_capacity(&self) -> usize {
+        self.canonical.capacity()
+            + self.revision.capacity()
+            + self.digest.capacity()
+            + self.unavailable.capacity()
+            + self
+                .keys
+                .iter()
+                .flatten()
+                .map(String::capacity)
+                .sum::<usize>()
+    }
     /// Canonical bytes used for the immutable lookup digest, also retained by
     /// the importer so a batch serializes every evidence record only once.
     pub(crate) fn canonical_bytes(&self) -> &[u8] {

@@ -150,6 +150,8 @@ fn mapping_path_parts(root: &NativePath, relative: &NativePath) -> Result<PathBu
 }
 
 fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDescriptor> {
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::DESCRIPTOR_RECORD);
     ensure!(
         request.retained_capture_record > 0 && i64::try_from(request.member_index).is_ok(),
         "artifact member selector bounds"
@@ -159,6 +161,8 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         record.collection == Collection::Captures,
         "artifact authority must be a retained Captures record"
     );
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(crate::capacity_probes::DESCRIPTOR_RECORD, 0);
     let bytes = retention::field_bytes(
         db,
         request.retained_capture_record,
@@ -166,7 +170,15 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         "manifest",
         crate::lightroom::MANIFEST_BYTES,
     )?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(crate::capacity_probes::DESCRIPTOR_BYTES, bytes.capacity());
     let manifest = crate::lightroom::migration_source::manifest_json::decode(&bytes)?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::DESCRIPTOR_MANIFEST,
+        crate::capacity_probes::manifest(&manifest),
+    );
+
     ensure!(
         manifest.protocol == 1
             && manifest.state == "captured"
@@ -182,6 +194,11 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         crate::lightroom::MANIFEST_BYTES,
         &|| false,
     )?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::DESCRIPTOR_SEAL,
+        crate::capacity_probes::seal(&seal),
+    );
     let selected = seal
         .selected
         .iter()
@@ -217,6 +234,14 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         manifest_blake3,
         artifact,
     };
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::DESCRIPTOR_CLONES,
+        crate::capacity_probes::artifact(&result.artifact)
+            + crate::capacity_probes::path(&result.request.mapping.root)
+            + crate::capacity_probes::path(&result.request.mapping.relative)
+            + crate::capacity_probes::revision(&result.request.mapping.copy_identity),
+    );
     crate::lightroom::bounded_json(&result, DESCRIPTOR_LIMIT)?;
     Ok(result)
 }
@@ -511,6 +536,11 @@ impl Catalog {
                 == Some(id.as_str()),
             "artifact custody changed"
         );
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(
+            crate::capacity_probes::CHUNK_VERIFY,
+            bytes.capacity() + prepared.probe_capacity(),
+        );
         reader.verify()?;
         ensure!(!stop(), "artifact custody stopped before commit");
         let result = evidence::append_owned(
@@ -557,6 +587,12 @@ mod tests {
     }
     impl RawFixture {
         fn new(length: usize) -> Result<(Self, Catalog)> {
+            Self::with_manifest(length, |_| {})
+        }
+        fn with_manifest(
+            length: usize,
+            customize: impl FnOnce(&mut crate::lightroom::capture::Manifest),
+        ) -> Result<(Self, Catalog)> {
             let root = tempfile::tempdir()?;
             let absolute = fs::canonicalize(root.path())?;
             let raw = absolute.join("sealed");
@@ -598,6 +634,7 @@ mod tests {
                     blake3: blake3::hash(bytes).to_hex().to_string(),
                 });
             }
+            customize(&mut manifest);
             let old = inspection.revision().to_owned();
             let revision = crate::lightroom::json_digest(&manifest.artifacts)?;
             manifest.revision_id = Some(revision.clone());
@@ -675,6 +712,10 @@ mod tests {
             }
         }
     }
+
+    #[cfg(feature = "internal-capacity-probes")]
+    #[path = "capacity_tests.rs"]
+    mod capacity_tests;
 
     #[test]
     fn artifact_opening_retention_columns_reject_before_materialization() -> Result<()> {

@@ -13,7 +13,11 @@ fn owned_source_fixture() -> Result<()> {
     if std::env::var_os(FIXTURE).is_none() {
         return Ok(());
     }
+    #[cfg(feature = "internal-capacity-probes")]
+    let capacity_baseline = crate::capacity_probes::begin();
     super::super::owner::serve(std::io::stdin(), std::io::stderr())?;
+    #[cfg(feature = "internal-capacity-probes")]
+    crate::capacity_probes::report("owned-source-helper", capacity_baseline);
     std::process::exit(0);
 }
 fn epoch() -> Epoch {
@@ -481,3 +485,7 @@ fn authority_preserves_complete_u128_range_and_reports_open_failure() -> Result<
     );
     Ok(())
 }
+
+#[cfg(feature = "internal-capacity-probes")]
+#[path = "tests/capacity_tests.rs"]
+mod capacity_tests;

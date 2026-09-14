@@ -312,6 +312,8 @@ impl InputSeal {
         )?))
     }
     fn validate(&self) -> Result<()> {
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::SEAL_SETS);
         ensure!(self.protocol == 1, "unsupported migration-source seal");
         ensure!(
             digest_valid(&self.blake3) && self.identity.bytes > 0,
@@ -384,6 +386,11 @@ impl InputSeal {
                 "duplicate supplemental evidence"
             );
         }
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(
+            crate::capacity_probes::SEAL_SETS,
+            crate::capacity_probes::seal(self),
+        );
         Ok(())
     }
 }
@@ -449,6 +456,8 @@ impl MigrationSource {
             !cancel.load(Ordering::Relaxed),
             "inspection-source read canceled"
         );
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        let _capacity_open = crate::capacity_probes::phase(crate::capacity_probes::OPEN_AUTHORITY);
         limits.validate()?;
         seal.validate()?;
         if let Some(protected) = protected {
@@ -1106,3 +1115,7 @@ mod closed_tests;
 #[cfg(test)]
 #[path = "reader_opening_tests.rs"]
 mod opening_tests;
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[path = "reader_capacity_tests.rs"]
+mod capacity_tests;

@@ -84,6 +84,9 @@ impl Session {
         epoch.validate()?;
         let budget = Budget::from_authority(&authority)?;
         let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(crate::capacity_probes::OPEN_AUTHORITY, encoded.capacity());
+
         let binding = authority.binding()?;
         let process_stop = Arc::new(Stop::default());
         let process = Process::spawn_role(
@@ -235,6 +238,8 @@ impl Session {
         result
     }
     fn query_inner(&mut self, query: Read) -> Result<Value> {
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::SOURCE_DECODED);
         let until = Instant::now() + self.deadline;
         let sequence = self.next;
         self.next = self
@@ -272,6 +277,9 @@ impl Session {
             "source result admission identity/bounds"
         );
         let mut encoded = Vec::with_capacity(length);
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(crate::capacity_probes::SOURCE_ENCODED, encoded.capacity());
+
         while encoded.len() < length {
             let Reply::Chunk {
                 sequence: got,
@@ -315,6 +323,8 @@ impl Session {
         // Even when cancellation arrived during streaming, consume its complete
         // ticket before returning the cancellation. Keep the process alive.
         self.check()?;
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(crate::capacity_probes::SOURCE_DECODED, encoded.capacity());
         Value::decode_checked(
             &encoded,
             Expected {
