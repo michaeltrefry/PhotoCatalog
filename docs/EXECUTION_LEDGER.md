@@ -51,7 +51,11 @@ compile found 12 errors before any test ran (receipt
 Independent review found six integration defects: blocking actor I/O, incomplete
 descendant proof, render/read fairness, cache acceptance parity, premature root
 authority release, and synchronous self-wait during an existing native pause.
-Their repairs are in progress; source v3 is running compile-only verification.
+Source v3 passed compile-only verification: one waited Cargo command, zero
+tests executed; receipt `91c2734d7bf2db944ac2da952f9f98f357818c783e21131500b48ce6a3609479`.
+Its three warnings do not constitute a Clippy pass. Subsequent off-actor I/O,
+synchronous-read preflight and native-admission repairs change that source;
+the successor integrated runtime gate remains pending.
 
 Two components have isolated runtime evidence, separate from package acceptance:
 four retained transport-task tests passed (receipt
@@ -65,6 +69,21 @@ completion. Independent scheduler review passed,
 The isolated scheduler wrapper's initial module-path compilation failure was
 retained; only the wrapper changed. Full G actual-child, concurrent stage-lane
 replay, held-transfer responsiveness and desktop queue acceptance remain open.
+
+The v4 successor also failed compilation before tests (missing test-only
+`CodecSettings` import); five evidence hashes and waited exit 101 are verified
+in receipt `094d06b8b3d004e91af143deb773577a2539d4f43b8bd78dd1bfadbf991ce72b`.
+V5 repairs that import and three independently identified shutdown issues:
+canceled unstarted work exits before waiting on an unresolved admission, reads
+receive reserved Stop before sequential shutdown joins, and Render shutdown
+reconciles an unknown filesystem admission when no Job was returned. Its focused
+runtime gate compiled and passed 101 tests before one managed recovery fixture
+failed (two expected Spawn calls versus one observed); the distinction between
+authenticated Stop/status recovery and exact initial replay is being checked.
+Eleven evidence hashes and all six waited commands are verified, with no observed
+owned survivors; receipt `51bb62b838e34623176bab3376e8e86f84f9cd05d3ee3aac7f5b7d7cf50067f3`.
+The remaining groups, Clippy and formatting were not reached. A foreign filesystem pending-operation shutdown cycle
+remains explicitly open; no complete FS8 acceptance is claimed.
 
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
