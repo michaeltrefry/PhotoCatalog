@@ -35,6 +35,73 @@ default-Python import failure is preserved separately. These are local repair
 results; fresh hosted qualification remains required. Comment23345 records the
 preceding integrated gate and the XMP zero-test correction; it was read back.
 
+The repairs are published at `872667e7375f64246e564e74ce3ce795fc38a316`.
+CI34791575107 passed all four jobs, including macOS, Linux and Windows packaging
+and installed-worker checks. All three provider archives and their included
+payload, notices, installer and worker evidence passed read-only verification.
+Receipt `sc-22847-ci-34791575107-5284b88m/receipt.json`, SHA256
+`042a3d7efe02bf7b938906845b357b7af7d7c4167736726eb0b3c36b4a611d67`.
+Mac observer remains receipt-only; GUI acceptance and undiscovered descendant
+absence are not claimed. Comment23346 and its In Progress state were read back
+exactly.
+
+Source Part B's refined full-method admission plan is accepted in comment23347:
+first qualify explicit public/private JSON grammar and shortest accepted forms,
+then implement exact-capacity Manifest decoding and request-derived preflight
+for all nine result kinds and ten Page collections. Candidate byte weights are
+not qualified limits. Part C and combined lifetime admission remain required.
+The first test-only milestone passes all four grammar functions and package
+formatting at frozen v27 (104 pins). The tests confirm the private decoder's
+sequence-tag acceptance widening, which the production B implementation must
+repair. Receipt `sc-22847-lightroom-migration-bridge-xksnotzh/`
+`source-v27-runtime-receipt.json`, SHA256
+`cb69174946734ba46c9c5125b948db057f12523abc284bbf2d8181ecfcdf3297`;
+root verified all four evidence hashes and actual test/gap output. No real files
+or child workers were opened by this JSON-only gate.
+
+FS6 plan v4 is accepted in comment23348 (SHA256
+`0b5794e1dd8aadb958f26d3af1decfd00b06b90b89be5c3741732b865d12f928`).
+The existing F will own preview/configuration descriptors through a session-bound
+C adapter, retaining current, partial and retired root locks until verified final
+native and SQL drain. Managed admission uses independent 16-root/2 MiB actual
+owned-capacity limits, exact 256-byte serialized markers and the existing native
+path cap. Real lock contention, lost results, restart/promotion and checked release
+must be tested before acceptance. Store status has its own bounded control and
+response capacity alongside bootstrap admission status. Both comments and S12's
+In Progress state were read back; FS7/FS8 and production route selection remain
+required.
+
+The real catalog/filesystem relay is integrated as `f7c0b15` (author
+`9539540a3fa04cf3870b7f8877fa52cca38745d8`). All nine integrated files initially
+matched qualified v6 exactly. Twenty-one pure tests and six actual-process
+fixtures pass, along with strict all-target Clippy, package formatting and the
+exact CLI build. Actual SQLite contention verifies held write locks across F
+marker operations, nine SQL closes before root release, and C fatal-74 retirement
+before F termination after lost confirmation. Root verified all 43 final evidence
+artifacts and nine committed blobs. Final author receipt
+`sc-22847-filesystem-relay-y8j0veyc/final-receipt.json`, SHA256
+`65fa85c02640604175040d7fa5c6baca61fed87a1d11906647c2f1b0377e545f`.
+The integrated release/locked Tauri check also passes (8.86 seconds).
+
+Integration found the configured-CLI fixtures needed a dedicated CI invocation:
+the ordinary all-target test step runs before CLI build and supplies no helper
+path. The six external-process tests are now explicitly ignored in ordinary test
+runs and required by a separate post-build runner (six on Unix, five on Windows).
+It supplies the exact built executable and rejects zero-test success; the two
+inert subprocess entrypoints are never admitted as ordinary tests. Local runner
+qualification passes: exact D release build, all six configured fixtures through
+the new runner, and package formatting (session31048 terminal/reaped). Receipt
+`sc-22847-filesystem-relay-y8j0veyc/root-ci-wiring-gate.json` preserves the four
+source pins and all three logs. Independent review then caught Unix-only physical
+IDs in a pure test helper; it now emits the proper native identity on Windows as
+well. The ordinary desktop gate passes 21 tests with eight explicitly ignored
+external/helper entrypoints and no configured executable; strict all-target Clippy
+and formatting also pass (session68966 terminal/reaped). Independent four-file
+source review passes with exact hashes. This fixture correction is checked
+separately from unchanged actual-process test bodies. The relay and CI wiring
+remain local pending publication; production
+selection still requires the remaining custody work.
+
 Earlier successful checkpoints remain preserved: CI34779651605 at `ab921727`
 qualifies reader/preview drain before transport and the exclusive-create guard;
 CI34776023414 at `3bd92de` qualifies its preceding identity/close corrections.

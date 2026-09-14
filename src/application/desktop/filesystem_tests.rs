@@ -451,21 +451,25 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
     Ok(())
 }
 #[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
 fn actual_f_and_eight_sql_roles_preserve_wal_write_lock_through_marker_and_close()
 -> anyhow::Result<()> {
     actual(false, false, false)
 }
 #[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
 fn actual_confirm_loss_reaps_c74_before_f_retirement() -> anyhow::Result<()> {
     actual(true, false, false)
 }
 #[cfg(unix)]
 #[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
 fn actual_f_binary_shm_alias_read_does_not_release_c_posix_lock() -> anyhow::Result<()> {
     actual(false, true, false)
 }
 
 #[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
 fn actual_lost_prepare_inspects_original_record_and_abandons_without_replay() -> anyhow::Result<()>
 {
     actual(false, false, true)

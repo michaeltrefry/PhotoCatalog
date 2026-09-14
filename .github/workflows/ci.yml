@@ -163,6 +163,8 @@ jobs:
         run: ./scripts/validate_windows_volume.ps1
       - name: Build CLI and full-resolution validation probe
         run: cargo build --locked --bins --examples
+      - name: Validate catalog and filesystem process custody
+        run: python scripts/test_catalog_filesystem_processes.py --executable "target/debug/photocatalog${{ runner.os == 'Windows' && '.exe' || '' }}"
       - name: Validate public CC0 Canon and Panasonic RAW originals
         run: python scripts/validate_public_raw.py --probe "target/debug/examples/render_probe${{ runner.os == 'Windows' && '.exe' || '' }}"
 

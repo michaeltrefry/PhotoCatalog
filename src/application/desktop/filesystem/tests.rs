@@ -13,11 +13,24 @@ fn request() -> PrepareCatalog {
         import_source: None,
     }
 }
+fn physical_object(index: u64) -> PhysicalObjectId {
+    #[cfg(unix)]
+    {
+        PhysicalObjectId::Unix {
+            device: U64(u64::MAX),
+            inode: U64(index),
+        }
+    }
+    #[cfg(windows)]
+    {
+        PhysicalObjectId::Windows {
+            volume_serial: U64(u32::MAX as u64),
+            file_index: U64(index),
+        }
+    }
+}
 fn bootstrap(r: &PrepareCatalog, b: &Binding) -> CatalogBootstrap {
-    let physical = PhysicalObjectId::Unix {
-        device: U64(u64::MAX),
-        inode: U64(u64::MAX - 1),
-    };
+    let physical = physical_object(u64::MAX - 1);
     CatalogBootstrap {
         version: 1,
         operation: r.operation,
@@ -35,10 +48,7 @@ fn bootstrap(r: &PrepareCatalog, b: &Binding) -> CatalogBootstrap {
             path: NativePath::from_path(
                 &r.manifest_root.to_path().unwrap().join("previews.sqlite3"),
             ),
-            physical: PhysicalObjectId::Unix {
-                device: U64(u64::MAX),
-                inode: U64(u64::MAX - 2),
-            },
+            physical: physical_object(u64::MAX - 2),
             created: true,
         },
     }
@@ -309,6 +319,7 @@ fn await_lane(owner: &Parent, lane: Lane) -> Result<Out> {
     }
 }
 #[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
 fn actual_queued_cancel_and_duplicate_ids_do_not_dispatch_f_effects() -> Result<()> {
     let owner = real_empty_owner()?;
     let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -454,6 +465,7 @@ fn actual_queued_cancel_and_duplicate_ids_do_not_dispatch_f_effects() -> Result<
     Ok(())
 }
 #[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
 fn actual_idle_f_death_is_monitored_but_normal_retirement_is_not_failure() -> Result<()> {
     let owner = real_empty_owner()?;
     // No C has ever existed; explicit external retirement safely models an idle
