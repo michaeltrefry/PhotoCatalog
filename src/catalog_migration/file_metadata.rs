@@ -2173,6 +2173,11 @@ mod tests {
     }
 }
 
+/// Target layout coefficient for the bounded packet roster's actual element.
+pub(crate) fn packet_guard_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<PacketGuard>()
+}
+
 #[cfg(all(test, feature = "internal-capacity-probes"))]
 #[test]
 fn capacity_fixed_packet_guard_layout() {

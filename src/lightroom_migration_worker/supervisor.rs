@@ -398,7 +398,7 @@ pub(crate) fn execute<A: Admission>(
 ) -> Result<SavedResult> {
     execute_with_broker(
         |stop| Process::spawn(executable, stop),
-        Some(executable.to_path_buf()),
+        Some(executable),
         guard,
         request,
         stop,
@@ -421,7 +421,7 @@ fn execute_owned<A: Admission>(
 }
 fn execute_with_broker<A: Admission>(
     spawn: impl FnOnce(Arc<Stop>) -> Result<Process>,
-    source_executable: Option<std::path::PathBuf>,
+    source_executable: Option<&Path>,
     guard: Guard,
     request: &str,
     stop: Arc<Stop>,
@@ -442,13 +442,30 @@ fn execute_with_broker<A: Admission>(
     // Full typed/core phase admission is added by the coordinator separately.
     let mut memory = budget.reservation();
     memory.grow(INPUT_BYTES)?;
+    // Reserve current-target backing before constructing the broker or any
+    // Child/pipe owner. Two Sources are the complete concurrent role roster.
+    // These fixed owners remain operation-scoped through every checked join.
+    let mut backing = Process::<ChildFrame>::allocation_backing()?;
+    if let Some(path) = source_executable {
+        use super::memory::layout::add;
+        backing = add(backing, Broker::allocation_backing()?)?;
+        backing = add(backing, path.as_os_str().len())?;
+    }
+    memory.grow(backing)?;
     let mut result_memory = budget.reservation();
     result_memory.grow(RESULT_BYTES)?;
     let input_digest = blake3::hash(request.as_bytes()).to_hex().to_string();
     // Start the broker before LM; if LM launch fails, no Source command could
     // have arrived and the broker's owned Drop still joins its thread.
     let broker = source_executable
-        .map(|path| Broker::start(path, guard.clone(), stop.clone(), budget.clone()))
+        .map(|path| {
+            Broker::start(
+                path.to_path_buf(),
+                guard.clone(),
+                stop.clone(),
+                budget.clone(),
+            )
+        })
         .transpose()?;
     let mut owner = Owned {
         process: spawn(stop.clone())?,

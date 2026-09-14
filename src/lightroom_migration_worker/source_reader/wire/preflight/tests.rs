@@ -422,3 +422,89 @@ fn malformed_budget_bodies_cancel_and_reject_before_repeated_output_allocation()
     assert!(decode(&roster, &read, sql()).is_err());
     Ok(())
 }
+
+#[test]
+fn numerical_page_admission_uses_public_count_and_full_rejected_input() -> Result<()> {
+    use crate::lightroom_migration_worker::memory::layout::{add, record_dynamic};
+    let read = |limit| {
+        Read::Sql(Query::Page {
+            revision: "r".into(),
+            collection: Collection::Rows,
+            after: None,
+            limit: U64(limit),
+        })
+    };
+    let small = read(64);
+    let full = read(1000);
+    let limits = ReadLimits {
+        page_bytes: 1024,
+        inline_bytes: 256,
+        ..ReadLimits::default()
+    };
+    fn expected(query: &Read, limits: ReadLimits) -> Expected<'_> {
+        Expected {
+            read: query,
+            budget: Budget::Sql(limits),
+            binding: BINDING,
+        }
+    }
+    let length = 4096; // Rejected partial input can exceed the final page ceiling.
+    let (_, small_graph) = Value::allocation(length, expected(&small, limits))?;
+    let (transient, full_graph) = Value::allocation(length, expected(&full, limits))?;
+    assert!(full_graph > small_graph);
+    assert!(full_graph >= record_dynamic(length, add(1000, 1)?)?);
+    assert!(transient >= 32 * length);
+    assert!(Value::producer_allocation(expected(&full, limits))? > 0);
+    assert!(Value::allocation(length, expected(&read(1001), limits)).is_err());
+    assert!(Value::producer_allocation(expected(&read(1001), limits)).is_err());
+    Ok(())
+}
+
+#[test]
+fn numerical_source_opening_charges_owned_partitions_before_manifest_reads() -> Result<()> {
+    use crate::lightroom_migration_worker::memory::layout::{
+        add, capture_partitions, manifest_dynamic, mul, tree,
+    };
+    use crate::lightroom_migration_worker::protocol::FRAME_BYTES;
+    let partitions = capture_partitions()?;
+    // The rejected SQL row and a duplicate insertion candidate both count.
+    assert_eq!(
+        partitions,
+        add(
+            add(tree::<String, ()>(16_385)?, tree::<String, ()>(16_384)?)?,
+            mul(64, 16_385 + 16_384 + 1)?,
+        )?
+    );
+    let common = add(
+        manifest_dynamic()?,
+        add(
+            mul(32, crate::lightroom::MANIFEST_BYTES)?,
+            mul(8, FRAME_BYTES)?,
+        )?,
+    )?;
+    let limits = ReadLimits::default();
+    let opening = Value::sql_opening_allocation(limits)?;
+    assert_eq!(opening, add(common, partitions)?);
+    let read = Read::Sql(Query::CaptureManifest {
+        revision: REV.into(),
+    });
+    let production = Value::producer_allocation(Expected {
+        read: &read,
+        budget: Budget::Sql(limits),
+        binding: BINDING,
+    })?;
+    assert_eq!(
+        production,
+        add(common, super::super::super::transport::RESULT_BYTES)?
+    );
+    // Opening and Read are separate phases, not two simultaneous Manifest graphs.
+    assert_eq!(
+        opening.max(production),
+        add(
+            common,
+            partitions.max(super::super::super::transport::RESULT_BYTES)
+        )?
+    );
+    println!("SOURCE_OPEN_PARTITIONS requested={partitions} opening={opening} read={production}");
+    Ok(())
+}

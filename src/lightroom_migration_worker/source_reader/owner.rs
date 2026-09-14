@@ -28,6 +28,23 @@ struct Controls {
     cancel: Arc<AtomicBool>,
     epoch: Mutex<Option<Epoch>>,
 }
+pub(super) fn allocation_backing() -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    use std::alloc::Layout;
+    // The control listener and sole reader access state/epoch; no third thread
+    // uses these mutexes. Thread/runtime objects remain the explicit baseline.
+    add(
+        add(
+            channels::arc(Layout::new::<Controls>())?,
+            channels::arc(Layout::new::<AtomicBool>())?,
+        )?,
+        add(
+            channels::pthread_mutexes(4)?,
+            channels::pthread_condvars(2)?,
+        )?,
+    )
+}
+
 impl Controls {
     fn receive(&self) -> Result<Request> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

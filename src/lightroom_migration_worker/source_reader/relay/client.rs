@@ -5,7 +5,7 @@ use super::{Assembly, Command, Event, Kind, Outgoing};
 use crate::{
     application::U64,
     lightroom_migration_worker::{
-        memory::{AllocationGrant, MemoryBudget},
+        memory::{AllocationGrant, MemoryBudget, Reservation},
         process::{Output, Stop},
         protocol::{ChildFrame, Guard, Publish, SourceListener},
     },
@@ -49,30 +49,141 @@ struct Slot {
     stop: Arc<Stop>,
     state: Mutex<State>,
 }
+struct OperationMemory {
+    retained_graph: usize,
+    transient: usize,
+    opening: [usize; 2],
+    producer: [usize; 2],
+    phases: Reservation,
+}
+
+impl OperationMemory {
+    fn required(&self, transient: usize, graph: usize, opening: [usize; 2]) -> Result<usize> {
+        use crate::lightroom_migration_worker::memory::layout::{add, mul};
+        add(
+            add(
+                add(opening[0], opening[1])?,
+                add(self.producer[0], self.producer[1])?,
+            )?,
+            add(transient, mul(3, graph)?)?,
+        )
+    }
+}
+
 pub(crate) struct Client {
     guard: Guard,
     output: Arc<dyn Publish>,
+    operation_memory: Mutex<OperationMemory>,
     slots: Mutex<[Option<Arc<Slot>>; 2]>,
     next: AtomicU64,
     revoked: AtomicBool,
     abort: Arc<dyn Fn() + Send + Sync>,
+    // Last field: payload/slot owners retire first. The production parent grant
+    // remains held beyond this Drop until G has checked the entire LM drain.
+    _backing: Reservation,
 }
 impl Client {
     pub(crate) fn new(
         guard: Guard,
         output: Arc<dyn Publish>,
         abort: Arc<dyn Fn() + Send + Sync>,
+        operation_memory: MemoryBudget,
     ) -> Result<Arc<Self>> {
         guard.validate()?;
+        let mut backing = operation_memory.reservation();
+        backing.grow(Self::allocation_backing()?)?;
         Ok(Arc::new(Self {
             guard,
             output,
+            _backing: backing,
+            operation_memory: Mutex::new(OperationMemory {
+                retained_graph: 0,
+                transient: 0,
+                opening: [0; 2],
+                producer: [0; 2],
+                phases: operation_memory.reservation(),
+            }),
             slots: Mutex::new([None, None]),
             next: AtomicU64::new(1),
             revoked: AtomicBool::new(false),
             abort,
         }))
     }
+    fn allocation_backing() -> Result<usize> {
+        use crate::lightroom_migration_worker::memory::{
+            channels,
+            layout::{add, mul},
+        };
+        use std::alloc::Layout;
+        let slots = add(
+            channels::arc(Layout::new::<Slot>())?,
+            add(
+                channels::arc(Layout::new::<Stop>())?,
+                channels::arc(Layout::new::<AtomicBool>())?,
+            )?,
+        )?;
+        add(
+            add(channels::arc(Layout::new::<Self>())?, mul(2, slots)?)?,
+            channels::pthread_mutexes(8)?,
+        )
+    }
+
+    /// The operation owns returned public values beyond Source quiescence. Its
+    /// Controls/MemoryGrants budget therefore remains separate from EpochGrant.
+    /// The current managed caller retains at most two prior public Source
+    /// results; the third graph allowance is the current result being decoded.
+    pub(crate) fn admit_result(&self, transient: usize, graph: usize) -> Result<()> {
+        self.check()?;
+        let mut owner = self
+            .operation_memory
+            .lock()
+            .map_err(|_| anyhow::anyhow!("migration operation phase admission poisoned"))?;
+        let maximum = owner.retained_graph.max(graph);
+        let transient = owner.transient.max(transient);
+        let required = owner.required(transient, maximum, owner.opening)?;
+        // No local pool mutex is held by ensure_at_least while the parent grant
+        // callback waits. The independent Controls listener does not take this
+        // worker-only phase-owner lock.
+        owner.phases.ensure_at_least(required)?;
+        owner.retained_graph = maximum;
+        owner.transient = transient;
+        Ok(())
+    }
+    /// Opening copies coexist with returned results and the other Source role.
+    /// Retain each role's high-water allowance until the whole operation drains.
+    pub(crate) fn admit_opening(&self, kind: Kind, bytes: usize) -> Result<()> {
+        self.check()?;
+        let mut owner = self
+            .operation_memory
+            .lock()
+            .map_err(|_| anyhow::anyhow!("migration operation phase admission poisoned"))?;
+        let mut opening = owner.opening;
+        opening[kind.index()] = opening[kind.index()].max(bytes);
+        let required = owner.required(owner.transient, owner.retained_graph, opening)?;
+        owner.phases.ensure_at_least(required)?;
+        owner.opening = opening;
+        Ok(())
+    }
+
+    /// Producer work is admitted by LM before it sends the read command. The
+    /// locked Source never waits for a new allocation RPC during SQL execution.
+    pub(crate) fn admit_producer(&self, kind: Kind, bytes: usize) -> Result<()> {
+        self.check()?;
+        let mut owner = self
+            .operation_memory
+            .lock()
+            .map_err(|_| anyhow::anyhow!("migration operation phase admission poisoned"))?;
+        let maximum = owner.producer[kind.index()].max(bytes);
+        let delta = maximum - owner.producer[kind.index()];
+        let required = crate::lightroom_migration_worker::memory::layout::add(
+            owner.required(owner.transient, owner.retained_graph, owner.opening)?,
+            delta,
+        )?;
+        owner.phases.ensure_at_least(required)?;
+        owner.producer[kind.index()] = maximum;
+        Ok(())
+    }
+
     fn check(&self) -> Result<()> {
         ensure!(
             !self.revoked.load(Ordering::Acquire),
@@ -358,6 +469,12 @@ pub(crate) struct Remote {
     slot: Arc<Slot>,
 }
 impl Remote {
+    pub(crate) fn admit_result(&self, transient: usize, graph: usize) -> Result<()> {
+        self.client.admit_result(transient, graph)
+    }
+    pub(crate) fn admit_producer(&self, bytes: usize) -> Result<()> {
+        self.client.admit_producer(self.slot.kind, bytes)
+    }
     pub(crate) fn try_send(&self, request: Request) -> Result<Option<Request>> {
         self.client.check()?;
         ensure!(

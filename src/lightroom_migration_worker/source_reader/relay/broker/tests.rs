@@ -655,7 +655,7 @@ fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> 
     }
     let fixture = Fixture::new();
     let revision = fixture.revision().to_owned();
-    let budget = MemoryBudget::new(1024 * 1024)?;
+    let budget = MemoryBudget::new(2 * 1024 * 1024 * 1024)?;
     let mut caller = budget.reservation();
     caller.grow(17)?;
     let stop = Arc::new(Stop::default());
@@ -685,6 +685,7 @@ fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> 
         guard(),
         Arc::new(Published(output)),
         Arc::new(move || abort.cancel()),
+        budget.clone(),
     )?;
     let worker_client = client.clone();
     let seal = fixture.seal.clone();
@@ -705,12 +706,14 @@ fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> 
             "typed opening made no parent scope reservation"
         );
         let manifest = source.capture_manifest(&revision)?;
+        let result_admitted = observed.used();
         drop(source);
+        let operation_retained = observed.used();
         ensure!(
-            observed.used() == 17,
-            "typed Source Drop omitted checked quiescence"
+            operation_retained > 17 && operation_retained < result_admitted,
+            "Source quiescence must release path scope and retain public-result operation allowance"
         );
-        Ok((manifest, admitted))
+        Ok((manifest, admitted, operation_retained))
     });
     let pumped = (|| -> Result<()> {
         let until = Instant::now() + Duration::from_secs(15);
@@ -761,14 +764,17 @@ fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> 
     absent(&pids);
     drop(broker);
     pumped?;
-    let (manifest, admitted) = joined.expect("typed Source consumer panicked")?;
+    let (manifest, admitted, operation_retained) =
+        joined.expect("typed Source consumer panicked")?;
     drained?;
+    assert_eq!(budget.used(), operation_retained);
+    drop(manifest); // Release public graph before its operation owner.
+    drop(client);
     assert_eq!(budget.used(), 17);
-    drop(manifest); // Public result storage belongs to caller/operation admission.
     drop(caller);
     assert_eq!(budget.used(), 0);
     println!(
-        "TYPED_G_SCOPE admitted={admitted} source_quiesced=17 caller_released=0 worker_thread_joined=true"
+        "TYPED_G_SCOPE admitted={admitted} source_quiesced={operation_retained} operation_released=17 caller_released=0 worker_thread_joined=true"
     );
     Ok(())
 }

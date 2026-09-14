@@ -731,19 +731,29 @@ impl MigrationSource {
             .db
             .prepare("SELECT CASE WHEN typeof(revision)='text' AND length(CAST(revision AS BLOB))=64 THEN revision END FROM captures ORDER BY revision LIMIT 16385")
             .context("prepare source admission capture roster")?;
-        let actual = rows
+        // Insert directly: BTreeSet::from_iter first retains a Vec and stable
+        // sort scratch. The opening allowance covers these two trees and one
+        // current 64-byte candidate, without those extra collection owners.
+        let mut actual = BTreeSet::new();
+        for revision in rows
             .query_map([], |r| r.get::<_, Option<String>>(0))
             .context("query source admission capture roster")?
-            .collect::<rusqlite::Result<Option<BTreeSet<_>>>>()
-            .context("read source admission capture roster")?
-            .context("capture revision storage type/64-byte admission")?;
-        let expected = self
+        {
+            let revision = revision
+                .context("read source admission capture roster")?
+                .context("capture revision storage type/64-byte admission")?;
+            actual.insert(revision);
+        }
+        let mut expected = BTreeSet::new();
+        for revision in self
             .seal
             .selected
             .iter()
-            .map(|r| r.revision.clone())
-            .chain(self.seal.excluded_revisions.iter().cloned())
-            .collect::<BTreeSet<_>>();
+            .map(|r| &r.revision)
+            .chain(self.seal.excluded_revisions.iter())
+        {
+            expected.insert(revision.clone());
+        }
         ensure!(
             actual == expected,
             "selected/excluded capture partition differs from sealed plan"

@@ -29,8 +29,17 @@ impl Budget {
         a: &Authority,
     ) -> Result<Self> {
         Ok(match a {
-            Authority::Sql { limits, .. } => Self::Sql((*limits).try_into()?),
-            Authority::Artifact { limits, .. } => Self::Raw(limits.chunk_bytes.0.try_into()?),
+            Authority::Sql { limits, .. } => {
+                let limits: ReadLimits = (*limits).try_into()?;
+                limits.validate()?;
+                Self::Sql(limits)
+            }
+            Authority::Artifact { limits, .. } => {
+                let limits: crate::catalog_migration::artifacts::ArtifactLimits =
+                    (*limits).try_into()?;
+                limits.validate()?;
+                Self::Raw(limits.chunk_bytes)
+            }
         })
     }
 }

@@ -1,5 +1,6 @@
 //! Checked requested-Rust-storage admission shared by one migration operation.
 //! A configured allowance is a resource decision, never a data-format ceiling.
+pub(crate) mod channels;
 pub(crate) mod layout;
 
 use anyhow::{Context, Result, ensure};
@@ -91,6 +92,15 @@ impl MemoryBudget {
     }
 }
 impl Reservation {
+    /// Admit a complete phase envelope without accumulating the same temporary
+    /// allowance on every row. The high-water charge stays owned through drain;
+    /// a smaller phase does not release payloads still retained by a sibling.
+    pub(crate) fn ensure_at_least(&mut self, required: usize) -> Result<()> {
+        if required > self.held {
+            self.grow(required - self.held)?;
+        }
+        Ok(())
+    }
     pub(crate) fn grow(&mut self, bytes: usize) -> Result<()> {
         let held = self
             .held
@@ -136,6 +146,29 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn phase_high_water_reuses_temporary_allowance_and_preserves_sibling_charge() -> Result<()> {
+        let pool = MemoryBudget::new(100)?;
+        let mut caller = pool.reservation();
+        caller.grow(20)?;
+        let mut phases = pool.reservation();
+        for required in [30, 70, 10, 70] {
+            phases.ensure_at_least(required)?;
+        }
+        assert_eq!(pool.used(), 90);
+        let error = phases.ensure_at_least(81).unwrap_err();
+        let limit = error.downcast_ref::<ResourceLimit>().unwrap();
+        assert_eq!((limit.required, limit.available), (11, 10));
+        assert_eq!(pool.used(), 90);
+        phases.ensure_at_least(80)?;
+        assert_eq!(pool.used(), 100);
+        drop(phases);
+        assert_eq!(pool.used(), 20);
+        drop(caller);
+        assert_eq!(pool.used(), 0);
+        Ok(())
+    }
+
     #[test]
     fn shared_reservations_deny_before_change_and_retire_exactly() -> Result<()> {
         let budget = MemoryBudget::new(100)?;

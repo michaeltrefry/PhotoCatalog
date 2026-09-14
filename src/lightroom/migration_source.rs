@@ -105,7 +105,7 @@ impl Default for ReadLimits {
     }
 }
 impl ReadLimits {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         ensure!(
             (1024..=super::PAGE_BYTES).contains(&self.page_bytes),
             "page byte limit"

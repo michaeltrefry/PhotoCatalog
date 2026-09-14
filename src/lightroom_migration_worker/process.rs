@@ -105,6 +105,23 @@ pub(crate) enum Output<T = ChildFrame> {
     End,
 }
 impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
+    /// Application-owned channel, Arc and erased pipe backing on this target.
+    /// OS/process creation, inherited environment and runtime thread/stack
+    /// initialization remain explicit baseline owners outside this allowance.
+    pub(crate) fn allocation_backing() -> Result<usize> {
+        use super::memory::{channels, layout::add};
+        use std::alloc::Layout;
+        let mut bytes = channels::process::<T>()?;
+        for layout in [
+            Layout::new::<Mutex<Option<String>>>(),
+            Layout::new::<TransportHealth>(),
+            Layout::new::<Stop>(),
+        ] {
+            bytes = add(bytes, channels::arc(layout)?)?;
+        }
+        bytes = add(bytes, channels::pthread_mutexes(2)?)?;
+        add(bytes, std::mem::size_of::<std::process::ChildStdout>())
+    }
     pub(crate) fn spawn(executable: &Path, stop: Arc<Stop>) -> Result<Self> {
         ensure!(
             executable.is_absolute(),

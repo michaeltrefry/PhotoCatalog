@@ -63,7 +63,7 @@ pub struct ArtifactLimits {
     pub chunk_bytes: usize,
 }
 impl ArtifactLimits {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         ensure!(
             self.maximum_bytes > 0 && self.maximum_bytes <= i64::MAX as u64,
             "artifact byte admission limit"

@@ -43,6 +43,40 @@ pub(crate) struct Broker {
     _charges: super::server::Charges,
 }
 impl Broker {
+    pub(crate) fn allocation_backing() -> Result<usize> {
+        use crate::lightroom_migration_worker::memory::{
+            channels,
+            layout::{add, mul},
+        };
+        use std::alloc::Layout;
+        let channels = add(
+            channels::broker::<Command, Event>()?,
+            mul(
+                2,
+                add(
+                    Process::<Reply>::allocation_backing()?,
+                    super::super::owner::allocation_backing()?,
+                )?,
+            )?,
+        )?;
+        let shared = channels::arc(Layout::new::<Shared>())?;
+        let charges = channels::arc(Layout::new::<Mutex<[Option<super::server::Charge>; 2]>>())?;
+        let per_charge = channels::arc(Layout::new::<
+            Mutex<crate::lightroom_migration_worker::memory::Reservation>,
+        >())?;
+        // Shared's condition variable and charge mutexes can be initialized by
+        // either participating owner. Channel mutex candidates are in broker().
+        add(
+            add(add(channels, shared)?, charges)?,
+            add(
+                mul(2, per_charge)?,
+                add(
+                    channels::pthread_mutexes(8)?,
+                    channels::pthread_condvars(2)?,
+                )?,
+            )?,
+        )
+    }
     pub(crate) fn start(
         executable: PathBuf,
         guard: Guard,

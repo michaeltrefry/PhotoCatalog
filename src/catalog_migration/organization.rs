@@ -2012,6 +2012,14 @@ mod tests {
     }
 }
 
+/// Target layout coefficients; no allocation and no exposure of private state.
+pub(crate) fn evidence_cache_entry_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<Kept>()
+}
+pub(crate) fn organization_decision_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<(SourceRecord, Decision)>()
+}
+
 #[cfg(all(test, feature = "internal-capacity-probes"))]
 #[test]
 fn capacity_fixed_evidence_and_decision_layouts() {

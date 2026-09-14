@@ -271,11 +271,11 @@ impl Read {
 /// output buffer, then fill exactly that admitted byte allocation. A geometric
 /// Vec writer's capacity is not bounded by its serialized-length check.
 /// This accounts for requested Rust payload bytes, not allocator metadata/RSS.
-pub(super) fn exact_json<T: Serialize>(
+pub(super) fn exact_json_length<T: Serialize>(
     value: &T,
     maximum: usize,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<Vec<u8>> {
+) -> Result<usize> {
     use std::{io, sync::atomic::Ordering};
     struct Count<'a> {
         length: usize,
@@ -305,7 +305,17 @@ pub(super) fn exact_json<T: Serialize>(
     serde_json::to_writer(&mut count, value)?;
     // Check again before the sole output allocation, including empty values.
     ensure!(!cancel.load(Ordering::Acquire), "source encoding canceled");
-    let mut bytes = vec![0; count.length];
+    Ok(count.length)
+}
+
+pub(super) fn exact_json<T: Serialize>(
+    value: &T,
+    maximum: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>> {
+    use std::{io, sync::atomic::Ordering};
+    let length = exact_json_length(value, maximum, cancel)?;
+    let mut bytes = vec![0; length];
     struct Fill<'a> {
         remaining: &'a mut [u8],
         cancel: &'a std::sync::atomic::AtomicBool,

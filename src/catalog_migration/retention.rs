@@ -854,14 +854,16 @@ impl Catalog {
             if !result.is_empty() && bytes.saturating_add(length) > RECORD_LIMIT {
                 break;
             }
-            result.push((
-                row.get(0)?,
-                decode(
-                    &row.get::<_, Vec<u8>>(1)?,
-                    length,
-                    &row.get::<_, String>(3)?,
-                )?,
-            ));
+            ensure!(length <= RECORD_LIMIT, "retained record size limit");
+            // Keep compressed storage borrowed until admission and decoding finish.
+            let compressed = match row.get_ref(1)? {
+                rusqlite::types::ValueRef::Blob(bytes) if bytes.len() <= RECORD_LIMIT + 32768 => {
+                    bytes
+                }
+                _ => anyhow::bail!("retained record type/size limit"),
+            };
+            let digest = evidence::retained_identity(row, 3)?;
+            result.push((row.get(0)?, decode(compressed, length, &digest)?));
             bytes += length;
         }
         Ok(result)
@@ -872,7 +874,7 @@ impl Catalog {
         record: i64,
         field: &str,
     ) -> Result<evidence::EvidenceState> {
-        let id:String=self.db.query_row("SELECT f.evidence FROM migration_retained_fields f JOIN migration_retained_records r ON r.sequence=f.record WHERE f.record=?1 AND f.field=?2 AND r.complete=1",params![record,field],|r|r.get(0))?;
+        let id:String=self.db.query_row("SELECT f.evidence FROM migration_retained_fields f JOIN migration_retained_records r ON r.sequence=f.record WHERE f.record=?1 AND f.field=?2 AND r.complete=1",params![record,field],|r|evidence::retained_identity(r, 0))?;
         self.migration_evidence(&id)
     }
 }
@@ -880,3 +882,7 @@ impl Catalog {
 #[cfg(all(test, feature = "internal-capacity-probes"))]
 #[path = "retention_capacity_tests.rs"]
 mod capacity_tests;
+
+#[cfg(test)]
+#[path = "retention_query_tests.rs"]
+mod query_tests;

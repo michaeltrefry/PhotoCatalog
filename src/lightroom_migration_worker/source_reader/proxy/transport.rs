@@ -17,6 +17,20 @@ impl From<Remote> for Transport {
     }
 }
 impl Transport {
+    pub(super) fn admit_producer(&self, bytes: usize) -> Result<()> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::Managed(remote) => remote.admit_producer(bytes),
+        }
+    }
+    pub(super) fn admit_result(&self, transient: usize, graph: usize) -> Result<()> {
+        match self {
+            // Legacy direct ownership has its separately qualified path-grant
+            // contract; managed aggregate admission never falls back to it.
+            Self::Direct(_) => Ok(()),
+            Self::Managed(remote) => remote.admit_result(transient, graph),
+        }
+    }
     pub(super) fn try_send(&self, request: Request) -> Result<Option<Request>> {
         match self {
             Self::Direct(p) => p.try_send(request),

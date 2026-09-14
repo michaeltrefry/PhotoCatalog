@@ -105,6 +105,7 @@ impl Session {
         relay: Arc<Client>,
         epoch: Epoch,
         authority: Authority,
+        opening_graph: usize,
         cancel: Arc<AtomicBool>,
         open_ms: u64,
         read_ms: u64,
@@ -119,6 +120,14 @@ impl Session {
             Authority::Artifact { .. } => Kind::Raw,
         };
         let budget = Budget::from_authority(&authority)?;
+        let encoded_length = exact_json_length(&authority, AUTHORITY_BYTES, &cancel)?;
+        relay.admit_opening(
+            kind,
+            crate::lightroom_migration_worker::memory::layout::add(
+                opening_graph,
+                crate::lightroom_migration_worker::memory::layout::mul(3, encoded_length)?,
+            )?,
+        )?;
         let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
         #[cfg(all(test, feature = "internal-capacity-probes"))]
         crate::capacity_probes::observe(crate::capacity_probes::OPEN_AUTHORITY, encoded.capacity());
@@ -314,6 +323,13 @@ impl Session {
             .next
             .checked_add(1)
             .context("source sequence exhausted")?;
+        self.process
+            .admit_producer(Value::producer_allocation(Expected {
+                read: &query,
+                budget: self.budget,
+                binding: &self.binding,
+            })?)?;
+        self.check()?;
         let query_digest =
             crate::lightroom::digest(&crate::lightroom::bounded_json(&query, 120 * 1024)?);
         let expected = query.clone();
@@ -344,6 +360,15 @@ impl Session {
                 && (1..=RESULT_BYTES).contains(&length),
             "source result admission identity/bounds"
         );
+        let (transient, graph) = Value::allocation(
+            length,
+            Expected {
+                read: &expected,
+                budget: self.budget,
+                binding: &self.binding,
+            },
+        )?;
+        self.process.admit_result(transient, graph)?;
         let mut encoded = Vec::with_capacity(length);
         #[cfg(all(test, feature = "internal-capacity-probes"))]
         crate::capacity_probes::observe(crate::capacity_probes::SOURCE_ENCODED, encoded.capacity());
@@ -455,6 +480,32 @@ impl SqlReader {
         protected: Vec<FileKey>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
+        use crate::lightroom::migration_source::{SelectedCapture, SupplementPin};
+        use crate::lightroom_migration_worker::memory::layout::{
+            add, mul, seal_dynamic, seal_validation,
+        };
+        limits.validate()?;
+        // Counting uses the already-owned seal and allocates no JSON buffer.
+        // Clone payload bytes are bounded by its canonical encoded length;
+        // repeated struct/Vec roots require their actual member counts too.
+        let length = exact_json_length(&seal, crate::lightroom::MANIFEST_BYTES, &cancel)?;
+        let members = add(
+            mul(seal.selected.len(), std::mem::size_of::<SelectedCapture>())?,
+            add(
+                mul(seal.excluded_revisions.len(), std::mem::size_of::<String>())?,
+                mul(seal.supplements.len(), std::mem::size_of::<SupplementPin>())?,
+            )?,
+        )?;
+        // Source::admit validates one complete selected Manifest at a time
+        // while both capture partitions remain live. Admit that opening phase
+        // before Open; later reads reuse this per-role producer high water.
+        let opening_work = Value::sql_opening_allocation(limits)?;
+        relay.admit_producer(Kind::Sql, opening_work)?;
+        let opening_graph = add(
+            add(length, members)?,
+            add(seal_dynamic()?, seal_validation()?)?,
+        )?;
+        relay.admit_opening(Kind::Sql, opening_graph)?;
         let session = Session::open(
             relay,
             Epoch { guard, reader },
@@ -463,6 +514,7 @@ impl SqlReader {
                 limits: limits.into(),
                 protected,
             },
+            opening_graph,
             cancel,
             limits.open_deadline_ms,
             limits.deadline_ms,
@@ -603,7 +655,13 @@ impl RawReader {
         protected: Vec<FileKey>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let encoded = crate::lightroom::bounded_json(&descriptor, 64 * 1024)?;
+        limits.validate()?;
+        let length = exact_json_length(&descriptor, 64 * 1024, &cancel)?;
+        // Descriptor clone has four native unit vectors and strings, all paid
+        // by canonical bytes. Preserve the separate retained encoded descriptor.
+        let opening_graph = crate::lightroom_migration_worker::memory::layout::mul(3, length)?;
+        relay.admit_opening(Kind::Raw, opening_graph)?;
+        let encoded = exact_json(&descriptor, 64 * 1024, &cancel)?;
         let session = Session::open(
             relay,
             Epoch { guard, reader },
@@ -612,6 +670,7 @@ impl RawReader {
                 limits: limits.into(),
                 protected,
             },
+            opening_graph,
             cancel,
             limits.open_deadline_ms,
             limits.chunk_deadline_ms,
