@@ -3,6 +3,8 @@
 mod paths;
 use paths::{encode_path, read_path, validate_paths};
 
+#[path = "store_custody.rs"]
+pub(crate) mod custody;
 #[path = "relocation.rs"]
 mod relocation;
 use super::{CodecSettings, PREPARATION_VERSION};
@@ -230,6 +232,36 @@ pub(crate) trait AdmittedStoreFiles: Send + Sync {
         config: &StoreConfig,
         identity: &str,
     ) -> Result<std::sync::Arc<dyn Send + Sync>>;
+    fn lock_tiers_recovering(
+        &self,
+        config: &StoreConfig,
+        identity: &str,
+        relocation: Option<crate::catalog_session::store::Relocation>,
+    ) -> Result<std::sync::Arc<dyn Send + Sync>> {
+        ensure!(relocation.is_none(), "managed preview recovery unavailable");
+        self.lock_tiers(config, identity)
+    }
+    fn recovered_root(&self) -> Option<crate::catalog_session::store::Lease> {
+        None
+    }
+    fn reserve_root(&self, _: &Path, _: Tier) -> Result<crate::catalog_session::store::Lease> {
+        bail!("managed preview relocation reservation unavailable")
+    }
+    fn lock_reserved(&self, _: &crate::catalog_session::store::Lease) -> Result<()> {
+        bail!("managed preview relocation lock unavailable")
+    }
+    fn promote_root(
+        &self,
+        _: &crate::catalog_session::store::Lease,
+    ) -> Result<crate::catalog_session::store::Lease> {
+        bail!("managed preview relocation promotion unavailable")
+    }
+    fn retire_root(&self, _: &crate::catalog_session::store::Lease) -> Result<()> {
+        bail!("managed preview relocation retirement unavailable")
+    }
+    fn abandon_root(&self, _: &crate::catalog_session::store::Lease) -> Result<()> {
+        bail!("managed preview reservation cleanup unavailable")
+    }
 }
 
 /// One owner serializes filesystem/manifest mutations; workers return encoded
@@ -240,6 +272,8 @@ pub struct PreviewStore {
     _lock: Option<AcquiredPreviewLock>,
     _tier_locks: [Option<AcquiredPreviewLock>; 2],
     _managed_lease: Option<std::sync::Arc<dyn Send + Sync>>,
+    managed_files: Option<std::sync::Arc<dyn AdmittedStoreFiles>>,
+    managed_relocation: Option<crate::catalog_session::store::Lease>,
     _relocation_lock: Option<AcquiredPreviewLock>,
     identity: String,
     clock: Cell<i64>,
@@ -341,7 +375,11 @@ impl PreviewStore {
         origin: ManifestOrigin,
         files: std::sync::Arc<dyn AdmittedStoreFiles>,
     ) -> Result<Self> {
-        let config = Self::current_configuration_on(&db, config, origin)?;
+        custody::saved_paths(&db)?;
+        let mut config = Self::current_configuration_on(&db, config, origin)?;
+        config.manifest_root = custody::normalized(&config.manifest_root, "manifest")?;
+        config.thumbnail_root = custody::normalized(&config.thumbnail_root, "thumbnail")?;
+        config.large_root = custody::normalized(&config.large_root, "large")?;
         ensure!(
             config.thumbnail_bytes > 0
                 && config.large_bytes > 0
@@ -427,14 +465,19 @@ impl PreviewStore {
             "INSERT OR IGNORE INTO store_identity VALUES(1,?1)",
             [uuid::Uuid::new_v4().to_string()],
         )?;
-        let identity: String =
+        let identity: String = if files.is_some() {
+            custody::identity(&db, config.layout)?
+        } else {
             db.query_row("SELECT value FROM store_identity WHERE id=1", [], |r| {
                 r.get(0)
-            })?;
-        let (tier_locks, managed_lease) = if let Some(files) = files {
+            })?
+        };
+        let (tier_locks, managed_lease) = if let Some(files) = &files {
             (
                 [None, None],
-                Some(db.retain_opaque_owner(|| files.lock_tiers(&config, &identity))?),
+                Some(db.retain_opaque_owner(|| {
+                    files.lock_tiers_recovering(&config, &identity, custody::relocation(&db)?)
+                })?),
             )
         } else {
             (
@@ -461,6 +504,8 @@ impl PreviewStore {
             _lock: lock,
             _tier_locks: tier_locks,
             _managed_lease: managed_lease,
+            managed_files: files,
+            managed_relocation: None,
             _relocation_lock: None,
             identity,
             clock: Cell::new(clock),

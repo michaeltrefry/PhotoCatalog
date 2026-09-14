@@ -32,6 +32,7 @@ pub(super) enum Kind {
     Drained = 16,
     DrainAck = 17,
     FilesystemAdmission = 18,
+    FilesystemStore = 19,
     #[cfg(test)]
     Fixture = 250,
 }
@@ -56,6 +57,7 @@ impl Kind {
             16 => Ok(Self::Drained),
             17 => Ok(Self::DrainAck),
             18 => Ok(Self::FilesystemAdmission),
+            19 => Ok(Self::FilesystemStore),
             #[cfg(test)]
             250 => Ok(Self::Fixture),
             _ => Err(invalid("unknown desktop frame kind")),
@@ -231,8 +233,11 @@ pub(super) fn build_identity() -> String {
             include_str!("filesystem.rs"),
             include_str!("../../catalog_session.rs"),
             include_str!("../../catalog_session/roles.rs"),
+            include_str!("../../catalog_session/store.rs"),
             include_str!("../../filesystem_worker.rs"),
             include_str!("../../filesystem_worker/bootstrap.rs"),
+            include_str!("../../filesystem_worker/store.rs"),
+            include_str!("../../preview/store_custody.rs"),
             include_str!("../../filesystem_worker/client.rs"),
             include_str!("../../filesystem_worker/process.rs"),
             include_str!("../../filesystem_worker/wire.rs"),

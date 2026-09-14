@@ -61,8 +61,11 @@ pub fn build_identity() -> String {
             include_str!("client.rs"),
             include_str!("process.rs"),
             include_str!("../catalog_session.rs"),
+            include_str!("../catalog_session/store.rs"),
+            include_str!("../preview/store.rs"),
             include_str!("../filesystem_worker.rs"),
             include_str!("bootstrap.rs"),
+            include_str!("store.rs"),
             include_str!("../catalog_backup.rs"),
             include_str!("../lib.rs"),
             include_str!("../catalog_storage.rs"),
@@ -87,6 +90,8 @@ pub fn build_identity() -> String {
 // confirmation inline instead of adding a separate allocation to every decode.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    PreviewStore(crate::catalog_session::store::Request),
+    ReadPreviewConfiguration(NativePath),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
     AbandonPrepare {
@@ -119,9 +124,12 @@ pub enum Operation {
 impl Operation {
     pub(crate) fn is_cleanup(&self) -> bool {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
+            || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
     }
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::PreviewStore(value) => value.validate()?,
+            Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
                 validate_root(&value.root)?;
@@ -219,6 +227,8 @@ impl AdmissionSnapshot {
     deny_unknown_fields
 )]
 pub enum Response {
+    PreviewStore(crate::catalog_session::store::Reply),
+    PreviewConfiguration(Vec<u8>),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
     RestoreStatus(Option<RestoreStatus>),
@@ -232,6 +242,7 @@ pub struct Empty {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
+    ResourceLimit,
     Rejected,
     Canceled,
     Unknown,
@@ -243,16 +254,24 @@ pub struct Failure {
     pub message: String,
 }
 impl Failure {
-    pub fn new(kind: FailureKind, message: impl ToString) -> Self {
-        let mut message = message.to_string();
-        if message.len() > ERROR_BYTES {
-            let mut end = ERROR_BYTES;
-            while !message.is_char_boundary(end) {
-                end -= 1;
+    pub fn new(kind: FailureKind, message: impl std::fmt::Display) -> Self {
+        struct Bounded(String);
+        impl std::fmt::Write for Bounded {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let mut end = text.len().min(ERROR_BYTES.saturating_sub(self.0.len()));
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.0.push_str(&text[..end]);
+                Ok(())
             }
-            message.truncate(end);
         }
-        Self { kind, message }
+        let mut message_out = Bounded(String::with_capacity(ERROR_BYTES));
+        let _ = std::fmt::write(&mut message_out, format_args!("{message}"));
+        Self {
+            kind,
+            message: message_out.0.into_boxed_str().into_string(),
+        }
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -312,6 +331,7 @@ pub struct Status {
 pub(crate) enum Control {
     Status(Status),
     Admission(Option<AdmissionSnapshot>),
+    Store(std::result::Result<crate::catalog_session::store::Status, Failure>),
     Rejected(Failure),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +360,7 @@ pub(crate) enum Kind {
     Stop = 8,
     Control = 9,
     Result = 10,
+    StoreStatus = 11,
 }
 impl Kind {
     fn decode(value: u8) -> io::Result<Self> {
@@ -354,6 +375,7 @@ impl Kind {
             8 => Ok(Self::Stop),
             9 => Ok(Self::Control),
             10 => Ok(Self::Result),
+            11 => Ok(Self::StoreStatus),
             _ => Err(invalid("unknown filesystem frame kind")),
         }
     }
@@ -550,7 +572,9 @@ pub(crate) fn encode(value: &impl Serialize, cap: usize) -> Result<Vec<u8>> {
     }
     let mut count = Count { bytes: 0, cap };
     serde_json::to_writer(&mut count, value)?;
-    let mut bytes = vec![0; count.bytes];
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(count.bytes)?;
+    bytes.resize(count.bytes, 0);
     let mut cursor = io::Cursor::new(bytes.as_mut_slice());
     serde_json::to_writer(&mut cursor, value)?;
     ensure!(

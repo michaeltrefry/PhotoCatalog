@@ -1,7 +1,7 @@
 //! Single execution owner and independent bounded controls for the F helper.
 use super::wire::*;
 use crate::application::U64;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     io::{Read, Write},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -47,6 +47,8 @@ struct State {
     retained: Option<Retained>,
     admission: Option<AdmissionSnapshot>,
     admission_reply: Option<(u64, Control)>,
+    store: Option<super::store::Snapshot>,
+    store_reply: Option<(u64, Control)>,
     error: Option<Failure>,
     last_sequence: u64,
     revision: u64,
@@ -87,7 +89,12 @@ impl State {
             cancel.store(true, Ordering::Release);
         }
         // This item has not entered Handler. A stopped owner never dispatches it.
-        if let Some(pending) = self.queued.take() {
+        if self
+            .queued
+            .as_ref()
+            .is_some_and(|p| !p.operation.is_cleanup())
+            && let Some(pending) = self.queued.take()
+        {
             self.canceled_before_execution = Some(U64(pending.sequence));
         }
         self.changed();
@@ -108,6 +115,8 @@ impl Shared {
                 retained: None,
                 admission: None,
                 admission_reply: None,
+                store: None,
+                store_reply: None,
                 error: None,
                 last_sequence: 0,
                 revision: 1,
@@ -124,7 +133,7 @@ impl Shared {
             epoch,
         }
     }
-    fn fail(&self, message: impl ToString) {
+    fn fail(&self, message: impl std::fmt::Display) {
         let mut state = self.state.lock().unwrap();
         state.error = Some(Failure::new(FailureKind::Unknown, message));
         state.stop();
@@ -138,10 +147,40 @@ pub struct OperationContext {
     cancel: Arc<AtomicBool>,
     shared: Arc<Shared>,
     admission: Option<(U64, crate::catalog_session::LeaseId)>,
+    store: Option<crate::catalog_session::store::StatusQuery>,
 }
 impl OperationContext {
     pub fn cancellation(&self) -> &AtomicBool {
         &self.cancel
+    }
+    pub(super) fn publish_store(&self, snapshot: super::store::Snapshot) -> Result<()> {
+        let query = self
+            .store
+            .as_ref()
+            .context("operation cannot publish preview status")?;
+        ensure!(
+            query.epoch == self.shared.epoch,
+            "preview snapshot helper epoch mismatch"
+        );
+        snapshot.status(query)?.validate(query)?;
+        self.shared.state.lock().unwrap().store = Some(snapshot);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+    pub(super) fn clear_store(&self, root: &crate::catalog_session::RootCapability) -> Result<()> {
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(snapshot) = &state.store {
+            let query = crate::catalog_session::store::StatusQuery::from(
+                &crate::catalog_session::store::Query {
+                    root: root.clone(),
+                    operation: U64(1),
+                    selected: None,
+                },
+            );
+            snapshot.status(&query)?;
+        }
+        state.store = None;
+        Ok(())
     }
     pub fn publish_admission(&self, snapshot: AdmissionSnapshot) -> Result<()> {
         snapshot.validate()?;
@@ -406,7 +445,12 @@ fn input_loop(input: &mut impl Read, nonce: [u8; 16], shared: &Arc<Shared>) -> R
                     shared.wake.notify_all();
                 }
             }
-            Kind::Cancel | Kind::Ack | Kind::Status | Kind::AdmissionStatus | Kind::Stop => {
+            Kind::Cancel
+            | Kind::Ack
+            | Kind::Status
+            | Kind::AdmissionStatus
+            | Kind::StoreStatus
+            | Kind::Stop => {
                 ensure!(
                     frame.offset == 0 && frame.total == frame.payload.len(),
                     "fragmented filesystem control"
@@ -457,6 +501,26 @@ fn input_loop(input: &mut impl Read, nonce: [u8; 16], shared: &Arc<Shared>) -> R
                         {
                             result.sent = false;
                         }
+                    }
+                    Kind::StoreStatus => {
+                        ensure!(
+                            state.store_reply.is_none(),
+                            "preview status reply already pending"
+                        );
+                        let query: crate::catalog_session::store::StatusQuery =
+                            decode(&frame.payload, CHUNK_BYTES)?;
+                        query.validate()?;
+                        ensure!(
+                            query.epoch == shared.epoch,
+                            "preview status helper epoch mismatch"
+                        );
+                        let value = state
+                            .store
+                            .as_ref()
+                            .context("preview ownership has no published status")
+                            .and_then(|s| s.status(&query))
+                            .map_err(|e| Failure::new(FailureKind::Rejected, e));
+                        state.store_reply = Some((frame.sequence, Control::Store(value)));
                     }
                     Kind::AdmissionStatus => {
                         ensure!(
@@ -526,7 +590,12 @@ fn execution_loop<H: Handler, F: FnOnce(Startup) -> Result<H>>(
         let pending = {
             let mut state = shared.state.lock().unwrap();
             loop {
-                if state.stop_attempt > state.stopped_attempt {
+                if state.stop_attempt > state.stopped_attempt
+                    && !state
+                        .queued
+                        .as_ref()
+                        .is_some_and(|p| p.operation.is_cleanup())
+                {
                     let attempt = state.stop_attempt;
                     let wire_attempt = state.shutdown_wire;
                     drop(state);
@@ -598,11 +667,27 @@ fn execution_loop<H: Handler, F: FnOnce(Startup) -> Result<H>>(
             }
         });
         let context = OperationContext {
-            cancel: pending.cancel.clone(),
+            cancel: if pending.operation.is_cleanup() {
+                Arc::new(AtomicBool::new(false))
+            } else {
+                pending.cancel.clone()
+            },
             shared: shared.clone(),
             admission,
+            store: match &pending.operation {
+                Operation::PreviewStore(r) => {
+                    Some(crate::catalog_session::store::StatusQuery::from(
+                        &crate::catalog_session::store::Query {
+                            root: r.root.clone(),
+                            operation: r.operation,
+                            selected: None,
+                        },
+                    ))
+                }
+                _ => None,
+            },
         };
-        let result = if pending.cancel.load(Ordering::Acquire) {
+        let result = if pending.cancel.load(Ordering::Acquire) && !pending.operation.is_cleanup() {
             if let Operation::PrepareCatalog(_) = &pending.operation {
                 let mut state = shared.state.lock().unwrap();
                 if let Some(snapshot) = state.admission.as_mut() {
@@ -682,10 +767,15 @@ fn control_loop(mut output: impl Write, nonce: [u8; 16], shared: &Shared) -> Res
     loop {
         let (sequence, value, stopped) = {
             let mut state = shared.state.lock().unwrap();
-            while state.revision == seen && state.admission_reply.is_none() {
+            while state.revision == seen
+                && state.admission_reply.is_none()
+                && state.store_reply.is_none()
+            {
                 state = shared.wake.wait(state).unwrap();
             }
-            if let Some((sequence, value)) = state.admission_reply.take() {
+            if let Some((sequence, value)) = state.store_reply.take() {
+                (sequence, value, false)
+            } else if let Some((sequence, value)) = state.admission_reply.take() {
                 (sequence, value, false)
             } else {
                 seen = state.revision;

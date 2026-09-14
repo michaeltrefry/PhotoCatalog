@@ -126,8 +126,25 @@ impl PreviewStore {
                 ensure!(phase == "cleanup", "invalid relocation phase");
                 source
             };
-            self._relocation_lock =
-                Some(lock_root(&extra, &self.identity, tier, self.config.layout)?);
+            if let Some(files) = &self.managed_files {
+                let extra = custody::normalized(&extra, "relocation recovery")?;
+                let reservation = if let Some(held) = files.recovered_root() {
+                    ensure!(
+                        held.path == crate::storage_volume::NativePath::from_path(&extra)
+                            && held.tier == tier,
+                        "recovered preview root facts mismatch"
+                    );
+                    held
+                } else {
+                    files.reserve_root(&extra, tier)?
+                };
+                // Acquisition errors retain partial custody in F until root close.
+                files.lock_reserved(&reservation)?;
+                self.managed_relocation = Some(reservation);
+            } else {
+                self._relocation_lock =
+                    Some(lock_root(&extra, &self.identity, tier, self.config.layout)?);
+            }
         }
         Ok(())
     }
@@ -184,6 +201,11 @@ impl PreviewStore {
         );
         self.flush_touches()?;
         let destination = prospective(destination)?;
+        let destination = if self.managed_files.is_some() {
+            custody::normalized(&destination, "relocation target")?
+        } else {
+            destination
+        };
         for other in [
             &self.config.manifest_root,
             &self.config.thumbnail_root,
@@ -201,34 +223,68 @@ impl PreviewStore {
                 "relocation overlaps originals"
             );
         }
-        fs::create_dir_all(&destination)?;
+        // Reserve finite F ownership before any destination or journal effect.
+        let reservation = self
+            .managed_files
+            .as_ref()
+            .map(|files| files.reserve_root(&destination, tier))
+            .transpose()?;
+        if self.managed_files.is_none() {
+            fs::create_dir_all(&destination)?;
+        }
         // A crash after durable ownership markers but before the journal insert
         // can be retried only by this same manifest/tier/layout. No data objects
         // or foreign entries may be adopted. The marker lock below authenticates
         // ownership before an incomplete relocation marker is rewritten.
-        for entry in fs::read_dir(&destination)? {
-            let entry = entry?;
+        let preflight = (|| -> Result<()> {
+            if destination.exists() {
+                for entry in fs::read_dir(&destination)? {
+                    let entry = entry?;
+                    ensure!(
+                        entry.file_type()?.is_file()
+                            && matches!(
+                                entry.file_name().to_str(),
+                                Some(".photocatalog-preview-owner" | ".photocatalog-relocation")
+                            ),
+                        "relocation destination contains non-admission files"
+                    );
+                }
+            }
+            let relocation_marker = destination.join(".photocatalog-relocation");
             ensure!(
-                entry.file_type()?.is_file()
-                    && matches!(
-                        entry.file_name().to_str(),
-                        Some(".photocatalog-preview-owner" | ".photocatalog-relocation")
-                    ),
-                "relocation destination contains non-admission files"
+                !relocation_marker.exists()
+                    || destination.join(".photocatalog-preview-owner").exists(),
+                "relocation marker has no owning manifest"
             );
+            if relocation_marker.exists() {
+                ensure!(
+                    fs::metadata(destination.join(".photocatalog-preview-owner"))?.len() > 0,
+                    "relocation admission has no recorded owner identity"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = preflight {
+            if let (Some(files), Some(reservation)) = (&self.managed_files, &reservation) {
+                files
+                    .abandon_root(reservation)
+                    .context("retain or abandon failed relocation preflight")?;
+            }
+            return Err(error);
         }
+        let target_lock =
+            if let (Some(files), Some(reservation)) = (&self.managed_files, &reservation) {
+                files.lock_reserved(reservation)?;
+                None
+            } else {
+                Some(lock_root(
+                    &destination,
+                    &self.identity,
+                    tier,
+                    self.config.layout,
+                )?)
+            };
         let relocation_marker = destination.join(".photocatalog-relocation");
-        ensure!(
-            !relocation_marker.exists() || destination.join(".photocatalog-preview-owner").exists(),
-            "relocation marker has no owning manifest"
-        );
-        if relocation_marker.exists() {
-            ensure!(
-                fs::metadata(destination.join(".photocatalog-preview-owner"))?.len() > 0,
-                "relocation admission has no recorded owner identity"
-            );
-        }
-        let target_lock = lock_root(&destination, &self.identity, tier, self.config.layout)?;
         let id = if relocation_marker.exists() {
             ensure!(
                 fs::metadata(&relocation_marker)?.len() <= 36,
@@ -263,7 +319,8 @@ impl PreviewStore {
                 encode_path(&destination)?
             ],
         )?;
-        self._relocation_lock = Some(target_lock);
+        self._relocation_lock = target_lock;
+        self.managed_relocation = reservation;
         Ok(())
     }
     /// At most `limit` entries and `byte_limit` bytes per call; an individual
@@ -303,6 +360,38 @@ impl PreviewStore {
                 complete: true,
             });
         };
+        let source = if self.managed_files.is_some() {
+            custody::normalized(&source, "relocation source")?
+        } else {
+            source
+        };
+        let target = if self.managed_files.is_some() {
+            custody::normalized(&target, "relocation target")?
+        } else {
+            target
+        };
+        // A committed SQL transition can outlive its F reply. Reconcile the exact
+        // retained promotion before reading or deleting another cache object.
+        if phase == "cleanup"
+            && let Some(files) = &self.managed_files
+        {
+            let current = if tier == Tier::Thumbnail {
+                &self.config.thumbnail_root
+            } else {
+                &self.config.large_root
+            };
+            if current != &target {
+                let held = self
+                    .managed_relocation
+                    .as_ref()
+                    .context("managed relocation target missing")?;
+                self.managed_relocation = Some(files.promote_root(held)?);
+                match tier {
+                    Tier::Thumbnail => self.config.thumbnail_root = target.clone(),
+                    Tier::Large => self.config.large_root = target.clone(),
+                }
+            }
+        }
         let mut marker_file = File::open(target.join(".photocatalog-relocation"))?;
         ensure!(
             id.len() <= 128 && marker_file.metadata()?.len() == id.len() as u64,
@@ -409,20 +498,39 @@ impl PreviewStore {
                 )?;
                 tx.commit()?;
                 let index = if tier == Tier::Thumbnail { 0 } else { 1 };
-                let target_lock = self
-                    ._relocation_lock
-                    .take()
-                    .context("relocation target lock missing")?;
-                self._relocation_lock = self._tier_locks[index].replace(target_lock);
+                if let Some(files) = &self.managed_files {
+                    let target_lock = self
+                        .managed_relocation
+                        .as_ref()
+                        .context("managed relocation target lock missing")?;
+                    self.managed_relocation = Some(files.promote_root(target_lock)?);
+                } else {
+                    let target_lock = self
+                        ._relocation_lock
+                        .take()
+                        .context("relocation target lock missing")?;
+                    self._relocation_lock = self._tier_locks[index].replace(target_lock);
+                }
                 match tier {
                     Tier::Thumbnail => self.config.thumbnail_root = target,
                     Tier::Large => self.config.large_root = target,
                 };
                 progress.phase = "cleanup".into();
             } else {
+                if let Some(files) = &self.managed_files {
+                    let old = self
+                        .managed_relocation
+                        .as_ref()
+                        .context("managed relocation cleanup lock missing")?;
+                    files.retire_root(old)?;
+                }
                 self.db
                     .execute("DELETE FROM relocations WHERE tier=?1", [tier.name()])?;
-                self._relocation_lock.take();
+                if self.managed_files.is_some() {
+                    self.managed_relocation.take();
+                } else {
+                    self._relocation_lock.take();
+                }
                 progress.phase = "complete".into();
                 progress.complete = true;
                 // Keep the small ownership marker as an audit anchor. Foreign

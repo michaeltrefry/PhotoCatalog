@@ -24,9 +24,11 @@ use std::{
 
 struct Outbound {
     command: Option<Message>,
+    command_cleanup: bool,
     cancel: Option<u64>,
     ack: Option<Ack>,
     admission: Option<(u64, AdmissionQuery)>,
+    store: Option<(u64, crate::catalog_session::store::StatusQuery)>,
     status: Option<u64>,
     stop: Option<u64>,
     close: bool,
@@ -38,6 +40,12 @@ struct State {
     waiting: Option<u64>,
     result: Option<(u64, Outcome, String)>,
     admission: Option<(u64, Option<AdmissionSnapshot>)>,
+    store: Option<(
+        u64,
+        std::result::Result<crate::catalog_session::store::Status, Failure>,
+    )>,
+    store_sequence: u64,
+    store_waiting: Option<(u64, crate::catalog_session::store::StatusQuery)>,
     failure: Option<Failure>,
     reaped: bool,
     io_drained: bool,
@@ -65,7 +73,7 @@ struct Shared {
     nonce: [u8; 16],
 }
 impl Shared {
-    fn fail(&self, message: impl ToString) {
+    fn fail(&self, message: impl std::fmt::Display) {
         let mut state = self.state.lock().unwrap();
         if state.failure.is_none() {
             state.failure = Some(Failure::new(FailureKind::Unknown, message));
@@ -157,6 +165,7 @@ pub struct Client {
     owner: Mutex<Owner>,
     calls: Mutex<()>,
     admission_calls: Mutex<()>,
+    store_calls: Mutex<()>,
     shutdown: Mutex<()>,
     epoch: LeaseId,
     pid: u32,
@@ -214,9 +223,11 @@ impl Client {
                 },
                 outgoing: Outbound {
                     command: None,
+                    command_cleanup: false,
                     cancel: None,
                     ack: None,
                     admission: None,
+                    store: None,
                     status: None,
                     stop: None,
                     close: false,
@@ -225,6 +236,9 @@ impl Client {
                 waiting: None,
                 result: None,
                 admission: None,
+                store: None,
+                store_sequence: 0,
+                store_waiting: None,
                 failure: None,
                 reaped: false,
                 io_drained: false,
@@ -275,6 +289,7 @@ impl Client {
             owner: Mutex::new(owner),
             calls: Mutex::new(()),
             admission_calls: Mutex::new(()),
+            store_calls: Mutex::new(()),
             shutdown: Mutex::new(()),
             epoch: startup.epoch,
             pid,
@@ -374,7 +389,7 @@ impl Client {
                 ) && operation.is_cleanup()),
             "filesystem helper is not admitting operations"
         );
-        if cancel.load(Ordering::Acquire) {
+        if cancel.load(Ordering::Acquire) && !operation.is_cleanup() {
             return Err(Failure::new(
                 FailureKind::Canceled,
                 "filesystem operation canceled before admission",
@@ -391,6 +406,7 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("filesystem sequence exhausted"))?;
         let sequence = state.sequence;
         state.waiting = Some(sequence);
+        state.outgoing.command_cleanup = operation.is_cleanup();
         state.outgoing.command = Some(Message {
             kind: Kind::Execute,
             sequence,
@@ -433,7 +449,7 @@ impl Client {
             // the call and acknowledgement slot until that exact result arrives.
             // Poisoned pipes are handled by the sticky failure above.
 
-            if !signaled && cancel.load(Ordering::Acquire) {
+            if !signaled && cancel.load(Ordering::Acquire) && !operation.is_cleanup() {
                 state.outgoing.cancel = Some(sequence);
                 signaled = true;
                 self.shared.wake.notify_all();
@@ -499,13 +515,82 @@ impl Client {
             state = self.shared.wake.wait(state).unwrap();
         }
     }
+    pub fn store_status(
+        &self,
+        query: &crate::catalog_session::store::StatusQuery,
+    ) -> Result<crate::catalog_session::store::Status> {
+        query.validate()?;
+        ensure!(
+            query.epoch == self.epoch,
+            "preview query helper epoch mismatch"
+        );
+        let _call = self.store_calls.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
+        // A fully received matching response is authoritative even when Stop
+        // arrived immediately afterward. No new query is sent to a dead writer.
+        if state
+            .store_waiting
+            .as_ref()
+            .is_some_and(|(_, active)| active == query)
+            && let Some((sequence, value)) = state.store.take()
+        {
+            ensure!(
+                state
+                    .store_waiting
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == sequence),
+                "preview status sequence mismatch"
+            );
+            state.store_waiting = None;
+            return value.map_err(Into::into);
+        }
+        ensure!(
+            !state.reaped && !state.outgoing.close && state.status.phase != Phase::Stopped,
+            "preview filesystem owner is terminal"
+        );
+        if let Some(error) = &state.failure {
+            return Err(error.clone().into());
+        }
+        ensure!(
+            state.outgoing.store.is_none()
+                && state.store.is_none()
+                && state.store_waiting.is_none(),
+            "preview status slot busy"
+        );
+        state.store_sequence = state
+            .store_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("preview query sequence exhausted"))?;
+        let sequence = state.store_sequence;
+        state.store_waiting = Some((sequence, query.clone()));
+        state.outgoing.store = Some((sequence, query.clone()));
+        self.shared.wake.notify_all();
+        loop {
+            if let Some((actual, value)) = state.store.take() {
+                ensure!(actual == sequence, "preview status sequence mismatch");
+                state.store_waiting = None;
+                return value.map_err(Into::into);
+            }
+            if state.reaped || state.outgoing.close || state.status.phase == Phase::Stopped {
+                state.store_waiting = None;
+                state.outgoing.store = None;
+                anyhow::bail!("preview filesystem owner is terminal");
+            }
+            if let Some(error) = &state.failure {
+                return Err(error.clone().into());
+            }
+            state = self.shared.wake.wait(state).unwrap();
+        }
+    }
     pub fn signal_stop(&self) {
         let mut state = self.shared.state.lock().unwrap();
         if state.status.phase == Phase::Stopped {
             return;
         }
         state.closing = true;
-        if let Some(command) = state.outgoing.command.take() {
+        if !state.outgoing.command_cleanup
+            && let Some(command) = state.outgoing.command.take()
+        {
             state.result = Some((
                 command.sequence,
                 Err(Failure::new(
@@ -657,6 +742,14 @@ fn write_loop(mut input: impl Write, hello: Vec<u8>, shared: &Shared) -> Result<
                     return Ok(());
                 }
                 let out = &mut state.outgoing;
+                // A pending cleanup must reach even an idle F before Stop can
+                // affirm shutdown; preserving the slot alone is insufficient.
+                if out.command_cleanup
+                    && let Some(command) = out.command.take()
+                {
+                    out.command_cleanup = false;
+                    break command;
+                }
                 if let Some(sequence) = out.stop.take() {
                     break Message {
                         kind: Kind::Stop,
@@ -676,6 +769,13 @@ fn write_loop(mut input: impl Write, hello: Vec<u8>, shared: &Shared) -> Result<
                         kind: Kind::Ack,
                         sequence: ack.sequence.0,
                         bytes: encode(&ack, CHUNK_BYTES)?,
+                    };
+                }
+                if let Some((id, query)) = out.store.take() {
+                    break Message {
+                        kind: Kind::StoreStatus,
+                        sequence: id,
+                        bytes: encode(&query, CHUNK_BYTES)?,
                     };
                 }
                 if let Some((id, query)) = out.admission.take() {
@@ -738,6 +838,22 @@ fn read_loop(mut input: impl Read, control: bool, shared: &Shared) -> Result<()>
                     }
                     state.status = value;
                 }
+                Control::Store(value) => {
+                    let (sequence, query) = state
+                        .store_waiting
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("unsolicited preview status response"))?;
+                    ensure!(
+                        *sequence == message.sequence,
+                        "preview status response sequence mismatch"
+                    );
+                    ensure!(state.store.is_none(), "preview status reply slot occupied");
+                    match &value {
+                        Ok(status) => status.validate(query)?,
+                        Err(error) => error.validate()?,
+                    }
+                    state.store = Some((message.sequence, value));
+                }
                 Control::Admission(value) => {
                     if let Some(snapshot) = &value {
                         snapshot.validate()?;
@@ -797,6 +913,43 @@ fn read_loop(mut input: impl Read, control: bool, shared: &Shared) -> Result<()>
 }
 
 impl CatalogFilesystem for Client {
+    fn preview_store_call(
+        &self,
+        request: &crate::catalog_session::store::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::store::Reply> {
+        match self.execute(Operation::PreviewStore(request.clone()), cancel)? {
+            Response::PreviewStore(value) => {
+                crate::catalog_session::store::validate_reply(request, &value)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected preview custody response"),
+        }
+    }
+    fn preview_store_status(
+        &self,
+        query: &crate::catalog_session::store::Query,
+    ) -> Result<crate::catalog_session::store::Status> {
+        crate::catalog_session::store::path(&query.root.canonical_root)?;
+        self.store_status(&crate::catalog_session::store::StatusQuery::from(query))
+    }
+    fn read_preview_configuration(
+        &self,
+        path: &NativePath,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<u8>> {
+        match self.execute(Operation::ReadPreviewConfiguration(path.clone()), cancel)? {
+            Response::PreviewConfiguration(value) => {
+                ensure!(
+                    value.len() <= crate::catalog_session::store::CONFIG_BYTES,
+                    "preview configuration reply byte limit"
+                );
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected preview configuration response"),
+        }
+    }
+
     fn prepare_catalog(
         &self,
         request: &PrepareCatalog,
@@ -889,6 +1042,319 @@ mod tests {
     use super::*;
     use crate::filesystem_worker::process::{Handler, OperationContext};
     use std::{fs, io, path::PathBuf};
+
+    // No child or I/O thread exists in these transport-state fixtures.
+    fn bare() -> Result<Client> {
+        let startup = Startup::new(vec![])?;
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                status: Status {
+                    phase: Phase::Starting,
+                    shutdown_attempt: U64(0),
+                    active: None,
+                    queued: None,
+                    retained: None,
+                    canceled_before_execution: None,
+                    error: None,
+                },
+                outgoing: Outbound {
+                    command: None,
+                    command_cleanup: false,
+                    cancel: None,
+                    ack: None,
+                    admission: None,
+                    store: None,
+                    status: None,
+                    stop: None,
+                    close: false,
+                },
+                sequence: 0,
+                waiting: None,
+                result: None,
+                admission: None,
+                store: None,
+                store_sequence: 0,
+                store_waiting: None,
+                failure: None,
+                reaped: false,
+                io_drained: false,
+                closing: false,
+                completed: None,
+                calls: 0,
+                shutdown_requested: 0,
+                startup_failed: false,
+            }),
+            wake: Condvar::new(),
+            nonce: startup.nonce(),
+        });
+        shared.state.lock().unwrap().status.phase = Phase::Ready;
+        Ok(Client {
+            shared,
+            owner: Mutex::new(Owner {
+                child: None,
+                threads: vec![],
+                faults: Faults::default(),
+            }),
+            calls: Mutex::new(()),
+            admission_calls: Mutex::new(()),
+            store_calls: Mutex::new(()),
+            shutdown: Mutex::new(()),
+            epoch: startup.epoch,
+            pid: 0,
+        })
+    }
+    fn store_query(client: &Client) -> Result<crate::catalog_session::store::StatusQuery> {
+        let file = tempfile::tempfile()?;
+        let physical = crate::catalog_storage::physical_object_id(&file)?;
+        Ok(crate::catalog_session::store::StatusQuery {
+            epoch: client.epoch.clone(),
+            token: LeaseId::new(),
+            session: LeaseId::new(),
+            root_physical: physical,
+            catalog_physical: physical,
+            operation: U64(7),
+            selected: None,
+        })
+    }
+    fn control_bytes(
+        client: &Client,
+        sequence: u64,
+        value: Control,
+        stopped: bool,
+    ) -> Result<Vec<u8>> {
+        let mut bytes = vec![];
+        Message {
+            kind: Kind::Control,
+            sequence,
+            bytes: encode(&value, MESSAGE_BYTES)?,
+        }
+        .write(client.shared.nonce, &mut bytes)?;
+        if stopped {
+            let mut status = client.shared.state.lock().unwrap().status.clone();
+            status.phase = Phase::Stopped;
+            Message {
+                kind: Kind::Control,
+                sequence: 0,
+                bytes: encode(&Control::Status(status), MESSAGE_BYTES)?,
+            }
+            .write(client.shared.nonce, &mut bytes)?;
+        }
+        Ok(bytes)
+    }
+    #[test]
+    fn store_control_validates_active_sequence_payload_bounds_and_terminal_delivery() -> Result<()>
+    {
+        for invalid in 0..3 {
+            let client = bare()?;
+            let query = store_query(&client)?;
+            if invalid != 2 {
+                client.shared.state.lock().unwrap().store_waiting = Some((9, query));
+            }
+            let failure = Failure {
+                kind: FailureKind::Unknown,
+                message: "x".repeat(if invalid == 1 { ERROR_BYTES + 1 } else { 1 }),
+            };
+            let bytes = control_bytes(
+                &client,
+                if invalid == 0 { 8 } else { 9 },
+                Control::Store(Err(failure)),
+                false,
+            )?;
+            let error = read_loop(bytes.as_slice(), true, &client.shared).unwrap_err();
+            client.shared.fail(error);
+            let state = client.shared.state.lock().unwrap();
+            assert!(state.store.is_none() && state.failure.is_some());
+        }
+        let client = bare()?;
+        let query = store_query(&client)?;
+        client.shared.state.lock().unwrap().store_waiting = Some((9, query.clone()));
+        let status = crate::catalog_session::store::Status {
+            operation: query.operation,
+            group: None,
+            stage: None,
+            slots: 0,
+            owned_bytes: 0,
+            selected: None,
+        };
+        let bytes = control_bytes(&client, 9, Control::Store(Ok(status.clone())), true)?;
+        read_loop(bytes.as_slice(), true, &client.shared)?;
+        assert_eq!(
+            client.store_status(&query)?,
+            status,
+            "received reply must win over subsequent Stop"
+        );
+        assert!(
+            client.store_status(&query).is_err(),
+            "terminal writer must not accept a new query before reap"
+        );
+        Ok(())
+    }
+    #[test]
+    fn store_query_waiter_settles_on_clean_terminal_control_before_reap() -> Result<()> {
+        let client = Arc::new(bare()?);
+        let query = store_query(&client)?;
+        let querying = client.clone();
+        let waiter = std::thread::spawn(move || querying.store_status(&query));
+        {
+            let mut state = client.shared.state.lock().unwrap();
+            while state.store_waiting.is_none() {
+                state = client.shared.wake.wait(state).unwrap();
+            }
+        }
+        let mut status = client.shared.state.lock().unwrap().status.clone();
+        status.phase = Phase::Stopped;
+        let bytes = control_bytes(&client, 0, Control::Status(status), false)?;
+        read_loop(bytes.as_slice(), true, &client.shared)?;
+        assert!(waiter.join().unwrap().is_err());
+        assert!(client.shared.state.lock().unwrap().store_waiting.is_none());
+        Ok(())
+    }
+    #[test]
+    fn stop_preserves_unsent_cleanup_and_writer_dispatches_it_before_stop() -> Result<()> {
+        struct Capture {
+            shared: Arc<Shared>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                let bytes = self.bytes.lock().unwrap();
+                let mut input = bytes.as_slice();
+                while let Some(frame) = Frame::read(&mut input)? {
+                    if frame.kind == Kind::Stop {
+                        self.shared.state.lock().unwrap().outgoing.close = true;
+                    }
+                }
+                Ok(())
+            }
+        }
+        struct Cleanup(Arc<AtomicBool>);
+        impl Handler for Cleanup {
+            fn execute(&mut self, operation: Operation, context: &OperationContext) -> Outcome {
+                assert!(operation.is_cleanup());
+                assert!(!context.cancellation().load(Ordering::Acquire));
+                self.0.store(true, Ordering::Release);
+                Ok(Response::Unit(Empty {}))
+            }
+            fn shutdown(&mut self) -> std::result::Result<(), Failure> {
+                Ok(())
+            }
+        }
+        let client = bare()?;
+        let operation = Operation::AbandonPrepare {
+            operation: U64(1),
+            session: LeaseId::new(),
+        };
+        {
+            let mut state = client.shared.state.lock().unwrap();
+            state.outgoing.command_cleanup = operation.is_cleanup();
+            state.outgoing.command = Some(Message {
+                kind: Kind::Execute,
+                sequence: 1,
+                bytes: encode(&operation, MESSAGE_BYTES)?,
+            });
+        }
+        client.signal_stop();
+        assert!(
+            client
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .outgoing
+                .command
+                .is_some()
+        );
+        assert!(client.shared.state.lock().unwrap().result.is_none());
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let startup = Startup {
+            build: build_identity(),
+            epoch: client.epoch.clone(),
+            original_roots: vec![],
+        };
+        write_loop(
+            Capture {
+                shared: client.shared.clone(),
+                bytes: bytes.clone(),
+            },
+            encode(&startup, CONFIG_BYTES)?,
+            &client.shared,
+        )?;
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let observed = dispatched.clone();
+        let input = bytes.lock().unwrap().clone();
+        let mut frames = input.as_slice();
+        let mut kinds = Vec::new();
+        while let Some(frame) = Frame::read(&mut frames)? {
+            kinds.push(frame.kind);
+        }
+        assert_eq!(kinds, vec![Kind::Startup, Kind::Execute, Kind::Stop]);
+        // Hold execution input until the real F Ready control, like Client does.
+        struct ReadyInput {
+            input: io::Cursor<Vec<u8>>,
+            boundary: u64,
+            ready: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Read for ReadyInput {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.input.position() >= self.boundary {
+                    let (lock, wake) = &*self.ready;
+                    let mut ready = lock.lock().unwrap();
+                    while !*ready {
+                        ready = wake.wait(ready).unwrap();
+                    }
+                }
+                self.input.read(output)
+            }
+        }
+        struct ReadyOutput {
+            bytes: Vec<u8>,
+            ready: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Write for ReadyOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                let mut input = self.bytes.as_slice();
+                while let Some(frame) = Frame::read(&mut input)? {
+                    if let Control::Status(status) =
+                        decode::<Control>(&frame.payload, MESSAGE_BYTES)
+                            .map_err(io::Error::other)?
+                        && status.phase == Phase::Ready
+                    {
+                        *self.ready.0.lock().unwrap() = true;
+                        self.ready.1.notify_all();
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut cursor = io::Cursor::new(input);
+        Frame::read(&mut cursor)?;
+        let boundary = cursor.position();
+        cursor.set_position(0);
+        let ready = Arc::new((Mutex::new(false), Condvar::new()));
+        crate::filesystem_worker::process::serve(
+            ReadyInput {
+                input: cursor,
+                boundary,
+                ready: ready.clone(),
+            },
+            io::sink(),
+            ReadyOutput {
+                bytes: vec![],
+                ready,
+            },
+            move |_| Ok(Cleanup(observed)),
+        )?;
+        assert!(dispatched.load(Ordering::Acquire));
+        Ok(())
+    }
 
     const CHILD: &str = "filesystem_worker::client::tests::owned_child_entrypoint";
     const ROLE: &str = "PHOTOCATALOG_F_OWNERSHIP_FIXTURE";

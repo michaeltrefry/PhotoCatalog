@@ -19,6 +19,7 @@ impl RelayOutput {
                 filesystem::Lane::Control => Kind::FilesystemControl,
                 filesystem::Lane::Data => Kind::Filesystem,
                 filesystem::Lane::Admission => Kind::FilesystemAdmission,
+                filesystem::Lane::Store => Kind::FilesystemStore,
             },
             session,
             id: 0,
@@ -37,10 +38,11 @@ impl RelayOutput {
 struct RelayAssembly {
     data: Option<Assembly>,
     admission: Option<Assembly>,
+    store: Option<Assembly>,
 }
 impl RelayAssembly {
     fn incomplete(&self) -> bool {
-        self.data.is_some() || self.admission.is_some()
+        self.data.is_some() || self.admission.is_some() || self.store.is_some()
     }
 }
 fn relay_input(
@@ -52,6 +54,7 @@ fn relay_input(
         Kind::FilesystemControl => filesystem::Lane::Control,
         Kind::Filesystem => filesystem::Lane::Data,
         Kind::FilesystemAdmission => filesystem::Lane::Admission,
+        Kind::FilesystemStore => filesystem::Lane::Store,
         _ => anyhow::bail!("unexpected relay frame"),
     };
     if lane == filesystem::Lane::Control {
@@ -61,10 +64,11 @@ fn relay_input(
         );
         return Ok(Some((f.payload, lane)));
     }
-    let slot = if lane == filesystem::Lane::Admission {
-        &mut active.admission
-    } else {
-        &mut active.data
+    let slot = match lane {
+        filesystem::Lane::Admission => &mut active.admission,
+        filesystem::Lane::Store => &mut active.store,
+        filesystem::Lane::Data => &mut active.data,
+        filesystem::Lane::Control => unreachable!(),
     };
     let a = match slot.as_mut() {
         Some(a) => a,
@@ -443,6 +447,7 @@ fn parent_write(mut w: impl Write, shared: &Shared, hello: Vec<u8>) -> std::io::
     let mut active = None;
     let mut relay: Option<RelayOutput> = None;
     let mut admission: Option<RelayOutput> = None;
+    let mut store: Option<RelayOutput> = None;
     loop {
         if shared.state.lock().unwrap().reaped {
             return Ok(());
@@ -460,6 +465,17 @@ fn parent_write(mut w: impl Write, shared: &Shared, hello: Vec<u8>) -> std::io::
                 m.frame(shared.session).write(&mut w)?;
                 if m.done() {
                     admission = None;
+                }
+            }
+            if store.is_none() {
+                store = owner
+                    .next(filesystem::Lane::Store)
+                    .map(|out| RelayOutput { out, offset: 0 });
+            }
+            if let Some(message) = &mut store {
+                message.frame(shared.session).write(&mut w)?;
+                if message.done() {
+                    store = None;
                 }
             }
             if let Some(out) = owner.next(filesystem::Lane::Control) {
@@ -510,7 +526,10 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
         }
         if matches!(
             f.kind,
-            Kind::Filesystem | Kind::FilesystemControl | Kind::FilesystemAdmission
+            Kind::Filesystem
+                | Kind::FilesystemControl
+                | Kind::FilesystemAdmission
+                | Kind::FilesystemStore
         ) {
             let owner = shared
                 .filesystem
@@ -799,6 +818,7 @@ fn output_writer(
     let mut ordinary: Option<Message> = None;
     let mut relay: Option<RelayOutput> = None;
     let mut admission: Option<RelayOutput> = None;
+    let mut store: Option<RelayOutput> = None;
     loop {
         let result = (|| -> std::io::Result<bool> {
             if let Some(proxy) = &proxy {
@@ -811,6 +831,17 @@ fn output_writer(
                     m.frame(session).write(&mut w)?;
                     if m.done() {
                         admission = None;
+                    }
+                }
+                if store.is_none() {
+                    store = proxy
+                        .next(filesystem::Lane::Store)
+                        .map(|out| RelayOutput { out, offset: 0 });
+                }
+                if let Some(message) = &mut store {
+                    message.frame(session).write(&mut w)?;
+                    if message.done() {
+                        store = None;
                     }
                 }
                 if let Some(out) = proxy.next(filesystem::Lane::Control) {
@@ -1255,7 +1286,10 @@ fn child_input_relay(
         anyhow::ensure!(f.session == session, "stale child session");
         if matches!(
             f.kind,
-            Kind::Filesystem | Kind::FilesystemControl | Kind::FilesystemAdmission
+            Kind::Filesystem
+                | Kind::FilesystemControl
+                | Kind::FilesystemAdmission
+                | Kind::FilesystemStore
         ) {
             let proxy = proxy.context("unselected child filesystem relay")?;
             if let Some((bytes, control)) = relay_input(&mut relay, f)? {
@@ -1876,6 +1910,7 @@ mod tests {
         };
         let mut ordinary = make(Lane::Data, 1);
         let mut admission = make(Lane::Admission, 2);
+        let mut store = make(Lane::Store, 5);
         let mut assembly = RelayAssembly::default();
         assert!(
             relay_input(&mut assembly, ordinary.frame([9; 16]))
@@ -1886,6 +1921,19 @@ mod tests {
             relay_input(&mut assembly, admission.frame([9; 16]))
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            relay_input(&mut assembly, store.frame([9; 16]))
+                .unwrap()
+                .is_none()
+        );
+        let (bytes, lane) = relay_input(&mut assembly, store.frame([9; 16]))
+            .unwrap()
+            .unwrap();
+        assert_eq!((bytes, lane), (vec![5; wire::CHUNK + 7], Lane::Store));
+        assert!(
+            assembly.data.is_some() && assembly.admission.is_some(),
+            "store completion cannot consume admission or ordinary assembly"
         );
         let control = Frame {
             kind: Kind::FilesystemControl,

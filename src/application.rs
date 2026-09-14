@@ -219,7 +219,17 @@ fn failure(code: ErrorCode, message: impl Into<String>) -> Reply {
     }
 }
 fn native(e: anyhow::Error) -> BridgeError {
-    error(ErrorCode::Native, format!("{e:#}"))
+    let limited = e.is::<crate::catalog_session::store::ResourceLimit>()
+        || e.downcast_ref::<crate::filesystem_worker::wire::Failure>()
+            .is_some_and(|f| f.kind == crate::filesystem_worker::wire::FailureKind::ResourceLimit);
+    error(
+        if limited {
+            ErrorCode::ResourceLimit
+        } else {
+            ErrorCode::Native
+        },
+        format!("{e:#}"),
+    )
 }
 fn reply(r: std::result::Result<Response, BridgeError>) -> Reply {
     match r {
@@ -1038,7 +1048,6 @@ impl ImportTask {
 #[derive(Clone)]
 pub(crate) struct ManagedCatalogConfig {
     pub(crate) filesystem: Arc<dyn crate::catalog_session::CatalogFilesystem>,
-    pub(crate) store_files: Arc<dyn preview::AdmittedStoreFiles>,
 }
 struct Actor {
     failed_admission: Option<crate::catalog_session::AdmissionCleanup>,
@@ -1732,7 +1741,7 @@ impl Actor {
                 },
                 managed.manifest()?,
                 origin,
-                configured.store_files,
+                managed.store_files(cancel.0.clone())?,
                 self.config.worker_executable.clone(),
                 self.config.preview_policy.clone(),
                 self.config.preview_limits.clone(),

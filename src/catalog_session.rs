@@ -250,7 +250,26 @@ pub type SqlAdmissionConfirmed = ConfirmSqlAdmission;
 /// Calls run on the admission/operation owner, never the GUI thread. An F client
 /// must keep its independent cancel/status controls live while awaiting a reply.
 /// Implementations must not fall back to local filesystem access after failure.
+pub mod store;
+
 pub trait CatalogFilesystem: Send + Sync {
+    fn preview_store_call(
+        &self,
+        _request: &store::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<store::Reply> {
+        anyhow::bail!("filesystem owner does not support preview custody")
+    }
+    fn preview_store_status(&self, _query: &store::Query) -> Result<store::Status> {
+        anyhow::bail!("filesystem owner does not support preview custody status")
+    }
+    fn read_preview_configuration(
+        &self,
+        _path: &NativePath,
+        _cancel: &AtomicBool,
+    ) -> Result<Vec<u8>> {
+        anyhow::bail!("filesystem owner does not support preview configuration reads")
+    }
     /// A lost reply is recovered by the original operation identity inside the
     /// client. Never repeat Prepare/creation. An error/cancel can still leave an
     /// outstanding token, which the caller explicitly abandons before SQL opens.

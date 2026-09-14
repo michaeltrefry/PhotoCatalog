@@ -462,6 +462,9 @@ fn actual_queued_cancel_and_duplicate_ids_do_not_dispatch_f_effects() -> Result<
             .is_none(),
         "neither fixture path enters F Prepare"
     );
+    let pid = owner.0.client.pid();
+    owner.0.finish_after_dependents(true)?;
+    eprintln!("queued relay fixture verified F={pid} reaped and relay joined");
     Ok(())
 }
 #[test]

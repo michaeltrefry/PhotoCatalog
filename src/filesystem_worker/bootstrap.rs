@@ -41,6 +41,8 @@ struct RootRecord {
     catalog: Option<File>,
     manifest: Option<File>,
     manifest_lock: ManifestLock,
+    manifest_directory: File,
+    store: super::store::StoreOwner,
 }
 struct ManifestLock(File);
 impl ManifestLock {
@@ -243,6 +245,8 @@ impl BootstrapOwner {
             catalog: Some(catalog),
             manifest: Some(manifest),
             manifest_lock,
+            manifest_directory: open_directory(&manifest_root)?,
+            store: super::store::StoreOwner::default(),
         };
         record.verify_root_binding()?;
         self.record = Some(record);
@@ -309,11 +313,12 @@ impl BootstrapOwner {
     }
 
     pub fn release(&mut self, root: &RootCapability) -> Result<()> {
-        if let Some(record) = &self.record {
+        if let Some(record) = &mut self.record {
             ensure!(
                 &record.bootstrap.root_capability() == root,
                 "root belongs to another session"
             );
+            record.store.release()?;
             record.manifest_lock.release()?;
             self.record.take();
             self.progress.as_mut().unwrap().state = PreparationState::Abandoned;
@@ -334,6 +339,47 @@ impl BootstrapOwner {
     pub fn restore_status(&self, root: &RootCapability) -> Result<Option<RestoreStatus>> {
         self.with_root(root, |path| catalog_backup::restore_status(path))
     }
+
+    pub fn store_call(
+        &mut self,
+        request: &crate::catalog_session::store::Request,
+        cancel: &AtomicBool,
+        publish: impl FnMut(super::store::Snapshot) -> Result<()>,
+    ) -> Result<crate::catalog_session::store::Reply> {
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "preview tier acquisition requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("catalog filesystem root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "preview store belongs to another session"
+        );
+        record.verify_root_binding()?;
+        let manifest = record.bootstrap.manifest.path.to_path()?;
+        ensure!(
+            physical_object_id(&record.manifest_directory)?
+                == physical_object_id(&open_directory(
+                    manifest.parent().context("manifest parent")?
+                )?)?,
+            "preview manifest directory was moved or replaced"
+        );
+        let result = record.store.execute(
+            &record.bootstrap,
+            &self.original_roots,
+            request,
+            cancel,
+            publish,
+        );
+        record.verify_root_binding()?;
+        result
+    }
+
     pub fn resume(
         &self,
         root: &RootCapability,

@@ -5,9 +5,13 @@ use crate::{
     catalog_backup::RestoreStatus,
     catalog_session::{
         CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, LeaseId, PrepareCatalog,
-        RootCapability, SqlAdmissionConfirmed,
+        RootCapability, SqlAdmissionConfirmed, store,
     },
-    filesystem_worker::{client::Client, wire::AdmissionSnapshot},
+    filesystem_worker::{
+        client::Client,
+        wire::{AdmissionSnapshot, Failure, FailureKind},
+    },
+    storage_volume::NativePath,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -47,13 +51,19 @@ pub(super) enum Call {
         acknowledge: bool,
     },
     Release(RootCapability),
+    PreviewStore(Box<store::Request>),
+    ReadPreviewConfiguration(NativePath),
 }
 impl Call {
     fn cleanup(&self) -> bool {
         matches!(self, Self::Abandon { .. } | Self::Release(_))
+            || matches!(self, Self::PreviewStore(request) if request.is_cleanup())
     }
     fn cancellable(&self) -> bool {
-        matches!(self, Self::Prepare(_) | Self::Confirm(_))
+        matches!(
+            self,
+            Self::Prepare(_) | Self::Confirm(_) | Self::ReadPreviewConfiguration(_)
+        ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -71,6 +81,8 @@ impl Call {
                 uuid::Uuid::parse_str(restore_id)?;
                 Ok(())
             }
+            Self::PreviewStore(request) => request.validate(),
+            Self::ReadPreviewConfiguration(path) => store::path(path),
             _ => Ok(()),
         }
     }
@@ -81,6 +93,8 @@ pub(super) enum Value {
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
     Restore(Option<RestoreStatus>),
+    PreviewStore(store::Reply),
+    Configuration(Vec<u8>),
     Unit,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -88,16 +102,53 @@ pub(super) enum Value {
 pub(super) struct Fault {
     message: String,
     unknown: bool,
+    kind: FailureKind,
 }
 impl Fault {
-    fn new(message: impl ToString, unknown: bool) -> Self {
-        let mut message = message.to_string();
-        let mut end = message.len().min(4096);
-        while !message.is_char_boundary(end) {
-            end -= 1;
+    fn new(message: impl std::fmt::Display, unknown: bool) -> Self {
+        let kind = if unknown {
+            FailureKind::Unknown
+        } else {
+            FailureKind::Rejected
+        };
+        let failure = Failure::new(kind, message);
+        Self {
+            message: failure.message,
+            unknown,
+            kind,
         }
-        message.truncate(end);
-        Self { message, unknown }
+    }
+    fn from_error(error: anyhow::Error, unknown: bool) -> Self {
+        let kind = if let Some(failure) = error.downcast_ref::<Failure>() {
+            failure.kind
+        } else if error.downcast_ref::<store::ResourceLimit>().is_some() {
+            FailureKind::ResourceLimit
+        } else if unknown {
+            FailureKind::Unknown
+        } else {
+            FailureKind::Rejected
+        };
+        // Preserve delivered typed failures even if the F status changes after
+        // publication. A terminal ResourceLimit is not transport uncertainty.
+        let failure = Failure::new(kind, error);
+        Self {
+            message: failure.message,
+            unknown: kind == FailureKind::Unknown,
+            kind,
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.message.len() <= 4096 && self.unknown == (self.kind == FailureKind::Unknown),
+            "relay failure bounds/category mismatch"
+        );
+        Ok(())
+    }
+    fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(Failure {
+            kind: self.kind,
+            message: self.message,
+        })
     }
 }
 type Outcome = std::result::Result<Value, Fault>;
@@ -124,6 +175,10 @@ pub(super) enum Control {
         operation: U64,
         session: LeaseId,
     },
+    StoreStatus {
+        id: U64,
+        query: store::StatusQuery,
+    },
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
@@ -140,6 +195,10 @@ pub(super) enum Body {
         id: U64,
         value: std::result::Result<Option<AdmissionSnapshot>, Fault>,
     },
+    StoreReply {
+        id: U64,
+        value: std::result::Result<store::Status, Fault>,
+    },
     Control(Control),
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -155,22 +214,35 @@ fn encode(value: &impl Serialize, cap: usize) -> Result<Vec<u8>> {
     struct Count {
         n: usize,
         cap: usize,
+        exceeded: bool,
     }
     impl Write for Count {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.n = self
-                .n
-                .checked_add(b.len())
-                .filter(|n| *n <= self.cap)
-                .ok_or_else(|| std::io::Error::other("relay encoded byte admission"))?;
+            let Some(next) = self.n.checked_add(b.len()).filter(|n| *n <= self.cap) else {
+                self.exceeded = true;
+                return Err(std::io::Error::other("relay encoded byte admission"));
+            };
+            self.n = next;
             Ok(b.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut count = Count { n: 0, cap };
-    serde_json::to_writer(&mut count, value)?;
+    let mut count = Count {
+        n: 0,
+        cap,
+        exceeded: false,
+    };
+    let counted = serde_json::to_writer(&mut count, value);
+    if count.exceeded {
+        return Err(Failure::new(
+            FailureKind::ResourceLimit,
+            "Filesystem relay message exceeds its encoded byte limit; no request was dispatched",
+        )
+        .into());
+    }
+    counted?;
     let mut bytes = Vec::with_capacity(count.n);
     serde_json::to_writer(&mut bytes, value)?;
     ensure!(bytes.len() == count.n, "relay serialization changed");
@@ -181,6 +253,7 @@ pub(super) enum Lane {
     Control,
     Data,
     Admission,
+    Store,
 }
 pub(super) struct Out {
     pub lane: Lane,
@@ -216,6 +289,8 @@ struct Output {
     state: Slot,
     query: Slot,
     admission: Slot,
+    store_query: Slot,
+    store_reply: Slot,
     data: VecDeque<Arc<Vec<u8>>>,
 }
 impl Output {
@@ -228,10 +303,12 @@ impl Output {
             Body::Control(Control::Status { id }) => (3, id.0),
             Body::Control(Control::State { id, .. }) => (4, id.0),
             Body::Control(Control::Admission { id, .. }) => (5, id.0),
-            Body::AdmissionReply { id, .. } => (6, id.0),
-            _ => (7, 0),
+            Body::Control(Control::StoreStatus { id, .. }) => (6, id.0),
+            Body::AdmissionReply { id, .. } => (7, id.0),
+            Body::StoreReply { id, .. } => (8, id.0),
+            _ => (9, 0),
         };
-        let control = class.0 < 6;
+        let control = class.0 < 7;
         let bytes = Arc::new(encode(
             &Packet {
                 binding: binding.clone(),
@@ -249,7 +326,9 @@ impl Output {
             (3, id) => self.status.push(id, bytes, 2),
             (4, id) => self.state.push(id, bytes, 2),
             (5, id) => self.query.push(id, bytes, 1),
-            (6, id) => self.admission.push(id, bytes, 1),
+            (6, id) => self.store_query.push(id, bytes, 1),
+            (7, id) => self.admission.push(id, bytes, 1),
+            (8, id) => self.store_reply.push(id, bytes, 1),
             _ => self.encoded(bytes),
         }
     }
@@ -270,10 +349,12 @@ impl Output {
                 .or_else(|| self.cancel.take())
                 .or_else(|| self.ack.take())
                 .or_else(|| self.query.take())
+                .or_else(|| self.store_query.take())
                 .or_else(|| self.state.take())
                 .or_else(|| self.status.take()),
             Lane::Data => self.data.pop_front(),
             Lane::Admission => self.admission.take(),
+            Lane::Store => self.store_reply.take(),
         }?;
         Some(Out { lane, bytes })
     }
@@ -293,9 +374,24 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
     let actual = match packet.body {
         Body::Control(_) => Lane::Control,
         Body::AdmissionReply { .. } => Lane::Admission,
+        Body::StoreReply { .. } => Lane::Store,
         _ => Lane::Data,
     };
     ensure!(actual == lane, "relay frame class mismatch");
+    match &packet.body {
+        Body::Reply {
+            outcome: Err(fault),
+            ..
+        }
+        | Body::AdmissionReply {
+            value: Err(fault), ..
+        }
+        | Body::StoreReply {
+            value: Err(fault), ..
+        }
+        | Body::Control(Control::Failed(fault)) => fault.validate()?,
+        _ => {}
+    }
     Ok(packet.body)
 }
 
@@ -311,6 +407,10 @@ struct Retained {
     digest: String,
     bytes: Arc<Vec<u8>>,
 }
+enum ReadQuery {
+    Admission(u64, U64, LeaseId),
+    Store(u64, store::StatusQuery),
+}
 struct ParentState {
     next: u64,
     queue: VecDeque<Pending>,
@@ -321,6 +421,10 @@ struct ParentState {
     admission_busy: Option<(u64, U64, LeaseId)>,
     admission_next: u64,
     admission_result: Option<(u64, U64, LeaseId, Arc<Vec<u8>>)>,
+    store_query: Option<(u64, store::StatusQuery)>,
+    store_busy: Option<(u64, store::StatusQuery)>,
+    store_next: u64,
+    store_result: Option<(u64, store::StatusQuery, Arc<Vec<u8>>)>,
     output: Output,
     closing: bool,
     stop: bool,
@@ -359,6 +463,10 @@ impl Parent {
                 admission_busy: None,
                 admission_next: 1,
                 admission_result: None,
+                store_query: None,
+                store_busy: None,
+                store_next: 1,
+                store_result: None,
                 output: Output::default(),
                 closing: false,
                 stop: false,
@@ -415,7 +523,7 @@ impl Parent {
         );
         Ok(())
     }
-    pub fn fail(&self, error: impl ToString) {
+    pub fn fail(&self, error: impl std::fmt::Display) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let fault = Fault::new(error, true);
         s.fault.get_or_insert_with(|| fault.clone());
@@ -450,6 +558,12 @@ impl Parent {
         match body {
             Body::Call { id, call } => {
                 call.validate()?;
+                if let Call::PreviewStore(request) = &call {
+                    ensure!(
+                        request.root.epoch == self.binding.epoch,
+                        "preview store epoch mismatch"
+                    );
+                }
                 ensure!(id.0 > 0, "relay call identity");
                 let digest = blake3::hash(bytes).to_hex().to_string();
                 if let Some(r) = &s.retained
@@ -607,6 +721,42 @@ impl Parent {
                 s.admission_result = None;
                 s.admission = Some(query);
             }
+            Body::Control(Control::StoreStatus { id, query }) => {
+                query.validate()?;
+                ensure!(
+                    id.0 > 0 && query.epoch == self.binding.epoch,
+                    "store status query epoch/identity"
+                );
+                let request = (id.0, query);
+                for pending in [s.store_query.as_ref(), s.store_busy.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if pending.0 == id.0 {
+                        ensure!(pending == &request, "altered store status query");
+                        return Ok(());
+                    }
+                }
+                if let Some((old, expected, bytes)) = &s.store_result
+                    && *old == id.0
+                {
+                    ensure!(expected == &request.1, "altered store status result query");
+                    let bytes = bytes.clone();
+                    s.output.store_reply.push(id.0, bytes, 1)?;
+                    return Ok(());
+                }
+                ensure!(id.0 == s.store_next, "store status query replay/gap");
+                ensure!(
+                    s.store_query.is_none() && s.store_busy.is_none(),
+                    "store status query capacity"
+                );
+                s.store_next = s
+                    .store_next
+                    .checked_add(1)
+                    .context("store status query ID exhausted")?;
+                s.store_result = None;
+                s.store_query = Some(request);
+            }
             _ => anyhow::bail!("unexpected C filesystem relay message"),
         }
         self.wake.notify_all();
@@ -632,12 +782,15 @@ impl Parent {
             };
             let dispatched = if pending.call.cancellable() && pending.cancel.load(Ordering::Acquire)
             {
-                Err(anyhow::anyhow!("filesystem relay canceled before dispatch"))
+                Err(anyhow::Error::new(Failure::new(
+                    FailureKind::Canceled,
+                    "filesystem relay canceled before dispatch",
+                )))
             } else {
                 self.invoke(&pending.call, &pending.cancel)
             };
             let result = dispatched.map_err(|e| {
-                Fault::new(
+                Fault::from_error(
                     e,
                     self.client.status().phase == crate::filesystem_worker::wire::Phase::Unknown,
                 )
@@ -697,6 +850,12 @@ impl Parent {
                     self.client.release_root(r)?;
                     Value::Unit
                 }
+                Call::PreviewStore(request) => {
+                    Value::PreviewStore(self.client.preview_store_call(request, cancel)?)
+                }
+                Call::ReadPreviewConfiguration(path) => {
+                    Value::Configuration(self.client.read_preview_configuration(path, cancel)?)
+                }
             })
         })();
         #[cfg(test)]
@@ -706,22 +865,17 @@ impl Parent {
         result
     }
     fn admission_loop(&self) -> Result<()> {
+        // One existing read/control owner services two independently retained
+        // query classes. Alternate when both are waiting; neither joins the
+        // mutating executor queue or consumes the other's snapshot slot.
+        let mut store_turn = false;
         loop {
-            let (id, operation, session) = {
+            let query = {
                 let mut s = self.state.lock().unwrap();
                 loop {
                     if s.stop {
                         return Ok(());
                     }
-                    if let Some(query) = s.admission.take() {
-                        s.admission_busy = Some(query.clone());
-                        break query;
-                    }
-                    s = self
-                        .wake
-                        .wait_timeout(s, Duration::from_millis(20))
-                        .unwrap()
-                        .0;
                     let phase = self.client.status().phase;
                     if !s.retiring
                         && s.fault.is_none()
@@ -733,28 +887,68 @@ impl Parent {
                         )
                     {
                         drop(s);
-                        self.fail("filesystem owner failed while relay idle; C must drain");
+                        self.fail("filesystem owner failed; C must drain");
                         s = self.state.lock().unwrap();
                     }
+                    if (store_turn || s.admission.is_none())
+                        && let Some(query) = s.store_query.take()
+                    {
+                        s.store_busy = Some(query.clone());
+                        store_turn = false;
+                        break ReadQuery::Store(query.0, query.1);
+                    }
+                    if let Some(query) = s.admission.take() {
+                        s.admission_busy = Some(query.clone());
+                        store_turn = true;
+                        break ReadQuery::Admission(query.0, query.1, query.2);
+                    }
+                    s = self
+                        .wake
+                        .wait_timeout(s, Duration::from_millis(20))
+                        .unwrap()
+                        .0;
                 }
             };
-            let value = self
-                .client
-                .admission_status(operation, &session)
-                .map_err(|e| Fault::new(e, true));
-            // Independent retained snapshot: a repeated exact query never rereads F.
-            // This is bounded by F's frame cap, not the small control-frame cap.
-            let bytes = Arc::new(encode(
-                &Packet {
-                    binding: self.binding.clone(),
-                    body: Body::AdmissionReply { id: U64(id), value },
-                },
-                BYTES,
-            )?);
-            let mut s = self.state.lock().unwrap();
-            s.admission_busy = None;
-            s.admission_result = Some((id, operation, session, bytes.clone()));
-            s.output.admission.push(id, bytes, 1)?;
+            match query {
+                ReadQuery::Admission(id, operation, session) => {
+                    let value = self
+                        .client
+                        .admission_status(operation, &session)
+                        .map_err(|e| Fault::from_error(e, true));
+                    let bytes = Arc::new(encode(
+                        &Packet {
+                            binding: self.binding.clone(),
+                            body: Body::AdmissionReply { id: U64(id), value },
+                        },
+                        BYTES,
+                    )?);
+                    let mut s = self.state.lock().unwrap();
+                    s.admission_busy = None;
+                    s.admission_result = Some((id, operation, session, bytes.clone()));
+                    s.output.admission.push(id, bytes, 1)?;
+                }
+                ReadQuery::Store(id, query) => {
+                    let value = self
+                        .client
+                        .store_status(&query)
+                        .and_then(|status| {
+                            status.validate(&query)?;
+                            Ok(status)
+                        })
+                        .map_err(|e| Fault::from_error(e, true));
+                    let bytes = Arc::new(encode(
+                        &Packet {
+                            binding: self.binding.clone(),
+                            body: Body::StoreReply { id: U64(id), value },
+                        },
+                        BYTES,
+                    )?);
+                    let mut s = self.state.lock().unwrap();
+                    s.store_busy = None;
+                    s.store_result = Some((id, query, bytes.clone()));
+                    s.output.store_reply.push(id, bytes, 1)?;
+                }
+            }
         }
     }
     /// Only after C and every dependent native owner has been verified drained.
@@ -793,6 +987,11 @@ struct Query {
     session: LeaseId,
     result: Option<std::result::Result<Option<AdmissionSnapshot>, Fault>>,
 }
+struct StoreQuery {
+    id: u64,
+    query: store::StatusQuery,
+    result: Option<std::result::Result<store::Status, Fault>>,
+}
 struct ChildState {
     next: u64,
     calls: Vec<ChildCall>,
@@ -801,6 +1000,8 @@ struct ChildState {
     closing: bool,
     query: Option<Query>,
     query_next: u64,
+    store_query: Option<StoreQuery>,
+    store_next: u64,
     completed: Option<(u64, String)>,
 }
 pub(super) struct Proxy {
@@ -823,6 +1024,8 @@ impl Proxy {
                 closing: false,
                 query: None,
                 query_next: 1,
+                store_query: None,
+                store_next: 1,
                 completed: None,
             }),
             wake: Condvar::new(),
@@ -831,7 +1034,7 @@ impl Proxy {
     pub fn next(&self, lane: Lane) -> Option<Out> {
         self.state.lock().unwrap().output.next(lane)
     }
-    pub fn fail(&self, message: impl ToString) {
+    pub fn fail(&self, message: impl std::fmt::Display) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.fault.get_or_insert_with(|| Fault::new(message, true));
         self.wake.notify_all();
@@ -902,6 +1105,20 @@ impl Proxy {
                 }
                 q.result = Some(value);
             }
+            Body::StoreReply { id, value } => {
+                let query = s
+                    .store_query
+                    .as_mut()
+                    .context("unowned store status reply")?;
+                ensure!(
+                    query.id == id.0 && query.result.is_none(),
+                    "store status reply identity"
+                );
+                if let Ok(status) = &value {
+                    status.validate(&query.query)?;
+                }
+                query.result = Some(value);
+            }
             _ => anyhow::bail!("unexpected G filesystem relay message"),
         }
         self.wake.notify_all();
@@ -914,7 +1131,9 @@ impl Proxy {
             crate::catalog_session::overlap_tests::before_release()?;
         }
         let mut s = self.state.lock().unwrap();
-        ensure!(s.fault.is_none(), "filesystem relay unknown");
+        if let Some(fault) = &s.fault {
+            return Err(fault.clone().into_error());
+        }
         ensure!(!s.closing || call.cleanup(), "filesystem relay closing");
         ensure!(s.calls.len() < 2, "filesystem relay busy");
         let id = s.next;
@@ -939,20 +1158,10 @@ impl Proxy {
             let index = s.calls.iter().position(|c| c.id == id).unwrap();
             if let Some(outcome) = s.calls[index].outcome.take() {
                 s.calls.remove(index);
-                return outcome.map_err(|e| {
-                    anyhow::anyhow!(
-                        "{}{}",
-                        if e.unknown {
-                            "unknown filesystem outcome: "
-                        } else {
-                            ""
-                        },
-                        e.message
-                    )
-                });
+                return outcome.map_err(Fault::into_error);
             }
             if let Some(fault) = &s.fault {
-                anyhow::bail!("unknown filesystem outcome: {}", fault.message);
+                return Err(fault.clone().into_error());
             }
             if call.cancellable() && cancel.load(Ordering::Acquire) && !s.calls[index].canceled {
                 s.output.push(
@@ -1002,13 +1211,10 @@ impl Proxy {
         loop {
             if s.query.as_ref().is_some_and(|q| q.result.is_some()) {
                 let query = s.query.take().unwrap();
-                return query
-                    .result
-                    .unwrap()
-                    .map_err(|e| anyhow::anyhow!(e.message));
+                return query.result.unwrap().map_err(Fault::into_error);
             }
             if let Some(f) = &s.fault {
-                anyhow::bail!("admission owner unknown: {}", f.message);
+                return Err(f.clone().into_error());
             }
             s = self.wake.wait(s).unwrap();
         }
@@ -1078,6 +1284,82 @@ impl CatalogFilesystem for Proxy {
     fn release_root(&self, r: &RootCapability) -> Result<()> {
         unit(self.call(Call::Release(r.clone()), &AtomicBool::new(false))?)
     }
+    fn preview_store_call(
+        &self,
+        request: &store::Request,
+        cancel: &AtomicBool,
+    ) -> Result<store::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch,
+            "preview store epoch mismatch"
+        );
+        match self.call(Call::PreviewStore(Box::new(request.clone())), cancel)? {
+            Value::PreviewStore(reply) => {
+                store::validate_reply(request, &reply)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("wrong preview store reply"),
+        }
+    }
+    fn preview_store_status(&self, query: &store::Query) -> Result<store::Status> {
+        store::path(&query.root.canonical_root)?;
+        let query = store::StatusQuery::from(query);
+        query.validate()?;
+        ensure!(
+            query.epoch == self.binding.epoch,
+            "store status query epoch mismatch"
+        );
+        let mut s = self.state.lock().unwrap();
+        if let Some(fault) = &s.fault {
+            return Err(fault.clone().into_error());
+        }
+        ensure!(s.store_query.is_none(), "relay store status query busy");
+        let id = s.store_next;
+        let next = id
+            .checked_add(1)
+            .context("store status query ID exhausted")?;
+        s.output.push(
+            &self.binding,
+            Body::Control(Control::StoreStatus {
+                id: U64(id),
+                query: query.clone(),
+            }),
+        )?;
+        s.store_next = next;
+        s.store_query = Some(StoreQuery {
+            id,
+            query,
+            result: None,
+        });
+        loop {
+            if s.store_query.as_ref().is_some_and(|q| q.result.is_some()) {
+                let query = s.store_query.take().unwrap();
+                return query.result.unwrap().map_err(Fault::into_error);
+            }
+            if let Some(fault) = &s.fault {
+                return Err(fault.clone().into_error());
+            }
+            s = self.wake.wait(s).unwrap();
+        }
+    }
+    fn read_preview_configuration(
+        &self,
+        path: &NativePath,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<u8>> {
+        // Immutable relay call ID plus F Client sequence bind the selected path;
+        // configuration reads grant no root/store authority or replay token.
+        match self.call(Call::ReadPreviewConfiguration(path.clone()), cancel)? {
+            Value::Configuration(bytes) => {
+                ensure!(
+                    bytes.len() <= store::CONFIG_BYTES,
+                    "preview configuration response byte limit"
+                );
+                Ok(bytes)
+            }
+            _ => anyhow::bail!("wrong preview configuration reply"),
+        }
+    }
 }
 fn unit(v: Value) -> Result<()> {
     ensure!(matches!(v, Value::Unit), "wrong unit reply");
@@ -1098,6 +1380,13 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         }
         (Call::Abandon { .. } | Call::Release(_), Value::Unit) => {}
         (Call::RestoreStatus(_), Value::Restore(_)) => {}
+        (Call::PreviewStore(request), Value::PreviewStore(reply)) => {
+            store::validate_reply(request, reply)?
+        }
+        (Call::ReadPreviewConfiguration(_), Value::Configuration(bytes)) => ensure!(
+            bytes.len() <= store::CONFIG_BYTES,
+            "preview configuration response byte limit"
+        ),
         (Call::Resume { restore_id, .. }, Value::Restore(Some(v))) => ensure!(
             &v.receipt.restore_id == restore_id && !v.jobs_held,
             "relay restored-job receipt mismatch"
@@ -1146,3 +1435,6 @@ pub(super) fn before_child_failure(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod store_tests;

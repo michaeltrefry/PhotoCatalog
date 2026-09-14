@@ -68,6 +68,58 @@ pub(crate) fn run(
         }
     };
     ensure!(!lost_confirm, "lost Confirm fixture unexpectedly admitted");
+    // Exercise the real session-bound C adapter through G's sibling F. Dropping
+    // PreviewStore returns its SQL role; it cannot release any F tier lock.
+    let base = request
+        .manifest_root
+        .to_path()?
+        .parent()
+        .context("fixture preview parent")?
+        .to_path_buf();
+    let config = crate::preview::StoreConfig {
+        manifest_root: request.manifest_root.to_path()?,
+        thumbnail_root: base.join("custody-thumb"),
+        large_root: base.join("custody-large"),
+        layout: crate::preview::Layout::Flat,
+        thumbnail_bytes: 1024,
+        large_bytes: 1024,
+    };
+    let origin = if session.bootstrap.manifest.created {
+        crate::preview::ManifestOrigin::CreatedByAdmission
+    } else {
+        crate::preview::ManifestOrigin::Existing
+    };
+    let files = session.store_files(Arc::new(AtomicBool::new(false)))?;
+    let mut preview = crate::preview::PreviewStore::open_admitted(
+        config.clone(),
+        session.manifest()?,
+        origin,
+        files,
+    )?;
+    let relocated = base.join("custody-relocated");
+    preview.begin_relocation(crate::preview::Tier::Thumbnail, &relocated, &[])?;
+    while !preview
+        .relocation_step(crate::preview::Tier::Thumbnail, 1, 1024)?
+        .complete
+    {}
+    drop(preview);
+    let tier_locked = |path: &std::path::Path| -> Result<bool> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join(".photocatalog-preview-owner"))?;
+        let locked = fs2::FileExt::try_lock_exclusive(&file).is_err();
+        if !locked {
+            fs2::FileExt::unlock(&file)?;
+        }
+        Ok(locked)
+    };
+    ensure!(
+        tier_locked(&config.thumbnail_root)?
+            && tier_locked(&config.large_root)?
+            && tier_locked(&relocated)?,
+        "dropping C store released F custody before SQL drain"
+    );
     let pool = session.authority.pool().unwrap();
     let discovery = pool.lease(DISCOVERY_ROLE)?;
     observe(&discovery)?;
@@ -144,7 +196,17 @@ pub(crate) fn run(
     );
     session.authority.joined(SqlRole::Export, true)?;
     before_final_close()?;
+    ensure!(
+        tier_locked(&config.thumbnail_root)? && tier_locked(&relocated)?,
+        "F released retired or active tier before final SQL close"
+    );
     session.close()?;
+    ensure!(
+        !tier_locked(&config.thumbnail_root)?
+            && !tier_locked(&config.large_root)?
+            && !tier_locked(&relocated)?,
+        "final verified drain retained a tier lock"
+    );
     result?;
     Ok(())
 }

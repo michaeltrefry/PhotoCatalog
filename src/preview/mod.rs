@@ -43,4 +43,5 @@ pub use service::{
 mod config;
 pub use config::PreviewConfiguration;
 
+pub(crate) use store::custody::ManagedFiles as ManagedStoreFiles;
 pub(crate) use store::{AdmittedStoreFiles, ManifestOrigin};

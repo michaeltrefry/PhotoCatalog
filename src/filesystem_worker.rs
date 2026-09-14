@@ -4,6 +4,7 @@
 mod bootstrap;
 pub mod client;
 pub mod process;
+mod store;
 pub mod wire;
 
 use crate::{catalog_backup, catalog_storage::physical_object_id, storage_volume::NativePath};
@@ -38,6 +39,13 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::PreviewStore(request) => self
+                .owner
+                .store_call(&request, cancel, |snapshot| context.publish_store(snapshot))
+                .map(Response::PreviewStore),
+            Operation::ReadPreviewConfiguration(path) => {
+                store::read_configuration(&path, cancel).map(Response::PreviewConfiguration)
+            }
             Operation::PrepareCatalog(request) => self
                 .owner
                 .prepare(&request, cancel, |progress| {
@@ -56,6 +64,7 @@ impl FilesystemHandler {
             }
             Operation::ReleaseRoot { root } => {
                 self.owner.release(&root)?;
+                context.clear_store(&root)?;
                 self.publish(context)?;
                 Ok(Response::Released(Empty {}))
             }
@@ -119,13 +128,23 @@ impl Handler for FilesystemHandler {
         // A filesystem failure can follow a successful creation or publication.
         // Preserve uncertainty and the separate admission record for reconciliation.
         self.execute_inner(operation, context)
-            .map_err(|error| Failure::new(FailureKind::Unknown, format!("{error:#}")))
+            .map_err(filesystem_failure)
     }
     fn shutdown(&mut self) -> std::result::Result<(), Failure> {
         self.owner
             .shutdown()
             .map_err(|error| Failure::new(FailureKind::Unknown, error))
     }
+}
+fn filesystem_failure(error: anyhow::Error) -> Failure {
+    let kind = if let Some(failure) = error.downcast_ref::<Failure>() {
+        failure.kind
+    } else if error.is::<crate::catalog_session::store::ResourceLimit>() {
+        FailureKind::ResourceLimit
+    } else {
+        FailureKind::Unknown
+    };
+    Failure::new(kind, error)
 }
 fn snapshot(value: &PreparationProgress) -> AdmissionSnapshot {
     AdmissionSnapshot {

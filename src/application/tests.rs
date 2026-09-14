@@ -874,16 +874,6 @@ fn owner_unwind_retains_whole_open_when_worker_wait_fails() -> Result<()> {
 
 #[test]
 fn managed_catalog_refuses_independent_lightroom_at_submit_and_dispatch() -> anyhow::Result<()> {
-    struct NoStore;
-    impl preview::AdmittedStoreFiles for NoStore {
-        fn lock_tiers(
-            &self,
-            _: &preview::StoreConfig,
-            _: &str,
-        ) -> anyhow::Result<Arc<dyn Send + Sync>> {
-            anyhow::bail!("fixture must not open preview storage")
-        }
-    }
     let temp = tempfile::tempdir()?;
     let mut bridge = disconnected();
     Arc::get_mut(&mut Arc::get_mut(&mut bridge.0).unwrap().shared)
@@ -915,7 +905,6 @@ fn managed_catalog_refuses_independent_lightroom_at_submit_and_dispatch() -> any
     );
     actor.managed = Some(ManagedCatalogConfig {
         filesystem: crate::catalog_session::unused_filesystem(temp.path())?,
-        store_files: Arc::new(NoStore),
     });
     assert!(matches!(
         actor
