@@ -117,6 +117,38 @@ and the two-file source passed independent review
 runtime remains pending. Source files are retained privately in
 `sc-22847-stage-capacity-czfw9qcf` for exact comparison.
 
+The next encoded-delivery implementation has source review for its retained
+read/native pause, SQL identity checks, off-actor transfer and exact E/binary
+reservation lifetime. V11 failed compilation before tests (module path, shadowed
+Context trait and private read-state accessor); receipt
+`a6cecf59675a5a60d234f32b04c008ccfd3ba9439477192a205b02427e354cd6`
+has five verified artifacts and Cargo39083 waited101, with no observed survivors.
+V12 corrects those three issues and rejects delivery when CancelPreview has
+changed an already-ready ticket state. Independent successor review
+`fbb7dce99535996b3a8f10872e2434175dc4dc469f4b32c3ab3479974c2f79e5`
+passed. The v12 focused gate passed all 20 tests, strict all-target Clippy and
+formatting; root verified thirteen artifacts, all eight waited commands and no
+observed survivors. Receipt
+`32dce8f47f28091938ad05beffd691b4d5ab9a79f4aa5fc3f0ebcd269fc22899`
+qualifies the affected stage11, delivery4, transfer2, preflight1 and progress2
+cases. Actual configured C/G/F/N and full desktop acceptance remain pending.
+
+The private legacy-read extension also passed three-file source review
+`1963bea5601baa65911de8f927f72e7555051dc7ecb40c4382f98fede19fafbd`.
+It opens only catalog-root previews by validated hash under the 4MiB legacy cap,
+using the existing single stage stream with a generated read lease and exact
+replay/Finish/Abort. Four tests cover catalog versus manifest authority, bounded
+chunks, cancellation, integrity and no source deletion. The three F files are now
+applied; both managed call sites use C-only hash selection and owned F tasks.
+Three additional adapter tests cover lost-begin/middle-read replay, foreign-lane
+isolation and held first/middle cancellation with retained task/result charges;
+independent test review `a6c1d286ddb86adfd9059d369581afcad1b2f7a5f3f5283ed6f3a2ab80026b7b`
+passed. V13 composition review verified all 44 pins and the exact seven-file delta,
+`ba0aeef713296dc29ff3bef7d7387dd3b77739709f474b9f87642556504c8215`.
+The 38-test focused gate is queued behind the active Lightroom pure gate. Source
+is preserved in `sc-22847-legacy-read-lrx3ovg7`; configured C/G/F/N proof remains
+required after these focused tests.
+
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
 an epoch/token-bound relay; reaping LM alone cannot prove its Source children
@@ -155,9 +187,20 @@ actual-process), three formatting checks and all 40 waited commands including
 the preserved failed fixture. Twenty-one warnings are not a Clippy pass. This is
 relay/permit qualification, not whole migration or installed-platform acceptance. Original EAGAIN attribution remains an
 inference because the failed log did not identify its precise I/O operation.
+V49 implements exact Source-scoped grants and two-condition retirement. Its pure
+gate failed compilation before tests because a new fixture called a nonexistent
+MigrationRead verification method. Five artifacts and waited Cargo50603 exit101
+are verified, with no observed survivors; receipt
+`13a9c4d24aade72fa0d9dbf7c369bd178c9b3a884514afb5f2f78035ff282ad9`.
+V50 removes only that invalid fixture call after capture_manifest; production
+source review passed (`b5b9512f05098c5134f6107618e9804c52d21406c4f33013f6ec24518d498fc8`)
+and the one-line successor review passed
+`84e435ffaf89a48cd9d8b3955d3170c6ac30ca5b47c24a626d8aa40e0e5bc1e3`.
+Its nine-test pure gate is active; actual-process scoped retirement and complete
+numerical phase admission/coordinator remain unqualified.
 Source-scoped allocation retirement design passed independent review, requiring
-both G process/pipe/relay drain and LM proxy quiescence; its enforcement is not yet
-implemented, and operation/caller allocations remain charged separately.
+both G process/pipe/relay drain and LM proxy quiescence; v50 enforcement awaits
+runtime qualification, and operation/caller allocations remain charged separately.
 Remaining
 filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
 the full tracked scope. Current local tests use synthetic files without RAID/GPU.
