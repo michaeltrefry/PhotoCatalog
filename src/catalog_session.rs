@@ -270,6 +270,160 @@ pub struct PreparedExportDirectory {
     pub requested: NativePath,
     pub directory: NativePath,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportAliasFactKind {
+    Destination,
+    File,
+    Directory,
+    CanonicalFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportObjectKey {
+    pub volume: U64,
+    /// Decimal preserves the complete platform object identifier through JSON.
+    pub object: String,
+}
+impl ExportObjectKey {
+    pub(crate) fn from_native(value: (u64, u128)) -> Self {
+        Self {
+            volume: U64(value.0),
+            object: value.1.to_string(),
+        }
+    }
+    pub(crate) fn native(&self) -> Result<(u64, u128)> {
+        let object = self.object.parse::<u128>()?;
+        ensure!(
+            object.to_string() == self.object,
+            "invalid export object identity"
+        );
+        Ok((self.volume.0, object))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportAliasFactRequest {
+    pub root: RootCapability,
+    pub path: NativePath,
+    pub kind: ExportAliasFactKind,
+}
+impl ExportAliasFactRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        validate_path(&self.path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExportAliasFactValue {
+    Missing,
+    File {
+        object: ExportObjectKey,
+        canonical: Option<NativePath>,
+    },
+    Directory {
+        object: ExportObjectKey,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportAliasFactReply {
+    pub root: RootCapability,
+    pub path: NativePath,
+    pub kind: ExportAliasFactKind,
+    pub value: ExportAliasFactValue,
+}
+impl ExportAliasFactReply {
+    pub fn validate_for(&self, request: &ExportAliasFactRequest) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            self.root == request.root && self.path == request.path && self.kind == request.kind,
+            "export alias fact belongs to another request"
+        );
+        match (&request.kind, &self.value) {
+            (_, ExportAliasFactValue::Missing) => Ok(()),
+            (
+                ExportAliasFactKind::Destination | ExportAliasFactKind::File,
+                ExportAliasFactValue::File {
+                    object,
+                    canonical: None,
+                },
+            ) => {
+                object.native()?;
+                Ok(())
+            }
+            (
+                ExportAliasFactKind::CanonicalFile,
+                ExportAliasFactValue::File {
+                    object,
+                    canonical: Some(path),
+                },
+            ) => {
+                object.native()?;
+                validate_path(path)
+            }
+            (ExportAliasFactKind::Directory, ExportAliasFactValue::Directory { object }) => {
+                object.native()?;
+                Ok(())
+            }
+            _ => anyhow::bail!("unexpected export alias fact"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportDestinationSnapshotRequest {
+    pub root: RootCapability,
+    pub destination: NativePath,
+    pub max_existing_bytes: U64,
+}
+impl ExportDestinationSnapshotRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        validate_path(&self.destination)?;
+        ensure!(
+            self.max_existing_bytes.0 > 0,
+            "zero destination snapshot allowance"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportDestinationSnapshotReply {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub snapshot: crate::metadata_export::DestinationSnapshot,
+}
+impl ExportDestinationSnapshotReply {
+    pub fn validate_for(&self, request: &ExportDestinationSnapshotRequest) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            self.root == request.root
+                && self.requested == request.destination
+                && self.snapshot.max_existing_bytes == request.max_existing_bytes.0,
+            "export destination snapshot belongs to another request"
+        );
+        crate::metadata_export::validate_destination_snapshot_wire(&self.snapshot)
+    }
+}
 impl PreparedExportDirectory {
     pub fn validate_for(&self, request: &PrepareExportDirectory) -> Result<()> {
         request.validate()?;
@@ -475,6 +629,20 @@ pub trait CatalogFilesystem: Send + Sync {
         _cancel: &AtomicBool,
     ) -> Result<PreparedExportDirectory> {
         anyhow::bail!("filesystem owner does not support export directory preparation")
+    }
+    fn export_destination_snapshot(
+        &self,
+        _request: &ExportDestinationSnapshotRequest,
+        _cancel: &AtomicBool,
+    ) -> Result<ExportDestinationSnapshotReply> {
+        anyhow::bail!("filesystem owner does not support export destination snapshots")
+    }
+    fn export_alias_fact(
+        &self,
+        _request: &ExportAliasFactRequest,
+        _cancel: &AtomicBool,
+    ) -> Result<ExportAliasFactReply> {
+        anyhow::bail!("filesystem owner does not support export alias facts")
     }
     fn export_profile_call(
         &self,
@@ -694,6 +862,50 @@ impl CatalogSessionAuthority {
             }
         }
         result.map(Some)
+    }
+    pub(crate) fn export_destination_snapshot(
+        &self,
+        destination: &NativePath,
+        max_existing_bytes: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::metadata_export::DestinationSnapshot>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let request = ExportDestinationSnapshotRequest {
+            root: root.clone(),
+            destination: destination.clone(),
+            max_existing_bytes: U64(max_existing_bytes),
+        };
+        request.validate()?;
+        let reply = filesystem.export_destination_snapshot(&request, cancel)?;
+        reply.validate_for(&request)?;
+        Ok(Some(reply.snapshot))
+    }
+    pub(crate) fn export_alias_fact(
+        &self,
+        path: &NativePath,
+        kind: ExportAliasFactKind,
+        cancel: &AtomicBool,
+    ) -> Result<Option<ExportAliasFactValue>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let request = ExportAliasFactRequest {
+            root: root.clone(),
+            path: path.clone(),
+            kind,
+        };
+        request.validate()?;
+        let reply = filesystem.export_alias_fact(&request, cancel)?;
+        reply.validate_for(&request)?;
+        Ok(Some(reply.value))
     }
     pub(crate) fn require_jobs_released(&self, legacy_root: &Path) -> Result<()> {
         if matches!(&self.mode, AuthorityMode::Legacy(_)) {
@@ -1187,7 +1399,8 @@ impl Drop for ManagedSession {
 mod tests;
 #[cfg(test)]
 pub(crate) use tests::{
-    export_managed_session, export_profile_managed_session, retained_admission, unused_filesystem,
+    export_facts_managed_session, export_managed_session, export_profile_managed_session,
+    retained_admission, unused_filesystem,
 };
 
 #[cfg(test)]

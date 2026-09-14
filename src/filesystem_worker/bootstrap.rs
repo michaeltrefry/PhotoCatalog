@@ -2,10 +2,12 @@
 use crate::{
     catalog_backup::{self, RestoreStatus},
     catalog_session::{
-        BootstrapMode, CatalogBootstrap, ConfirmSqlAdmission, ExportProfileAction,
-        ExportProfileReply, ExportProfileRequest, ExportProfileValue, LeaseId, PinnedDatabase,
-        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
-        validate_path,
+        BootstrapMode, CatalogBootstrap, ConfirmSqlAdmission, ExportAliasFactKind,
+        ExportAliasFactReply, ExportAliasFactRequest, ExportAliasFactValue,
+        ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportObjectKey,
+        ExportProfileAction, ExportProfileReply, ExportProfileRequest, ExportProfileValue, LeaseId,
+        PinnedDatabase, PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory,
+        RootCapability, validate_path,
     },
     catalog_storage::{open_regular, physical_object_id},
     storage_volume::NativePath,
@@ -17,6 +19,42 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
+
+#[cfg(test)]
+pub(super) const EXPORT_DESTINATION_SNAPSHOT_BARRIER: &str =
+    "PHOTOCATALOG_F_EXPORT_DESTINATION_SNAPSHOT_BARRIER";
+
+#[cfg(test)]
+fn export_destination_snapshot_test_barrier(
+    bytes: u64,
+    cancel: &AtomicBool,
+) -> std::io::Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let Some(marker) = std::env::var_os(EXPORT_DESTINATION_SNAPSHOT_BARRIER) else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(marker);
+    if !barrier.join("armed").exists() {
+        return Ok(());
+    }
+    let entered = barrier.join("entered");
+    if !entered.exists() {
+        fs::write(&entered, b"snapshot-read-started")?;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !cancel.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "test snapshot cancellation was not released",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreparationState {
@@ -526,6 +564,131 @@ impl BootstrapOwner {
             })
         })
     }
+    pub fn export_destination_snapshot(
+        &self,
+        request: &ExportDestinationSnapshotRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportDestinationSnapshotReply> {
+        request.validate()?;
+        export_fact_cancel(cancel)?;
+        self.with_root(&request.root, |_| {
+            let path = request.destination.to_path()?;
+            let mut canceled_while_reading = false;
+            let snapshot = crate::metadata_export::snapshot_photo_destination_with_checkpoint(
+                &path,
+                request.max_existing_bytes.0,
+                &mut |_bytes| {
+                    #[cfg(test)]
+                    export_destination_snapshot_test_barrier(_bytes, cancel)?;
+                    if cancel.load(Ordering::Acquire) {
+                        canceled_while_reading = true;
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "export destination inspection canceled",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            if canceled_while_reading {
+                return Err(anyhow::Error::new(super::wire::Failure::new(
+                    super::wire::FailureKind::Canceled,
+                    "export destination inspection canceled",
+                )));
+            }
+            export_fact_cancel(cancel)?;
+            let snapshot = snapshot?;
+            Ok(ExportDestinationSnapshotReply {
+                root: request.root.clone(),
+                requested: request.destination.clone(),
+                snapshot,
+            })
+        })
+    }
+    pub fn export_alias_fact(
+        &self,
+        request: &ExportAliasFactRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportAliasFactReply> {
+        request.validate()?;
+        export_fact_cancel(cancel)?;
+        self.with_root(&request.root, |_| {
+            let path = request.path.to_path()?;
+            let value = match request.kind {
+                ExportAliasFactKind::Destination => match fs::symlink_metadata(&path) {
+                    Ok(metadata) => {
+                        ensure!(
+                            metadata.is_file() && !metadata.file_type().is_symlink(),
+                            "export destination is not an ordinary file"
+                        );
+                        ExportAliasFactValue::File {
+                            object: ExportObjectKey::from_native(
+                                crate::storage_volume::object_key(&path, &metadata)?,
+                            ),
+                            canonical: None,
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ExportAliasFactValue::Missing
+                    }
+                    Err(error) => return Err(error.into()),
+                },
+                ExportAliasFactKind::File | ExportAliasFactKind::CanonicalFile => {
+                    match fs::metadata(&path) {
+                        Ok(metadata) => {
+                            ensure!(
+                                metadata.is_file(),
+                                "catalog original changed file type; reconcile before overwrite"
+                            );
+                            ExportAliasFactValue::File {
+                                object: ExportObjectKey::from_native(
+                                    crate::storage_volume::object_key(&path, &metadata)?,
+                                ),
+                                canonical: matches!(
+                                    request.kind,
+                                    ExportAliasFactKind::CanonicalFile
+                                )
+                                .then(|| fs::canonicalize(&path))
+                                .transpose()?
+                                .map(|path| NativePath::from_path(&path)),
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            ExportAliasFactValue::Missing
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                ExportAliasFactKind::Directory => match fs::metadata(&path) {
+                    Ok(metadata) => {
+                        ensure!(
+                            metadata.is_dir(),
+                            "original directory changed type; reconcile before export"
+                        );
+                        ExportAliasFactValue::Directory {
+                            object: ExportObjectKey::from_native(
+                                crate::storage_volume::object_key(&path, &metadata)?,
+                            ),
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ExportAliasFactValue::Missing
+                    }
+                    Err(error) => return Err(error.into()),
+                },
+            };
+            export_fact_cancel(cancel)?;
+            let reply = ExportAliasFactReply {
+                root: request.root.clone(),
+                path: request.path.clone(),
+                kind: request.kind,
+                value,
+            };
+            reply.validate_for(request)?;
+            Ok(reply)
+        })
+    }
     pub fn export_profile_call(
         &mut self,
         request: &ExportProfileRequest,
@@ -798,6 +961,15 @@ fn export_cancel(cancel: &AtomicBool) -> Result<()> {
         return Err(anyhow::Error::new(super::wire::Failure::new(
             super::wire::FailureKind::Canceled,
             "export directory preparation canceled",
+        )));
+    }
+    Ok(())
+}
+fn export_fact_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(anyhow::Error::new(super::wire::Failure::new(
+            super::wire::FailureKind::Canceled,
+            "export destination inspection canceled",
         )));
     }
     Ok(())

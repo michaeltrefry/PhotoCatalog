@@ -5,8 +5,9 @@ use crate::{
     application::U64,
     catalog_backup::RestoreStatus,
     catalog_session::{
-        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportProfileReply,
-        ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportAliasFactReply,
+        ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
+        ExportProfileReply, ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
         PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, store,
     },
     filesystem_worker::{
@@ -59,6 +60,8 @@ pub(super) enum Call {
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
+    ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
+    ExportAliasFact(Box<ExportAliasFactRequest>),
     ExportProfile(Box<ExportProfileRequest>),
 }
 impl Call {
@@ -76,6 +79,8 @@ impl Call {
                 | Self::Confirm(_)
                 | Self::ReadPreviewConfiguration(_)
                 | Self::PrepareExportDirectory(_)
+                | Self::ExportDestinationSnapshot(_)
+                | Self::ExportAliasFact(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
@@ -115,6 +120,8 @@ impl Call {
             }
             Self::ReadPreviewConfiguration(path) => store::path(path),
             Self::PrepareExportDirectory(request) => request.validate(),
+            Self::ExportDestinationSnapshot(request) => request.validate(),
+            Self::ExportAliasFact(request) => request.validate(),
             Self::ExportProfile(request) => request.validate(),
             _ => Ok(()),
         }
@@ -127,6 +134,8 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
+        std::mem::size_of::<ExportDestinationSnapshotRequest>(),
+        std::mem::size_of::<ExportAliasFactRequest>(),
         std::mem::size_of::<ExportProfileRequest>(),
     ]
     .into_iter()
@@ -149,6 +158,8 @@ pub(super) enum Value {
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
     ExportDirectory(PreparedExportDirectory),
+    ExportDestinationSnapshot(ExportDestinationSnapshotReply),
+    ExportAliasFact(ExportAliasFactReply),
     ExportProfile(ExportProfileReply),
     Unit,
 }
@@ -1058,6 +1069,12 @@ impl Parent {
                 Call::PrepareExportDirectory(request) => {
                     Value::ExportDirectory(self.client.prepare_export_directory(request, cancel)?)
                 }
+                Call::ExportDestinationSnapshot(request) => Value::ExportDestinationSnapshot(
+                    self.client.export_destination_snapshot(request, cancel)?,
+                ),
+                Call::ExportAliasFact(request) => {
+                    Value::ExportAliasFact(self.client.export_alias_fact(request, cancel)?)
+                }
                 Call::ExportProfile(request) => {
                     Value::ExportProfile(self.client.export_profile_call(request, cancel)?)
                 }
@@ -1647,6 +1664,35 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("wrong export directory reply"),
         }
     }
+    fn export_destination_snapshot(
+        &self,
+        request: &ExportDestinationSnapshotRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportDestinationSnapshotReply> {
+        match self.call(
+            Call::ExportDestinationSnapshot(Box::new(request.clone())),
+            cancel,
+        )? {
+            Value::ExportDestinationSnapshot(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("wrong export destination snapshot reply"),
+        }
+    }
+    fn export_alias_fact(
+        &self,
+        request: &ExportAliasFactRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportAliasFactReply> {
+        match self.call(Call::ExportAliasFact(Box::new(request.clone())), cancel)? {
+            Value::ExportAliasFact(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("wrong export alias fact reply"),
+        }
+    }
     fn export_profile_call(
         &self,
         request: &ExportProfileRequest,
@@ -1691,6 +1737,12 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
             "preview configuration response byte limit"
         ),
         (Call::PrepareExportDirectory(request), Value::ExportDirectory(value)) => {
+            value.validate_for(request)?
+        }
+        (Call::ExportDestinationSnapshot(request), Value::ExportDestinationSnapshot(value)) => {
+            value.validate_for(request)?
+        }
+        (Call::ExportAliasFact(request), Value::ExportAliasFact(value)) => {
             value.validate_for(request)?
         }
         (Call::ExportProfile(request), Value::ExportProfile(value)) => value.validate(request)?,

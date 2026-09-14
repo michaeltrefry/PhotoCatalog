@@ -227,6 +227,83 @@ fn bounded_job_pages_and_exact_frozen_plan_chunks() -> anyhow::Result<()> {
     assert!(c.photo_export_plan("job0", 1).is_err());
     Ok(())
 }
+
+#[test]
+fn managed_append_routes_destination_snapshot_and_alias_facts_through_authority()
+-> anyhow::Result<()> {
+    use crate::catalog_session::{ExportAliasFactKind, export_facts_managed_session};
+    let temp = tempfile::tempdir()?;
+    let original = temp.path().join("managed-original.png");
+    std::fs::write(&original, b"managed original custody bytes")?;
+    let (mut session, (snapshots, aliases)) = export_facts_managed_session(temp.path())?;
+    let destination = temp.path().join("managed-export.png");
+    let protected_destination = NativePath::from_path(
+        &destination
+            .parent()
+            .unwrap()
+            .canonicalize()?
+            .join(destination.file_name().unwrap()),
+    );
+    {
+        let catalog = session.catalog.as_mut().unwrap();
+        let fingerprint = blake3::hash(b"managed original custody bytes")
+            .to_hex()
+            .to_string();
+        catalog.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('managed',?1,?2,'ready',?3,'fixture','{\"format\":\"PNG\",\"width\":32,\"height\":24,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",rusqlite::params![crate::location_bytes(&original),original.to_string_lossy(),fingerprint])?;
+        catalog.record_storage_path("managed", &NativePath::from_path(&original))?;
+        let job = catalog.begin_photo_export()?;
+        catalog.append_photo_export(
+            &job.id,
+            0,
+            &core::ExportTarget {
+                key: VariantKey::master("managed"),
+                expected_revision: 0,
+                destination: destination.clone(),
+                overwrite: false,
+                metadata: core::MetadataSelection::Omit,
+            },
+            &crate::image_export::OutputSpec {
+                size: OutputSize::Original,
+                format: output().format,
+                profile: crate::image_export::OutputProfile::Srgb,
+                alpha: AlphaPolicy::Preserve,
+            },
+            1024,
+            1024,
+        )?;
+    }
+    let snapshots = snapshots.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        snapshots[0].destination,
+        NativePath::from_path(&destination)
+    );
+    drop(snapshots);
+    let aliases = aliases.lock().unwrap();
+    assert!(
+        aliases
+            .iter()
+            .all(|request| request.root == session.bootstrap.root_capability())
+    );
+    assert!(aliases.iter().any(|request| {
+        request.path == NativePath::from_path(&original)
+            && request.kind == ExportAliasFactKind::CanonicalFile
+    }));
+    assert!(
+        aliases
+            .iter()
+            .filter(|request| {
+                request.path == protected_destination
+                    && request.kind == ExportAliasFactKind::Destination
+            })
+            .count()
+            >= 2
+    );
+    drop(aliases);
+    assert!(!destination.exists());
+    session.close()?;
+    Ok(())
+}
 #[test]
 fn profile_tokens_are_rgb_validated_bounded_and_native_links_rejected() -> anyhow::Result<()> {
     let (temp, catalog) = fixture()?;

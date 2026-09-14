@@ -66,6 +66,16 @@ impl FilesystemHandler {
                 .prepare_export_directory(&request, cancel)
                 .map_err(export_directory_failure)
                 .map(Response::ExportDirectory),
+            Operation::ExportDestinationSnapshot(request) => self
+                .owner
+                .export_destination_snapshot(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::ExportDestinationSnapshot),
+            Operation::ExportAliasFact(request) => self
+                .owner
+                .export_alias_fact(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::ExportAliasFact),
             Operation::ExportProfile(request) => self
                 .owner
                 .export_profile_call(&request, cancel)
@@ -185,6 +195,8 @@ fn filesystem_failure(error: anyhow::Error) -> Failure {
 fn export_directory_failure(error: anyhow::Error) -> anyhow::Error {
     if error.downcast_ref::<Failure>().is_some() {
         error
+    } else if error.is::<crate::metadata_export::FileByteLimit>() {
+        Failure::new(FailureKind::ResourceLimit, error).into()
     } else {
         Failure::new(FailureKind::Rejected, error).into()
     }

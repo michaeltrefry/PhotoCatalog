@@ -17,10 +17,13 @@ struct Facts {
     fail_release: AtomicBool,
     fail_prepare: AtomicBool,
     fail_confirmation: AtomicBool,
+    empty_restore_status: AtomicBool,
     fresh: bool,
     fatal_drop_sentry: bool,
     export_directory: NativePath,
     export_requests: Arc<Mutex<Vec<PrepareExportDirectory>>>,
+    export_snapshot_requests: Arc<Mutex<Vec<ExportDestinationSnapshotRequest>>>,
+    export_alias_requests: Arc<Mutex<Vec<ExportAliasFactRequest>>>,
     export_profile: Mutex<Vec<u8>>,
     export_profile_requests: Arc<Mutex<Vec<ExportProfileRequest>>>,
     cancel_profile_after_begin: AtomicBool,
@@ -97,10 +100,13 @@ impl Facts {
                 fail_release: AtomicBool::new(false),
                 fail_prepare: AtomicBool::new(false),
                 fail_confirmation: AtomicBool::new(false),
+                empty_restore_status: AtomicBool::new(false),
                 fresh: true,
                 fatal_drop_sentry: false,
                 export_directory: NativePath::from_path(&export_directory),
                 export_requests: Arc::new(Mutex::new(Vec::new())),
+                export_snapshot_requests: Arc::new(Mutex::new(Vec::new())),
+                export_alias_requests: Arc::new(Mutex::new(Vec::new())),
                 export_profile: Mutex::new(Vec::new()),
                 export_profile_requests: Arc::new(Mutex::new(Vec::new())),
                 cancel_profile_after_begin: AtomicBool::new(false),
@@ -120,6 +126,57 @@ impl Drop for Facts {
     }
 }
 impl CatalogFilesystem for Facts {
+    fn export_destination_snapshot(
+        &self,
+        request: &ExportDestinationSnapshotRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportDestinationSnapshotReply> {
+        request.validate()?;
+        self.export_snapshot_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if cancel.load(Ordering::Acquire) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Canceled,
+                "synthetic export snapshot cancellation",
+            )
+            .into());
+        }
+        let snapshot = crate::metadata_export::snapshot_photo_destination(
+            &request.destination.to_path()?,
+            request.max_existing_bytes.0,
+        )?;
+        Ok(ExportDestinationSnapshotReply {
+            root: request.root.clone(),
+            requested: request.destination.clone(),
+            snapshot,
+        })
+    }
+    fn export_alias_fact(
+        &self,
+        request: &ExportAliasFactRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportAliasFactReply> {
+        request.validate()?;
+        self.export_alias_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if cancel.load(Ordering::Acquire) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Canceled,
+                "synthetic export alias cancellation",
+            )
+            .into());
+        }
+        Ok(ExportAliasFactReply {
+            root: request.root.clone(),
+            path: request.path.clone(),
+            kind: request.kind,
+            value: crate::catalog_export_alias::local_alias_fact(&request.path, request.kind)?,
+        })
+    }
     fn export_profile_call(
         &self,
         request: &ExportProfileRequest,
@@ -253,6 +310,9 @@ impl CatalogFilesystem for Facts {
     }
     fn restore_status(&self, root: &RootCapability) -> Result<Option<RestoreStatus>> {
         ensure!(root == &self.bootstrap.root_capability());
+        if self.empty_restore_status.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         anyhow::bail!("synthetic F marker observation: no local fallback")
     }
     fn resume_restored_jobs(
@@ -709,6 +769,23 @@ pub(crate) fn export_managed_session(
     let directory = NativePath::from_path(&export_directory.canonicalize()?);
     let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
     Ok((session, requests, directory))
+}
+
+pub(crate) type ExportFactRequests = (
+    Arc<Mutex<Vec<ExportDestinationSnapshotRequest>>>,
+    Arc<Mutex<Vec<ExportAliasFactRequest>>>,
+);
+pub(crate) fn export_facts_managed_session(
+    base: &Path,
+) -> Result<(ManagedSession, ExportFactRequests)> {
+    let (facts, request) = Facts::create(base)?;
+    facts.empty_restore_status.store(true, Ordering::Release);
+    let calls = (
+        facts.export_snapshot_requests.clone(),
+        facts.export_alias_requests.clone(),
+    );
+    let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
+    Ok((session, calls))
 }
 
 pub(crate) fn export_profile_managed_session(

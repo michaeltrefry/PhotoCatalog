@@ -139,6 +139,111 @@ fn export_directory_reply_requires_exact_root_and_requested_path() -> Result<()>
 }
 
 #[test]
+fn export_snapshot_and_alias_fact_replies_require_exact_provenance() -> Result<()> {
+    use crate::catalog_session::{
+        ExportAliasFactKind, ExportAliasFactReply, ExportAliasFactRequest, ExportAliasFactValue,
+        ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportObjectKey,
+    };
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let root = bootstrap(&request(), &binding).root_capability();
+    let destination = NativePath::from_path(&std::env::temp_dir().join("selected.png"));
+    let snapshot_request = ExportDestinationSnapshotRequest {
+        root: root.clone(),
+        destination: destination.clone(),
+        max_existing_bytes: U64(1024),
+    };
+    let snapshot_call = Call::ExportDestinationSnapshot(Box::new(snapshot_request.clone()));
+    let snapshot = ExportDestinationSnapshotReply {
+        root: root.clone(),
+        requested: destination.clone(),
+        snapshot: crate::metadata_export::DestinationSnapshot {
+            version: 2,
+            operation: uuid::Uuid::new_v4().to_string(),
+            destination: destination.to_path()?,
+            expected: None,
+            max_existing_bytes: 1024,
+        },
+    };
+    validate_reply(
+        &snapshot_call,
+        &Value::ExportDestinationSnapshot(snapshot.clone()),
+        &binding,
+    )?;
+    let encoded = encode(
+        &Packet {
+            binding: binding.clone(),
+            body: Body::Call {
+                id: U64(13),
+                call: snapshot_call.clone(),
+            },
+        },
+        BYTES,
+    )?;
+    assert!(matches!(
+        decode(&binding, &encoded, Lane::Data)?,
+        Body::Call {
+            id: U64(13),
+            call: Call::ExportDestinationSnapshot(_)
+        }
+    ));
+    let mut foreign_snapshot = snapshot;
+    foreign_snapshot.requested = NativePath::from_path(&std::env::temp_dir().join("other.png"));
+    assert!(
+        validate_reply(
+            &snapshot_call,
+            &Value::ExportDestinationSnapshot(foreign_snapshot),
+            &binding,
+        )
+        .is_err()
+    );
+
+    let fact_request = ExportAliasFactRequest {
+        root: root.clone(),
+        path: destination,
+        kind: ExportAliasFactKind::Destination,
+    };
+    let fact_call = Call::ExportAliasFact(Box::new(fact_request.clone()));
+    let fact = ExportAliasFactReply {
+        root,
+        path: fact_request.path.clone(),
+        kind: fact_request.kind,
+        value: ExportAliasFactValue::File {
+            object: ExportObjectKey {
+                volume: U64(u64::MAX),
+                object: u128::MAX.to_string(),
+            },
+            canonical: None,
+        },
+    };
+    validate_reply(&fact_call, &Value::ExportAliasFact(fact.clone()), &binding)?;
+    let encoded = encode(
+        &Packet {
+            binding: binding.clone(),
+            body: Body::Reply {
+                id: U64(14),
+                outcome: Ok(Value::ExportAliasFact(fact.clone())),
+            },
+        },
+        BYTES,
+    )?;
+    let Body::Reply {
+        id: U64(14),
+        outcome: Ok(decoded),
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        panic!("alias fact reply")
+    };
+    validate_reply(&fact_call, &decoded, &binding)?;
+    let mut wrong_kind = fact;
+    wrong_kind.kind = ExportAliasFactKind::File;
+    assert!(validate_reply(&fact_call, &Value::ExportAliasFact(wrong_kind), &binding).is_err());
+    Ok(())
+}
+
+#[test]
 fn export_profile_chunk_uses_bounded_binary_and_exact_provenance() -> Result<()> {
     use crate::catalog_session::{
         EXPORT_PROFILE_BYTES, ExportProfileAction, ExportProfileReply, ExportProfileRequest,

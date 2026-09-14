@@ -4,8 +4,9 @@ use crate::{
     application::U64,
     catalog_backup::RestoreStatus,
     catalog_session::{
-        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportProfileReply,
-        ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportAliasFactReply,
+        ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
+        ExportProfileReply, ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
         PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
@@ -993,6 +994,38 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected export directory response"),
         }
     }
+    fn export_destination_snapshot(
+        &self,
+        request: &ExportDestinationSnapshotRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportDestinationSnapshotReply> {
+        match self.execute(
+            Operation::ExportDestinationSnapshot(Box::new(request.clone())),
+            cancel,
+        )? {
+            Response::ExportDestinationSnapshot(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected export destination snapshot response"),
+        }
+    }
+    fn export_alias_fact(
+        &self,
+        request: &ExportAliasFactRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportAliasFactReply> {
+        match self.execute(
+            Operation::ExportAliasFact(Box::new(request.clone())),
+            cancel,
+        )? {
+            Response::ExportAliasFact(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected export alias fact response"),
+        }
+    }
     fn export_profile_call(
         &self,
         request: &ExportProfileRequest,
@@ -1098,7 +1131,10 @@ fn restore(value: Response) -> Result<Option<RestoreStatus>> {
 mod tests {
     use super::*;
     use crate::filesystem_worker::process::{Handler, OperationContext};
-    use std::{fs, io, path::PathBuf};
+    use std::{
+        fs, io,
+        path::{Path, PathBuf},
+    };
 
     // No child or I/O thread exists in these transport-state fixtures.
     fn bare() -> Result<Client> {
@@ -1482,9 +1518,18 @@ mod tests {
         }
     }
     fn spawn_fixture(role: &str, directory: &Path, faults: Faults) -> Result<NoDependents> {
+        spawn_fixture_with_snapshot_barrier(role, directory, None, faults)
+    }
+    fn spawn_fixture_with_snapshot_barrier(
+        role: &str,
+        directory: &Path,
+        snapshot_barrier: Option<&Path>,
+        faults: Faults,
+    ) -> Result<NoDependents> {
         let startup = Startup::new(vec![])?;
         let hello = encode(&startup, CONFIG_BYTES)?;
-        let mut child = Command::new(std::env::current_exe()?)
+        let mut command = Command::new(std::env::current_exe()?);
+        command
             .args([
                 "--ignored",
                 "--exact",
@@ -1496,8 +1541,14 @@ mod tests {
             .env(DIRECTORY, directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        if let Some(marker) = snapshot_barrier {
+            command.env(
+                crate::filesystem_worker::bootstrap::EXPORT_DESTINATION_SNAPSHOT_BARRIER,
+                marker,
+            );
+        }
+        let mut child = command.spawn()?;
         let pid = child.id();
         eprintln!("F ownership fixture spawned pid={pid} role={role}");
         let input = child.stdin.take().unwrap();
@@ -1601,6 +1652,227 @@ mod tests {
         child
             .0
             .abandon_prepare(bootstrap.operation, &bootstrap.session)?;
+        child.0.try_shutdown()?;
+        assert_retired(&child.0);
+        Ok(())
+    }
+
+    #[test]
+    fn actual_f_export_destination_snapshot_and_alias_facts_are_bounded_and_read_only() -> Result<()>
+    {
+        use crate::catalog_session::{
+            ExportAliasFactKind, ExportAliasFactRequest, ExportAliasFactValue,
+            ExportDestinationSnapshotRequest, SQL_ROLES, SqlRole, SqlRoleObservation,
+        };
+        let temp = tempfile::tempdir()?;
+        let snapshot_barrier = temp.path().join("snapshot-barrier");
+        fs::create_dir(&snapshot_barrier)?;
+        let child = spawn_fixture_with_snapshot_barrier(
+            "filesystem",
+            temp.path(),
+            Some(&snapshot_barrier),
+            Faults::default(),
+        )?;
+        let catalog = PrepareCatalog {
+            operation: U64(19),
+            session: LeaseId::new(),
+            mode: crate::catalog_session::BootstrapMode::DesktopCreate,
+            root: NativePath::from_path(&temp.path().join("catalog")),
+            manifest_root: NativePath::from_path(&temp.path().join("manifest")),
+            import_source: None,
+        };
+        let bootstrap = child.0.prepare_catalog(&catalog, &AtomicBool::new(false))?;
+        let confirmation = ConfirmSqlAdmission {
+            operation: bootstrap.operation,
+            root: bootstrap.root_capability(),
+            roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                role,
+                physical: if role == SqlRole::Manifest {
+                    bootstrap.manifest.physical
+                } else {
+                    bootstrap.catalog.physical
+                },
+            }),
+        };
+        child
+            .0
+            .confirm_sql_admission(&confirmation, &AtomicBool::new(false))?;
+        let root = bootstrap.root_capability();
+        let output = temp.path().join("output");
+        fs::create_dir(&output)?;
+        let destination = output.join("photo.png");
+        let request = ExportDestinationSnapshotRequest {
+            root: root.clone(),
+            destination: NativePath::from_path(&destination),
+            max_existing_bytes: U64(16),
+        };
+        let absent = child
+            .0
+            .export_destination_snapshot(&request, &AtomicBool::new(false))?;
+        absent.validate_for(&request)?;
+        assert!(absent.snapshot.expected.is_none());
+        assert!(!destination.exists());
+
+        fs::write(&destination, b"old destination")?;
+        let present = child
+            .0
+            .export_destination_snapshot(&request, &AtomicBool::new(false))?;
+        assert_eq!(present.snapshot.expected.as_ref().unwrap().bytes, 15);
+        assert_eq!(fs::read(&destination)?, b"old destination");
+        let alias = |path: &Path, kind| ExportAliasFactRequest {
+            root: root.clone(),
+            path: NativePath::from_path(path),
+            kind,
+        };
+        let destination_fact = alias(&destination, ExportAliasFactKind::Destination);
+        assert!(matches!(
+            child
+                .0
+                .export_alias_fact(&destination_fact, &AtomicBool::new(false))?
+                .value,
+            ExportAliasFactValue::File {
+                canonical: None,
+                ..
+            }
+        ));
+        let canonical = alias(&destination, ExportAliasFactKind::CanonicalFile);
+        assert!(matches!(
+            child
+                .0
+                .export_alias_fact(&canonical, &AtomicBool::new(false))?
+                .value,
+            ExportAliasFactValue::File {
+                canonical: Some(_),
+                ..
+            }
+        ));
+        let file = alias(&destination, ExportAliasFactKind::File);
+        assert!(matches!(
+            child
+                .0
+                .export_alias_fact(&file, &AtomicBool::new(false))?
+                .value,
+            ExportAliasFactValue::File {
+                canonical: None,
+                ..
+            }
+        ));
+        let directory = alias(&output, ExportAliasFactKind::Directory);
+        assert!(matches!(
+            child
+                .0
+                .export_alias_fact(&directory, &AtomicBool::new(false))?
+                .value,
+            ExportAliasFactValue::Directory { .. }
+        ));
+
+        let limited = ExportDestinationSnapshotRequest {
+            max_existing_bytes: U64(14),
+            ..request.clone()
+        };
+        let error = child
+            .0
+            .export_destination_snapshot(&limited, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::ResourceLimit
+        );
+        let error = child
+            .0
+            .export_destination_snapshot(&request, &AtomicBool::new(true))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Canceled
+        );
+        let error = child
+            .0
+            .export_alias_fact(&destination_fact, &AtomicBool::new(true))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Canceled
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let linked = output.join("linked.png");
+            symlink(&destination, &linked)?;
+            let error = child
+                .0
+                .export_alias_fact(
+                    &alias(&linked, ExportAliasFactKind::Destination),
+                    &AtomicBool::new(false),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<Failure>().unwrap().kind,
+                FailureKind::Rejected
+            );
+            assert!(matches!(
+                child
+                    .0
+                    .export_alias_fact(
+                        &alias(&linked, ExportAliasFactKind::File),
+                        &AtomicBool::new(false),
+                    )?
+                    .value,
+                ExportAliasFactValue::File { .. }
+            ));
+            fs::remove_file(linked)?;
+        }
+        let mut foreign = directory;
+        foreign.root.session = LeaseId::new();
+        let error = child
+            .0
+            .export_alias_fact(&foreign, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Rejected
+        );
+        assert_eq!(fs::read_dir(&output)?.count(), 1);
+        assert_eq!(fs::read(&destination)?, b"old destination");
+
+        let cancel_destination = output.join("cancel.png");
+        let cancel_bytes = vec![0x5a; 128 * 1024];
+        fs::write(&cancel_destination, &cancel_bytes)?;
+        fs::write(snapshot_barrier.join("armed"), b"cancel next snapshot read")?;
+        let cancel_marker = snapshot_barrier.join("entered");
+        let cancel_request = ExportDestinationSnapshotRequest {
+            root: root.clone(),
+            destination: NativePath::from_path(&cancel_destination),
+            max_existing_bytes: U64(cancel_bytes.len() as u64),
+        };
+        let cancel = AtomicBool::new(false);
+        let error = std::thread::scope(|scope| -> Result<anyhow::Error> {
+            let call = scope.spawn(|| {
+                child
+                    .0
+                    .export_destination_snapshot(&cancel_request, &cancel)
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !cancel_marker.exists() {
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "F did not reach the post-read snapshot checkpoint"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cancel.store(true, Ordering::Release);
+            Ok(call
+                .join()
+                .expect("snapshot cancellation caller")
+                .unwrap_err())
+        })?;
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Canceled
+        );
+        assert_eq!(fs::read(&cancel_destination)?, cancel_bytes);
+        assert_eq!(fs::read_dir(&output)?.count(), 2);
+        child.0.release_root(&root)?;
         child.0.try_shutdown()?;
         assert_retired(&child.0);
         Ok(())

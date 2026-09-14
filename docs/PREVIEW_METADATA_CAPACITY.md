@@ -77,6 +77,30 @@ native-path backings while its deep-cloned relay `Call` is in flight; that Call
 graph remains separately charged. Directory contents and exported image bytes
 are outside this read-only preparation phase.
 
+Destination planning and alias admission reuse that same single-operation
+export envelope. The export coordinator owns one serial worker and dispatches
+one operation at a time, so directory preparation, destination snapshotting and
+stateless alias fact queries are phase-exclusive. F canonicalizes the requested
+photo destination and reads an existing ordinary file through one held handle,
+with the admitted size, object/change identity, byte count and digest rechecked
+before returning. F also resolves the no-follow destination fact, followed-file
+fact, directory fact and optional canonical-file path. Every reply is bound to
+the complete catalog root capability and exact requested path/fact kind; C keeps
+the authoritative catalog transaction, indexed candidate selection and all
+identity/spelling comparisons. The existing alias contract still performs fresh
+synchronous facts at each recheck and does not freeze later external changes.
+
+The active report uses the maximum exact F operation/request/response graph,
+the simultaneous original C caller request backing and the retained snapshot
+result. Snapshot validation separately charges its path clones/conversions,
+bounded detail and the transient serializer output for the three repeated
+destination paths before a 64 KiB durable-plan rejection. A separate C phase
+envelope charges the two simultaneously reachable 256 KiB SQL rows, their
+parsed native paths, the destination projection's path/string allocations, and
+the later source/canonical/destination exclusion backings. No destination bytes
+survive beyond the bounded snapshot revision. Original acquisition and
+publication capture/link filesystem operations remain outside this component.
+
 Managed ICC acquisition uses one serial export-profile transfer. F retains the
 opened stable `Source`, the exact catalog root capability, requested path,
 transfer identity, next step and offset until an acknowledged finish or abort.
@@ -182,9 +206,9 @@ checked application-requested backing assemblies:
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 71,264,322 | 5,938,306,300 | 5,364,516,472 | 6,009,570,622 |
-| Default | 785,359,688 | 5,938,315,876 | 5,364,516,472 | 6,723,675,564 |
-| Maximum | 1,066,041,177,824 | 10,455,470,776 | 5,364,516,472 | 1,076,496,648,600 |
+| Minimum | 71,264,322 | 5,954,269,130 | 5,364,516,472 | 6,025,533,452 |
+| Default | 785,359,688 | 5,954,278,706 | 5,364,516,472 | 6,739,638,394 |
+| Maximum | 1,066,041,177,824 | 10,471,433,606 | 5,364,516,472 | 1,076,512,611,430 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime

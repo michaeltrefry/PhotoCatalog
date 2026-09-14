@@ -13,6 +13,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Debug)]
+pub(crate) struct FileByteLimit;
+impl std::fmt::Display for FileByteLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("file exceeds explicit byte admission")
+    }
+}
+impl std::error::Error for FileByteLimit {}
+
 #[path = "metadata_export/photo_phases.rs"]
 mod photo_phases;
 pub mod wire;
@@ -833,6 +842,37 @@ fn validate_snapshot(snapshot: &DestinationSnapshot) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_destination_snapshot_wire(snapshot: &DestinationSnapshot) -> Result<()> {
+    ensure!(
+        snapshot.version == 2,
+        "unsupported managed photo snapshot version"
+    );
+    ensure!(
+        uuid::Uuid::parse_str(&snapshot.operation)?.to_string() == snapshot.operation,
+        "invalid photo operation identity"
+    );
+    ensure!(
+        snapshot.destination.is_absolute()
+            && snapshot.destination.parent().is_some()
+            && snapshot.destination.extension().is_some_and(|extension| {
+                ["jpg", "jpeg", "png", "tif", "tiff"]
+                    .iter()
+                    .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+            }),
+        "invalid managed photo destination"
+    );
+    crate::catalog_session::validate_path(&crate::storage_volume::NativePath::from_path(
+        &snapshot.destination,
+    ))?;
+    if let Some(expected) = &snapshot.expected {
+        ensure!(
+            expected.bytes <= snapshot.max_existing_bytes && valid_digest(&expected.digest),
+            "invalid destination revision/admission"
+        );
+    }
+    Ok(())
+}
+
 fn validate_photo_seal(sealed: &SealedPhotoExport) -> Result<()> {
     validate_snapshot(&sealed.snapshot)?;
     ensure!(
@@ -944,10 +984,9 @@ fn stream_revision(
     checkpoint(0)?;
     let file = open_regular(path)?;
     let before = file.metadata()?;
-    ensure!(
-        before.len() <= max_bytes,
-        "file exceeds explicit byte admission"
-    );
+    if before.len() > max_bytes {
+        return Err(FileByteLimit.into());
+    }
     let file_identity = identity(&file, &before)?;
     let mut reader = (&file).take(before.len().saturating_add(1));
     let mut buffer = [0u8; 64 * 1024];
@@ -1202,4 +1241,33 @@ fn publish_noclobber(source: &Path, destination: &Path) -> Result<()> {
         move_to_private(&alias, destination)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn destination_snapshot_rejects_growth_during_held_read() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("changing.jpg");
+        fs::write(&destination, vec![0x5a; 128 * 1024])?;
+        let mut changed = false;
+        let error =
+            snapshot_photo_destination_with_checkpoint(&destination, 256 * 1024, &mut |bytes| {
+                if bytes >= 64 * 1024 && !changed {
+                    changed = true;
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&destination)?
+                        .write_all(&[0xa5])?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(changed);
+        assert!(error.to_string().contains("grew during bounded read"));
+        assert_eq!(fs::metadata(destination)?.len(), 128 * 1024 + 1);
+        Ok(())
+    }
 }

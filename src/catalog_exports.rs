@@ -292,44 +292,86 @@ fn verify_original(
 }
 fn protect_destination_controlled(
     db: &Connection,
+    session: &crate::catalog_session::CatalogSessionAuthority,
     destination: &Path,
     original: &Path,
     limits: crate::catalog_export_alias::AliasLimits,
     control: &mut ExportControl<'_>,
 ) -> Result<()> {
-    crate::catalog_export_alias::protect_destination_with_checkpoint(
-        db,
-        destination,
-        limits,
-        &mut || control.check(ExportCheckpoint::Alias),
-    )?;
+    protect_alias_controlled(db, session, destination, limits, control)?;
     control.check(ExportCheckpoint::Alias)?;
+    let original_native = NativePath::from_path(original);
+    let (source, canonical) = match export_alias_fact(
+        session,
+        &original_native,
+        crate::catalog_session::ExportAliasFactKind::CanonicalFile,
+        control,
+    )? {
+        crate::catalog_session::ExportAliasFactValue::File {
+            object,
+            canonical: Some(canonical),
+        } => (object.native()?, canonical),
+        _ => anyhow::bail!("export original is not an ordinary file"),
+    };
+    let destination_native = NativePath::from_path(destination);
     ensure!(
-        destination != original.canonicalize()?,
+        destination_native != canonical,
         "export destination is the original"
     );
-    let encoded = serde_json::to_string(&NativePath::from_path(destination))?;
+    let encoded = serde_json::to_string(&destination_native)?;
     let known: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM storage_bindings WHERE native_path=?1)",
         [encoded],
         |r| r.get(0),
     )?;
     ensure!(!known, "export destination is a catalog original");
-    if let Ok(m) = std::fs::symlink_metadata(destination) {
-        ensure!(
-            m.is_file() && !m.file_type().is_symlink(),
-            "destination must be an ordinary file"
-        );
-        let key = crate::storage_volume::object_key(destination, &m)?;
+    if let crate::catalog_session::ExportAliasFactValue::File { object, .. } = export_alias_fact(
+        session,
+        &destination_native,
+        crate::catalog_session::ExportAliasFactKind::Destination,
+        control,
+    )? {
+        let key = object.native()?;
         let known: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM storage_bindings WHERE file_key=?1)",
             [format!("{}:{}", key.0, key.1)],
             |r| r.get(0),
         )?;
         ensure!(!known, "export destination aliases a catalog original");
-        let source = crate::storage_volume::object_key(original, &std::fs::metadata(original)?)?;
         ensure!(key != source, "export destination aliases the source");
     }
+    Ok(())
+}
+fn export_alias_fact(
+    session: &crate::catalog_session::CatalogSessionAuthority,
+    path: &NativePath,
+    kind: crate::catalog_session::ExportAliasFactKind,
+    control: &ExportControl<'_>,
+) -> Result<crate::catalog_session::ExportAliasFactValue> {
+    if let Some(value) = session.export_alias_fact(path, kind, control.cancellation())? {
+        Ok(value)
+    } else {
+        crate::catalog_export_alias::local_alias_fact(path, kind)
+    }
+}
+fn protect_alias_controlled(
+    db: &Connection,
+    session: &crate::catalog_session::CatalogSessionAuthority,
+    destination: &Path,
+    limits: crate::catalog_export_alias::AliasLimits,
+    control: &mut ExportControl<'_>,
+) -> Result<()> {
+    let shared = std::cell::RefCell::new(control);
+    crate::catalog_export_alias::protect_destination_with_facts(
+        db,
+        destination,
+        limits,
+        &mut || shared.borrow_mut().check(ExportCheckpoint::Alias),
+        &mut |path, kind| {
+            let control = shared.borrow();
+            export_alias_fact(session, path, kind, &control)
+        },
+    )?;
     Ok(())
 }
 fn metadata_current(db: &Connection, plan: &PhotoExportPlan) -> Result<()> {
@@ -554,11 +596,12 @@ impl Catalog {
                 current != "rendering",
                 "worker became active before restoration"
             );
-            crate::catalog_export_alias::protect_destination_with_checkpoint(
+            protect_alias_controlled(
                 &tx,
+                &self.session,
                 &plan.destination.destination,
                 plan.alias_limits,
-                &mut || control.check(ExportCheckpoint::Alias),
+                control,
             )?;
             control.check(ExportCheckpoint::BeforeMutation)?;
             session.restore_link()?;
@@ -721,11 +764,25 @@ impl Catalog {
             identity.source.fingerprint.as_deref() == Some(&original_revision.digest),
             "original fingerprint changed"
         );
-        let destination = metadata_export::snapshot_photo_destination_with_checkpoint(
-            &target.destination,
-            max_payload_bytes,
-            &mut |bytes| control.hash(bytes),
-        )?;
+        let destination = if self.session.pool().is_some() {
+            control.hash(0)?;
+            let destination = self
+                .session
+                .export_destination_snapshot(
+                    &NativePath::from_path(&target.destination),
+                    max_payload_bytes,
+                    control.cancellation(),
+                )?
+                .context("managed export destination snapshot unavailable")?;
+            control.hash(destination.expected.as_ref().map_or(0, |value| value.bytes))?;
+            destination
+        } else {
+            metadata_export::snapshot_photo_destination_with_checkpoint(
+                &target.destination,
+                max_payload_bytes,
+                &mut |bytes| control.hash(bytes),
+            )?
+        };
         ensure!(
             !destination.destination.starts_with(&self.root),
             "export destination is inside the catalog"
@@ -776,10 +833,11 @@ impl Catalog {
             }
         };
         let guarded = identity.clone();
+        let filesystem = self.session.clone();
         self.with_edit_transaction(&guarded,Priority::Foreground,|tx|{
             control.check(ExportCheckpoint::BeforeMutation)?;
             let j=job(tx,id)?;ensure!(j.state=="building" && j.total==expected_total,"export job changed or sealed");
-            protect_destination_controlled(tx,&destination.destination,&path,alias_limits,control)?;
+            protect_destination_controlled(tx,&filesystem,&destination.destination,&path,alias_limits,control)?;
             control.check(ExportCheckpoint::BeforeMutation)?;
             let profile=match &output.profile {OutputProfile::Srgb=>StoredProfile::Srgb,OutputProfile::LinearSrgb=>StoredProfile::LinearSrgb,OutputProfile::Icc{bytes}=>StoredProfile::Icc{blob:store_blob(tx,bytes)?}};
             let xmp_blob=packet.as_deref().map(|b|store_blob(tx,b)).transpose()?;
@@ -1010,11 +1068,12 @@ impl Catalog {
             })?;
         hook(PhotoExportBoundary::OriginalVerified)?;
         control.check(ExportCheckpoint::OriginalVerified)?;
+        let filesystem = self.session.clone();
         self.with_edit_transaction(&work.plan.identity,Priority::Foreground,|tx|{
             control.check(ExportCheckpoint::BeforeMutation)?;
             metadata_current(tx,&work.plan)?;ensure!(job(tx,&work.job)?.state=="queued","export canceled");
             original.recheck().context("original changed while waiting for export authority")?;_publication.recheck_payload()?;
-            protect_destination_controlled(tx,&work.plan.destination.destination,&work.plan.original.to_path()?,work.plan.alias_limits,control)?;
+            protect_destination_controlled(tx,&filesystem,&work.plan.destination.destination,&work.plan.original.to_path()?,work.plan.alias_limits,control)?;
             control.check(ExportCheckpoint::BeforeMutation)?;
             ensure!(tx.execute("UPDATE photo_export_items SET state='sealed',seal=?1 WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![serde_json::to_string(seal)?,work.job,work.sequence,work.attempt,work.authority])?==1,"export attempt changed or canceled");Ok(())
         })?.context("edit/source changed before accepting export")
@@ -1118,10 +1177,11 @@ impl Catalog {
             hook(PhotoExportBoundary::OriginalVerified)?;
             control.check(ExportCheckpoint::OriginalVerified)?;
             let start = std::time::Instant::now();
+            let filesystem = self.session.clone();
             self.with_edit_transaction(&plan.identity,Priority::Foreground,|tx|{
                 control.check(ExportCheckpoint::BeforeMutation)?;
                 metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");original.recheck().context("original changed while waiting for export authority")?;
-                protect_destination_controlled(tx,&plan.destination.destination,&plan.original.to_path()?,plan.alias_limits,control)?;
+                protect_destination_controlled(tx,&filesystem,&plan.destination.destination,&plan.original.to_path()?,plan.alias_limits,control)?;
                 control.check(ExportCheckpoint::BeforeMutation)?;
                 ensure!(tx.execute("UPDATE photo_export_items SET publication=?1 WHERE job=?2 AND sequence=?3 AND authority=?4 AND state='sealed' AND (publication IS NULL OR publication=?1)",params![intent,id,sequence,authority])?==1,"export publication intent changed");Ok(())
             })?.context("edit/source changed before publication intent")?;
@@ -1131,6 +1191,7 @@ impl Catalog {
             hook(PhotoExportBoundary::IntentCommitted)?;
             control.check(ExportCheckpoint::IntentCommitted)?;
             let start = std::time::Instant::now();
+            let filesystem = self.session.clone();
             let capture = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
                 control.check(ExportCheckpoint::BeforeMutation)?;
                 publication_current(tx, id, sequence, &authority, &intent, &plan)?;
@@ -1139,6 +1200,7 @@ impl Catalog {
                     .context("original changed while waiting for export authority")?;
                 protect_destination_controlled(
                     tx,
+                    &filesystem,
                     &plan.destination.destination,
                     &plan.original.to_path()?,
                     plan.alias_limits,
@@ -1176,6 +1238,7 @@ impl Catalog {
             hook(PhotoExportBoundary::CaptureVerified)?;
             control.check(ExportCheckpoint::CaptureVerified)?;
             let start = std::time::Instant::now();
+            let filesystem = self.session.clone();
             let link = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
                 control.check(ExportCheckpoint::BeforeMutation)?;
                 publication_current(tx, id, sequence, &authority, &intent, &plan)?;
@@ -1184,6 +1247,7 @@ impl Catalog {
                     .context("original changed while waiting for export authority")?;
                 protect_destination_controlled(
                     tx,
+                    &filesystem,
                     &plan.destination.destination,
                     &plan.original.to_path()?,
                     plan.alias_limits,

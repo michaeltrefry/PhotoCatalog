@@ -841,39 +841,139 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         1,
         SAVED_DESCRIPTOR_BYTES,
     )?;
-    // During export-directory preparation, G retains its encoded F Operation
-    // while F owns the decoded request. Once the result crosses back, G retains
-    // that request alongside one decoded Response. The C relay Call graph is an
-    // independent owner already charged above.
-    let export_request = c.add(&[
+    // The serial export worker runs directory preparation, destination snapshot,
+    // and alias fact queries exclusively. G retains its encoded F Operation while
+    // F owns the decoded request; on return, the request coexists with one decoded
+    // Response. The C relay Call graph is independently charged above.
+    let export_directory_request = c.add(&[
         Layout::of::<crate::filesystem_worker::wire::Operation>().size,
         Layout::of::<crate::catalog_session::PrepareExportDirectory>().size,
         c.mul(3, LEASE_ID_BYTES)?,
         c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
     ])?;
-    let export_reply = c.add(&[
+    let export_directory_reply = c.add(&[
         Layout::of::<crate::filesystem_worker::wire::Response>().size,
         c.mul(3, LEASE_ID_BYTES)?,
         c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
     ])?;
+    let export_snapshot_request = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Operation>().size,
+        Layout::of::<crate::catalog_session::ExportDestinationSnapshotRequest>().size,
+        c.mul(3, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+    ])?;
+    let export_snapshot_reply = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Response>().size,
+        c.mul(4, LEASE_ID_BYTES)?,
+        c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
+        64,
+    ])?;
+    let export_alias_request = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Operation>().size,
+        Layout::of::<crate::catalog_session::ExportAliasFactRequest>().size,
+        c.mul(3, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+    ])?;
+    let export_alias_reply = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Response>().size,
+        c.mul(3, LEASE_ID_BYTES)?,
+        c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
+        c.vec(1, 39)?,
+    ])?;
+    let export_typed_graph = [
+        c.add(&[
+            export_directory_request,
+            export_directory_request.max(export_directory_reply),
+        ])?,
+        c.add(&[
+            export_snapshot_request,
+            export_snapshot_request.max(export_snapshot_reply),
+        ])?,
+        c.add(&[
+            export_alias_request,
+            export_alias_request.max(export_alias_reply),
+        ])?,
+    ]
+    .into_iter()
+    .max()
+    .unwrap();
     a.push(
-        "active.export_directory_f_typed_graphs",
+        "active.export_destination_f_typed_graph_envelope",
         Phase::Active,
         1,
-        c.add(&[export_request, export_request.max(export_reply)])?,
+        export_typed_graph,
     )?;
     // CatalogSessionAuthority retains its original request while Proxy owns an
     // independent deep clone in the C relay Call charged above. Only the
     // original request's separately allocated backings belong here; its inline
     // stack root is not an allocation.
     a.push(
-        "active.export_directory_c_caller_request_backing",
+        "active.export_destination_c_caller_request_backing",
         Phase::Active,
         1,
         c.add(&[
             c.mul(3, LEASE_ID_BYTES)?,
             c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
         ])?,
+    )?;
+    // The snapshot result remains live while append runs alias validation.
+    a.push(
+        "active.export_destination_snapshot_result_backing",
+        Phase::Active,
+        1,
+        c.add(&[LEASE_ID_BYTES, c.vec(2, PATH_UNITS as u64)?, 64])?,
+    )?;
+    // Snapshot construction reuses metadata_export's durable 64 KiB plan and
+    // receipt validation. Before an oversized path is rejected, receipt serde
+    // may repeat the request-bounded destination in three path fields. Four
+    // relay envelopes therefore bound that output, including the 8 KiB detail
+    // and derived-name syntax. Fourteen path vectors name the request-derived
+    // local/snapshot paths (2), validation plan/recovery paths (2), receipt
+    // paths (3), serde clone/native conversions (6), and the C reply validator's
+    // bounded NativePath conversion (1). Only one serializer output lives at a
+    // time.
+    let export_derived_path_units = c.add(&[PATH_UNITS as u64, 64])?;
+    let export_snapshot_validation_scratch = c.add(&[
+        c.mul(14, c.vec(2, export_derived_path_units)?)?,
+        c.mul(2, c.vec(1, 8192)?)?,
+        c.mul(4, c.vec(1, 64)?)?,
+        c.vec_growth(1, c.mul(4, RELAY_BYTES)?)?,
+    ])?;
+    a.push(
+        "active.export_destination_resolution_and_validation_scratch",
+        Phase::Active,
+        1,
+        export_snapshot_validation_scratch,
+    )?;
+    // The alias phase retains the destination NativePath and its projected
+    // parent/ASCII-prefix/filename strings. One admitted 256 KiB directory row
+    // can remain live while a second 256 KiB candidate row, their parsed paths,
+    // and a fact request coexist. The fact request is charged by the caller term
+    // above. The five paths are destination, projected parent, current parent,
+    // indexed directory and candidate. Projection construction has two more
+    // temporary path-unit vectors but no SQL rows, so this query phase is the
+    // maximum under the same Vec-capacity rule.
+    let alias_projection_and_candidate = c.add(&[
+        c.mul(2, 256 * 1024)?,
+        c.mul(5, c.vec(2, PATH_UNITS as u64)?)?,
+        c.mul(3, c.vec(1, c.add(&[PATH_UNITS as u64, 4])?)?)?,
+        c.vec(1, 39)?,
+    ])?;
+    // Exact source exclusion runs after the alias phase. It retains original,
+    // canonical-original and destination NativePaths plus the destination's
+    // bounded serialized SQL key. The managed snapshot was already admitted by
+    // the 64 KiB durable-plan contract in F.
+    let exact_source_exclusion = c.add(&[
+        c.vec(1, 64 * 1024)?,
+        c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
+        c.vec(1, 39)?,
+        c.vec(1, 60)?,
+    ])?;
+    a.push(
+        "active.export_alias_projection_candidate_and_source_backing_envelope",
+        Phase::Active,
+        1,
+        alias_projection_and_candidate.max(exact_source_exclusion),
     )?;
     // The serial export worker owns at most one profile transfer. Its cache and
     // the in-progress assembly share the existing 32 MiB quota: before token
@@ -1211,7 +1311,7 @@ mod tests {
         let export_caller = default_report
             .contributions
             .iter()
-            .find(|entry| entry.name == "active.export_directory_c_caller_request_backing")
+            .find(|entry| entry.name == "active.export_destination_c_caller_request_backing")
             .unwrap();
         assert_eq!(export_caller.phase, Phase::Active);
         assert_eq!(export_caller.count, 1);
@@ -1220,6 +1320,43 @@ mod tests {
             Checked.add(&[
                 Checked.mul(3, LEASE_ID_BYTES)?,
                 Checked.mul(2, Checked.vec(2, PATH_UNITS as u64)?)?,
+            ])?
+        );
+        let export_snapshot_scratch = default_report
+            .contributions
+            .iter()
+            .find(|entry| {
+                entry.name == "active.export_destination_resolution_and_validation_scratch"
+            })
+            .unwrap();
+        assert_eq!(export_snapshot_scratch.phase, Phase::Active);
+        assert_eq!(export_snapshot_scratch.count, 1);
+        let derived_path_units = Checked.add(&[PATH_UNITS as u64, 64])?;
+        assert_eq!(
+            export_snapshot_scratch.each,
+            Checked.add(&[
+                Checked.mul(14, Checked.vec(2, derived_path_units)?)?,
+                Checked.mul(2, Checked.vec(1, 8192)?)?,
+                Checked.mul(4, Checked.vec(1, 64)?)?,
+                Checked.vec_growth(1, Checked.mul(4, RELAY_BYTES)?)?,
+            ])?
+        );
+        let export_alias = default_report
+            .contributions
+            .iter()
+            .find(|entry| {
+                entry.name == "active.export_alias_projection_candidate_and_source_backing_envelope"
+            })
+            .unwrap();
+        assert_eq!(export_alias.phase, Phase::Active);
+        assert_eq!(export_alias.count, 1);
+        assert_eq!(
+            export_alias.each,
+            Checked.add(&[
+                Checked.mul(2, 256 * 1024)?,
+                Checked.mul(5, Checked.vec(2, PATH_UNITS as u64)?)?,
+                Checked.mul(3, Checked.vec(1, Checked.add(&[PATH_UNITS as u64, 4])?)?,)?,
+                Checked.vec(1, 39)?,
             ])?
         );
         let profile_cache = default_report
