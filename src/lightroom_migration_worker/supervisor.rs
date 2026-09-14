@@ -448,7 +448,7 @@ fn execute_with_broker<A: Admission>(
     // Start the broker before LM; if LM launch fails, no Source command could
     // have arrived and the broker's owned Drop still joins its thread.
     let broker = source_executable
-        .map(|path| Broker::start(path, guard.clone(), stop.clone()))
+        .map(|path| Broker::start(path, guard.clone(), stop.clone(), budget.clone()))
         .transpose()?;
     let mut owner = Owned {
         process: spawn(stop.clone())?,

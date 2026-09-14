@@ -437,3 +437,146 @@ fn sql_and_raw_live_slots_cannot_share_a_start_token() -> Result<()> {
     drop(raw);
     Ok(())
 }
+
+#[test]
+fn scoped_allocation_requires_exact_ack_and_rejects_replay() -> Result<()> {
+    let open = opened()?;
+    let budget = open.remote.allocation_budget();
+    let worker = thread::spawn(move || {
+        let mut reservation = budget.reservation();
+        reservation.grow(37)?;
+        Ok::<_, anyhow::Error>(reservation)
+    });
+    let result = (|| -> Result<()> {
+        assert!(
+            matches!(command(&open.fixture)?, Command::Reserve { token, sequence: U64(1), bytes: U64(37) } if token == open.token)
+        );
+        assert!(
+            open.fixture
+                .client
+                .accept(Event::Reserved {
+                    token: open.token.clone(),
+                    sequence: U64(2),
+                    bytes: U64(37)
+                })
+                .is_err()
+        );
+        assert!(
+            open.fixture
+                .client
+                .accept(Event::Reserved {
+                    token: open.token.clone(),
+                    sequence: U64(1),
+                    bytes: U64(36)
+                })
+                .is_err()
+        );
+        open.fixture.client.accept(Event::Reserved {
+            token: open.token.clone(),
+            sequence: U64(1),
+            bytes: U64(37),
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        open.fixture.client.revoke();
+    }
+    let reservation = worker.join().expect("allocation waiter panicked");
+    result?;
+    let reservation = reservation?;
+    assert!(
+        open.fixture
+            .client
+            .accept(Event::Reserved {
+                token: open.token.clone(),
+                sequence: U64(1),
+                bytes: U64(37)
+            })
+            .is_err()
+    );
+    drop(reservation);
+    assert!(
+        open.fixture.output.try_recv().is_err(),
+        "dropping child reservation cannot publish a scope release"
+    );
+    Ok(())
+}
+
+#[test]
+fn worker_quiescence_clears_queued_payloads_and_waits_for_exact_ack() -> Result<()> {
+    let open = opened()?;
+    assert!(
+        open.remote
+            .try_send(Request::Cancel { epoch: epoch() })?
+            .is_some()
+    );
+    assert!(matches!(command(&open.fixture)?, Command::Input { .. }));
+    output(
+        &open.fixture.client,
+        &open.token,
+        1,
+        &Reply::Retired { epoch: epoch() },
+    )?;
+    open.fixture.client.accept(Event::Drained {
+        token: open.token.clone(),
+    })?;
+    {
+        let state = open.remote.slot.state.lock().unwrap();
+        assert!(state.sending.is_some() && state.reply.is_some());
+        assert!(!state.quiesced);
+    }
+    thread::scope(|scope| -> Result<()> {
+        let worker = scope.spawn(|| open.remote.quiesce());
+        let result = (|| -> Result<()> {
+            assert!(
+                matches!(command(&open.fixture)?, Command::Quiesced { token } if token == open.token)
+            );
+            {
+                let state = open.remote.slot.state.lock().unwrap();
+                assert!(
+                    state.sending.is_none() && state.reply.is_none() && state.incoming.is_none()
+                );
+                assert!(!state.quiesced);
+            }
+            assert!(
+                open.fixture
+                    .client
+                    .open(
+                        Kind::Sql,
+                        epoch(),
+                        Arc::new(Stop::default()),
+                        Instant::now()
+                    )
+                    .is_err()
+            );
+            assert!(
+                open.fixture
+                    .client
+                    .accept(Event::Quiesced {
+                        token: "f".repeat(64)
+                    })
+                    .is_err()
+            );
+            open.fixture.client.accept(Event::Quiesced {
+                token: open.token.clone(),
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            open.fixture.client.revoke();
+        }
+        let joined = worker.join().expect("quiescence worker panicked");
+        result?;
+        joined?;
+        Ok(())
+    })?;
+    assert!(
+        open.fixture
+            .client
+            .accept(Event::Quiesced {
+                token: open.token.clone()
+            })
+            .is_err()
+    );
+    Ok(())
+}

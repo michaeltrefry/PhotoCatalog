@@ -3,6 +3,7 @@
 use super::super::transport::Reply;
 use super::{Command, Event, Kind, server::Owner};
 use crate::lightroom_migration_worker::{
+    memory::MemoryBudget,
     process::{Process, Stop},
     protocol::Guard,
 };
@@ -37,14 +38,22 @@ pub(crate) struct Broker {
     events: Receiver<Event>,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<Result<()>>>,
+    // Survives worker-thread exit until G's Owned has waited LM and this broker.
+    // Only acknowledged per-epoch quiescence removes a charge early.
+    _charges: super::server::Charges,
 }
 impl Broker {
-    pub(crate) fn start(executable: PathBuf, guard: Guard, stop: Arc<Stop>) -> Result<Self> {
+    pub(crate) fn start(
+        executable: PathBuf,
+        guard: Guard,
+        stop: Arc<Stop>,
+        memory: MemoryBudget,
+    ) -> Result<Self> {
         ensure!(
             executable.is_absolute(),
             "absolute configured Source executable required"
         );
-        Self::start_with(guard, stop, move |kind, stop, before_wait| {
+        Self::start_with(guard, stop, memory, move |kind, stop, before_wait| {
             let role = match kind {
                 Kind::Sql => "--lightroom-source-reader-sql",
                 Kind::Raw => "--lightroom-source-reader-raw",
@@ -55,11 +64,16 @@ impl Broker {
     fn start_with(
         guard: Guard,
         stop: Arc<Stop>,
+        memory: MemoryBudget,
         mut spawn: impl FnMut(Kind, Arc<Stop>, &mut dyn FnMut()) -> Result<Process<Reply>>
         + Send
         + 'static,
     ) -> Result<Self> {
-        let mut owner = Owner::new(guard)?;
+        // Managed G admission is backed by the caller's local shared pool;
+        // holding a charge lock never invokes an IPC allocation callback.
+        memory.snapshot()?;
+        let charges = Arc::new(Mutex::new([None, None]));
+        let mut owner = Owner::new(guard, memory, charges.clone())?;
         let (commands, incoming) = mpsc::sync_channel(2);
         let (outgoing, events) = mpsc::sync_channel(2);
         let shared = Arc::new(Shared {
@@ -216,6 +230,7 @@ impl Broker {
             events,
             shared,
             worker: Some(worker),
+            _charges: charges,
         })
     }
     pub(crate) fn try_send(&self, command: Command) -> Result<Option<Command>> {

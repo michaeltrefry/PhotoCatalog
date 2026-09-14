@@ -5,7 +5,7 @@ use crate::{
         artifacts::{ArtifactLimits, ArtifactRead, ArtifactRequest},
         import_artifacts::ArtifactFactory,
     },
-    lightroom_migration_worker::{identity::FileKey, memory::MemoryBudget, protocol::Guard},
+    lightroom_migration_worker::{identity::FileKey, protocol::Guard},
 };
 use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -18,7 +18,6 @@ pub(crate) struct RemoteArtifacts {
     pub protected: Vec<FileKey>,
     pub cancel: Arc<AtomicBool>,
     pub health: Arc<CommitHealth>,
-    pub memory: MemoryBudget,
     pub next_epoch: u64,
 }
 impl ArtifactFactory for RemoteArtifacts {
@@ -48,7 +47,6 @@ impl ArtifactFactory for RemoteArtifacts {
             limits,
             self.protected.clone(),
             self.cancel.clone(),
-            self.memory.clone(),
         )?;
         reader.attach(&self.health)?;
         ensure!(

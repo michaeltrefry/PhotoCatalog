@@ -16,6 +16,14 @@ fn owned_broker_source_fixture() -> Result<()> {
     if std::env::var_os(ENV).is_none() {
         return Ok(());
     }
+    if std::env::var_os("PHOTOCATALOG_BROKER_TYPED_SQL").is_some() {
+        crate::lightroom_migration_worker::source_reader::owner::serve_mode(
+            std::io::stdin(),
+            std::io::stderr(),
+            Some(Kind::Sql),
+        )?;
+        std::process::exit(0);
+    }
     if let Ok(address) = std::env::var("PHOTOCATALOG_BROKER_ERROR_BARRIER") {
         use std::io::{Read, Write};
         let mut barrier = std::net::TcpStream::connect(address)?;
@@ -75,19 +83,28 @@ fn epoch(reader: &str) -> Epoch {
     }
 }
 fn broker() -> Result<(Broker, Arc<Stop>, Arc<Mutex<Vec<u32>>>)> {
+    broker_with_budget(MemoryBudget::new(1024 * 1024)?)
+}
+fn broker_with_budget(budget: MemoryBudget) -> Result<(Broker, Arc<Stop>, Arc<Mutex<Vec<u32>>>)> {
     let stop = Arc::new(Stop::default());
     let pids = Arc::new(Mutex::new(Vec::with_capacity(2)));
     let seen = pids.clone();
-    let broker = Broker::start_with(guard(), stop.clone(), move |_, stop, before_wait| {
-        let mut command = OsCommand::new(std::env::current_exe()?);
-        command
-            .args(["--exact", HELPER, "--nocapture"])
-            .env(ENV, "1");
-        crate::lightroom_migration_worker::process::source_environment(&mut command);
-        let process = Process::spawn_test_command_with_cleanup(command, stop, Some(before_wait))?;
-        seen.lock().unwrap().push(process.pid());
-        Ok(process)
-    })?;
+    let broker = Broker::start_with(
+        guard(),
+        stop.clone(),
+        budget,
+        move |_, stop, before_wait| {
+            let mut command = OsCommand::new(std::env::current_exe()?);
+            command
+                .args(["--exact", HELPER, "--nocapture"])
+                .env(ENV, "1");
+            crate::lightroom_migration_worker::process::source_environment(&mut command);
+            let process =
+                Process::spawn_test_command_with_cleanup(command, stop, Some(before_wait))?;
+            seen.lock().unwrap().push(process.pid());
+            Ok(process)
+        },
+    )?;
     Ok((broker, stop, pids))
 }
 fn send(broker: &Broker, mut command: Command) -> Result<()> {
@@ -257,6 +274,17 @@ fn orderly_retirement_keeps_reply_until_consumed_then_checks_actual_reap() -> Re
         },
     )?;
     assert!(matches!(event(&broker)?, Event::Drained { token: actual } if actual == token));
+    assert!(
+        broker.ensure_idle().is_err(),
+        "Drained alone cannot release the epoch"
+    );
+    send(
+        &broker,
+        Command::Quiesced {
+            token: token.clone(),
+        },
+    )?;
+    assert!(matches!(event(&broker)?, Event::Quiesced { token: actual } if actual == token));
     broker.ensure_idle()?;
     broker.revoke_after_lm();
     broker.finish()?;
@@ -339,6 +367,7 @@ fn live_transport_errors_bypass_observed_full_events_before_any_dequeue() -> Res
         let mut broker = Broker::start_with(
             guard(),
             stop.clone(),
+            MemoryBudget::new(1024 * 1024)?,
             move |kind, child_stop, before_wait| {
                 let mut command = OsCommand::new(std::env::current_exe()?);
                 command
@@ -464,5 +493,282 @@ fn live_transport_errors_bypass_observed_full_events_before_any_dequeue() -> Res
         drop(sql);
         drop(raw);
     }
+    Ok(())
+}
+
+#[test]
+fn source_charge_needs_quiescence_and_reuses_only_exact_retired_epoch() -> Result<()> {
+    let budget = MemoryBudget::new(100)?;
+    let mut caller = budget.reservation();
+    caller.grow(10)?;
+    let (mut broker, _, pids) = broker_with_budget(budget.clone())?;
+    let sql = start(&broker, 1, Kind::Sql, "sql")?;
+    let raw = start(&broker, 2, Kind::Raw, "raw")?;
+    for (token, bytes) in [(&sql, 30), (&raw, 20)] {
+        send(
+            &broker,
+            Command::Reserve {
+                token: token.clone(),
+                sequence: U64(1),
+                bytes: U64(bytes),
+            },
+        )?;
+        assert!(
+            matches!(event(&broker)?, Event::Reserved { token: actual, sequence: U64(1), bytes: amount } if actual == *token && amount == U64(bytes))
+        );
+    }
+    assert_eq!(budget.used(), 60);
+    send(&broker, Command::Drain { token: sql.clone() })?;
+    assert!(matches!(event(&broker)?, Event::Drained { token } if token == sql));
+    assert_eq!(
+        budget.used(),
+        60,
+        "Source wait/joins alone must retain its charge"
+    );
+    assert!(broker.ensure_idle().is_err());
+    send(&broker, Command::Quiesced { token: sql.clone() })?;
+    assert!(matches!(event(&broker)?, Event::Quiesced { token } if token == sql));
+    assert_eq!(
+        budget.used(),
+        30,
+        "only SQL charge retires; caller and raw remain"
+    );
+    let next = start(&broker, 3, Kind::Sql, "sql-new")?;
+    assert_ne!(next, sql);
+    send(
+        &broker,
+        Command::Reserve {
+            token: next,
+            sequence: U64(1),
+            bytes: U64(30),
+        },
+    )?;
+    assert!(matches!(
+        event(&broker)?,
+        Event::Reserved { bytes: U64(30), .. }
+    ));
+    assert_eq!(budget.used(), 60);
+    broker.revoke_after_lm();
+    broker.wait_revoked();
+    broker.finish()?;
+    absent(&pids);
+    assert_eq!(
+        budget.used(),
+        60,
+        "broker thread exit is not LM/operation drain"
+    );
+    drop(broker); // production G drops this owner only after LM and all I/O wait.
+    assert_eq!(budget.used(), 10);
+    drop(caller);
+    assert_eq!(budget.used(), 0);
+    println!(
+        "SOURCE_SCOPE_RETIRED after_wait=60 after_quiesced=30 after_broker_thread=60 after_owner=10 final=0"
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_quiescence_early_reuse_and_denial_retain_source_charge() -> Result<()> {
+    for invalid in 0..4 {
+        let budget = MemoryBudget::new(100)?;
+        let (mut broker, stop, pids) = broker_with_budget(budget.clone())?;
+        let token = start(&broker, 1, Kind::Sql, "sql")?;
+        send(
+            &broker,
+            Command::Reserve {
+                token: token.clone(),
+                sequence: U64(1),
+                bytes: U64(40),
+            },
+        )?;
+        assert!(matches!(event(&broker)?, Event::Reserved { .. }));
+        let bad = if invalid == 3 {
+            Command::Reserve {
+                token: token.clone(),
+                sequence: U64(2),
+                bytes: U64(61),
+            }
+        } else if invalid == 0 {
+            Command::Quiesced {
+                token: token.clone(),
+            }
+        } else {
+            send(
+                &broker,
+                Command::Drain {
+                    token: token.clone(),
+                },
+            )?;
+            assert!(matches!(event(&broker)?, Event::Drained { .. }));
+            if invalid == 1 {
+                Command::Quiesced {
+                    token: "f".repeat(64),
+                }
+            } else {
+                Command::Start {
+                    sequence: U64(2),
+                    kind: Kind::Sql,
+                    reader: "too-early".into(),
+                }
+            }
+        };
+        send(&broker, bad)?;
+        let until = Instant::now() + Duration::from_secs(5);
+        while !stop.requested() {
+            ensure!(Instant::now() < until, "invalid quiescence did not revoke");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(budget.used(), 40);
+        if invalid == 3 {
+            assert!(
+                matches!(broker.try_urgent(), Some(Event::Failed { detail, .. })
+                if detail.contains("requested 61 additional bytes, 60 available"))
+            );
+        }
+        broker.revoke_after_lm();
+        broker.wait_revoked();
+        assert!(broker.finish().is_err());
+        absent(&pids);
+        assert_eq!(budget.used(), 40);
+        drop(broker);
+        assert_eq!(budget.used(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> Result<()> {
+    use crate::lightroom::migration_source::{MigrationRead, ReadLimits, tests::Fixture};
+    use crate::lightroom_migration_worker::{
+        protocol::{ChildFrame, Publish, SourceListener},
+        source_reader::{SqlReader, relay::client::Client},
+    };
+    use std::sync::atomic::AtomicBool;
+    struct Published(mpsc::SyncSender<ChildFrame>);
+    impl Publish for Published {
+        fn publish(&self, frame: &ChildFrame) -> Result<()> {
+            let copy = serde_json::from_slice(&serde_json::to_vec(frame)?)?;
+            self.0
+                .try_send(copy)
+                .map_err(|e| anyhow::anyhow!("typed relay fixture output: {e}"))
+        }
+    }
+    let fixture = Fixture::new();
+    let revision = fixture.revision().to_owned();
+    let budget = MemoryBudget::new(1024 * 1024)?;
+    let mut caller = budget.reservation();
+    caller.grow(17)?;
+    let stop = Arc::new(Stop::default());
+    let pids = Arc::new(Mutex::new(Vec::new()));
+    let seen = pids.clone();
+    let mut broker = Broker::start_with(
+        guard(),
+        stop.clone(),
+        budget.clone(),
+        move |kind, child_stop, before_wait| {
+            assert_eq!(kind, Kind::Sql);
+            let mut command = OsCommand::new(std::env::current_exe()?);
+            command
+                .args(["--exact", HELPER, "--nocapture"])
+                .env(ENV, "1")
+                .env("PHOTOCATALOG_BROKER_TYPED_SQL", "1");
+            crate::lightroom_migration_worker::process::source_environment(&mut command);
+            let process =
+                Process::spawn_test_command_with_cleanup(command, child_stop, Some(before_wait))?;
+            seen.lock().unwrap().push(process.pid());
+            Ok(process)
+        },
+    )?;
+    let (output, incoming) = mpsc::sync_channel(4);
+    let abort = stop.clone();
+    let client = Client::new(
+        guard(),
+        Arc::new(Published(output)),
+        Arc::new(move || abort.cancel()),
+    )?;
+    let worker_client = client.clone();
+    let seal = fixture.seal.clone();
+    let observed = budget.clone();
+    let worker = thread::spawn(move || -> Result<_> {
+        let source = SqlReader::open(
+            worker_client,
+            guard(),
+            "typed-sql".into(),
+            seal,
+            ReadLimits::default(),
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        let admitted = observed.used();
+        ensure!(
+            admitted > 17,
+            "typed opening made no parent scope reservation"
+        );
+        let manifest = source.capture_manifest(&revision)?;
+        drop(source);
+        ensure!(
+            observed.used() == 17,
+            "typed Source Drop omitted checked quiescence"
+        );
+        Ok((manifest, admitted))
+    });
+    let pumped = (|| -> Result<()> {
+        let until = Instant::now() + Duration::from_secs(15);
+        let mut pending = None;
+        while !worker.is_finished() {
+            ensure!(
+                !stop.requested() && Instant::now() < until,
+                "typed relay stopped/deadline"
+            );
+            if let Some(event) = broker.try_urgent() {
+                client.accept(event)?;
+            }
+            if let Some(event) = broker.try_receive()? {
+                client.accept(event)?;
+            }
+            if pending.is_none() {
+                match incoming.try_recv() {
+                    Ok(ChildFrame::Source {
+                        guard: actual,
+                        command,
+                    }) => {
+                        ensure!(actual == guard(), "typed guard");
+                        pending = Some(command);
+                    }
+                    Ok(_) => anyhow::bail!("unexpected typed relay frame"),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => anyhow::bail!("typed worker output lost"),
+                }
+            }
+            if let Some(command) = pending.take() {
+                pending = broker.try_send(command)?;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        broker.ensure_idle()?;
+        Ok(())
+    })();
+    if pumped.is_err() {
+        client.revoke();
+        stop.cancel();
+    }
+    // This fixture substitutes a joined worker thread for LM, not an LM Child.
+    // The actual Source Child still has the production G wait/pipe owner.
+    broker.revoke_after_lm();
+    broker.wait_revoked();
+    let joined = worker.join();
+    let drained = broker.finish();
+    absent(&pids);
+    drop(broker);
+    pumped?;
+    let (manifest, admitted) = joined.expect("typed Source consumer panicked")?;
+    drained?;
+    assert_eq!(budget.used(), 17);
+    drop(manifest); // Public result storage belongs to caller/operation admission.
+    drop(caller);
+    assert_eq!(budget.used(), 0);
+    println!(
+        "TYPED_G_SCOPE admitted={admitted} source_quiesced=17 caller_released=0 worker_thread_joined=true"
+    );
     Ok(())
 }

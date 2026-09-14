@@ -5,6 +5,7 @@ use super::{Assembly, Command, Event, Kind, Outgoing};
 use crate::{
     application::U64,
     lightroom_migration_worker::{
+        memory::{AllocationGrant, MemoryBudget},
         process::{Output, Stop},
         protocol::{ChildFrame, Guard, Publish, SourceListener},
     },
@@ -27,6 +28,10 @@ struct Sending {
 }
 struct State {
     token: Option<String>,
+    next_memory: u64,
+    memory_waiting: Option<(u64, usize, bool)>,
+    quiescing: bool,
+    quiesced: bool,
     sending: Option<Sending>,
     next_input: u64,
     next_output: u64,
@@ -116,6 +121,10 @@ impl Client {
             stop,
             state: Mutex::new(State {
                 token: None,
+                next_memory: 1,
+                memory_waiting: None,
+                quiescing: false,
+                quiesced: false,
                 sending: None,
                 next_input: 1,
                 next_output: 1,
@@ -209,6 +218,34 @@ impl SourceListener for Client {
                     "duplicate Source start acknowledgement"
                 );
                 state.token = Some(token);
+            }
+            Event::Reserved {
+                token,
+                sequence,
+                bytes,
+            } => {
+                let slot = self.token_slot(&token)?;
+                let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                ensure!(
+                    !state.closed
+                        && state.memory_waiting
+                            == Some((sequence.0, usize::try_from(bytes.0)?, false)),
+                    "Source allocation acknowledgement differs or repeats"
+                );
+                state
+                    .memory_waiting
+                    .as_mut()
+                    .expect("matching memory request")
+                    .2 = true;
+            }
+            Event::Quiesced { token } => {
+                let slot = self.token_slot(&token)?;
+                let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                ensure!(
+                    state.closed && state.quiescing && !state.quiesced,
+                    "Source quiescence acknowledgement differs or repeats"
+                );
+                state.quiesced = true;
             }
             Event::Accepted {
                 token,
@@ -447,9 +484,116 @@ impl Remote {
         }
     }
 }
+/// A scoped callback uses the exact G-owned epoch, not a fresh local pool.
+/// Its wrapper and small control state belong to the operation allowance.
+struct EpochGrant {
+    client: Arc<Client>,
+    slot: Arc<Slot>,
+}
+impl AllocationGrant for EpochGrant {
+    fn reserve(&self, bytes: usize) -> Result<()> {
+        let result = (|| {
+            self.client.check()?;
+            let (token, sequence) = {
+                let mut state = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                ensure!(
+                    !state.closing && !state.closed && state.memory_waiting.is_none(),
+                    "Source allocation scope not open or request already pending"
+                );
+                let sequence = state.next_memory;
+                state.next_memory = sequence
+                    .checked_add(1)
+                    .context("Source allocation sequence exhausted")?;
+                let token = state
+                    .token
+                    .clone()
+                    .context("Source allocation before Started")?;
+                state.memory_waiting = Some((sequence, bytes, false));
+                (token, sequence)
+            };
+            self.client.publish(Command::Reserve {
+                token,
+                sequence: U64(sequence),
+                bytes: U64(bytes.try_into()?),
+            })?;
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                self.client.check()?;
+                {
+                    let mut state = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.memory_waiting == Some((sequence, bytes, true)) {
+                        state.memory_waiting = None;
+                        return Ok(());
+                    }
+                }
+                ensure!(
+                    Instant::now() < until,
+                    "Source allocation acknowledgement deadline"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        })();
+        if result.is_err() {
+            self.client.fail();
+        }
+        result
+    }
+}
+impl Remote {
+    pub(crate) fn allocation_budget(&self) -> MemoryBudget {
+        MemoryBudget::from_parent(Arc::new(EpochGrant {
+            client: self.client.clone(),
+            slot: self.slot.clone(),
+        }))
+    }
+    fn quiesce(&self) -> Result<()> {
+        // Called only by this worker-owned Remote's Drop after its active calls
+        // have returned/unwound. The listener never publishes this claim.
+        self.terminate()?;
+        self.client.check()?;
+        let token = {
+            let mut state = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            ensure!(
+                state.closed && state.memory_waiting.is_none(),
+                "Source quiescence before full drain"
+            );
+            if state.quiesced {
+                return Ok(());
+            }
+            ensure!(!state.quiescing, "Source quiescence already pending");
+            state.sending.take();
+            state.incoming.take();
+            state.reply.take();
+            state.quiescing = true;
+            state
+                .token
+                .clone()
+                .context("Source quiescence without exact token")?
+        };
+        self.client.publish(Command::Quiesced { token })?;
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.client.check()?;
+            if self
+                .slot
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .quiesced
+            {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < until,
+                "Source quiescence acknowledgement deadline"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
 impl Drop for Remote {
     fn drop(&mut self) {
-        if self.terminate().is_err() {
+        if self.quiesce().is_err() {
             self.client.fail();
         }
         let mut slots = self.client.slots.lock().unwrap_or_else(|e| e.into_inner());

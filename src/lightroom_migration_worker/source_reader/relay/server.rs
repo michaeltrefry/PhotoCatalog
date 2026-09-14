@@ -5,18 +5,24 @@ use super::{Assembly, Command, Event, Kind, Outgoing};
 use crate::{
     application::U64,
     lightroom_migration_worker::{
+        memory::{MemoryBudget, Reservation},
         process::{Output, Process, Stop},
         protocol::Guard,
     },
 };
 use anyhow::{Context, Result, ensure};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+pub(super) type Charge = Arc<Mutex<Reservation>>;
+pub(super) type Charges = Arc<Mutex<[Option<Charge>; 2]>>;
 
 struct Slot {
     process: Process<Reply>,
     stop: Arc<Stop>,
     epoch: Epoch,
     token: String,
+    memory: Charge,
+    next_memory: u64,
     next_input: u64,
     next_output: u64,
     assembly: Option<Assembly>,
@@ -29,18 +35,30 @@ struct Slot {
     closing: bool,
     eof: bool,
 }
+struct Retired {
+    token: String,
+    // Physical Source/pipe owners are gone, but LM may still retain epoch
+    // payloads. Only exact worker quiescence or whole broker drain retires this.
+    _memory: Charge,
+}
 pub(crate) struct Owner {
     guard: Guard,
     slots: [Option<Slot>; 2],
+    retired: [Option<Retired>; 2],
+    memory: MemoryBudget,
+    charges: Charges,
     next_start: u64,
     cursor: usize,
 }
 impl Owner {
-    pub(crate) fn new(guard: Guard) -> Result<Self> {
+    pub(crate) fn new(guard: Guard, memory: MemoryBudget, charges: Charges) -> Result<Self> {
         guard.validate()?;
         Ok(Self {
             guard,
             slots: [None, None],
+            retired: [None, None],
+            memory,
+            charges,
             next_start: 1,
             cursor: 0,
         })
@@ -57,7 +75,9 @@ impl Owner {
                 reader,
             } => {
                 ensure!(
-                    sequence.0 == self.next_start && self.slots[kind.index()].is_none(),
+                    sequence.0 == self.next_start
+                        && self.slots[kind.index()].is_none()
+                        && self.retired[kind.index()].is_none(),
                     "Source relay slot/start replay"
                 );
                 let next = self
@@ -74,6 +94,11 @@ impl Owner {
                     4096,
                 )?);
                 let stop = Arc::new(Stop::default());
+                let memory = Arc::new(Mutex::new(self.memory.reservation()));
+                // G retains a second owner outside this broker thread. Even an
+                // abrupt thread/LM loss cannot retire charges before G drains LM.
+                self.charges.lock().unwrap_or_else(|e| e.into_inner())[kind.index()] =
+                    Some(memory.clone());
                 let process = spawn(kind, stop.clone(), &mut || self.revoke_all())?;
                 // Own the child and every pipe before constructing/publishing its
                 // acknowledgement. A lost Started reply cannot orphan it.
@@ -82,6 +107,8 @@ impl Owner {
                     stop,
                     epoch,
                     token: token.clone(),
+                    memory,
+                    next_memory: 1,
                     next_input: 1,
                     next_output: 1,
                     assembly: None,
@@ -96,6 +123,45 @@ impl Owner {
                 });
                 self.next_start = next;
                 Some(Event::Started { sequence, token })
+            }
+            Command::Reserve {
+                token,
+                sequence,
+                bytes,
+            } => {
+                let slot = self.slot(&token)?;
+                ensure!(
+                    !slot.closing && !slot.retiring && sequence.0 == slot.next_memory,
+                    "Source allocation scope/sequence differs"
+                );
+                let next = slot
+                    .next_memory
+                    .checked_add(1)
+                    .context("Source allocation sequence exhausted")?;
+                slot.memory
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .grow(usize::try_from(bytes.0)?)?;
+                slot.next_memory = next;
+                Some(Event::Reserved {
+                    token,
+                    sequence,
+                    bytes,
+                })
+            }
+            Command::Quiesced { token } => {
+                let index = self
+                    .retired
+                    .iter()
+                    .position(|r| r.as_ref().is_some_and(|r| r.token == token))
+                    .context("Source quiescence precedes drain or has stale scope")?;
+                // Drained was emitted only after checked Child wait and both
+                // pipe joins. This ordered worker acknowledgement is the second
+                // condition; pipe/relay framing remains operation-scoped.
+                self.retired[index].take();
+                let charge = self.charges.lock().unwrap_or_else(|e| e.into_inner())[index].take();
+                drop(charge);
+                Some(Event::Quiesced { token })
             }
             Command::Input {
                 token,
@@ -190,7 +256,13 @@ impl Owner {
                         "Source exited unsuccessfully after retirement"
                     );
                     let token = slot.token.clone();
-                    self.slots[index].take();
+                    let slot = self.slots[index].take().expect("drained Source slot");
+                    self.retired[index] = Some(Retired {
+                        token: token.clone(),
+                        _memory: slot.memory,
+                    });
+                    // All remaining slot payloads drop before Drained can leave
+                    // this method. Parent pipe/framing allowances are separate.
                     return Ok(Some(Event::Drained { token }));
                 }
                 continue;
@@ -295,14 +367,18 @@ impl Owner {
         Ok(())
     }
     pub(crate) fn live(&self) -> usize {
-        self.slots.iter().flatten().count()
+        self.slots.iter().flatten().count() + self.retired.iter().flatten().count()
     }
     pub(crate) fn failures(&self, detail: &str) -> [Option<Event>; 2] {
         std::array::from_fn(|index| {
-            self.slots[index].as_ref().map(|slot| Event::Failed {
-                token: slot.token.clone(),
-                detail: detail.to_owned(),
-            })
+            self.slots[index]
+                .as_ref()
+                .map(|slot| &slot.token)
+                .or_else(|| self.retired[index].as_ref().map(|slot| &slot.token))
+                .map(|token| Event::Failed {
+                    token: token.clone(),
+                    detail: detail.to_owned(),
+                })
         })
     }
     pub(crate) fn revoke_all(&mut self) {

@@ -2,6 +2,9 @@
 //! child; this owner retains its process until the caller's SQL/permit stack has
 //! drained. It is never stored on or joined by the foreground actor.
 mod transport;
+#[cfg(test)]
+use crate::lightroom_migration_worker::memory::MemoryBudget;
+
 use super::relay::{Kind, client::Client};
 use transport::Transport;
 
@@ -21,7 +24,7 @@ use crate::{
     },
     lightroom_migration_worker::{
         identity::FileKey,
-        memory::{MemoryBudget, Reservation},
+        memory::Reservation,
         process::{Output, Process, Stop},
         protocol::Guard,
     },
@@ -105,7 +108,6 @@ impl Session {
         cancel: Arc<AtomicBool>,
         open_ms: u64,
         read_ms: u64,
-        memory: MemoryBudget,
     ) -> Result<Self> {
         epoch.validate()?;
         ensure!(
@@ -129,6 +131,9 @@ impl Session {
             process_stop.clone(),
             Instant::now() + Duration::from_millis(open_ms),
         )?;
+        let scoped_memory = process.allocation_budget();
+        // Authority/result/caller graphs use the operation's allowance. This
+        // budget is only for Source-owned opening grants requested before locks.
         Self::admit(
             process,
             process_stop,
@@ -140,7 +145,7 @@ impl Session {
                 open_ms,
                 read_ms,
                 budget,
-                memory: memory.reservation(),
+                memory: scoped_memory.reservation(),
             },
         )
     }
@@ -449,7 +454,6 @@ impl SqlReader {
         limits: ReadLimits,
         protected: Vec<FileKey>,
         cancel: Arc<AtomicBool>,
-        memory: MemoryBudget,
     ) -> Result<Self> {
         let session = Session::open(
             relay,
@@ -462,7 +466,6 @@ impl SqlReader {
             cancel,
             limits.open_deadline_ms,
             limits.deadline_ms,
-            memory,
         )?;
         Ok(Self {
             binding: session.binding.clone(),
@@ -599,7 +602,6 @@ impl RawReader {
         limits: ArtifactLimits,
         protected: Vec<FileKey>,
         cancel: Arc<AtomicBool>,
-        memory: MemoryBudget,
     ) -> Result<Self> {
         let encoded = crate::lightroom::bounded_json(&descriptor, 64 * 1024)?;
         let session = Session::open(
@@ -613,7 +615,6 @@ impl RawReader {
             cancel,
             limits.open_deadline_ms,
             limits.chunk_deadline_ms,
-            memory,
         )?;
         Ok(Self {
             session,

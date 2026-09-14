@@ -32,6 +32,14 @@ pub enum Command {
         kind: Kind,
         reader: String,
     },
+    Reserve {
+        token: String,
+        sequence: U64,
+        bytes: U64,
+    },
+    Quiesced {
+        token: String,
+    },
     Input {
         token: String,
         frame: U64,
@@ -52,6 +60,14 @@ pub enum Command {
 pub enum Event {
     Started {
         sequence: U64,
+        token: String,
+    },
+    Reserved {
+        token: String,
+        sequence: U64,
+        bytes: U64,
+    },
+    Quiesced {
         token: String,
     },
     Accepted {
