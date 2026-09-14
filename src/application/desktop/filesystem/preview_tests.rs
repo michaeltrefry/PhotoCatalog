@@ -23,10 +23,13 @@ struct Observation {
     render: bool,
 }
 // Only held before C construction; no catalog or native request can exist yet.
-struct BeforeCatalog(Option<Arc<Parent>>);
+struct BeforeCatalog {
+    parent: Option<Arc<Parent>>,
+    temporary: Arc<tempfile::TempDir>,
+}
 impl Drop for BeforeCatalog {
     fn drop(&mut self) {
-        if let Some(parent) = self.0.take()
+        if let Some(parent) = self.parent.take()
             && let Err(orderly) = parent.finish_after_dependents(false)
             && let Err(retained) = parent.finish_after_dependents(true)
         {
@@ -35,8 +38,15 @@ impl Drop for BeforeCatalog {
                 "pre-catalog fixture cleanup retained: orderly={orderly:#}; forced={retained:#}"
             );
             std::mem::forget(parent);
+            std::mem::forget(self.temporary.clone());
         }
     }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupState {
+    Active,
+    Attempted,
+    Retired,
 }
 struct Running {
     bridge: DesktopBridge,
@@ -44,6 +54,9 @@ struct Running {
     client: Arc<Client>,
     observed: Arc<Mutex<Vec<Observation>>>,
     metadata: crate::preview::ByteBudget,
+    temporary: Arc<tempfile::TempDir>,
+    token: Option<String>,
+    cleanup: CleanupState,
 }
 fn command(bridge: &DesktopBridge, request: Request) -> Result<Response> {
     let result = bridge
@@ -58,12 +71,14 @@ fn command(bridge: &DesktopBridge, request: Request) -> Result<Response> {
 }
 impl Running {
     fn start(
+        temporary: Arc<tempfile::TempDir>,
         executable: &Path,
         root: &Path,
         originals: &Path,
         small: bool,
     ) -> Result<(Self, String)> {
         Self::start_codec(
+            temporary,
             executable,
             root,
             originals,
@@ -72,15 +87,17 @@ impl Running {
         )
     }
     fn start_codec(
+        temporary: Arc<tempfile::TempDir>,
         executable: &Path,
         root: &Path,
         originals: &Path,
         small: bool,
         codec: crate::preview::Codec,
     ) -> Result<(Self, String)> {
-        Self::start_options(executable, root, originals, small, codec, 1)
+        Self::start_options(temporary, executable, root, originals, small, codec, 1)
     }
     fn start_options(
+        temporary: Arc<tempfile::TempDir>,
         executable: &Path,
         root: &Path,
         originals: &Path,
@@ -94,7 +111,10 @@ impl Running {
             vec![NativePath::from_path(originals)],
         )?);
         let parent = Parent::new(client.clone());
-        let mut before_catalog = BeforeCatalog(Some(parent.clone()));
+        let mut before_catalog = BeforeCatalog {
+            parent: Some(parent.clone()),
+            temporary: temporary.clone(),
+        };
         let limits = crate::preview::ServiceLimits {
             workers,
             working_bytes: if small {
@@ -155,18 +175,46 @@ impl Running {
             Ok(())
         }));
         config.validate()?;
-        // Validation passed while guarded; spawn_inner now owns C creation/retirement.
-        before_catalog.0.take();
         let metadata = crate::preview::ByteBudget::new(config.requested_preview_metadata_bytes()?)?;
-        let bridge = DesktopBridge::spawn_inner(config, Some(parent.clone()), Some(&metadata))?;
+        // All pre-C fallibility passed while guarded. Once called, spawn_inner
+        // owns C creation and its Unstarted error retains F when required.
+        before_catalog.parent.take();
+        let bridge = match DesktopBridge::spawn_inner(config, Some(parent.clone()), Some(&metadata))
+        {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                if let Some(unstarted) = error.downcast_ref::<super::Unstarted>()
+                    && let Err(retirement) = unstarted.retire()
+                {
+                    let retained_owner = unstarted.owner.clone();
+                    eprintln!(
+                        "configured preview pre-C cleanup failed: {retirement:#}; fixture retained at {:?}",
+                        temporary.path()
+                    );
+                    std::mem::forget(retained_owner);
+                    std::mem::forget(temporary);
+                }
+                return Err(error);
+            }
+        };
         eprintln!(
             "configured preview G={} C={} F={}",
             std::process::id(),
             bridge.status().pid,
             client.pid()
         );
+        let mut running = Self {
+            bridge,
+            parent,
+            client,
+            observed,
+            metadata,
+            temporary,
+            token: None,
+            cleanup: CleanupState::Active,
+        };
         let Response::Status(status) = command(
-            &bridge,
+            &running.bridge,
             Request::OpenExisting {
                 path: NativePath::from_path(root),
             },
@@ -175,16 +223,8 @@ impl Running {
             anyhow::bail!("wrong open reply")
         };
         let token = status.catalog.context("missing catalog token")?;
-        Ok((
-            Self {
-                bridge,
-                parent,
-                client,
-                observed,
-                metadata,
-            },
-            token,
-        ))
+        running.token = Some(token.clone());
+        Ok((running, token))
     }
     fn ready(&self, token: &str, key: &VariantKey, generation: u64) -> Result<PreviewStatus> {
         let Response::Preview(mut status) = command(
@@ -233,44 +273,151 @@ impl Running {
             .receiver
             .recv_timeout(Duration::from_secs(30))??)
     }
-    fn finish(self, token: String) -> Result<()> {
-        command(&self.bridge, Request::Close { catalog: token })?;
-        self.bridge.try_shutdown()?;
-        {
-            let state = self.bridge.0.shared.state.lock().unwrap();
-            ensure!(
-                state.reaped && state.child_finished && state.filesystem_verified,
-                "configured preview C wait/pipe or F retirement unverified"
-            );
-        }
-        self.parent.finish_after_dependents(false)?;
-        let owner = self.parent.native_owner()?;
-        for row in self.observed.lock().unwrap().iter() {
-            ensure!(
-                owner.status(&row.root, row.operation).is_err(),
-                "native operation retained after checked close"
-            );
-            eprintln!(
-                "configured preview verified N pid={} retired after wait/pipe joins",
-                row.pid
-            );
-        }
-        eprintln!(
-            "configured preview verified C={} F={} checked retirement",
-            self.bridge.status().pid,
-            self.client.pid()
+    fn mark_externally_retired(&mut self) {
+        self.token = None;
+        self.cleanup = CleanupState::Retired;
+    }
+    fn finish(mut self, token: String) -> Result<()> {
+        ensure!(
+            self.token.as_deref() == Some(token.as_str()),
+            "configured preview catalog token changed before cleanup"
         );
         let metadata = self.metadata.clone();
+        let result = self.cleanup();
         drop(self);
+        result?;
         ensure!(
             metadata.used() == 0,
             "metadata retained after final C/F owners dropped"
         );
         Ok(())
     }
+    fn cleanup(&mut self) -> Result<()> {
+        ensure!(
+            self.cleanup == CleanupState::Active,
+            "configured preview cleanup already attempted"
+        );
+        self.cleanup = CleanupState::Attempted;
+        let mut first = None;
+        if let Some(token) = self.token.take()
+            && let Err(error) = command(&self.bridge, Request::Close { catalog: token })
+        {
+            first = Some(error.context("configured preview catalog close"));
+        }
+        if let Err(error) = self.bridge.try_shutdown() {
+            if first.is_none() {
+                first = Some(anyhow::Error::new(error).context("configured preview C shutdown"));
+            } else {
+                eprintln!("configured preview C shutdown also failed: {error:#}");
+            }
+        }
+        let c_reaped = {
+            let state = self.bridge.0.shared.state.lock().unwrap();
+            state.reaped && state.child_finished
+        };
+        if !c_reaped {
+            let error = anyhow::anyhow!("configured preview C wait/pipe retirement unverified");
+            if first.is_none() {
+                first = Some(error);
+            } else {
+                eprintln!("{error:#}");
+            }
+        }
+        let mut filesystem_retired = false;
+        if c_reaped {
+            // This fixture admits only the preview helper allowlist. Once C is
+            // reaped, forced F cleanup cannot race an untracked descendant.
+            match self.parent.finish_after_dependents(false) {
+                Ok(()) => filesystem_retired = true,
+                Err(orderly) => match self.parent.finish_after_dependents(true) {
+                    Ok(()) => filesystem_retired = true,
+                    Err(forced) => {
+                        let error = anyhow::anyhow!(
+                            "configured preview F retirement failed: orderly={orderly:#}; forced={forced:#}"
+                        );
+                        if first.is_none() {
+                            first = Some(error);
+                        } else {
+                            eprintln!("{error:#}");
+                        }
+                    }
+                },
+            }
+        }
+        let mut native_retired = false;
+        if filesystem_retired {
+            match self.parent.native_owner() {
+                Ok(owner) => {
+                    native_retired = true;
+                    for row in self.observed.lock().unwrap().iter() {
+                        if owner.status(&row.root, row.operation).is_ok() {
+                            native_retired = false;
+                            let error = anyhow::anyhow!(
+                                "native operation {} retained after checked close",
+                                row.operation.0
+                            );
+                            if first.is_none() {
+                                first = Some(error);
+                            } else {
+                                eprintln!("{error:#}");
+                            }
+                        } else {
+                            eprintln!(
+                                "configured preview verified N pid={} retired after wait/pipe joins",
+                                row.pid
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    if first.is_none() {
+                        first = Some(error.context("configured preview native owner"));
+                    } else {
+                        eprintln!("configured preview native owner also failed: {error:#}");
+                    }
+                }
+            }
+        }
+        if c_reaped && filesystem_retired && native_retired {
+            self.cleanup = CleanupState::Retired;
+            eprintln!(
+                "configured preview verified C={} F={} checked retirement",
+                self.bridge.status().pid,
+                self.client.pid()
+            );
+        }
+        match first {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
-fn fixture() -> Result<(tempfile::TempDir, PathBuf, PathBuf, VariantKey, String)> {
-    let temp = tempfile::tempdir()?;
+impl Drop for Running {
+    fn drop(&mut self) {
+        if self.cleanup == CleanupState::Active
+            && let Err(error) = self.cleanup()
+        {
+            eprintln!(
+                "configured preview early-error cleanup failed: {error:#}; retaining custody"
+            );
+        }
+        if self.cleanup != CleanupState::Retired {
+            eprintln!(
+                "configured preview unresolved custody retained C={} F={} at {:?}",
+                self.bridge.status().pid,
+                self.client.pid(),
+                self.temporary.path()
+            );
+            std::mem::forget(self.bridge.clone());
+            std::mem::forget(self.parent.clone());
+            std::mem::forget(self.client.clone());
+            std::mem::forget(self.metadata.clone());
+            std::mem::forget(self.temporary.clone());
+        }
+    }
+}
+fn fixture() -> Result<(Arc<tempfile::TempDir>, PathBuf, PathBuf, VariantKey, String)> {
+    let temp = Arc::new(tempfile::tempdir()?);
     let base = temp.path().canonicalize()?;
     let originals = base.join("originals");
     std::fs::create_dir(&originals)?;
@@ -301,8 +448,9 @@ fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {
         std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
     );
     ensure!(executable.is_absolute(), "configured CLI must be absolute");
-    let (_temp, root, originals, key, original) = fixture()?;
-    let (running, token) = Running::start(&executable, &root, &originals, false)?;
+    let (temporary, root, originals, key, original) = fixture()?;
+    let (running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
     let status = running.ready(&token, &key, 1)?;
     let bytes = running.bytes(&token, &status.ticket)?;
     ensure!(
@@ -316,7 +464,7 @@ fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {
         "cold request did not render in N"
     );
     running.finish(token)?;
-    let (running, token) = Running::start(&executable, &root, &originals, true)?;
+    let (running, token) = Running::start(temporary.clone(), &executable, &root, &originals, true)?;
     let cold = Instant::now();
     let status = running.ready(&token, &key, 1)?;
     let bytes = running.bytes(&token, &status.ticket)?;
@@ -357,6 +505,69 @@ fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {
             .as_str()
             == original,
         "original bytes changed"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "configured actual C/F early-error fixture cleanup"]
+fn actual_managed_second_session_error_reaps_c_f_and_releases_budget() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, original) = fixture()?;
+    let (first, token) = Running::start(temporary.clone(), &executable, &root, &originals, true)?;
+    first.finish(token)?;
+
+    let (second, _) = Running::start(temporary.clone(), &executable, &root, &originals, true)?;
+    let c_pid = second.bridge.status().pid;
+    let f_pid = second.client.pid();
+    let budget = second.metadata.clone();
+    let original_error = (|| -> Result<()> {
+        let _running = second;
+        anyhow::bail!("injected second-session error")
+    })();
+    ensure!(
+        original_error
+            .unwrap_err()
+            .to_string()
+            .contains("injected second-session error"),
+        "early assertion error was not preserved"
+    );
+    ensure!(budget.used() == 0, "early-error metadata retained");
+    process_is_gone(c_pid)?;
+    process_is_gone(f_pid)?;
+    match Running::start(
+        temporary.clone(),
+        &executable,
+        &root.join("missing-catalog"),
+        &originals,
+        true,
+    ) {
+        Err(_) => {}
+        Ok((running, token)) => {
+            running.finish(token)?;
+            anyhow::bail!("post-spawn startup failure was not reached")
+        }
+    }
+    ensure!(
+        blake3::hash(&std::fs::read(originals.join("original.png"))?)
+            .to_hex()
+            .as_str()
+            == original,
+        "early-error cleanup changed the synthetic original"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> Result<()> {
+    let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    ensure!(
+        status == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "configured fixture process {pid} was not reaped"
     );
     Ok(())
 }
@@ -462,15 +673,15 @@ fn actual_managed_first_and_middle_transfers_keep_actor_cancel_responsive() -> R
     let executable = PathBuf::from(
         std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
     );
-    let (_temp, root, originals, key, original) = fixture()?;
-    let (warm, token) = Running::start(&executable, &root, &originals, false)?;
+    let (temporary, root, originals, key, original) = fixture()?;
+    let (warm, token) = Running::start(temporary.clone(), &executable, &root, &originals, false)?;
     let status = warm.ready(&token, &key, 1)?;
     let bytes = warm.bytes(&token, &status.ticket)?;
     let digest = blake3::hash(bytes.bytes());
     ensure!(bytes.bytes().len() > 16 * 1024, "multi-chunk fixture");
     drop(bytes);
     warm.finish(token)?;
-    let (running, token) = Running::start(&executable, &root, &originals, true)?;
+    let (running, token) = Running::start(temporary.clone(), &executable, &root, &originals, true)?;
     let result = (|| -> Result<()> {
         // First cache-object chunk, before native admission.
         {
@@ -562,8 +773,15 @@ fn actual_managed_webp_avif_render_and_cold_cache_delivery() -> Result<()> {
         (crate::preview::Codec::Webp, "image/webp"),
         (crate::preview::Codec::Avif, "image/avif"),
     ] {
-        let (_temp, root, originals, key, original) = fixture()?;
-        let (running, token) = Running::start_codec(&executable, &root, &originals, false, codec)?;
+        let (temporary, root, originals, key, original) = fixture()?;
+        let (running, token) = Running::start_codec(
+            temporary.clone(),
+            &executable,
+            &root,
+            &originals,
+            false,
+            codec,
+        )?;
         let status = running.ready(&token, &key, 1)?;
         let bytes = running.bytes(&token, &status.ticket)?;
         ensure!(
@@ -582,7 +800,14 @@ fn actual_managed_webp_avif_render_and_cold_cache_delivery() -> Result<()> {
             "codec cold request did not render in N"
         );
         running.finish(token)?;
-        let (running, token) = Running::start_codec(&executable, &root, &originals, true, codec)?;
+        let (running, token) = Running::start_codec(
+            temporary.clone(),
+            &executable,
+            &root,
+            &originals,
+            true,
+            codec,
+        )?;
         let status = running.ready(&token, &key, 1)?;
         let bytes = running.bytes(&token, &status.ticket)?;
         ensure!(
@@ -862,7 +1087,7 @@ fn actual_managed_jpeg_webp_avif_corruption_is_typed_and_exactly_invalidated() -
         crate::preview::Codec::Webp,
         crate::preview::Codec::Avif,
     ] {
-        let (_temporary, root, originals, bad_variant, original_checksum) = fixture()?;
+        let (temporary, root, originals, bad_variant, original_checksum) = fixture()?;
         let healthy_variant = {
             let mut catalog = crate::Catalog::open(&root)?;
             let revision = catalog.edit_variant(&bad_variant)?.revision;
@@ -882,7 +1107,14 @@ fn actual_managed_jpeg_webp_avif_corruption_is_typed_and_exactly_invalidated() -
                 )?
                 .key
         };
-        let (warm, token) = Running::start_codec(&executable, &root, &originals, false, codec)?;
+        let (warm, token) = Running::start_codec(
+            temporary.clone(),
+            &executable,
+            &root,
+            &originals,
+            false,
+            codec,
+        )?;
         let bad_ready = warm.ready(&token, &bad_variant, 1)?;
         let bad_bytes = warm.bytes(&token, &bad_ready.ticket)?;
         ensure!(!bad_bytes.bytes().is_empty(), "bad fixture preview empty");
@@ -908,7 +1140,14 @@ fn actual_managed_jpeg_webp_avif_corruption_is_typed_and_exactly_invalidated() -
         );
         let (malformed_bytes, malformed_checksum) = replace_cached_fixture_object(&root, &bad)?;
 
-        let (cold, token) = Running::start_codec(&executable, &root, &originals, true, codec)?;
+        let (cold, token) = Running::start_codec(
+            temporary.clone(),
+            &executable,
+            &root,
+            &originals,
+            true,
+            codec,
+        )?;
         let failed = failed_status(&cold, &token, &bad_variant, 10)?;
         eprintln!(
             "configured {codec:?} malformed-object failure: {:?}",
@@ -967,13 +1206,14 @@ fn actual_managed_metadata_is_held_through_close_until_checked_wait() -> Result<
     );
     let (temporary, root, originals, _, checksum) = fixture()?;
     let (started, gate) = crate::application::desktop::process::test_reap::armed(|| {
-        Running::start(&executable, &root, &originals, true)
+        Running::start(temporary.clone(), &executable, &root, &originals, true)
     });
-    let (running, token) = match started {
+    let (mut running, token) = match started {
         Ok(value) => value,
         Err(error) => {
             drop(gate);
-            eprintln!("metadata fixture retained at {:?}", temporary.keep());
+            eprintln!("metadata fixture retained at {:?}", temporary.path());
+            std::mem::forget(temporary.clone());
             return Err(error);
         }
     };
@@ -1032,13 +1272,15 @@ fn actual_managed_metadata_is_held_through_close_until_checked_wait() -> Result<
                 == checksum,
             "synthetic original changed"
         );
+        running.mark_externally_retired();
         Ok(())
     })();
     if result.is_err() || retired.is_err() {
         eprintln!(
             "metadata fixture retained at {:?}; assertions={result:?}; retirement={retired:?}",
-            temporary.keep()
+            temporary.path()
         );
+        std::mem::forget(temporary.clone());
         return result.and(retired);
     }
     drop(running);

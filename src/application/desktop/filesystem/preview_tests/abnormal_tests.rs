@@ -5,7 +5,7 @@ use super::*;
 
 struct Custody {
     running: Option<Running>,
-    temporary: Option<tempfile::TempDir>,
+    temporary: Option<Arc<tempfile::TempDir>>,
     hold: Option<Hold>,
     reap: Option<crate::application::desktop::process::test_reap::Gate>,
 }
@@ -13,7 +13,7 @@ impl Custody {
     fn cleanup(&mut self) -> Result<()> {
         self.hold.take(); // Release the ordinary relay before joining it.
         self.reap.take(); // Also release the actual Child wait owner on early error.
-        let running = self.running.as_ref().context("fixture custody missing")?;
+        let running = self.running.as_mut().context("fixture custody missing")?;
         let _shutdown = running.bridge.try_shutdown();
         {
             let state = running.bridge.0.shared.state.lock().unwrap();
@@ -30,6 +30,7 @@ impl Custody {
             running.bridge.status().pid,
             running.client.pid()
         );
+        running.mark_externally_retired();
         self.running.take();
         Ok(())
     }
@@ -45,8 +46,9 @@ impl Drop for Custody {
             if let Some(temporary) = self.temporary.take() {
                 eprintln!(
                     "abnormal preview unresolved fixture retained at {:?}",
-                    temporary.keep()
+                    temporary.path()
                 );
+                std::mem::forget(temporary);
             }
         }
         // If cleanup proved retirement, any remaining TempDir drops normally.
@@ -145,7 +147,7 @@ fn hold_boundary(
     }
 }
 fn scope(
-    temporary: tempfile::TempDir,
+    temporary: Arc<tempfile::TempDir>,
     executable: &Path,
     root: &Path,
     originals: &Path,
@@ -154,11 +156,14 @@ fn scope(
 ) -> Result<(Custody, String)> {
     let (started, reap) = if abnormal {
         let (started, gate) = crate::application::desktop::process::test_reap::armed(|| {
-            Running::start(executable, root, originals, small)
+            Running::start(temporary.clone(), executable, root, originals, small)
         });
         (started, Some(gate))
     } else {
-        (Running::start(executable, root, originals, small), None)
+        (
+            Running::start(temporary.clone(), executable, root, originals, small),
+            None,
+        )
     };
     match started {
         Ok((running, token)) => Ok((
@@ -174,8 +179,9 @@ fn scope(
             drop(reap);
             eprintln!(
                 "abnormal preview failed startup retained at {:?}",
-                temporary.keep()
+                temporary.path()
             );
+            std::mem::forget(temporary);
             Err(error)
         }
     }
@@ -496,6 +502,7 @@ fn actual_catalog_loss_with_two_staggered_workers_retains_f() -> Result<()> {
     };
     let (started, reap) = crate::application::desktop::process::test_reap::armed(|| {
         Running::start_options(
+            temporary.clone(),
             &executable,
             &root,
             &originals,
@@ -510,8 +517,9 @@ fn actual_catalog_loss_with_two_staggered_workers_retains_f() -> Result<()> {
             drop(reap);
             eprintln!(
                 "two-worker fixture failed startup retained at {:?}",
-                temporary.keep()
+                temporary.path()
             );
+            std::mem::forget(temporary);
             return Err(error);
         }
     };
