@@ -25,11 +25,31 @@ Lightroom admission prerequisites remain isolated from the desktop PR:
   SHA256 `46070894fd747ccfcfb80c24d68eb93e3e9b9b04066b6cbfb2d0c13ad529b213`;
   independent final review SHA256
   `c1448f7257a327767d10800bd84f1b86a5595b7e5fbc91d8db9e02c4b8f02747` passed.
+- `00038f0ed323b8347120d51a00ddcf4f85607a50`: closed-roster Source path
+  preparation uses explicit allocation grants retained through child reap and
+  pipe joins; Source children disable library backtrace capture locally. Sixteen
+  functional host tests (ten in-process, six actual-process) and formatting
+  passed; all 17 commands were waited. Root verified 124 committed blobs and 25
+  gate artifacts. Host receipt SHA256
+  `c19e6f2938ff4c3db9d8930e0d04fa919b0873718e870d56796302bdf730a030`;
+  compatibility receipt SHA256
+  `562e61c027b9fe9666b6bd1945d2936753d4694fc7ed1c6a9d6bf70d30655d94`;
+  independent qualification SHA256
+  `e56263e28b1510cfae0a987a2e46041fb0d8b073a4c398cb8e6d53f3a170a1ad`.
+  The first attempt failed compilation before running any tests; three old
+  fixture calls were corrected and the negative evidence retained. Windows
+  runtime, whole migration integration and aggregate memory admission remain
+  unqualified.
 
 FS8 native/stage/prepared design v6 passed independent review; actual child
 ownership, header/full decode and shared scheduler implementation is in progress.
-Complete Source/core aggregate admission and migration wiring remain active,
-including Windows path preparation before original Source admission. Remaining
+The F-stage repair passed bounded source review: exact transfer abort, retained
+prepared-folder identity, nonreplacing cleanup claims, sealed header-only rearm
+and supervisor abandonment after all native owners drain. Eight F tests, four
+stage-adapter tests and three scheduler tests are source-only until the complete
+FS8 gate runs. Full G actual-child and desktop queue acceptance remain required.
+Complete Source/core aggregate admission and migration wiring remain active.
+Remaining
 filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
 the full tracked scope. Current local tests use synthetic files without RAID/GPU.
 
