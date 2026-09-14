@@ -4,13 +4,51 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-13
 
+FS7 is independently accepted and integrated as
+`f13ddb30bbb6eedf3158ac00a9e718f2870c49a3` from author
+`b8a1cefa30ccd19ef45b6436041ce2273c642b57`. All19 committed/source blobs match
+the reviewed checkpoint. Root verified61 final qualification artifacts;
+independent review `sc-22847-fs7-final-independent-wf08wccl/review-final.json`
+has SHA256 `b8313ad90b0ca01bc0b506877ded781662450e6a6f7a3b5866e8debc6872d52b`.
+Coverage is113 distinct positives:105 focused, six configured C/F cases and two
+compatibility tests, plus strict Clippy and formatting. Integrated Mac Tauri
+release/locked compilation passed in16.44seconds; exec92743/PID34725 terminal0
+and reaped. Its receipt is
+`sc-22847-fs7-integration-1bdnfsrv/gate-initial-1789358718496710000/receipt.json`,
+SHA256 `5bada1b51a2bbf388a2d893f4d7647cf835599158bac62fe191031d842a774de`.
+This batch is ready for publication; newer CI is not yet qualified. Managed route
+selection, FS8 native ownership, full Source/core admission and remaining S12
+requirements remain open. Later paragraphs below preserve earlier checkpoints.
+
+Latest continuation checkpoint: the isolated Lightroom migration branch now
+includes `040dd7b4bdf09943acd705c5f68731e28dfe7af0`, which validates retained
+identity storage, exact byte length and UTF-8 before allocation at all three
+identified initial/recheck readers. Independent source review and six regression/
+compatibility tests plus formatting passed. Root verified all122 committed blobs
+and nine gate artifacts. Receipt `sc-22847-retained-identities-c1b54mxh/gate-initial-1789358190523259000/receipt.json`
+has SHA256 `9761d043e6d0617e7b1789f8f09e88e15216633623daf041b6673d05f5c303be`.
+This remains isolated from the desktop PR; aggregate Source/core memory admission
+and production integration are unfinished.
+
+FS7 local qualification now covers105 focused positives, six configured C/F
+process cases and two compatibility cases, strict all-target Clippy and format.
+The nine ordinary ignored entries are six configured behavior tests subsequently
+passed plus three inert entrypoints, correcting earlier shorthand that called
+all nine inert. Source v4 is frozen pending final independent acceptance.
+FS8's required next inventory includes both native worker-output validation and
+encoded-cache-hit decode; managed N owns decode/encode. No user originals or
+catalogs were accessed by these synthetic gates.
+
 The user selected **LensWorks** as the product name on 2026-09-13. Current
 branding uses LensWorks; historical evidence below retains its original names.
 Repository, bundle and persistent format identifiers remain compatible.
 Shortcut epic E1 and S12 were updated; comment23342 records the decision.
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
-PR16 head `33d4a84f3e992e7d423ddf046e21b3450946e735` passed all four
+PR16 head `81986e37e0119793682cdca6aa3559cc903c59b6` passed all four
+CI34797188873 jobs and all three installer/archive/payload audits. Root verified
+all41 evidence hashes in `sc-22847-ci-34797188873-rw8rygeh/receipt.json`, SHA256
+`b8d83dd403dee42a455599be99b2df5ff84057548ac5efaf8e56be20c0d65f10`. The preceding `33d4a84` checkpoint passed all four
 CI34794176560 jobs. All three provider archives, installers, native payloads,
 notices and installed-worker evidence passed read-only audit. Root reverified
 all56 evidence hashes in `sc-22847-ci-34794176560-p04ycpod/receipt.json`, SHA256
@@ -46,6 +84,106 @@ remain unfinished. Source receipt `foundation-source-v30.json`, SHA256
 `edffd90ccd0bdf27a9d20e7c8456b8a6929e923f67e84e402516abf23268dd47`, under
 `sc-22847-lightroom-migration-bridge-xksnotzh`. This is not part of the published
 FS6 batch and no runtime parity is claimed yet.
+
+Current public head `81986e37e0119793682cdca6aa3559cc903c59b6` includes the
+qualified FS6 integration and this ledger. Fresh CI34797188873 is running;
+comment23353 and exact PR body/head were read back. Its private audit directory
+is `sc-22847-ci-34797188873-rw8rygeh`; prior successful CI receipts stay frozen.
+
+FS7/FS8 plan-v3 is accepted in comment23354 after independent design review
+`sc-22847-fs78-design-independent-d0rcl58x/review.json`, SHA256
+`cc9eb46412417c7eb9557cd612ea4eca77d37d1bdd2543521ca283315aa6ef76`.
+FS7 implementation starts on isolated `codex/sc-22847-preview-io`: bounded binary
+transport followed by complete cache/relocation filesystem operations. FS8 keeps
+staging/prepared work and managed G-owned native children as a required next
+slice. Native wait must never block Stop while holding the sole live Child;
+actual wait and IO joins precede cleanup/fence release. No production selection.
+
+LM Part C v30 initial gate failed and stopped after five passing tests and one
+Authority grammar mismatch. Root verified all10 evidence hashes; all114 source
+pins remain unchanged. Receipt `source-v30-initial-20260914T015313Z-41219/receipt.json`
+SHA256 `3ac75f41daacb8c3985acc02d56af76a301f7063321c09a890641cc3c3295466`
+under `sc-22847-lightroom-migration-bridge-xksnotzh`. Session21101 is terminal and
+reaped; no observed descendants remain. Independent source review8314d59 requires
+buffered enum/path unit grammar and map-only Authority struct-variant corrections.
+The author is applying both before the successor freeze; unrun tests remain unrun.
+Measured macOS structs: InputSeal304, SelectedCapture104, SupplementPin176,
+String24, ArtifactDescriptor496. The successful seal payload expression is
+21,365,041 bytes excluding parser/transient/allocator owners; this is not an
+aggregate opening/RSS qualification.
+
+FS7/FS8 v4 makes kill-error ownership explicit; independent delta review
+`sc-22847-fs78-design-independent-d0rcl58x/review-v4.json` SHA256
+`3b01c6ad410137189cd40e8fa5173d3a18f0e8f7e65ba343c2e246013f862b6d`
+passes without topology/scope changes. FS7 source implementation is active.
+
+LM correction v31 is frozen at115 pins for independent review. It preserves
+buffered-only numeric NativePath identifiers and empty-map unit enum payloads,
+keeps direct parsing unchanged, and requires Authority variant bodies to be maps.
+Two new public-oracle matrix functions supplement the original fixtures; no new
+runtime claim yet. Source manifest SHA256
+`5c2cbc990016d31ad09c00b797945f1cac9902f20fcd29cd79346212249452eb`.
+Lifetime accounting review separately identifies parent-side chosen Artifact and
+request clones before descriptor admission, whole Manifest/retained record/seal
+overlap, validation BTreeSets and Source native-path/URI/open transients. These
+must remain charged through rejection; the small descriptor-decoder bound does
+not bound the parent constructor or total RSS.
+
+LM v31 independent source review `review-v31.json` SHA256
+`b34f7a8c613d044a4cc06f156fb4a212299680753d3dec3f5c19c30c7d7fdc88`
+passes both corrective findings. Initial gate now passes15 actual functions plus
+package formatting; root verified all20 evidence hashes,115 stationary pins and
+exact counts. Session4966 is terminal/reaped. Receipt
+`source-v31-initial-20260914T020507Z-45843/receipt.json` SHA256
+`8fcb4176b7aba8089e0afebe8ec634142e7f1467b931941f753177119e3c8b83`.
+Compiled Manifest box576 and Value inline192 bytes were measured; the tested
+nested grammar cutoff agrees with the public decoder (123 accepted,124 rejected
+in this fixture). Compatibility16 functions are now running separately; no result
+or aggregate-memory qualification is implied yet.
+
+LM v31 functional checkpoint is committed clean at
+`50926345cdb3e0c476c129548fba9a1a9a89da59` (22 files). Root verified all115
+committed blobs. Final independent source/runtime review SHA256
+`c6b2be29ea049b4367c3bf85917f3638c70235937e06c6b87a71f8bbfae12caa`
+passes30 functional tests (four actual-process) plus one inert helper and fmt;
+root independently verified all40 runtime evidence hashes. Compatibility receipt
+`source-v31-compatibility-20260914T020743Z-46819/receipt.json` SHA256
+`f9948d55fc4b57476d845185434cf8734cd38bdf16a09d4514f8e0c547675d56`.
+All native sessions are terminal/reaped. This functional source remains isolated
+from PR16; aggregate memory/maximum observations, strict Clippy production wiring
+and complete LM acceptance remain open. Actual consumer analysis additionally
+finds pending/request retaining two Manifests; their overlap must stay charged.
+
+At CI34797188873 / `81986e3`, macOS/Linux/contracts are successful; Windows
+is still running. Download session11907 completed/reaped. macOS archive10330293580
+(77,567,711 bytes), SHA256
+`ca073ea5f1eebc9758867b7caeb606bfd1d6ccdba76bc09b61570bf5c248544f`,
+and Linux10329789542 (51,540,951 bytes), SHA256
+`ca4370d8615f0e296b9a0a6ac6dc2eb22c88b304ec683d92d86fe30f2c4e6ca5`,
+match provider receipts. Both payload/installer/notice/worker-evidence readbacks
+pass (Mac18 closure files/25 notices, Linux4/17; Mac observer receipt-only,
+Linux included observer rehashed). This is not all-platform terminal acceptance.
+
+Reference Mac launch smoke now verifies the actual new LensWorks package:
+47 payload files and deep/strict code signature verified; native window/header/menu,
+onboarding and catalog-picker open/cancel observed through computer use. No
+catalog/photo was opened. The native picker restored the prior RAID test folder
+and listed directory/file metadata. Command-Q reported App quit and known PID56948
+was absent afterward; root is not its wait parent and makes no wait/reap claim.
+No full catalog/editing/accessibility/color acceptance. Private fresh copy and
+receipt `sc-22847-mac-gui-fs6-_d_97zwv/receipt.json`, SHA256
+`30a1e81707260adb97384c5f29606465aa9bc8827225448b70e91997ec574cfd`.
+Original CI artifacts remain unchanged. PR body/head read back exactly after
+updating this limited native GUI evidence. Native/UI lane is released.
+
+LM numerical observation plan-v3 is accepted for test-only implementation after
+finite consumer review435cf4cc (16 committed pins). Five families cover opening,
+parent Artifact construction, actual consumer overlap, retention batch break/resume
+and transport overlap. A nondefault internal-capacity-probes feature gates all
+allocator instrumentation behind cfg(test); default ordinary suite and production
+builds keep their allocator. Source plan SHA256
+`c656e16eb7476ae92e46b9af433ba683e6b16a6a31ff386dfe89fffa17738351`.
+No native measurement or aggregate memory qualification yet.
 
 Earlier PR16 checkpoint `e841bdb8a452c747bbf4e1eaf429c52f82c402b6` passed all four
 CI34783536524 jobs (macOS, Linux, Windows, contracts). All three provider ZIP
@@ -567,6 +705,143 @@ cleanup. Its isolated implementation and the complete custody design are active.
 The migration lock-name finding was retracted after verifying the existing CLI
 uses `.lightroom-import.lock`; no desktop-only rename is planned. These findings
 are tracked on S12 comment23317; S12/epic remain In Progress, S13 unstarted.
+
+CI34797188873 at81986e3 is terminal success in all four jobs. Root reverified
+all41 receipt artifact hashes after the third archive download and full payload
+audit; Windows artifact10331355869 is49,698,135 bytes, SHA256
+`c826108989e6776de7c0c4f516695b96513451f42e853a7a8a6f1b8c8a988599`.
+Final receipt `sc-22847-ci-34797188873-rw8rygeh/receipt.json`, SHA256
+`b8d83dd403dee42a455599be99b2df5ff84057548ac5efaf8e56be20c0d65f10`, is
+frozen. Included closure files/notices are Mac18/25, Linux4/17, Windows4/71.
+The Mac observer remains receipt-only; the separate GUI smoke retains its
+limited scope. PR16 exact body/head and Shortcut comment23357 were read back.
+
+FS7 source v1 is frozen for independent review at19 changed/new files, manifest
+`sc-22847-preview-io-82489lu8/source-v1.json`, SHA256
+`cc24a0680b2af4d9b570e9d0c686567168688516891d51ac7e5a5169a6fee330`.
+No native/source qualification is claimed. Review identified legacy pending-name
+admission and lost-reply cleanup cases for a bounded correction batch. FS8 and
+production route selection remain next required work.
+
+LM test-only capacity v32 review verified122 pins and found two fixture evidence
+gaps: cancellation must immediately follow an observed full send, and bounded
+escaped/native-path cases must supplement the maximum-roster observation.
+Artifact `sc-22847-capacity-v32-review-0ijkm_bd/review-v32.json`, SHA256
+`185277f498d4193bd4ca6e226daa1db8c796e371e3710103e317c841d2dea48d`.
+Author corrected only two test files in v33; root read both deltas and granted
+the initial three exact synthetic tests under the existing serialized native
+lane. Frozen v33 manifest SHA256
+`0d9e0090f77211fae1f73ee45133bc862aaeda34bf29503df28d84e6ec8fbbec`.
+No production/default allocator, protocol or original/RAID operation changes.
+
+FS7 v1 independent source review returned two concrete fixes: retain exact
+operation identity through undelivered failures and retire a reconciled known
+failure so later reads can recover; preserve legacy pending-name cleanup with
+borrowed SQL admission before materialization. Review artifact
+`sc-22847-fs7-independent-4ls1kctl/review-source-v1.json`, SHA256
+`eec1bda04b920983d457898b5cd1ab482e60bfdde1649cf52f8db7bbdd7256b0`.
+No speculative active-step defect was asserted; actual current stream failures
+and pre-admission failures were distinguished. Author is applying both findings.
+
+LM v33 initial gate passed allocator and exact-key BTree observations, then
+stopped on an invalid maximum-roster fixture (16384 selected plus one inherited
+exclusion exceeded the existing combined cap). Root verified seven artifacts
+in `source-v33-initial-20260914T030217Z-59508/receipt.json`, SHA256
+`c311c2425e26bae4316eea7981cec177fd26468bcc5e22c9661b531bf01cb15e`.
+Session53109 is terminal/reaped with no observed descendants. Actual Rust1.98
+arm64 node layouts104/200 and280/376, alignment8, combine with the pinned
+occupancy/transient proof to bound three validation sets at2,545,584 requested
+node bytes. String owners, stack, allocator overhead and RSS are separate.
+Independent partial review `sc-22847-capacity-v32-review-0ijkm_bd/review-v33-partial.json`,
+SHA256 `ab817dc6c3fd870013f363051fe357a5eee343889ce68e74c0190d01b9453299`.
+
+The v35 test-only correction passes the affected seal test, including exact
+16384 selected/0 excluded and16383/1 boundaries and six escaped/native-path
+8/16MiB grammar cases. The physical SQLite fixture remains small and unchanged.
+Root verified five artifacts in
+`source-v35-initial-20260914T030846Z-65270/receipt.json`, SHA256
+`827a92a728211647d5433eec239446b020d83a24e247091bc45302711414c8d4`.
+Session44531 is terminal/reaped. All122 source pins remain stationary at manifest
+`db27cca9d562d658504304486ed1e716ecbd62d49d6a540373a3eb1ec150a353`.
+The91,987,768-byte process peak includes deliberate fixture/expected/decoded
+copies and is not a production aggregate. Remaining five numerical probes plus
+formatting are now authorized serially; the two unchanged passing probes are
+not repeated. Whole LM wiring, aggregate reservation and strict Clippy remain open.
+
+The complete test-only LM observation milestone now has eight distinct positive
+functions plus formatting, with failed fixture runs retained. v35 consumers
+stopped at an expected-size fixture assertion; only one probe ran, no later
+four/fmt. Receipt `source-v35-compatibility-20260914T031131Z-66430/receipt.json`,
+SHA256 `d9d0056033677b0846ae3d20a6969594a587b8ddf5c0a9511c1fa5336eab78db`,
+has five root-verified artifacts. The descriptor fixture correction changes
+only decimal byte97 to120 to meet its existing near64KiB assertion.
+
+v36 descriptor and actual custody-consumer probes pass. Accepted descriptors
+are1351/57277 bytes; overlapping pending/request scopes and three chunk/Verify
+observations are recorded. Retention then failed because its fixture expected
+four large records in one saved-record page despite the existing8MiB cap.
+Root verified seven artifacts in
+`source-v36-compatibility-20260914T031939Z-82927/receipt.json`, SHA256
+`73e4d9f8678659ad46c925e8f76e6f20c036f65fb9c157e838b7a1b5b6341f28`.
+No production cap or retention behavior was changed by either fixture repair.
+
+v37 checks SQL has four complete records, reads keys1–3 on the first bounded
+saved page, key4 after the exact durable sequence cursor, then exhaustion.
+That affected test, both actual-process probes and package fmt pass; prior five
+successful functions are source-equivalent and not rerun. Root verified eight
+artifacts in `source-v37-compatibility-20260914T032444Z-83731/receipt.json`, SHA256
+`9709390451f677619c9810a66ae6da1b7e88451600901c25b71a9217464ccde1`.
+All122 live/before/after pins remain exact at v37 manifest SHA256
+`d0997034c4d669e5dbe2fa655a76b5803345240aead5dce79aadade966ea9b29`.
+SQL/raw PIDs88273/88274 exercised64 queries with two caller Manifests and one
+raw reader; pipe88430 observed Full then canceled. Known helpers report checked
+wait/reap, all runners are terminal, and no observed same-identity descendants
+remain. Unlabeled child peak observations101899/108473 bytes stay unordered,
+not assigned to roles without independent evidence. Numerical substitution
+and full independent closeout are pending; no production aggregate/RSS claim.
+
+FS7 v2 freezes the two review repairs across19 files, manifest SHA256
+`fe822e56723153fd22123c03b890e579d4065131deda46e55002e22e30283186`.
+Its fixed optional failure receipt binds exact admitted operation/step/request;
+transport uncertainty cannot erase the pending request. Legacy pending-name
+cleanup uses borrowed SQL metadata admission and the complete packet cap.
+Five added regressions bring new FS7 tests to17. Independent repair review is
+active, and the private native harness is being strengthened for interruption
+cleanup before the105-function initial suite/Clippy/fmt. Source remains frozen;
+no FS7 native claim. Shortcut comment23358 and In Progress state were read back.
+
+LM test-only observation milestone is independently qualified and committed clean
+as `837ddec0ff70cc3d0fcdec6abb2291ece074f72e` (18-file delta). Root verified
+all122 committed blobs. Committed receipt SHA256
+`474cea884e701ae9470c49867e1c4f3bde9fb2d07f2718a61ab156b492e49ea0`;
+cumulative readback `source-v37-cumulative-readback.json`, SHA256
+`80c34a8d82186cdfe2873fec2c22f03db46aba8ac163d6a84a6841c19dbe5caa`,
+verifies31 artifacts. Independent final `review-v37-final.json`, SHA256
+`07a50f4bff5957f2b5d121ef24e365b6c8fbc60d12018003962c51aff4614ab1`,
+confirms eight distinct functions (six in-process, two actual-process), formatting,
+source equivalence of carried passes and known helper retirement. No push or
+integration into the desktop branch yet.
+
+The corrected inventory `PART-C-NUMERICAL-SUBSTITUTION-v37-v2.md`, SHA256
+`affdd72d48eedf4749be22aa7e20bef41c4c9711f771653af83bace44112c742`,
+preserves the original report and distinguishes seal dynamic21,364,737 bytes
+from complete21,365,041 including its304-byte root. The576-byte Manifest box
+exists only while the wire Value owns it; public returned values have separate
+inline root placement. These report corrections change no source or runtime
+qualification. Remaining Policy/Evidence and constructor/path/protocol owner
+terms are being derived independently before aggregate admission/enforcement.
+
+FS7 v2 repair source passes independent review `review-source-v2.json`, SHA256
+`5ccf5fab849a77fe281bf21cd9b1cbcff80994d4148f9a8d0686f71ce7c991ee`.
+Root strengthened only the private gate harness: v3 adds bounded owned-process
+cleanup and terminal evidence; v4 uses current PID/start-matched process groups
+rather than stale historical group values. A pure row regression covers moved
+groups and PID reuse. All source v2 and prior harness artifacts remain intact.
+Runner-v4 receipt SHA256
+`eab96308bf57a230f52de26986c0188ad6c54a2e51beee73d45c752a8d41836b`.
+Initial native gate is running with standard caps, discovery then105 positive
+functions/9 inert ignored, Clippy and formatting; later configured phases are
+not yet granted. No FS7 runtime qualification is claimed at this checkpoint.
 
 ## Earlier integration checkpoints
 
