@@ -37,6 +37,14 @@ impl ByteBudget {
         })
     }
 }
+impl ByteReservation {
+    pub(crate) fn shrink(&mut self, bytes: u64) -> Result<()> {
+        ensure!(bytes <= self.bytes, "reservation cannot grow by shrinking");
+        self.budget.0.lock().unwrap_or_else(|p| p.into_inner()).used -= self.bytes - bytes;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
 impl Drop for ByteReservation {
     fn drop(&mut self) {
         self.budget.0.lock().unwrap_or_else(|e| e.into_inner()).used -= self.bytes;
@@ -145,6 +153,59 @@ impl DecodedCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.cached_bytes = 0;
+    }
+    pub(crate) fn managed_lookup(&mut self, key: &str) -> Result<Option<Arc<RetainedPixels>>> {
+        ensure!(!key.is_empty() && key.len() <= 64, "decoded key length");
+        let found = self.get(key)?;
+        if found.is_some() {
+            self.hits = self.hits.saturating_add(1);
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
+        Ok(found)
+    }
+    pub(crate) fn reserve_rgb(&mut self, width: u32, height: u32) -> Result<ByteReservation> {
+        let bytes = crate::catalog_session::native::rgb_bytes(width, height)?;
+        loop {
+            if let Some(reservation) = self.budget.try_reserve(bytes) {
+                return Ok(reservation);
+            }
+            if !self.evict_one() {
+                return Err(DecodedBudgetExceeded.into());
+            }
+        }
+    }
+    pub(crate) fn commit_rgb(
+        &mut self,
+        key: String,
+        pixels: PreparedRgb,
+        reservation: ByteReservation,
+    ) -> Result<Arc<RetainedPixels>> {
+        let bytes = u64::try_from(pixels.byte_len())?;
+        ensure!(
+            reservation.bytes == bytes && Arc::ptr_eq(&reservation.budget.0, &self.budget.0),
+            "decoded reservation identity/length"
+        );
+        let retained = Arc::new(RetainedPixels {
+            pixels,
+            _reservation: reservation,
+        });
+        if bytes <= self.cache_limit {
+            while self.cached_bytes > self.cache_limit - bytes
+                || self.entries.len() >= self.max_entries
+            {
+                if !self.evict_one() {
+                    break;
+                }
+            }
+            let tick = self.tick()?;
+            if let Some((old, _)) = self.entries.remove(&key) {
+                self.cached_bytes -= old.pixels.byte_len() as u64;
+            }
+            self.cached_bytes += bytes;
+            self.entries.insert(key, (retained.clone(), tick));
+        }
+        Ok(retained)
     }
     /// The manifest supplies exact dimensions, checked again after decoding.
     /// Worker admission separately covers codec scratch and encoded buffers.

@@ -19,6 +19,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+pub(crate) mod managed;
+pub(crate) mod managed_process;
+mod managed_transport;
+pub(crate) mod read_transport;
+
 const RECEIPT_LIMIT: u64 = 192 * 1024;
 use super::prepared_cache::{
     MAX_PROXY_BYTES, PROXY_EDGE, PreparedReference, ProducedPrepared, SourceInstance,
@@ -152,6 +157,8 @@ impl std::error::Error for WorkerFailure {}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ObjectReceipt {
+    #[serde(default)]
+    rgb: Option<managed::Rgb>,
     key: PreviewKey,
     width: u32,
     height: u32,
@@ -160,6 +167,8 @@ struct ObjectReceipt {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct RenderReceipt {
+    #[serde(default)]
+    native: Option<managed::Binding>,
     edit_input: Option<EditInputProvenance>,
     peak_resident_bytes: Option<u64>,
     peak_method: String,
@@ -209,6 +218,7 @@ fn validate_object(key: &PreviewKey, width: u32, height: u32, bytes: &[u8]) -> R
 /// The launcher path is supplied by the application; the library does not guess
 /// a binary from test executables or silently fall back to synchronous rendering.
 pub struct WorkerProcess {
+    managed: Option<managed_transport::Render>,
     child: Option<Child>,
     lease: Option<ChildStdin>,
     staging: PathBuf,
@@ -249,6 +259,7 @@ impl WorkerProcess {
         // Establish the child owner before any fallible transport operation.
         let lease = child.stdin.take();
         Ok(Self {
+            managed: None,
             child: Some(child),
             lease,
             staging,
@@ -256,6 +267,31 @@ impl WorkerProcess {
             exited: false,
             encoding_admitted: false,
             initial_request: Some(bytes),
+            start_failure: None,
+            #[cfg(test)]
+            wait_failures: Default::default(),
+        })
+    }
+    pub(crate) fn spawn_managed(
+        calls: std::sync::Arc<super::stage_io::Calls>,
+        request: RenderWork,
+        limits: &super::ServiceLimits,
+    ) -> Result<Self> {
+        let cost = crate::catalog_session::native::render_cost(
+            &request,
+            limits.per_worker_bytes,
+            limits.cache_codec_scratch_bytes,
+        )?;
+        let job = managed_transport::Render::new(calls.task_lane()?, request.clone(), limits, cost);
+        Ok(Self {
+            managed: Some(job),
+            child: None,
+            lease: None,
+            staging: PathBuf::new(),
+            request,
+            exited: false,
+            encoding_admitted: false,
+            initial_request: None,
             start_failure: None,
             #[cfg(test)]
             wait_failures: Default::default(),
@@ -270,6 +306,7 @@ impl WorkerProcess {
     ) -> Self {
         let lease = child.stdin.take();
         Self {
+            managed: None,
             child: Some(child),
             lease,
             staging,
@@ -290,6 +327,9 @@ impl WorkerProcess {
     /// Transport failure is latched for every later poll; partial input is never
     /// replayed. The owner must stop/drain before releasing this instance.
     pub fn start(&mut self) -> Result<()> {
+        if let Some(job) = &mut self.managed {
+            return job.start();
+        }
         if let Some(failure) = &self.start_failure {
             bail!("{failure}");
         }
@@ -309,11 +349,17 @@ impl WorkerProcess {
         Ok(())
     }
     pub fn pid(&self) -> u32 {
+        if let Some(job) = &self.managed {
+            return job.pid();
+        }
         self.child.as_ref().expect("owned preview process").id()
     }
     /// Returns only after exit. The service releases the scheduler reservation
     /// after consuming this batch, including its validated decoded pixel buffers.
     pub fn poll(&mut self, canceled: &AtomicBool) -> Result<Option<RenderedPreviewBatch>> {
+        if let Some(job) = &mut self.managed {
+            return job.poll(canceled);
+        }
         ensure!(!self.exited, "worker already consumed");
         if canceled.load(Ordering::Acquire) {
             self.stop()?;
@@ -405,6 +451,7 @@ impl WorkerProcess {
             provenance: receipt.provenance,
             objects,
             prepared: receipt.prepared.map(|(receipt, source)| ProducedPrepared {
+                managed: None,
                 path: self.staging.join("prepared.linear"),
                 receipt,
                 source,
@@ -414,6 +461,10 @@ impl WorkerProcess {
     /// The worker holds a decoded source under its reservation until a subsequent
     /// owner poll admits encoding. No output transport or blocking read is needed.
     pub fn awaiting_encode_admission(&self) -> Result<bool> {
+        if self.managed.is_some() {
+            // The retained transport task owns the managed checkpoint handshake.
+            return Ok(false);
+        }
         if self.encoding_admitted || self.exited {
             return Ok(false);
         }
@@ -427,7 +478,26 @@ impl WorkerProcess {
         );
         Ok(true)
     }
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_spawn(&mut self) {
+        self.managed
+            .as_mut()
+            .expect("managed fixture")
+            .fail_next_cleanup_spawn();
+    }
+    pub(crate) fn progress_transport(&mut self, canceled: &AtomicBool) {
+        if let Some(managed) = &mut self.managed {
+            managed.progress(canceled);
+        }
+    }
+    pub(crate) fn transport_busy(&self) -> bool {
+        self.managed.as_ref().is_some_and(|m| m.busy())
+    }
     pub(crate) fn signal_stop(&mut self) {
+        if let Some(job) = &mut self.managed {
+            job.signal_stop();
+            return;
+        }
         self.lease.take();
         if !self.exited {
             // Wait, rather than kill's result, establishes that ownership ended.
@@ -435,6 +505,11 @@ impl WorkerProcess {
         }
     }
     pub(crate) fn stop(&mut self) -> Result<()> {
+        if let Some(job) = &mut self.managed {
+            job.stop()?;
+            self.exited = true;
+            return Ok(());
+        }
         self.signal_stop();
         if !self.exited {
             #[cfg(test)]
@@ -458,6 +533,12 @@ impl WorkerProcess {
 }
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
+        if self.managed.is_some() {
+            if self.stop().is_err() {
+                std::mem::forget(self.managed.take());
+            }
+            return;
+        }
         if self.stop().is_err() {
             // Explicit owners keep self for retry. Drop cannot report a reap
             // failure; retain the native process handle without claiming exit.
@@ -748,8 +829,24 @@ fn run_worker() -> Result<()> {
         line.last() == Some(&b'\n') && (line.len() as u64) < RECEIPT_LIMIT,
         "incomplete worker request"
     );
-    let request: RenderWork = serde_json::from_slice(&line)?;
-    let source = request.validate()?;
+    let (native, work) =
+        match serde_json::from_slice::<crate::catalog_session::native::Envelope>(&line) {
+            Ok(envelope) => {
+                envelope.work.validate()?;
+                (
+                    Some(managed::Binding {
+                        operation: envelope.operation,
+                        stage: envelope.stage,
+                    }),
+                    envelope.work,
+                )
+            }
+            Err(_) => (
+                None,
+                crate::catalog_session::native::Work::Render(serde_json::from_slice(&line)?),
+            ),
+        };
+    drop(line);
     let mut start = [0];
     input
         .read_exact(&mut start)
@@ -768,6 +865,20 @@ fn run_worker() -> Result<()> {
             }
             std::process::exit(74);
         })?;
+    if matches!(
+        work,
+        crate::catalog_session::native::Work::DecodeEncoded { .. }
+    ) {
+        return managed::decode_encoded(
+            work,
+            native.context("managed decode binding missing")?,
+            admitted,
+        );
+    }
+    let crate::catalog_session::native::Work::Render(request) = work else {
+        unreachable!()
+    };
+    let source = request.validate()?;
     let (instance, _source_write_lease) =
         SourceInstance::read_for_worker(&source, request.decode_limits.max_encoded_bytes)?;
     let mut prepared_receipt = None;
@@ -893,10 +1004,19 @@ fn run_worker() -> Result<()> {
             "encoded worker allowance exceeded"
         );
         write_exclusive(Path::new(&format!("{index}.preview")), &bytes)?;
+        let (width, height) = (rgb.width(), rgb.height());
+        drop(rgb);
+        let rgb = if native.is_some() {
+            let verified = validate_object(key, width, height, &bytes)?;
+            Some(managed::write_rgb(index, &verified)?)
+        } else {
+            None
+        };
         objects.push(ObjectReceipt {
+            rgb,
             key: key.clone(),
-            width: rgb.width(),
-            height: rgb.height(),
+            width,
+            height,
             bytes: bytes.len() as u64,
             checksum: blake3::hash(&bytes).to_hex().to_string(),
         });
@@ -915,6 +1035,7 @@ fn run_worker() -> Result<()> {
     // source verification. Only the bounded 64 KiB receipt write follows.
     let (peak_resident_bytes, peak_method) = peak_resident_memory();
     let receipt = serde_json::to_vec(&RenderReceipt {
+        native,
         edit_input,
         peak_resident_bytes,
         peak_method,
@@ -1015,6 +1136,7 @@ mod tests {
             decode_limits: DecodeLimits::default(),
         };
         let mut worker = WorkerProcess {
+            managed: None,
             child: Some(child),
             lease,
             staging: stage.clone(),

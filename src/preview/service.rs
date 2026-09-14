@@ -1,5 +1,9 @@
 //! Application-owned preview service. All catalog/manifest mutations occur on
 //! the owner; native workers can only return isolated, validated image results.
+#[path = "encoded_delivery.rs"]
+pub(crate) mod encoded_delivery;
+#[path = "managed_reads.rs"]
+mod managed_reads;
 #[path = "read_queue.rs"]
 mod read_queue;
 use super::*;
@@ -55,6 +59,10 @@ pub struct ServiceLimits {
     /// temporary encoded Vec. Measured RSS is separate evidence, not this count.
     pub working_bytes: u64,
     pub per_worker_bytes: u64,
+    #[serde(default = "default_header_scratch")]
+    pub cache_header_scratch_bytes: u64,
+    #[serde(default = "default_codec_scratch")]
+    pub cache_codec_scratch_bytes: u64,
     pub decode_limits: crate::media::DecodeLimits,
     pub encoded_staging_bytes: u64,
     pub per_worker_encoded_bytes: u64,
@@ -65,6 +73,12 @@ pub struct ServiceLimits {
     pub prepared_cache_bytes: u64,
     #[serde(default = "default_prepared_entries")]
     pub prepared_cache_entries: usize,
+}
+fn default_header_scratch() -> u64 {
+    crate::catalog_session::native::DEFAULT_HEADER_SCRATCH
+}
+fn default_codec_scratch() -> u64 {
+    crate::catalog_session::native::DEFAULT_CODEC_SCRATCH
 }
 fn default_prepared_bytes() -> u64 {
     256 * 1024 * 1024
@@ -84,6 +98,8 @@ impl Default for ServiceLimits {
             workers: 1,
             working_bytes: 3 * 1024 * 1024 * 1024,
             per_worker_bytes: 2164 * 1024 * 1024,
+            cache_header_scratch_bytes: default_header_scratch(),
+            cache_codec_scratch_bytes: default_codec_scratch(),
             encoded_staging_bytes: 32 * 1024 * 1024,
             per_worker_encoded_bytes: 8 * 1024 * 1024,
             decoded_cache_bytes: 256 * 1024 * 1024,
@@ -260,6 +276,8 @@ pub struct PreviewService {
     external_native: std::sync::Arc<std::sync::atomic::AtomicBool>,
     native_catalog: Option<std::sync::Arc<crate::catalog_writer::Writers>>,
     reads: read_queue::ReadQueue,
+    delivery_io: Arc<std::sync::atomic::AtomicBool>,
+    delivery_pending: Arc<std::sync::atomic::AtomicBool>,
     prepared: super::prepared_cache::PreparedCache,
     observer: std::cell::RefCell<Option<ServiceObserver>>,
     store: StoreOwner,
@@ -555,6 +573,9 @@ impl SavedJob {
     }
 }
 impl PreviewService {
+    pub(crate) fn uses_managed_filesystem(&self) -> bool {
+        self.store.stage_calls().is_some()
+    }
     pub(crate) fn return_managed_sql(&mut self) {
         self.store.return_managed_sql();
     }
@@ -590,6 +611,10 @@ impl PreviewService {
     ) -> Result<()> {
         limits.decode_limits.validate()?;
         ensure!(
+            limits.cache_header_scratch_bytes > 0 && limits.cache_codec_scratch_bytes > 0,
+            "zero native scratch admission"
+        );
+        ensure!(
             executable.is_absolute() && executable.is_file(),
             "preview worker executable unavailable"
         );
@@ -615,12 +640,26 @@ impl PreviewService {
         limits: ServiceLimits,
     ) -> Result<Self> {
         let staging = store.configuration().manifest_root.join("workers");
-        recover_worker_staging(&staging, 128)?;
-        let prepared = super::prepared_cache::PreparedCache::open(
-            store.configuration().manifest_root.join("prepared"),
-            limits.prepared_cache_bytes,
-            limits.prepared_cache_entries,
-        )?;
+        let prepared_root = store.configuration().manifest_root.join("prepared");
+        let prepared = if let Some(calls) = store.stage_calls() {
+            calls.call(
+                crate::catalog_session::preview_stage::Action::Recover { limit: 128 },
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+            super::prepared_cache::PreparedCache::open_managed(
+                prepared_root,
+                limits.prepared_cache_bytes,
+                limits.prepared_cache_entries,
+                calls,
+            )?
+        } else {
+            recover_worker_staging(&staging, 128)?;
+            super::prepared_cache::PreparedCache::open(
+                prepared_root,
+                limits.prepared_cache_bytes,
+                limits.prepared_cache_entries,
+            )?
+        };
         Ok(Self {
             stopping: false,
             launch_pauses: Default::default(),
@@ -628,6 +667,8 @@ impl PreviewService {
             native_catalog: None,
             prepared,
             reads: read_queue::ReadQueue::default(),
+            delivery_io: Default::default(),
+            delivery_pending: Default::default(),
             observer: std::cell::RefCell::new(None),
             store: StoreOwner(Some(store)),
             decoded: DecodedCache::new(
@@ -824,6 +865,29 @@ impl PreviewService {
         metrics.returned_pixels = matches!(&result, Ok(Some(_)));
         result
     }
+    fn ensure_synchronous_read_available(&self) -> Result<()> {
+        let usage = self.scheduler.usage();
+        ensure!(
+            !self.reads.active()
+                && !self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
+                && !self
+                    .delivery_pending
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && usage.active == 0
+                && usage.queued == 0
+                && self
+                    .launch_pauses
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+                && !self
+                    .external_native
+                    .load(std::sync::atomic::Ordering::Acquire),
+            super::stage_io::Busy(
+                "Native preview work is busy; release the active permit or use a queued cache read"
+            )
+        );
+        Ok(())
+    }
     fn cached_inner(
         &mut self,
         catalog: &Catalog,
@@ -833,6 +897,17 @@ impl PreviewService {
         interactive: bool,
         mut metrics: Option<&mut CacheReadMetrics>,
     ) -> Result<Option<PreviewView>> {
+        if self.store.stage_calls().is_some() {
+            match self.begin_managed_read(catalog, variant, tier, allow_stale, interactive, true)? {
+                managed_reads::Begin::Ready(view) => return Ok(view.map(|v| *v)),
+                managed_reads::Begin::Pending(mut read) => loop {
+                    if let Some(view) = self.poll_managed_read(catalog, &mut read)? {
+                        return Ok(view);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                },
+            }
+        }
         let identity = measured(&mut metrics, ReadPhase::Identity, || {
             catalog.edit_render_identity(variant)
         })?;
@@ -1210,7 +1285,7 @@ impl PreviewService {
         let id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
             .to_hex()
             .to_string();
-        let stored = serde_json::to_string(&job)?;
+        let stored = super::store::encoded_descriptor(&job, "saved job serialization changed")?;
         let writer_priority = match priority {
             Priority::Foreground => crate::catalog_writer::Priority::Foreground,
             Priority::Background => crate::catalog_writer::Priority::Background,
@@ -1249,9 +1324,19 @@ impl PreviewService {
             })?
         };
         ensure!(admitted.is_some(), "stale preview request");
-        let consumer =
-            self.scheduler
-                .request(id.clone(), self.limits.per_worker_bytes, priority)?;
+        let consumer = self.scheduler.request(
+            id.clone(),
+            if self.store.stage_calls().is_some() {
+                crate::catalog_session::native::render_cost(
+                    &job.request,
+                    self.limits.per_worker_bytes,
+                    self.limits.cache_codec_scratch_bytes,
+                )?
+            } else {
+                self.limits.per_worker_bytes
+            },
+            priority,
+        )?;
         self.consumers.insert(consumer, id.clone());
         self.jobs.insert(id, job);
         Ok(consumer)
@@ -1273,6 +1358,29 @@ impl PreviewService {
     /// children; stale/canceled children are joined before reservations release.
     pub fn tick(&mut self, catalog: &mut Catalog) -> Result<()> {
         ensure!(!self.stopping, "preview service is draining");
+        for active in self.active.values_mut() {
+            if active
+                .lease
+                .canceled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                active.worker.signal_stop();
+            }
+            // A finished task may own the receipt another live task awaits.
+            // Collect it/start origin cleanup before the publication fence.
+            active.worker.progress_transport(&active.lease.canceled);
+        }
+        // Existing publication/maintenance uses synchronous F calls. Do not
+        // enter them while a retained data task may own F's ordinary slot.
+        if self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
+            || self.reads.transport_busy()
+            || self.active.values().any(|a| a.worker.transport_busy())
+        {
+            if self.store.stage_calls().is_some() {
+                self.dispatch_ready(catalog)?;
+            }
+            return Ok(());
+        }
         let active_ids = self.active.keys().copied().collect::<Vec<_>>();
         for lease_id in active_ids {
             let active = &self.active[&lease_id];
@@ -1292,6 +1400,12 @@ impl PreviewService {
                 active.worker.poll(&active.lease.canceled)
             };
             if matches!(result, Ok(None)) {
+                if self.active.values().any(|a| a.worker.transport_busy()) {
+                    if self.store.stage_calls().is_some() {
+                        self.dispatch_ready(catalog)?;
+                    }
+                    return Ok(());
+                }
                 continue;
             }
             // A poll error can precede process exit (transport/OS errors).
@@ -1357,6 +1471,13 @@ impl PreviewService {
                 self.completed.insert(consumer, status.clone());
             }
         }
+        self.dispatch_ready(catalog)
+    }
+    // Launch admission is independent of result publication. The managed path
+    // below uses C-owned SQL/cache state and the existing source-path separation
+    // check. It makes no synchronous F calls: stage/native transport begins only
+    // after insertion into the active registry.
+    fn dispatch_ready(&mut self, catalog: &mut Catalog) -> Result<()> {
         if self.store.relocation_pending()?
             || self
                 .launch_pauses
@@ -1407,7 +1528,11 @@ impl PreviewService {
                         &edit.recipe.validate()?.settings().white_balance,
                     )?;
                 }
-                WorkerProcess::spawn(&self.executable, &self.staging, request)
+                if let Some(calls) = self.store.stage_calls() {
+                    WorkerProcess::spawn_managed(calls, request, &self.limits)
+                } else {
+                    WorkerProcess::spawn(&self.executable, &self.staging, request)
+                }
             })();
             match launch {
                 Ok(worker) => {
@@ -1422,7 +1547,9 @@ impl PreviewService {
                     );
                     // Dispatch only after every owner is registered. A failure
                     // is latched in the worker and follows normal poll/drain.
-                    let _ = self.active.get_mut(&lease_id).unwrap().worker.start();
+                    if self.store.stage_calls().is_none() {
+                        let _ = self.active.get_mut(&lease_id).unwrap().worker.start();
+                    }
                 }
                 Err(error) => {
                     drop(guard);
@@ -1433,6 +1560,11 @@ impl PreviewService {
                         self.completed.insert(consumer, status.clone());
                     }
                 }
+            }
+        }
+        if self.store.stage_calls().is_some() {
+            for active in self.active.values_mut() {
+                let _ = active.worker.start();
             }
         }
         Ok(())
@@ -1545,8 +1677,7 @@ impl PreviewService {
         job: &SavedJob,
         error: anyhow::Error,
     ) -> Result<ServiceCompletion> {
-        let message = format!("{error:#}");
-        let message = message.chars().take(4096).collect::<String>();
+        let message = failure_message(&error);
         let kind = error
             .downcast_ref::<WorkerFailure>()
             .and_then(|failure| failure.decode_status);
@@ -1586,8 +1717,11 @@ impl PreviewService {
         };
         let mut saved = job.clone();
         saved.state = state;
-        self.store
-            .save_job(id, &serde_json::to_string(&saved)?, self.limits.requests)?;
+        self.store.save_job(
+            id,
+            &super::store::encoded_descriptor(&saved, "saved job serialization changed")?,
+            self.limits.requests,
+        )?;
         Ok(status)
     }
     pub fn jobs(&self, after: i64, limit: usize) -> Result<Vec<JobView>> {
@@ -1832,7 +1966,9 @@ impl PreviewService {
     /// Queued descriptors may remain while paused; only active children and
     /// their reservations must drain before the owner admits an external worker.
     pub fn native_work_drained(&self) -> bool {
-        self.active.is_empty() && self.scheduler.usage().reserved_bytes == 0
+        self.active.is_empty()
+            && self.scheduler.usage().reserved_bytes == 0
+            && !self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
     }
     /// Mint without filesystem access on the actor. Pause provenance, actual
     /// native drain and exclusive external ownership are checked here. The first
@@ -1899,6 +2035,7 @@ impl PreviewService {
     /// Stops dispatch and signals every worker without joining. Call before
     /// waiting on other owners that may be blocked behind a native worker.
     pub fn signal_shutdown(&mut self) {
+        self.signal_read_shutdown();
         self.stopping = true;
         for active in self.active.values_mut() {
             active
@@ -1912,16 +2049,34 @@ impl PreviewService {
     /// reservations remain available for retry.
     pub fn try_shutdown(&mut self) -> Result<()> {
         self.signal_shutdown();
+        // A closing lane can encounter another owner's retained F receipt.
+        // Attempt every origin's cleanup before returning the first error, so
+        // hash iteration order cannot prevent that receipt's reconciliation.
+        let mut failure = None;
         for active in self.active.values_mut() {
-            active.worker.stop()?;
+            if let Err(error) = active.worker.stop() {
+                failure.get_or_insert(error);
+            }
         }
-        ensure!(
-            !self
-                .external_native
-                .load(std::sync::atomic::Ordering::Acquire),
-            "external native worker ownership has not drained"
-        );
+        if let Err(error) = self.try_read_shutdown() {
+            failure.get_or_insert(error);
+        }
+        if self
+            .external_native
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            failure.get_or_insert_with(|| {
+                anyhow::anyhow!("external native worker ownership has not drained")
+            });
+        }
+        if self.delivery_io.load(std::sync::atomic::Ordering::Acquire) {
+            failure.get_or_insert_with(|| anyhow::anyhow!("encoded delivery remains owned"));
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
         // Every worker is verified before any aggregate reservation is released.
+        self.finish_read_shutdown()?;
         for (id, active) in self.active.drain() {
             drop(active);
             self.scheduler.finished(id, WorkerOutcome::Stopped)?;
@@ -1930,9 +2085,22 @@ impl PreviewService {
     }
 
     pub fn maintenance(&self) -> Result<()> {
+        if self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
+            || self.reads.transport_busy()
+            || self.active.values().any(|a| a.worker.transport_busy())
+        {
+            return Ok(());
+        }
         self.store.flush_touches()?;
         self.store.recover(128)?;
-        recover_worker_staging(&self.staging, 128)?;
+        if let Some(calls) = self.store.stage_calls() {
+            calls.call(
+                crate::catalog_session::preview_stage::Action::Recover { limit: 128 },
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+        } else {
+            recover_worker_staging(&self.staging, 128)?;
+        }
         Ok(())
     }
 }
@@ -1943,9 +2111,37 @@ impl Drop for PreviewService {
             // Retain the cache lock and unverified worker/resource owners rather
             // than permit overlapping work. Checked callers retain self/retry.
             std::mem::forget(std::mem::take(&mut self.active));
+            std::mem::forget(std::mem::take(&mut self.reads));
             std::mem::forget(self.store.0.take());
         }
     }
+}
+
+// Preserve the existing 4096-character diagnostic prefix, including UTF-8.
+// The maximum backing is admitted before formatting, with no full error String.
+fn failure_message(error: &anyhow::Error) -> String {
+    struct Prefix {
+        text: String,
+        remaining: usize,
+    }
+    impl std::fmt::Write for Prefix {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            for character in value.chars() {
+                if self.remaining == 0 {
+                    return Err(std::fmt::Error);
+                }
+                self.text.push(character);
+                self.remaining -= 1;
+            }
+            Ok(())
+        }
+    }
+    let mut prefix = Prefix {
+        text: String::with_capacity(4 * 4096),
+        remaining: 4096,
+    };
+    let _ = std::fmt::write(&mut prefix, format_args!("{error:#}"));
+    prefix.text
 }
 
 #[cfg(test)]
@@ -1955,3 +2151,15 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "drain_tests.rs"]
 mod drain_tests;
+
+#[cfg(test)]
+#[path = "sync_read_tests.rs"]
+mod sync_read_tests;
+
+#[cfg(test)]
+#[path = "transport_progress_tests.rs"]
+mod transport_progress_tests;
+
+#[cfg(test)]
+#[path = "descriptor_capacity_tests.rs"]
+mod descriptor_capacity_tests;

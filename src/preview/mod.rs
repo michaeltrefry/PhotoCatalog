@@ -24,7 +24,8 @@ pub use store::{
     Publication, RelocationProgress, RenderRecord, StoreConfig, StoreUsage, Tier,
 };
 
-mod prepared_cache;
+pub(crate) mod prepared_cache;
+pub(crate) mod stage_io;
 mod worker;
 pub(crate) use worker::peak_resident_memory;
 pub use worker::{
@@ -33,6 +34,7 @@ pub use worker::{
 };
 
 mod service;
+pub(crate) use service::encoded_delivery;
 pub use service::{
     CacheReadMetrics, EncodedPreview, HydrationRequest, JobState, JobView, NativeLaunchPause,
     NativeLaunchPermit, PreviewPolicy, PreviewService, PreviewView, ReadCompletion, ReadOutcome,
@@ -45,3 +47,5 @@ pub use config::PreviewConfiguration;
 
 pub(crate) use store::custody::ManagedFiles as ManagedStoreFiles;
 pub(crate) use store::{AdmittedStoreFiles, ManifestOrigin};
+
+pub(crate) mod transport_task;

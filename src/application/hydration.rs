@@ -44,6 +44,26 @@ fn post_hydration(
     image.physical_generation = next;
     identity_equal(&post, current)
 }
+// The actor owns queue admission, so this check and insertion cannot race a
+// sibling actor request. Temporary occupancy leaves the original ticket queued.
+fn queue_managed_read(
+    catalog: &Catalog,
+    service: &mut PreviewService,
+    ticket: &mut Ticket,
+    priority: preview::Priority,
+) -> Result<()> {
+    if service.available_request_slots() > 0 {
+        ticket.read = Some(service.queue_read_variant(
+            catalog,
+            &ticket.dto.key,
+            ticket.tier,
+            false,
+            priority,
+            ticket.interactive,
+        )?);
+    }
+    Ok(())
+}
 impl State {
     /// Drain a canceled reader without admitting another source or publishing.
     pub(super) fn drain_canceled(&mut self) -> bool {
@@ -169,7 +189,11 @@ impl State {
         }
         let mut candidates: Vec<_> = tickets
             .iter()
-            .filter(|(_, t)| t.consumer.is_none() && matches!(t.dto.state, PreviewState::Queued))
+            .filter(|(_, t)| {
+                t.read.is_none()
+                    && t.consumer.is_none()
+                    && matches!(t.dto.state, PreviewState::Queued)
+            })
             .map(|(id, t)| (id.clone(), !t.foreground, t.touched))
             .collect();
         candidates.sort_by_key(|(_, background, at)| (*background, *at));
@@ -238,6 +262,8 @@ impl State {
                             canceling: false,
                         });
                     }
+                } else if service.uses_managed_filesystem() {
+                    queue_managed_read(catalog, service, t, priority)?;
                 } else {
                     let cached = if t.interactive {
                         service.cached_interactive(catalog, &t.dto.key, t.tier, false)?
@@ -264,3 +290,6 @@ impl State {
         }
     }
 }
+
+#[cfg(test)]
+mod read_owner_tests;

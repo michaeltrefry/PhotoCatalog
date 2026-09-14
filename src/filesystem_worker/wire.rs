@@ -57,6 +57,10 @@ pub fn build_identity() -> String {
     blake3::hash(
         concat!(
             env!("CARGO_PKG_VERSION"),
+            include_str!("../catalog_row.rs"),
+            include_str!("../catalog_edits.rs"),
+            include_str!("../catalog_images.rs"),
+            include_str!("../catalog_metadata.rs"),
             include_str!("wire.rs"),
             include_str!("../preview/store_custody.rs"),
             include_str!("../preview/store_io.rs"),
@@ -71,6 +75,17 @@ pub fn build_identity() -> String {
             include_str!("bootstrap.rs"),
             include_str!("store.rs"),
             include_str!("preview_io.rs"),
+            include_str!("preview_stage.rs"),
+            include_str!("../catalog_session/preview_stage.rs"),
+            include_str!("../catalog_session/native.rs"),
+            include_str!("../preview/stage_io.rs"),
+            include_str!("../preview/prepared_cache.rs"),
+            include_str!("../preview/worker.rs"),
+            include_str!("../preview/worker/managed.rs"),
+            include_str!("../preview/worker/managed_process.rs"),
+            include_str!("../preview/worker/managed_transport.rs"),
+            include_str!("../preview/worker/read_transport.rs"),
+            include_str!("../preview/transport_task.rs"),
             include_str!("../catalog_backup.rs"),
             include_str!("../lib.rs"),
             include_str!("../catalog_storage.rs"),
@@ -97,6 +112,7 @@ pub fn build_identity() -> String {
 pub enum Operation {
     PreviewStore(crate::catalog_session::store::Request),
     PreviewIo(crate::catalog_session::preview_io::Request),
+    PreviewStage(crate::catalog_session::preview_stage::Request),
     ReadPreviewConfiguration(NativePath),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
@@ -132,11 +148,13 @@ impl Operation {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
+            || matches!(self, Self::PreviewStage(r) if r.cleanup())
     }
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::PreviewStore(value) => value.validate()?,
             Self::PreviewIo(value) => value.validate()?,
+            Self::PreviewStage(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
@@ -237,6 +255,7 @@ impl AdmissionSnapshot {
 pub enum Response {
     PreviewStore(crate::catalog_session::store::Reply),
     PreviewIo(crate::catalog_session::preview_io::Reply),
+    PreviewStage(crate::catalog_session::preview_stage::Reply),
     PreviewConfiguration(Vec<u8>),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
@@ -606,6 +625,7 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], cap: usize) -> Result<T>
 pub(crate) fn encode_operation(value: &Operation) -> Result<Vec<u8>> {
     let binary = match value {
         Operation::PreviewIo(r) => r.binary(),
+        Operation::PreviewStage(r) => (!r.binary().is_empty()).then(|| r.binary()),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -615,6 +635,7 @@ pub(crate) fn decode_operation(bytes: &[u8]) -> Result<Operation> {
         crate::catalog_session::preview_io::unpack(bytes, MESSAGE_BYTES)?;
     match &mut value {
         Operation::PreviewIo(r) => r.set_binary(binary)?,
+        Operation::PreviewStage(r) => r.set_binary(binary.to_vec())?,
         _ => ensure!(binary.is_empty(), "unexpected operation binary trailer"),
     }
     value.validate()?;
@@ -623,6 +644,7 @@ pub(crate) fn decode_operation(bytes: &[u8]) -> Result<Operation> {
 pub(crate) fn encode_outcome(value: &Outcome) -> Result<Vec<u8>> {
     let binary = match value {
         Ok(Response::PreviewIo(r)) => r.binary(),
+        Ok(Response::PreviewStage(r)) => (!r.binary().is_empty()).then(|| r.binary()),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -632,6 +654,7 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
         crate::catalog_session::preview_io::unpack(bytes, MESSAGE_BYTES)?;
     match &mut value {
         Ok(Response::PreviewIo(r)) => r.set_binary(binary)?,
+        Ok(Response::PreviewStage(r)) => r.set_binary(binary.to_vec())?,
         _ => ensure!(binary.is_empty(), "unexpected outcome binary trailer"),
     }
     Ok(value)
@@ -640,6 +663,48 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stage_packed_outcomes_preserve_skipped_chunk_content_and_metadata() -> Result<()> {
+        use crate::catalog_session::preview_stage::{Reply, Value};
+        for value in [
+            Value::Unit,
+            Value::Metadata(None),
+            Value::Metadata(Some(vec![1, 2, 3])),
+            Value::Chunk { bytes: vec![] },
+            Value::Chunk {
+                bytes: vec![0xa5; CHUNK_BYTES],
+            },
+        ] {
+            let reply = Reply {
+                epoch: LeaseId::new(),
+                session: LeaseId::new(),
+                operation: U64(u64::MAX),
+                value,
+            };
+            let expected = reply.binary().to_vec();
+            let encoded = encode_outcome(&Ok(Response::PreviewStage(reply.clone())))?;
+            let Ok(Response::PreviewStage(decoded)) = decode_outcome(&encoded)? else {
+                anyhow::bail!("stage outcome shape");
+            };
+            assert_eq!(decoded.epoch, reply.epoch);
+            assert_eq!(decoded.session, reply.session);
+            assert_eq!(decoded.operation, reply.operation);
+            assert_eq!(decoded.binary(), expected);
+            assert_eq!(
+                serde_json::to_value(&decoded.value)?,
+                serde_json::to_value(&reply.value)?
+            );
+            // Binary is present only in the trailer, never a numeric JSON array.
+            assert!(encoded.len() < expected.len() + 1024);
+            if matches!(reply.value, Value::Chunk { .. }) {
+                assert_eq!(
+                    serde_json::to_value(&reply.value)?,
+                    serde_json::json!({"kind":"Chunk","value":{}})
+                );
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn frame_rejects_size_before_read_and_preserves_exact_chunks() -> Result<()> {
         let payload = vec![0xa5; MESSAGE_BYTES];

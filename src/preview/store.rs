@@ -138,9 +138,35 @@ impl RenderRecord {
             self.width > 0 && self.height > 0 && self.width <= key.edge && self.height <= key.edge,
             "render record dimensions exceed tier"
         );
-        let value = serde_json::to_string(self)?;
-        ensure!(value.len() <= 64 * 1024, "render record size limit");
-        Ok(value)
+        encoded_descriptor(self, "render record serialization changed")
+    }
+}
+/// Both durable preview records and jobs have the same existing 64KiB JSON cap.
+/// Count the immutable value before allocating the encoded destination.
+pub(super) fn encoded_descriptor(value: &impl Serialize, mismatch: &'static str) -> Result<String> {
+    let mut count = RecordSize(0);
+    serde_json::to_writer(&mut count, value)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(count.0)?;
+    serde_json::to_writer(&mut bytes, value)?;
+    ensure!(bytes.len() == count.0, mismatch);
+    Ok(String::from_utf8(bytes)?)
+}
+struct RecordSize(usize);
+impl Write for RecordSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|size| *size <= 64 * 1024)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "render record size limit")
+            })?;
+        self.0 = next;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 #[derive(Debug)]
@@ -149,6 +175,12 @@ pub struct CachedPreview {
     pub bytes: Vec<u8>,
     pub stale: bool,
     pub record: Option<RenderRecord>,
+}
+/// SQL-selected immutable read authority. This value contains no connection.
+pub(crate) struct ManagedSelection {
+    pub cached: CachedPreview,
+    pub expected: crate::catalog_session::preview_io::Expected,
+    pub files: std::sync::Arc<dyn AdmittedStoreFiles>,
 }
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct StoreUsage {
@@ -186,19 +218,19 @@ fn restore_image_scopes(db: &Connection) -> Result<()> {
         db.prepare("SELECT descriptor FROM objects WHERE key IN (SELECT desired FROM wanted)")?;
     let mut rows = objects.query([])?;
     while let Some(row) = rows.next()? {
-        let descriptor: String = row.get(0)?;
+        let descriptor = custody::object_text(row, 0)?;
         ensure!(
             descriptor.len() <= 64 * 1024,
             "cached descriptor migration bound"
         );
-        apply(serde_json::from_str(&descriptor)?)?;
+        apply(serde_json::from_str(descriptor)?)?;
     }
     let mut jobs = db.prepare("SELECT descriptor FROM render_jobs ORDER BY created,id")?;
     let mut rows = jobs.query([])?;
     while let Some(row) = rows.next()? {
-        let descriptor: String = row.get(0)?;
+        let descriptor = custody::object_text(row, 0)?;
         ensure!(descriptor.len() <= 64 * 1024, "cached job migration bound");
-        let value: serde_json::Value = serde_json::from_str(&descriptor)?;
+        let value: serde_json::Value = serde_json::from_str(descriptor)?;
         let keys = value
             .get("request")
             .and_then(|v| v.get("keys"))
@@ -227,6 +259,9 @@ pub(crate) enum ManifestOrigin {
 /// Supplied by the separately owned F lease group. The callback receives only
 /// exact SQL-derived config/identity and returns retained opaque ownership.
 pub(crate) trait AdmittedStoreFiles: Send + Sync {
+    fn stage_calls(&self) -> Option<std::sync::Arc<super::stage_io::Calls>> {
+        None
+    }
     #[cfg(test)]
     fn cache_status(&self) -> Result<crate::catalog_session::store::Status> {
         bail!("managed cache status unsupported")
@@ -246,6 +281,18 @@ pub(crate) trait AdmittedStoreFiles: Send + Sync {
         _allowance: u64,
     ) -> Result<(crate::catalog_session::preview_io::Integrity, Vec<u8>)> {
         bail!("managed cache read unsupported")
+    }
+    fn cache_read_cancel(
+        &self,
+        expected: crate::catalog_session::preview_io::Expected,
+        allowance: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(crate::catalog_session::preview_io::Integrity, Vec<u8>)> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "cache read canceled"
+        );
+        self.cache_read(expected, allowance)
     }
     fn cache_write(
         &self,
@@ -588,6 +635,9 @@ impl PreviewStore {
         store.recover_relocation_lock()?;
         store.recover(128)?;
         Ok(store)
+    }
+    pub(crate) fn stage_calls(&self) -> Option<std::sync::Arc<super::stage_io::Calls>> {
+        self.managed_files.as_ref().and_then(|f| f.stage_calls())
     }
     pub(crate) fn return_managed_sql(&mut self) {
         self.db.return_managed();
@@ -1073,11 +1123,22 @@ impl PreviewStore {
     ) -> Result<Vec<(i64, String, String)>> {
         ensure!((1..=1000).contains(&limit), "job recovery page limit");
         let mut statement=self.db.prepare("SELECT created,id,descriptor FROM render_jobs WHERE created>?1 ORDER BY created,id LIMIT ?2")?;
-        Ok(statement
-            .query_map(params![after, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows = statement.query(params![after, limit as i64])?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id = custody::object_text(row, 1)?;
+            ensure!(
+                id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid saved job identity"
+            );
+            let descriptor = custody::object_text(row, 2)?;
+            ensure!(
+                descriptor.len() <= 64 * 1024,
+                "saved job descriptor size limit"
+            );
+            result.push((row.get(0)?, id.to_owned(), descriptor.to_owned()));
+        }
+        Ok(result)
     }
     pub(crate) fn finish_job(&self, id: &str) -> Result<()> {
         self.db
@@ -1085,10 +1146,19 @@ impl PreviewStore {
         Ok(())
     }
     pub fn render_record(&self, key: &PreviewKey) -> Result<Option<RenderRecord>> {
-        let value: Option<String> = self.db.query_row(
-            "SELECT r.record FROM render_records r JOIN objects o ON o.key=r.key WHERE r.key=?1 AND o.status='ready'",
-            [key.digest()?], |r| r.get(0),
-        ).optional()?;
+        let value: Option<String> = if self.managed_files.is_some() {
+            let mut statement=self.db.prepare("SELECT r.record FROM render_records r JOIN objects o ON o.key=r.key WHERE r.key=?1 AND o.status='ready'")?;
+            let mut rows = statement.query([key.digest()?])?;
+            rows.next()?
+                .map(|row| -> Result<String> {
+                    let value = custody::object_text(row, 0)?;
+                    ensure!(value.len() <= 64 * 1024, "render record size limit");
+                    Ok(value.to_owned())
+                })
+                .transpose()?
+        } else {
+            self.db.query_row("SELECT r.record FROM render_records r JOIN objects o ON o.key=r.key WHERE r.key=?1 AND o.status='ready'",[key.digest()?],|r|r.get(0)).optional()?
+        };
         value
             .map(|value| {
                 ensure!(value.len() <= 64 * 1024, "render record size limit");
@@ -1259,6 +1329,101 @@ impl PreviewStore {
             stale,
             record,
         }))
+    }
+    pub(crate) fn select_managed_read(
+        &self,
+        expected: &PreviewKey,
+        allow_stale: bool,
+        max_bytes: u64,
+    ) -> Result<Option<ManagedSelection>> {
+        expected.validate()?;
+        let (digest, key, len, checksum) = {
+            let mut statement=self.db.prepare("SELECT o.key,o.descriptor,o.bytes,o.checksum FROM wanted w JOIN objects o ON o.key=w.current WHERE w.asset=?1 AND w.variant=?2 AND w.tier=?3 AND w.channel=?4 AND o.status='ready'")?;
+            let mut rows = statement.query(params![
+                expected.asset_id,
+                expected.variant_id,
+                expected.tier.name(),
+                expected.channel()
+            ])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let digest = custody::object_text(row, 0)?;
+            let descriptor = custody::object_text(row, 1)?;
+            let checksum = custody::object_text(row, 3)?;
+            crate::catalog_session::preview_io::hex(digest)?;
+            crate::catalog_session::preview_io::hex(checksum)?;
+            let key: PreviewKey = serde_json::from_str(descriptor)?;
+            (
+                digest.to_owned(),
+                key,
+                unsigned(row, 2)?,
+                checksum.to_owned(),
+            )
+        };
+        let stale = key != *expected;
+        if stale && !(allow_stale && expected.tier == Tier::Thumbnail) {
+            return Ok(None);
+        }
+        ensure!(
+            key.digest()? == digest
+                && key.asset_id == expected.asset_id
+                && key.variant_id == expected.variant_id
+                && key.channel() == expected.channel()
+                && key.tier == expected.tier,
+            "manifest descriptor identity mismatch"
+        );
+        if len > 256 * 1024 * 1024 {
+            self.db
+                .execute("UPDATE objects SET status='orphan' WHERE key=?1", [&digest])?;
+            anyhow::bail!("cached preview length mismatch; entry invalidated");
+        }
+        if len > max_bytes {
+            return Err(
+                anyhow::Error::new(super::EncodedBudgetExceeded).context(format!(
+                    "selected cache requires {len} encoded bytes; admitted {max_bytes}"
+                )),
+            );
+        }
+        let record = self.render_record(&key)?;
+        Ok(Some(ManagedSelection {
+            expected: self.cache_expected(&digest, key.tier, len, &checksum)?,
+            files: self
+                .managed_files
+                .as_ref()
+                .context("managed cache filesystem missing")?
+                .clone(),
+            cached: CachedPreview {
+                key,
+                bytes: Vec::new(),
+                stale,
+                record,
+            },
+        }))
+    }
+    pub(crate) fn finish_managed_read(
+        &self,
+        key: &PreviewKey,
+        integrity: crate::catalog_session::preview_io::Integrity,
+    ) -> Result<bool> {
+        let digest = key.digest()?;
+        if integrity != crate::catalog_session::preview_io::Integrity::Intact {
+            // SQL invalidation is immediate; existing bounded recovery owns the
+            // eventual F removal. Actor ticks do not wait for object cleanup IO.
+            self.db
+                .execute("UPDATE objects SET status='orphan' WHERE key=?1", [&digest])?;
+            self.touches.borrow_mut().remove(&digest);
+            ensure!(
+                integrity == crate::catalog_session::preview_io::Integrity::Missing,
+                "cached preview checksum mismatch; entry invalidated"
+            );
+            return Ok(false);
+        }
+        self.touches.borrow_mut().insert(digest, self.clock()?);
+        if self.touches.borrow().len() >= 256 {
+            self.flush_touches()?;
+        }
+        Ok(true)
     }
     /// Bounded maintenance; startup performs one batch, subsequent service ticks
     /// can finish remaining pending/orphan cleanup without loading the catalog.
@@ -1729,6 +1894,40 @@ mod tests {
         }
     }
     #[test]
+    fn render_record_count_preserves_json_and_enforces_encoded_boundary() -> Result<()> {
+        let key = key(1, Tier::Thumbnail);
+        let normal = record("quoted \" newline\n Unicode é");
+        assert_eq!(normal.encoded(&key)?, serde_json::to_string(&normal)?);
+        let mut value = record("");
+        let fixed = serde_json::to_vec(&value)?.len();
+        value.metadata.preview_source = "a".repeat(64 * 1024 - fixed);
+        let boundary = value.encoded(&key)?;
+        assert_eq!(boundary.len(), 64 * 1024);
+        assert_eq!(boundary, serde_json::to_string(&value)?);
+        value.metadata.preview_source.push('a');
+        assert!(
+            value
+                .encoded(&key)
+                .unwrap_err()
+                .to_string()
+                .contains("render record size limit")
+        );
+        // The input is well below 64KiB, but escaping expands it over the cap.
+        value.metadata.preview_source = "\0".repeat((64 * 1024 - fixed) / 6 + 1);
+        assert!(value.metadata.preview_source.len() < 64 * 1024);
+        assert!(serde_json::to_vec(&value)?.len() > 64 * 1024);
+        assert!(
+            value
+                .encoded(&key)
+                .unwrap_err()
+                .to_string()
+                .contains("render record size limit")
+        );
+        value.metadata.preview_source = "retry".into();
+        assert_eq!(value.encoded(&key)?, serde_json::to_string(&value)?);
+        Ok(())
+    }
+    #[test]
     fn fallback_keeps_its_own_render_record_through_interrupted_replacement() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path(), 100, 100);
@@ -2147,3 +2346,7 @@ mod tests {
 #[cfg(test)]
 #[path = "store_lock_tests.rs"]
 mod lock_tests;
+
+#[cfg(test)]
+#[path = "store_query_tests.rs"]
+mod query_tests;

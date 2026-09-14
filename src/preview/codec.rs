@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -228,21 +228,110 @@ pub fn encode(
     ensure!(bytes.len() <= MAX_ENCODED, "encoded preview limit");
     Ok(bytes)
 }
+fn decode_error(status: crate::media::DecodeStatus, message: impl Into<String>) -> anyhow::Error {
+    crate::media::DecodeError {
+        status,
+        message: message.into(),
+    }
+    .into()
+}
+fn encoded_input(bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Err(decode_error(
+            crate::media::DecodeStatus::Corrupt,
+            "empty encoded preview",
+        ));
+    }
+    if bytes.len() > MAX_ENCODED {
+        return Err(decode_error(
+            crate::media::DecodeStatus::ResourceLimit,
+            "encoded preview limit",
+        ));
+    }
+    Ok(())
+}
+fn backend_decode_status(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<crate::media::DecodeStatus> {
+    use crate::media::DecodeStatus::{Corrupt, ResourceLimit};
+    if let Some(error) = error.downcast_ref::<image_webp::DecodingError>() {
+        use image_webp::DecodingError::*;
+        return match error {
+            MemoryLimitExceeded | ImageTooLarge => Some(ResourceLimit),
+            RiffSignatureInvalid(_)
+            | WebpSignatureInvalid(_)
+            | ChunkMissing
+            | ChunkHeaderInvalid(_)
+            | InvalidAlphaPreprocessing
+            | InvalidCompressionMethod
+            | AlphaChunkSizeMismatch
+            | FrameOutsideImage
+            | LosslessSignatureInvalid(_)
+            | VersionNumberInvalid(_)
+            | InvalidColorCacheBits(_)
+            | HuffmanError
+            | BitStreamError
+            | TransformError
+            | Vp8MagicInvalid(_)
+            | NotEnoughInitData
+            | ColorSpaceInvalid(_)
+            | LumaPredictionModeInvalid(_)
+            | IntraPredictionModeInvalid(_)
+            | ChromaPredictionModeInvalid(_)
+            | InconsistentImageSizes
+            | InvalidChunkSize => Some(Corrupt),
+            _ => None,
+        };
+    }
+    if let Some(error) = error.downcast_ref::<zune_jpeg::errors::DecodeErrors>() {
+        use zune_jpeg::errors::DecodeErrors::*;
+        return match error {
+            IllegalMagicBytes(_) | HuffmanDecode(_) | ZeroError | DqtError(_) | SosError(_)
+            | SofError(_) | MCUError(_) | ExhaustedData => Some(Corrupt),
+            LargeDimensions(_) => Some(ResourceLimit),
+            _ => None,
+        };
+    }
+    None
+}
+fn image_decode_error(error: image::ImageError) -> anyhow::Error {
+    use std::error::Error;
+    let status = match &error {
+        image::ImageError::Decoding(inner) => inner.source().and_then(backend_decode_status),
+        image::ImageError::Unsupported(_) => Some(crate::media::DecodeStatus::Corrupt),
+        image::ImageError::Limits(_) => Some(crate::media::DecodeStatus::ResourceLimit),
+        _ => None,
+    };
+    match status {
+        Some(status) => decode_error(status, error.to_string()),
+        None => error.into(),
+    }
+}
+fn native_decode_status(out: &NativeBuffer, status: i32) -> Result<()> {
+    // Numeric categories are declared in native/preview.h; unknown values stay unknown.
+    if status == 0 {
+        return Ok(());
+    }
+    let message = unsafe { CStr::from_ptr(out.error.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    match status {
+        2 => Err(decode_error(crate::media::DecodeStatus::Corrupt, message)),
+        3 => Err(decode_error(
+            crate::media::DecodeStatus::ResourceLimit,
+            message,
+        )),
+        _ => bail!("{message}"),
+    }
+}
 /// Parse dimensions without allocating decoded pixel planes. Callers use this
 /// before reserving output memory; codec scratch is a separate worker allowance.
 pub fn encoded_dimensions(bytes: &[u8], codec: Codec) -> Result<(u32, u32)> {
-    ensure!(
-        !bytes.is_empty() && bytes.len() <= MAX_ENCODED,
-        "encoded preview limit"
-    );
+    encoded_input(bytes)?;
     let (width, height) = if codec == Codec::Avif {
         let mut out = NativeBuffer::default();
         let status = unsafe { pc_preview_avif_dimensions(bytes.as_ptr(), bytes.len(), &mut out) };
-        ensure!(
-            status == 0,
-            "AVIF header: {}",
-            unsafe { CStr::from_ptr(out.error.as_ptr()) }.to_string_lossy()
-        );
+        native_decode_status(&out, status)?;
         (out.width, out.height)
     } else {
         let format = match codec {
@@ -250,28 +339,32 @@ pub fn encoded_dimensions(bytes: &[u8], codec: Codec) -> Result<(u32, u32)> {
             Codec::Webp => ImageFormat::WebP,
             _ => unreachable!(),
         };
-        ensure!(
-            image::guess_format(bytes)? == format,
-            "preview codec mismatch"
-        );
-        ImageReader::with_format(Cursor::new(bytes), format).into_dimensions()?
+        if image::guess_format(bytes).map_err(image_decode_error)? != format {
+            return Err(decode_error(
+                crate::media::DecodeStatus::Corrupt,
+                "preview codec mismatch",
+            ));
+        }
+        ImageReader::with_format(Cursor::new(bytes), format)
+            .into_dimensions()
+            .map_err(image_decode_error)?
     };
-    ensure!(
-        width > 0 && height > 0 && width <= MAX_EDGE && height <= MAX_EDGE,
-        "preview dimension limit"
-    );
+    if width == 0 || height == 0 || width > MAX_EDGE || height > MAX_EDGE {
+        return Err(decode_error(
+            crate::media::DecodeStatus::Corrupt,
+            "preview dimension limit",
+        ));
+    }
     Ok((width, height))
 }
 /// Complete production cache decoder: allocation and conversion to owned RGB8 are included.
 /// Input is an internally generated cache object, not an arbitrary original/photo decoder.
 pub fn decode(bytes: &[u8], codec: Codec) -> Result<PreparedRgb> {
-    ensure!(
-        !bytes.is_empty() && bytes.len() <= MAX_ENCODED,
-        "encoded preview limit"
-    );
+    encoded_input(bytes)?;
     if codec == Codec::Avif {
         let mut out = NativeBuffer::default();
         let status = unsafe { pc_preview_avif_decode(bytes.as_ptr(), bytes.len(), &mut out) };
+        native_decode_status(&out, status)?;
         let pixels = native_result(&out, status)?;
         return PreparedRgb::new(out.width, out.height, pixels);
     }
@@ -280,17 +373,19 @@ pub fn decode(bytes: &[u8], codec: Codec) -> Result<PreparedRgb> {
         Codec::Webp => ImageFormat::WebP,
         _ => unreachable!(),
     };
-    ensure!(
-        image::guess_format(bytes).context("preview header")? == format,
-        "preview codec mismatch"
-    );
+    if image::guess_format(bytes).map_err(image_decode_error)? != format {
+        return Err(decode_error(
+            crate::media::DecodeStatus::Corrupt,
+            "preview codec mismatch",
+        ));
+    }
     let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_EDGE);
     limits.max_image_height = Some(MAX_EDGE);
     limits.max_alloc = Some(MAX_ENCODED as u64);
     reader.limits(limits);
-    let rgb = reader.decode()?.to_rgb8();
+    let rgb = reader.decode().map_err(image_decode_error)?.to_rgb8();
     PreparedRgb::new(rgb.width(), rgb.height(), rgb.into_raw())
 }
 pub fn versions() -> String {
@@ -314,3 +409,7 @@ pub fn versions() -> String {
         unsafe { CStr::from_ptr(native.as_ptr()) }.to_string_lossy()
     )
 }
+
+#[cfg(test)]
+#[path = "codec_error_tests.rs"]
+mod error_tests;

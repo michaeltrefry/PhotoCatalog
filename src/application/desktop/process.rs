@@ -264,12 +264,23 @@ impl Owner {
             std::mem::take(&mut owner.threads),
         ))));
         let owned = slot.clone();
+        #[cfg(all(test, unix))]
+        let test_reap_gate = test_reap::take();
         match thread::Builder::new()
             .name("desktop-reap".into())
             .spawn(move || {
                 let (child, threads) = owned.lock().unwrap().take().unwrap();
                 let mut child = Some(child);
-                match wait_owned(&mut child, Child::wait) {
+                #[cfg(all(test, unix))]
+                if let Some(gate) = &test_reap_gate {
+                    gate.before_wait(child.as_mut().unwrap());
+                }
+                let waited = wait_owned(&mut child, Child::wait);
+                #[cfg(all(test, unix))]
+                if let Some(gate) = &test_reap_gate {
+                    gate.after_wait(&waited);
+                }
+                match waited {
                     Ok(status) => {
                         finish_wait(&shared, status, threads);
                         (None, vec![])
@@ -453,8 +464,16 @@ fn parent_write(mut w: impl Write, shared: &Shared, hello: Vec<u8>) -> std::io::
             return Ok(());
         }
         if let Some(owner) = &shared.filesystem {
-            if owner.healthy().is_err() && !shared.state.lock().unwrap().stopping {
-                shared.fail("filesystem owner is unavailable; paired C must drain");
+            if let Err(error) = owner.healthy()
+                && !shared.state.lock().unwrap().stopping
+            {
+                shared.fail(
+                    crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        format_args!("filesystem owner unavailable; paired C must drain: {error}"),
+                    )
+                    .message,
+                );
             }
             if admission.is_none() {
                 admission = owner
@@ -1151,8 +1170,18 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
     let fixture = config.fixture.clone();
     let config = config.into_config()?;
     let limits = config.limits.clone();
+    let bridge = if let Some(proxy) = &proxy {
+        Bridge::spawn_managed(
+            config,
+            super::super::ManagedCatalogConfig {
+                filesystem: proxy.clone(),
+            },
+        )?
+    } else {
+        Bridge::spawn(config)?
+    };
     let engine = ChildEngine {
-        bridge: Bridge::spawn(config)?,
+        bridge,
         state: Arc::new(Mutex::new(DrainState {
             attempt: 0,
             verified: false,
@@ -1203,13 +1232,11 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
             &mut input,
             session,
             &mut |kind, bytes| {
-                if proxy.is_some() {
-                    let request: Request = serde_json::from_slice(bytes)?;
-                    anyhow::ensure!(
-                        kind == Kind::Command
-                            && matches!(request, Request::Status | Request::Close { .. }),
-                        "managed actor routing awaits FS6"
-                    );
+                if proxy.is_some() && !paired_preview_route(kind, bytes)? {
+                    return Ok(Err(error(
+                        ErrorCode::InvalidRequest,
+                        "request unavailable on the managed preview custody route",
+                    )));
                 }
                 dispatch(bridge, kind, bytes)
             },
@@ -1248,6 +1275,27 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
     let _ = control.join();
     let _ = data.join();
     result
+}
+// Explicit paired admission covers the qualified preview surface. The default
+// desktop constructor stays legacy until the remaining custody routes qualify.
+fn paired_preview_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
+    if kind == Kind::Bytes {
+        return Ok(true);
+    }
+    if kind != Kind::Command {
+        return Ok(false);
+    }
+    Ok(matches!(
+        serde_json::from_slice::<Request>(bytes)?,
+        Request::OpenExisting { .. }
+            | Request::Create { .. }
+            | Request::Status
+            | Request::Close { .. }
+            | Request::Preview { .. }
+            | Request::PreviewStatus { .. }
+            | Request::CancelPreview { .. }
+            | Request::ReleaseViewport { .. }
+    ))
 }
 fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<ChildPending>> {
     if kind == Kind::Command {
@@ -1466,6 +1514,63 @@ fn child_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paired_preview_route_admits_preview_lifecycle_and_rejects_unconverted_calls() {
+        let path = crate::storage_volume::NativePath::from_path(std::path::Path::new("/fixture"));
+        let catalog = "catalog".to_owned();
+        for request in [
+            Request::OpenExisting { path: path.clone() },
+            Request::Create { path },
+            Request::Status,
+            Request::Close {
+                catalog: catalog.clone(),
+            },
+            Request::Preview {
+                catalog: catalog.clone(),
+                key: crate::catalog_edits::VariantKey::master("asset"),
+                tier: crate::application::PreviewTier::Thumbnail,
+                interactive: false,
+                viewport: "view".into(),
+                generation: crate::application::U64(1),
+                foreground: true,
+            },
+            Request::PreviewStatus {
+                catalog: catalog.clone(),
+                ticket: "ticket".into(),
+            },
+            Request::CancelPreview {
+                catalog: catalog.clone(),
+                ticket: "ticket".into(),
+            },
+            Request::ReleaseViewport {
+                catalog: catalog.clone(),
+                viewport: "view".into(),
+                generation: crate::application::U64(1),
+            },
+        ] {
+            assert!(
+                paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
+                    .unwrap()
+            );
+        }
+        for request in [
+            Request::ImportCancel {
+                catalog: catalog.clone(),
+                import: "import".into(),
+            },
+            Request::Export {
+                catalog,
+                request: Box::new(crate::application::exports::Request::Options),
+            },
+        ] {
+            assert!(
+                !paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
+                    .unwrap()
+            );
+        }
+        assert!(paired_preview_route(Kind::Bytes, b"{}").unwrap());
+        assert!(!paired_preview_route(Kind::Hello, b"{}").unwrap());
+    }
     fn child_state() -> ChildShared {
         Arc::new(Mutex::new(ChildState {
             pending: HashMap::new(),
@@ -1975,3 +2080,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+pub(super) mod test_reap;

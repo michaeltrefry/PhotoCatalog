@@ -18,6 +18,7 @@ use std::{
 mod filesystem;
 #[cfg(test)]
 mod filesystem_tests;
+mod native;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -278,7 +279,14 @@ impl DesktopBridge {
         client: Arc<crate::filesystem_worker::client::Client>,
     ) -> anyhow::Result<Self> {
         config.validate()?;
-        Self::spawn_inner(config, Some(filesystem::Parent::new(client)))
+        {
+            let parent = filesystem::Parent::new(client);
+            parent.configure_native(
+                config.worker_executable.clone(),
+                config.preview_limits.clone(),
+            )?;
+            Self::spawn_inner(config, Some(parent))
+        }
     }
     fn spawn_inner(
         config: Config,

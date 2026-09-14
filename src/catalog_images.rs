@@ -200,7 +200,7 @@ pub(crate) fn id(db: &Connection, key: &VariantKey) -> Result<String> {
     db.query_row(
         "SELECT id FROM catalog_images WHERE asset_id=?1 AND variant_id=?2",
         params![key.asset_id, key.variant_id],
-        |r| r.get(0),
+        |r| crate::catalog_row::owned_text(r, 0, 256),
     )
     .context("logical image not found")
 }
@@ -218,7 +218,7 @@ pub(crate) fn require_current(db: &Connection, image: &str) -> Result<()> {
 }
 pub(crate) fn identity(db: &Connection, image: &str) -> Result<ImageMetadataIdentity> {
     require_current(db, image)?;
-    Ok(db.query_row("SELECT i.id,i.asset_id,i.variant_id,COALESCE(m.revision,0),i.pixel_generation,s.epoch,a.physical_generation FROM catalog_images i JOIN assets a ON a.id=i.asset_id JOIN image_shared_state s ON s.asset_id=i.asset_id LEFT JOIN metadata_assets m ON m.asset_id=i.id WHERE i.id=?",[image],|r|Ok(ImageMetadataIdentity{image_id:r.get(0)?,key:VariantKey{asset_id:r.get(1)?,variant_id:r.get(2)?},metadata_revision:r.get(3)?,pixel_generation:r.get(4)?,shared_source_epoch:r.get(5)?,physical_generation:r.get(6)?}))?)
+    Ok(db.query_row("SELECT i.id,i.asset_id,i.variant_id,COALESCE(m.revision,0),i.pixel_generation,s.epoch,a.physical_generation FROM catalog_images i JOIN assets a ON a.id=i.asset_id JOIN image_shared_state s ON s.asset_id=i.asset_id LEFT JOIN metadata_assets m ON m.asset_id=i.id WHERE i.id=?",[image],|r|Ok(ImageMetadataIdentity{image_id:crate::catalog_row::owned_text(r,0,256)?,key:VariantKey{asset_id:crate::catalog_row::owned_text(r,1,256)?,variant_id:crate::catalog_row::owned_text(r,2,256)?},metadata_revision:r.get(3)?,pixel_generation:r.get(4)?,shared_source_epoch:r.get(5)?,physical_generation:r.get(6)?}))?)
 }
 /// Call inside the same writer transaction as authority reservation/publication.
 pub fn require_image_metadata_identity(

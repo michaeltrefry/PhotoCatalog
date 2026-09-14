@@ -4,6 +4,7 @@
 mod bootstrap;
 pub mod client;
 mod preview_io;
+mod preview_stage;
 pub mod process;
 mod store;
 pub mod wire;
@@ -40,6 +41,10 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::PreviewStage(request) => self
+                .owner
+                .stage_call(&request, cancel)
+                .map(Response::PreviewStage),
             Operation::PreviewIo(request) => self
                 .owner
                 .preview_io_call(&request, cancel, |snapshot| {

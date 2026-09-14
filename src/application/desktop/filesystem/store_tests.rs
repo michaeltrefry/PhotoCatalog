@@ -471,3 +471,52 @@ fn cache_failure_receipt_survives_relay_but_transport_unknown_has_no_authority()
     assert!(old.object_receipt.is_none());
     Ok(())
 }
+
+#[test]
+fn stage_chunk_binary_survives_both_relay_packet_and_f_outcome() -> Result<()> {
+    use crate::catalog_session::preview_stage as stage;
+    let (binding, root) = authority();
+    for bytes in [
+        vec![],
+        vec![0x5a; crate::catalog_session::preview_io::CHUNK_BYTES],
+    ] {
+        let reply = stage::Reply {
+            epoch: root.epoch.clone(),
+            session: root.session.clone(),
+            operation: U64(u64::MAX),
+            value: stage::Value::Chunk {
+                bytes: bytes.clone(),
+            },
+        };
+        let f = crate::filesystem_worker::wire::encode_outcome(&Ok(
+            crate::filesystem_worker::wire::Response::PreviewStage(reply),
+        ))?;
+        let Ok(crate::filesystem_worker::wire::Response::PreviewStage(reply)) =
+            crate::filesystem_worker::wire::decode_outcome(&f)?
+        else {
+            anyhow::bail!("wrong F chunk reply");
+        };
+        let packet = Packet {
+            binding: binding.clone(),
+            body: Body::Reply {
+                id: U64(7),
+                outcome: Ok(Value::PreviewStage(reply)),
+            },
+        };
+        let encoded = encode_packet(&packet, BYTES)?;
+        assert!(encoded.len() < bytes.len() + 1024);
+        let Body::Reply {
+            id,
+            outcome: Ok(Value::PreviewStage(reply)),
+        } = decode(&binding, &encoded, Lane::Data)?
+        else {
+            anyhow::bail!("wrong relayed chunk reply");
+        };
+        assert_eq!(id, U64(7));
+        assert_eq!(reply.epoch, root.epoch);
+        assert_eq!(reply.session, root.session);
+        assert_eq!(reply.operation, U64(u64::MAX));
+        assert_eq!(reply.binary(), bytes);
+    }
+    Ok(())
+}
