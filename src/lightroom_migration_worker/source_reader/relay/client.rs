@@ -77,6 +77,8 @@ pub(crate) struct Client {
     operation_memory: Mutex<OperationMemory>,
     slots: Mutex<[Option<Arc<Slot>>; 2]>,
     next: AtomicU64,
+    #[cfg(test)]
+    core_growth_attempts: AtomicU64,
     revoked: AtomicBool,
     abort: Arc<dyn Fn() + Send + Sync>,
     // Last field: payload/slot owners retire first. The production parent grant
@@ -107,6 +109,8 @@ impl Client {
             }),
             slots: Mutex::new([None, None]),
             next: AtomicU64::new(1),
+            #[cfg(test)]
+            core_growth_attempts: AtomicU64::new(0),
             revoked: AtomicBool::new(false),
             abort,
         }))
@@ -177,6 +181,10 @@ impl Client {
             .operation_memory
             .lock()
             .map_err(|_| anyhow::anyhow!("migration operation phase admission poisoned"))?;
+        #[cfg(test)]
+        if bytes > owner.core {
+            self.core_growth_attempts.fetch_add(1, Ordering::Relaxed);
+        }
         let maximum = owner.core.max(bytes);
         let required = crate::lightroom_migration_worker::memory::layout::add(
             owner.required(owner.transient, owner.retained_graph, owner.opening)?,
@@ -185,6 +193,18 @@ impl Client {
         owner.phases.ensure_at_least(required)?;
         owner.core = maximum;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core_observation(&self) -> Result<(usize, u64)> {
+        let owner = self
+            .operation_memory
+            .lock()
+            .map_err(|_| anyhow::anyhow!("migration operation phase observation poisoned"))?;
+        Ok((
+            owner.core,
+            self.core_growth_attempts.load(Ordering::Relaxed),
+        ))
     }
 
     /// Producer work is admitted by LM before it sends the read command. The

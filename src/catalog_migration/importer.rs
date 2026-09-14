@@ -989,12 +989,32 @@ fn metadata(
         )))
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileMetadataBoundary {
+    HistoricalPrepared,
+    SupplementalPreparing,
+    SupplementalPrepared,
+    CommitStarting,
+    CommitComplete,
+}
+
 fn file_metadata(
     catalog: &mut Catalog,
     source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     stage: Stage,
+) -> Result<RowResult> {
+    file_metadata_observed(catalog, source, policy, origin, stage, |_, _, _| Ok(()))
+}
+
+fn file_metadata_observed(
+    catalog: &mut Catalog,
+    source: &dyn MigrationRead,
+    policy: &Policy,
+    origin: &SourceRecord,
+    stage: Stage,
+    mut observe: impl FnMut(FileMetadataBoundary, usize, usize) -> Result<()>,
 ) -> Result<RowResult> {
     use super::file_metadata::{Association, Origin, Projection};
     let (kind, name) = match stage {
@@ -1011,6 +1031,27 @@ fn file_metadata(
             "File metadata has no mapped original; all source evidence remains retained",
         ));
     }
+    const EMBEDDED_REASON: &str =
+        "Retained embedded packet belongs to its exact selected file source";
+    let association_reason = (kind == Origin::Embedded).then_some(EMBEDDED_REASON);
+    let admit = |bytes| source.admit_file_metadata(bytes);
+    let requested = crate::lightroom_migration_worker::memory::requested::Requested::new(&admit);
+    let preprojection =
+        crate::lightroom_migration_worker::memory::core::file_metadata_preprojection(
+            origin,
+            &policy.import_source,
+            association_reason,
+        )?;
+    // Declared before every importer owner. It is reduced to exact retained
+    // capacities after construction; later preparation shares this ledger.
+    let mut preprojection_scope = requested.scope(preprojection)?;
+    let association = if let Some(reason) = association_reason {
+        Association::Confirmed {
+            reason: reason.into(),
+        }
+    } else {
+        Association::Unresolved
+    };
     let walk = Walk::new(catalog, source, &origin.source.capture_revision)?;
     let source_id = walk.source_id(origin)?;
     let page = catalog.migration_lookup(
@@ -1040,30 +1081,112 @@ fn file_metadata(
         origin: kind,
         packet_records,
         import_source: policy.import_source.clone(),
-        association: if kind == Origin::Embedded {
-            Association::Confirmed {
-                reason: "Retained embedded packet belongs to its exact selected file source".into(),
-            }
-        } else {
-            Association::Unresolved
-        },
+        association,
         supplement: None,
     };
-    let historical = catalog.project_migration_file_metadata_reader(Some(source), &request)?;
+    let importer_retained =
+        crate::lightroom_migration_worker::memory::core::file_metadata_preprojection_retained(
+            &source_id, &page, &request,
+        )?;
+    preprojection_scope.shrink_to(importer_retained)?;
     let supplemental = policy.supplements.iter().find(|p| {
         p.capture_revision == origin.source.capture_revision
             && p.source_id == source_id
             && p.origin == kind
     });
+    let historical_scope = requested.scope(
+        crate::lightroom_migration_worker::memory::core::file_metadata_projection_work(
+            request.packet_records.len(),
+        )?,
+    )?;
+    let historical = catalog.prepare_migration_file_metadata_reader(
+        Some(source),
+        &request,
+        &requested,
+        historical_scope,
+    )?;
+    observe(
+        FileMetadataBoundary::HistoricalPrepared,
+        requested.live(),
+        importer_retained,
+    )?;
     let result = if let Some(supplement) = supplemental {
-        let mut request = request;
-        request.supplement = Some(supplement.evidence.clone());
-        catalog.project_migration_file_metadata_reader(Some(source), &request)?
+        let _supplemental_request_scope = requested.scope(
+            crate::lightroom_migration_worker::memory::core::file_metadata_supplemental_projection_clone(
+                &request,
+                supplement.evidence.len(),
+            )?,
+        )?;
+        let mut supplemental_request = request.clone();
+        supplemental_request.supplement = Some(supplement.evidence.clone());
+        observe(
+            FileMetadataBoundary::SupplementalPreparing,
+            requested.live(),
+            importer_retained,
+        )?;
+        let supplemental_scope = requested.scope(
+            crate::lightroom_migration_worker::memory::core::file_metadata_projection_work(
+                supplemental_request.packet_records.len(),
+            )?,
+        )?;
+        let supplemental = catalog.prepare_migration_file_metadata_reader(
+            Some(source),
+            &supplemental_request,
+            &requested,
+            supplemental_scope,
+        )?;
+        observe(
+            FileMetadataBoundary::SupplementalPrepared,
+            requested.live(),
+            importer_retained,
+        )?;
+        observe(
+            FileMetadataBoundary::CommitStarting,
+            requested.live(),
+            importer_retained,
+        )?;
+        let [_, result] = catalog.commit_prepared_file_metadata([
+            (&request, historical),
+            (&supplemental_request, supplemental),
+        ])?;
+        observe(
+            FileMetadataBoundary::CommitComplete,
+            requested.live(),
+            importer_retained,
+        )?;
+        result
     } else {
-        historical
+        observe(
+            FileMetadataBoundary::CommitStarting,
+            requested.live(),
+            importer_retained,
+        )?;
+        let [result] = catalog.commit_prepared_file_metadata([(&request, historical)])?;
+        observe(
+            FileMetadataBoundary::CommitComplete,
+            requested.live(),
+            importer_retained,
+        )?;
+        result
     };
     Ok(RowResult::Applied(Outcome::FileMetadata(result)))
 }
+
+#[cfg(test)]
+pub(crate) fn project_file_metadata_preprojection_observed_test(
+    catalog: &mut Catalog,
+    source: &dyn MigrationRead,
+    policy: &Policy,
+    origin: &SourceRecord,
+    stage: Stage,
+    observe: impl FnMut(FileMetadataBoundary, usize, usize) -> Result<()>,
+) -> Result<super::file_metadata::ProjectionResult> {
+    match file_metadata_observed(catalog, source, policy, origin, stage, observe)? {
+        RowResult::Applied(Outcome::FileMetadata(result)) => Ok(result),
+        _ => anyhow::bail!("file metadata preprojection fixture result kind"),
+    }
+}
+
 fn metadata_outcome(result: super::metadata::ResultRecord) -> Outcome {
     // Full extracted settings already live in their source-bound projection.
     // The run ledger stores a compact receipt instead of duplicating all values.

@@ -1045,6 +1045,36 @@ fn supplement(
     }
     Ok(Some((hash, semantic_hash, Some(inspection))))
 }
+struct PreparedCommit<'a> {
+    proof: Evidence,
+    packet_guards: Vec<PacketGuard>,
+    asset: String,
+    supplement_semantic: String,
+    receipts: Vec<u8>,
+    prepared: Option<(catalog_metadata::AdmittedPrepared<'a>, Source)>,
+}
+
+/// Every value constructed during preparation precedes the admission guard, so
+/// the complete owner graph is destroyed before its requested-storage scope.
+pub(crate) struct PreparedFileMetadata<'a> {
+    result: ProjectionResult,
+    commit: Option<PreparedCommit<'a>>,
+    _selected_scope: crate::lightroom_migration_worker::memory::requested::Scope<'a>,
+}
+
+impl PreparedFileMetadata<'_> {
+    fn into_result(self) -> ProjectionResult {
+        let Self {
+            result,
+            commit,
+            _selected_scope,
+        } = self;
+        drop(commit);
+        drop(_selected_scope);
+        result
+    }
+}
+
 impl Catalog {
     /// One complete selected file/origin. Reading and preparation precede writer
     /// admission; only original mapping, native observation and checkpoint commit.
@@ -1072,7 +1102,27 @@ impl Catalog {
         let selected = crate::lightroom_migration_worker::memory::core::file_metadata_selected(
             request.packet_records.len(),
         )?;
-        let _selected_scope = requested.scope(selected)?;
+        let selected_scope = requested.scope(selected)?;
+        let prepared = self.prepare_migration_file_metadata_reader(
+            source,
+            request,
+            &requested,
+            selected_scope,
+        )?;
+        Ok(self
+            .commit_prepared_file_metadata([(request, prepared)])?
+            .into_iter()
+            .next()
+            .expect("one prepared file-metadata result"))
+    }
+
+    pub(crate) fn prepare_migration_file_metadata_reader<'a>(
+        &self,
+        source: Option<&dyn MigrationRead>,
+        request: &Projection,
+        requested: &'a crate::lightroom_migration_worker::memory::requested::Requested<'a>,
+        selected_scope: crate::lightroom_migration_worker::memory::requested::Scope<'a>,
+    ) -> Result<PreparedFileMetadata<'a>> {
         request.file.source.identity()?;
         ensure!(
             request.file.source.table == "AgLibraryFile",
@@ -1148,7 +1198,11 @@ impl Catalog {
         )?;
         let digest=blake3::hash(&encoded(&serde_json::json!({"adapter":ADAPTER,"source":request.file.source,"owner":request.import_source,"origin":request.origin,"observation":historical.observation,"association":request.association,"supplement":supplement_semantic,"historical_content_v1":content}))?).to_hex().to_string();
         if let Some(old) = previous(&self.db, request, &digest, &supplement_semantic)? {
-            return Ok(old);
+            return Ok(PreparedFileMetadata {
+                result: old,
+                commit: None,
+                _selected_scope: selected_scope,
+            });
         }
         let asset = mapped(&self.db, request)?;
         let inspection = if let Some((_, _, inspection)) = &mut supplemental {
@@ -1163,7 +1217,7 @@ impl Catalog {
         let prepared=inspection.as_ref().map(|inspection| {
             let location=origin_path(&historical.path,request.origin)?;
             let source=Source{kind:request.origin.kind().into(),locator:format!("lightroom:{}:{}:{}",request.file.source.identity()?,request.origin.name(),supplement_semantic).into_bytes(),display:format!("Lightroom retained {}",request.origin.name()),ambiguous,provenance:serde_json::json!({"adapter":ADAPTER,"file":request.file.source,"origin":request.origin,"source_path":location,"historical_observation":historical.observation,"association":request.association,"supplement_proof_blake3":supplemental.as_ref().map(|s|&s.0)})};
-            let prepared = Prepared::new_admitted(inspection, &source, &requested)?;
+            let prepared = Prepared::new_admitted(inspection, &source, requested)?;
             Ok::<_,anyhow::Error>((prepared, source))
         }).transpose()?;
         let mut result = ProjectionResult {
@@ -1197,46 +1251,85 @@ impl Catalog {
         let receipts = encoded(
             &serde_json::json!({"file":request.file.retained_record,"path":request.retained_path,"packet_records":request.packet_records,"supplement_evidence":request.supplement,"source_binding":binding}),
         )?;
+        Ok(PreparedFileMetadata {
+            result,
+            commit: Some(PreparedCommit {
+                proof,
+                packet_guards,
+                asset,
+                supplement_semantic,
+                receipts,
+                prepared,
+            }),
+            _selected_scope: selected_scope,
+        })
+    }
+
+    pub(crate) fn commit_prepared_file_metadata<'a, const N: usize>(
+        &mut self,
+        mut entries: [(&Projection, PreparedFileMetadata<'a>); N],
+    ) -> Result<[ProjectionResult; N]> {
+        if entries
+            .iter()
+            .all(|(_, prepared)| prepared.commit.is_none())
+        {
+            return Ok(entries.map(|(_, prepared)| prepared.into_result()));
+        }
         let _permit = self.writers.enter(Priority::Background)?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        proof.recheck(&tx)?;
-        for guard in &packet_guards {
+        for (request, pending) in &mut entries {
+            let Some(commit) = &pending.commit else {
+                continue;
+            };
+            commit.proof.recheck(&tx)?;
+            for guard in &commit.packet_guards {
+                ensure!(
+                    packet_guard(&tx, guard.sequence)? == *guard,
+                    "packet custody changed before commit"
+                );
+            }
             ensure!(
-                packet_guard(&tx, guard.sequence)? == *guard,
-                "packet custody changed before commit"
+                mapped(&tx, request)? == commit.asset,
+                "original file mapping changed"
             );
+            if let Some(old) = previous(
+                &tx,
+                request,
+                &pending.result.input_digest,
+                &commit.supplement_semantic,
+            )? {
+                pending.result = old;
+                continue;
+            }
+            if let Some((prepared, source)) = &commit.prepared {
+                let change = catalog_metadata::retain_prepared(
+                    &tx,
+                    &commit.asset,
+                    source,
+                    &prepared.value,
+                    true,
+                )?;
+                pending.result.observation = Some(change.observation_id);
+            }
+            tx.execute(
+                "INSERT INTO migration_file_metadata VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    request.file.source.identity()?,
+                    request.origin.name(),
+                    commit.supplement_semantic,
+                    request.import_source,
+                    pending.result.input_digest,
+                    request.file.retained_record,
+                    request.retained_path,
+                    commit.receipts,
+                    encoded(&pending.result)?
+                ],
+            )?;
         }
-        ensure!(
-            mapped(&tx, request)? == asset,
-            "original file mapping changed"
-        );
-        if let Some(old) = previous(&tx, request, &result.input_digest, &supplement_semantic)? {
-            tx.commit()?;
-            return Ok(old);
-        }
-        if let Some((prepared, source)) = prepared {
-            let change =
-                catalog_metadata::retain_prepared(&tx, &asset, &source, &prepared.value, true)?;
-            result.observation = Some(change.observation_id);
-        }
-        tx.execute(
-            "INSERT INTO migration_file_metadata VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![
-                request.file.source.identity()?,
-                request.origin.name(),
-                supplement_semantic,
-                request.import_source,
-                result.input_digest,
-                request.file.retained_record,
-                request.retained_path,
-                receipts,
-                encoded(&result)?
-            ],
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(entries.map(|(_, prepared)| prepared.into_result()))
     }
 }
 
@@ -1436,6 +1529,10 @@ pub(crate) mod tests {
             Self::new(Origin::Embedded, Status::Complete, false, false)
         }
 
+        pub(crate) fn managed_preprojection() -> Result<Self> {
+            Self::new(Origin::Embedded, Status::Complete, true, false)
+        }
+
         pub(crate) fn managed_seal(&self) -> InputSeal {
             self._fixture.seal.clone()
         }
@@ -1447,6 +1544,26 @@ pub(crate) mod tests {
         pub(crate) fn managed_core_bytes(&self) -> Result<usize> {
             crate::lightroom_migration_worker::memory::core::file_metadata_selected(
                 self.request.packet_records.len(),
+            )
+        }
+
+        pub(crate) fn managed_preprojection_core_bytes(&self) -> Result<usize> {
+            crate::lightroom_migration_worker::memory::core::file_metadata_preprojection(
+                &self.request.file,
+                &self.request.import_source,
+                Some("Retained embedded packet belongs to its exact selected file source"),
+            )
+        }
+
+        pub(crate) fn managed_preprojection_allowance_bytes(&self) -> Result<usize> {
+            use crate::lightroom_migration_worker::memory::layout::{add, mul};
+            // Deliberately sufficient fixture ceiling, separate from the real
+            // Source/relay 2 GiB allowance and never used by production. Sum
+            // the named construction and two standalone selected envelopes;
+            // actual nested XMP remains admitted dynamically by the shared ledger.
+            add(
+                self.managed_preprojection_core_bytes()?,
+                mul(2, self.managed_core_bytes()?)?,
             )
         }
 
@@ -1479,7 +1596,70 @@ pub(crate) mod tests {
                 .project_migration_file_metadata_reader(Some(source), &self.request)
         }
 
+        pub(crate) fn project_managed_preprojection(
+            &mut self,
+            source: &dyn MigrationRead,
+        ) -> Result<ProjectionResult> {
+            self.project_managed_preprojection_observed(source, |_, _, _| Ok(()))
+        }
+
+        pub(crate) fn project_managed_preprojection_observed(
+            &mut self,
+            source: &dyn MigrationRead,
+            observe: impl FnMut(
+                super::super::importer::FileMetadataBoundary,
+                usize,
+                usize,
+            ) -> Result<()>,
+        ) -> Result<ProjectionResult> {
+            let policy = self.managed_preprojection_policy()?;
+            super::super::importer::project_file_metadata_preprojection_observed_test(
+                &mut self.catalog,
+                source,
+                &policy,
+                &self.request.file,
+                super::super::importer::Stage::FileEmbedded,
+                observe,
+            )
+        }
+
+        fn managed_preprojection_policy(&self) -> Result<super::super::importer::Policy> {
+            let evidence = self
+                .request
+                .supplement
+                .clone()
+                .context("managed preprojection supplement missing")?;
+            Ok(super::super::importer::Policy {
+                import_source: self.request.import_source.clone(),
+                overlap: super::super::importer::OverlapPolicy::RequireDecision,
+                keyword_overlap: super::super::importer::KeywordOverlap::RequireDecision,
+                artifacts: vec![],
+                supplements: vec![super::super::importer::SupplementInput {
+                    capture_revision: self.request.file.source.capture_revision.clone(),
+                    source_id: "file-id".into(),
+                    origin: Origin::Embedded,
+                    evidence,
+                }],
+            })
+        }
+
+        fn project_preprojection_local(&mut self) -> Result<ProjectionResult> {
+            let policy = self.managed_preprojection_policy()?;
+            super::super::importer::project_file_metadata_preprojection_observed_test(
+                &mut self.catalog,
+                &self.source,
+                &policy,
+                &self.request.file,
+                super::super::importer::Stage::FileEmbedded,
+                |_, _, _| Ok(()),
+            )
+        }
+
         pub(crate) fn verify_managed(&self, result: &ProjectionResult) -> Result<()> {
+            self.verify_managed_count(result, 1)
+        }
+
+        fn verify_managed_count(&self, result: &ProjectionResult, projections: i64) -> Result<()> {
             ensure!(
                 result.state == "metadata_retained",
                 "managed selected metadata was not retained"
@@ -1506,12 +1686,77 @@ pub(crate) mod tests {
             );
             let counts = self.managed_counts()?;
             ensure!(
-                counts[0] == 1 && counts[1] == 1 && counts[2] > 0 && counts[3] > 0 && counts[4] > 0,
+                counts[0] == projections
+                    && counts[1] == projections
+                    && counts[2] > 0
+                    && counts[3] > 0
+                    && counts[4] > 0,
                 "managed selected catalog rows missing"
             );
+            if projections == 2 {
+                let mut statement = self
+                    .catalog
+                    .db
+                    .prepare("SELECT result FROM migration_file_metadata ORDER BY supplement")?;
+                let stored = statement
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                    .map(|row| Ok(serde_json::from_slice::<ProjectionResult>(&row?)?))
+                    .collect::<Result<Vec<_>>>()?;
+                drop(statement);
+                ensure!(stored.len() == 2, "atomic projection results missing");
+                let mut observations = BTreeSet::new();
+                for stored_result in stored {
+                    let observation = stored_result
+                        .observation
+                        .context("atomic projection observation missing")?;
+                    ensure!(
+                        observations.insert(observation),
+                        "atomic projections reused one observation"
+                    );
+                    let packets = self.catalog.metadata_packets_for_image(
+                        &VariantKey::master(&self.asset),
+                        observation,
+                    )?;
+                    ensure!(
+                        packets.len() == 1 && packets[0].bytes == XML,
+                        "atomic projection raw XMP changed"
+                    );
+                }
+            }
             Ok(())
         }
+
+        pub(crate) fn verify_managed_preprojection(&self, result: &ProjectionResult) -> Result<()> {
+            self.verify_managed_count(result, 2)
+        }
     }
+
+    #[test]
+    fn file_metadata_preprojection_second_write_failure_rolls_back_atomic_batch() -> Result<()> {
+        let mut t = Test::managed_preprojection()?;
+        t.catalog.db.execute_batch(
+            "CREATE TRIGGER fail_supplemental_projection
+             BEFORE INSERT ON migration_file_metadata
+             WHEN NEW.supplement <> ''
+             BEGIN SELECT RAISE(ABORT,'fixture supplemental commit failure'); END;",
+        )?;
+        let error = t.project_preprojection_local().unwrap_err();
+        ensure!(
+            format!("{error:#}").contains("fixture supplemental commit failure"),
+            "fixture did not fail the second projection write"
+        );
+        ensure!(
+            t.managed_counts()? == [0; 5],
+            "failed atomic batch retained partial metadata rows"
+        );
+        t.catalog
+            .db
+            .execute_batch("DROP TRIGGER fail_supplemental_projection;")?;
+        let result = t.project_preprojection_local()?;
+        t.verify_managed_preprojection(&result)?;
+        Ok(())
+    }
+
     // A distinct sealed inspection of the same capture, including distinct
     // inspection-local source IDs. No original is opened or re-inspected.
     fn rebuilt(

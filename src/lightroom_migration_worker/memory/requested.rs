@@ -18,6 +18,28 @@ pub(crate) struct Scope<'a> {
     bytes: usize,
 }
 
+impl Scope<'_> {
+    /// Replace completed working storage with the smaller owner that survives
+    /// it. The guard was created before that owner, so it still drops last.
+    /// Growth must use Requested::scope and pass admission first.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) -> Result<()> {
+        anyhow::ensure!(
+            bytes <= self.bytes,
+            "requested scope cannot grow while shrinking"
+        );
+        let released = self.bytes - bytes;
+        self.requested.live.set(
+            self.requested
+                .live
+                .get()
+                .checked_sub(released)
+                .context("requested core storage shrink imbalance")?,
+        );
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
 impl<'a> Requested<'a> {
     pub(crate) fn new(admit: &'a dyn Fn(usize) -> Result<()>) -> Self {
         Self {
@@ -46,7 +68,6 @@ impl<'a> Requested<'a> {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.live.get()
     }
@@ -125,6 +146,28 @@ mod tests {
         drop(requested);
         drop(operation);
         assert_eq!(pool.used(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn file_metadata_preprojection_scope_shrinks_without_early_release() -> Result<()> {
+        let calls = RefCell::new(Vec::new());
+        let admit = |bytes| {
+            calls.borrow_mut().push(bytes);
+            Ok(())
+        };
+        let requested = Requested::new(&admit);
+        let mut first = requested.scope(100)?;
+        first.shrink_to(7)?;
+        assert_eq!(requested.live(), 7);
+        let second = requested.scope(100)?;
+        assert_eq!(requested.live(), 107);
+        assert_eq!(*calls.borrow(), [100, 107]);
+        assert!(first.shrink_to(8).is_err());
+        drop(second);
+        assert_eq!(requested.live(), 7);
+        drop(first);
+        assert_eq!(requested.live(), 0);
         Ok(())
     }
 }

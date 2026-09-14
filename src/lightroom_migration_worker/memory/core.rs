@@ -20,6 +20,11 @@ use std::mem::size_of;
 const RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const DESCRIPTOR_BYTES: usize = 64 * 1024;
 const FILE_METADATA_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+// reader::origin_packet_roster reads LIMIT 2049 and rejects more than 2048;
+// file_metadata accepts the same existing 1024 packet + 1024 parse-input set.
+const FILE_METADATA_PACKET_RECORDS: usize = 2048;
+// lookup::page checks the stored classification before parsing each hit.
+const LOOKUP_CLASSIFICATION_BYTES: usize = 4096;
 
 /// Requested backing during roxmltree 0.21.1 parsing. The pinned parser starts
 /// node/attribute vectors from spelling counts, keeps its temporary vectors
@@ -86,6 +91,15 @@ pub(crate) fn xml_document(text: &str) -> Result<usize> {
 /// 64 MiB decoded payload ceilings while Prepared is built. Every vector/tree
 /// uses the actual requested roster and the pinned RawVec/BTree expressions.
 pub(crate) fn file_metadata_selected(packet_records: usize) -> Result<usize> {
+    add(
+        saved_state_retained()?,
+        file_metadata_projection_work(packet_records)?,
+    )
+}
+
+/// Selected projection work without the importer caller state already retained
+/// by file_metadata_preprojection's outer scope.
+pub(crate) fn file_metadata_projection_work(packet_records: usize) -> Result<usize> {
     use crate::lightroom::migration_source::EvidenceRecord;
     let evidence_records = add(packet_records, 2)?;
     let evidence = add(
@@ -133,9 +147,343 @@ pub(crate) fn file_metadata_selected(packet_records: usize) -> Result<usize> {
             mul(2, tree::<usize, usize>(packet_records)?)?,
         )?,
     )?;
+    add(evidence, add(historical, roster)?)
+}
+
+fn source_record_clone(
+    record: &crate::catalog_migration::organization::SourceRecord,
+) -> Result<usize> {
+    use crate::lightroom::plan::Cell;
+    let key_payload = record.source.key.iter().try_fold(0usize, |bytes, cell| {
+        add(
+            bytes,
+            match cell {
+                Cell::Text(value) | Cell::Blob(value) => value.len(),
+                _ => 0,
+            },
+        )
+    })?;
+    add(
+        add(
+            record.source.capture_revision.len(),
+            record.source.table.len(),
+        )?,
+        add(
+            mul(record.source.key.len(), size_of::<Cell>())?,
+            key_payload,
+        )?,
+    )
+}
+
+fn source_record_retained(
+    record: &crate::catalog_migration::organization::SourceRecord,
+) -> Result<usize> {
+    use crate::lightroom::plan::Cell;
+    let key_payload = record.source.key.iter().try_fold(0usize, |bytes, cell| {
+        add(
+            bytes,
+            match cell {
+                Cell::Text(value) | Cell::Blob(value) => value.capacity(),
+                _ => 0,
+            },
+        )
+    })?;
+    add(
+        add(
+            record.source.capture_revision.capacity(),
+            record.source.table.capacity(),
+        )?,
+        add(
+            mul(record.source.key.capacity(), size_of::<Cell>())?,
+            key_payload,
+        )?,
+    )
+}
+
+fn association_retained(
+    association: &crate::catalog_migration::file_metadata::Association,
+) -> usize {
+    match association {
+        crate::catalog_migration::file_metadata::Association::Unresolved => 0,
+        crate::catalog_migration::file_metadata::Association::Confirmed { reason } => {
+            reason.capacity()
+        }
+    }
+}
+
+fn projection_clone(
+    file: &crate::catalog_migration::organization::SourceRecord,
+    packet_records: usize,
+    import_source: &str,
+) -> Result<usize> {
+    add(
+        source_record_clone(file)?,
+        add(mul(packet_records, size_of::<i64>())?, import_source.len())?,
+    )
+}
+
+/// Exact heap payload allocated when the importer clones an already validated
+/// projection and attaches one retained supplemental-evidence identifier.
+pub(crate) fn file_metadata_supplemental_projection_clone(
+    request: &crate::catalog_migration::file_metadata::Projection,
+    supplement_bytes: usize,
+) -> Result<usize> {
+    let association = match &request.association {
+        crate::catalog_migration::file_metadata::Association::Unresolved => 0,
+        crate::catalog_migration::file_metadata::Association::Confirmed { reason } => reason.len(),
+    };
+    add(
+        projection_clone(
+            &request.file,
+            request.packet_records.len(),
+            &request.import_source,
+        )?,
+        add(association, supplement_bytes)?,
+    )
+}
+
+fn path_lookup_page_max() -> Result<(usize, usize)> {
+    use crate::catalog_migration::lookup::{LookupHit, UnavailableKey};
+    // The shortest accepted classification member is
+    // {"field":"","reason":"Missing"}; commas separate later members.
+    const MEMBER: usize = r#"{"field":"","reason":"Missing"}"#.len();
+    let unavailable = (LOOKUP_CLASSIFICATION_BYTES + 1) / (MEMBER + 1);
+    let hit = add(
+        vector::<UnavailableKey>(unavailable)?,
+        LOOKUP_CLASSIFICATION_BYTES,
+    )?;
+    let returned = add(vector::<LookupHit>(2)?, add(mul(2, hit)?, 64)?)?;
+    // One raw classification is parsed while earlier hits and the optional
+    // cursor remain live. This is the same bounded serde family used elsewhere;
+    // the two source-id query copies and four fixed 64-byte identity copies are
+    // the simultaneously retained primary/availability parameter vectors.
+    let parser = add(
+        content_containers(LOOKUP_CLASSIFICATION_BYTES, 1)?,
+        add(mul(32, LOOKUP_CLASSIFICATION_BYTES)?, mul(8, FRAME_BYTES)?)?,
+    )?;
+    let working = add(returned, add(parser, add(mul(2, 4096)?, mul(4, 64)?)?)?)?;
+    Ok((returned, working))
+}
+
+fn source_key_identity_work(
+    source: &crate::catalog_migration::originals::SourceKey,
+) -> Result<usize> {
+    const SOURCE: usize = r#"{"capture_revision":"","table":"","key":[]}"#.len();
+    const NULL: usize = r#"{"type":"Null"}"#.len();
+    const INTEGER: usize = r#"{"type":"Integer","value":-9223372036854775808}"#.len();
+    const REAL: usize = r#"{"type":"RealBits","value":18446744073709551615}"#.len();
+    const TEXT: usize = r#"{"type":"Text","value":""}"#.len();
+    const BLOB: usize = r#"{"type":"Blob","value":""}"#.len();
+    let mut encoded = add(
+        SOURCE,
+        mul(6, add(source.capture_revision.len(), source.table.len())?)?,
+    )?;
+    let mut hex = 0usize;
+    for (index, cell) in source.key.iter().enumerate() {
+        encoded = add(encoded, usize::from(index != 0))?;
+        encoded = add(
+            encoded,
+            match cell {
+                Cell::Null => NULL,
+                Cell::Integer(_) => INTEGER,
+                Cell::RealBits(_) => REAL,
+                Cell::Text(value) => {
+                    hex = hex.max(mul(2, value.len())?);
+                    add(TEXT, mul(2, value.len())?)?
+                }
+                Cell::Blob(value) => {
+                    hex = hex.max(mul(2, value.len())?);
+                    add(BLOB, mul(2, value.len())?)?
+                }
+            },
+        )?;
+    }
+    // serde_json's output Vec can grow while Cell's existing hex serializer
+    // owns its one current 2-byte-per-input-byte String. The returned digest
+    // String is produced only after both have dropped.
+    Ok(add(vector::<u8>(encoded)?, hex)?.max(64))
+}
+
+fn selected_record_load_work() -> Result<usize> {
+    let record = add(
+        record_dynamic(RETAINED_BYTES, 1)?,
+        vector::<Cell>(RETAINED_BYTES / 2)?,
+    )?;
+    // Exact selected_record opening already established for Artifact: retained
+    // seal R, compressed R+32768, growing decoded raw <=2*(R+1)+8 and its old
+    // <=R+1 backing. Four 64-byte SQL identities include Evidence::load's outer
+    // input/digest and selected_record's inner copies.
+    let opening = add(
+        add(add(mul(5, RETAINED_BYTES)?, 32779)?, mul(4, 64)?)?,
+        add(
+            add(seal_dynamic()?, seal_validation()?)?,
+            mul(3, MANIFEST_BYTES)?,
+        )?,
+    )?;
+    let parser = add(
+        content_containers(RETAINED_BYTES, 1)?,
+        add(mul(32, RETAINED_BYTES)?, mul(8, FRAME_BYTES)?)?,
+    )?;
+    add(record, add(opening, parser)?)
+}
+
+fn retained_field_work(maximum: usize) -> Result<usize> {
+    // field_bytes keeps the SQL-copied descriptor and its 64-byte evidence ID
+    // through the later chunk loop. Direct ByteRef parsing additionally owns at
+    // most one descriptor-sized typed string payload graph.
+    let retained_descriptor = add(DESCRIPTOR_BYTES, 64)?;
+    let descriptor = add(
+        add(retained_descriptor, DESCRIPTOR_BYTES)?,
+        add(
+            content_containers(DESCRIPTOR_BYTES, 1)?,
+            add(mul(32, DESCRIPTOR_BYTES)?, mul(8, FRAME_BYTES)?)?,
+        )?,
+    )?;
+    // A Bytes field reads one existing 1 MiB evidence chunk. The stored
+    // compressed member can be CHUNK+4096 before the declared short field length
+    // is compared; the decoded candidate can reach maximum+1 on refusal.
+    let chunk = add(
+        retained_descriptor,
+        add(
+            add(crate::catalog_migration::evidence::CHUNK_BYTES, 4096)?,
+            add(vector::<u8>(add(maximum, 1)?)?, mul(3, 64)?)?,
+        )?,
+    )?;
+    Ok(descriptor.max(chunk))
+}
+
+fn source_id_work(file: &crate::catalog_migration::organization::SourceRecord) -> Result<usize> {
+    const TABLE: usize = 1024;
+    const KEY: usize = 64 * 1024;
+    const SOURCE_ID: usize = 4096;
+    let identity = source_key_identity_work(&file.source)?;
+    let load = selected_record_load_work()?;
+    let record = record_dynamic(RETAINED_BYTES, 1)?;
+    let cache = add(
+        record,
+        add(
+            tree_layout(
+                1,
+                std::alloc::Layout::new::<i64>(),
+                crate::catalog_migration::organization::evidence_cache_entry_layout(),
+            )?,
+            mul(2, 64)?,
+        )?,
+    )?;
+    let table = vector::<u8>(TABLE)?;
+    let key = vector::<u8>(KEY)?;
+    let source_id = vector::<u8>(SOURCE_ID)?;
+    // The shortest Cell is {"type":"Null"}; a nonempty byte Cell needs at
+    // least {"type":"Text","value":"00"}. Separators cost one byte except
+    // after the last member. Decode owns the root Vec, every completed nested
+    // byte Vec, and one current hex String. Sum the nested RawVec growth from
+    // the KEY/2 decoded-byte ceiling and give every possible nonempty vector its
+    // pinned per-vector growth term instead of relying on unused Cell roots.
+    const CELL_MEMBER: usize = r#"{"type":"Null"}"#.len();
+    const BYTE_MEMBER: usize = r#"{"type":"Text","value":"00"}"#.len();
+    let cells = (KEY + 1) / (CELL_MEMBER + 1);
+    let byte_vectors = (KEY + 1) / (BYTE_MEMBER + 1);
+    let decoded_payload = add(KEY, mul(8, byte_vectors)?)?;
+    let hex_scratch = vector::<u8>(KEY)?;
+    let key_parser = add(
+        add(vector::<Cell>(cells)?, add(decoded_payload, hex_scratch)?)?,
+        add(
+            content_containers(KEY, 1)?,
+            add(mul(32, KEY)?, mul(8, FRAME_BYTES)?)?,
+        )?,
+    )?;
+    // Evidence::source keeps its cache and cloned record through each field.
+    // Table stays live while key loads/parses, then both stay live while the
+    // returned source ID is assembled. Only one field's descriptor/chunk work
+    // exists at a time, so take the phase maximum rather than summing it.
+    let fields = add(table, retained_field_work(TABLE)?)?
+        .max(add(add(table, key)?, retained_field_work(KEY)?)?)
+        .max(add(add(table, key)?, key_parser)?)
+        .max(add(
+            add(add(table, key)?, source_id)?,
+            retained_field_work(SOURCE_ID)?,
+        )?);
+    Ok(identity.max(load).max(add(cache, add(record, fields)?)?))
+}
+
+/// Importer construction high water admitted before Walk::new. It includes the
+/// existing source roster/lookup bounds and construction of the first Projection.
+/// The scope is then shrunk to the capacities of the returned owner graph. Later
+/// content-dependent projection work shares its Requested ledger and is admitted
+/// before allocation while these owners remain live.
+pub(crate) fn file_metadata_preprojection(
+    file: &crate::catalog_migration::organization::SourceRecord,
+    import_source: &str,
+    association_reason: Option<&str>,
+) -> Result<usize> {
+    let (page, page_work) = path_lookup_page_max()?;
+    let association = association_reason.map_or(0, str::len);
+    let persistent = add(association, add(4096, page)?)?;
+    let roster = vector::<i64>(FILE_METADATA_PACKET_RECORDS)?;
+    let packet_records = mul(FILE_METADATA_PACKET_RECORDS, size_of::<i64>())?;
+    let roster_phase = add(persistent, add(roster, packet_records)?)?;
+    let request_phase = add(
+        persistent,
+        projection_clone(file, FILE_METADATA_PACKET_RECORDS, import_source)?,
+    )?;
+    let retained = add(
+        add(4096, page)?,
+        add(
+            association,
+            projection_clone(file, FILE_METADATA_PACKET_RECORDS, import_source)?,
+        )?,
+    )?;
+    let local = add(association, source_id_work(file)?)?
+        .max(add(association, add(4096, page_work)?)?)
+        .max(roster_phase)
+        .max(request_phase)
+        .max(retained);
+    add(saved_state_retained()?, local)
+}
+
+/// Requested heap storage that remains after importer construction. Capacities
+/// are read only after the preprojection maximum has already been admitted.
+pub(crate) fn file_metadata_preprojection_retained(
+    source_id: &String,
+    page: &crate::catalog_migration::lookup::LookupPage,
+    request: &crate::catalog_migration::file_metadata::Projection,
+) -> Result<usize> {
+    use crate::catalog_migration::lookup::{LookupHit, UnavailableKey};
+    let records = mul(page.records.capacity(), size_of::<LookupHit>())?;
+    let hits = page.records.iter().try_fold(0usize, |bytes, hit| {
+        let fields = hit
+            .unavailable
+            .iter()
+            .try_fold(0usize, |sum, value| add(sum, value.field.capacity()))?;
+        add(
+            bytes,
+            add(
+                mul(hit.unavailable.capacity(), size_of::<UnavailableKey>())?,
+                fields,
+            )?,
+        )
+    })?;
+    let cursor = page
+        .next
+        .as_ref()
+        .map_or(0, |value| value.query_blake3.capacity());
+    let page = add(records, add(hits, cursor)?)?;
+    let projection = add(
+        source_record_retained(&request.file)?,
+        add(
+            mul(request.packet_records.capacity(), size_of::<i64>())?,
+            add(
+                request.import_source.capacity(),
+                add(
+                    association_retained(&request.association),
+                    request.supplement.as_ref().map_or(0, String::capacity),
+                )?,
+            )?,
+        )?,
+    )?;
     add(
         saved_state_retained()?,
-        add(evidence, add(historical, roster)?)?,
+        add(source_id.capacity(), add(page, projection)?)?,
     )
 }
 
@@ -396,6 +744,66 @@ pub(crate) fn retention(cursor_bytes: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_metadata_preprojection_covers_construction_and_exact_supplement_clone() -> Result<()> {
+        use crate::{
+            catalog_migration::{
+                file_metadata::{Association, Origin, Projection},
+                lookup::{LookupHit, LookupPage, UnavailableKey, UnavailableReason},
+                organization::SourceRecord,
+                originals::SourceKey,
+            },
+            lightroom::plan::Cell,
+        };
+        let file = SourceRecord {
+            retained_record: 1,
+            source: SourceKey {
+                capture_revision: "a".repeat(64),
+                table: "AgLibraryFile".into(),
+                key: vec![Cell::Text("é".repeat(40).into_bytes())],
+            },
+        };
+        let reason = "Retained embedded packet belongs to its exact selected file source";
+        let admitted = file_metadata_preprojection(&file, "lightroom", Some(reason))?;
+        let page = LookupPage {
+            records: vec![LookupHit {
+                sequence: 2,
+                unavailable: vec![UnavailableKey {
+                    field: "source_id".into(),
+                    reason: UnavailableReason::Missing,
+                }],
+            }],
+            next: None,
+            coverage_complete: true,
+            keys_complete: true,
+        };
+        let request = Projection {
+            file,
+            retained_path: 2,
+            origin: Origin::Embedded,
+            packet_records: vec![3, 4],
+            import_source: "lightroom".into(),
+            association: Association::Confirmed {
+                reason: reason.into(),
+            },
+            supplement: None,
+        };
+        let source_id = String::from("selected:file");
+        let retained = file_metadata_preprojection_retained(&source_id, &page, &request)?;
+        assert!(retained <= admitted);
+        let selected = file_metadata_projection_work(request.packet_records.len())?;
+        let supplemental_clone = file_metadata_supplemental_projection_clone(&request, 64)?;
+        let overlap = add(retained, add(selected, add(supplemental_clone, selected)?)?)?;
+        assert!(overlap > add(retained, selected)?);
+        let source_id = source_id_work(&request.file)?;
+        assert!(source_id >= selected_record_load_work()?);
+        assert!(source_id >= source_key_identity_work(&request.file.source)?);
+        println!(
+            "CORE_FILE_METADATA_PREPROJECTION initial={admitted} source_id={source_id} retained={retained} selected={selected} supplemental_clone={supplemental_clone} shared_ledger_overlap={overlap} construction_before_walk=true roster_limit={FILE_METADATA_PACKET_RECORDS}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn retention_phase_admits_actual_cursor_length_without_a_raw_format_ceiling() -> Result<()> {
         let authority = lookup_authority()?;

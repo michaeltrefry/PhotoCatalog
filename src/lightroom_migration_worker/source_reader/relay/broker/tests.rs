@@ -651,11 +651,18 @@ fn typed_source_selected_metadata_retries_same_pool_before_catalog_mutation() ->
     typed_source_consumer(TypedCore::SelectedMetadata)
 }
 
+#[test]
+fn file_metadata_preprojection_managed_source_refuses_supplement_before_atomic_retry() -> Result<()>
+{
+    typed_source_consumer(TypedCore::SelectedMetadataPreprojection)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypedCore {
     None,
     Retention,
     SelectedMetadata,
+    SelectedMetadataPreprojection,
 }
 
 fn typed_source_consumer(mode: TypedCore) -> Result<()> {
@@ -674,21 +681,34 @@ fn typed_source_consumer(mode: TypedCore) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("typed relay fixture output: {e}"))
         }
     }
-    let mut selected = if mode == TypedCore::SelectedMetadata {
-        Some(crate::catalog_migration::file_metadata::tests::Test::managed()?)
-    } else {
-        None
+    let mut selected = match mode {
+        TypedCore::SelectedMetadata => {
+            Some(crate::catalog_migration::file_metadata::tests::Test::managed()?)
+        }
+        TypedCore::SelectedMetadataPreprojection => {
+            Some(crate::catalog_migration::file_metadata::tests::Test::managed_preprojection()?)
+        }
+        _ => None,
     };
     let mut fixture = Fixture::new();
     let approval = b"typed retention fixture authorization";
     if mode == TypedCore::Retention {
         fixture.seal.approval.document_blake3 = blake3::hash(approval).to_hex().to_string();
     }
-    let (seal, revision, core) = match selected.as_ref() {
+    let (seal, revision, core, allowance) = match selected.as_ref() {
         Some(value) => (
             value.managed_seal(),
             value.managed_revision().to_owned(),
-            value.managed_core_bytes()?,
+            if mode == TypedCore::SelectedMetadataPreprojection {
+                value.managed_preprojection_core_bytes()?
+            } else {
+                value.managed_core_bytes()?
+            },
+            if mode == TypedCore::SelectedMetadataPreprojection {
+                value.managed_preprojection_allowance_bytes()?
+            } else {
+                value.managed_core_bytes()?
+            },
         ),
         None => (
             fixture.seal.clone(),
@@ -698,10 +718,15 @@ fn typed_source_consumer(mode: TypedCore) -> Result<()> {
             } else {
                 0
             },
+            if mode == TypedCore::Retention {
+                crate::lightroom_migration_worker::memory::core::retention(0)?
+            } else {
+                0
+            },
         ),
     };
     let limit =
-        crate::lightroom_migration_worker::memory::layout::add(2 * 1024 * 1024 * 1024, core)?;
+        crate::lightroom_migration_worker::memory::layout::add(2 * 1024 * 1024 * 1024, allowance)?;
     let budget = MemoryBudget::new(limit)?;
     let mut caller = budget.reservation();
     caller.grow(17)?;
@@ -737,6 +762,7 @@ fn typed_source_consumer(mode: TypedCore) -> Result<()> {
     let worker_client = client.clone();
     let observed = budget.clone();
     let worker = thread::spawn(move || -> Result<_> {
+        let core_observer = worker_client.clone();
         let source = SqlReader::open(
             worker_client,
             guard(),
@@ -802,7 +828,13 @@ fn typed_source_consumer(mode: TypedCore) -> Result<()> {
                 selected.managed_counts()? == [0; 5],
                 "selected metadata fixture was already projected"
             );
-            let denied = selected.project_managed(&source).unwrap_err();
+            let preprojection = mode == TypedCore::SelectedMetadataPreprojection;
+            let denied = if preprojection {
+                selected.project_managed_preprojection(&source)
+            } else {
+                selected.project_managed(&source)
+            }
+            .unwrap_err();
             let details = denied
                 .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
                 .context("expected selected metadata ResourceLimit at caller")?;
@@ -814,20 +846,135 @@ fn typed_source_consumer(mode: TypedCore) -> Result<()> {
                 selected.managed_counts()? == [0; 5],
                 "selected metadata denial mutated catalog rows"
             );
+            if preprojection {
+                ensure!(
+                    core_observer.core_observation()? == (0, 1),
+                    "failed pre-Walk admission changed core high or retried admission"
+                );
+            }
             drop(competition);
             let retry_before = observed.used();
-            let result = selected.project_managed(&source)?;
-            selected.verify_managed(&result)?;
+            let result = if preprojection {
+                use crate::catalog_migration::importer::FileMetadataBoundary;
+                let mut pressure = None;
+                let mut denied_boundaries = Vec::new();
+                let denied = selected
+                    .project_managed_preprojection_observed(
+                        &source,
+                        |boundary, live, importer_retained| {
+                            let core = core_observer.core_observation()?;
+                            denied_boundaries.push((boundary, live, importer_retained, core));
+                            if boundary == FileMetadataBoundary::SupplementalPreparing {
+                                let snapshot = observed.snapshot()?;
+                                let mut reservation = observed.reservation();
+                                reservation.grow(snapshot.available)?;
+                                pressure = Some(reservation);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap_err();
+                let details = denied
+                    .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+                    .context("expected real shared-pool refusal during supplemental preparation")?;
+                ensure!(
+                    details.required > 0 && details.available == 0,
+                    "supplemental refusal did not come from exhausted shared pool"
+                );
+                ensure!(
+                    denied_boundaries
+                        .iter()
+                        .any(|(boundary, live, retained, core)| {
+                            *boundary == FileMetadataBoundary::HistoricalPrepared
+                                && *retained > 0
+                                && *live > *retained
+                                && core.0 >= *live
+                        })
+                        && denied_boundaries
+                            .iter()
+                            .any(|(boundary, live, retained, core)| {
+                                *boundary == FileMetadataBoundary::SupplementalPreparing
+                                    && *retained > 0
+                                    && *live > *retained
+                                    && core.0 >= *live
+                            })
+                        && !denied_boundaries
+                            .iter()
+                            .any(|(boundary, _, _, _)| *boundary
+                                == FileMetadataBoundary::CommitStarting),
+                    "supplemental refusal boundary did not retain importer and historical owners"
+                );
+                ensure!(
+                    selected.managed_counts()? == [0; 5],
+                    "supplemental preparation refusal mutated catalog rows"
+                );
+                drop(pressure.take());
+
+                let mut retry_boundaries = Vec::new();
+                let result = selected.project_managed_preprojection_observed(
+                    &source,
+                    |boundary, live, importer_retained| {
+                        retry_boundaries.push((
+                            boundary,
+                            live,
+                            importer_retained,
+                            core_observer.core_observation()?,
+                        ));
+                        Ok(())
+                    },
+                )?;
+                let commit_start = retry_boundaries
+                    .iter()
+                    .find(|(boundary, _, _, _)| *boundary == FileMetadataBoundary::CommitStarting)
+                    .context("atomic commit start was not observed")?;
+                let commit_complete = retry_boundaries
+                    .iter()
+                    .find(|(boundary, _, _, _)| *boundary == FileMetadataBoundary::CommitComplete)
+                    .context("atomic commit completion was not observed")?;
+                ensure!(
+                    commit_start.3 == commit_complete.3,
+                    "atomic commit requested additional managed core storage"
+                );
+                ensure!(
+                    retry_boundaries.iter().all(|(_, live, retained, core)| {
+                        *retained > 0 && *live >= *retained && core.0 >= *live
+                    }),
+                    "nested projection request omitted retained importer owners"
+                );
+                result
+            } else {
+                selected.project_managed(&source)?
+            };
+            if preprojection {
+                selected.verify_managed_preprojection(&result)?;
+            } else {
+                selected.verify_managed(&result)?;
+            }
             let projected = observed.used();
-            ensure!(
-                projected
-                    >= crate::lightroom_migration_worker::memory::layout::add(retry_before, core)?,
-                "selected metadata core did not join the Source operation pool"
-            );
-            println!(
-                "TYPED_CORE_SELECTED required={core} denied_available={} denied_before_catalog=true retry_succeeded=true raw_xmp_preserved=true semantic_digest_preserved=true catalog_rows_preserved=true projected_pool={projected} source_child_actual=true lm_thread_substitute=true",
-                core - 1,
-            );
+            if preprojection {
+                let (core_high, growth_attempts) = core_observer.core_observation()?;
+                ensure!(
+                    core_high > core && growth_attempts > 2,
+                    "shared ledger did not admit content-dependent nested owners"
+                );
+                println!(
+                    "TYPED_CORE_PREPROJECTION initial_required={core} initial_denied_available={} supplemental_real_pool_denial=true denied_before_catalog=true retry_succeeded=true historical_supplement_overlap=true atomic_commit_no_growth=true raw_xmp_preserved=true semantic_digest_preserved=true catalog_rows_preserved=true projected_pool={projected} core_high={core_high} growth_attempts={growth_attempts} source_child_actual=true lm_thread_substitute=true",
+                    core - 1,
+                );
+            } else {
+                ensure!(
+                    projected
+                        >= crate::lightroom_migration_worker::memory::layout::add(
+                            retry_before,
+                            core,
+                        )?,
+                    "selected metadata core did not join the Source operation pool"
+                );
+                println!(
+                    "TYPED_CORE_SELECTED required={core} denied_available={} denied_before_catalog=true retry_succeeded=true raw_xmp_preserved=true semantic_digest_preserved=true catalog_rows_preserved=true projected_pool={projected} source_child_actual=true lm_thread_substitute=true",
+                    core - 1,
+                );
+            }
         }
         let result_admitted = observed.used();
         drop(source);
@@ -836,7 +983,10 @@ fn typed_source_consumer(mode: TypedCore) -> Result<()> {
             operation_retained > 17 && operation_retained < result_admitted,
             "Source quiescence must release path scope and retain public-result operation allowance"
         );
-        if mode == TypedCore::SelectedMetadata {
+        if matches!(
+            mode,
+            TypedCore::SelectedMetadata | TypedCore::SelectedMetadataPreprojection
+        ) {
             ensure!(
                 operation_retained
                     >= crate::lightroom_migration_worker::memory::layout::add(17, core)?,
