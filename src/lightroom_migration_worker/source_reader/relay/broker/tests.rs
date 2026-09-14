@@ -638,15 +638,27 @@ fn stale_quiescence_early_reuse_and_denial_retain_source_charge() -> Result<()> 
 
 #[test]
 fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> Result<()> {
-    typed_source_consumer(false)
+    typed_source_consumer(TypedCore::None)
 }
 
 #[test]
 fn typed_source_retention_reserves_core_before_destination_mutation() -> Result<()> {
-    typed_source_consumer(true)
+    typed_source_consumer(TypedCore::Retention)
 }
 
-fn typed_source_consumer(retention: bool) -> Result<()> {
+#[test]
+fn typed_source_selected_metadata_retries_same_pool_before_catalog_mutation() -> Result<()> {
+    typed_source_consumer(TypedCore::SelectedMetadata)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypedCore {
+    None,
+    Retention,
+    SelectedMetadata,
+}
+
+fn typed_source_consumer(mode: TypedCore) -> Result<()> {
     use crate::lightroom::migration_source::{MigrationRead, ReadLimits, tests::Fixture};
     use crate::lightroom_migration_worker::{
         protocol::{ChildFrame, Publish, SourceListener},
@@ -662,16 +674,31 @@ fn typed_source_consumer(retention: bool) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("typed relay fixture output: {e}"))
         }
     }
+    let mut selected = if mode == TypedCore::SelectedMetadata {
+        Some(crate::catalog_migration::file_metadata::tests::Test::managed()?)
+    } else {
+        None
+    };
     let mut fixture = Fixture::new();
     let approval = b"typed retention fixture authorization";
-    if retention {
+    if mode == TypedCore::Retention {
         fixture.seal.approval.document_blake3 = blake3::hash(approval).to_hex().to_string();
     }
-    let revision = fixture.revision().to_owned();
-    let core = if retention {
-        crate::lightroom_migration_worker::memory::core::retention(0)?
-    } else {
-        0
+    let (seal, revision, core) = match selected.as_ref() {
+        Some(value) => (
+            value.managed_seal(),
+            value.managed_revision().to_owned(),
+            value.managed_core_bytes()?,
+        ),
+        None => (
+            fixture.seal.clone(),
+            fixture.revision().to_owned(),
+            if mode == TypedCore::Retention {
+                crate::lightroom_migration_worker::memory::core::retention(0)?
+            } else {
+                0
+            },
+        ),
     };
     let limit =
         crate::lightroom_migration_worker::memory::layout::add(2 * 1024 * 1024 * 1024, core)?;
@@ -708,7 +735,6 @@ fn typed_source_consumer(retention: bool) -> Result<()> {
         budget.clone(),
     )?;
     let worker_client = client.clone();
-    let seal = fixture.seal.clone();
     let observed = budget.clone();
     let worker = thread::spawn(move || -> Result<_> {
         let source = SqlReader::open(
@@ -726,7 +752,7 @@ fn typed_source_consumer(retention: bool) -> Result<()> {
             "typed opening made no parent scope reservation"
         );
         let manifest = source.capture_manifest(&revision)?;
-        if retention {
+        if mode == TypedCore::Retention {
             let temp = tempfile::tempdir()?;
             let mut catalog = crate::Catalog::open(temp.path().join("destination"))?;
             let before = observed.snapshot()?;
@@ -764,6 +790,44 @@ fn typed_source_consumer(retention: bool) -> Result<()> {
                 core - 1,
                 stepped.records,
             );
+        } else if let Some(selected) = selected.as_mut() {
+            let before = observed.snapshot()?;
+            let mut competition = observed.reservation();
+            ensure!(
+                before.available >= core,
+                "fixture pool lacks selected metadata allowance"
+            );
+            competition.grow(before.available - (core - 1))?;
+            ensure!(
+                selected.managed_counts()? == [0; 5],
+                "selected metadata fixture was already projected"
+            );
+            let denied = selected.project_managed(&source).unwrap_err();
+            let details = denied
+                .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+                .context("expected selected metadata ResourceLimit at caller")?;
+            ensure!(
+                details.required == core && details.available == core - 1,
+                "selected metadata did not request its exact first phase"
+            );
+            ensure!(
+                selected.managed_counts()? == [0; 5],
+                "selected metadata denial mutated catalog rows"
+            );
+            drop(competition);
+            let retry_before = observed.used();
+            let result = selected.project_managed(&source)?;
+            selected.verify_managed(&result)?;
+            let projected = observed.used();
+            ensure!(
+                projected
+                    >= crate::lightroom_migration_worker::memory::layout::add(retry_before, core)?,
+                "selected metadata core did not join the Source operation pool"
+            );
+            println!(
+                "TYPED_CORE_SELECTED required={core} denied_available={} denied_before_catalog=true retry_succeeded=true raw_xmp_preserved=true semantic_digest_preserved=true catalog_rows_preserved=true projected_pool={projected} source_child_actual=true lm_thread_substitute=true",
+                core - 1,
+            );
         }
         let result_admitted = observed.used();
         drop(source);
@@ -772,6 +836,13 @@ fn typed_source_consumer(retention: bool) -> Result<()> {
             operation_retained > 17 && operation_retained < result_admitted,
             "Source quiescence must release path scope and retain public-result operation allowance"
         );
+        if mode == TypedCore::SelectedMetadata {
+            ensure!(
+                operation_retained
+                    >= crate::lightroom_migration_worker::memory::layout::add(17, core)?,
+                "selected metadata core retired before operation owner"
+            );
+        }
         Ok((manifest, admitted, operation_retained))
     });
     let pumped = (|| -> Result<()> {

@@ -1241,13 +1241,13 @@ impl Catalog {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::catalog_edits::VariantKey;
     use crate::catalog_migration::originals::{OriginalDecision, OriginalRequest, SourceKey};
     use crate::lightroom::migration_source::{SupplementPin, tests::Fixture};
     const XML:&[u8]=br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:u="urn:opaque" xmp:Rating="4"><u:unknown>keep all</u:unknown></rdf:Description></rdf:RDF>"#;
-    struct Test {
+    pub(crate) struct Test {
         _fixture: Fixture,
         _temp: tempfile::TempDir,
         source: MigrationSource,
@@ -1430,6 +1430,86 @@ mod tests {
         fn run(&mut self) -> Result<ProjectionResult> {
             self.catalog
                 .project_migration_file_metadata(Some(&self.source), &self.request)
+        }
+
+        pub(crate) fn managed() -> Result<Self> {
+            Self::new(Origin::Embedded, Status::Complete, false, false)
+        }
+
+        pub(crate) fn managed_seal(&self) -> InputSeal {
+            self._fixture.seal.clone()
+        }
+
+        pub(crate) fn managed_revision(&self) -> &str {
+            &self.request.file.source.capture_revision
+        }
+
+        pub(crate) fn managed_core_bytes(&self) -> Result<usize> {
+            crate::lightroom_migration_worker::memory::core::file_metadata_selected(
+                self.request.packet_records.len(),
+            )
+        }
+
+        pub(crate) fn managed_counts(&self) -> Result<[i64; 5]> {
+            let mut counts = [0; 5];
+            for (slot, table) in [
+                "migration_file_metadata",
+                "metadata_observations",
+                "metadata_models",
+                "metadata_values",
+                "metadata_blobs",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                counts[slot] = self.catalog.db.query_row(
+                    &format!("SELECT count(*) FROM {table}"),
+                    [],
+                    |row| row.get(0),
+                )?;
+            }
+            Ok(counts)
+        }
+
+        pub(crate) fn project_managed(
+            &mut self,
+            source: &dyn MigrationRead,
+        ) -> Result<ProjectionResult> {
+            self.catalog
+                .project_migration_file_metadata_reader(Some(source), &self.request)
+        }
+
+        pub(crate) fn verify_managed(&self, result: &ProjectionResult) -> Result<()> {
+            ensure!(
+                result.state == "metadata_retained",
+                "managed selected metadata was not retained"
+            );
+            let observation = result.observation.context("managed observation missing")?;
+            let packets = self
+                .catalog
+                .metadata_packets_for_image(&VariantKey::master(&self.asset), observation)?;
+            ensure!(
+                packets.len() == 1 && packets[0].bytes == XML,
+                "managed selected raw XMP changed"
+            );
+            let expected = crate::xmp::field_semantics(XML)?
+                .remove("rating")
+                .context("fixture rating semantic digest missing")?;
+            let actual: String = self.catalog.db.query_row(
+                "SELECT v.semantic_hash FROM metadata_values v JOIN metadata_models m ON m.id=v.model_id WHERE m.observation_id=?1 AND v.field='rating'",
+                [observation],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                actual == expected,
+                "managed selected semantic digest changed"
+            );
+            let counts = self.managed_counts()?;
+            ensure!(
+                counts[0] == 1 && counts[1] == 1 && counts[2] > 0 && counts[3] > 0 && counts[4] > 0,
+                "managed selected catalog rows missing"
+            );
+            Ok(())
         }
     }
     // A distinct sealed inspection of the same capture, including distinct
