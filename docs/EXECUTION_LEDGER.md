@@ -239,6 +239,30 @@ are phase high-water bounds, not measured live allocation or RSS. The fixture
 still substitutes a joined thread for LM; actual LM/core/protocol/production-pool
 integration remains required. Twenty libtest warnings are not a Clippy result.
 
+The subsequent preview v24 test build stopped on a boxed-Request fixture type
+mismatch before tests. V25 corrects only that test line; three regressions pass
+(read-owned hydration, managed prepared candidate retention and bounded
+RenderRecord serialization), with strict Clippy/formatting. Root verified all 59
+source pins, eleven artifacts and six waited commands; receipt
+`71c52dcf1660b779872213bc4c6ca30d07c2f83861dac0cba7ae7b6fc0846cd0`.
+Independent composition review found temporary descriptor saturation in the new
+managed hydration retry could mark a valid queued ticket Stale (HY-1; review
+`7d877d2a21301ba7a695924307ceb8ec01bafdc176613a0a548f9b09ceccdc1d`).
+Configured v25 was withheld; preserve Queued until a slot becomes available,
+then prove retry before the actual process suite. Prepared cache recovery keeps
+its existing 1024-entry limit; the separate worker-stage recovery batch is 128.
+
+Root's four-file organization query correction is composed on the migration
+branch after independent source review
+`36611200f4e1d83439107c8123f40fb12d84f7e73ea2db0a484590d0873b9c38`.
+The existing, mapped, public-projection and dictionary-slot readers compare
+SQLite-owned TEXT identities and check the inclusive 64 KiB result bound before
+UTF-8/JSON decoding, without an intermediate owned JSON String. Two regressions
+cover exact-limit success, malformed/oversized storage, identity precedence and
+rollback/replay. Runtime remains pending. Private source manifest
+`b9543f9f11d4629d5feb9a4d418f2ab09d184daced517646705c38ebf7d09f1a`
+is under `sc-22847-organization-query-w9vqymoo` in private results.
+
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
 an epoch/token-bound relay; reaping LM alone cannot prove its Source children
