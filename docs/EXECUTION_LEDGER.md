@@ -160,27 +160,44 @@ then exposed the obsolete FS6 helper gate: Proxy-backed worker_main still chose
 legacy Bridge, rejected OpenExisting and parked cleanup. The hung fixture was
 explicitly interrupted and directly waited; ten receipt artifacts and no observed
 survivors verified (`0eb7180c6867eefc5015019f3a581a7344cea3e62f11cdc8c49e04073c6d279d`).
-No actual preview success is awarded. Next coherent source selects the existing
-managed helper for Proxy-backed work and permits only already-converted routes.
+V19 selects the existing managed helper for Proxy-backed work and permits only
+already-converted routes. Its first compile stopped before tests on a missing
+ImportCancel fixture field. V20 corrects that field and passes all eleven focused
+tests (codec four, cache two, saved-query three, full upgrade one, helper one),
+strict Clippy and formatting. Root verified thirteen artifact hashes and eight
+waited commands; receipt `63d970f7a3912df22919df3fe492ba1292585e303bf4f7d6e49b97fb3ebac308`.
 
-Root codec error correction passed independent successor source review
-`83c73a4e1d9e71edb1d3b2714b2ebb5685833c45f9910be7312054d69607b6e0`.
-It retains typed native/JPEG/WebP resource and unknown failures, marks explicit
-cache data rejection Corrupt, and removes the broad managed error wrapper.
-Only direct edges to already-locked backend versions are added. Four tests await
-runtime. Source and preserved initial negative review are private under
+Configured v20 reaches actual G/C/F and Render N but fails with a generic
+filesystem-unavailable error. The CLI and fixture were directly waited, and all
+seven artifact hashes match with no observed survivors; receipt
+`b1f3493c835173640b10af604b904fdc2690fec1b3f495856a1987ddcf3d1918`.
+The underlying fault was discarded at relay boundaries. V21 preserves it through
+the existing bounded error formatter; independent two-file review
+`747e6326a384616c0d385aaeb89cea0f0353e56023f1bd594ce4e0c2c1aace9c`
+passes without changing classification, admission or cleanup. Strict Clippy and
+formatting pass with six verified artifacts and two waited commands; receipt
+`cae42fb666a90a295a97ccd63fe12c9c14d46ba2ba84ff65bf2bace3bc463f33`.
+A fresh CLI/configured retry is active. No actual preview success is awarded yet.
+
+The codec correction now has local runtime evidence: typed native/JPEG/WebP
+resource and unknown failures are retained, explicit invalid cache data is
+Corrupt, and the broad managed error wrapper is removed. Only direct edges to
+already-locked backend versions are added. Four tests pass in v20; independent
+source review `83c73a4e1d9e71edb1d3b2714b2ebb5685833c45f9910be7312054d69607b6e0`.
+Source and the initial negative review are preserved under
 `sc-22847-codec-errors-6l024y0_`.
 
-Saved preview job recovery and schema-upgrade descriptors now have a reviewed
-private two-file candidate checking borrowed TEXT, existing 64hex identities and
-64KiB descriptor bounds before copying/JSON. Three tests await runtime; review
-`f41ac8871f0ce71994190b9afbf12f5224eb966758a4a64e0642004fda507b4b`.
-The guard-only upgrade fixture does not replace existing complete upgrade tests.
+Saved preview job recovery and schema-upgrade descriptors check borrowed TEXT,
+existing 64hex identities and 64KiB descriptor bounds before copying/JSON. All
+three new tests and the existing full upgrade test pass in v20; independent
+review `f41ac8871f0ce71994190b9afbf12f5224eb966758a4a64e0642004fda507b4b`.
 Root RenderWork/receipt/RenderRecord graph note passed shape review
-`dbb25958b65a3613b720946e3dd033f09c9f61aa4027a7166a95d1238c9da95d`;
-final aggregate admission and std/serde allocation coefficient proof remain open.
-Both private corrections are handed to the FS8 author for coherent composition;
-no current installed-app or full FS8 acceptance follows.
+`dbb25958b65a3613b720946e3dd033f09c9f61aa4027a7166a95d1238c9da95d`.
+The pinned std/serde Vec construction and clone notes now distinguish fresh
+length-sized clones from original spare capacity and shared Arc backing. Final
+checked aggregate accounting remains open. Private WebP/AVIF route fixtures have
+source review; root abnormal-C/live-N/F-retention fixture is under review. Neither
+has runtime evidence yet. No installed-app or full FS8 acceptance follows.
 
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
