@@ -82,8 +82,27 @@ failed (two expected Spawn calls versus one observed); the distinction between
 authenticated Stop/status recovery and exact initial replay is being checked.
 Eleven evidence hashes and all six waited commands are verified, with no observed
 owned survivors; receipt `51bb62b838e34623176bab3376e8e86f84f9cd05d3ee3aac7f5b7d7cf50067f3`.
-The remaining groups, Clippy and formatting were not reached. A foreign filesystem pending-operation shutdown cycle
-remains explicitly open; no complete FS8 acceptance is claimed.
+The remaining groups, Clippy and formatting were not reached in v5. Its failing
+fixture expected an unnecessary second Spawn after authenticated Stop/status
+already recovered the identity; a separate exact-replay regression remains.
+The foreign filesystem shutdown cycle was repaired and independently reviewed.
+V7 passed 30 focused tests, then strict Clippy reported 12 diagnostics; formatting
+was not reached. Receipt
+`93b37293394e44150b174185e500fd583114dd1b649fe7f628221891672b0154`
+preserves all eight waited commands and no observed survivors. This is bounded
+coverage, with earlier unaffected component evidence retained.
+
+Normal service progress also needed to advance completed transport cleanup while
+a sibling waits on the unresolved filesystem operation. Independent review caught
+a cleanup-thread creation error being treated as terminal, preventing retry; v9
+corrects this and adds a regression. Its gate failed before tests because the
+new fixture omitted the Duration import. Receipt
+`5fdd0ca6c09baac1155a1c6e15042f77831a9534dc0ea0b2c33b11bbd76cf71f`
+has five verified evidence hashes, Cargo14767 waited101 and no observed survivors.
+The import-only correction is being prepared. Ready-ticket encoded delivery still
+needs off-actor storage I/O, and stage metadata needs actual capacity admission
+before filesystem effects. These remain within full FS8 acceptance; configured
+C/G/F/N delivery, final accounting and bounded measurements are not yet qualified.
 
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
