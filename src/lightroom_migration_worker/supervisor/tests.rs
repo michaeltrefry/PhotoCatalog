@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 struct Admit {
     writers: Arc<Writers>,
@@ -22,8 +22,9 @@ impl Admission for Admit {
     ) -> Result<Arc<Writers>> {
         Ok(self.writers.clone())
     }
-    fn release(&mut self, sequence: u64, kind: WriteKind) {
+    fn release(&mut self, sequence: u64, kind: WriteKind) -> Result<()> {
         self.releases.lock().unwrap().push((sequence, kind));
+        Ok(())
     }
     fn progress(&mut self, _: &str, _: u64, _: Option<u64>) -> Result<()> {
         Ok(())
@@ -46,7 +47,7 @@ fn state(writers: Arc<Writers>, releases: Arc<Mutex<Vec<(u64, WriteKind)>>>) -> 
             .reservation(),
     )
 }
-fn admitted(state: &mut State<Admit>, stop: &Arc<Stop>) -> Result<()> {
+fn admitted<A: Admission>(state: &mut State<A>, stop: &Arc<Stop>) -> Result<()> {
     state.accept_wait(
         ChildFrame::Admitted {
             guard: guard(),
@@ -455,5 +456,371 @@ fn transport_payload_denial_precedes_child_creation_and_retires_all_charges() ->
         "TRANSPORT_PRESPAWN_DENIED requested={} available={} no_child=true retired=0",
         limit.required, limit.available
     );
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch2_streamed_result_denies_before_retained_allocation_then_pages_exactly()
+-> Result<()> {
+    let bytes = RESULT_BYTES + 37;
+    let (storage, expected_pages) =
+        crate::lightroom_migration_worker::protocol::result::retained_storage_bytes(bytes)?;
+    let operation_bytes = 17usize;
+    let pool = crate::preview::ByteBudget::new((storage + operation_bytes).try_into()?)?;
+    let budget = MemoryBudget::from_shared(pool.clone());
+    let mut competitor = budget.reservation();
+    competitor.grow(1)?;
+    let mut state = State::new_streaming(
+        Admit {
+            writers: Arc::new(Writers::default()),
+            releases: Arc::new(Mutex::new(vec![])),
+        },
+        guard(),
+        "a".repeat(64),
+        budget.reservation(),
+        budget.reservation(),
+        bytes,
+    );
+    state.memory.grow(operation_bytes)?;
+    let stop = Arc::new(Stop::default());
+    admitted(&mut state, &stop)?;
+    let digest = {
+        let mut hash = blake3::Hasher::new();
+        let block = [b'x'; crate::lightroom_migration_worker::protocol::result::CHUNK];
+        let mut remaining = bytes;
+        while remaining != 0 {
+            let length = remaining.min(block.len());
+            hash.update(&block[..length]);
+            remaining -= length;
+        }
+        hash.finalize().to_hex().to_string()
+    };
+    let begin = || ChildFrame::BeginResult {
+        guard: guard(),
+        bytes: U64(bytes as u64),
+        blake3: digest.clone(),
+    };
+    let error = state
+        .accept_wait(begin(), &stop, Instant::now() + Duration::from_secs(5))
+        .unwrap_err();
+    let limit = error
+        .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+        .context("typed streamed-result ResourceLimit")?;
+    assert_eq!((limit.required, limit.available), (storage, storage - 1));
+    let typed = Failure::from_error(error, false, false, &budget);
+    assert!(matches!(
+        typed.cause,
+        FailureCause::ResourceLimit(crate::lightroom_migration_worker::memory::ResourceLimit {
+            required,
+            available
+        }) if (required, available) == (storage, storage - 1)
+    ));
+    assert!(!typed.poisoned && !typed.outcome_unknown);
+    assert!(state.streamed_result.is_none());
+    assert_eq!(pool.used(), (operation_bytes + 1) as u64);
+    drop(competitor);
+    assert!(matches!(
+        state.accept_wait(
+            begin(),
+            &stop,
+            Instant::now() + Duration::from_secs(5)
+        )?,
+        Some(ParentFrame::ResultGrant { bytes: U64(actual), .. }) if actual == bytes as u64
+    ));
+    assert_eq!(pool.used(), (storage + operation_bytes) as u64);
+    let mut offset = 0usize;
+    while offset != bytes {
+        let length =
+            (bytes - offset).min(crate::lightroom_migration_worker::protocol::result::CHUNK);
+        state.accept_wait(
+            ChildFrame::Result {
+                guard: guard(),
+                offset: U64(offset as u64),
+                text: "x".repeat(length),
+            },
+            &stop,
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        offset += length;
+    }
+    state.accept_wait(
+        ChildFrame::Finished {
+            guard: guard(),
+            result_blake3: digest.clone(),
+            bytes: U64(bytes as u64),
+        },
+        &stop,
+        Instant::now() + Duration::from_secs(5),
+    )?;
+    let result = state.take_saved_result(None)?;
+    assert_eq!(result.identity(), Some((bytes, digest.as_str())));
+    assert_eq!(result.page_count(), expected_pages);
+    assert!(result.page(0).is_some());
+    assert!(result.page(expected_pages).is_none());
+    drop(state);
+    assert_eq!(pool.used(), storage as u64);
+    drop(result);
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch2_failed_parent_release_retains_attempt_until_checked_retry() -> Result<()> {
+    struct RetryAdmission {
+        writers: Arc<Writers>,
+        failures: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+    impl Admission for RetryAdmission {
+        fn lock(&mut self, _: &str, _: &DestinationPin, _: &FileKey) -> Result<()> {
+            Ok(())
+        }
+        fn writer(
+            &mut self,
+            _: u64,
+            _: WriteKind,
+            _: &str,
+            _: Option<&FileKey>,
+            _: &Stop,
+            _: Instant,
+        ) -> Result<Arc<Writers>> {
+            Ok(self.writers.clone())
+        }
+        fn release(&mut self, _: u64, _: WriteKind) -> Result<()> {
+            self.releases.fetch_add(1, Ordering::AcqRel);
+            if self
+                .failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                anyhow::bail!("injected parent release acknowledgement loss")
+            }
+            Ok(())
+        }
+        fn progress(&mut self, _: &str, _: u64, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+    }
+    let failures = Arc::new(AtomicUsize::new(1));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let budget = MemoryBudget::new(FAILURE_BYTES + 1024)?;
+    let mut state = State::new_streaming(
+        RetryAdmission {
+            writers: Arc::new(Writers::default()),
+            failures: failures.clone(),
+            releases: releases.clone(),
+        },
+        guard(),
+        "a".repeat(64),
+        budget.reservation(),
+        budget.reservation(),
+        0,
+    );
+    let stop = Arc::new(Stop::default());
+    admitted(&mut state, &stop)?;
+    assert!(matches!(
+        state.accept_wait(need(), &stop, Instant::now() + Duration::from_secs(5))?,
+        Some(ParentFrame::Grant { .. })
+    ));
+    let owner = Owned {
+        process: None,
+        broker: None,
+        state,
+        lm_drained: false,
+        broker_drained: false,
+        drain_fault: None,
+        primary_broker_failure: None,
+    };
+    let mut operation = Operation::DrainPending(DrainPending::new(owner, None, None));
+    let until = Instant::now() + Duration::from_secs(5);
+    while releases.load(Ordering::Acquire) == 0 {
+        assert!(operation.retry_drain().is_none());
+        ensure!(Instant::now() < until, "parent release fixture deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let Operation::DrainPending(pending) = &operation else {
+        anyhow::bail!("lost release acknowledgement retired operation")
+    };
+    let failure = pending
+        .failure()
+        .context("release failure cause retained")?;
+    assert!(
+        matches!(&failure.cause, FailureCause::Rejected(detail) if detail.contains("release acknowledgement"))
+    );
+    assert!(failure.poisoned && failure.outcome_unknown);
+    assert!(operation.retry_drain().is_some());
+    assert!(matches!(operation, Operation::Drained(Drained::Failed(_))));
+    assert_eq!(releases.load(Ordering::Acquire), 2);
+    assert_eq!(budget.used(), FAILURE_BYTES);
+    drop(operation);
+    assert_eq!(budget.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch2_child_terminal_poison_preserves_known_outcome() -> Result<()> {
+    let operation_bytes = 17usize;
+    let pool = crate::preview::ByteBudget::new((FAILURE_BYTES + operation_bytes) as u64)?;
+    let budget = MemoryBudget::from_shared(pool.clone());
+    let mut state = State::new_streaming(
+        Admit {
+            writers: Arc::new(Writers::default()),
+            releases: Arc::new(Mutex::new(vec![])),
+        },
+        guard(),
+        "a".repeat(64),
+        budget.reservation(),
+        budget.reservation(),
+        0,
+    );
+    state.memory.grow(operation_bytes)?;
+    let stop = Arc::new(Stop::default());
+    admitted(&mut state, &stop)?;
+    state.accept_wait(
+        ChildFrame::Failed {
+            guard: guard(),
+            detail: "worker rejected an approved operation".into(),
+            poisoned: true,
+        },
+        &stop,
+        Instant::now() + Duration::from_secs(5),
+    )?;
+    let owner = Owned {
+        process: None,
+        broker: None,
+        state,
+        lm_drained: false,
+        broker_drained: false,
+        drain_fault: None,
+        primary_broker_failure: None,
+    };
+    let detail = owner
+        .state
+        .terminal
+        .as_ref()
+        .context("terminal worker failure absent")?
+        .as_ref()
+        .unwrap_err()
+        .to_string();
+    let failure = failure_for_owner(&owner, anyhow::anyhow!(detail));
+    assert!(failure.poisoned && !failure.outcome_unknown);
+    let mut operation = Operation::DrainPending(DrainPending::new(owner, None, Some(failure)));
+    let Some(Drained::Failed(failure)) = operation.retry_drain() else {
+        anyhow::bail!("known terminal worker failure did not drain")
+    };
+    assert!(
+        matches!(&failure.cause, FailureCause::Rejected(detail) if detail.contains("approved operation"))
+    );
+    assert!(failure.poisoned && !failure.outcome_unknown);
+    assert_eq!(pool.used(), FAILURE_BYTES as u64);
+    drop(operation);
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch2_rejection_text_is_typed_and_utf8_byte_bounded() -> Result<()> {
+    let pool = crate::preview::ByteBudget::new(FAILURE_BYTES as u64)?;
+    let budget = MemoryBudget::from_shared(pool.clone());
+    let failure = Failure::from_error(
+        anyhow::anyhow!("request was not canceled; policy rejected it"),
+        false,
+        false,
+        &budget,
+    );
+    assert!(
+        matches!(&failure.cause, FailureCause::Rejected(detail) if detail.contains("not canceled"))
+    );
+    assert_eq!(pool.used(), FAILURE_BYTES as u64);
+    drop(failure);
+    assert_eq!(pool.used(), 0);
+
+    let source = "é🦀".repeat(FAILURE_BYTES);
+    let failure = Failure::from_error(anyhow::anyhow!(source), false, false, &budget);
+    let FailureCause::Rejected(detail) = &failure.cause else {
+        anyhow::bail!("multibyte rejection changed type")
+    };
+    assert_eq!(detail.len(), FAILURE_BYTES);
+    assert_eq!(detail.capacity(), FAILURE_BYTES);
+    assert!(std::str::from_utf8(detail.as_bytes()).is_ok());
+    assert_eq!(pool.used(), FAILURE_BYTES as u64);
+    drop(failure);
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch2_shared_pool_guard_outlives_funded_state_owner() -> Result<()> {
+    struct DropAdmission {
+        pool: crate::preview::ByteBudget,
+        observed: Arc<AtomicUsize>,
+    }
+    impl Drop for DropAdmission {
+        fn drop(&mut self) {
+            self.observed
+                .store(self.pool.used() as usize, Ordering::Release);
+        }
+    }
+    impl Admission for DropAdmission {
+        fn lock(&mut self, _: &str, _: &DestinationPin, _: &FileKey) -> Result<()> {
+            Ok(())
+        }
+        fn writer(
+            &mut self,
+            _: u64,
+            _: WriteKind,
+            _: &str,
+            _: Option<&FileKey>,
+            _: &Stop,
+            _: Instant,
+        ) -> Result<Arc<Writers>> {
+            Ok(Arc::new(Writers::default()))
+        }
+        fn release(&mut self, _: u64, _: WriteKind) -> Result<()> {
+            Ok(())
+        }
+        fn progress(&mut self, _: &str, _: u64, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+    }
+    let pool = crate::preview::ByteBudget::new(23)?;
+    let observed = Arc::new(AtomicUsize::new(0));
+    let budget = MemoryBudget::from_shared(pool.clone());
+    let mut state = State::new_streaming(
+        DropAdmission {
+            pool: pool.clone(),
+            observed: observed.clone(),
+        },
+        guard(),
+        "a".repeat(64),
+        budget.reservation(),
+        budget.reservation(),
+        0,
+    );
+    state.memory.grow(23)?;
+    let owner = Owned {
+        process: None,
+        broker: None,
+        lm_drained: false,
+        broker_drained: false,
+        drain_fault: Some(anyhow::anyhow!("funded queued diagnostic")),
+        primary_broker_failure: None,
+        state,
+    };
+    let operation = Operation::Running(Running {
+        ended: false,
+        command: None,
+        data: Some(ParentFrame::Cancel { guard: guard() }),
+        control: Some(ParentFrame::Cancel { guard: guard() }),
+        stop: Arc::new(Stop::default()),
+        until: Instant::now() + Duration::from_secs(5),
+        owner: Some(owner),
+        result_memory: Some(budget.reservation()),
+    });
+    drop(operation);
+    assert_eq!(observed.load(Ordering::Acquire), 23);
+    assert_eq!(pool.used(), 0);
     Ok(())
 }

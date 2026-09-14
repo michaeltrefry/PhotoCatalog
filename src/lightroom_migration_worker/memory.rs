@@ -17,12 +17,16 @@ pub(crate) struct MemoryBudget(Arc<Backend>);
 enum Backend {
     Local(Mutex<State>),
     Parent(Arc<dyn AllocationGrant>),
+    Shared(crate::preview::ByteBudget),
 }
-/// The parent retains every successful grant until the complete helper process
-/// and its consumers have drained. Dropping a child reservation never releases
-/// a possibly still-live cross-process allocation.
+/// A remote adapter retains every successful grant in its physical parent.
+/// Dropping a child reservation never releases a possibly live cross-process
+/// allocation.
 pub(crate) trait AllocationGrant: Send + Sync {
     fn reserve(&self, bytes: usize) -> Result<()>;
+    fn snapshot(&self) -> Option<Snapshot> {
+        None
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
@@ -30,7 +34,7 @@ pub(crate) struct Snapshot {
     pub used: usize,
     pub available: usize,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ResourceLimit {
     pub required: usize,
     pub available: usize,
@@ -53,6 +57,7 @@ struct State {
 pub(crate) struct Reservation {
     budget: MemoryBudget,
     held: usize,
+    shared: Option<crate::preview::ByteReservation>,
 }
 impl MemoryBudget {
     pub(crate) fn new(limit: usize) -> Result<Self> {
@@ -68,25 +73,48 @@ impl MemoryBudget {
     pub(crate) fn from_parent(grant: Arc<dyn AllocationGrant>) -> Self {
         Self(Arc::new(Backend::Parent(grant)))
     }
+    /// G-local operation scopes each own one growable token in the actual
+    /// desktop pool. A separate result scope can therefore outlive drain
+    /// without retaining unrelated process/input allowances.
+    pub(crate) fn from_shared(budget: crate::preview::ByteBudget) -> Self {
+        Self(Arc::new(Backend::Shared(budget)))
+    }
     /// Parent snapshots are current shared-pool state. A child must never report
     /// a local counter as the parent pool's current available allowance.
     pub(crate) fn snapshot(&self) -> Result<Snapshot> {
-        let Backend::Local(state) = &*self.0 else {
-            anyhow::bail!("allocation availability belongs to the parent coordinator")
-        };
-        let state = state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("migration allocation allowance poisoned"))?;
-        Ok(Snapshot {
-            limit: state.limit,
-            used: state.used,
-            available: state.limit - state.used,
-        })
+        match &*self.0 {
+            Backend::Local(state) => {
+                let state = state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("migration allocation allowance poisoned"))?;
+                Ok(Snapshot {
+                    limit: state.limit,
+                    used: state.used,
+                    available: state.limit - state.used,
+                })
+            }
+            Backend::Parent(grant) => grant
+                .snapshot()
+                .context("allocation availability belongs to the parent coordinator"),
+            Backend::Shared(budget) => {
+                let (limit, used) = budget.snapshot();
+                let limit = usize::try_from(limit).context("shared allocation limit overflow")?;
+                let used = usize::try_from(used).context("shared allocation usage overflow")?;
+                Ok(Snapshot {
+                    limit,
+                    used,
+                    available: limit
+                        .checked_sub(used)
+                        .context("shared allocation usage exceeds limit")?,
+                })
+            }
+        }
     }
     pub(crate) fn reservation(&self) -> Reservation {
         Reservation {
             budget: self.clone(),
             held: 0,
+            shared: None,
         }
     }
     #[cfg(test)]
@@ -95,6 +123,9 @@ impl MemoryBudget {
     }
 }
 impl Reservation {
+    pub(crate) fn budget(&self) -> MemoryBudget {
+        self.budget.clone()
+    }
     /// Admit a complete phase envelope without accumulating the same temporary
     /// allowance on every row. The high-water charge stays owned through drain;
     /// a smaller phase does not release payloads still retained by a sibling.
@@ -130,20 +161,48 @@ impl Reservation {
             // No local pool mutex is held through this IPC callback. Its exact
             // grant sequence is serialized by the protocol's owned waiting slot.
             Backend::Parent(grant) => grant.reserve(bytes)?,
+            Backend::Shared(budget) => {
+                let bytes = u64::try_from(bytes).context("shared allocation request overflow")?;
+                let refused = if let Some(reservation) = &mut self.shared {
+                    match reservation.grow_exact(bytes) {
+                        Ok(()) => None,
+                        Err(limit) => Some(limit),
+                    }
+                } else {
+                    match budget.reserve_exact(bytes) {
+                        Ok(reservation) => {
+                            self.shared = Some(reservation);
+                            None
+                        }
+                        Err(limit) => Some(limit),
+                    }
+                };
+                if let Some(refused) = refused {
+                    return Err(ResourceLimit {
+                        required: usize::try_from(refused.required)
+                            .context("shared allocation refusal request overflow")?,
+                        available: usize::try_from(refused.available)
+                            .context("shared allocation refusal availability overflow")?,
+                    }
+                    .into());
+                }
+            }
         }
         self.held = held;
         Ok(())
     }
 }
+
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let Backend::Local(state) = &*self.budget.0 else {
-            return;
-        };
-        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-        // This owner alone retires its monotonic contribution. No allocation,
-        // filesystem access, callback or process wait occurs under this lock.
-        state.used -= self.held;
+        if let Backend::Local(state) = &*self.budget.0 {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            // This owner alone retires its monotonic contribution. No allocation,
+            // filesystem access, callback or process wait occurs under this lock.
+            state.used -= self.held;
+        }
+        // Shared drops its single ByteReservation after the checked owner fields
+        // above it; Parent deliberately has no local release acknowledgement.
     }
 }
 #[cfg(test)]

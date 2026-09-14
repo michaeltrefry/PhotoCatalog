@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::io::{self, Write};
 
-const CHUNK: usize = 16 * 1024;
+pub(crate) const CHUNK: usize = 16 * 1024;
 const DIGEST_BYTES: usize = 64;
 const SUPPLEMENT_SOURCE_ID_BYTES: usize = 4096;
 
@@ -59,6 +59,27 @@ pub(crate) fn measure(value: &impl Serialize, maximum: usize) -> Result<Measured
         bytes: counter.bytes,
         blake3: counter.hash.finalize().to_hex().to_string(),
     })
+}
+
+pub(crate) fn retained_storage_bytes(bytes: usize) -> Result<(usize, usize)> {
+    let pages = if bytes == 0 {
+        0
+    } else {
+        bytes
+            .checked_add(CHUNK - 4)
+            .context("migration result page count overflow")?
+            / (CHUNK - 3)
+    };
+    let backing = pages
+        .checked_mul(std::mem::size_of::<Box<str>>())
+        .context("migration result page backing overflow")?;
+    Ok((
+        bytes
+            .checked_add(backing)
+            .and_then(|bytes| bytes.checked_add(DIGEST_BYTES))
+            .context("migration retained result storage overflow")?,
+        pages,
+    ))
 }
 
 struct Chunks<'a> {
@@ -329,6 +350,25 @@ mod tests {
             reconstructed.push_str(&text);
         }
         assert_eq!(reconstructed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn lm_supervisor_batch2_retained_page_storage_includes_digest_and_vector_backing() -> Result<()>
+    {
+        for bytes in [0, 1, CHUNK - 3, CHUNK - 2, 2 * CHUNK + 7] {
+            let (storage, pages) = retained_storage_bytes(bytes)?;
+            let expected_pages = if bytes == 0 {
+                0
+            } else {
+                bytes.div_ceil(CHUNK - 3)
+            };
+            assert_eq!(pages, expected_pages);
+            assert_eq!(
+                storage,
+                bytes + pages * std::mem::size_of::<Box<str>>() + DIGEST_BYTES
+            );
+        }
         Ok(())
     }
 }

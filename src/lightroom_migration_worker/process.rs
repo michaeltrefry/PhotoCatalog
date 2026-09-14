@@ -36,6 +36,8 @@ pub(crate) struct Process<T = ChildFrame> {
     transport: Arc<TransportHealth>,
     #[cfg(test)]
     injected_input: Arc<Mutex<Option<Vec<u8>>>>,
+    #[cfg(test)]
+    injected_wait_failures: usize,
 }
 #[derive(Default)]
 struct TransportHealth {
@@ -53,33 +55,35 @@ impl Drop for IoCompletion {
         }
     }
 }
-/// During managed startup, revoke the partial child and the other owners before
-/// any failure cleanup can enter a blocking wait. Successful startup transfers
-/// the complete Process and never invokes this callback.
-struct SetupOwner<'a, T> {
-    process: Option<Process<T>>,
-    before_wait: Option<&'a mut dyn FnMut()>,
+/// A failure after `Command::spawn` retains the partial Child, pipes and any I/O
+/// thread which was already created. Managed callers move this into their
+/// operation owner; legacy callers explicitly drain it before returning.
+pub(crate) struct SpawnFailure<T = ChildFrame> {
+    pub(crate) error: anyhow::Error,
+    pub(crate) process: Option<Process<T>>,
 }
-impl<T> std::ops::Deref for SetupOwner<'_, T> {
-    type Target = Process<T>;
-    fn deref(&self) -> &Self::Target {
-        self.process.as_ref().expect("owned process setup")
+impl<T> SpawnFailure<T> {
+    fn before_child(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            process: None,
+        }
     }
-}
-impl<T> std::ops::DerefMut for SetupOwner<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.process.as_mut().expect("owned process setup")
+    fn after_child(error: anyhow::Error, process: Process<T>) -> Self {
+        Self {
+            error,
+            process: Some(process),
+        }
     }
-}
-impl<T> Drop for SetupOwner<'_, T> {
-    fn drop(&mut self) {
+    fn drain_legacy(mut self, before_wait: Option<&mut dyn FnMut()>) -> anyhow::Error {
         if let Some(process) = &mut self.process {
             process.revoke();
-            if let Some(before_wait) = &mut self.before_wait {
+            if let Some(before_wait) = before_wait {
                 before_wait();
             }
+            process.terminate();
         }
-        // The Process field's Drop now performs the checked ownership wait.
+        self.error
     }
 }
 #[derive(Default)]
@@ -104,6 +108,13 @@ pub(crate) enum Output<T = ChildFrame> {
     Frame(T),
     End,
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DrainReport {
+    pub(crate) status: ExitStatus,
+    /// Joining a panicked thread proves termination; retain this as poison
+    /// without treating the already-consumed handle as retryable.
+    pub(crate) io_panicked: bool,
+}
 impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     /// Application-owned channel, Arc and erased pipe backing on this target.
     /// OS/process creation, inherited environment and runtime thread/stack
@@ -123,11 +134,18 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         add(bytes, std::mem::size_of::<std::process::ChildStdout>())
     }
     pub(crate) fn spawn(executable: &Path, stop: Arc<Stop>) -> Result<Self> {
-        ensure!(
-            executable.is_absolute(),
-            "absolute configured migration executable required"
-        );
-        Self::spawn_role(executable, "--lightroom-migration-worker", stop)
+        Self::spawn_owned(executable, stop).map_err(|failure| failure.drain_legacy(None))
+    }
+    pub(crate) fn spawn_owned(
+        executable: &Path,
+        stop: Arc<Stop>,
+    ) -> std::result::Result<Self, SpawnFailure<T>> {
+        if !executable.is_absolute() {
+            return Err(SpawnFailure::before_child(anyhow::anyhow!(
+                "absolute configured migration executable required"
+            )));
+        }
+        Self::spawn_role_owned(executable, "--lightroom-migration-worker", stop)
     }
     pub(crate) fn spawn_role(
         executable: &Path,
@@ -136,16 +154,16 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     ) -> Result<Self> {
         Self::spawn_role_with_cleanup(executable, role, stop, None)
     }
-    pub(crate) fn spawn_role_with_cleanup(
+    fn spawn_role_owned(
         executable: &Path,
         role: &'static str,
         stop: Arc<Stop>,
-        before_wait: Option<&mut dyn FnMut()>,
-    ) -> Result<Self> {
-        ensure!(
-            executable.is_absolute(),
-            "absolute configured worker required"
-        );
+    ) -> std::result::Result<Self, SpawnFailure<T>> {
+        if !executable.is_absolute() {
+            return Err(SpawnFailure::before_child(anyhow::anyhow!(
+                "absolute configured worker required"
+            )));
+        }
         let mut command = Command::new(executable);
         command.arg(role);
         if matches!(
@@ -156,15 +174,23 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         ) {
             source_environment(&mut command);
         }
-        Self::spawn_command(command, stop, before_wait)
+        Self::spawn_command_owned(command, stop)
     }
-    fn spawn_command(
-        mut command: Command,
+    pub(crate) fn spawn_role_with_cleanup(
+        executable: &Path,
+        role: &'static str,
         stop: Arc<Stop>,
         before_wait: Option<&mut dyn FnMut()>,
     ) -> Result<Self> {
+        Self::spawn_role_owned(executable, role, stop)
+            .map_err(|failure| failure.drain_legacy(before_wait))
+    }
+    fn spawn_command_owned(
+        mut command: Command,
+        stop: Arc<Stop>,
+    ) -> std::result::Result<Self, SpawnFailure<T>> {
         command.stdout(Stdio::piped()).stderr(Stdio::null());
-        Self::spawn_configured(command, stop, before_wait, |child| {
+        Self::spawn_configured_owned(command, stop, |child| {
             Ok(Box::new(
                 child.stdout.take().context("migration output pipe")?,
             ))
@@ -175,144 +201,169 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         Self::spawn_test_command_with_cleanup(command, stop, None)
     }
     #[cfg(test)]
-    pub(crate) fn spawn_test_command_with_cleanup(
+    pub(crate) fn spawn_test_command_owned(
         mut command: Command,
         stop: Arc<Stop>,
-        before_wait: Option<&mut dyn FnMut()>,
-    ) -> Result<Self> {
-        // Unit-test harness chatter stays on discarded stdout. The same
-        // bounded protocol and process owner read direct helper stderr bytes.
+    ) -> std::result::Result<Self, SpawnFailure<T>> {
         #[cfg(not(feature = "internal-capacity-probes"))]
         command.stdout(Stdio::null());
         #[cfg(feature = "internal-capacity-probes")]
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::piped());
-        Self::spawn_configured(command, stop, before_wait, |child| {
+        Self::spawn_configured_owned(command, stop, |child| {
             Ok(Box::new(
                 child.stderr.take().context("test helper output pipe")?,
             ))
         })
     }
-    fn spawn_configured(
+    #[cfg(test)]
+    pub(crate) fn spawn_test_command_with_cleanup(
+        command: Command,
+        stop: Arc<Stop>,
+        before_wait: Option<&mut dyn FnMut()>,
+    ) -> Result<Self> {
+        Self::spawn_test_command_owned(command, stop)
+            .map_err(|failure| failure.drain_legacy(before_wait))
+    }
+    fn spawn_configured_owned(
         mut command: Command,
+        stop: Arc<Stop>,
+        output: impl FnOnce(&mut Child) -> Result<Box<dyn Read + Send>>,
+    ) -> std::result::Result<Self, SpawnFailure<T>> {
+        let child = command
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("start owned migration helper")
+            .map_err(SpawnFailure::before_child)?;
+        // Establish the kill/reap owner before any fallible thread creation.
+        let mut owner = Self {
+            child,
+            input: None,
+            output: None,
+            control: None,
+            writer: None,
+            reader: None,
+            input_error: Arc::new(Mutex::new(None)),
+            reaped: None,
+            io_panicked: false,
+            transport: Arc::new(TransportHealth::default()),
+            #[cfg(test)]
+            injected_input: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            injected_wait_failures: 0,
+        };
+        let configured = (|| -> Result<()> {
+            let mut stdin = owner.child.stdin.take().context("migration input pipe")?;
+            let mut stdout = output(&mut owner.child)?;
+            let (input, incoming) = mpsc::sync_channel::<Vec<u8>>(1);
+            let (urgent, controls) = mpsc::sync_channel::<Vec<u8>>(1);
+            let (outgoing, output) = mpsc::sync_channel(1);
+            owner.input = Some(input);
+            owner.control = Some(urgent);
+            owner.output = Some(output);
+            let errors = owner.input_error.clone();
+            let write_stop = stop.clone();
+            let write_health = owner.transport.clone();
+            let read_health = owner.transport.clone();
+            #[cfg(test)]
+            let injected = owner.injected_input.clone();
+            owner.writer = Some(
+                thread::Builder::new()
+                    .name("migration-input".into())
+                    .spawn(move || {
+                        let mut completion = IoCompletion {
+                            health: write_health,
+                            completed: false,
+                        };
+                        loop {
+                            #[cfg(test)]
+                            let injected_frame =
+                                injected.lock().unwrap_or_else(|e| e.into_inner()).take();
+                            #[cfg(not(test))]
+                            let injected_frame: Option<Vec<u8>> = None;
+                            let frame = if let Some(frame) = injected_frame {
+                                frame
+                            } else {
+                                match controls.try_recv() {
+                                    Ok(frame) => frame,
+                                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                                        match incoming.recv_timeout(Duration::from_millis(2)) {
+                                            Ok(frame) => frame,
+                                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                        }
+                                    }
+                                }
+                            };
+                            let result = stdin.write_all(&frame).and_then(|_| stdin.flush());
+                            if let Err(error) = result {
+                                completion.health.failed.store(true, Ordering::Release);
+                                *errors.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(error.to_string());
+                                write_stop.admission.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                        completion.completed = true;
+                        // Closing this pipe revokes helper ownership even if the GUI died
+                        // before it could send an explicit cancellation frame.
+                    })?,
+            );
+            owner.reader = Some(
+                thread::Builder::new()
+                    .name("migration-output".into())
+                    .spawn(move || {
+                        let mut completion = IoCompletion {
+                            health: read_health,
+                            completed: false,
+                        };
+                        loop {
+                            let frame = read_frame_optional::<T>(&mut stdout);
+                            match &frame {
+                                Err(_) => completion.health.failed.store(true, Ordering::Release),
+                                Ok(None) => completion.health.eof.store(true, Ordering::Release),
+                                Ok(Some(_)) => {}
+                            }
+                            #[cfg(all(test, feature = "internal-capacity-probes"))]
+                            crate::capacity_probes::observe(
+                                crate::capacity_probes::FRAME_OUTPUT,
+                                std::mem::size_of_val(&frame),
+                            );
+                            let failed = !matches!(&frame, Ok(Some(_)));
+                            if failed {
+                                stop.admission.store(true, Ordering::Release);
+                            }
+                            if outgoing.send(frame).is_err() || failed {
+                                break;
+                            }
+                        }
+                        completion.completed = true;
+                    })?,
+            );
+            Ok(())
+        })();
+        match configured {
+            Ok(()) => Ok(owner),
+            Err(error) => Err(SpawnFailure::after_child(error, owner)),
+        }
+    }
+    #[cfg(test)]
+    fn spawn_configured(
+        command: Command,
         stop: Arc<Stop>,
         before_wait: Option<&mut dyn FnMut()>,
         output: impl FnOnce(&mut Child) -> Result<Box<dyn Read + Send>>,
     ) -> Result<Self> {
-        let child = command
-            .stdin(Stdio::piped())
-            .spawn()
-            .context("start owned migration helper")?;
-        // Establish the kill/reap owner before any fallible thread creation.
-        let mut owner = SetupOwner {
-            process: Some(Self {
-                child,
-                input: None,
-                output: None,
-                control: None,
-                writer: None,
-                reader: None,
-                input_error: Arc::new(Mutex::new(None)),
-                reaped: None,
-                io_panicked: false,
-                transport: Arc::new(TransportHealth::default()),
-                #[cfg(test)]
-                injected_input: Arc::new(Mutex::new(None)),
-            }),
-            before_wait,
-        };
-        let mut stdin = owner.child.stdin.take().context("migration input pipe")?;
-        let mut stdout = output(&mut owner.child)?;
-        let (input, incoming) = mpsc::sync_channel::<Vec<u8>>(1);
-        let (urgent, controls) = mpsc::sync_channel::<Vec<u8>>(1);
-        let (outgoing, output) = mpsc::sync_channel(1);
-        owner.input = Some(input);
-        owner.control = Some(urgent);
-        owner.output = Some(output);
-        let errors = owner.input_error.clone();
-        let write_stop = stop.clone();
-        let write_health = owner.transport.clone();
-        let read_health = owner.transport.clone();
-        #[cfg(test)]
-        let injected = owner.injected_input.clone();
-        owner.writer = Some(
-            thread::Builder::new()
-                .name("migration-input".into())
-                .spawn(move || {
-                    let mut completion = IoCompletion {
-                        health: write_health,
-                        completed: false,
-                    };
-                    loop {
-                        #[cfg(test)]
-                        let injected_frame =
-                            injected.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        #[cfg(not(test))]
-                        let injected_frame: Option<Vec<u8>> = None;
-                        let frame = if let Some(frame) = injected_frame {
-                            frame
-                        } else {
-                            match controls.try_recv() {
-                                Ok(frame) => frame,
-                                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                                    match incoming.recv_timeout(Duration::from_millis(2)) {
-                                        Ok(frame) => frame,
-                                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                                    }
-                                }
-                            }
-                        };
-                        let result = stdin.write_all(&frame).and_then(|_| stdin.flush());
-                        if let Err(error) = result {
-                            completion.health.failed.store(true, Ordering::Release);
-                            *errors.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(error.to_string());
-                            write_stop.admission.store(true, Ordering::Release);
-                            break;
-                        }
-                    }
-                    completion.completed = true;
-                    // Closing this pipe revokes helper ownership even if the GUI died
-                    // before it could send an explicit cancellation frame.
-                })?,
-        );
-        owner.reader = Some(
-            thread::Builder::new()
-                .name("migration-output".into())
-                .spawn(move || {
-                    let mut completion = IoCompletion {
-                        health: read_health,
-                        completed: false,
-                    };
-                    loop {
-                        let frame = read_frame_optional::<T>(&mut stdout);
-                        match &frame {
-                            Err(_) => completion.health.failed.store(true, Ordering::Release),
-                            Ok(None) => completion.health.eof.store(true, Ordering::Release),
-                            Ok(Some(_)) => {}
-                        }
-                        #[cfg(all(test, feature = "internal-capacity-probes"))]
-                        crate::capacity_probes::observe(
-                            crate::capacity_probes::FRAME_OUTPUT,
-                            std::mem::size_of_val(&frame),
-                        );
-                        let failed = !matches!(&frame, Ok(Some(_)));
-                        if failed {
-                            stop.admission.store(true, Ordering::Release);
-                        }
-                        if outgoing.send(frame).is_err() || failed {
-                            break;
-                        }
-                    }
-                    completion.completed = true;
-                })?,
-        );
-        Ok(owner.process.take().expect("complete owned process setup"))
+        Self::spawn_configured_owned(command, stop, output)
+            .map_err(|failure| failure.drain_legacy(before_wait))
     }
     #[cfg(test)]
     pub(crate) fn input_failure_probe(&self) -> Arc<Mutex<Option<Vec<u8>>>> {
         self.injected_input.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_wait_failures(&mut self, count: usize) {
+        self.injected_wait_failures = count;
     }
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
@@ -380,6 +431,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     }
 }
 impl<T> Process<T> {
+    #[cfg(test)]
+    pub(crate) fn inject_io_panic_report(&mut self) {
+        self.io_panicked = true;
+    }
     /// Nonblocking first pass over every owned child. Call this for the executor
     /// and both Sources before waiting for any one child; a failed first kill
     /// must not postpone revoking the other owners.
@@ -394,39 +449,57 @@ impl<T> Process<T> {
     /// Checked I/O completion for managed relays. A join panic is reported as an
     /// operation failure; joining still proves that thread has terminated.
     pub(crate) fn drain_checked(&mut self) -> Result<()> {
-        self.terminate();
+        let report = loop {
+            match self.retry_drain() {
+                Ok(Some(report)) => break report,
+                Ok(None) | Err(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        };
         ensure!(
-            !self.io_panicked,
+            !report.io_panicked,
             "migration I/O thread panicked during owned drain"
         );
         Ok(())
     }
-    /// Revokes both channels before kill/wait, so a reader blocked on its
-    /// bounded output queue cannot obstruct cleanup. Never called on the actor.
-    pub(crate) fn terminate(&mut self) {
+    /// One retryable drain step. A wait error retains Child and every pipe
+    /// handle. Join handles are consumed only after confirmed process reap;
+    /// their panic result proves the corresponding thread terminated.
+    pub(crate) fn retry_drain(&mut self) -> Result<Option<DrainReport>> {
         self.input.take();
         self.control.take();
         self.output.take();
-        self.reap_before_release();
+        if self.reaped.is_none() {
+            #[cfg(test)]
+            if self.injected_wait_failures != 0 {
+                self.injected_wait_failures -= 1;
+                anyhow::bail!("injected migration child wait failure");
+            }
+            match self.child.try_wait()? {
+                Some(status) => self.reaped = Some(status),
+                None => {
+                    let _ = self.child.kill();
+                    return Ok(None);
+                }
+            }
+        }
         if let Some(writer) = self.writer.take() {
             self.io_panicked |= writer.join().is_err();
         }
         if let Some(reader) = self.reader.take() {
             self.io_panicked |= reader.join().is_err();
         }
+        Ok(Some(DrainReport {
+            status: self.reaped.expect("confirmed process reap"),
+            io_panicked: self.io_panicked,
+        }))
     }
-    fn reap_before_release(&mut self) {
-        // Reap errors cannot authorize releasing a parent writer permit. Keep
-        // ownership and retry rather than returning an unverified terminal.
-        while self.reaped.is_none() {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.reaped = Some(status);
-                break;
-            }
-            let _ = self.child.kill();
-            match self.child.wait() {
-                Ok(status) => self.reaped = Some(status),
-                Err(_) => thread::sleep(Duration::from_millis(20)),
+    /// Revokes both channels before kill/wait, so a reader blocked on its
+    /// bounded output queue cannot obstruct cleanup. Never called on the actor.
+    pub(crate) fn terminate(&mut self) {
+        loop {
+            match self.retry_drain() {
+                Ok(Some(_)) => return,
+                Ok(None) | Err(_) => thread::sleep(Duration::from_millis(20)),
             }
         }
     }
@@ -565,6 +638,56 @@ mod managed_setup_tests {
             );
         }
         println!("PARTIAL_SOURCE_SETUP pid={pid} callback_before_wait=true owner_joined=true");
+        Ok(())
+    }
+
+    #[test]
+    fn lm_supervisor_batch2_partial_spawn_and_wait_error_retain_one_checked_owner() -> Result<()> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args(["--exact", "lightroom_migration_worker::source_reader::relay::broker::tests::owned_broker_source_fixture", "--nocapture"])
+            .env("PHOTOCATALOG_OWNED_BROKER_SOURCE_FIXTURE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        source_environment(&mut command);
+        let failure = match Process::<ChildFrame>::spawn_configured_owned(
+            command,
+            Arc::new(Stop::default()),
+            |child| anyhow::bail!("injected output setup failure for child {}", child.id()),
+        ) {
+            Ok(_) => anyhow::bail!("partial setup unexpectedly succeeded"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("injected output setup"));
+        let mut process = failure.process.context("partial Process owner required")?;
+        let pid = process.pid();
+        process.writer = Some(thread::spawn(|| panic!("injected completed I/O panic")));
+        process.inject_wait_failures(1);
+        process.revoke();
+        assert!(process.retry_drain().is_err());
+        assert!(process.reaped.is_none());
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let report = loop {
+            if let Some(report) = process.retry_drain()? {
+                break report;
+            }
+            ensure!(
+                std::time::Instant::now() < until,
+                "partial owner drain deadline"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert!(report.io_panicked);
+        let repeated = process
+            .retry_drain()?
+            .context("completed drain remains idempotently observable")?;
+        assert_eq!(report.status, repeated.status);
+        assert_eq!(report.io_panicked, repeated.io_panicked);
+        #[cfg(unix)]
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        println!(
+            "LM_PARTIAL_SETUP child_pid={pid} first_wait_error=retained final_reap=true io_panic_terminated=true repeated_join=false"
+        );
         Ok(())
     }
 }

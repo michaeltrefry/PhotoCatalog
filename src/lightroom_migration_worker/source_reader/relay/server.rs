@@ -392,10 +392,33 @@ impl Owner {
         // Signal BOTH children before the first retrying wait/pipe join.
         self.revoke_all();
         let mut first = None;
-        for slot in self.slots.iter_mut().flatten() {
-            if let Err(error) = slot.process.drain_checked() {
-                first.get_or_insert(error);
+        loop {
+            let mut complete = true;
+            for slot in self.slots.iter_mut().flatten() {
+                match slot.process.retry_drain() {
+                    Ok(Some(report)) => {
+                        if report.io_panicked {
+                            first.get_or_insert_with(|| {
+                                anyhow::anyhow!("Source I/O thread panicked during owned drain")
+                            });
+                        }
+                        if !report.status.success() && !slot.closing {
+                            first.get_or_insert_with(|| {
+                                anyhow::anyhow!("Source helper exited {}", report.status)
+                            });
+                        }
+                    }
+                    Ok(None) => complete = false,
+                    Err(error) => {
+                        first.get_or_insert(error);
+                        complete = false;
+                    }
+                }
             }
+            if complete {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         self.slots = [None, None];
         if let Some(error) = first {

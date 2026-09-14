@@ -568,6 +568,50 @@ fn source_charge_needs_quiescence_and_reuses_only_exact_retired_epoch() -> Resul
 }
 
 #[test]
+fn lm_supervisor_batch2_source_wait_failure_is_retained_through_broker_reap() -> Result<()> {
+    let stop = Arc::new(Stop::default());
+    let pids = Arc::new(Mutex::new(Vec::new()));
+    let seen = pids.clone();
+    let mut broker = Broker::start_with(
+        guard(),
+        stop,
+        MemoryBudget::new(1024 * 1024)?,
+        move |_, child_stop, _| {
+            let mut command = OsCommand::new(std::env::current_exe()?);
+            command
+                .args(["--exact", HELPER, "--nocapture"])
+                .env(ENV, "1");
+            crate::lightroom_migration_worker::process::source_environment(&mut command);
+            let mut process = Process::spawn_test_command(command, child_stop)?;
+            process.inject_wait_failures(1);
+            seen.lock().unwrap().push(process.pid());
+            Ok(process)
+        },
+    )?;
+    let _token = start(&broker, 1, Kind::Sql, "sql")?;
+    broker.revoke_after_lm();
+    let until = Instant::now() + Duration::from_secs(5);
+    let report = loop {
+        if let Some(report) = broker.retry_finish() {
+            break report;
+        }
+        ensure!(Instant::now() < until, "Source broker retry deadline");
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert!(report.failure.as_ref().is_some_and(|error| {
+        error
+            .to_string()
+            .contains("injected migration child wait failure")
+    }));
+    assert!(broker.retry_finish().unwrap().failure.is_none());
+    absent(&pids);
+    println!(
+        "SOURCE_WAIT_RETRY first_wait_error=retained broker_joined=true repeated_child_join=false"
+    );
+    Ok(())
+}
+
+#[test]
 fn stale_quiescence_early_reuse_and_denial_retain_source_charge() -> Result<()> {
     for invalid in 0..4 {
         let budget = MemoryBudget::new(100)?;

@@ -12,6 +12,13 @@ pub(super) enum Outcome {
     Finished(Result<()>),
     Panicked(Box<dyn Any + Send>),
 }
+pub(super) fn panic_detail(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload")
+}
 struct Retirement {
     requested: Mutex<bool>,
     changed: Condvar,
@@ -21,20 +28,36 @@ pub(super) struct Lease {
     retirement: Arc<Retirement>,
 }
 impl Lease {
-    pub(super) fn retire(&mut self) -> Result<()> {
-        let Some(thread) = self.thread.take() else {
-            return Ok(());
-        };
+    fn request_retirement(&self) {
         *self
             .retirement
             .requested
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = true;
         self.retirement.changed.notify_all();
-        thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("migration permit owner panicked during retirement"))?;
-        Ok(())
+    }
+    pub(super) fn retry_retire(&mut self) -> Option<Result<()>> {
+        self.request_retirement();
+        let Some(thread) = self.thread.as_ref() else {
+            return Some(Ok(()));
+        };
+        if !thread.is_finished() {
+            return None;
+        }
+        let thread = self.thread.take().expect("finished permit owner");
+        Some(
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("migration permit owner panicked during retirement")),
+        )
+    }
+    pub(super) fn retire(&mut self) -> Result<()> {
+        loop {
+            if let Some(result) = self.retry_retire() {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
 impl Drop for Lease {
@@ -50,6 +73,10 @@ pub(super) struct Pending<A: Admission> {
     pub(super) sequence: u64,
     pub(super) kind: WriteKind,
 }
+pub(super) struct StartFailure<A> {
+    pub(super) admission: A,
+    pub(super) error: anyhow::Error,
+}
 impl<A: Admission> Pending<A> {
     pub(super) fn start(
         admission: A,
@@ -59,7 +86,7 @@ impl<A: Admission> Pending<A> {
         lock: Option<FileKey>,
         stop: Arc<Stop>,
         until: Instant,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, StartFailure<A>> {
         let state = Arc::new(Mutex::new(Some(admission)));
         let worker_state = state.clone();
         let ready = Arc::new(Mutex::new(None));
@@ -140,13 +167,14 @@ impl<A: Admission> Pending<A> {
                 sequence,
                 kind,
             }),
-            Err(error) => {
-                if let Some(mut admission) = state.lock().unwrap_or_else(|e| e.into_inner()).take()
-                {
-                    admission.release(sequence, kind);
-                }
-                Err(error.into())
-            }
+            Err(error) => Err(StartFailure {
+                admission: state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .expect("unstarted admission owner"),
+                error: error.into(),
+            }),
         }
     }
     pub(super) fn finished(&self) -> bool {
@@ -176,19 +204,19 @@ impl<A: Admission> Pending<A> {
             retirement: self.lease.retirement.clone(),
         }
     }
-    /// Only after the executor/Source drain, or for a never-granted failed wait.
-    pub(super) fn join(&mut self) -> (A, Outcome) {
+    /// Only after executor/Source revocation, or for a never-granted failed wait.
+    pub(super) fn retry_join(&mut self) -> Option<(A, Outcome)> {
         self.stop.cancel();
-        let joined = self.lease.retire();
+        let joined = self.lease.retry_retire()?;
         let (admission, outcome) = self.take_ready();
-        (
+        Some((
             admission,
             if let Err(error) = joined {
                 Outcome::Finished(Err(error))
             } else {
                 outcome
             },
-        )
+        ))
     }
 }
 impl<A: Admission> Drop for Pending<A> {
@@ -198,7 +226,9 @@ impl<A: Admission> Drop for Pending<A> {
             let _ = self.lease.retire();
             if let Some(mut admission) = self.state.lock().unwrap_or_else(|e| e.into_inner()).take()
             {
-                admission.release(self.sequence, self.kind);
+                while admission.release(self.sequence, self.kind).is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
             }
         }
     }

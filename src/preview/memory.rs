@@ -23,6 +23,21 @@ pub struct ByteReservation {
     budget: ByteBudget,
     bytes: u64,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ByteLimit {
+    pub(crate) required: u64,
+    pub(crate) available: u64,
+}
+impl std::fmt::Display for ByteLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "byte allowance exhausted; requested {} bytes, {} available",
+            self.required, self.available
+        )
+    }
+}
+impl std::error::Error for ByteLimit {}
 impl ByteBudget {
     pub fn new(limit: u64) -> Result<Self> {
         ensure!(limit > 0, "zero memory allowance");
@@ -32,18 +47,51 @@ impl ByteBudget {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).used
     }
     pub fn try_reserve(&self, bytes: u64) -> Option<ByteReservation> {
+        self.reserve_exact(bytes).ok()
+    }
+    /// Atomically reports the same-pool availability observed by the failed
+    /// reservation. Callers can preserve required/available as a typed error.
+    pub(crate) fn reserve_exact(
+        &self,
+        bytes: u64,
+    ) -> std::result::Result<ByteReservation, ByteLimit> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if bytes > state.limit - state.used {
-            return None;
+        let available = state.limit - state.used;
+        if bytes > available {
+            return Err(ByteLimit {
+                required: bytes,
+                available,
+            });
         }
         state.used += bytes;
-        Some(ByteReservation {
+        Ok(ByteReservation {
             budget: self.clone(),
             bytes,
         })
     }
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (state.limit, state.used)
+    }
 }
 impl ByteReservation {
+    pub(crate) fn grow_exact(&mut self, bytes: u64) -> std::result::Result<(), ByteLimit> {
+        let mut state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
+        let available = state.limit - state.used;
+        if bytes > available {
+            return Err(ByteLimit {
+                required: bytes,
+                available,
+            });
+        }
+        let retained = self
+            .bytes
+            .checked_add(bytes)
+            .expect("reservation cannot exceed its budget limit");
+        state.used += bytes;
+        self.bytes = retained;
+        Ok(())
+    }
     pub(crate) fn shrink(&mut self, bytes: u64) -> Result<()> {
         ensure!(bytes <= self.bytes, "reservation cannot grow by shrinking");
         self.budget.0.lock().unwrap_or_else(|p| p.into_inner()).used -= self.bytes - bytes;
@@ -274,6 +322,32 @@ impl DecodedCache {
 mod tests {
     use super::*;
     use crate::preview::{CodecSettings, encode};
+    #[test]
+    fn lm_supervisor_batch2_typed_reservation_denies_atomically_and_retries_same_pool() {
+        let pool = ByteBudget::new(100).unwrap();
+        let budget =
+            crate::lightroom_migration_worker::memory::MemoryBudget::from_shared(pool.clone());
+        let mut held = budget.reservation();
+        held.grow(40).unwrap();
+        held.grow(30).unwrap();
+        let mut refused = budget.reservation();
+        let error = refused.grow(31).unwrap_err();
+        let limit = error
+            .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+            .unwrap();
+        assert_eq!((limit.required, limit.available), (31usize, 30usize));
+        assert_eq!(pool.used(), 70);
+        drop(held);
+        refused.grow(31).unwrap();
+        assert_eq!(pool.used(), 31);
+        let mut result = budget.reservation();
+        result.grow(20).unwrap();
+        assert_eq!(pool.used(), 51);
+        drop(refused);
+        assert_eq!(pool.used(), 20);
+        drop(result);
+        assert_eq!(pool.used(), 0);
+    }
     #[test]
     fn external_references_keep_memory_charged_after_lru_eviction() {
         let rgb = PreparedRgb::new(2, 2, vec![128; 12]).unwrap();

@@ -5,7 +5,10 @@ use crate::{
         identity::Audit,
         input,
         lease::{DestinationLease, DestinationReview},
-        protocol::{Controls, Grants, Publish, read_frame},
+        protocol::{Controls, Grants, Publish, read_frame, write_frame},
+        source_reader::relay::{
+            Command as SourceCommand, Event as SourceEvent, Kind as SourceKind,
+        },
     },
     storage_volume::NativePath,
 };
@@ -18,6 +21,79 @@ use std::{
 const HELPER: &str =
     "lightroom_migration_worker::supervisor::tests::process_tests::owned_executor_fixture";
 const FIXTURE: &str = "PHOTOCATALOG_LM_OWNED_EXECUTOR_FIXTURE";
+const PART_HELPER: &str = "lightroom_migration_worker::supervisor::tests::process_tests::multipart_admission_receiver_fixture";
+const PART_FIXTURE: &str = "PHOTOCATALOG_LM_MULTIPART_RECEIVER_FIXTURE";
+
+#[test]
+fn multipart_admission_receiver_fixture() -> Result<()> {
+    if std::env::var_os(PART_FIXTURE).is_none() {
+        return Ok(());
+    }
+    let mut input = std::io::stdin();
+    let ParentFrame::BeginPart {
+        guard,
+        role,
+        blake3,
+        bytes,
+    } = read_frame(&mut input)?
+    else {
+        anyhow::bail!("multipart fixture expected BeginPart")
+    };
+    write_frame(
+        &mut std::io::stderr(),
+        &ChildFrame::NeedMemory {
+            guard: guard.clone(),
+            sequence: U64(1),
+            bytes,
+        },
+    )?;
+    let ParentFrame::MemoryGrant {
+        guard: granted_guard,
+        sequence: U64(1),
+        bytes: granted_bytes,
+    } = read_frame(&mut input)?
+    else {
+        anyhow::bail!("multipart fixture read content before MemoryGrant")
+    };
+    ensure!(
+        granted_guard == guard && granted_bytes == bytes,
+        "multipart fixture memory grant differs"
+    );
+    let mut received = String::with_capacity(usize::try_from(bytes.0)?);
+    loop {
+        match read_frame::<ParentFrame>(&mut input)? {
+            ParentFrame::Part {
+                guard: part_guard,
+                role: part_role,
+                offset,
+                text,
+            } => {
+                ensure!(
+                    part_guard == guard && part_role == role && offset.0 == received.len() as u64,
+                    "multipart fixture content order differs"
+                );
+                received.push_str(&text);
+            }
+            ParentFrame::FinishPart {
+                guard: part_guard,
+                role: part_role,
+                blake3: finished,
+            } => {
+                ensure!(
+                    part_guard == guard
+                        && part_role == role
+                        && received.len() as u64 == bytes.0
+                        && finished == blake3
+                        && finished == blake3::hash(received.as_bytes()).to_hex().as_str(),
+                    "multipart fixture completion differs"
+                );
+                break;
+            }
+            _ => anyhow::bail!("multipart fixture unexpected frame"),
+        }
+    }
+    std::process::exit(0);
+}
 
 /// Inert during an ordinary test run. A dedicated instance of this executable
 /// combines the actual lock, SQL connection and writer-control primitives.
@@ -26,6 +102,11 @@ fn owned_executor_fixture() -> Result<()> {
     let Ok(mode) = std::env::var(FIXTURE) else {
         return Ok(());
     };
+    if mode == "hang_before_input" {
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
     let mut stdin = std::io::stdin();
     let request = input::receive(&mut stdin, Instant::now() + Duration::from_secs(20))?;
     let root: NativePath = serde_json::from_str(&request.text)?;
@@ -148,13 +229,14 @@ impl Admission for Parent {
         }
         Ok(self.writers.clone())
     }
-    fn release(&mut self, sequence: u64, _: WriteKind) {
+    fn release(&mut self, sequence: u64, _: WriteKind) -> Result<()> {
         let unlocked = self.contender.try_lock_exclusive().is_ok();
         if unlocked {
             FileExt::unlock(&self.contender).unwrap();
         }
         self.released.lock().unwrap().push((sequence, unlocked));
         self.actor_held.store(false, Ordering::Release);
+        Ok(())
     }
     fn progress(&mut self, _: &str, _: u64, _: Option<u64>) -> Result<()> {
         Ok(())
@@ -190,8 +272,66 @@ fn command(mode: &str) -> Result<Command> {
         .env(FIXTURE, mode);
     Ok(command)
 }
+
 #[test]
-fn lost_release_keeps_parent_permit_until_actual_executor_reap() -> Result<()> {
+fn lm_supervisor_batch2_multipart_pumps_memory_grant_before_multichunk_content() -> Result<()> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args(["--exact", PART_HELPER, "--nocapture"])
+        .env(PART_FIXTURE, "1");
+    let stop = Arc::new(Stop::default());
+    let process = Process::spawn_test_command(command, stop.clone())?;
+    let pid = process.pid();
+    let text = format!("qualified-é-🦀-{}", "x".repeat(3 * TEXT_CHUNK));
+    let budget = MemoryBudget::new(text.len())?;
+    let mut owner = Owned {
+        process: Some(process),
+        broker: None,
+        state: State::new_streaming(
+            Admit {
+                writers: Arc::new(Writers::default()),
+                releases: Arc::new(Mutex::new(vec![])),
+            },
+            guard(),
+            "a".repeat(64),
+            budget.reservation(),
+            budget.reservation(),
+            0,
+        ),
+        lm_drained: false,
+        broker_drained: false,
+        drain_fault: None,
+        primary_broker_failure: None,
+    };
+    send_part_admitted(
+        &mut owner,
+        &guard(),
+        crate::lightroom_migration_worker::protocol::InputRole::Policy,
+        &text,
+        &stop,
+        Instant::now() + Duration::from_secs(10),
+    )?;
+    assert_eq!(owner.state.next_memory, 2);
+    assert_eq!(budget.used(), text.len());
+    let until = Instant::now() + Duration::from_secs(10);
+    while owner.process.as_mut().unwrap().try_reap()?.is_none() {
+        ensure!(Instant::now() < until, "multipart receiver exit deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    while !owner.retry_drain()? {
+        ensure!(Instant::now() < until, "multipart receiver drain deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    drop(owner);
+    assert_eq!(budget.used(), 0);
+    #[cfg(unix)]
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    println!("LM_MULTIPART child_pid={pid} grant_before_content=true chunks>3 retired=0");
+    Ok(())
+}
+#[test]
+fn lm_supervisor_batch2_lost_release_keeps_parent_permit_until_actual_executor_reap() -> Result<()>
+{
     let (_temp, catalog, parent, _needs) = setup()?;
     let released = parent.released.clone();
     let stop = Arc::new(Stop::default());
@@ -231,7 +371,8 @@ fn lost_release_keeps_parent_permit_until_actual_executor_reap() -> Result<()> {
     Ok(())
 }
 #[test]
-fn cancel_while_parent_writer_held_reaps_without_waiting_for_that_writer() -> Result<()> {
+fn lm_supervisor_batch2_cancel_while_parent_writer_held_reaps_without_waiting_for_that_writer()
+-> Result<()> {
     let (_temp, catalog, parent, needs) = setup()?;
     let held = catalog.writers.enter(Priority::Foreground)?;
     let stop = Arc::new(Stop::default());
@@ -295,7 +436,8 @@ fn cancel_while_parent_writer_held_reaps_without_waiting_for_that_writer() -> Re
 }
 
 #[test]
-fn failed_or_panicked_actor_acknowledgement_retires_hold_after_actual_reap() -> Result<()> {
+fn lm_supervisor_batch2_failed_or_panicked_actor_acknowledgement_retires_hold_after_actual_reap()
+-> Result<()> {
     for panic in [false, true] {
         let (_temp, catalog, mut parent, _needs) = setup()?;
         parent.fail_admission = Some(panic);
@@ -303,26 +445,23 @@ fn failed_or_panicked_actor_acknowledgement_retires_hold_after_actual_reap() -> 
         let released = parent.released.clone();
         let request = serde_json::to_string(&parent.root)?;
         let mut pid = None;
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_owned(
-                |stop| {
-                    let process = Process::spawn_test_command(command("normal")?, stop)?;
-                    pid = Some(process.pid());
-                    Ok(process)
-                },
-                guard(),
-                &request,
-                Arc::new(Stop::default()),
-                Instant::now() + Duration::from_secs(20),
-                parent,
-                MemoryBudget::new(2 * 1024 * 1024 * 1024)?,
-            )
-        }));
-        if panic {
-            assert!(outcome.is_err());
-        } else {
-            assert!(outcome.unwrap().is_err());
-        }
+        let outcome = execute_owned(
+            |stop| {
+                let process = Process::spawn_test_command(command("normal")?, stop)?;
+                pid = Some(process.pid());
+                Ok(process)
+            },
+            guard(),
+            &request,
+            Arc::new(Stop::default()),
+            Instant::now() + Duration::from_secs(20),
+            parent,
+            MemoryBudget::new(2 * 1024 * 1024 * 1024)?,
+        );
+        let error = outcome
+            .err()
+            .context("failed actor acknowledgement required")?;
+        assert_eq!(error.to_string().contains("panicked"), panic);
         assert!(!actor_held.load(Ordering::Acquire));
         // The callback can acquire the physical lock only after the helper has
         // exited; no GrantWrite was sent, so its SQL table must not exist.
@@ -347,7 +486,8 @@ fn failed_or_panicked_actor_acknowledgement_retires_hold_after_actual_reap() -> 
 }
 
 #[test]
-fn parent_pool_refuses_before_spawn_and_charges_saved_result_after_reap() -> Result<()> {
+fn lm_supervisor_batch2_parent_pool_refuses_before_spawn_and_charges_saved_result_after_reap()
+-> Result<()> {
     let (_temp, _catalog, parent, _needs) = setup()?;
     let request = serde_json::to_string(&parent.root)?;
     let tiny = MemoryBudget::new(1)?;
@@ -396,6 +536,417 @@ fn parent_pool_refuses_before_spawn_and_charges_saved_result_after_reap() -> Res
         "PARENT_MEMORY child_pid={} reaped=true saved_result_charge={} final_charge=0",
         pid.unwrap(),
         RESULT_BYTES
+    );
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch2_failed_wait_stays_addressable_until_checked_retry() -> Result<()> {
+    let (_temp, _catalog, parent, _needs) = setup()?;
+    let request = serde_json::to_string(&parent.root)?;
+    let budget = MemoryBudget::new(2 * 1024 * 1024 * 1024)?;
+    let stop = Arc::new(Stop::default());
+    let cancel = stop.clone();
+    let (pids, seen) = mpsc::sync_channel(1);
+    let canceler = thread::spawn(move || -> Result<()> {
+        let _ = seen.recv_timeout(Duration::from_secs(5))?;
+        thread::sleep(Duration::from_millis(20));
+        cancel.cancel();
+        Ok(())
+    });
+    let mut operation = execute_owned_operation(
+        |stop| {
+            let mut process = Process::spawn_test_command_owned(
+                command("hang_before_input").map_err(|error| SpawnFailure {
+                    error,
+                    process: None,
+                })?,
+                stop,
+            )?;
+            process.inject_wait_failures(1);
+            let _ = pids.send(process.pid());
+            Ok(process)
+        },
+        guard(),
+        &request,
+        stop,
+        Instant::now() + Duration::from_secs(10),
+        parent,
+        budget.clone(),
+        None,
+    );
+    canceler
+        .join()
+        .map_err(|_| anyhow::anyhow!("canceler panicked"))??;
+    assert!(operation.poll());
+    let Operation::DrainPending(pending) = &operation else {
+        anyhow::bail!("unconfirmed wait must return DrainPending")
+    };
+    assert!(matches!(
+        pending.failure().map(|failure| &failure.cause),
+        Some(FailureCause::Canceled)
+    ));
+    assert!(!pending.failure().unwrap().poisoned);
+    let held = budget.used();
+    assert!(held > 0);
+    assert!(operation.retry_drain().is_none());
+    let Operation::DrainPending(pending) = &operation else {
+        anyhow::bail!("failed wait retired operation")
+    };
+    assert!(pending.failure().unwrap().poisoned);
+    assert!(pending.failure().unwrap().outcome_unknown);
+    let until = Instant::now() + Duration::from_secs(5);
+    while operation.retry_drain().is_none() {
+        ensure!(Instant::now() < until, "owned wait retry deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(matches!(operation, Operation::Drained(Drained::Failed(_))));
+    assert_eq!(budget.used(), 0);
+    println!(
+        "LM_DRAIN_PENDING held_before_retry={held} typed=canceled poisoned=true outcome_unknown=true final_charge=0"
+    );
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch2_postspawn_failure_is_owned_and_drop_drains_last_resort() -> Result<()> {
+    let (_temp, _catalog, parent, _needs) = setup()?;
+    let request = serde_json::to_string(&parent.root)?;
+    let budget = MemoryBudget::new(2 * 1024 * 1024 * 1024)?;
+    let mut child_pid = None;
+    let operation = execute_owned_operation(
+        |stop| {
+            let configured = command("hang_before_input").map_err(|error| SpawnFailure {
+                error,
+                process: None,
+            })?;
+            let process = Process::spawn_test_command_owned(configured, stop)?;
+            child_pid = Some(process.pid());
+            Err(SpawnFailure {
+                error: anyhow::anyhow!("injected failure after Child ownership"),
+                process: Some(process),
+            })
+        },
+        guard(),
+        &request,
+        Arc::new(Stop::default()),
+        Instant::now() + Duration::from_secs(10),
+        parent,
+        budget.clone(),
+        None,
+    );
+    let Operation::DrainPending(pending) = &operation else {
+        anyhow::bail!("postspawn failure must retain DrainPending")
+    };
+    assert!(
+        matches!(pending.failure().map(|failure| &failure.cause), Some(FailureCause::Rejected(detail)) if detail.contains("after Child ownership"))
+    );
+    assert!(!pending.failure().unwrap().poisoned);
+    let held = budget.used();
+    assert!(held > 0);
+    let pid = child_pid.context("postspawn child pid")?;
+    drop(operation);
+    assert_eq!(budget.used(), 0);
+    #[cfg(unix)]
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    println!(
+        "LM_POSTSPAWN_DROP child_pid={pid} held_before_drop={held} blocking_last_resort=true final_charge=0"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn broker_stop_fixture(
+    internal_failure: bool,
+    inject_lm_io_panic: bool,
+) -> Result<(
+    tempfile::TempDir,
+    Operation<Admit>,
+    crate::preview::ByteBudget,
+    crate::preview::ByteReservation,
+    u32,
+    u32,
+)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let source_pid_path = temp.path().join("source.pid");
+    let source_executable = temp.path().join("source-wrapper");
+    let current = std::env::current_exe()?;
+    let current = current.to_str().context("non-UTF-8 test executable path")?;
+    let source_pid_path_text = source_pid_path
+        .to_str()
+        .context("non-UTF-8 Source pid path")?;
+    ensure!(
+        !current.contains('\'')
+            && !current.contains('\n')
+            && !source_pid_path_text.contains('\'')
+            && !source_pid_path_text.contains('\n'),
+        "fixture path cannot be represented by its fixed shell wrapper"
+    );
+    std::fs::write(
+        &source_executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{source_pid_path_text}'\nPHOTOCATALOG_OWNED_BROKER_SOURCE_FIXTURE=1 exec '{current}' --exact lightroom_migration_worker::source_reader::relay::broker::tests::owned_broker_source_fixture --nocapture\n"
+        ),
+    )?;
+    std::fs::set_permissions(&source_executable, std::fs::Permissions::from_mode(0o700))?;
+
+    let backing = crate::lightroom_migration_worker::memory::layout::add(
+        crate::lightroom_migration_worker::memory::layout::add(
+            Process::<ChildFrame>::allocation_backing()?,
+            Broker::allocation_backing()?,
+        )?,
+        crate::lightroom_migration_worker::memory::layout::add(
+            source_executable.as_os_str().len(),
+            crate::lightroom_migration_worker::memory::transport::payloads(true)?.total()?,
+        )?,
+    )?;
+    let pool = crate::preview::ByteBudget::new(u64::try_from(
+        backing
+            .checked_add(61)
+            .context("typed Broker fixture allowance overflow")?,
+    )?)?;
+    let budget = MemoryBudget::from_shared(pool.clone());
+    let mut operation_memory = budget.reservation();
+    operation_memory.grow(backing)?;
+    let competing = pool
+        .reserve_exact(60)
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    let stop = Arc::new(Stop::default());
+    let broker = Broker::start(source_executable, guard(), stop.clone(), budget.clone())?;
+    let mut start = Some(SourceCommand::Start {
+        sequence: U64(1),
+        kind: SourceKind::Sql,
+        reader: "typed-limit".into(),
+    });
+    let until = Instant::now() + Duration::from_secs(10);
+    while let Some(command) = start.take() {
+        start = broker.try_send(command)?;
+        ensure!(Instant::now() < until, "Source start send deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let token = loop {
+        if let Some(SourceEvent::Started { token, .. }) = broker.try_receive()? {
+            break token;
+        }
+        ensure!(
+            Instant::now() < until,
+            "Source start acknowledgement deadline"
+        );
+        thread::sleep(Duration::from_millis(2));
+    };
+    let source_pid = loop {
+        match std::fs::read_to_string(&source_pid_path) {
+            Ok(text) => {
+                if let Ok(pid) = text.trim().parse::<u32>()
+                    && pid != 0
+                {
+                    break pid;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(Instant::now() < until, "Source fixture pid deadline");
+        thread::sleep(Duration::from_millis(2));
+    };
+    let mut process =
+        match Process::spawn_test_command_owned(command("hang_before_input")?, stop.clone()) {
+            Ok(process) => process,
+            Err(mut failure) => {
+                if let Some(process) = &mut failure.process {
+                    process.revoke();
+                    process.terminate();
+                }
+                return Err(failure.error);
+            }
+        };
+    let lm_pid = process.pid();
+    if inject_lm_io_panic {
+        process.inject_io_panic_report();
+    }
+
+    if internal_failure {
+        let mut reserve = Some(SourceCommand::Reserve {
+            token,
+            sequence: U64(1),
+            bytes: U64(2),
+        });
+        while let Some(command) = reserve.take() {
+            reserve = broker.try_send(command)?;
+            ensure!(Instant::now() < until, "Source reserve send deadline");
+            thread::sleep(Duration::from_millis(2));
+        }
+        while !stop.requested() {
+            ensure!(Instant::now() < until, "typed Broker refusal deadline");
+            thread::sleep(Duration::from_millis(2));
+        }
+    } else {
+        stop.cancel();
+    }
+
+    let state = State::new_streaming(
+        Admit {
+            writers: Arc::new(Writers::default()),
+            releases: Arc::new(Mutex::new(Vec::new())),
+        },
+        guard(),
+        "a".repeat(64),
+        operation_memory,
+        budget.reservation(),
+        0,
+    );
+    let operation = Operation::Running(Running {
+        ended: false,
+        command: None,
+        data: None,
+        control: None,
+        stop,
+        until,
+        owner: Some(Owned {
+            process: Some(process),
+            broker: Some(broker),
+            lm_drained: false,
+            broker_drained: false,
+            drain_fault: None,
+            primary_broker_failure: None,
+            state,
+        }),
+        result_memory: None,
+    });
+    Ok((temp, operation, pool, competing, lm_pid, source_pid))
+}
+
+#[cfg(unix)]
+fn drain_broker_stop_fixture(operation: &mut Operation<Admit>, until: Instant) -> Result<&Drained> {
+    assert!(operation.poll());
+    loop {
+        if operation.retry_drain().is_some() {
+            break;
+        }
+        ensure!(Instant::now() < until, "Broker stop checked drain deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    match operation {
+        Operation::Drained(drained) => Ok(drained),
+        Operation::Running(_) | Operation::DrainPending(_) => unreachable!(),
+    }
+}
+
+#[cfg(unix)]
+fn transition_with_secondary_cancel(operation: &mut Operation<Admit>) {
+    let pending = match operation {
+        Operation::Running(running) => {
+            let budget = running
+                .owner
+                .as_ref()
+                .expect("running Broker owner")
+                .state
+                .memory
+                .budget();
+            running.take_pending(Some(Failure::from_error(
+                OperationCanceled.into(),
+                false,
+                false,
+                &budget,
+            )))
+        }
+        Operation::Drained(_) | Operation::DrainPending(_) => {
+            panic!("Broker fixture must begin running")
+        }
+    };
+    *operation = Operation::DrainPending(pending);
+}
+
+#[cfg(unix)]
+fn assert_processes_reaped(pids: [u32; 2]) {
+    for pid in pids {
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lm_supervisor_batch2_broker_resource_limit_precedes_internal_cancel_and_lm_io_panic()
+-> Result<()> {
+    let (_temp, mut operation, pool, competing, lm_pid, source_pid) =
+        broker_stop_fixture(true, true)?;
+    let drained =
+        drain_broker_stop_fixture(&mut operation, Instant::now() + Duration::from_secs(10))?;
+    let Drained::Failed(failure) = drained else {
+        anyhow::bail!("typed Broker refusal completed successfully")
+    };
+    let FailureCause::ResourceLimit(limit) = &failure.cause else {
+        anyhow::bail!("typed Broker refusal was replaced by {failure}")
+    };
+    assert_eq!((limit.required, limit.available), (2, 1));
+    assert!(failure.poisoned);
+    assert!(!failure.outcome_unknown);
+    assert_eq!(pool.used(), 60);
+    assert_processes_reaped([lm_pid, source_pid]);
+    drop(operation);
+    drop(competing);
+    assert_eq!(pool.used(), 0);
+    println!(
+        "LM_BROKER_TYPED_LIMIT required=2 available=1 lm_pid={lm_pid} source_pid={source_pid} lm_io_panic=true checked_reap=true held_after_drain=60 final_charge=0"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn lm_supervisor_batch2_live_broker_external_cancel_remains_canceled() -> Result<()> {
+    let (_temp, mut operation, pool, competing, lm_pid, source_pid) =
+        broker_stop_fixture(false, false)?;
+    let drained =
+        drain_broker_stop_fixture(&mut operation, Instant::now() + Duration::from_secs(10))?;
+    let Drained::Failed(failure) = drained else {
+        anyhow::bail!("externally canceled Broker operation completed successfully")
+    };
+    assert!(matches!(failure.cause, FailureCause::Canceled));
+    assert!(!failure.poisoned);
+    assert!(!failure.outcome_unknown);
+    assert_eq!(pool.used(), 60);
+    assert_processes_reaped([lm_pid, source_pid]);
+    drop(operation);
+    drop(competing);
+    assert_eq!(pool.used(), 0);
+    println!(
+        "LM_BROKER_EXTERNAL_CANCEL lm_pid={lm_pid} source_pid={source_pid} typed=canceled checked_reap=true held_after_drain=60 final_charge=0"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn lm_supervisor_batch2_joined_broker_primary_replaces_secondary_pending_cancel() -> Result<()> {
+    let (_temp, mut operation, pool, competing, lm_pid, source_pid) =
+        broker_stop_fixture(true, false)?;
+    transition_with_secondary_cancel(&mut operation);
+    let drained =
+        drain_broker_stop_fixture(&mut operation, Instant::now() + Duration::from_secs(10))?;
+    let Drained::Failed(failure) = drained else {
+        anyhow::bail!("typed Broker refusal completed successfully")
+    };
+    let FailureCause::ResourceLimit(limit) = &failure.cause else {
+        anyhow::bail!("secondary pending cause replaced joined Broker failure: {failure}")
+    };
+    assert_eq!((limit.required, limit.available), (2, 1));
+    assert!(failure.poisoned);
+    assert!(!failure.outcome_unknown);
+    assert_eq!(pool.used(), 60);
+    assert_processes_reaped([lm_pid, source_pid]);
+    drop(operation);
+    drop(competing);
+    assert_eq!(pool.used(), 0);
+    println!(
+        "LM_BROKER_PRIMARY_AFTER_PENDING required=2 available=1 secondary=canceled lm_pid={lm_pid} source_pid={source_pid} checked_reap=true held_after_drain=60 final_charge=0"
     );
     Ok(())
 }

@@ -28,6 +28,10 @@ struct Control {
     // At most one exact failure for each of the two live epochs. This reserved
     // storage is independent of the normal event queue's occupancy.
     urgent: [Option<Event>; 2],
+    // The original typed broker failure stays here until the broker thread has
+    // ended and G performs its checked join. The shared Stop is only a wakeup
+    // and must not replace this cause with generic cancellation.
+    failure: Option<anyhow::Error>,
 }
 struct Shared {
     state: Mutex<Control>,
@@ -41,6 +45,15 @@ pub(crate) struct Broker {
     // Survives worker-thread exit until G's Owned has waited LM and this broker.
     // Only acknowledged per-epoch quiescence removes a charge early.
     _charges: super::server::Charges,
+}
+pub(crate) struct DrainReport {
+    pub(crate) failure: Option<anyhow::Error>,
+    pub(crate) primary_failure: bool,
+}
+pub(crate) enum StopState {
+    Running,
+    BrokerFailed,
+    Canceled,
 }
 impl Broker {
     pub(crate) fn allocation_backing() -> Result<usize> {
@@ -95,7 +108,7 @@ impl Broker {
             Process::spawn_role_with_cleanup(&executable, role, stop, Some(before_wait))
         })
     }
-    fn start_with(
+    pub(crate) fn start_with(
         guard: Guard,
         stop: Arc<Stop>,
         memory: MemoryBudget,
@@ -119,6 +132,7 @@ impl Broker {
                 #[cfg(test)]
                 event_full: false,
                 urgent: [None, None],
+                failure: None,
             }),
             changed: Condvar::new(),
         });
@@ -200,8 +214,8 @@ impl Broker {
                                             command,
                                             &mut |kind, child_stop, revoke_sources| {
                                                 spawn(kind, child_stop, &mut || {
-                                                    // The partial Process has already been revoked
-                                                    // by SetupOwner before entering this callback.
+                                                    // The partial Process is already revoked by its
+                                                    // owned SpawnFailure before this callback waits.
                                                     stop.cancel();
                                                     revoke_sources();
                                                     let mut state = control
@@ -240,15 +254,20 @@ impl Broker {
                                 .unwrap_or_else(|e| e.into_inner());
                         }
                     }));
-                let result = match run {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!("Source broker panicked")),
+                let failure = match run {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some(anyhow::anyhow!("Source broker panicked")),
                 };
-                if let Err(error) = &result {
-                    let detail = super::super::owner::reply_error_text(error);
+                if let Some(error) = failure {
+                    let detail = super::super::owner::reply_error_text(&error);
                     let urgent = draining.owner.failures(&detail);
                     let mut state = control.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.urgent = urgent;
+                    state.failure = Some(error);
+                    // Publish the typed cause before setting Stop while holding
+                    // the same mutex used by stop_state(), so G cannot observe
+                    // this internal wakeup as an unrelated cancellation.
                     stop.cancel();
                     control.changed.notify_all();
                 }
@@ -256,7 +275,7 @@ impl Broker {
                 // this scope before G has acknowledged its own LM revocation.
                 let drained = draining.finish();
                 drop(draining);
-                result.and(drained)
+                drained
             })
             .context("start owned Source broker")?;
         Ok(Self {
@@ -298,6 +317,16 @@ impl Broker {
             Err(TryRecvError::Disconnected) => anyhow::bail!("Source broker ended"),
         }
     }
+    pub(crate) fn stop_state(&self, stop: &Stop) -> StopState {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.failure.is_some() {
+            StopState::BrokerFailed
+        } else if stop.requested() {
+            StopState::Canceled
+        } else {
+            StopState::Running
+        }
+    }
     /// Caller has already revoked LM. Signal the independent broker immediately;
     /// no join or source wait can precede that acknowledgement.
     pub(crate) fn revoke_after_lm(&self) {
@@ -328,15 +357,56 @@ impl Broker {
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
-    pub(crate) fn finish(&mut self) -> Result<()> {
+    pub(crate) fn revoked(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .revoked
+    }
+    /// Nonblocking join boundary. A join panic proves the broker thread ended;
+    /// its failure is returned as a drained poison rather than a retryable wait.
+    pub(crate) fn retry_finish(&mut self) -> Option<DrainReport> {
         self.revoke_after_lm();
         self.commands.take();
-        if let Some(worker) = self.worker.take() {
-            return worker
-                .join()
-                .map_err(|_| anyhow::anyhow!("Source broker join panic"))?;
+        let Some(worker) = self.worker.as_ref() else {
+            return Some(DrainReport {
+                failure: None,
+                primary_failure: false,
+            });
+        };
+        if !worker.is_finished() {
+            return None;
         }
-        Ok(())
+        let worker = self.worker.take().expect("finished broker owner");
+        let joined = match worker.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(anyhow::anyhow!("Source broker join panic")),
+        };
+        // A run failure is moved exactly once only after checked thread join.
+        // It takes precedence over a secondary drain error or join panic.
+        let recorded = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .take();
+        let primary_failure = recorded.is_some();
+        let failure = recorded.or(joined);
+        Some(DrainReport {
+            failure,
+            primary_failure,
+        })
+    }
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        loop {
+            if let Some(report) = self.retry_finish() {
+                return report.failure.map_or(Ok(()), Err);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 impl Drop for Broker {
