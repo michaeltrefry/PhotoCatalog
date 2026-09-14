@@ -59,6 +59,13 @@ PIDs absent; raw4726f042 and passing-receipt885bb117 retained. The one bounded
 fix/test now preserves actual Broker failure over internal cancellation. No
 batch2 completion claim until its successor review and affected gate pass.
 No executor/G-C caller exists.
+Typed-cause successor T174251 remains CHANGES_REQUIRED0.99 (9744822a): a
+generic LM I/O drain fault can occupy the terminal slot before the primary
+Broker error. Bounded repair retains primary error precedence through checked
+join, tests exact required2/available1 together with LM I/O panic, and tests
+external cancellation with a live nonfailed Broker. No native grant on rejected
+source. Shortcut23430 read back; prior sixteen-test evidence remains valid for
+its frozen source, without a batch2 completion claim.
 Sol/high implements and independently reviews using separate agents, reusing
 context because new-agent thread capacity was exhausted.
 Earlier actual Source evidence used an LM thread substitute; that limitation
@@ -87,6 +94,15 @@ final evidence PASS0.99 (3e33a444); Rust hashes are identical. Component8f03d7d3
 is integrated as786be8c with fifteen blob matches and formatting PASS. Combined
 integration is held until LM batch2 passes; its conditional retry owns CPU2.
 
+
+Read-only next FS9 assessment (not implementation authorization): original
+`VerifiedFile` continuity at accept/publish genuinely needs an F-owned lease;
+`PhotoPublication` owns operation lock plus payload/destination/capture handles
+across capture/link/restore and remains a separate full stateful component.
+Current `ExportService::open` still owns filesystem executor lock/staging in C,
+and `ExportWorkerProcess::spawn` remains C-local. G-owned export process and
+F-owned staging/original acquisition remain explicit managed-route prerequisites.
+No new source work starts from this assessment before current combined checkpoint.
 
 ## Retained verified component history
 
