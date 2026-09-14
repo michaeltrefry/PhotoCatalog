@@ -45,10 +45,35 @@ FS8 native/stage/prepared design v6 passed independent review; actual child
 ownership, header/full decode and shared scheduler implementation is in progress.
 The F-stage repair passed bounded source review: exact transfer abort, retained
 prepared-folder identity, nonreplacing cleanup claims, sealed header-only rearm
-and supervisor abandonment after all native owners drain. Eight F tests, four
-stage-adapter tests and three scheduler tests are source-only until the complete
-FS8 gate runs. Full G actual-child and desktop queue acceptance remain required.
+and supervisor abandonment after all native owners drain. The first integrated
+compile found 12 errors before any test ran (receipt
+`2061d2b2c17d45a23479efe8c44a1138b1cad0a721d406b0ca484ae7851f1501`).
+Independent review found six integration defects: blocking actor I/O, incomplete
+descendant proof, render/read fairness, cache acceptance parity, premature root
+authority release, and synchronous self-wait during an existing native pause.
+Their repairs are in progress; source v3 is running compile-only verification.
+
+Two components have isolated runtime evidence, separate from package acceptance:
+four retained transport-task tests passed (receipt
+`eddc2fd016e00ea8fd6aa2b1c12916b68fa284703168931d7358e7f585954c54`),
+and twelve scheduler tests passed (eight FS8, four existing; receipt
+`db806880f32c8b14311922c4ca1c024961b7dd8f8ce1e2ddb943e3c2c1ff1e8b`).
+The scheduler now shares priority/arrival arbitration between cache reads and
+renders; retries retain request age but receive a new lease to reject stale
+completion. Independent scheduler review passed,
+`f12944cf636bde5b96e19caae2cbcae2e71b2a100aa86fce780318fab02bcb47`.
+The isolated scheduler wrapper's initial module-path compilation failure was
+retained; only the wrapper changed. Full G actual-child, concurrent stage-lane
+replay, held-transfer responsiveness and desktop queue acceptance remain open.
+
 Complete Source/core aggregate admission and migration wiring remain active.
+Managed migration requires G to own both actual SQL/raw Source processes through
+an epoch/token-bound relay; reaping LM alone cannot prove its Source children
+stopped. Preserve the existing 128 KiB Source frame grammar using bounded 16 KiB
+relay chunks, with independent health/cancel controls and cancel-all-before-join
+ordering. The shared pool cannot retire until LM and both Source process/I/O
+owners drain. Direction and API review passed (`fb85126a3ae17944d77b15fe106708baaa20b3076a7b7c669837bcf1738e8ea5`);
+implementation, simultaneous-copy accounting and abrupt-death tests are pending.
 Remaining
 filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
 the full tracked scope. Current local tests use synthetic files without RAID/GPU.
