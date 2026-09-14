@@ -70,6 +70,25 @@ pub struct EvidenceState {
     pub complete: bool,
 }
 
+/// Admit retained identities from borrowed SQLite bytes before allocating them.
+pub(crate) fn retained_identity(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    let value = row.get_ref(index)?;
+    if let rusqlite::types::ValueRef::Text(bytes) = value
+        && bytes.len() == 64
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return Ok(text.to_owned());
+    }
+    Err(rusqlite::Error::FromSqlConversionFailure(
+        index,
+        value.data_type(),
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "retained identity must be 64 bytes of UTF-8 TEXT",
+        )),
+    ))
+}
+
 pub(crate) fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(row.get::<_, i64>(index)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -351,6 +370,32 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_identity_checks_bytes_storage_and_utf8_without_normalizing() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        for value in ["g".repeat(64), "é".repeat(32)] {
+            let actual = db.query_row("SELECT ?", [&value], |r| retained_identity(r, 0))?;
+            assert_eq!(actual, value);
+        }
+        for expression in [
+            "NULL",
+            "64",
+            "zeroblob(64)",
+            "hex(zeroblob(32)) || 'x'",
+            "replace(hex(zeroblob(33)), '0', 'é')",
+            "CAST(x'ff' || zeroblob(63) AS TEXT)",
+            "'short'",
+        ] {
+            let error = db
+                .query_row(&format!("SELECT {expression}"), [], |r| {
+                    retained_identity(r, 0)
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("64 bytes of UTF-8 TEXT"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn opening_evidence_columns_admit_bytes_and_storage_before_materialization() -> Result<()> {

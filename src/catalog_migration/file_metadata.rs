@@ -498,7 +498,7 @@ struct PacketGuard {
     complete: bool,
 }
 fn packet_guard(db: &Connection, sequence: i64) -> Result<PacketGuard> {
-    Ok(db.query_row("SELECT input,revision,collection,source_rowid,digest,raw_length,complete FROM migration_retained_records WHERE sequence=?",[sequence],|r|Ok(PacketGuard{sequence,input:r.get(0)?,revision:r.get(1)?,collection:r.get(2)?,rowid:r.get(3)?,digest:r.get(4)?,length:evidence::size(r,5)?,complete:r.get(6)?}))?)
+    Ok(db.query_row("SELECT input,revision,collection,source_rowid,digest,raw_length,complete FROM migration_retained_records WHERE sequence=?",[sequence],|r|Ok(PacketGuard{sequence,input:evidence::retained_identity(r,0)?,revision:evidence::retained_identity(r,1)?,collection:r.get(2)?,rowid:r.get(3)?,digest:evidence::retained_identity(r,4)?,length:evidence::size(r,5)?,complete:r.get(6)?}))?)
 }
 fn packet_guards(
     db: &Connection,
@@ -1772,6 +1772,47 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn retained_identity_guards_apply_when_packet_descriptors_exceed_budget() -> Result<()> {
+        let t = Test::new(Origin::Embedded, Status::Complete, false, false)?;
+        let sequence = t.request.packet_records[0];
+        let original = packet_guard(&t.catalog.db, sequence)?;
+        // The descriptor-heavy path deliberately skips selected_record decoding.
+        t.catalog.db.execute(
+            "UPDATE migration_retained_records SET raw_length=?, compressed=x'00' WHERE sequence=?",
+            params![META as i64, sequence],
+        )?;
+        let (_, fits) = packet_guards(&t.catalog.db, &t.request, &original.input)?;
+        assert!(!fits);
+        for column in ["input", "revision", "digest"] {
+            for expression in [
+                "hex(zeroblob(524288))",
+                "replace(hex(zeroblob(33)), '0', 'é')",
+                "zeroblob(64)",
+                "CAST(x'ff' || zeroblob(63) AS TEXT)",
+                "'short'",
+            ] {
+                t.catalog
+                    .db
+                    .execute_batch("SAVEPOINT corrupt; PRAGMA defer_foreign_keys=ON")?;
+                t.catalog.db.execute(
+                    &format!("UPDATE migration_retained_records SET {column}={expression} WHERE sequence=?"),
+                    [sequence],
+                )?;
+                let error = packet_guards(&t.catalog.db, &t.request, &original.input).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                // Transaction rechecks use the same direct guard reader.
+                let error = packet_guard(&t.catalog.db, sequence).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                t.catalog
+                    .db
+                    .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            }
+        }
+        assert!(packet_guard(&t.catalog.db, sequence).is_ok());
+        Ok(())
+    }
+
     #[test]
     fn interpretation_limits_keep_complete_custody_without_reading_oversized_bytes() -> Result<()> {
         let t = Test::new(Origin::Embedded, Status::Complete, false, false)?;

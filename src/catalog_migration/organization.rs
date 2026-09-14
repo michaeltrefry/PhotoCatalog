@@ -6,7 +6,7 @@
 //! The 100-record/8-MiB limits bound source proofs and decisions, not the number
 //! of internal SQLite rows refreshed by the existing per-image organization
 //! engine. Original paths are never opened by this component.
-use super::{originals::SourceKey, retention};
+use super::{evidence, originals::SourceKey, retention};
 use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
@@ -343,7 +343,7 @@ impl Evidence {
             );
             let (input, length, digest): (String, i64, String) = db.query_row(
                 "SELECT input,raw_length,digest FROM migration_retained_records WHERE sequence=? AND complete=1",
-                [sequence], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                [sequence], |r| Ok((evidence::retained_identity(r, 0)?, r.get(1)?, evidence::retained_identity(r, 2)?)))?;
             let length = usize::try_from(length)?;
             ensure!(
                 length <= MAX_BYTES - self.bytes,
@@ -392,7 +392,13 @@ impl Evidence {
             let actual: (String, String, bool) = db.query_row(
                 "SELECT input,digest,complete FROM migration_retained_records WHERE sequence=?",
                 [sequence],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| {
+                    Ok((
+                        evidence::retained_identity(r, 0)?,
+                        evidence::retained_identity(r, 1)?,
+                        r.get(2)?,
+                    ))
+                },
             )?;
             ensure!(
                 actual == (kept.input.clone(), kept.digest.clone(), true),
@@ -1504,6 +1510,48 @@ mod tests {
             }
             Ok((keys[0].clone(), keys[1].clone()))
         }
+    }
+
+    #[test]
+    fn retained_identity_rejection_precedes_decode_and_transaction_recheck() -> Result<()> {
+        let b = Bed::new(false)?;
+        let sequence = b.rows[&100].retained_record;
+        let mut cached = Evidence::default();
+        cached.record(&b.catalog.db, sequence)?;
+        cached.recheck(&b.catalog.db)?;
+        let bytes = cached.bytes;
+        for column in ["input", "digest"] {
+            for expression in [
+                "hex(zeroblob(524288))",
+                "replace(hex(zeroblob(33)), '0', 'é')",
+                "zeroblob(64)",
+                "CAST(x'ff' || zeroblob(63) AS TEXT)",
+                "'short'",
+            ] {
+                b.catalog
+                    .db
+                    .execute_batch("SAVEPOINT corrupt; PRAGMA defer_foreign_keys=ON")?;
+                b.catalog.db.execute(
+                    &format!("UPDATE migration_retained_records SET {column}={expression}, compressed=x'00' WHERE sequence=?"),
+                    [sequence],
+                )?;
+                let mut fresh = Evidence::default();
+                let error = fresh.record(&b.catalog.db, sequence).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                assert!(fresh.records.is_empty());
+                assert_eq!(fresh.bytes, 0);
+                let error = cached.recheck(&b.catalog.db).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                assert_eq!(cached.records.len(), 1);
+                assert_eq!(cached.bytes, bytes);
+                b.catalog
+                    .db
+                    .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            }
+        }
+        cached.recheck(&b.catalog.db)?;
+        assert!(Evidence::default().record(&b.catalog.db, sequence).is_ok());
+        Ok(())
     }
 
     #[test]
