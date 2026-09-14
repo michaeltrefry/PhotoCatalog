@@ -89,6 +89,27 @@ pub(crate) fn retained_identity(row: &rusqlite::Row<'_>, index: usize) -> rusqli
     ))
 }
 
+/// Validate stored descriptors while SQLite still owns the bytes.
+pub(super) fn retained_descriptor<'r>(
+    row: &'r rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<&'r [u8]> {
+    let value = row.get_ref(index)?;
+    if let rusqlite::types::ValueRef::Blob(bytes) = value
+        && bytes.len() <= DESCRIPTOR_BYTES
+    {
+        return Ok(bytes);
+    }
+    Err(rusqlite::Error::FromSqlConversionFailure(
+        index,
+        value.data_type(),
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "retained descriptor must be a BLOB of at most 64 KiB",
+        )),
+    ))
+}
+
 pub(crate) fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(row.get::<_, i64>(index)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -202,15 +223,12 @@ pub(crate) fn begin_owned(
         "INSERT OR IGNORE INTO migration_evidence(id,descriptor,length,manifest,complete,authority) VALUES(?1,?2,?3,?1,?4,?5)",
         params![id, descriptor, i64::try_from(length)?, length == 0, authority.name()],
     )?;
-    let existing: (Vec<u8>, u64) = db.query_row(
+    let matches: bool = db.query_row(
         "SELECT descriptor,length FROM migration_evidence WHERE id=?1",
         [&id],
-        |r| Ok((r.get(0)?, unsigned(r, 1)?)),
+        |r| Ok(retained_descriptor(r, 0)? == descriptor && unsigned(r, 1)? == length),
     )?;
-    ensure!(
-        existing == (descriptor.to_vec(), length),
-        "evidence identity collision"
-    );
+    ensure!(matches, "evidence identity collision");
     require_authority(db, &id, authority)?;
     state(db, &id)
 }
@@ -355,7 +373,7 @@ impl Catalog {
             .query_row(
                 "SELECT descriptor FROM migration_evidence WHERE id=?1",
                 [id],
-                |r| r.get(0),
+                |r| Ok(retained_descriptor(r, 0)?.to_vec()),
             )
             .optional()?
             .context("unknown migration evidence")
@@ -370,6 +388,51 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_descriptors_admit_blob_size_before_copy_or_comparison() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        let descriptor = vec![0xff; DESCRIPTOR_BYTES];
+        let before = catalog.begin_migration_evidence(&descriptor, 1)?;
+        assert_eq!(
+            catalog.migration_evidence_descriptor(&before.id)?,
+            descriptor
+        );
+        assert_eq!(catalog.begin_migration_evidence(&descriptor, 1)?, before);
+        for expression in ["zeroblob(65537)", "zeroblob(1048576)", "'text'", "64"] {
+            catalog.db.execute_batch("SAVEPOINT malformed_descriptor")?;
+            catalog.db.execute(
+                &format!("UPDATE migration_evidence SET descriptor={expression} WHERE id=?1"),
+                [&before.id],
+            )?;
+            for error in [
+                begin(&catalog.db, &descriptor, 1).unwrap_err(),
+                catalog
+                    .migration_evidence_descriptor(&before.id)
+                    .unwrap_err(),
+            ] {
+                assert!(format!("{error:#}").contains("BLOB of at most 64 KiB"));
+            }
+            catalog
+                .db
+                .execute_batch("ROLLBACK TO malformed_descriptor; RELEASE malformed_descriptor")?;
+            assert_eq!(
+                catalog.migration_evidence_descriptor(&before.id)?,
+                descriptor
+            );
+        }
+        let empty = catalog.begin_migration_evidence(b"", 0)?;
+        assert!(catalog.migration_evidence_descriptor(&empty.id)?.is_empty());
+        assert!(
+            catalog
+                .migration_evidence_descriptor(&"x".repeat(64))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown migration evidence")
+        );
+        Ok(())
+    }
 
     #[test]
     fn retained_identity_checks_bytes_storage_and_utf8_without_normalizing() -> Result<()> {

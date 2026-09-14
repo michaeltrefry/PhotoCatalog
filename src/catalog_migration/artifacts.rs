@@ -251,10 +251,10 @@ fn existing(
     descriptor: &[u8],
     request: &ArtifactRequest,
 ) -> Result<Option<String>> {
-    let previous: Option<(Vec<u8>,String)> = db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2", params![request.retained_capture_record,i64::try_from(request.member_index)?], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-    if let Some((old, id)) = previous {
+    let previous: Option<(bool,String)> = db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2", params![request.retained_capture_record,i64::try_from(request.member_index)?], |r| Ok((evidence::retained_descriptor(r, 0)? == descriptor, evidence::retained_identity(r, 1)?))).optional()?;
+    if let Some((matches, id)) = previous {
         ensure!(
-            old == descriptor,
+            matches,
             "artifact custody mapping or provenance differs; explicit reconciliation required"
         );
         return Ok(Some(id));
@@ -559,7 +559,7 @@ impl Catalog {
         retained_capture_record: i64,
         member_index: usize,
     ) -> Result<(ArtifactDescriptor, EvidenceState)> {
-        let (bytes,id):(Vec<u8>,String)=self.db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2",params![retained_capture_record,i64::try_from(member_index)?],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (bytes,id):(Vec<u8>,String)=self.db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2",params![retained_capture_record,i64::try_from(member_index)?],|r|Ok((evidence::retained_descriptor(r, 0)?.to_vec(),evidence::retained_identity(r, 1)?)))?;
         ensure!(bytes.len() <= DESCRIPTOR_LIMIT, "artifact descriptor limit");
         ensure!(
             self.migration_evidence_descriptor(&id)? == bytes,
@@ -716,6 +716,111 @@ mod tests {
     #[cfg(feature = "internal-capacity-probes")]
     #[path = "capacity_tests.rs"]
     mod capacity_tests;
+
+    #[test]
+    fn saved_artifact_identity_and_descriptor_guards_cover_pending_and_recheck() -> Result<()> {
+        use crate::catalog_migration::{import_artifacts, importer};
+        let (fixture, mut catalog) = RawFixture::new(17)?;
+        let request = &fixture.requests[0];
+        let mut reader =
+            catalog.open_migration_artifact(request.clone(), RawFixture::limits(), &|| false)?;
+        let before = catalog.begin_migration_artifact(&mut reader)?;
+        let encoded = reader.encoded().to_vec();
+        drop(reader);
+        let source = fixture.inspection.open();
+        let policy = importer::Policy {
+            import_source: "saved-artifact-guards".into(),
+            overlap: importer::OverlapPolicy::RequireDecision,
+            keyword_overlap: importer::KeywordOverlap::RequireDecision,
+            artifacts: vec![importer::ArtifactInput {
+                capture_revision: fixture.inspection.revision().into(),
+                member_index: request.member_index,
+                mapping: request.mapping.clone(),
+            }],
+            supplements: vec![],
+        };
+        let progress = importer::Progress {
+            id: "synthetic pending checkpoint".into(),
+            input: source.binding_blake3().into(),
+            stage: importer::Stage::ArtifactCustody,
+            capture_index: 0,
+            artifact_index: 0,
+            cursor: None,
+            processed: 0,
+            complete: false,
+        };
+        for expression in [
+            "replace(hex(zeroblob(524288)), '0', 'x')",
+            "replace(hex(zeroblob(33)), '0', 'é')",
+            "CAST(x'ff' || zeroblob(63) AS TEXT)",
+        ] {
+            catalog
+                .db
+                .execute_batch("SAVEPOINT malformed_identity; PRAGMA defer_foreign_keys=ON")?;
+            catalog.db.execute(
+                &format!("UPDATE migration_evidence SET id={expression} WHERE id=?1"),
+                [&before.id],
+            )?;
+            catalog.db.execute(
+                &format!("UPDATE migration_artifacts SET evidence={expression} WHERE evidence=?1"),
+                [&before.id],
+            )?;
+            assert_eq!(
+                catalog
+                    .db
+                    .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))?,
+                0
+            );
+            for error in [
+                existing(&catalog.db, &encoded, request).unwrap_err(),
+                catalog
+                    .migration_artifact(request.retained_capture_record, request.member_index)
+                    .unwrap_err(),
+                import_artifacts::pending(&mut catalog, &source, &progress, &policy).unwrap_err(),
+            ] {
+                assert!(
+                    format!("{error:#}").contains("64 bytes of UTF-8 TEXT"),
+                    "{error:#}"
+                );
+            }
+            catalog
+                .db
+                .execute_batch("ROLLBACK TO malformed_identity; RELEASE malformed_identity")?;
+            assert_eq!(
+                catalog
+                    .migration_artifact(request.retained_capture_record, request.member_index)?
+                    .1,
+                before
+            );
+        }
+        catalog.db.execute(
+            "UPDATE migration_evidence SET descriptor=zeroblob(65537) WHERE id=?1",
+            [&before.id],
+        )?;
+        let error =
+            import_artifacts::pending(&mut catalog, &source, &progress, &policy).unwrap_err();
+        assert!(format!("{error:#}").contains("BLOB of at most 64 KiB"));
+        catalog.db.execute(
+            "UPDATE migration_evidence SET descriptor=?2 WHERE id=?1",
+            params![before.id, encoded],
+        )?;
+        assert_eq!(
+            import_artifacts::pending(&mut catalog, &source, &progress, &policy)?
+                .progress
+                .artifact_index,
+            0
+        );
+        assert_eq!(
+            catalog
+                .migration_artifact(request.retained_capture_record, request.member_index)?
+                .1,
+            before
+        );
+        Ok(())
+    }
 
     #[test]
     fn artifact_opening_retention_columns_reject_before_materialization() -> Result<()> {

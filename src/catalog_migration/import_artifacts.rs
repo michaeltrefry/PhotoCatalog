@@ -10,7 +10,6 @@ use crate::{
     lightroom::migration_source::{Collection, MigrationSource},
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::OptionalExtension;
 
 fn request(
     catalog: &Catalog,
@@ -113,8 +112,8 @@ pub(crate) fn pending(
     #[cfg(all(test, feature = "internal-capacity-probes"))]
     let _capacity_pending = crate::capacity_probes::phase(crate::capacity_probes::PENDING_MANIFEST);
     let request = request(catalog, source, before, policy)?.context("artifact request absent")?;
-    let found:Option<String>=catalog.db.query_row("SELECT evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2",rusqlite::params![request.retained_capture_record,i64::try_from(request.member_index)?],|r|r.get(0)).optional()?;
-    if found.is_some() {
+    let found:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2)",rusqlite::params![request.retained_capture_record,i64::try_from(request.member_index)?],|r|r.get(0))?;
+    if found {
         let (descriptor, state) =
             catalog.migration_artifact(request.retained_capture_record, request.member_index)?;
         ensure!(
