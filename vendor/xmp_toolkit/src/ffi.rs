@@ -41,6 +41,21 @@ impl CXmpString {
         })
     }
 
+    pub(crate) fn as_string_admitted<G, E: From<crate::XmpError>>(
+        &self,
+        admit: impl FnOnce(usize) -> Result<G, E>,
+    ) -> Result<crate::AdmittedString<G>, E> {
+        let value = unsafe { CStr::from_ptr(self.s) };
+        let no_memory = || crate::XmpError {
+            error_type: crate::XmpErrorType::NoMemory,
+            debug_message: "cannot allocate admitted XMP output".into(),
+        };
+        let len = bounded_string::output_len(value, usize::MAX).ok_or_else(no_memory)?;
+        let guard = admit(len)?;
+        let text = bounded_string::copy_measured(value, len).map_err(|_| no_memory())?;
+        Ok(crate::AdmittedString::new(text, guard))
+    }
+
     pub(crate) fn map<U, F>(&self, f: F) -> Option<U>
     where
         F: FnOnce(String) -> U,

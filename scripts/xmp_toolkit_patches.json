@@ -90,5 +90,67 @@
         "after": "        #endif\n\n        return NULL;\n    }\n\n    void CXmpMetaPackageForJPEG(CXmpMeta* m, CXmpError* outError,\n                                const char** standard, const char** extended,\n                                const char** digest) {\n        *standard = *extended = *digest = NULL;\n        #ifndef NOOP_FFI\n            if (!init_xmp()) { signalXmpInitFailure(outError); return; }\n            try {\n                std::string a, b, c;\n                SXMPUtils::PackageForJPEG(m->m, &a, &b, &c);\n                // Allocate all outputs before publishing any pointer to Rust.\n                char* aa = static_cast<char*>(malloc(a.size() + 1));\n                char* bb = static_cast<char*>(malloc(b.size() + 1));\n                char* cc = static_cast<char*>(malloc(c.size() + 1));\n                if (!aa || !bb || !cc) {\n                    free(aa); free(bb); free(cc);\n                    signalUnknownError(outError); return;\n                }\n                memcpy(aa, a.c_str(), a.size() + 1);\n                memcpy(bb, b.c_str(), b.size() + 1);\n                memcpy(cc, c.c_str(), c.size() + 1);\n                *standard = aa; *extended = bb; *digest = cc;\n            } catch (XMP_Error& e) { copyErrorForResult(e, outError); }\n              catch (...) { signalUnknownError(outError); }\n        #endif\n    }\n\n    const char* CXmpMetaRegisterNamespace(CXmpError* outError,\n"
       }
     ]
+  },
+  {
+    "file": "src/ffi.rs",
+    "before_sha256": "efdba4461f4654285930d0949489c978bb4d33808374f9d80af1060b179fd1d9",
+    "after_sha256": "c296e948752cf29e8ff221a2d2bb10d58ccb6ea4494cd6066dcb26ab708f05b4",
+    "replacements": [
+      {
+        "before": "            error_type: crate::XmpErrorType::NoMemory,\n            debug_message: \"cannot allocate bounded XMP output\".into(),\n        })\n    }\n\n    pub(crate) fn map<U, F>(&self, f: F) -> Option<U>\n",
+        "after": "            error_type: crate::XmpErrorType::NoMemory,\n            debug_message: \"cannot allocate bounded XMP output\".into(),\n        })\n    }\n\n    pub(crate) fn as_string_admitted<G, E: From<crate::XmpError>>(\n        &self,\n        admit: impl FnOnce(usize) -> Result<G, E>,\n    ) -> Result<crate::AdmittedString<G>, E> {\n        let value = unsafe { CStr::from_ptr(self.s) };\n        let no_memory = || crate::XmpError {\n            error_type: crate::XmpErrorType::NoMemory,\n            debug_message: \"cannot allocate admitted XMP output\".into(),\n        };\n        let len = bounded_string::output_len(value, usize::MAX).ok_or_else(no_memory)?;\n        let guard = admit(len)?;\n        let text = bounded_string::copy_measured(value, len).map_err(|_| no_memory())?;\n        Ok(crate::AdmittedString::new(text, guard))\n    }\n\n    pub(crate) fn map<U, F>(&self, f: F) -> Option<U>\n"
+      }
+    ]
+  },
+  {
+    "file": "src/ffi/bounded_string.rs",
+    "before_sha256": "679481d6377c9bd96dc10dab6bba7e3b64bc4e1f7af928b8b87dc84dee5f15e2",
+    "after_sha256": "80b2db63f0b6aee97f85d89172af2e1b448a3921dd44cd753e42d5ead922bce8",
+    "replacements": [
+      {
+        "before": "// Count the exact lossy UTF-8 output while the native allocation is borrowed.\n// A raw-byte bound alone misses replacement-character expansion.\npub(super) fn copy(value: &CStr, max_bytes: usize) -> Result<Option<String>, TryReserveError> {\n    let mut len = 0usize;\n    for chunk in value.to_bytes().utf8_chunks() {\n        let replacement = if chunk.invalid().is_empty() { 0 } else { 3 };\n        let Some(next) = len\n            .checked_add(chunk.valid().len())\n            .and_then(|value| value.checked_add(replacement))\n            .filter(|next| *next <= max_bytes)\n        else {\n            return Ok(None);\n        };\n        len = next;\n    }\n    let mut output = String::new();\n    output.try_reserve_exact(len)?;\n    for chunk in value.to_bytes().utf8_chunks() {\n",
+        "after": "// Count the exact lossy UTF-8 output while the native allocation is borrowed.\n// A raw-byte bound alone misses replacement-character expansion.\npub(super) fn copy(value: &CStr, max_bytes: usize) -> Result<Option<String>, TryReserveError> {\n    let Some(len) = output_len(value, max_bytes) else {\n        return Ok(None);\n    };\n    copy_measured(value, len).map(Some)\n}\n\npub(super) fn output_len(value: &CStr, max_bytes: usize) -> Option<usize> {\n    let mut len = 0usize;\n    for chunk in value.to_bytes().utf8_chunks() {\n        let replacement = if chunk.invalid().is_empty() { 0 } else { 3 };\n        len = len\n            .checked_add(chunk.valid().len())?\n            .checked_add(replacement)\n            .filter(|next| *next <= max_bytes)?;\n    }\n    Some(len)\n}\n\n// len must come from output_len for this same immutable borrowed value.\npub(super) fn copy_measured(value: &CStr, len: usize) -> Result<String, TryReserveError> {\n    let mut output = String::new();\n    output.try_reserve_exact(len)?;\n    for chunk in value.to_bytes().utf8_chunks() {\n"
+      },
+      {
+        "before": "            output.push('\\u{fffd}');\n        }\n    }\n    Ok(Some(output))\n}\n\n#[cfg(test)]\n",
+        "after": "            output.push('\\u{fffd}');\n        }\n    }\n    Ok(output)\n}\n\n#[cfg(test)]\n"
+      }
+    ]
+  },
+  {
+    "file": "src/xmp_meta.rs",
+    "before_sha256": "463b42dbffa8f7254139f22566a05548356d07e7c5a7e0e98ad1102fb13a7b97",
+    "after_sha256": "f64e1f8ce3617b8eda91dbdd4cb9bc3fa8f32ce83249a5d749d70457d738c34d",
+    "replacements": [
+      {
+        "before": "        self.serialize_with(options, |result| result.as_string_bounded(max_bytes))\n    }\n\n    fn serialize_with<T>(\n        &self,\n        options: ToStringOptions,\n        copy: impl FnOnce(&CXmpString) -> XmpResult<T>,\n    ) -> XmpResult<T> {\n        if let Some(m) = self.m {\n            let c_newline = CString::new(options.newline).unwrap_or_default();\n            let c_indent = CString::new(options.indent).unwrap_or_default();\n",
+        "after": "        self.serialize_with(options, |result| result.as_string_bounded(max_bytes))\n    }\n\n    /// Serializes RDF after the caller admits the exact Rust UTF-8 output size.\n    ///\n    /// After successful native serialization, `admit` is called once with the\n    /// exact lossy UTF-8 byte length, before allocating the Rust output string.\n    /// Its error is returned unchanged. On success, the returned guard stays\n    /// with the text until the text buffer is freed. Native serialization and\n    /// native allocations precede this callback and are not bounded by it.\n    pub fn to_string_with_options_admitted<G, E: From<XmpError>>(\n        &self,\n        options: ToStringOptions,\n        admit: impl FnOnce(usize) -> Result<G, E>,\n    ) -> Result<crate::AdmittedString<G>, E> {\n        self.serialize_with(options, |result| result.as_string_admitted(admit))\n    }\n\n    fn serialize_with<T, E: From<XmpError>>(\n        &self,\n        options: ToStringOptions,\n        copy: impl FnOnce(&CXmpString) -> Result<T, E>,\n    ) -> Result<T, E> {\n        if let Some(m) = self.m {\n            let c_newline = CString::new(options.newline).unwrap_or_default();\n            let c_indent = CString::new(options.indent).unwrap_or_default();\n"
+      },
+      {
+        "before": "                copy(&result)\n            }\n        } else {\n            Err(no_cpp_toolkit())\n        }\n    }\n}\n",
+        "after": "                copy(&result)\n            }\n        } else {\n            Err(no_cpp_toolkit().into())\n        }\n    }\n}\n"
+      }
+    ]
+  },
+  {
+    "file": "src/lib.rs",
+    "before_sha256": "316b1069633e09c6176d1839585be3304b05d4f8c90f9b2ccb04f40a5c8b47b2",
+    "after_sha256": "28d7157ab93c40714f50ab9a348fda53f8764dc5397ac1c626968fe3dd86bad6",
+    "replacements": [
+      {
+        "before": "#![deny(warnings)]\n#![doc = include_str!(\"../README.md\")]\n\nmod ffi;\nmod xmp_date_time;\nmod xmp_error;\n",
+        "after": "#![deny(warnings)]\n#![doc = include_str!(\"../README.md\")]\n\nmod admitted_string;\nmod ffi;\nmod xmp_date_time;\nmod xmp_error;\n"
+      },
+      {
+        "before": "mod xmp_meta;\npub mod xmp_ns;\nmod xmp_value;\n\n#[cfg(feature = \"chrono\")]\npub use xmp_date_time::DateTimeConvertError;\n",
+        "after": "mod xmp_meta;\npub mod xmp_ns;\nmod xmp_value;\n\npub use admitted_string::AdmittedString;\n\n#[cfg(feature = \"chrono\")]\npub use xmp_date_time::DateTimeConvertError;\n"
+      }
+    ]
+  },
+  {
+    "file": "src/admitted_string.rs",
+    "before_sha256": null,
+    "after_sha256": "db71472fd988845be0e789fe5d6ff5a38014d404c62eb65d1f46b00e7ff3d903",
+    "content": "// SPDX-License-Identifier: MIT OR Apache-2.0\n\n/// Serialized XMP whose allocation remains accompanied by an admission guard.\n///\n/// The text can be borrowed through `Deref` or `AsRef`. Dropping this value frees\n/// the text before dropping the guard. No conversion releases the owned text\n/// from its guard; a caller that makes another copy must account for that copy.\npub struct AdmittedString<G> {\n    text: String,\n    // Fields drop in declaration order, so this grant outlives the text buffer.\n    _guard: G,\n}\n\nimpl<G> AdmittedString<G> {\n    pub(crate) fn new(text: String, guard: G) -> Self {\n        Self {\n            text,\n            _guard: guard,\n        }\n    }\n}\n\nimpl<G> std::ops::Deref for AdmittedString<G> {\n    type Target = str;\n\n    fn deref(&self) -> &str {\n        &self.text\n    }\n}\n\nimpl<G> AsRef<str> for AdmittedString<G> {\n    fn as_ref(&self) -> &str {\n        &self.text\n    }\n}\n"
   }
 ]

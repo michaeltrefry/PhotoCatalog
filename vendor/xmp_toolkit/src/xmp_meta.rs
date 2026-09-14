@@ -2046,11 +2046,26 @@ impl XmpMeta {
         self.serialize_with(options, |result| result.as_string_bounded(max_bytes))
     }
 
-    fn serialize_with<T>(
+    /// Serializes RDF after the caller admits the exact Rust UTF-8 output size.
+    ///
+    /// After successful native serialization, `admit` is called once with the
+    /// exact lossy UTF-8 byte length, before allocating the Rust output string.
+    /// Its error is returned unchanged. On success, the returned guard stays
+    /// with the text until the text buffer is freed. Native serialization and
+    /// native allocations precede this callback and are not bounded by it.
+    pub fn to_string_with_options_admitted<G, E: From<XmpError>>(
         &self,
         options: ToStringOptions,
-        copy: impl FnOnce(&CXmpString) -> XmpResult<T>,
-    ) -> XmpResult<T> {
+        admit: impl FnOnce(usize) -> Result<G, E>,
+    ) -> Result<crate::AdmittedString<G>, E> {
+        self.serialize_with(options, |result| result.as_string_admitted(admit))
+    }
+
+    fn serialize_with<T, E: From<XmpError>>(
+        &self,
+        options: ToStringOptions,
+        copy: impl FnOnce(&CXmpString) -> Result<T, E>,
+    ) -> Result<T, E> {
         if let Some(m) = self.m {
             let c_newline = CString::new(options.newline).unwrap_or_default();
             let c_indent = CString::new(options.indent).unwrap_or_default();
@@ -2073,7 +2088,7 @@ impl XmpMeta {
                 copy(&result)
             }
         } else {
-            Err(no_cpp_toolkit())
+            Err(no_cpp_toolkit().into())
         }
     }
 }

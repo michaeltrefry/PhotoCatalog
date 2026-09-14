@@ -5,18 +5,26 @@ use std::{collections::TryReserveError, ffi::CStr};
 // Count the exact lossy UTF-8 output while the native allocation is borrowed.
 // A raw-byte bound alone misses replacement-character expansion.
 pub(super) fn copy(value: &CStr, max_bytes: usize) -> Result<Option<String>, TryReserveError> {
+    let Some(len) = output_len(value, max_bytes) else {
+        return Ok(None);
+    };
+    copy_measured(value, len).map(Some)
+}
+
+pub(super) fn output_len(value: &CStr, max_bytes: usize) -> Option<usize> {
     let mut len = 0usize;
     for chunk in value.to_bytes().utf8_chunks() {
         let replacement = if chunk.invalid().is_empty() { 0 } else { 3 };
-        let Some(next) = len
-            .checked_add(chunk.valid().len())
-            .and_then(|value| value.checked_add(replacement))
-            .filter(|next| *next <= max_bytes)
-        else {
-            return Ok(None);
-        };
-        len = next;
+        len = len
+            .checked_add(chunk.valid().len())?
+            .checked_add(replacement)
+            .filter(|next| *next <= max_bytes)?;
     }
+    Some(len)
+}
+
+// len must come from output_len for this same immutable borrowed value.
+pub(super) fn copy_measured(value: &CStr, len: usize) -> Result<String, TryReserveError> {
     let mut output = String::new();
     output.try_reserve_exact(len)?;
     for chunk in value.to_bytes().utf8_chunks() {
@@ -25,7 +33,7 @@ pub(super) fn copy(value: &CStr, max_bytes: usize) -> Result<Option<String>, Try
             output.push('\u{fffd}');
         }
     }
-    Ok(Some(output))
+    Ok(output)
 }
 
 #[cfg(test)]
