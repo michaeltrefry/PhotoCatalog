@@ -6,7 +6,10 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
-Current wave from `95ce173`: C preview metadata admission is reviewed and
+Current desktop source is `96d5fa7`, including C admission `d8bb236`, LM atomic
+projection `c609abf`, and FS9 directory preparation `96d5fa7`. The combined CLI,
+actual managed startup/render and Tauri backend gate passed; component
+evidence is verified below. C preview metadata admission is reviewed and
 verified locally. Its mandatory explicit shared allowance precedes ConfigWire
 copy and C launch; the guard spans OS wait/pipe joins plus final Shared/Parent
 owner drop. Typed refusal preserves F startup custody and supports same-pool
@@ -17,11 +20,63 @@ passing tests missed surviving G relay storage; reviewer found that issue and
 final configured tests now keep the charge until parent drop, then start a
 second actual C/F pair. Superseded evidence remains visible. Requested aggregate
 adds96 bytes for its exact guard storage; it is not RSS or a native/image budget.
-Sol/high implements LM preprojection in a separate worktree; independent
-Sol/high review follows C closeout (new-agent thread capacity was exhausted).
+Sol/high implemented LM preprojection in a separate worktree, with independent
+Sol/high review (new-agent thread capacity was exhausted). Root escalated the
+cross-layer design after failed static-peak proofs; the shared-ledger/atomic
+successor passed four tests and final review. A separate Sol/high component
+completed FS9 output-directory preparation from `d8bb236`: move directory resolution/checks to F,
+preserve catalog-based native naming/revision/error behavior and prove the
+managed route. ICC/profile admission, aliases and export publication remain open.
+Its nine focused tests and final review pass; source writes did not overlap LM.
+LM T140535Z native verification disproved the claimed complete initial peak:
+the managed core rose from 3,466,257,961 to 3,503,438,666 bytes (15 growth
+attempts). Two helper tests passed; the actual managed test failed. Source-review
+PASS is therefore insufficient. Root owns the cross-layer diagnosis after
+repeated incomplete peak proofs; Sol/high has a bounded test-only trace task
+to distinguish growth before and after the historical commit. No extra slack
+or production formula change is authorized pending that evidence. FS9's exact
+13-file freeze is independently under review. Shortcut briefly returned HTTP
+503, then recovered; comment 23408 and S12 In Progress were read back.
+The T141633Z single-test diagnostic now proves timing: 37,180,469 bytes of
+growth precede the historical commit and another 232 bytes occur between the
+historical and supplemental commits. It failed the expected assertion and all
+processes were reaped. Raw log SHA-256 is
+`b7063ddce4f7a6f0e093ede406912bfe043cc9ddf771b96d637d6a59c73fde14`.
+Root selected shared-ledger preparation of both projections before a single
+atomic commit, rather than an unproven complete static XMP peak. The Sol/high
+author is checking a bounded extraction plan before implementation. Required
+proof: supplemental preparation refusal changes no projection/native metadata
+tables; same-pool retry preserves both outcomes and exact retained XMP.
+FS9 successor `sc-22847-export-directory-successor-FZVawZ` passed independent
+source review (0.97); candidate SHA-256
+`dfafe0141da1f2e0c4fddc13e509f1cf4f62d9fc8cb76a99474a514c2d7884df`.
+Review caught and corrected the uncounted outer C caller request backing.
+Nine exact focused tests are granted the CPU2 lane against frozen source,
+including real F process and actual managed destinations routing. No native
+success is claimed until the receipt is returned.
+LM atomic T144126Z now passes all four selected native tests, including real
+shared-pool supplemental refusal before writes, same-pool retry, no admission
+growth during commit, and second-write rollback. Cargo PID 94489 and Source
+child 96154 were reaped. Log SHA-256
+`b1ced5d8ca5db556db59d67ac3f1228c12a9ed7646e3ffe9029e488414dfdf46`;
+requested core high was 6,720,502,850 bytes (not an RSS measurement).
+FS9 retains five passing focused tests. Its real-F shutdown initially failed
+because libtest appended a stdout trailer after the protocol completed; the
+test-only child now exits cleanly before that trailer. A subsequent run selected
+zero tests due to a stale shared-target artifact from the LM worktree, so it is
+explicitly invalid. Force the active crate's Rust rebuild on worktree switches
+(mtime-only root touch, content hash unchanged); do not clean native SDK caches.
 Native runs remain serialized CPU2 and unchanged checks are retained. Production
 route/shared-pool policy, full LM/S12 and S13 remain open. No RAID reads,
 installed-app replacement, push or Actions.
+
+Combined gate `sc-22847-combined-gate-9q1g4k6t/receipt.json` passes formatting,
+fresh release CLI build, actual managed startup refusal/same-pool retry (one
+test), actual cold-render/warm-preview delivery (one test), and release Tauri
+backend check. All five direct commands and outer session 8050 were waited,
+exit 0; all frozen Rust/manifest/lock source hashes remained unchanged. Root
+integration preserved the reviewed component blobs exactly. This is local
+integration evidence, not installation, platform packaging or S13 performance.
 
 The bounded wave is integrated locally: metadata aggregate (Sol/high), managed
 SqlReader selected-XMP proof (Sol/high with existing subsystem context), and
