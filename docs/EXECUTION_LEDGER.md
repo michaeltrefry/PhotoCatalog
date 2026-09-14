@@ -28,7 +28,18 @@ Latest local checkpoint (supersedes older pending notes below):
   All direct commands were waited; the outer runner exited 1. The earlier v29/v30
   negatives exposed test setup transactions/identity triggers and are preserved.
   The successor combines formatting with reviewed count-before-copy SavedJob
-  serialization, then runs affected checks and the three actual preview fixtures.
+  serialization. v32 then passed its three affected tests, strict Clippy,
+  formatting, fresh CLI build and all three actual preview fixtures: prepared
+  reuse, changed-original/corrupt-cache fallback, cold/warm delivery and
+  JPEG/WebP/AVIF. Initial receipt SHA256
+  `4344b9afcfa64dbea031d7ac5b35f12f1254af9db0ec626cb2dc35f7873b6cb5`;
+  configured receipt SHA256
+  `ab30907026f3f58013ac3ab15b6b7efdc27ab913a1002c21c70fe4c1a941fc7a`.
+  Both outer runners exited 0; all nine direct commands were waited. Four cached
+  previews at 2 MiB took 995.719 ms in this synthetic batch; this is not S13's
+  200-preview p95 benchmark. The local checkpoint is committed at
+  `b2ecda61fae387848d3cfae30c9ebe393cdd92d3`, with all 68 committed file hashes
+  verified against source-v32. No remote publication or full FS8 completion claim.
 - Execution uses the reloaded shortcut-epic model policy: Luna/low for mechanical
   evidence verification, Terra/medium for localized review and fixture repair,
   Sol/high for cross-layer XMP implementation. Each received an explicit model and
