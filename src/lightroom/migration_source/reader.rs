@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "reader_uri.rs"]
+mod reader_uri;
 #[path = "supplement_json.rs"]
 mod supplement_json;
 
@@ -275,6 +277,8 @@ pub struct MigrationSource {
     seal: InputSeal,
     namespace: String,
     limits: ReadLimits,
+    #[cfg(windows)]
+    prepared_companions: Option<reader_uri::Companions>,
     poisoned: Flag<bool>,
     cancel: Arc<AtomicBool>,
 }
@@ -422,27 +426,37 @@ impl MigrationSource {
         cancel: Arc<AtomicBool>,
         open: impl FnOnce(&Path) -> Result<Connection>,
     ) -> Result<Self> {
-        Self::open_ordered(seal, limits, cancel, None, open)
+        Self::open_ordered(seal, limits, cancel, None, None, |path, _| open(path))
     }
 
     /// Only for the dedicated closed-roster process. All handles are opened and
     /// identified before acquiring the first custom Source lock. No new source,
     /// destination, output, diagnostic or SQLite opener may run in that process
-    /// after this returns until the entire reader is retired.
+    /// after this returns until the entire reader is retired. Existing Windows
+    /// path identity verification retains its handle-scoped reopen, using only
+    /// the precharged prepared original-prefix roster and target path.
     pub(crate) fn open_closed_roster(
         seal: InputSeal,
         limits: ReadLimits,
         cancel: Arc<AtomicBool>,
         protected: &[crate::lightroom_migration_worker::identity::FileKey],
+        admit: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<Self> {
-        Self::open_ordered(seal, limits, cancel, Some(protected), |path| {
-            Ok(Connection::open_with_flags(
-                plan::uri(path)?,
-                OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | OpenFlags::SQLITE_OPEN_URI
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?)
-        })
+        Self::open_ordered(
+            seal,
+            limits,
+            cancel,
+            Some(protected),
+            Some(admit),
+            |path, admit| {
+                Ok(Connection::open_with_flags(
+                    reader_uri::prepare(path, admit.expect("closed-roster allowance"))?,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_URI
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?)
+            },
+        )
     }
 
     fn open_ordered(
@@ -450,7 +464,8 @@ impl MigrationSource {
         limits: ReadLimits,
         cancel: Arc<AtomicBool>,
         protected: Option<&[crate::lightroom_migration_worker::identity::FileKey]>,
-        open: impl FnOnce(&Path) -> Result<Connection>,
+        mut admit: Option<&mut dyn FnMut(usize) -> Result<()>>,
+        open: impl FnOnce(&Path, Option<&mut dyn FnMut(usize) -> Result<()>>) -> Result<Connection>,
     ) -> Result<Self> {
         ensure!(
             !cancel.load(Ordering::Relaxed),
@@ -466,19 +481,75 @@ impl MigrationSource {
                 "sealed reader protected identity bound"
             );
         }
+        #[cfg(windows)]
+        if let (Some(admit), crate::storage_volume::NativePath::WindowsWide(units)) =
+            (admit.as_mut(), &seal.database)
+        {
+            // NativePath::to_path uses the same pinned from_wide growth route.
+            let payload = units
+                .len()
+                .checked_mul(3)
+                .context("native path allocation overflow")?;
+            let growing = payload
+                .checked_mul(2)
+                .context("native path growth overflow")?
+                .max(8);
+            (*admit)(
+                payload
+                    .checked_add(growing)
+                    .context("native path transient overflow")?,
+            )?;
+        }
         let path = seal.database.to_path()?;
         ensure!(path.is_absolute(), "sealed database path must be absolute");
+        #[cfg(windows)]
+        let prepared_companions = if let Some(admit) = admit.as_mut() {
+            Some(reader_uri::Companions::prepare(&path, *admit)?)
+        } else {
+            no_companions(&path)?;
+            None
+        };
+        #[cfg(not(windows))]
         no_companions(&path)?;
         #[cfg(windows)]
-        let lease = {
+        let legacy_lease = if admit.is_none() {
             use std::os::windows::fs::OpenOptionsExt;
             crate::lightroom::source::reject_links(&path)?;
-            fs::OpenOptions::new()
-                .read(true)
-                .share_mode(1)
-                .open(&path)?
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(&path)?,
+            )
+        } else {
+            None
         };
+        #[cfg(windows)]
+        let mut guard = if let Some(admit) = admit.as_mut() {
+            Source::open_prepared(&path, seal.identity.bytes, *admit, reader_uri::file_path)?
+        } else {
+            Source::open(&path, seal.identity.bytes)?
+        };
+        #[cfg(not(windows))]
         let mut guard = Source::open(&path, seal.identity.bytes)?;
+        #[cfg(windows)]
+        let lease = match legacy_lease {
+            Some(lease) => lease,
+            None => {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(guard.prepared_path())?
+            }
+        };
+        let verify_companions = || -> Result<()> {
+            #[cfg(windows)]
+            if let Some(prepared) = &prepared_companions {
+                return prepared.verify();
+            }
+            no_companions(&path)
+        };
         ensure!(
             guard.before == seal.identity,
             "sealed inspection file identity differs"
@@ -495,13 +566,13 @@ impl MigrationSource {
                 crate::lightroom_migration_worker::identity::FileKey::of(&lease)? == identity,
                 "sealed deny-write handle differs from Source"
             );
-            let db = open.take().expect("one sealed SQL opener")(&path)?;
+            let db = open.take().expect("one sealed SQL opener")(&path, admit.take())?;
             crate::catalog_storage::verify_database_object(&db, &guard.file)
                 .context("closed-roster sealed inspection opened object")?;
             db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
             db.busy_timeout(Duration::ZERO)?;
             guard.verify()?;
-            no_companions(&path)?;
+            verify_companions()?;
             Some(db)
         } else {
             None
@@ -531,7 +602,7 @@ impl MigrationSource {
             "sealed inspection digest differs"
         );
         guard.verify()?;
-        no_companions(&path)?;
+        verify_companions()?;
         let db = if let Some(db) = admitted {
             // Re-identify the already-open descriptor; never reopen after lock.
             crate::catalog_storage::verify_database_object(&db, &guard.file)
@@ -539,7 +610,7 @@ impl MigrationSource {
             db
         } else {
             // Keep the historical synchronous CLI ordering unchanged.
-            let db = open.take().expect("one legacy sealed SQL opener")(&path)?;
+            let db = open.take().expect("one legacy sealed SQL opener")(&path, None)?;
             crate::catalog_storage::verify_database_object(&db, &guard.file)
                 .context("sealed inspection opened object")?;
             db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
@@ -555,6 +626,8 @@ impl MigrationSource {
             seal,
             namespace,
             limits,
+            #[cfg(windows)]
+            prepared_companions,
             poisoned: Flag::new(false),
             cancel,
         };
@@ -582,7 +655,13 @@ impl MigrationSource {
         let result = self
             .guard
             .verify()
-            .and_then(|()| no_companions(&self.guard.path))
+            .and_then(|()| {
+                #[cfg(windows)]
+                if let Some(prepared) = &self.prepared_companions {
+                    return prepared.verify();
+                }
+                no_companions(&self.guard.path)
+            })
             .and_then(|()| {
                 crate::catalog_storage::verify_database_object(&self.db, &self.guard.file)
             });

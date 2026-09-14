@@ -15,6 +15,12 @@ use std::{
     time::Duration,
 };
 
+/// Fresh Source processes use framed diagnostics without inherited library
+/// backtrace allocations. Preserve RUST_BACKTRACE for the caller's panic policy.
+pub(crate) fn source_environment(command: &mut Command) {
+    command.env("RUST_LIB_BACKTRACE", "0");
+}
+
 /// At most one encoded input and one decoded output are queued, in addition to
 /// the frame currently owned by each I/O thread. Joining is supervisor-only.
 pub(crate) struct Process<T = ChildFrame> {
@@ -67,6 +73,9 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         );
         let mut command = Command::new(executable);
         command.arg(role);
+        if role == "--lightroom-source-reader" {
+            source_environment(&mut command);
+        }
         Self::spawn_command(command, stop)
     }
     fn spawn_command(mut command: Command, stop: Arc<Stop>) -> Result<Self> {
@@ -248,3 +257,77 @@ impl<T> Drop for Process<T> {
 #[cfg(all(test, feature = "internal-capacity-probes"))]
 #[path = "process_capacity_tests.rs"]
 mod capacity_tests;
+
+#[cfg(test)]
+mod source_environment_tests {
+    use super::*;
+    use std::time::Instant;
+    const ENV_FIXTURE: &str = "PHOTOCATALOG_SOURCE_ENV_FIXTURE";
+    #[test]
+    #[ignore = "owned Source environment subprocess entrypoint"]
+    fn source_environment_child() -> Result<()> {
+        ensure!(
+            std::env::var_os(ENV_FIXTURE).is_some(),
+            "owned fixture required"
+        );
+        let result = (
+            std::env::var("RUST_LIB_BACKTRACE")?,
+            std::env::var("RUST_BACKTRACE")?,
+            format!("{:?}", std::backtrace::Backtrace::capture().status()),
+        );
+        crate::lightroom_migration_worker::protocol::write_frame(&mut std::io::stderr(), &result)?;
+        std::process::exit(0);
+    }
+    #[test]
+    fn source_environment_is_child_local_and_preserves_panic_backtrace() -> Result<()> {
+        let original = (
+            std::env::var_os("RUST_LIB_BACKTRACE"),
+            std::env::var_os("RUST_BACKTRACE"),
+        );
+        let mut command = Command::new(std::env::current_exe()?);
+        command.args(["--exact", "lightroom_migration_worker::process::source_environment_tests::source_environment_child", "--ignored", "--nocapture"])
+            .env(ENV_FIXTURE, "1").env("RUST_LIB_BACKTRACE", "1").env("RUST_BACKTRACE", "full");
+        source_environment(&mut command);
+        let mut process = Process::<(String, String, String)>::spawn_test_command(
+            command,
+            Arc::new(Stop::default()),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            ensure!(
+                Instant::now() < deadline,
+                "Source environment fixture deadline"
+            );
+            match process.try_receive()? {
+                Output::Frame(value) => break value,
+                Output::Pending => std::thread::sleep(Duration::from_millis(5)),
+                Output::End => anyhow::bail!("Source environment fixture ended without result"),
+            }
+        };
+        let pid = process.child.id();
+        while process.try_reap()?.is_none() {
+            ensure!(
+                Instant::now() < deadline,
+                "Source environment child exit deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        process.terminate();
+        ensure!(
+            process.reaped.is_some_and(|status| status.success()),
+            "Source environment child unsuccessful"
+        );
+        assert_eq!(result, ("0".into(), "full".into(), "Disabled".into()));
+        assert_eq!(
+            original,
+            (
+                std::env::var_os("RUST_LIB_BACKTRACE"),
+                std::env::var_os("RUST_BACKTRACE")
+            )
+        );
+        println!(
+            "SOURCE_ENV child_pid={pid} reaped=true library=0 panic=full captured=Disabled parent_unchanged=true"
+        );
+        Ok(())
+    }
+}

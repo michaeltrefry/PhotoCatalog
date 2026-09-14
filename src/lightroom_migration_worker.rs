@@ -4,6 +4,7 @@ pub mod authority;
 pub mod identity;
 
 pub(crate) mod lease;
+pub(crate) mod memory;
 pub mod protocol;
 
 pub(crate) mod input;

@@ -22,7 +22,8 @@ fn closed_roster_wrong_connection_rejects_before_pragma_and_prelock_writer_inval
         ReadLimits::default(),
         Arc::new(AtomicBool::new(false)),
         Some(&[]),
-        |_| {
+        None,
+        |_, _| {
             let db = immutable(&other.path)?;
             db.authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
                 observed.fetch_add(1, Ordering::SeqCst);
@@ -38,7 +39,8 @@ fn closed_roster_wrong_connection_rejects_before_pragma_and_prelock_writer_inval
         ReadLimits::default(),
         Arc::new(AtomicBool::new(false)),
         Some(&[]),
-        |path| {
+        None,
+        |path, _| {
             // The admitted Source still holds its original Revision, but has
             // acquired no custom lock yet. This write must not become baseline.
             let writer = Connection::open(path)?;
@@ -66,7 +68,8 @@ fn closed_roster_protected_alias_and_cancel_reject_before_opening_sql() -> Resul
             ReadLimits::default(),
             Arc::new(AtomicBool::new(cancel)),
             Some(std::slice::from_ref(&key)),
-            |path| {
+            None,
+            |path, _| {
                 calls.set(calls.get() + 1);
                 immutable(path)
             },
@@ -79,6 +82,7 @@ fn closed_roster_protected_alias_and_cancel_reject_before_opening_sql() -> Resul
         ReadLimits::default(),
         Arc::new(AtomicBool::new(false)),
         &[],
+        &mut |_| Ok(()),
     )?;
     assert_eq!(source.count(fixture.revision(), Collection::Rows)?, 1);
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -177,5 +181,84 @@ fn resolved_ids_admit_bytes_before_materialization_and_preserve_ambiguity() -> R
             .resolve(&revision, "image", "rootFile", "AgLibraryFile")
             .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn closed_roster_uri_normalizes_existing_deep_parents_after_original_admission() -> Result<()> {
+    use crate::storage_volume::NativePath;
+    let fixture = Fixture::new();
+    let parent = fixture.path.parent().unwrap().to_path_buf();
+    #[cfg(windows)]
+    let parent = {
+        // The fixture lives on a local drive. Exercise ordinary normalization;
+        // retained verbatim paths deliberately keep their original spelling.
+        let text = parent.to_str().context("representable synthetic path")?;
+        std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+    };
+    let mut deep = parent.to_path_buf();
+    let mut depth = 0usize;
+    // Bundled SQLite's Unix VFS mxPathname is 512. Exercise the actual
+    // overlong intermediate spelling, while the normalized database stays short.
+    while deep.as_os_str().len() <= 512 {
+        deep.push(format!("existing-original-prefix-{depth}"));
+        fs::create_dir(&deep)?;
+        depth += 1;
+    }
+    assert!(deep.as_os_str().len() > 512);
+    let intermediate_bytes = deep.as_os_str().len();
+    let mut original = deep;
+    for _ in 0..depth {
+        original.push("..");
+    }
+    original.push(fixture.path.file_name().unwrap());
+    let mut seal = fixture.seal.clone();
+    seal.database = NativePath::from_path(&original);
+    let before = fs::read(&fixture.path)?;
+    let mut charged = 0usize;
+    let source = MigrationSource::open_closed_roster(
+        seal,
+        ReadLimits::default(),
+        Arc::new(AtomicBool::new(false)),
+        &[],
+        &mut |n| {
+            charged = charged.checked_add(n).unwrap();
+            Ok(())
+        },
+    )?;
+    assert_eq!(source.count(fixture.revision(), Collection::Rows)?, 1);
+    assert!(charged > original.as_os_str().len());
+    assert_eq!(source.guard.before, fixture.seal.identity);
+    println!(
+        "SOURCE_URI intermediate_bytes={intermediate_bytes} sqlite_unix_limit=512 charged={charged} exact_identity=true"
+    );
+    drop(source);
+    assert_eq!(fs::read(&fixture.path)?, before);
+    // A nonexistent component followed by '..' must not become an accepted
+    // normalized source: original Source admission occurs first.
+    let invalid = parent
+        .join("not-created")
+        .join("..")
+        .join(fixture.path.file_name().unwrap());
+    let mut seal = fixture.seal.clone();
+    seal.database = NativePath::from_path(&invalid);
+    let mut calls = 0;
+    assert!(
+        MigrationSource::open_closed_roster(
+            seal,
+            ReadLimits::default(),
+            Arc::new(AtomicBool::new(false)),
+            &[],
+            &mut |_| {
+                calls += 1;
+                Ok(())
+            }
+        )
+        .is_err()
+    );
+    #[cfg(unix)]
+    assert_eq!(calls, 0);
+    #[cfg(windows)]
+    assert!(calls > 0); // per-prefix preparation precedes each original metadata check
     Ok(())
 }

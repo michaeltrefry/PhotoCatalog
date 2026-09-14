@@ -38,6 +38,19 @@ pub(super) fn session_with_deadline(
     cancel: Arc<AtomicBool>,
     read_ms: u64,
 ) -> Result<Session> {
+    session_with_memory(
+        authority,
+        cancel,
+        read_ms,
+        MemoryBudget::new(2 * 1024 * 1024 * 1024)?,
+    )
+}
+fn session_with_memory(
+    authority: Authority,
+    cancel: Arc<AtomicBool>,
+    read_ms: u64,
+    memory: MemoryBudget,
+) -> Result<Session> {
     let binding = authority.binding()?;
     let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
     let stop = Arc::new(Stop::default());
@@ -45,6 +58,7 @@ pub(super) fn session_with_deadline(
     command
         .args(["--exact", HELPER, "--nocapture"])
         .env(FIXTURE, "1");
+    crate::lightroom_migration_worker::process::source_environment(&mut command);
     let process = Process::spawn_test_command(command, stop.clone())?;
     let budget = super::super::wire::Budget::from_authority(&authority)?;
     Session::admit(
@@ -58,6 +72,7 @@ pub(super) fn session_with_deadline(
             open_ms: 15_000,
             read_ms,
             budget,
+            memory: memory.reservation(),
         },
     )
 }
@@ -489,3 +504,61 @@ fn authority_preserves_complete_u128_range_and_reports_open_failure() -> Result<
 #[cfg(feature = "internal-capacity-probes")]
 #[path = "tests/capacity_tests.rs"]
 mod capacity_tests;
+
+#[test]
+fn opening_allocation_sequence_and_limit_preserve_prior_reservation() -> Result<()> {
+    let budget = MemoryBudget::new(100)?;
+    let mut memory = budget.reservation();
+    let mut completed = 0;
+    assert!(reserve_opening(&mut memory, &mut completed, 2, 20).is_err());
+    assert_eq!(budget.used(), 0);
+    assert_eq!(reserve_opening(&mut memory, &mut completed, 1, 40)?, 40);
+    assert!(reserve_opening(&mut memory, &mut completed, 1, 40).is_err());
+    assert!(reserve_opening(&mut memory, &mut completed, 2, 61).is_err());
+    assert_eq!(completed, 1);
+    assert_eq!(budget.used(), 40);
+    assert_eq!(reserve_opening(&mut memory, &mut completed, 2, 60)?, 60);
+    drop(memory);
+    assert_eq!(budget.used(), 0);
+    Ok(())
+}
+#[test]
+fn actual_source_opening_allowance_denial_and_retirement_release_charge() -> Result<()> {
+    let fixture = Fixture::new();
+    let authority = || Authority::Sql {
+        seal: fixture.seal.clone(),
+        limits: ReadLimits::default().into(),
+        protected: vec![],
+    };
+    let tiny = MemoryBudget::new(1)?;
+    assert!(
+        session_with_memory(
+            authority(),
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            tiny.clone()
+        )
+        .is_err()
+    );
+    assert_eq!(tiny.used(), 0);
+    assert!(can_write(&fixture.path));
+    let budget = MemoryBudget::new(1024 * 1024)?;
+    let mut reader = session_with_memory(
+        authority(),
+        Arc::new(AtomicBool::new(false)),
+        10_000,
+        budget.clone(),
+    )?;
+    assert!(budget.used() > 0);
+    assert!(!can_write(&fixture.path));
+    let pid = reader.process.pid();
+    let charged = budget.used();
+    reader.retire()?;
+    // Reservation belongs to the epoch owner, not a transient acknowledgement.
+    assert!(budget.used() > 0);
+    drop(reader);
+    assert_eq!(budget.used(), 0);
+    assert!(can_write(&fixture.path));
+    println!("SOURCE_ALLOWANCE child_pid={pid} charged={charged} reaped=true retired_charge=0");
+    Ok(())
+}

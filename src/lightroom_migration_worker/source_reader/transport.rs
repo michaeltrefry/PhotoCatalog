@@ -146,6 +146,11 @@ pub(super) enum Request {
         binding: String,
         query: Read,
     },
+    Reserved {
+        epoch: Epoch,
+        sequence: U64,
+        bytes: U64,
+    },
     Cancel {
         epoch: Epoch,
     },
@@ -162,6 +167,7 @@ impl Request {
             | Self::Authority { epoch, .. }
             | Self::Open { epoch }
             | Self::Read { epoch, .. }
+            | Self::Reserved { epoch, .. }
             | Self::Cancel { epoch }
             | Self::Retire { epoch, .. } => epoch,
         }
@@ -170,6 +176,11 @@ impl Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub(super) enum Reply {
+    Reserve {
+        epoch: Epoch,
+        sequence: U64,
+        bytes: U64,
+    },
     Ready {
         epoch: Epoch,
         binding: String,
@@ -205,7 +216,8 @@ pub(super) enum Reply {
 impl Reply {
     pub fn epoch(&self) -> &Epoch {
         match self {
-            Self::Ready { epoch, .. }
+            Self::Reserve { epoch, .. }
+            | Self::Ready { epoch, .. }
             | Self::Result { epoch, .. }
             | Self::Chunk { epoch, .. }
             | Self::Ticket { epoch, .. }

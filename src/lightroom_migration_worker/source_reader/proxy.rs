@@ -17,6 +17,7 @@ use crate::{
     },
     lightroom_migration_worker::{
         identity::FileKey,
+        memory::{MemoryBudget, Reservation},
         process::{Output, Process, Stop},
         protocol::Guard,
     },
@@ -49,6 +50,24 @@ impl Health {
             || self.poisoned.load(Ordering::Acquire)
     }
 }
+fn reserve_opening(
+    memory: &mut Reservation,
+    completed: &mut u64,
+    sequence: u64,
+    bytes: u64,
+) -> Result<usize> {
+    let next = completed
+        .checked_add(1)
+        .context("source allocation sequence exhausted")?;
+    ensure!(
+        sequence == next,
+        "source allocation request sequence differs"
+    );
+    let bytes = usize::try_from(bytes)?;
+    memory.grow(bytes)?;
+    *completed = next;
+    Ok(bytes)
+}
 struct SourceAdmission {
     epoch: Epoch,
     binding: String,
@@ -57,6 +76,7 @@ struct SourceAdmission {
     open_ms: u64,
     read_ms: u64,
     budget: Budget,
+    memory: Reservation,
 }
 
 struct Session {
@@ -71,6 +91,8 @@ struct Session {
     canceled: bool,
     retired: bool,
     budget: Budget,
+    // Retired only after Process::terminate has verified reap and joined I/O.
+    memory: Reservation,
 }
 impl Session {
     fn open(
@@ -80,6 +102,7 @@ impl Session {
         cancel: Arc<AtomicBool>,
         open_ms: u64,
         read_ms: u64,
+        memory: MemoryBudget,
     ) -> Result<Self> {
         epoch.validate()?;
         let budget = Budget::from_authority(&authority)?;
@@ -105,6 +128,7 @@ impl Session {
                 open_ms,
                 read_ms,
                 budget,
+                memory: memory.reservation(),
             },
         )
     }
@@ -121,6 +145,7 @@ impl Session {
             open_ms,
             read_ms,
             budget,
+            memory,
         } = admission;
         ensure!(
             (1..=3_600_000).contains(&open_ms) && (1..=120_000).contains(&read_ms),
@@ -143,6 +168,7 @@ impl Session {
             canceled: false,
             retired: false,
             budget,
+            memory,
         };
         let digest = crate::lightroom::digest(&encoded);
         session.send(
@@ -170,8 +196,33 @@ impl Session {
             },
             until,
         )?;
-        let Reply::Ready { binding, .. } = session.receive(until, true)? else {
-            anyhow::bail!("source Ready required");
+        let mut allocation_sequence = 0u64;
+        let binding = loop {
+            match session.receive(until, true)? {
+                Reply::Reserve {
+                    sequence, bytes, ..
+                } => {
+                    session.check()?;
+                    // Charge before acknowledgement. The exact epoch/sequence/byte
+                    // echo cannot grant a different allocation or replay an old one.
+                    let bytes = reserve_opening(
+                        &mut session.memory,
+                        &mut allocation_sequence,
+                        sequence.0,
+                        bytes.0,
+                    )?;
+                    session.send(
+                        Request::Reserved {
+                            epoch: session.epoch.clone(),
+                            sequence,
+                            bytes: crate::application::U64(bytes.try_into()?),
+                        },
+                        until,
+                    )?;
+                }
+                Reply::Ready { binding, .. } => break binding,
+                _ => anyhow::bail!("source Ready or opening allocation required"),
+            }
         };
         ensure!(
             binding == session.binding,
@@ -386,6 +437,7 @@ impl SqlReader {
         limits: ReadLimits,
         protected: Vec<FileKey>,
         cancel: Arc<AtomicBool>,
+        memory: MemoryBudget,
     ) -> Result<Self> {
         let session = Session::open(
             executable,
@@ -398,6 +450,7 @@ impl SqlReader {
             cancel,
             limits.open_deadline_ms,
             limits.deadline_ms,
+            memory,
         )?;
         Ok(Self {
             binding: session.binding.clone(),
@@ -534,6 +587,7 @@ impl RawReader {
         limits: ArtifactLimits,
         protected: Vec<FileKey>,
         cancel: Arc<AtomicBool>,
+        memory: MemoryBudget,
     ) -> Result<Self> {
         let encoded = crate::lightroom::bounded_json(&descriptor, 64 * 1024)?;
         let session = Session::open(
@@ -547,6 +601,7 @@ impl RawReader {
             cancel,
             limits.open_deadline_ms,
             limits.chunk_deadline_ms,
+            memory,
         )?;
         Ok(Self {
             session,

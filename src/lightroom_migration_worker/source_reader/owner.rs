@@ -43,6 +43,35 @@ impl Controls {
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
+    fn reserved(&self, sequence: u64, bytes: usize) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            ensure!(
+                !self.cancel.load(Ordering::Acquire),
+                "source allocation admission canceled"
+            );
+            ensure!(
+                state.error.is_none() && !state.ended,
+                "source allocation grant stream ended"
+            );
+            if let Some(request) = state.pending.take() {
+                self.changed.notify_all();
+                ensure!(
+                    matches!(request, Request::Reserved { sequence: n, bytes: b, .. } if n.0 == sequence && b.0 == bytes as u64),
+                    "source allocation grant identity differs"
+                );
+                return Ok(());
+            }
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    fn signal_cancel(&self) {
+        // Synchronize with the predicate check -> Condvar wait transition.
+        // An atomic flag plus notify without this lock can lose the wakeup.
+        let _state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancel.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
     fn fail(&self, detail: String) {
         self.cancel.store(true, Ordering::Release);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -87,7 +116,7 @@ pub(super) fn serve(input: impl IoRead + Send + 'static, mut output: impl Write)
                         }
                         drop(epoch);
                         if matches!(request, Request::Cancel { .. }) {
-                            listener.cancel.store(true, Ordering::Release);
+                            listener.signal_cancel();
                             continue;
                         }
                         let retiring = matches!(request, Request::Retire { .. });
@@ -144,7 +173,11 @@ enum Roster {
     Artifact(ArtifactReader),
 }
 impl Roster {
-    fn open(authority: Authority, cancel: Arc<AtomicBool>) -> Result<Self> {
+    fn open(
+        authority: Authority,
+        cancel: Arc<AtomicBool>,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Self> {
         ensure!(!cancel.load(Ordering::Acquire), "source admission canceled");
         match authority {
             Authority::Sql {
@@ -156,6 +189,7 @@ impl Roster {
                 limits.try_into()?,
                 cancel,
                 &protected,
+                admit,
             )?)),
             Authority::Artifact {
                 descriptor,
@@ -233,7 +267,26 @@ fn run(controls: &Controls, output: &mut impl Write) -> Result<()> {
     crate::capacity_probes::observe(crate::capacity_probes::OPEN_DECODED, encoded.capacity());
     drop(encoded);
     let binding = authority.binding()?;
-    let mut roster = Roster::open(authority, controls.cancel.clone())?;
+    let mut allocation_sequence = 0u64;
+    let mut reserve = |bytes: usize| -> Result<()> {
+        ensure!(
+            !controls.cancel.load(Ordering::Acquire),
+            "source allocation admission canceled"
+        );
+        allocation_sequence = allocation_sequence
+            .checked_add(1)
+            .context("source allocation sequence exhausted")?;
+        write_frame(
+            output,
+            &Reply::Reserve {
+                epoch: epoch.clone(),
+                sequence: crate::application::U64(allocation_sequence),
+                bytes: crate::application::U64(bytes.try_into()?),
+            },
+        )?;
+        controls.reserved(allocation_sequence, bytes)
+    };
+    let mut roster = Roster::open(authority, controls.cancel.clone(), &mut reserve)?;
     write_frame(
         output,
         &Reply::Ready {
@@ -453,5 +506,77 @@ mod reply_error_tests {
         let actual = reply_prefix(format_args!("{}", IgnoresWriteError(&head)));
         assert_eq!(actual, head);
         assert_eq!(actual.capacity(), REPLY_ERROR_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    fn controls() -> Controls {
+        Controls {
+            state: Mutex::new(Incoming {
+                pending: None,
+                error: None,
+                ended: false,
+            }),
+            changed: Condvar::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            epoch: Mutex::new(None),
+        }
+    }
+    fn epoch() -> Epoch {
+        Epoch {
+            guard: crate::lightroom_migration_worker::protocol::Guard {
+                session: "s".into(),
+                generation: "1".into(),
+                operation: "o".into(),
+            },
+            reader: "r".into(),
+        }
+    }
+    #[test]
+    fn opening_grant_wait_wakes_for_cancel_or_parent_loss() {
+        for ended in [false, true] {
+            let c = Arc::new(controls());
+            let waiter = c.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || send.send(waiter.reserved(1, 10).is_err()).unwrap());
+            if ended {
+                let mut state = c.state.lock().unwrap();
+                state.ended = true;
+                c.changed.notify_all();
+            } else {
+                c.signal_cancel();
+            }
+            assert!(
+                receive
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            );
+            worker.join().unwrap();
+        }
+    }
+    #[test]
+    fn opening_grant_requires_exact_sequence_bytes_and_observes_cancel() -> Result<()> {
+        for (sequence, bytes) in [(2, 10), (1, 11)] {
+            let c = controls();
+            c.state.lock().unwrap().pending = Some(Request::Reserved {
+                epoch: epoch(),
+                sequence: crate::application::U64(sequence),
+                bytes: crate::application::U64(bytes),
+            });
+            assert!(c.reserved(1, 10).is_err());
+        }
+        let c = controls();
+        c.cancel.store(true, Ordering::Release);
+        assert!(c.reserved(1, 10).is_err());
+        let c = controls();
+        c.state.lock().unwrap().pending = Some(Request::Reserved {
+            epoch: epoch(),
+            sequence: crate::application::U64(1),
+            bytes: crate::application::U64(10),
+        });
+        c.reserved(1, 10)?;
+        Ok(())
     }
 }
