@@ -144,8 +144,16 @@ process tests and formatting then passed; receipt
 `a7e7237132cacd3c11522b0004dd9da442697f991083a79b639c17edd14b2fe8`
 has eleven verified artifacts and seven waited commands. No observed owners
 remain. This yields 28 distinct functional positives (17 in-process and eleven
-actual-process) across the preserved phases; compatibility and independent
-combined qualification remain pending. Original EAGAIN attribution remains an
+actual-process) across the preserved phases. Compatibility8 and formatting then
+passed (receipt `9d1c1da181758f968166abd0155967d4fdc51cc9121a91ee196190f337a64c77`,
+13 verified artifacts, nine waited commands). The bounded checkpoint is committed
+as `a363142f06568d143102058b8904789d67cb09b2`; root verified all 135 committed
+blobs. Independent final review
+`7677aff44d969fd3f08515ea6b58c1602e326c9f0acbcaa66e9d5ce14f77d1fe`
+verified 66 artifacts and 36 distinct functional positives (21 in-process, 15
+actual-process), three formatting checks and all 40 waited commands including
+the preserved failed fixture. Twenty-one warnings are not a Clippy pass. This is
+relay/permit qualification, not whole migration or installed-platform acceptance. Original EAGAIN attribution remains an
 inference because the failed log did not identify its precise I/O operation.
 Source-scoped allocation retirement design passed independent review, requiring
 both G process/pipe/relay drain and LM proxy quiescence; its enforcement is not yet
