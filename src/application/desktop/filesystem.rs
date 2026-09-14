@@ -6,7 +6,8 @@ use crate::{
     catalog_backup::RestoreStatus,
     catalog_session::{
         CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, LeaseId, PrepareCatalog,
-        RootCapability, SqlAdmissionConfirmed, store,
+        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
+        store,
     },
     filesystem_worker::{
         client::Client,
@@ -57,6 +58,7 @@ pub(super) enum Call {
     PreviewStage(Box<crate::catalog_session::preview_stage::Request>),
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
+    PrepareExportDirectory(Box<PrepareExportDirectory>),
 }
 impl Call {
     fn cleanup(&self) -> bool {
@@ -68,7 +70,10 @@ impl Call {
     fn cancellable(&self) -> bool {
         matches!(
             self,
-            Self::Prepare(_) | Self::Confirm(_) | Self::ReadPreviewConfiguration(_)
+            Self::Prepare(_)
+                | Self::Confirm(_)
+                | Self::ReadPreviewConfiguration(_)
+                | Self::PrepareExportDirectory(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
@@ -106,6 +111,7 @@ impl Call {
                 request.validate()
             }
             Self::ReadPreviewConfiguration(path) => store::path(path),
+            Self::PrepareExportDirectory(request) => request.validate(),
             _ => Ok(()),
         }
     }
@@ -116,6 +122,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<store::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
+        std::mem::size_of::<PrepareExportDirectory>(),
     ]
     .into_iter()
     .max()
@@ -136,6 +143,7 @@ pub(super) enum Value {
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
+    ExportDirectory(PreparedExportDirectory),
     Unit,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -1033,6 +1041,9 @@ impl Parent {
                 Call::ReadPreviewConfiguration(path) => {
                     Value::Configuration(self.client.read_preview_configuration(path, cancel)?)
                 }
+                Call::PrepareExportDirectory(request) => {
+                    Value::ExportDirectory(self.client.prepare_export_directory(request, cancel)?)
+                }
             })
         })();
         #[cfg(test)]
@@ -1603,6 +1614,22 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("wrong preview configuration reply"),
         }
     }
+    fn prepare_export_directory(
+        &self,
+        request: &PrepareExportDirectory,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedExportDirectory> {
+        match self.call(
+            Call::PrepareExportDirectory(Box::new(request.clone())),
+            cancel,
+        )? {
+            Value::ExportDirectory(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("wrong export directory reply"),
+        }
+    }
 }
 fn unit(v: Value) -> Result<()> {
     ensure!(matches!(v, Value::Unit), "wrong unit reply");
@@ -1633,6 +1660,9 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
             bytes.len() <= store::CONFIG_BYTES,
             "preview configuration response byte limit"
         ),
+        (Call::PrepareExportDirectory(request), Value::ExportDirectory(value)) => {
+            value.validate_for(request)?
+        }
         (Call::Resume { restore_id, .. }, Value::Restore(Some(v))) => ensure!(
             &v.receipt.restore_id == restore_id && !v.jobs_held,
             "relay restored-job receipt mismatch"

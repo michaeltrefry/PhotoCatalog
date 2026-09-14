@@ -287,6 +287,7 @@ pub(super) fn build_identity() -> String {
             include_str!("../metadata.rs"),
             include_str!("../organization.rs"),
             include_str!("../exports.rs"),
+            include_str!("../exports/worker.rs"),
             include_str!("../lightroom_bridge.rs"),
             include_str!("../../../Cargo.lock")
         )

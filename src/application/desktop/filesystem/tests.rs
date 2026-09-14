@@ -94,6 +94,49 @@ fn exact_encoding_and_epoch_bounds_precede_reply_adoption() -> Result<()> {
     assert!(decode(&binding, &encoded, Lane::Control).is_err());
     Ok(())
 }
+
+#[test]
+fn export_directory_reply_requires_exact_root_and_requested_path() -> Result<()> {
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let catalog = request();
+    let root = bootstrap(&catalog, &binding).root_capability();
+    let request = PrepareExportDirectory {
+        root: root.clone(),
+        directory: NativePath::from_path(&std::env::temp_dir().join("selected-output")),
+    };
+    let call = Call::PrepareExportDirectory(Box::new(request.clone()));
+    call.validate()?;
+    let value = Value::ExportDirectory(PreparedExportDirectory {
+        root,
+        requested: request.directory.clone(),
+        directory: NativePath::from_path(&std::env::temp_dir()),
+    });
+    validate_reply(&call, &value, &binding)?;
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Call {
+            id: U64(9),
+            call: call.clone(),
+        },
+    };
+    let bytes = encode(&packet, BYTES)?;
+    assert!(matches!(
+        decode(&binding, &bytes, Lane::Data)?,
+        Body::Call {
+            id: U64(9),
+            call: Call::PrepareExportDirectory(_)
+        }
+    ));
+    let Value::ExportDirectory(mut foreign) = value else {
+        unreachable!()
+    };
+    foreign.requested = NativePath::from_path(&std::env::temp_dir().join("other-output"));
+    assert!(validate_reply(&call, &Value::ExportDirectory(foreign), &binding).is_err());
+    Ok(())
+}
 #[test]
 fn wrong_reply_is_not_acknowledged_and_cancel_does_not_erase_publication() -> Result<()> {
     let binding = Binding {

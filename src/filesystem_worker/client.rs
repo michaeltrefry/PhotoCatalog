@@ -5,7 +5,7 @@ use crate::{
     catalog_backup::RestoreStatus,
     catalog_session::{
         CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, LeaseId, PrepareCatalog,
-        RootCapability, SqlAdmissionConfirmed,
+        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
 };
@@ -976,6 +976,22 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected preview configuration response"),
         }
     }
+    fn prepare_export_directory(
+        &self,
+        request: &PrepareExportDirectory,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedExportDirectory> {
+        match self.execute(
+            Operation::PrepareExportDirectory(Box::new(request.clone())),
+            cancel,
+        )? {
+            Response::ExportDirectory(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected export directory response"),
+        }
+    }
 
     fn prepare_catalog(
         &self,
@@ -1528,6 +1544,55 @@ mod tests {
     }
 
     #[test]
+    fn actual_f_export_directory_round_trip_is_read_only_and_root_bound() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let child = spawn_fixture("filesystem", temp.path(), Faults::default())?;
+        let catalog = PrepareCatalog {
+            operation: U64(17),
+            session: LeaseId::new(),
+            mode: crate::catalog_session::BootstrapMode::DesktopCreate,
+            root: NativePath::from_path(&temp.path().join("catalog")),
+            manifest_root: NativePath::from_path(&temp.path().join("manifest")),
+            import_source: None,
+        };
+        let bootstrap = child.0.prepare_catalog(&catalog, &AtomicBool::new(false))?;
+        let output = temp.path().join("output");
+        fs::create_dir(&output)?;
+        fs::write(output.join("sentinel"), b"unchanged")?;
+        let request = PrepareExportDirectory {
+            root: bootstrap.root_capability(),
+            directory: NativePath::from_path(&output),
+        };
+        let prepared = child
+            .0
+            .prepare_export_directory(&request, &AtomicBool::new(false))?;
+        prepared.validate_for(&request)?;
+        assert_eq!(
+            prepared.directory,
+            NativePath::from_path(&output.canonicalize()?)
+        );
+        assert_eq!(fs::read(output.join("sentinel"))?, b"unchanged");
+        assert_eq!(fs::read_dir(&output)?.count(), 1);
+
+        let mut foreign = request.clone();
+        foreign.root.session = LeaseId::new();
+        let error = child
+            .0
+            .prepare_export_directory(&foreign, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Rejected
+        );
+        child
+            .0
+            .abandon_prepare(bootstrap.operation, &bootstrap.session)?;
+        child.0.try_shutdown()?;
+        assert_retired(&child.0);
+        Ok(())
+    }
+
+    #[test]
     fn post_spawn_thread_failure_returns_owned_unexposed_client() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let child = spawn_fixture(
@@ -1684,6 +1749,21 @@ mod tests {
         if role == "wait" {
             io::copy(&mut io::stdin().lock(), &mut io::sink())?;
             return Ok(());
+        }
+        if role == "filesystem" {
+            let result = crate::filesystem_worker::process::serve(
+                io::stdin().lock(),
+                io::stdout(),
+                io::stderr(),
+                crate::filesystem_worker::FilesystemHandler::new,
+            );
+            if let Err(error) = result {
+                return Err(error);
+            }
+            // The libtest parent owns stdout outside this ignored connector.
+            // Exit after the flushed PCFS stream so its success trailer cannot
+            // be mistaken for another filesystem frame.
+            std::process::exit(0);
         }
         ensure!(role == "panic", "unknown owned F fixture role");
         let directory = PathBuf::from(std::env::var_os(DIRECTORY).expect("fixture directory"));

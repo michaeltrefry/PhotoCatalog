@@ -247,6 +247,40 @@ impl ConfirmSqlAdmission {
 /// A health response, stale cached Prepare, EOF or lost reply is not this proof.
 pub type SqlAdmissionConfirmed = ConfirmSqlAdmission;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareExportDirectory {
+    pub root: RootCapability,
+    pub directory: NativePath,
+}
+impl PrepareExportDirectory {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        validate_path(&self.directory)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedExportDirectory {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub directory: NativePath,
+}
+impl PreparedExportDirectory {
+    pub fn validate_for(&self, request: &PrepareExportDirectory) -> Result<()> {
+        request.validate()?;
+        validate_path(&self.directory)?;
+        ensure!(
+            self.root == request.root && self.requested == request.directory,
+            "prepared export directory belongs to another request"
+        );
+        Ok(())
+    }
+}
+
 pub mod native;
 pub mod preview_io;
 pub mod preview_stage;
@@ -290,6 +324,15 @@ pub trait CatalogFilesystem: Send + Sync {
         _cancel: &AtomicBool,
     ) -> Result<Vec<u8>> {
         anyhow::bail!("filesystem owner does not support preview configuration reads")
+    }
+    /// Resolves one existing export directory under the exact admitted catalog
+    /// capability. This is read-only and grants no later alias/publication right.
+    fn prepare_export_directory(
+        &self,
+        _request: &PrepareExportDirectory,
+        _cancel: &AtomicBool,
+    ) -> Result<PreparedExportDirectory> {
+        anyhow::bail!("filesystem owner does not support export directory preparation")
     }
     /// A lost reply is recovered by the original operation identity inside the
     /// client. Never repeat Prepare/creation. An error/cancel can still leave an
@@ -386,6 +429,27 @@ impl CatalogSessionAuthority {
         match &self.mode {
             AuthorityMode::Managed { pool, .. } => Some(pool),
             _ => None,
+        }
+    }
+    pub(crate) fn prepare_export_directory(
+        &self,
+        directory: &NativePath,
+        cancel: &AtomicBool,
+    ) -> Result<Option<NativePath>> {
+        match &self.mode {
+            AuthorityMode::Legacy(_) => Ok(None),
+            AuthorityMode::Managed {
+                filesystem, root, ..
+            } => {
+                let request = PrepareExportDirectory {
+                    root: root.clone(),
+                    directory: directory.clone(),
+                };
+                request.validate()?;
+                let prepared = filesystem.prepare_export_directory(&request, cancel)?;
+                prepared.validate_for(&request)?;
+                Ok(Some(prepared.directory))
+            }
         }
     }
     pub(crate) fn require_jobs_released(&self, legacy_root: &Path) -> Result<()> {
@@ -879,7 +943,7 @@ impl Drop for ManagedSession {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::{retained_admission, unused_filesystem};
+pub(crate) use tests::{export_managed_session, retained_admission, unused_filesystem};
 
 #[cfg(test)]
 pub(crate) mod overlap_tests;

@@ -3,7 +3,8 @@ use crate::{
     catalog_backup::{self, RestoreStatus},
     catalog_session::{
         BootstrapMode, CatalogBootstrap, ConfirmSqlAdmission, LeaseId, PinnedDatabase,
-        PrepareCatalog, RootCapability, validate_path,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
+        validate_path,
     },
     catalog_storage::{open_regular, physical_object_id},
     storage_volume::NativePath,
@@ -467,6 +468,27 @@ impl BootstrapOwner {
     pub fn require_jobs_released(&self, root: &RootCapability) -> Result<()> {
         self.with_root(root, catalog_backup::require_jobs_released)
     }
+    pub fn prepare_export_directory(
+        &self,
+        request: &PrepareExportDirectory,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedExportDirectory> {
+        request.validate()?;
+        export_cancel(cancel)?;
+        self.with_root(&request.root, |_| {
+            export_cancel(cancel)?;
+            let directory = fs::canonicalize(request.directory.to_path()?)?;
+            ensure!(directory.is_dir(), "existing output directory required");
+            let directory = NativePath::from_path(&directory);
+            validate_path(&directory)?;
+            export_cancel(cancel)?;
+            Ok(PreparedExportDirectory {
+                root: request.root.clone(),
+                requested: request.directory.clone(),
+                directory,
+            })
+        })
+    }
     fn with_root<T>(
         &self,
         root: &RootCapability,
@@ -522,6 +544,15 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
         !cancel.load(Ordering::Acquire),
         "filesystem operation canceled"
     );
+    Ok(())
+}
+fn export_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(anyhow::Error::new(super::wire::Failure::new(
+            super::wire::FailureKind::Canceled,
+            "export directory preparation canceled",
+        )));
+    }
     Ok(())
 }
 fn open_database(path: &Path, may_create: bool, must_create: bool) -> Result<(File, bool)> {

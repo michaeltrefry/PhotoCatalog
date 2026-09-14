@@ -19,15 +19,23 @@ struct Facts {
     fail_confirmation: AtomicBool,
     fresh: bool,
     fatal_drop_sentry: bool,
+    export_directory: NativePath,
+    export_requests: Arc<Mutex<Vec<PrepareExportDirectory>>>,
 }
 impl Facts {
     fn create(base: &Path) -> Result<(Arc<Self>, PrepareCatalog)> {
         let root = base.join("catalog");
         let cache = base.join("cache");
+        let export_directory = base.join("exports");
         fs::create_dir_all(&root)?;
         fs::create_dir_all(&cache)?;
         let root = root.canonicalize()?;
         let cache = cache.canonicalize()?;
+        let export_directory = if export_directory.exists() {
+            export_directory.canonicalize()?
+        } else {
+            export_directory
+        };
         let main = OpenOptions::new()
             .read(true)
             .write(true)
@@ -85,6 +93,8 @@ impl Facts {
                 fail_confirmation: AtomicBool::new(false),
                 fresh: true,
                 fatal_drop_sentry: false,
+                export_directory: NativePath::from_path(&export_directory),
+                export_requests: Arc::new(Mutex::new(Vec::new())),
             }),
             request,
         ))
@@ -98,6 +108,25 @@ impl Drop for Facts {
     }
 }
 impl CatalogFilesystem for Facts {
+    fn prepare_export_directory(
+        &self,
+        request: &PrepareExportDirectory,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedExportDirectory> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Canceled,
+                "synthetic export directory cancellation",
+            )
+            .into());
+        }
+        self.export_requests.lock().unwrap().push(request.clone());
+        Ok(PreparedExportDirectory {
+            root: request.root.clone(),
+            requested: request.directory.clone(),
+            directory: self.export_directory.clone(),
+        })
+    }
     fn prepare_catalog(
         &self,
         request: &PrepareCatalog,
@@ -159,6 +188,41 @@ impl CatalogFilesystem for Facts {
         );
         Ok(())
     }
+}
+
+#[test]
+fn managed_export_directory_uses_exact_session_capability_and_preserves_cancellation() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    fs::create_dir(temp.path().join("exports"))?;
+    let (facts, request) = Facts::create(temp.path())?;
+    let mut session =
+        ManagedSession::admit(facts.clone(), &request, &AtomicBool::new(false)).unwrap();
+    let requested = NativePath::from_path(&temp.path().join("selected-output"));
+    assert_eq!(
+        session
+            .authority
+            .prepare_export_directory(&requested, &AtomicBool::new(false))?,
+        Some(facts.export_directory.clone())
+    );
+    let calls = facts.export_requests.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].root, facts.bootstrap.root_capability());
+    assert_eq!(calls[0].directory, requested);
+    drop(calls);
+    let error = session
+        .authority
+        .prepare_export_directory(&requested, &AtomicBool::new(true))
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+            .unwrap()
+            .kind,
+        crate::filesystem_worker::wire::FailureKind::Canceled
+    );
+    session.close()?;
+    Ok(())
 }
 
 #[test]
@@ -541,6 +605,22 @@ fn managed_snapshot_close_drains_idle_owner_before_pool_release() -> Result<()> 
 
 pub(crate) fn unused_filesystem(base: &Path) -> Result<Arc<dyn CatalogFilesystem>> {
     Ok(Facts::create(base)?.0)
+}
+
+pub(crate) fn export_managed_session(
+    base: &Path,
+) -> Result<(
+    ManagedSession,
+    Arc<Mutex<Vec<PrepareExportDirectory>>>,
+    NativePath,
+)> {
+    let export_directory = base.join("exports");
+    fs::create_dir(&export_directory)?;
+    let (facts, request) = Facts::create(base)?;
+    let requests = facts.export_requests.clone();
+    let directory = NativePath::from_path(&export_directory.canonicalize()?);
+    let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
+    Ok((session, requests, directory))
 }
 
 #[test]

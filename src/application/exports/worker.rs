@@ -52,6 +52,138 @@ pub(super) fn options(c: &Config) -> Options {
         result_rows: U64(100),
     }
 }
+
+#[cfg(test)]
+mod managed_destination_tests {
+    use super::*;
+    use crate::{
+        catalog_edits::VariantKey, catalog_session::export_managed_session,
+        image_export::IntegerDepth,
+    };
+
+    fn config() -> Config {
+        Config {
+            worker_executable: std::env::current_exe().unwrap(),
+            cache_root: None,
+            original_roots: vec![],
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        }
+    }
+
+    #[test]
+    fn managed_destinations_use_catalog_filesystem_authority_without_touching_output()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (mut session, requests, output_directory) = export_managed_session(temp.path())?;
+        let output_path = output_directory.to_path()?;
+        let sentinel = output_path.join("sentinel");
+        std::fs::write(&sentinel, b"unchanged")?;
+        let entries_before = std::fs::read_dir(&output_path)?.count();
+        let requested = NativePath::from_path(&temp.path().join("caller-path-does-not-exist"));
+        let expected_root = session.bootstrap.root_capability();
+
+        {
+            let catalog = session.catalog.as_mut().unwrap();
+            let original = temp.path().join("original-name.png");
+            std::fs::write(&original, b"synthetic original")?;
+            let fingerprint = blake3::hash(b"synthetic original").to_hex().to_string();
+            catalog.db.execute(
+                "INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,?2,'ready',?3,'fixture','{\"format\":\"PNG\",\"width\":32,\"height\":24,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",
+                rusqlite::params![
+                    crate::location_bytes(&original),
+                    original.to_string_lossy(),
+                    fingerprint
+                ],
+            )?;
+            catalog.record_storage_path("a", &NativePath::from_path(&original))?;
+            let ctx = Context {
+                control: Default::default(),
+                cache: Default::default(),
+                config: config(),
+            };
+            let targets = vec![
+                TargetKey {
+                    key: VariantKey::master("a"),
+                    expected_revision: I64(0),
+                },
+                TargetKey {
+                    key: VariantKey::master("a"),
+                    expected_revision: I64(1),
+                },
+            ];
+            let ResultValue::Destinations { token, total } = destinations(
+                &ctx,
+                catalog,
+                &requested,
+                targets,
+                OutputFormat::Png {
+                    depth: IntegerDepth::Sixteen,
+                },
+                Naming {
+                    prefix: "managed-".into(),
+                    suffix: "-selected".into(),
+                    variant_suffix: false,
+                    sequence_start: None,
+                },
+            )?
+            else {
+                panic!("destination result")
+            };
+            assert_eq!(total, U64(2));
+            let options = super::options(&ctx.config);
+            let Response::Destinations { rows, .. } = read::execute(
+                catalog,
+                Request::DestinationRows {
+                    token: token.clone(),
+                    after: U64(0),
+                    limit: U64(2),
+                },
+                &ctx.config.limits,
+                &ctx.cache,
+                &options,
+            )?
+            else {
+                panic!("destination rows")
+            };
+            assert_eq!(rows.len(), 2);
+            let Destination {
+                destination: Some(destination),
+                error: None,
+                ..
+            } = &rows[0]
+            else {
+                panic!("valid destination")
+            };
+            assert_eq!(
+                destination.to_path()?,
+                output_path.join("managed-original-name-selected.png")
+            );
+            assert!(rows[1].destination.is_none());
+            assert!(rows[1].error.as_ref().unwrap().contains("changed"));
+            read::execute(
+                catalog,
+                Request::ResultRelease { token },
+                &ctx.config.limits,
+                &ctx.cache,
+                &options,
+            )?;
+            assert_eq!(std::fs::read(&original)?, b"synthetic original");
+        }
+
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].root, expected_root);
+        assert_eq!(calls[0].directory, requested);
+        drop(calls);
+        assert_eq!(std::fs::read_dir(&output_path)?.count(), entries_before);
+        assert_eq!(std::fs::read(&sentinel)?, b"unchanged");
+        session.close()?;
+        Ok(())
+    }
+}
 fn render(v: &RenderLimits) -> crate::edit::RenderLimits {
     crate::edit::RenderLimits {
         max_pixels: v.max_pixels.0,
@@ -453,9 +585,27 @@ pub(super) fn destinations(
     format: OutputFormat,
     naming: Naming,
 ) -> anyhow::Result<ResultValue> {
-    let directory = path(directory).map_err(ae)?.canonicalize()?;
-    ensure!(directory.is_dir(), "existing output directory required");
     let cancel = ctx.cancel();
+    ensure!(
+        !cancel.is_canceled() && !ctx.stopped(),
+        "destination preparation canceled"
+    );
+    let requested = path(directory).map_err(ae)?;
+    let directory = match catalog
+        .session
+        .prepare_export_directory(directory, &cancel.0)?
+    {
+        Some(directory) => path(&directory).map_err(ae)?,
+        None => {
+            let directory = requested.canonicalize()?;
+            ensure!(directory.is_dir(), "existing output directory required");
+            directory
+        }
+    };
+    ensure!(
+        !cancel.is_canceled() && !ctx.stopped(),
+        "destination preparation canceled"
+    );
     let mut rows = Vec::new();
     for (index, target) in targets.into_iter().enumerate() {
         ensure!(

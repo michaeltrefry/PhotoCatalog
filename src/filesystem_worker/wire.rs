@@ -3,8 +3,8 @@ use crate::{
     application::U64,
     catalog_backup::RestoreStatus,
     catalog_session::{
-        CatalogBootstrap, ConfirmSqlAdmission, LeaseId, PrepareCatalog, RootCapability,
-        SqlAdmissionConfirmed, validate_path,
+        CatalogBootstrap, ConfirmSqlAdmission, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, validate_path,
     },
     storage_volume::NativePath,
 };
@@ -114,6 +114,7 @@ pub enum Operation {
     PreviewIo(crate::catalog_session::preview_io::Request),
     PreviewStage(crate::catalog_session::preview_stage::Request),
     ReadPreviewConfiguration(NativePath),
+    PrepareExportDirectory(Box<PrepareExportDirectory>),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
     AbandonPrepare {
@@ -156,6 +157,7 @@ impl Operation {
             Self::PreviewIo(value) => value.validate()?,
             Self::PreviewStage(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
+            Self::PrepareExportDirectory(value) => value.validate()?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
                 validate_root(&value.root)?;
@@ -257,6 +259,7 @@ pub enum Response {
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     PreviewConfiguration(Vec<u8>),
+    ExportDirectory(PreparedExportDirectory),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
     RestoreStatus(Option<RestoreStatus>),

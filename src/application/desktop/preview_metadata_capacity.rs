@@ -836,6 +836,40 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         1,
         SAVED_DESCRIPTOR_BYTES,
     )?;
+    // During export-directory preparation, G retains its encoded F Operation
+    // while F owns the decoded request. Once the result crosses back, G retains
+    // that request alongside one decoded Response. The C relay Call graph is an
+    // independent owner already charged above.
+    let export_request = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Operation>().size,
+        Layout::of::<crate::catalog_session::PrepareExportDirectory>().size,
+        c.mul(3, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+    ])?;
+    let export_reply = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Response>().size,
+        c.mul(3, LEASE_ID_BYTES)?,
+        c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
+    ])?;
+    a.push(
+        "active.export_directory_f_typed_graphs",
+        Phase::Active,
+        1,
+        c.add(&[export_request, export_request.max(export_reply)])?,
+    )?;
+    // CatalogSessionAuthority retains its original request while Proxy owns an
+    // independent deep clone in the C relay Call charged above. Only the
+    // original request's separately allocated backings belong here; its inline
+    // stack root is not an allocation.
+    a.push(
+        "active.export_directory_c_caller_request_backing",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(3, LEASE_ID_BYTES)?,
+            c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+        ])?,
+    )?;
     for (name, count) in [
         ("relay.parent_fault_backing", 1),
         ("relay.child_fault_backing", 1),
@@ -1062,6 +1096,20 @@ mod tests {
                 .contributions
                 .iter()
                 .all(|entry| names.insert(entry.name))
+        );
+        let export_caller = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "active.export_directory_c_caller_request_backing")
+            .unwrap();
+        assert_eq!(export_caller.phase, Phase::Active);
+        assert_eq!(export_caller.count, 1);
+        assert_eq!(
+            export_caller.each,
+            Checked.add(&[
+                Checked.mul(3, LEASE_ID_BYTES)?,
+                Checked.mul(2, Checked.vec(2, PATH_UNITS as u64)?)?,
+            ])?
         );
         default.preview_limits.working_bytes = 1;
         assert_eq!(report(&default)?.requested, default_report.requested);

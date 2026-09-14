@@ -68,6 +68,15 @@ transports and fits the same envelope. Relay fault backing is split by its
 source owner: parent latch, child latch, two child call outcomes, admission
 query, store query, native pending query and retained native result.
 
+Managed export-directory preparation adds two bounded active ownership terms.
+The F typed-graph term charges the G-owned filesystem `Operation` plus the
+larger of the simultaneous F request and returned `Response`, including the
+boxed request, root-capability strings and every native-path backing. The C
+caller term charges the original request's three lease-ID strings and two
+native-path backings while its deep-cloned relay `Call` is in flight; that Call
+graph remains separately charged. Directory contents and exported image bytes
+are outside this read-only preparation phase.
+
 Tagged serde parsing uses the pinned `serde::__private229::de::Content` and
 `(Content,Content)` layouts. For raw length `R`, `N=floor((R+1)/2)`,
 `U=N*(max(2S,P)+8*max(S,P))`, and `G=S+U+R`. A parser charge is

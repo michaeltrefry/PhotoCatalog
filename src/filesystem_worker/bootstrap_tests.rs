@@ -2,8 +2,8 @@ use super::*;
 use crate::{
     application::U64,
     catalog_session::{
-        BootstrapMode, ConfirmSqlAdmission, LeaseId, PrepareCatalog, SQL_ROLES, SqlRole,
-        SqlRoleObservation,
+        BootstrapMode, ConfirmSqlAdmission, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        SQL_ROLES, SqlRole, SqlRoleObservation,
     },
 };
 use std::sync::atomic::AtomicBool;
@@ -221,5 +221,58 @@ fn global_restore_observation_rejects_replaced_directory() -> Result<()> {
     fs::rename(&root, temp.path().join("original"))?;
     fs::create_dir(&root)?;
     assert!(observed.verify().is_err());
+    Ok(())
+}
+
+#[test]
+fn export_directory_preparation_is_read_only_bound_and_cancellable() -> Result<()> {
+    let temp = TempDir::new()?;
+    let catalog_request = request(&temp);
+    let mut owner = owner();
+    let bootstrap = owner.prepare(&catalog_request, &AtomicBool::new(false), |_| Ok(()))?;
+    let output = temp.path().join("output");
+    fs::create_dir(&output)?;
+    fs::write(output.join("sentinel"), b"unchanged")?;
+    let request = PrepareExportDirectory {
+        root: bootstrap.root_capability(),
+        directory: NativePath::from_path(&output),
+    };
+    let prepared = owner.prepare_export_directory(&request, &AtomicBool::new(false))?;
+    prepared.validate_for(&request)?;
+    assert_eq!(
+        prepared.directory,
+        NativePath::from_path(&output.canonicalize()?)
+    );
+    assert_eq!(fs::read(output.join("sentinel"))?, b"unchanged");
+    assert_eq!(fs::read_dir(&output)?.count(), 1);
+
+    let error = owner
+        .prepare_export_directory(&request, &AtomicBool::new(true))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Failure>().unwrap().kind,
+        FailureKind::Canceled
+    );
+    let mut foreign = request.clone();
+    foreign.root.token = LeaseId::new();
+    assert!(
+        owner
+            .prepare_export_directory(&foreign, &AtomicBool::new(false))
+            .is_err()
+    );
+    fs::write(temp.path().join("not-directory"), b"file")?;
+    let mut not_directory = request.clone();
+    not_directory.directory = NativePath::from_path(&temp.path().join("not-directory"));
+    let error = owner
+        .prepare_export_directory(&not_directory, &AtomicBool::new(false))
+        .unwrap_err();
+    let error = export_directory_failure(error);
+    assert_eq!(
+        error.downcast_ref::<Failure>().unwrap().kind,
+        FailureKind::Rejected
+    );
+    assert_eq!(fs::read(output.join("sentinel"))?, b"unchanged");
+    owner.abandon(bootstrap.operation, &bootstrap.session)?;
+    owner.shutdown()?;
     Ok(())
 }

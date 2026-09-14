@@ -58,6 +58,11 @@ impl FilesystemHandler {
             Operation::ReadPreviewConfiguration(path) => {
                 store::read_configuration(&path, cancel).map(Response::PreviewConfiguration)
             }
+            Operation::PrepareExportDirectory(request) => self
+                .owner
+                .prepare_export_directory(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::ExportDirectory),
             Operation::PrepareCatalog(request) => self
                 .owner
                 .prepare(&request, cancel, |progress| {
@@ -162,6 +167,13 @@ fn filesystem_failure(error: anyhow::Error) -> Failure {
     let mut failure = Failure::new(kind, error);
     failure.object_receipt = object_receipt;
     failure
+}
+fn export_directory_failure(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<Failure>().is_some() {
+        error
+    } else {
+        Failure::new(FailureKind::Rejected, error).into()
+    }
 }
 fn snapshot(value: &PreparationProgress) -> AdmissionSnapshot {
     AdmissionSnapshot {
