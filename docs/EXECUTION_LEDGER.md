@@ -6,6 +6,26 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+LM3 R8 runtime completed five passes and four failures across nine exact tests;
+receipts sc-22847-lm3-runtime9-l1ctuiya and runtime9-remaining-8fi_fbox preserve
+all logs/source identity. Cargo waits verified; no shared-target workers remain.
+Run/status/raw retention, resolver, lock, supplement budget retry and populated
+alias refusal pass. Three failures share a 4-vs-3 evidence-row assertion; one
+expects a different disjointness rejection. A bounded Sol/high fixture repair
+must derive expected evidence content from producer and preserve no-write/path
+semantics before compile, independent review and affected-case rerun. Publication
+R1-R6 remains under separate stronger-author repair; no native run is active.
+
+LM3 R8 T213447 fixes original-path validation before Bootstrap and adds absent
+alias/no-write plus canonical first-use coverage. Full test-target compile
+passed db2dc091 with unchanged source and checked retirement. Independent
+closure review add7688f passed (0.96); nine affected runtime tests are active in
+sc-22847-lm3-runtime9-l1ctuiya, outer42891. Publication review
+9b908768 requires six repairs: original/publication joint custody, bounded
+rejected-step reconciliation, mode binding, allocation owner completeness,
+primary mutation-error retention, and correct recovery/fault coverage. Stronger
+implementation owns that bounded repair; a different reviewer must approve it.
+
 LM3 T212233 compile passed (ffb91e3a), but independent review found that an
 alias to an empty destination can reach Bootstrap before managed no-link
 validation. Author is repairing validation before any create/upgrade authority
