@@ -19,7 +19,9 @@ retry, cold/warm preview delivery, Tauri check, 27 LM executor tests and seven
 CLI compatibility tests. Evidence: private sc-22847-lm-publication-integration-
 bio0am7u; receipt cb7aa884, CLI edcc84fd. Root verified 390 source hashes,
 all 12 reported process IDs absent, and no remaining managed workers. Separate
-composition review 4448f225 passes; final integrated receipt audit is pending.
+composition review 4448f225 and integrated evidence audit 99f5d32a pass.
+Next: isolated LM batch4 implementation on codex/sc-22847-lm-desktop, with
+independent read-only inventory of the remaining N/G export path.
 LM batch4 G/C admission and public application bridge, N/G export executor,
 full S12 installed workflows and S13 readiness remain open. No push, CI,
 installation replacement, canonical migration or RAID access occurred.
