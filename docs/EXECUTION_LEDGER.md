@@ -6,6 +6,24 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+FS9 original verification is locally committed `dcdfd5d` and integrated `5c210c8`;
+all 14 reviewed blobs match, including observed capacity documentation. Eight
+exact tests passed (each1,953filtered), F61529 checked/reaped and absent;
+evidence review4e868bf4 PASS0.98. Integrated gate
+`sc-22847-original-lease-integration-g25tfc1m` passes formatting, fresh CLI,
+managed startup/refusal/retry, cold/warm render and Tauri. Logs d5307abd,
+05ae6f65,8b00e8e9,3ad528fd; binary4f4fbebd; source unchanged and all reported
+processes absent. Independent integrated review302bd465 PASS0.98. These are
+component and integration-smoke results, not full S12/RSS/default-route proof.
+Requested backing min/default/max is 6274571984/6988676926/1076761649962 bytes,
+not measured allocation or RSS.
+
+LM3 T200212 reviewf846ebd9 requires repair stored-state admission, valid supplement
+fixtures, actual unpinned legacy upgrade, and bounded prepared-input failure
+reporting. Stronger-model implementation owns this bounded repair now; a separate
+reviewer will assess its output. Original author is idle. Next FS9 publication
+capture/link/restore work is read-only mapping, with no implementation admitted.
+
 LM3 T200212 (32 files, manifest5d20174e) passes full test-target and Tauri checks,
 logs52011090/68191804, cargo36889/38062 waited0, source unchanged. Independent
 semantic re-review is active before the 15-test gate. FS9 reviewa9a43cbf found
