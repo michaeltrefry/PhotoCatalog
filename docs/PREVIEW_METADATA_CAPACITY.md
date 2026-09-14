@@ -124,6 +124,50 @@ long-lived admitted-original-root vector and all independently allocated native
 path vectors are a separate retained term derived from the 4 MiB startup frame;
 the formula includes outer-vector growth and per-path minimum allocation.
 
+Managed photo publication is a separate stateful F lease held by the same
+serial export actor. C retains SQL transactions, catalog and alias decisions,
+and every intent/finalization commit; F alone retains the operation lock and
+the verified payload, destination and captured-file handles while executing
+Capture, Link, RestoreLink and their existing verification/recheck steps. Each
+request carries the complete catalog root, transfer, step, mode and original
+seal or recovery authority. F caches the exact last request digest and bounded
+typed outcome, so replay after a lost mutating reply returns the saved result
+without repeating the namespace action. Finish and Abort retain a terminal
+record for exact replay; a new Begin constructs its complete candidate while
+that terminal remains live. Fresh mutation is cancelable before dispatch, but
+an admitted namespace step runs to a retained result before reconciliation.
+
+Publication accounting is additive with original custody. C owns the publication
+custody Arc (which shares the original Arc without allocating another pointee),
+three source/pending/lease seal graphs, two retained root paths, ten retained
+lease IDs including the exact original transfer, and its independent caller
+request/root/detail graph. A publication seal includes the optional overwritten
+file digest as well as its operation, authority and payload strings.
+
+F may simultaneously own seven authority graphs: the old terminal's source,
+seal and cached reply, and the new active transfer's source, seal, publication
+seal and cached reply. The returned reply is independently covered by the F typed
+request/response envelope. Each F record has five lease ID backings: its outer
+transfer, cached reply transfer, and root epoch/token/session. Both records
+therefore charge ten IDs, two cached root paths and four request/reply digests.
+Verification can temporarily hold five VerifiedFiles while replacing two of
+three existing proofs, plus the cloned expected FileRevision digest in
+verify_restored. All six file-related digest backings and six paths including
+the publication directory are charged explicitly.
+Old/new receipts and bounded failure strings also remain independently owned.
+
+The F wire parser has a separate 1 MiB prevalidation Content/typed-graph bound.
+Journal accounting covers the growing 64 KiB+1 read Vec, parse overlap, the
+previous parsed seal while reading plan.json, and cloned seal/receipt/path
+conversions alongside serialization output. The metadata-only recovery reader
+moves its returned seal into the existing candidate authority graph; it adds no
+concurrent parsed owner. The locked restoration seal/plan rechecks use the same
+journal scratch slots as strict publication. C/G relay Call clones retain their
+existing independent graph and buffer contributions. The fixed 64 KiB hashing
+buffer is stack memory; native handles, allocator overhead, runtime state and
+RSS remain outside this requested-allocation report. Successor numeric values
+must come from the frozen-source runtime capacity report.
+
 Managed ICC acquisition uses one serial export-profile transfer. F retains the
 opened stable `Source`, the exact catalog root capability, requested path,
 transfer identity, next step and offset until an acknowledged finish or abort.
@@ -224,14 +268,15 @@ canonical path plus its two optional retained stage IDs. Every active render or
 read Job separately owns its spawn root/stage, possible status IDs and Stage ID.
 The proxy binding IDs and completed digest are also named contributions.
 
-The original-lease macOS arm64 Rust 1.98.0 focused execution reported these
-checked application-requested backing assemblies (eight focused tests passed):
+The stateful publication macOS arm64 Rust 1.98.0 execution reported these
+checked application-requested backing assemblies. All 19 focused tests passed,
+including the capacity case. Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 318,728,794 | 5,955,843,190 | 5,364,516,472 | 6,274,571,984 |
-| Default | 1,032,824,160 | 5,955,852,766 | 5,364,516,472 | 6,988,676,926 |
-| Maximum | 1,066,288,642,296 | 10,473,007,666 | 5,364,516,472 | 1,076,761,649,962 |
+| Minimum | 318,729,802 | 8,231,328,677 | 5,364,516,472 | 8,550,058,479 |
+| Default | 1,032,825,168 | 8,231,338,253 | 5,364,516,472 | 9,264,163,421 |
+| Maximum | 1,066,288,643,304 | 12,748,496,033 | 5,364,516,472 | 1,079,037,139,337 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime

@@ -244,6 +244,129 @@ fn export_snapshot_and_alias_fact_replies_require_exact_provenance() -> Result<(
 }
 
 #[test]
+fn export_publication_relay_requires_exact_step_authority_and_bounded_detail() -> Result<()> {
+    use crate::catalog_session::{
+        ExportPublicationAction, ExportPublicationMode, ExportPublicationRequest,
+        ExportPublicationSource, ExportPublicationValue,
+    };
+
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let root = bootstrap(&request(), &binding).root_capability();
+    let seal = crate::metadata_export::SealedPhotoExport {
+        version: 2,
+        snapshot: crate::metadata_export::DestinationSnapshot {
+            version: 2,
+            operation: uuid::Uuid::new_v4().to_string(),
+            destination: std::env::temp_dir().join("publication-relay.jpg"),
+            expected: None,
+            max_existing_bytes: 4096,
+        },
+        authority_digest: "ab".repeat(32),
+        max_payload_bytes: 4096,
+        payload: crate::metadata_export::FileRevision {
+            bytes: 7,
+            digest: "cd".repeat(32),
+            modified_ns: 11,
+            identity: (12, 13),
+        },
+    };
+    let request = ExportPublicationRequest {
+        root: root.clone(),
+        transfer: LeaseId::new(),
+        step: U64(0),
+        mode: ExportPublicationMode::Publish,
+        source: ExportPublicationSource::Sealed(seal.clone()),
+        action: ExportPublicationAction::Begin,
+    };
+    let call = Call::ExportPublication(Box::new(request.clone()));
+    call.validate()?;
+    let reply = ExportPublicationReply {
+        mode: request.mode,
+        request_digest: request.digest()?,
+        root,
+        transfer: request.transfer.clone(),
+        step: request.step,
+        seal,
+        value: ExportPublicationValue::Begun { installed: false },
+        timings: Default::default(),
+        hashed_bytes: U64(0),
+    };
+    validate_reply(&call, &Value::ExportPublication(reply.clone()), &binding)?;
+    let encoded = encode(
+        &Packet {
+            binding: binding.clone(),
+            body: Body::Reply {
+                id: U64(15),
+                outcome: Ok(Value::ExportPublication(reply.clone())),
+            },
+        },
+        BYTES,
+    )?;
+    let Body::Reply {
+        outcome: Ok(decoded),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        panic!("publication reply")
+    };
+    validate_reply(&call, &decoded, &binding)?;
+
+    let mut wrong_mode = reply.clone();
+    wrong_mode.mode = ExportPublicationMode::Restore;
+    assert!(validate_reply(&call, &Value::ExportPublication(wrong_mode), &binding).is_err());
+    let mut wrong_digest = reply.clone();
+    wrong_digest.request_digest = "00".repeat(32);
+    assert!(validate_reply(&call, &Value::ExportPublication(wrong_digest), &binding).is_err());
+    let step = ExportPublicationRequest {
+        step: U64(1),
+        action: ExportPublicationAction::Capture,
+        ..request.clone()
+    };
+    let mut failed = ExportPublicationReply {
+        step: step.step,
+        request_digest: step.digest()?,
+        value: ExportPublicationValue::Failed(crate::filesystem_worker::wire::Failure::new(
+            crate::filesystem_worker::wire::FailureKind::Rejected,
+            "retained failure",
+        )),
+        ..reply.clone()
+    };
+    validate_reply(
+        &Call::ExportPublication(Box::new(step.clone())),
+        &Value::ExportPublication(failed.clone()),
+        &binding,
+    )?;
+    if let ExportPublicationValue::Failed(failure) = &mut failed.value {
+        failure.message = "x".repeat(crate::filesystem_worker::wire::ERROR_BYTES + 1);
+    }
+    assert!(
+        validate_reply(
+            &Call::ExportPublication(Box::new(step)),
+            &Value::ExportPublication(failed),
+            &binding
+        )
+        .is_err()
+    );
+    let mut foreign = reply;
+    foreign.transfer = LeaseId::new();
+    assert!(validate_reply(&call, &Value::ExportPublication(foreign), &binding).is_err());
+    let mut oversized = request;
+    oversized.step = U64(1);
+    oversized.action = ExportPublicationAction::FailureReceipt {
+        detail: "x".repeat(8193),
+    };
+    assert!(
+        Call::ExportPublication(Box::new(oversized))
+            .validate()
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn export_profile_chunk_uses_bounded_binary_and_exact_provenance() -> Result<()> {
     use crate::catalog_session::{
         EXPORT_PROFILE_BYTES, ExportProfileAction, ExportProfileReply, ExportProfileRequest,

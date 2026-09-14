@@ -38,6 +38,48 @@ struct Facts {
     fail_original_abort: Arc<AtomicBool>,
     original_cleanup_probe: Arc<Mutex<Option<crate::metadata_export::SealedPhotoExport>>>,
     original_cleanup_probe_results: Arc<Mutex<Vec<(ExportOriginalAction, bool)>>>,
+    export_publication: Mutex<TestPublicationState>,
+    export_publication_requests: Arc<Mutex<Vec<ExportPublicationRequest>>>,
+    reject_publication: AtomicBool,
+    lose_publication_action: Arc<Mutex<Option<ExportPublicationAction>>>,
+    cancel_lost_publication_reply: Arc<AtomicBool>,
+    fail_publication_begin_reply: AtomicBool,
+    fail_publication_step_reply: AtomicBool,
+    fail_publication_abort: Arc<AtomicBool>,
+}
+
+enum TestPublicationState {
+    Empty,
+    Active {
+        transfer: LeaseId,
+        source: ExportPublicationSource,
+        next_step: u64,
+        seal: crate::metadata_export::SealedPhotoExport,
+        publication: crate::metadata_export::PhotoPublication,
+        last: (
+            ExportPublicationRequest,
+            std::result::Result<ExportPublicationReply, crate::filesystem_worker::wire::Failure>,
+        ),
+    },
+    Terminal {
+        request: ExportPublicationRequest,
+        reply: ExportPublicationReply,
+    },
+}
+
+fn test_publication_failure(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+        .is_some()
+    {
+        error
+    } else {
+        crate::filesystem_worker::wire::Failure::new(
+            crate::filesystem_worker::wire::FailureKind::Rejected,
+            error,
+        )
+        .into()
+    }
 }
 impl Facts {
     fn create(base: &Path) -> Result<(Arc<Self>, PrepareCatalog)> {
@@ -129,6 +171,14 @@ impl Facts {
                 fail_original_abort: Arc::new(AtomicBool::new(false)),
                 original_cleanup_probe: Arc::new(Mutex::new(None)),
                 original_cleanup_probe_results: Arc::new(Mutex::new(Vec::new())),
+                export_publication: Mutex::new(TestPublicationState::Empty),
+                export_publication_requests: Arc::new(Mutex::new(Vec::new())),
+                reject_publication: AtomicBool::new(false),
+                lose_publication_action: Arc::new(Mutex::new(None)),
+                cancel_lost_publication_reply: Arc::new(AtomicBool::new(false)),
+                fail_publication_begin_reply: AtomicBool::new(false),
+                fail_publication_step_reply: AtomicBool::new(false),
+                fail_publication_abort: Arc::new(AtomicBool::new(false)),
             }),
             request,
         ))
@@ -246,6 +296,267 @@ impl CatalogFilesystem for Facts {
             step: request.step,
             value,
         })
+    }
+    fn export_publication_call(
+        &self,
+        request: &ExportPublicationRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportPublicationReply> {
+        request.validate()?;
+        self.export_publication_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if self.reject_publication.load(Ordering::Acquire) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Rejected,
+                "synthetic pre-admission rejection",
+            )
+            .into());
+        }
+        if cancel.load(Ordering::Acquire) && !request.cleanup() {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Canceled,
+                "synthetic publication cancellation",
+            )
+            .into());
+        }
+        let mut state = self.export_publication.lock().unwrap();
+        match &*state {
+            TestPublicationState::Active { last, .. } if last.0 == *request => {
+                if self
+                    .fail_publication_step_reply
+                    .swap(false, Ordering::AcqRel)
+                {
+                    return Err(crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        "synthetic lost publication step reply",
+                    )
+                    .into());
+                }
+                return last.1.clone().map_err(anyhow::Error::new);
+            }
+            TestPublicationState::Terminal {
+                request: prior,
+                reply,
+            } if prior == request => {
+                if self.fail_publication_abort.load(Ordering::Acquire) {
+                    return Err(crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        "synthetic lost publication cleanup reply",
+                    )
+                    .into());
+                }
+                return Ok(reply.clone());
+            }
+            _ => {}
+        }
+        if matches!(request.action, ExportPublicationAction::Begin) {
+            ensure!(
+                matches!(
+                    &*state,
+                    TestPublicationState::Empty | TestPublicationState::Terminal { .. }
+                ),
+                "synthetic publication already active"
+            );
+            let prepared = (|| -> Result<_> {
+                let seal = match &request.source {
+                    ExportPublicationSource::Sealed(seal) => seal.clone(),
+                    ExportPublicationSource::Recovery {
+                        snapshot,
+                        authority_digest,
+                    } => crate::metadata_export::read_photo_seal_for_restore_with_checkpoint(
+                        snapshot,
+                        authority_digest,
+                        &mut |_| Ok(()),
+                    )?,
+                };
+                let publication = match request.mode {
+                    ExportPublicationMode::Publish => {
+                        crate::metadata_export::PhotoPublication::prepare(&seal)?
+                    }
+                    ExportPublicationMode::Restore => {
+                        crate::metadata_export::PhotoPublication::prepare_restore(&seal)?
+                    }
+                };
+                Ok((seal, publication))
+            })()
+            .map_err(test_publication_failure)?;
+            let (seal, publication) = prepared;
+            let reply = ExportPublicationReply {
+                mode: request.mode,
+                request_digest: request.digest()?,
+                root: request.root.clone(),
+                transfer: request.transfer.clone(),
+                step: request.step,
+                seal: seal.clone(),
+                value: ExportPublicationValue::Begun {
+                    installed: publication.installed(),
+                },
+                timings: publication.timings().clone(),
+                hashed_bytes: U64(0),
+            };
+            reply.validate(request)?;
+            *state = TestPublicationState::Active {
+                transfer: request.transfer.clone(),
+                source: request.source.clone(),
+                next_step: 1,
+                seal,
+                publication,
+                last: (request.clone(), Ok(reply.clone())),
+            };
+            if self
+                .fail_publication_begin_reply
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(crate::filesystem_worker::wire::Failure::new(
+                    crate::filesystem_worker::wire::FailureKind::Unknown,
+                    "synthetic lost publication begin reply",
+                )
+                .into());
+            }
+            return Ok(reply);
+        }
+        let TestPublicationState::Active {
+            transfer,
+            source,
+            next_step,
+            seal,
+            publication,
+            last,
+        } = &mut *state
+        else {
+            anyhow::bail!("synthetic publication lease is not active")
+        };
+        ensure!(
+            transfer == &request.transfer
+                && source == &request.source
+                && last.0.mode == request.mode,
+            "synthetic publication provenance mismatch"
+        );
+        ensure!(
+            *next_step == request.step.0,
+            "synthetic publication step mismatch"
+        );
+        let value = (|| -> Result<_> {
+            Ok(match &request.action {
+                ExportPublicationAction::Begin => unreachable!(),
+                ExportPublicationAction::RecheckPayload => {
+                    publication.recheck_payload()?;
+                    ExportPublicationValue::RecheckedPayload
+                }
+                ExportPublicationAction::Capture => {
+                    publication.capture()?;
+                    ExportPublicationValue::Captured
+                }
+                ExportPublicationAction::VerifyCapture => {
+                    publication.verify_capture()?;
+                    ExportPublicationValue::CaptureVerified
+                }
+                ExportPublicationAction::FailureReceipt { detail } => {
+                    ExportPublicationValue::Receipt(publication.failure_receipt(detail.clone()))
+                }
+                ExportPublicationAction::Link => {
+                    publication.link()?;
+                    ExportPublicationValue::Linked
+                }
+                ExportPublicationAction::VerifyInstalled => {
+                    ExportPublicationValue::Installed(publication.verify_installed()?)
+                }
+                ExportPublicationAction::RecheckInstalled => {
+                    publication.recheck_installed()?;
+                    ExportPublicationValue::RecheckedInstalled
+                }
+                ExportPublicationAction::RestoreLink => {
+                    publication.restore_link()?;
+                    ExportPublicationValue::RestoredLinked
+                }
+                ExportPublicationAction::VerifyRestored => {
+                    ExportPublicationValue::Restored(publication.verify_restored()?)
+                }
+                ExportPublicationAction::RecheckRestored => {
+                    publication.recheck_restored()?;
+                    ExportPublicationValue::RecheckedRestored
+                }
+                ExportPublicationAction::Finish => ExportPublicationValue::Finished,
+                ExportPublicationAction::Abort => ExportPublicationValue::Aborted,
+            })
+        })();
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                let error = test_publication_failure(error);
+                ExportPublicationValue::Failed(
+                    error
+                        .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+                        .unwrap()
+                        .clone(),
+                )
+            }
+        };
+        let reply = ExportPublicationReply {
+            mode: request.mode,
+            request_digest: request.digest()?,
+            root: request.root.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            seal: seal.clone(),
+            value,
+            timings: publication.timings().clone(),
+            hashed_bytes: U64(0),
+        };
+        reply.validate(request)?;
+        *next_step = next_step
+            .checked_add(1)
+            .context("synthetic publication step exhausted")?;
+        *last = (request.clone(), Ok(reply.clone()));
+        let terminal =
+            request.cleanup() && !matches!(reply.value, ExportPublicationValue::Failed(_));
+        if terminal {
+            *state = TestPublicationState::Terminal {
+                request: request.clone(),
+                reply: reply.clone(),
+            };
+        }
+        if matches!(request.action, ExportPublicationAction::Abort)
+            && self.fail_publication_abort.load(Ordering::Acquire)
+        {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                "synthetic lost publication cleanup reply",
+            )
+            .into());
+        }
+        let lose_action = {
+            let mut action = self.lose_publication_action.lock().unwrap();
+            if action.as_ref() == Some(&request.action) {
+                action.take();
+                true
+            } else {
+                false
+            }
+        };
+        if lose_action {
+            if self.cancel_lost_publication_reply.load(Ordering::Acquire) {
+                cancel.store(true, Ordering::Release);
+            }
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                "synthetic lost publication mutation reply",
+            )
+            .into());
+        }
+        if self
+            .fail_publication_step_reply
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                "synthetic lost publication step reply",
+            )
+            .into());
+        }
+        Ok(reply)
     }
     fn export_destination_snapshot(
         &self,
@@ -610,6 +921,7 @@ fn managed_authority_is_exact_arc_while_legacy_exports_keep_physical_compatibili
         },
         searches: Mutex::new(Vec::new()),
         original: Arc::new(Mutex::new(None)),
+        publication: Arc::new(Mutex::new(None)),
     });
     assert!(CatalogSessionAuthority::export_matches(
         &authority, &authority
@@ -815,6 +1127,7 @@ fn prepared_variant_edit_uses_inherited_managed_arc_and_rejects_fresh_arc() -> R
         },
         searches: Mutex::new(Vec::new()),
         original: Arc::new(Mutex::new(None)),
+        publication: Arc::new(Mutex::new(None)),
     });
     assert!(
         catalog
@@ -947,6 +1260,9 @@ pub(crate) struct ExportOriginalTestControl {
     pub(crate) cleanup_probe_results: Arc<Mutex<Vec<(ExportOriginalAction, bool)>>>,
     pub(crate) fail_finish_reply: Arc<AtomicBool>,
     pub(crate) fail_abort: Arc<AtomicBool>,
+    pub(crate) publication_calls: Arc<Mutex<Vec<ExportPublicationRequest>>>,
+    pub(crate) lose_publication_action: Arc<Mutex<Option<ExportPublicationAction>>>,
+    pub(crate) cancel_lost_publication_reply: Arc<AtomicBool>,
 }
 
 pub(crate) fn export_original_managed_session(
@@ -961,6 +1277,9 @@ pub(crate) fn export_original_managed_session(
         cleanup_probe_results: facts.original_cleanup_probe_results.clone(),
         fail_finish_reply: facts.fail_original_finish_reply.clone(),
         fail_abort: facts.fail_original_abort.clone(),
+        publication_calls: facts.export_publication_requests.clone(),
+        lose_publication_action: facts.lose_publication_action.clone(),
+        cancel_lost_publication_reply: facts.cancel_lost_publication_reply.clone(),
     };
     let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
     Ok((session, control))
@@ -1063,6 +1382,198 @@ fn managed_original_custody_survives_lost_replies_and_close_reconciles_exact_tra
     assert!(requests.iter().any(|request| {
         matches!(request.action, ExportOriginalAction::Abort) && request.step == U64(2)
     }));
+    Ok(())
+}
+
+#[test]
+fn managed_publication_replays_lost_steps_preserves_errors_and_close_reconciles_cleanup()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (facts, request) = Facts::create(temp.path())?;
+    facts.empty_restore_status.store(true, Ordering::Release);
+    let destination = temp.path().join("publication-destination.jpg");
+    fs::write(&destination, b"existing destination")?;
+    let snapshot = crate::metadata_export::snapshot_photo_destination(&destination, 4096)?;
+    let payload = temp.path().join("publication-payload.jpg");
+    fs::write(&payload, b"new payload")?;
+    let seal = crate::metadata_export::seal_photo_export(
+        &snapshot,
+        &payload,
+        4096,
+        &"ab".repeat(32),
+        |_| Ok(()),
+    )?;
+    let source = ExportPublicationSource::Sealed(seal);
+    let mut session =
+        ManagedSession::admit(facts.clone(), &request, &AtomicBool::new(false)).unwrap();
+
+    facts
+        .fail_publication_begin_reply
+        .store(true, Ordering::Release);
+    let begin_error = session
+        .authority
+        .begin_export_publication(
+            ExportPublicationMode::Publish,
+            source.clone(),
+            &AtomicBool::new(false),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(
+        begin_error
+            .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+            .unwrap()
+            .kind,
+        crate::filesystem_worker::wire::FailureKind::Unknown
+    );
+    let begin_calls = facts.export_publication_requests.lock().unwrap().clone();
+    assert_eq!(begin_calls[0], begin_calls[1]);
+    assert!(matches!(
+        begin_calls.last().unwrap().action,
+        ExportPublicationAction::Abort
+    ));
+
+    let mut lease = session
+        .authority
+        .begin_export_publication(
+            ExportPublicationMode::Publish,
+            source.clone(),
+            &AtomicBool::new(false),
+        )?
+        .unwrap();
+    facts
+        .fail_publication_step_reply
+        .store(true, Ordering::Release);
+    assert!(lease.capture(&AtomicBool::new(false)).is_err());
+    let operation_error = lease
+        .complete::<()>(Err(anyhow::anyhow!(
+            "original publication operation failed"
+        )))
+        .unwrap_err();
+    assert_eq!(
+        operation_error.to_string(),
+        "original publication operation failed"
+    );
+    let calls = facts.export_publication_requests.lock().unwrap().clone();
+    let captures: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call.action, ExportPublicationAction::Capture))
+        .collect();
+    assert_eq!(captures.len(), 2);
+    assert_eq!(captures[0], captures[1]);
+    assert!(matches!(
+        calls.last().unwrap().action,
+        ExportPublicationAction::Abort
+    ));
+
+    // A pre-admission rejection never consumes a step, including on Close.
+    let mut lease = session
+        .authority
+        .begin_export_publication(
+            ExportPublicationMode::Publish,
+            source.clone(),
+            &AtomicBool::new(false),
+        )?
+        .unwrap();
+    facts.reject_publication.store(true, Ordering::Release);
+    let error = lease.recheck_payload(&AtomicBool::new(false)).unwrap_err();
+    let before = facts.export_publication_requests.lock().unwrap().len();
+    assert!(lease.complete::<()>(Err(error)).is_err());
+    assert_eq!(
+        facts.export_publication_requests.lock().unwrap().len(),
+        before + 1
+    );
+    assert!(session.authority.reconcile_export_publication().is_err());
+    assert_eq!(
+        facts.export_publication_requests.lock().unwrap().len(),
+        before + 2
+    );
+    facts.reject_publication.store(false, Ordering::Release);
+    session.authority.reconcile_export_publication()?;
+    let calls = facts.export_publication_requests.lock().unwrap();
+    assert_eq!(calls[before - 1].step, calls[before].step);
+    assert!(matches!(
+        calls[before].action,
+        ExportPublicationAction::Abort
+    ));
+    assert_eq!(calls[before], calls[before + 1]);
+    drop(calls);
+
+    // Lost Finish must be replayed exactly, but successful caller work still
+    // returns its first Unknown rather than claiming unproved success.
+    let lease = session
+        .authority
+        .begin_export_publication(
+            ExportPublicationMode::Publish,
+            source.clone(),
+            &AtomicBool::new(false),
+        )?
+        .unwrap();
+    *facts.lose_publication_action.lock().unwrap() = Some(ExportPublicationAction::Finish);
+    let error = lease.complete(Ok(())).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+            .unwrap()
+            .kind,
+        crate::filesystem_worker::wire::FailureKind::Unknown
+    );
+    assert!(session.authority.publication.lock().unwrap().is_none());
+    let calls = facts.export_publication_requests.lock().unwrap();
+    assert_eq!(calls[calls.len() - 2], calls[calls.len() - 1]);
+    drop(calls);
+
+    // An admitted failure is also an exact cached result. Reconciliation
+    // consumes its Failed reply and can then close the retained owner.
+    let mut lease = session
+        .authority
+        .begin_export_publication(
+            ExportPublicationMode::Publish,
+            source.clone(),
+            &AtomicBool::new(false),
+        )?
+        .unwrap();
+    *facts.lose_publication_action.lock().unwrap() = Some(ExportPublicationAction::VerifyInstalled);
+    let error = lease.verify_installed(&AtomicBool::new(false)).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+            .unwrap()
+            .kind,
+        crate::filesystem_worker::wire::FailureKind::Unknown
+    );
+    assert!(lease.complete::<()>(Err(error)).is_err());
+    assert!(session.authority.publication.lock().unwrap().is_none());
+
+    let lease = session
+        .authority
+        .begin_export_publication(
+            ExportPublicationMode::Publish,
+            source,
+            &AtomicBool::new(false),
+        )?
+        .unwrap();
+    facts.fail_publication_abort.store(true, Ordering::Release);
+    let operation_error = lease
+        .complete::<()>(Err(anyhow::anyhow!("retained cleanup operation failed")))
+        .unwrap_err();
+    assert_eq!(
+        operation_error.to_string(),
+        "retained cleanup operation failed"
+    );
+    assert!(session.close().is_err());
+    facts.fail_publication_abort.store(false, Ordering::Release);
+    session.close()?;
+    assert!(matches!(
+        facts
+            .export_publication_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .action,
+        ExportPublicationAction::Abort
+    ));
     Ok(())
 }
 

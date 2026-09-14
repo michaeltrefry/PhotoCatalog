@@ -7,8 +7,9 @@ use crate::{
         CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportAliasFactReply,
         ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
         ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
-        InspectExportOriginal, InspectedExportOriginal, LeaseId, PrepareCatalog,
-        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
+        ExportPublicationReply, ExportPublicationRequest, InspectExportOriginal,
+        InspectedExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
 };
@@ -1069,6 +1070,22 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected export original response"),
         }
     }
+    fn export_publication_call(
+        &self,
+        request: &ExportPublicationRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportPublicationReply> {
+        match self.execute(
+            Operation::ExportPublication(Box::new(request.clone())),
+            cancel,
+        )? {
+            Response::ExportPublication(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected export publication response"),
+        }
+    }
 
     fn prepare_catalog(
         &self,
@@ -1545,10 +1562,11 @@ mod tests {
             self.0
                 .terminate_after_dependents_drained()
                 .expect("fixture child retirement");
+            assert_retired(&self.0);
         }
     }
     fn spawn_fixture(role: &str, directory: &Path, faults: Faults) -> Result<NoDependents> {
-        spawn_fixture_config(role, directory, vec![], None, None, faults)
+        spawn_fixture_config(role, directory, vec![], None, None, None, faults)
     }
     fn spawn_fixture_with_snapshot_barrier(
         role: &str,
@@ -1556,7 +1574,15 @@ mod tests {
         snapshot_barrier: Option<&Path>,
         faults: Faults,
     ) -> Result<NoDependents> {
-        spawn_fixture_config(role, directory, vec![], snapshot_barrier, None, faults)
+        spawn_fixture_config(
+            role,
+            directory,
+            vec![],
+            snapshot_barrier,
+            None,
+            None,
+            faults,
+        )
     }
     fn spawn_fixture_with_originals(
         role: &str,
@@ -1571,6 +1597,23 @@ mod tests {
             original_roots,
             None,
             original_barrier,
+            None,
+            faults,
+        )
+    }
+    fn spawn_fixture_with_publication_barrier(
+        role: &str,
+        directory: &Path,
+        publication_barrier: Option<&Path>,
+        faults: Faults,
+    ) -> Result<NoDependents> {
+        spawn_fixture_config(
+            role,
+            directory,
+            vec![],
+            None,
+            None,
+            publication_barrier,
             faults,
         )
     }
@@ -1580,6 +1623,7 @@ mod tests {
         original_roots: Vec<NativePath>,
         snapshot_barrier: Option<&Path>,
         original_barrier: Option<&Path>,
+        publication_barrier: Option<&Path>,
         faults: Faults,
     ) -> Result<NoDependents> {
         let startup = Startup::new(original_roots)?;
@@ -1607,6 +1651,12 @@ mod tests {
         if let Some(marker) = original_barrier {
             command.env(
                 crate::filesystem_worker::bootstrap::EXPORT_ORIGINAL_BARRIER,
+                marker,
+            );
+        }
+        if let Some(marker) = publication_barrier {
+            command.env(
+                crate::filesystem_worker::bootstrap::EXPORT_PUBLICATION_BARRIER,
                 marker,
             );
         }
@@ -2201,6 +2251,571 @@ mod tests {
             FailureKind::Canceled
         );
         assert_eq!(fs::read(&original)?, bytes);
+        child.0.release_root(&root)?;
+        child.0.try_shutdown()?;
+        assert_retired(&child.0);
+        Ok(())
+    }
+
+    #[test]
+    fn actual_f_export_publication_replays_mutations_restores_cancels_and_reaps() -> Result<()> {
+        use crate::catalog_session::{
+            ExportPublicationAction, ExportPublicationMode, ExportPublicationRequest,
+            ExportPublicationSource, ExportPublicationValue, SQL_ROLES, SqlRole,
+            SqlRoleObservation,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let barrier = temp.path().join("publication-barrier");
+        fs::create_dir(&barrier)?;
+        let child = spawn_fixture_with_publication_barrier(
+            "filesystem",
+            temp.path(),
+            Some(&barrier),
+            Faults::default(),
+        )?;
+        let catalog = PrepareCatalog {
+            operation: U64(23),
+            session: LeaseId::new(),
+            mode: crate::catalog_session::BootstrapMode::DesktopCreate,
+            root: NativePath::from_path(&temp.path().join("catalog")),
+            manifest_root: NativePath::from_path(&temp.path().join("manifest")),
+            import_source: None,
+        };
+        let bootstrap = child.0.prepare_catalog(&catalog, &AtomicBool::new(false))?;
+        let confirmation = ConfirmSqlAdmission {
+            operation: bootstrap.operation,
+            root: bootstrap.root_capability(),
+            roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                role,
+                physical: if role == SqlRole::Manifest {
+                    bootstrap.manifest.physical
+                } else {
+                    bootstrap.catalog.physical
+                },
+            }),
+        };
+        child
+            .0
+            .confirm_sql_admission(&confirmation, &AtomicBool::new(false))?;
+        let root = bootstrap.root_capability();
+        let old = vec![0x12; 96 * 1024];
+        let payload = vec![0x34; 128 * 1024];
+        let make = |name: &str| -> Result<ExportPublicationRequest> {
+            let destination = temp.path().join(format!("{name}.jpg"));
+            fs::write(&destination, &old)?;
+            let snapshot =
+                crate::metadata_export::snapshot_photo_destination(&destination, 256 * 1024)?;
+            let completed = temp.path().join(format!("{name}-completed.jpg"));
+            fs::write(&completed, &payload)?;
+            let seal = crate::metadata_export::seal_photo_export(
+                &snapshot,
+                &completed,
+                256 * 1024,
+                &"ab".repeat(32),
+                |_| Ok(()),
+            )?;
+            Ok(ExportPublicationRequest {
+                root: root.clone(),
+                transfer: LeaseId::new(),
+                step: U64(0),
+                mode: ExportPublicationMode::Publish,
+                source: ExportPublicationSource::Sealed(seal),
+                action: ExportPublicationAction::Begin,
+            })
+        };
+        fn step(
+            begin: &ExportPublicationRequest,
+            number: u64,
+            action: ExportPublicationAction,
+        ) -> ExportPublicationRequest {
+            ExportPublicationRequest {
+                step: U64(number),
+                action,
+                ..begin.clone()
+            }
+        }
+        fn replay(
+            client: &Client,
+            request: &ExportPublicationRequest,
+        ) -> Result<ExportPublicationReply> {
+            // Lose the application acknowledgement after the real F owner
+            // returns; a new transport request must retrieve its cached result.
+            let first = client.export_publication_call(request, &AtomicBool::new(false))?;
+            let encoded = serde_json::to_vec(&first)?;
+            drop(first);
+            let replay = client.export_publication_call(request, &AtomicBool::new(false))?;
+            assert_eq!(encoded, serde_json::to_vec(&replay)?);
+            eprintln!(
+                "F exact publication replay action={:?} step={}",
+                request.action, request.step.0
+            );
+            Ok(replay)
+        }
+        fn seal(request: &ExportPublicationRequest) -> &crate::metadata_export::SealedPhotoExport {
+            let ExportPublicationSource::Sealed(seal) = &request.source else {
+                panic!("sealed fixture");
+            };
+            seal
+        }
+        fn recovery(begin: &ExportPublicationRequest) -> ExportPublicationRequest {
+            let seal = seal(begin);
+            ExportPublicationRequest {
+                root: begin.root.clone(),
+                transfer: LeaseId::new(),
+                step: U64(0),
+                mode: ExportPublicationMode::Restore,
+                source: ExportPublicationSource::Recovery {
+                    snapshot: seal.snapshot.clone(),
+                    authority_digest: seal.authority_digest.clone(),
+                },
+                action: ExportPublicationAction::Begin,
+            }
+        }
+        let begin = make("published")?;
+        replay(&child.0, &begin)?;
+        assert!(crate::metadata_export::PhotoPublication::prepare(seal(&begin)).is_err());
+        let recheck = step(&begin, 1, ExportPublicationAction::RecheckPayload);
+        for changed in 0..5 {
+            let mut foreign = recheck.clone();
+            match changed {
+                0 => foreign.mode = ExportPublicationMode::Restore,
+                1 => foreign.transfer = LeaseId::new(),
+                2 => foreign.root.session = LeaseId::new(),
+                3 => foreign.step = U64(9),
+                _ => {
+                    let ExportPublicationSource::Sealed(value) = &mut foreign.source else {
+                        unreachable!()
+                    };
+                    value.authority_digest = "cd".repeat(32);
+                }
+            }
+            assert!(
+                child
+                    .0
+                    .export_publication_call(&foreign, &AtomicBool::new(false))
+                    .is_err()
+            );
+        }
+        #[cfg(unix)]
+        {
+            let root_path = catalog.root.to_path()?;
+            let parked = temp.path().join("parked-catalog");
+            fs::rename(&root_path, &parked)?;
+            fs::create_dir(&root_path)?;
+            let rejected = child
+                .0
+                .export_publication_call(&recheck, &AtomicBool::new(false));
+            let abort_rejected = child.0.export_publication_call(
+                &step(&begin, 1, ExportPublicationAction::Abort),
+                &AtomicBool::new(false),
+            );
+            fs::remove_dir(&root_path)?;
+            fs::rename(&parked, &root_path)?;
+            assert!(rejected.is_err());
+            assert!(abort_rejected.is_err());
+        }
+        replay(&child.0, &recheck)?;
+        let capture = step(&begin, 2, ExportPublicationAction::Capture);
+        fs::write(barrier.join("mutation-armed"), b"cancel admitted mutation")?;
+        let mutation_cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| -> Result<()> {
+            let call = scope.spawn(|| child.0.export_publication_call(&capture, &mutation_cancel));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !barrier.join("mutation-entered").exists() {
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "F mutation barrier missing"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            mutation_cancel.store(true, Ordering::Release);
+            assert!(matches!(
+                call.join().unwrap()?.value,
+                ExportPublicationValue::Captured
+            ));
+            Ok(())
+        })?;
+        replay(&child.0, &capture)?;
+        assert!(!seal(&begin).snapshot.destination.exists());
+        assert!(
+            child
+                .0
+                .export_publication_call(
+                    &step(&begin, 2, ExportPublicationAction::Link),
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        replay(
+            &child.0,
+            &step(&begin, 3, ExportPublicationAction::VerifyCapture),
+        )?;
+        replay(
+            &child.0,
+            &step(
+                &begin,
+                4,
+                ExportPublicationAction::FailureReceipt {
+                    detail: "retained capture".into(),
+                },
+            ),
+        )?;
+        replay(&child.0, &step(&begin, 5, ExportPublicationAction::Link))?;
+        assert!(matches!(
+            replay(
+                &child.0,
+                &step(&begin, 6, ExportPublicationAction::VerifyInstalled)
+            )?
+            .value,
+            ExportPublicationValue::Installed(_)
+        ));
+        replay(
+            &child.0,
+            &step(&begin, 7, ExportPublicationAction::RecheckInstalled),
+        )?;
+        let finish = step(&begin, 8, ExportPublicationAction::Finish);
+        replay(&child.0, &finish)?;
+        let mut foreign_terminal = finish.clone();
+        foreign_terminal.mode = ExportPublicationMode::Restore;
+        assert!(
+            child
+                .0
+                .export_publication_call(&foreign_terminal, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert_eq!(fs::read(&seal(&begin).snapshot.destination)?, payload);
+        // Installed output recovery must finalize, never restore over output.
+        let installed = recovery(&begin);
+        assert!(matches!(
+            replay(&child.0, &installed)?.value,
+            ExportPublicationValue::Begun { installed: true }
+        ));
+        assert!(matches!(
+            replay(
+                &child.0,
+                &step(&installed, 1, ExportPublicationAction::RestoreLink)
+            )?
+            .value,
+            ExportPublicationValue::Failed(_)
+        ));
+        replay(
+            &child.0,
+            &step(&installed, 2, ExportPublicationAction::VerifyInstalled),
+        )?;
+        replay(
+            &child.0,
+            &step(&installed, 3, ExportPublicationAction::Finish),
+        )?;
+        assert_eq!(fs::read(&seal(&begin).snapshot.destination)?, payload);
+
+        // An interrupted capture is independently restorable without payload.
+        for missing_payload in [true, false] {
+            let captured = make(if missing_payload {
+                "captured-missing"
+            } else {
+                "captured-corrupt"
+            })?;
+            let captured_payload = seal(&captured).recovery_directory().join("payload");
+            ensure!(
+                captured_payload.is_file(),
+                "captured fixture payload absent after sealing: {}",
+                captured_payload.display()
+            );
+            replay(&child.0, &captured)?;
+            ensure!(
+                captured_payload.is_file(),
+                "captured fixture payload absent after Begin: {}",
+                captured_payload.display()
+            );
+            replay(
+                &child.0,
+                &step(&captured, 1, ExportPublicationAction::Capture),
+            )?;
+            ensure!(
+                captured_payload.is_file(),
+                "captured fixture payload absent after Capture: {}",
+                captured_payload.display()
+            );
+            replay(
+                &child.0,
+                &step(&captured, 2, ExportPublicationAction::VerifyCapture),
+            )?;
+            ensure!(
+                captured_payload.is_file(),
+                "captured fixture payload absent after VerifyCapture: {}",
+                captured_payload.display()
+            );
+            replay(
+                &child.0,
+                &step(&captured, 3, ExportPublicationAction::Abort),
+            )?;
+            ensure!(
+                captured_payload.is_file(),
+                "captured fixture payload absent after Abort: {}",
+                captured_payload.display()
+            );
+            if missing_payload {
+                fs::remove_file(&captured_payload).map_err(|error| {
+                    anyhow::anyhow!(
+                        "remove captured fixture payload after Abort {}: {error}",
+                        captured_payload.display()
+                    )
+                })?;
+            } else {
+                fs::write(&captured_payload, b"corrupt recovery payload")?;
+            }
+            // Publishing still requires the exact live payload. Rejection must not
+            // consume recovery evidence or authorize an installed destination.
+            let mut invalid_publish = captured.clone();
+            invalid_publish.transfer = LeaseId::new();
+            assert!(
+                child
+                    .0
+                    .export_publication_call(&invalid_publish, &AtomicBool::new(false))
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(seal(&captured).recovery_directory().join("original"))?,
+                old
+            );
+            let restore = recovery(&captured);
+            let begun = replay(&child.0, &restore).map_err(|error| {
+                anyhow::anyhow!(
+                    "restore Begin must admit missing/corrupt payload {}: {error:#}",
+                    captured_payload.display()
+                )
+            })?;
+            assert!(matches!(
+                begun.value,
+                ExportPublicationValue::Begun { installed: false }
+            ));
+            replay(
+                &child.0,
+                &step(&restore, 1, ExportPublicationAction::RestoreLink),
+            )?;
+            assert!(matches!(
+                replay(
+                    &child.0,
+                    &step(&restore, 2, ExportPublicationAction::VerifyRestored)
+                )?
+                .value,
+                ExportPublicationValue::Restored(_)
+            ));
+            replay(
+                &child.0,
+                &step(&restore, 3, ExportPublicationAction::RecheckRestored),
+            )?;
+            replay(
+                &child.0,
+                &step(&restore, 4, ExportPublicationAction::Finish),
+            )?;
+            assert_eq!(fs::read(&seal(&captured).snapshot.destination)?, old);
+        }
+
+        // Every bulk publication method observes cancellation inside real F.
+        for (index, action) in [
+            ExportPublicationAction::Begin,
+            ExportPublicationAction::VerifyCapture,
+            ExportPublicationAction::VerifyInstalled,
+            ExportPublicationAction::FailureReceipt {
+                detail: "canceled receipt".into(),
+            },
+            ExportPublicationAction::VerifyRestored,
+            ExportPublicationAction::Begin,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let base = make(&format!("cancel-{index}"))?;
+            let mut owner = base.clone();
+            let mut number = 0;
+            if index == 5 {
+                owner = recovery(&base);
+            }
+            if !matches!(action, ExportPublicationAction::Begin) {
+                replay(&child.0, &base)?;
+                replay(&child.0, &step(&base, 1, ExportPublicationAction::Capture))?;
+                number = 2;
+                if !matches!(action, ExportPublicationAction::VerifyCapture) {
+                    replay(
+                        &child.0,
+                        &step(&base, 2, ExportPublicationAction::VerifyCapture),
+                    )?;
+                    if matches!(action, ExportPublicationAction::VerifyRestored) {
+                        replay(&child.0, &step(&base, 3, ExportPublicationAction::Abort))?;
+                        owner = recovery(&base);
+                        replay(&child.0, &owner)?;
+                        replay(
+                            &child.0,
+                            &step(&owner, 1, ExportPublicationAction::RestoreLink),
+                        )?;
+                        number = 2;
+                    } else {
+                        replay(&child.0, &step(&base, 3, ExportPublicationAction::Link))?;
+                        number = 4;
+                    }
+                }
+            }
+            let request = step(&owner, number, action.clone());
+            let entered = barrier.join("entered");
+            if entered.exists() {
+                fs::remove_file(&entered)?;
+            }
+            fs::write(barrier.join("armed"), b"cancel hash")?;
+            let cancel = AtomicBool::new(false);
+            let result = std::thread::scope(|scope| -> Result<_> {
+                let call = scope.spawn(|| child.0.export_publication_call(&request, &cancel));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !entered.exists() {
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "F hash barrier missing for {:?}",
+                        action
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                cancel.store(true, Ordering::Release);
+                Ok(call.join().unwrap())
+            })?;
+            fs::remove_file(barrier.join("armed"))?;
+            if number == 0 {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<Failure>().unwrap().kind,
+                    FailureKind::Canceled
+                );
+                assert_eq!(fs::read(&seal(&base).snapshot.destination)?, old);
+            } else {
+                let result = result?;
+                assert!(
+                    matches!(&result.value, ExportPublicationValue::Failed(f) if f.kind == FailureKind::Canceled)
+                );
+                let repeated = replay(&child.0, &request)?;
+                assert_eq!(serde_json::to_vec(&result)?, serde_json::to_vec(&repeated)?);
+                replay(
+                    &child.0,
+                    &step(&owner, number + 1, ExportPublicationAction::Abort),
+                )?;
+            }
+            eprintln!("F publication hash canceled action={action:?}");
+        }
+        // No-clobber failures and failed verification are cached outcomes too.
+        let conflict = make("conflict")?;
+        replay(&child.0, &conflict)?;
+        replay(
+            &child.0,
+            &step(&conflict, 1, ExportPublicationAction::Capture),
+        )?;
+        replay(
+            &child.0,
+            &step(&conflict, 2, ExportPublicationAction::VerifyCapture),
+        )?;
+        fs::write(&seal(&conflict).snapshot.destination, b"foreign output")?;
+        assert!(matches!(
+            replay(&child.0, &step(&conflict, 3, ExportPublicationAction::Link))?.value,
+            ExportPublicationValue::Failed(_)
+        ));
+        replay(
+            &child.0,
+            &step(&conflict, 4, ExportPublicationAction::Abort),
+        )?;
+        assert_eq!(
+            fs::read(&seal(&conflict).snapshot.destination)?,
+            b"foreign output"
+        );
+        assert_eq!(
+            fs::read(seal(&conflict).recovery_directory().join("original"))?,
+            old
+        );
+        let oversized = make("oversized")?;
+        fs::write(
+            seal(&oversized).recovery_directory().join("payload"),
+            vec![0; 256 * 1024 + 1],
+        )?;
+        assert_eq!(
+            child
+                .0
+                .export_publication_call(&oversized, &AtomicBool::new(false))
+                .unwrap_err()
+                .downcast_ref::<Failure>()
+                .unwrap()
+                .kind,
+            FailureKind::ResourceLimit
+        );
+        #[cfg(unix)]
+        for change in [
+            "growth",
+            "same-inode-mtime",
+            "replacement",
+            "symlink",
+            "directory",
+        ] {
+            let changed = make(&format!("changed-{change}"))?;
+            replay(&child.0, &changed)?;
+            let path = seal(&changed).recovery_directory().join("payload");
+            let modified = fs::metadata(&path)?.modified()?;
+            match change {
+                "growth" => {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)?
+                        .set_len(256 * 1024 + 1)?;
+                }
+                "same-inode-mtime" => {
+                    fs::write(&path, vec![0x98; payload.len()])?;
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)?
+                        .set_times(fs::FileTimes::new().set_modified(modified))?;
+                }
+                "replacement" => {
+                    let replacement = temp.path().join("replacement-payload");
+                    fs::write(&replacement, &payload)?;
+                    fs::rename(replacement, &path)?;
+                }
+                "symlink" => {
+                    fs::remove_file(&path)?;
+                    std::os::unix::fs::symlink(&seal(&changed).snapshot.destination, &path)?;
+                }
+                _ => {
+                    fs::remove_file(&path)?;
+                    fs::create_dir(&path)?;
+                }
+            }
+            assert!(matches!(
+                replay(
+                    &child.0,
+                    &step(&changed, 1, ExportPublicationAction::RecheckPayload)
+                )?
+                .value,
+                ExportPublicationValue::Failed(_)
+            ));
+            replay(&child.0, &step(&changed, 2, ExportPublicationAction::Abort))?;
+            assert_eq!(fs::read(&seal(&changed).snapshot.destination)?, old);
+        }
+        // Raw cancellation before admission leaves the same step available.
+        let stopped = make("stopped")?;
+        replay(&child.0, &stopped)?;
+        let capture = step(&stopped, 1, ExportPublicationAction::Capture);
+        assert_eq!(
+            child
+                .0
+                .export_publication_call(&capture, &AtomicBool::new(true))
+                .unwrap_err()
+                .downcast_ref::<Failure>()
+                .unwrap()
+                .kind,
+            FailureKind::Canceled
+        );
+        assert_eq!(fs::read(&seal(&stopped).snapshot.destination)?, old);
+        child.0.signal_stop();
+        assert!(
+            child
+                .0
+                .export_publication_call(&capture, &AtomicBool::new(false))
+                .is_err()
+        );
+        replay(&child.0, &step(&stopped, 1, ExportPublicationAction::Abort))?;
         child.0.release_root(&root)?;
         child.0.try_shutdown()?;
         assert_retired(&child.0);

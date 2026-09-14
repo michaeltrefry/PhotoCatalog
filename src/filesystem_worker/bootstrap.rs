@@ -7,6 +7,8 @@ use crate::{
         ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportObjectKey,
         ExportOriginalAction, ExportOriginalReply, ExportOriginalRequest, ExportOriginalValue,
         ExportProfileAction, ExportProfileReply, ExportProfileRequest, ExportProfileValue,
+        ExportPublicationAction, ExportPublicationMode, ExportPublicationReply,
+        ExportPublicationRequest, ExportPublicationSource, ExportPublicationValue,
         InspectExportOriginal, InspectedExportOriginal, LeaseId, PinnedDatabase, PrepareCatalog,
         PrepareExportDirectory, PreparedExportDirectory, RootCapability, validate_path,
     },
@@ -26,6 +28,8 @@ pub(super) const EXPORT_DESTINATION_SNAPSHOT_BARRIER: &str =
     "PHOTOCATALOG_F_EXPORT_DESTINATION_SNAPSHOT_BARRIER";
 #[cfg(test)]
 pub(super) const EXPORT_ORIGINAL_BARRIER: &str = "PHOTOCATALOG_F_EXPORT_ORIGINAL_BARRIER";
+#[cfg(test)]
+pub(super) const EXPORT_PUBLICATION_BARRIER: &str = "PHOTOCATALOG_F_EXPORT_PUBLICATION_BARRIER";
 
 #[cfg(test)]
 fn export_destination_snapshot_test_barrier(
@@ -88,6 +92,74 @@ fn export_original_test_barrier(bytes: u64, cancel: &AtomicBool) -> std::io::Res
     Ok(())
 }
 
+#[cfg(test)]
+fn export_publication_test_barrier(bytes: u64, cancel: &AtomicBool) -> std::io::Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let Some(marker) = std::env::var_os(EXPORT_PUBLICATION_BARRIER) else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(marker);
+    if !barrier.join("armed").exists() {
+        return Ok(());
+    }
+    let entered = barrier.join("entered");
+    if !entered.exists() {
+        fs::write(&entered, b"publication-read-started")?;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !cancel.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "test publication cancellation was not released",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn export_publication_mutation_test_barrier(
+    action: &ExportPublicationAction,
+    cancel: &AtomicBool,
+) -> std::io::Result<()> {
+    if !matches!(
+        action,
+        ExportPublicationAction::Capture
+            | ExportPublicationAction::Link
+            | ExportPublicationAction::RestoreLink
+    ) {
+        return Ok(());
+    }
+    let Some(marker) = std::env::var_os(EXPORT_PUBLICATION_BARRIER) else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(marker);
+    let armed = barrier.join("mutation-armed");
+    if !armed.exists() {
+        return Ok(());
+    }
+    fs::remove_file(armed)?;
+    fs::write(
+        barrier.join("mutation-entered"),
+        b"publication-mutation-admitted",
+    )?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !cancel.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "test publication mutation cancellation was not released",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreparationState {
     Preparing,
@@ -122,6 +194,8 @@ struct RootRecord {
     export_profile_terminal: Option<ExportProfileTerminal>,
     export_original: Option<ExportOriginalTransfer>,
     export_original_terminal: Option<ExportOriginalTerminal>,
+    export_publication: Option<ExportPublicationTransfer>,
+    export_publication_terminal: Option<ExportPublicationTerminal>,
 }
 struct ExportProfileTransfer {
     requested: NativePath,
@@ -160,6 +234,29 @@ enum ExportOriginalTerminalValue {
     Finished,
     Aborted,
 }
+#[derive(Clone)]
+struct CachedPublication {
+    step: crate::application::U64,
+    request_digest: String,
+    reply: ExportPublicationReply,
+}
+struct ExportPublicationTransfer {
+    mode: ExportPublicationMode,
+    source: ExportPublicationSource,
+    transfer: LeaseId,
+    next_step: u64,
+    seal: crate::metadata_export::SealedPhotoExport,
+    publication: crate::metadata_export::PhotoPublication,
+    last: CachedPublication,
+}
+struct ExportPublicationTerminal {
+    mode: ExportPublicationMode,
+    source: ExportPublicationSource,
+    transfer: LeaseId,
+    next_step: u64,
+    seal: crate::metadata_export::SealedPhotoExport,
+    last: CachedPublication,
+}
 pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
     (
         std::mem::size_of::<Option<ExportProfileTransfer>>()
@@ -174,6 +271,14 @@ pub(crate) fn export_original_transfer_layout() -> (usize, usize) {
             + std::mem::size_of::<Option<ExportOriginalTerminal>>(),
         std::mem::align_of::<Option<ExportOriginalTransfer>>()
             .max(std::mem::align_of::<Option<ExportOriginalTerminal>>()),
+    )
+}
+pub(crate) fn export_publication_transfer_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Option<ExportPublicationTransfer>>()
+            + std::mem::size_of::<Option<ExportPublicationTerminal>>(),
+        std::mem::align_of::<Option<ExportPublicationTransfer>>()
+            .max(std::mem::align_of::<Option<ExportPublicationTerminal>>()),
     )
 }
 struct ManifestLock(File);
@@ -385,6 +490,8 @@ impl BootstrapOwner {
             export_profile_terminal: None,
             export_original: None,
             export_original_terminal: None,
+            export_publication: None,
+            export_publication_terminal: None,
         };
         record.verify_root_binding()?;
         self.record = Some(record);
@@ -467,6 +574,10 @@ impl BootstrapOwner {
             ensure!(
                 record.export_original.is_none(),
                 "export original lease has not drained"
+            );
+            ensure!(
+                record.export_publication.is_none(),
+                "export publication lease has not drained"
             );
             record.objects.drain();
             record.store.release()?;
@@ -1064,6 +1175,335 @@ impl BootstrapOwner {
             value,
         })
     }
+    pub fn export_publication_call(
+        &mut self,
+        request: &ExportPublicationRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportPublicationReply> {
+        request.validate()?;
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "export publication requires confirmed SQL admission"
+        );
+        let digest = request.digest()?;
+        {
+            let record = self
+                .record
+                .as_ref()
+                .context("export publication catalog root is not retained")?;
+            ensure!(
+                request.root == record.bootstrap.root_capability(),
+                "export publication session mismatch"
+            );
+            record.verify_root_binding()?;
+            if let Some(active) = &record.export_publication
+                && active.transfer == request.transfer
+                && active.source == request.source
+                && active.last.step == request.step
+            {
+                ensure!(
+                    active.mode == request.mode && active.last.request_digest == digest,
+                    "publication replay differs"
+                );
+                return cached_publication(&active.last);
+            }
+            if let Some(terminal) = &record.export_publication_terminal
+                && terminal.transfer == request.transfer
+                && terminal.source == request.source
+                && terminal.last.step == request.step
+            {
+                ensure!(
+                    terminal.mode == request.mode && terminal.last.request_digest == digest,
+                    "publication replay differs"
+                );
+                return cached_publication(&terminal.last);
+            }
+        }
+        if matches!(request.action, ExportPublicationAction::Begin) {
+            publication_cancel(cancel)?;
+            {
+                let record = self.record.as_ref().unwrap();
+                ensure!(
+                    record.export_publication.is_none(),
+                    "export publication already active"
+                );
+            }
+            let mut hashed = PublicationHashProgress::default();
+            let mut checkpoint = |bytes| hashed.checkpoint(bytes, cancel);
+            let prepared = (|| -> Result<_> {
+                let seal = match &request.source {
+                    ExportPublicationSource::Sealed(seal) => seal.clone(),
+                    ExportPublicationSource::Recovery {
+                        snapshot,
+                        authority_digest,
+                    } => {
+                        let seal =
+                            crate::metadata_export::read_photo_seal_for_restore_with_checkpoint(
+                                snapshot,
+                                authority_digest,
+                                &mut checkpoint,
+                            )?;
+                        ensure!(
+                            seal.snapshot == *snapshot
+                                && seal.authority_digest == *authority_digest,
+                            "publication recovery authority mismatch"
+                        );
+                        seal
+                    }
+                };
+                let publication = match request.mode {
+                    ExportPublicationMode::Publish => {
+                        crate::metadata_export::PhotoPublication::prepare_with_checkpoint(
+                            &seal,
+                            &mut checkpoint,
+                        )?
+                    }
+                    ExportPublicationMode::Restore => {
+                        crate::metadata_export::PhotoPublication::prepare_restore_with_checkpoint(
+                            &seal,
+                            &mut checkpoint,
+                        )?
+                    }
+                };
+                Ok((seal, publication))
+            })();
+            drop(checkpoint);
+            let (seal, publication) = prepared.map_err(|error| {
+                anyhow::Error::new(export_publication_failure(error, hashed.canceled))
+            })?;
+            publication_cancel(cancel)?;
+            let reply = ExportPublicationReply {
+                mode: request.mode,
+                request_digest: request.digest()?,
+                root: request.root.clone(),
+                transfer: request.transfer.clone(),
+                step: request.step,
+                seal: seal.clone(),
+                value: ExportPublicationValue::Begun {
+                    installed: publication.installed(),
+                },
+                timings: publication.timings().clone(),
+                hashed_bytes: crate::application::U64(hashed.total()),
+            };
+            reply.validate(request)?;
+            let record = self.record.as_mut().unwrap();
+            record.verify_root_binding()?;
+            let last = CachedPublication {
+                step: request.step,
+                request_digest: digest,
+                reply: reply.clone(),
+            };
+            record.export_publication = Some(ExportPublicationTransfer {
+                mode: request.mode,
+                source: request.source.clone(),
+                transfer: request.transfer.clone(),
+                next_step: 1,
+                seal,
+                publication,
+                last,
+            });
+            record.export_publication_terminal = None;
+            return Ok(reply);
+        }
+
+        let record = self
+            .record
+            .as_mut()
+            .context("export publication catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "export publication session mismatch"
+        );
+        record.verify_root_binding()?;
+        if record.export_publication.is_none() {
+            let terminal = record
+                .export_publication_terminal
+                .as_mut()
+                .context("export publication lease is not retained")?;
+            ensure!(
+                terminal.transfer == request.transfer
+                    && terminal.source == request.source
+                    && terminal.mode == request.mode,
+                "export publication terminal provenance mismatch"
+            );
+            ensure!(
+                matches!(request.action, ExportPublicationAction::Abort)
+                    && request.step.0 == terminal.next_step,
+                "export publication terminal action mismatch"
+            );
+            let reply = ExportPublicationReply {
+                mode: request.mode,
+                request_digest: request.digest()?,
+                root: request.root.clone(),
+                transfer: request.transfer.clone(),
+                step: request.step,
+                seal: terminal.seal.clone(),
+                value: ExportPublicationValue::Aborted,
+                timings: terminal.last.reply.timings.clone(),
+                hashed_bytes: crate::application::U64(0),
+            };
+            reply.validate(request)?;
+            terminal.next_step = terminal
+                .next_step
+                .checked_add(1)
+                .context("publication terminal step exhausted")?;
+            terminal.last = CachedPublication {
+                step: request.step,
+                request_digest: digest,
+                reply: reply.clone(),
+            };
+            return Ok(reply);
+        }
+        let transfer = record.export_publication.as_mut().unwrap();
+        ensure!(
+            transfer.transfer == request.transfer
+                && transfer.source == request.source
+                && transfer.mode == request.mode,
+            "export publication lease provenance mismatch"
+        );
+        ensure!(
+            transfer.next_step == request.step.0,
+            "export publication step mismatch"
+        );
+        let next_step = request
+            .step
+            .0
+            .checked_add(1)
+            .context("export publication step exhausted")?;
+        let mut hashed = PublicationHashProgress::default();
+        let mut checkpoint = |bytes| hashed.checkpoint(bytes, cancel);
+        let value = (|| -> Result<ExportPublicationValue> {
+            if !request.cleanup() {
+                publication_cancel(cancel)?;
+            }
+            ensure!(
+                !matches!(
+                    (request.mode, &request.action),
+                    (
+                        ExportPublicationMode::Restore,
+                        ExportPublicationAction::Capture
+                            | ExportPublicationAction::VerifyCapture
+                            | ExportPublicationAction::Link
+                    ) | (
+                        ExportPublicationMode::Publish,
+                        ExportPublicationAction::RestoreLink
+                            | ExportPublicationAction::VerifyRestored
+                            | ExportPublicationAction::RecheckRestored
+                    )
+                ),
+                "publication action differs from admitted mode"
+            );
+            #[cfg(test)]
+            export_publication_mutation_test_barrier(&request.action, cancel)?;
+            Ok(match &request.action {
+                ExportPublicationAction::Begin => unreachable!(),
+                ExportPublicationAction::RecheckPayload => {
+                    transfer.publication.recheck_payload()?;
+                    ExportPublicationValue::RecheckedPayload
+                }
+                ExportPublicationAction::Capture => {
+                    transfer.publication.capture()?;
+                    ExportPublicationValue::Captured
+                }
+                ExportPublicationAction::VerifyCapture => {
+                    transfer
+                        .publication
+                        .verify_capture_with_checkpoint(&mut checkpoint)?;
+                    ExportPublicationValue::CaptureVerified
+                }
+                ExportPublicationAction::FailureReceipt { detail } => {
+                    let receipt = transfer
+                        .publication
+                        .failure_receipt_with_checkpoint(detail.clone(), &mut checkpoint);
+                    publication_cancel(cancel)?;
+                    ExportPublicationValue::Receipt(receipt)
+                }
+                ExportPublicationAction::Link => {
+                    transfer.publication.link()?;
+                    ExportPublicationValue::Linked
+                }
+                ExportPublicationAction::VerifyInstalled => ExportPublicationValue::Installed(
+                    transfer
+                        .publication
+                        .verify_installed_with_checkpoint(&mut checkpoint)?,
+                ),
+                ExportPublicationAction::RecheckInstalled => {
+                    transfer.publication.recheck_installed()?;
+                    ExportPublicationValue::RecheckedInstalled
+                }
+                ExportPublicationAction::RestoreLink => {
+                    transfer.publication.restore_link()?;
+                    ExportPublicationValue::RestoredLinked
+                }
+                ExportPublicationAction::VerifyRestored => ExportPublicationValue::Restored(
+                    transfer
+                        .publication
+                        .verify_restored_with_checkpoint(&mut checkpoint)?,
+                ),
+                ExportPublicationAction::RecheckRestored => {
+                    transfer.publication.recheck_restored()?;
+                    ExportPublicationValue::RecheckedRestored
+                }
+                ExportPublicationAction::Finish => ExportPublicationValue::Finished,
+                ExportPublicationAction::Abort => ExportPublicationValue::Aborted,
+            })
+        })();
+        drop(checkpoint);
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                ExportPublicationValue::Failed(export_publication_failure(error, hashed.canceled))
+            }
+        };
+        let mut reply = ExportPublicationReply {
+            mode: request.mode,
+            request_digest: request.digest()?,
+            root: request.root.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            seal: transfer.seal.clone(),
+            value,
+            timings: transfer.publication.timings().clone(),
+            hashed_bytes: crate::application::U64(hashed.total()),
+        };
+        reply.validate(request)?;
+        let _ = transfer;
+        if let Err(error) = record.verify_root_binding() {
+            reply.value = ExportPublicationValue::Failed(super::wire::Failure::new(
+                super::wire::FailureKind::Unknown,
+                error,
+            ));
+        }
+        if request.cleanup() && !matches!(reply.value, ExportPublicationValue::Failed(_)) {
+            let transfer = record.export_publication.take().unwrap();
+            record.export_publication_terminal = Some(ExportPublicationTerminal {
+                mode: transfer.mode,
+                source: transfer.source,
+                transfer: transfer.transfer,
+                next_step,
+                seal: transfer.seal,
+                last: CachedPublication {
+                    step: request.step,
+                    request_digest: digest,
+                    reply: reply.clone(),
+                },
+            });
+        } else {
+            let transfer = record
+                .export_publication
+                .as_mut()
+                .expect("publication retained after step");
+            transfer.next_step = next_step;
+            transfer.last = CachedPublication {
+                step: request.step,
+                request_digest: digest,
+                reply: reply.clone(),
+            };
+        }
+        Ok(reply)
+    }
     pub fn export_profile_call(
         &mut self,
         request: &ExportProfileRequest,
@@ -1379,6 +1819,61 @@ fn export_original_error(error: anyhow::Error) -> anyhow::Error {
     } else {
         error
     }
+}
+#[derive(Default)]
+struct PublicationHashProgress {
+    completed: u64,
+    current: u64,
+    canceled: bool,
+}
+impl PublicationHashProgress {
+    fn checkpoint(&mut self, bytes: u64, cancel: &AtomicBool) -> std::io::Result<()> {
+        if bytes < self.current {
+            self.completed = self.completed.saturating_add(self.current);
+        }
+        self.current = bytes;
+        #[cfg(test)]
+        export_publication_test_barrier(bytes, cancel)?;
+        if cancel.load(Ordering::Acquire) {
+            self.canceled = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "export publication verification canceled",
+            ));
+        }
+        Ok(())
+    }
+    fn total(&self) -> u64 {
+        self.completed.saturating_add(self.current)
+    }
+}
+fn publication_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(anyhow::Error::new(super::wire::Failure::new(
+            super::wire::FailureKind::Canceled,
+            "export publication canceled before mutation",
+        )));
+    }
+    Ok(())
+}
+fn export_publication_failure(error: anyhow::Error, canceled: bool) -> super::wire::Failure {
+    if canceled {
+        super::wire::Failure::new(super::wire::FailureKind::Canceled, error)
+    } else if let Some(failure) = error.downcast_ref::<super::wire::Failure>() {
+        failure.clone()
+    } else if error.is::<crate::metadata_export::FileByteLimit>() {
+        super::wire::Failure::new(super::wire::FailureKind::ResourceLimit, error)
+    } else if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+    {
+        super::wire::Failure::new(super::wire::FailureKind::Canceled, error)
+    } else {
+        super::wire::Failure::new(super::wire::FailureKind::Rejected, error)
+    }
+}
+fn cached_publication(cached: &CachedPublication) -> Result<ExportPublicationReply> {
+    Ok(cached.reply.clone())
 }
 fn open_database(path: &Path, may_create: bool, must_create: bool) -> Result<(File, bool)> {
     if must_create {

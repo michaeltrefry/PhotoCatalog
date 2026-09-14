@@ -563,6 +563,252 @@ impl ExportOriginalReply {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportPublicationMode {
+    Publish,
+    Restore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExportPublicationSource {
+    Sealed(crate::metadata_export::SealedPhotoExport),
+    Recovery {
+        snapshot: crate::metadata_export::DestinationSnapshot,
+        authority_digest: String,
+    },
+}
+impl ExportPublicationSource {
+    fn validate(&self, mode: ExportPublicationMode) -> Result<()> {
+        match self {
+            Self::Sealed(seal) => crate::metadata_export::validate_photo_seal_wire(seal),
+            Self::Recovery {
+                snapshot,
+                authority_digest,
+            } => {
+                ensure!(
+                    mode == ExportPublicationMode::Restore,
+                    "publication recovery source requires restore mode"
+                );
+                crate::metadata_export::validate_destination_snapshot_wire(snapshot)?;
+                ensure!(
+                    authority_digest.len() == 64
+                        && authority_digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit()),
+                    "invalid publication recovery authority"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExportPublicationAction {
+    Begin,
+    RecheckPayload,
+    Capture,
+    VerifyCapture,
+    FailureReceipt { detail: String },
+    Link,
+    VerifyInstalled,
+    RecheckInstalled,
+    RestoreLink,
+    VerifyRestored,
+    RecheckRestored,
+    Finish,
+    Abort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportPublicationRequest {
+    pub root: RootCapability,
+    pub transfer: LeaseId,
+    pub step: U64,
+    pub mode: ExportPublicationMode,
+    pub source: ExportPublicationSource,
+    pub action: ExportPublicationAction,
+}
+impl ExportPublicationRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        self.source.validate(self.mode)?;
+        ensure!(
+            matches!(self.action, ExportPublicationAction::Begin) == (self.step.0 == 0),
+            "publication begin/step mismatch"
+        );
+        if let ExportPublicationAction::FailureReceipt { detail } = &self.action {
+            ensure!(detail.len() <= 8192, "publication failure detail limit");
+        }
+        Ok(())
+    }
+    pub(crate) fn digest(&self) -> Result<String> {
+        Ok(blake3::hash(&crate::filesystem_worker::wire::encode(
+            self,
+            crate::filesystem_worker::wire::MESSAGE_BYTES,
+        )?)
+        .to_hex()
+        .to_string())
+    }
+    pub fn cleanup(&self) -> bool {
+        matches!(
+            self.action,
+            ExportPublicationAction::Finish | ExportPublicationAction::Abort
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExportPublicationValue {
+    /// F admitted and consumed this exact step. Outer transport errors never
+    /// establish consumption; even cancellation during a hash is cached here.
+    Failed(crate::filesystem_worker::wire::Failure),
+    Begun {
+        installed: bool,
+    },
+    RecheckedPayload,
+    Captured,
+    CaptureVerified,
+    Receipt(crate::metadata_export::ExportReceipt),
+    Linked,
+    Installed(crate::metadata_export::ExportReceipt),
+    RecheckedInstalled,
+    RestoredLinked,
+    Restored(crate::metadata_export::ExportReceipt),
+    RecheckedRestored,
+    Finished,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportPublicationReply {
+    pub mode: ExportPublicationMode,
+    pub request_digest: String,
+    pub root: RootCapability,
+    pub transfer: LeaseId,
+    pub step: U64,
+    pub seal: crate::metadata_export::SealedPhotoExport,
+    pub value: ExportPublicationValue,
+    pub timings: crate::metadata_export::PhotoPublicationTimings,
+    pub hashed_bytes: U64,
+}
+impl ExportPublicationReply {
+    pub fn validate(&self, request: &ExportPublicationRequest) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            self.root == request.root
+                && self.transfer == request.transfer
+                && self.step == request.step
+                && self.mode == request.mode
+                && self.request_digest == request.digest()?,
+            "publication reply provenance mismatch"
+        );
+        ensure!(
+            [
+                self.timings.hash_ms,
+                self.timings.capture_ms,
+                self.timings.link_ms,
+                self.timings.durability_ms,
+            ]
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0.0),
+            "invalid publication timing"
+        );
+        crate::metadata_export::validate_photo_seal_wire(&self.seal)?;
+        match &request.source {
+            ExportPublicationSource::Sealed(expected) => {
+                ensure!(&self.seal == expected, "publication reply seal mismatch")
+            }
+            ExportPublicationSource::Recovery {
+                snapshot,
+                authority_digest,
+            } => ensure!(
+                &self.seal.snapshot == snapshot && &self.seal.authority_digest == authority_digest,
+                "publication recovery seal mismatch"
+            ),
+        }
+        let seal = &self.seal;
+        if let ExportPublicationValue::Failed(failure) = &self.value {
+            ensure!(
+                !matches!(request.action, ExportPublicationAction::Begin),
+                "Begin cannot acknowledge a retained failed step"
+            );
+            failure.validate()?;
+            ensure!(
+                failure.object_receipt.is_none(),
+                "unexpected publication object receipt"
+            );
+            return Ok(());
+        }
+        match (&request.action, &self.value) {
+            (ExportPublicationAction::Begin, ExportPublicationValue::Begun { .. })
+            | (ExportPublicationAction::RecheckPayload, ExportPublicationValue::RecheckedPayload)
+            | (ExportPublicationAction::Capture, ExportPublicationValue::Captured)
+            | (ExportPublicationAction::VerifyCapture, ExportPublicationValue::CaptureVerified)
+            | (ExportPublicationAction::Link, ExportPublicationValue::Linked)
+            | (
+                ExportPublicationAction::RecheckInstalled,
+                ExportPublicationValue::RecheckedInstalled,
+            )
+            | (ExportPublicationAction::RestoreLink, ExportPublicationValue::RestoredLinked)
+            | (
+                ExportPublicationAction::RecheckRestored,
+                ExportPublicationValue::RecheckedRestored,
+            )
+            | (ExportPublicationAction::Finish, ExportPublicationValue::Finished)
+            | (ExportPublicationAction::Abort, ExportPublicationValue::Aborted) => Ok(()),
+            (
+                ExportPublicationAction::FailureReceipt { .. },
+                ExportPublicationValue::Receipt(receipt),
+            ) => crate::metadata_export::validate_export_receipt_wire(receipt, seal),
+            (
+                ExportPublicationAction::VerifyInstalled,
+                ExportPublicationValue::Installed(receipt),
+            ) => {
+                ensure!(
+                    receipt.state == crate::metadata_export::ExportState::Published,
+                    "publication receipt state mismatch"
+                );
+                crate::metadata_export::validate_export_receipt_wire(receipt, seal)
+            }
+            (
+                ExportPublicationAction::VerifyRestored,
+                ExportPublicationValue::Restored(receipt),
+            ) => {
+                ensure!(
+                    receipt.state == crate::metadata_export::ExportState::Restored,
+                    "restoration receipt state mismatch"
+                );
+                crate::metadata_export::validate_export_receipt_wire(receipt, seal)
+            }
+            _ => anyhow::bail!("unexpected publication reply"),
+        }
+    }
+}
 impl PreparedExportDirectory {
     pub fn validate_for(&self, request: &PrepareExportDirectory) -> Result<()> {
         request.validate()?;
@@ -804,6 +1050,13 @@ pub trait CatalogFilesystem: Send + Sync {
     ) -> Result<ExportOriginalReply> {
         anyhow::bail!("filesystem owner does not support export original leases")
     }
+    fn export_publication_call(
+        &self,
+        _request: &ExportPublicationRequest,
+        _cancel: &AtomicBool,
+    ) -> Result<ExportPublicationReply> {
+        anyhow::bail!("filesystem owner does not support export publication leases")
+    }
     /// A lost reply is recovered by the original operation identity inside the
     /// client. Never repeat Prepare/creation. An error/cancel can still leave an
     /// outstanding token, which the caller explicitly abandons before SQL opens.
@@ -1031,6 +1284,364 @@ pub(crate) fn export_original_custody_layout() -> (usize, usize) {
         std::mem::align_of::<Mutex<Option<OriginalCustody>>>(),
     )
 }
+
+#[derive(Clone)]
+enum PublicationCustodyState {
+    BeginPending {
+        request: ExportPublicationRequest,
+    },
+    Active {
+        next_step: u64,
+    },
+    StepPending {
+        request: ExportPublicationRequest,
+        next_step: u64,
+    },
+}
+struct PublicationCustody {
+    original: Arc<Mutex<Option<OriginalCustody>>>,
+    original_transfer: Option<LeaseId>,
+    cleanup_requested: bool,
+    filesystem: Arc<dyn CatalogFilesystem>,
+    root: RootCapability,
+    transfer: LeaseId,
+    mode: ExportPublicationMode,
+    source: ExportPublicationSource,
+    state: PublicationCustodyState,
+}
+pub(crate) struct ManagedPublicationLease {
+    custody: Arc<Mutex<Option<PublicationCustody>>>,
+    transfer: LeaseId,
+    seal: crate::metadata_export::SealedPhotoExport,
+    installed: bool,
+    timings: crate::metadata_export::PhotoPublicationTimings,
+    initial_hashed_bytes: u64,
+    complete: bool,
+}
+fn publication_failure_known(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+        .is_some_and(|failure| failure.kind != crate::filesystem_worker::wire::FailureKind::Unknown)
+}
+impl ManagedPublicationLease {
+    fn request(
+        custody: &PublicationCustody,
+        step: u64,
+        action: ExportPublicationAction,
+    ) -> ExportPublicationRequest {
+        ExportPublicationRequest {
+            root: custody.root.clone(),
+            transfer: custody.transfer.clone(),
+            step: U64(step),
+            mode: custody.mode,
+            source: custody.source.clone(),
+            action,
+        }
+    }
+    fn call(
+        &mut self,
+        action: ExportPublicationAction,
+        cancel: &AtomicBool,
+    ) -> Result<ExportPublicationReply> {
+        let (filesystem, request, next_step) = {
+            let mut slot = self.custody.lock().unwrap_or_else(|e| e.into_inner());
+            let custody = slot
+                .as_mut()
+                .context("export publication custody is not retained")?;
+            ensure!(
+                custody.transfer == self.transfer,
+                "export publication custody changed"
+            );
+            let PublicationCustodyState::Active { next_step } = custody.state.clone() else {
+                anyhow::bail!("export publication request requires reconciliation")
+            };
+            let after = next_step
+                .checked_add(1)
+                .context("export publication step exhausted")?;
+            let request = Self::request(custody, next_step, action);
+            custody.state = PublicationCustodyState::StepPending {
+                request: request.clone(),
+                next_step: after,
+            };
+            (custody.filesystem.clone(), request, after)
+        };
+        match filesystem.export_publication_call(&request, cancel) {
+            Ok(reply) => {
+                apply_publication_reply(&self.custody, &request, &reply, next_step)?;
+                self.complete = matches!(
+                    reply.value,
+                    ExportPublicationValue::Finished | ExportPublicationValue::Aborted
+                );
+                self.timings = reply.timings.clone();
+                if let ExportPublicationValue::Failed(failure) = &reply.value {
+                    return Err(failure.clone().into());
+                }
+                Ok(reply)
+            }
+            Err(error) => {
+                // A direct, known outer failure rejects this fresh step before
+                // admission. Consumed failures (including canceled hashes) use
+                // Failed replies. Unknown transport errors retain exact pending.
+                if publication_failure_known(&error) {
+                    let mut slot = self.custody.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(custody) = slot.as_mut() {
+                        ensure!(
+                            custody.transfer == self.transfer,
+                            "publication custody changed"
+                        );
+                        custody.state = PublicationCustodyState::Active {
+                            next_step: request.step.0,
+                        };
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+    pub(crate) fn seal(&self) -> &crate::metadata_export::SealedPhotoExport {
+        &self.seal
+    }
+    pub(crate) fn installed(&self) -> bool {
+        self.installed
+    }
+    pub(crate) fn timings(&self) -> &crate::metadata_export::PhotoPublicationTimings {
+        &self.timings
+    }
+    pub(crate) fn take_initial_hashed_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.initial_hashed_bytes)
+    }
+    pub(crate) fn recheck_payload(&mut self, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self
+            .call(ExportPublicationAction::RecheckPayload, cancel)?
+            .hashed_bytes
+            .0)
+    }
+    pub(crate) fn capture(&mut self, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self
+            .call(ExportPublicationAction::Capture, cancel)?
+            .hashed_bytes
+            .0)
+    }
+    pub(crate) fn verify_capture(&mut self, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self
+            .call(ExportPublicationAction::VerifyCapture, cancel)?
+            .hashed_bytes
+            .0)
+    }
+    pub(crate) fn failure_receipt(
+        &mut self,
+        detail: String,
+        cancel: &AtomicBool,
+    ) -> Result<(crate::metadata_export::ExportReceipt, u64)> {
+        let reply = self.call(ExportPublicationAction::FailureReceipt { detail }, cancel)?;
+        let ExportPublicationValue::Receipt(receipt) = reply.value else {
+            unreachable!()
+        };
+        Ok((receipt, reply.hashed_bytes.0))
+    }
+    pub(crate) fn link(&mut self, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self
+            .call(ExportPublicationAction::Link, cancel)?
+            .hashed_bytes
+            .0)
+    }
+    pub(crate) fn verify_installed(
+        &mut self,
+        cancel: &AtomicBool,
+    ) -> Result<(crate::metadata_export::ExportReceipt, u64)> {
+        let reply = self.call(ExportPublicationAction::VerifyInstalled, cancel)?;
+        let ExportPublicationValue::Installed(receipt) = reply.value else {
+            unreachable!()
+        };
+        Ok((receipt, reply.hashed_bytes.0))
+    }
+    pub(crate) fn recheck_installed(&mut self, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self
+            .call(ExportPublicationAction::RecheckInstalled, cancel)?
+            .hashed_bytes
+            .0)
+    }
+    pub(crate) fn restore_link(&mut self, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self
+            .call(ExportPublicationAction::RestoreLink, cancel)?
+            .hashed_bytes
+            .0)
+    }
+    pub(crate) fn verify_restored(
+        &mut self,
+        cancel: &AtomicBool,
+    ) -> Result<(crate::metadata_export::ExportReceipt, u64)> {
+        let reply = self.call(ExportPublicationAction::VerifyRestored, cancel)?;
+        let ExportPublicationValue::Restored(receipt) = reply.value else {
+            unreachable!()
+        };
+        Ok((receipt, reply.hashed_bytes.0))
+    }
+    pub(crate) fn recheck_restored(&mut self, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self
+            .call(ExportPublicationAction::RecheckRestored, cancel)?
+            .hashed_bytes
+            .0)
+    }
+    fn abort(&mut self) -> Result<()> {
+        reconcile_publication(&self.custody, Some(&self.transfer))?;
+        self.complete = self
+            .custody
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<()> {
+        publication_original_retired(&self.custody)?;
+        self.call(ExportPublicationAction::Finish, &AtomicBool::new(false))?;
+        Ok(())
+    }
+    pub(crate) fn complete<T>(mut self, result: Result<T>) -> Result<T> {
+        if let Some(custody) = self
+            .custody
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            custody.cleanup_requested = true;
+        }
+        match result {
+            Ok(value) => match self.finish() {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let _ = self.abort();
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.abort();
+                Err(error)
+            }
+        }
+    }
+}
+impl Drop for ManagedPublicationLease {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        if let Some(custody) = self
+            .custody
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            && custody.transfer == self.transfer
+        {
+            custody.cleanup_requested = true;
+        }
+        // Retain exact pending request and both owners. Drop performs no I/O.
+    }
+}
+fn publication_original_retired(registry: &Arc<Mutex<Option<PublicationCustody>>>) -> Result<()> {
+    let slot = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(custody) = slot.as_ref() {
+        let original = custody.original.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(original) = original.as_ref() {
+            ensure!(
+                custody.original_transfer.as_ref() == Some(&original.transfer),
+                "publication original custody changed"
+            );
+            anyhow::bail!("publication retains its lock until original cleanup is acknowledged");
+        }
+    }
+    Ok(())
+}
+fn apply_publication_reply(
+    registry: &Arc<Mutex<Option<PublicationCustody>>>,
+    request: &ExportPublicationRequest,
+    reply: &ExportPublicationReply,
+    next_step: u64,
+) -> Result<()> {
+    reply.validate(request)?;
+    let mut slot = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let custody = slot.as_mut().context("publication custody disappeared")?;
+    let pending = match &custody.state {
+        PublicationCustodyState::BeginPending { request }
+        | PublicationCustodyState::StepPending { request, .. } => request,
+        PublicationCustodyState::Active { .. } => {
+            anyhow::bail!("publication reply has no pending request")
+        }
+    };
+    ensure!(pending == request, "publication pending request changed");
+    if matches!(
+        reply.value,
+        ExportPublicationValue::Finished | ExportPublicationValue::Aborted
+    ) {
+        *slot = None;
+    } else {
+        custody.state = PublicationCustodyState::Active { next_step };
+    }
+    Ok(())
+}
+fn reconcile_publication(
+    registry: &Arc<Mutex<Option<PublicationCustody>>>,
+    expected: Option<&LeaseId>,
+) -> Result<()> {
+    publication_original_retired(registry)?;
+    // At most one exact pending replay followed by one Abort. An outer error
+    // leaves the pending request untouched; it never proves step consumption.
+    for _ in 0..2 {
+        let (filesystem, request, next_step) = {
+            let mut slot = registry.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(custody) = slot.as_mut() else {
+                return Ok(());
+            };
+            if let Some(expected) = expected {
+                ensure!(&custody.transfer == expected, "publication custody changed");
+            }
+            custody.cleanup_requested = true;
+            match &custody.state {
+                PublicationCustodyState::BeginPending { request } => {
+                    (custody.filesystem.clone(), request.clone(), 1)
+                }
+                PublicationCustodyState::StepPending { request, next_step } => {
+                    (custody.filesystem.clone(), request.clone(), *next_step)
+                }
+                PublicationCustodyState::Active { next_step } => {
+                    let next = next_step
+                        .checked_add(1)
+                        .context("publication step exhausted")?;
+                    let request = ManagedPublicationLease::request(
+                        custody,
+                        *next_step,
+                        ExportPublicationAction::Abort,
+                    );
+                    custody.state = PublicationCustodyState::StepPending {
+                        request: request.clone(),
+                        next_step: next,
+                    };
+                    (custody.filesystem.clone(), request, next)
+                }
+            }
+        };
+        let reply = filesystem.export_publication_call(&request, &AtomicBool::new(false))?;
+        apply_publication_reply(registry, &request, &reply, next_step)?;
+        if request.cleanup() {
+            return match reply.value {
+                ExportPublicationValue::Finished | ExportPublicationValue::Aborted => Ok(()),
+                ExportPublicationValue::Failed(failure) => Err(failure.into()),
+                _ => anyhow::bail!("publication terminal reply did not retire custody"),
+            };
+        }
+    }
+    ensure!(
+        registry.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+        "publication reconciliation remains pending"
+    );
+    Ok(())
+}
+pub(crate) fn export_publication_custody_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Mutex<Option<PublicationCustody>>>(),
+        std::mem::align_of::<Mutex<Option<PublicationCustody>>>(),
+    )
+}
 /// The Arc instance, not its serialized epoch/physical tuple, grants a prepared
 /// edit or native permit authority within the original catalog lifetime.
 pub(crate) struct CatalogSessionAuthority {
@@ -1038,6 +1649,7 @@ pub(crate) struct CatalogSessionAuthority {
     mode: AuthorityMode,
     searches: Mutex<Vec<Arc<dyn SessionTask>>>,
     original: Arc<Mutex<Option<OriginalCustody>>>,
+    publication: Arc<Mutex<Option<PublicationCustody>>>,
 }
 impl CatalogSessionAuthority {
     pub(crate) fn legacy(file: Arc<File>) -> Result<Arc<Self>> {
@@ -1046,6 +1658,7 @@ impl CatalogSessionAuthority {
             mode: AuthorityMode::Legacy(file),
             searches: Mutex::new(Vec::new()),
             original: Arc::new(Mutex::new(None)),
+            publication: Arc::new(Mutex::new(None)),
         }))
     }
     pub(crate) fn legacy_file(&self) -> Result<&Arc<File>> {
@@ -1117,7 +1730,22 @@ impl CatalogSessionAuthority {
         else {
             return Ok(None);
         };
+        let abandoned_publication = {
+            let slot = self.publication.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(publication) = slot.as_ref() {
+                ensure!(
+                    publication.cleanup_requested || publication.original_transfer.is_none(),
+                    "publication already bound to an original transfer"
+                );
+                publication.cleanup_requested
+            } else {
+                false
+            }
+        };
         self.reconcile_export_original(cancel)?;
+        if abandoned_publication {
+            self.reconcile_export_publication()?;
+        }
         let transfer = LeaseId::new();
         let request = ExportOriginalRequest {
             root: root.clone(),
@@ -1142,6 +1770,18 @@ impl CatalogSessionAuthority {
                 allowance,
                 state: OriginalCustodyState::BeginPending,
             });
+        }
+        if let Some(publication) = self
+            .publication
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            ensure!(
+                publication.original_transfer.is_none(),
+                "publication original transfer already bound"
+            );
+            publication.original_transfer = Some(transfer.clone());
         }
         let reply = filesystem.export_original_call(&request, cancel);
         let reply = match reply {
@@ -1242,6 +1882,108 @@ impl CatalogSessionAuthority {
         ensure!(matches!(reply.value, ExportOriginalValue::Aborted));
         *slot = None;
         Ok(())
+    }
+    pub(crate) fn begin_export_publication(
+        &self,
+        mode: ExportPublicationMode,
+        source: ExportPublicationSource,
+        cancel: &AtomicBool,
+    ) -> Result<Option<ManagedPublicationLease>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        self.reconcile_export_publication()?;
+        let transfer = LeaseId::new();
+        let request = ExportPublicationRequest {
+            root: root.clone(),
+            transfer: transfer.clone(),
+            step: U64(0),
+            mode,
+            source: source.clone(),
+            action: ExportPublicationAction::Begin,
+        };
+        request.validate()?;
+        {
+            let mut slot = self.publication.lock().unwrap_or_else(|e| e.into_inner());
+            ensure!(
+                slot.is_none(),
+                "export publication custody is already retained"
+            );
+            *slot = Some(PublicationCustody {
+                original: self.original.clone(),
+                original_transfer: self
+                    .original
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|original| original.transfer.clone()),
+                cleanup_requested: false,
+                filesystem: filesystem.clone(),
+                root: root.clone(),
+                transfer: transfer.clone(),
+                mode,
+                source,
+                state: PublicationCustodyState::BeginPending {
+                    request: request.clone(),
+                },
+            });
+        }
+        let reply = match filesystem.export_publication_call(&request, cancel) {
+            Ok(reply) => reply,
+            Err(error) => {
+                if publication_failure_known(&error) {
+                    *self.publication.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                } else {
+                    if let Some(custody) = self
+                        .publication
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
+                        custody.cleanup_requested = true;
+                    }
+                    let _ = self.reconcile_export_publication();
+                }
+                return Err(error);
+            }
+        };
+        let validated = reply.validate(&request);
+        if let Err(error) = validated {
+            if let Some(custody) = self
+                .publication
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                custody.cleanup_requested = true;
+            }
+            let _ = self.reconcile_export_publication();
+            return Err(error);
+        }
+        let ExportPublicationValue::Begun { installed } = reply.value else {
+            unreachable!()
+        };
+        self.publication
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .expect("publication begin custody retained")
+            .state = PublicationCustodyState::Active { next_step: 1 };
+        Ok(Some(ManagedPublicationLease {
+            custody: self.publication.clone(),
+            transfer,
+            seal: reply.seal,
+            installed,
+            timings: reply.timings,
+            initial_hashed_bytes: reply.hashed_bytes.0,
+            complete: false,
+        }))
+    }
+    pub(crate) fn reconcile_export_publication(&self) -> Result<()> {
+        reconcile_publication(&self.publication, None)
     }
     pub(crate) fn read_export_profile(
         &self,
@@ -1829,6 +2571,7 @@ impl ManagedSession {
             },
             searches: Mutex::new(Vec::new()),
             original: Arc::new(Mutex::new(None)),
+            publication: Arc::new(Mutex::new(None)),
         });
         let db = pool.lease(0).expect("new confirmed actor role available");
         let catalog = Catalog {
@@ -1852,6 +2595,7 @@ impl ManagedSession {
         self.close_attempted = true;
         self.authority
             .reconcile_export_original(&AtomicBool::new(false))?;
+        self.authority.reconcile_export_publication()?;
         self.authority.pool().unwrap().begin_close();
         self.authority.cancel_searches();
         self.authority.drain_searches()?;

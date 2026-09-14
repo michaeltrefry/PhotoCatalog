@@ -35,8 +35,17 @@ fn target(path: PathBuf) -> ExportTarget {
     }
 }
 fn queued(c: &mut Catalog, path: PathBuf) -> Result<(ExportJob, ExportWork)> {
+    queued_with_overwrite(c, path, false)
+}
+fn queued_with_overwrite(
+    c: &mut Catalog,
+    path: PathBuf,
+    overwrite: bool,
+) -> Result<(ExportJob, ExportWork)> {
     let j = c.begin_photo_export()?;
-    c.append_photo_export(&j.id, 0, &target(path), &output(), 1024, 1024)?;
+    let mut target = target(path);
+    target.overwrite = overwrite;
+    c.append_photo_export(&j.id, 0, &target, &output(), 1024, 1024)?;
     c.seal_photo_export_job(&j.id, 1)?;
     let w = c.claim_photo_export(&j.id)?.unwrap();
     Ok((j, w))
@@ -164,7 +173,9 @@ fn frozen_job_survives_restart_and_only_accepted_seal_publishes() -> Result<()> 
 #[test]
 fn managed_original_lease_spans_every_accept_and_publish_recheck_and_skips_installed_recovery()
 -> Result<()> {
-    use crate::catalog_session::{ExportOriginalAction, export_original_managed_session};
+    use crate::catalog_session::{
+        ExportOriginalAction, ExportPublicationAction, export_original_managed_session,
+    };
     let temp = tempfile::tempdir()?;
     let original = temp.path().join("managed-original.png");
     let original_bytes = b"managed source bytes unchanged";
@@ -172,6 +183,7 @@ fn managed_original_lease_spans_every_accept_and_publish_recheck_and_skips_insta
     let (mut managed, original_control) = export_original_managed_session(temp.path())?;
     let inspections = &original_control.inspections;
     let calls = &original_control.calls;
+    let publication_calls = &original_control.publication_calls;
     let destination = temp.path().join("managed-export.png");
     {
         let catalog = managed.catalog.as_mut().unwrap();
@@ -181,6 +193,19 @@ fn managed_original_lease_spans_every_accept_and_publish_recheck_and_skips_insta
         let (job, work) = queued(catalog, destination.clone())?;
         let sealed = seal(temp.path(), &work)?;
         catalog.accept_photo_export_seal(&work, &sealed)?;
+        assert_eq!(
+            publication_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.action.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ExportPublicationAction::Begin,
+                ExportPublicationAction::RecheckPayload,
+                ExportPublicationAction::Finish,
+            ]
+        );
         let after_accept = calls.lock().unwrap().len();
         assert_eq!(after_accept, 3);
         assert_eq!(
@@ -211,6 +236,30 @@ fn managed_original_lease_spans_every_accept_and_publish_recheck_and_skips_insta
         // The already-installed recovery/finalization path needs no source lease.
         catalog.publish_photo_export_item(&job.id, 1)?;
         assert_eq!(calls.lock().unwrap().len(), after_publish);
+        assert_eq!(
+            publication_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.action.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ExportPublicationAction::Begin,
+                ExportPublicationAction::RecheckPayload,
+                ExportPublicationAction::Finish,
+                ExportPublicationAction::Begin,
+                ExportPublicationAction::Capture,
+                ExportPublicationAction::VerifyCapture,
+                ExportPublicationAction::Link,
+                ExportPublicationAction::VerifyInstalled,
+                ExportPublicationAction::RecheckInstalled,
+                ExportPublicationAction::Finish,
+                ExportPublicationAction::Begin,
+                ExportPublicationAction::VerifyInstalled,
+                ExportPublicationAction::RecheckInstalled,
+                ExportPublicationAction::Finish,
+            ]
+        );
     }
     assert_eq!(inspections.lock().unwrap().len(), 1);
     assert_eq!(
@@ -218,6 +267,132 @@ fn managed_original_lease_spans_every_accept_and_publish_recheck_and_skips_insta
         b"completed encoded derivative"
     );
     assert_eq!(std::fs::read(&original)?, original_bytes);
+    managed.close()?;
+    Ok(())
+}
+
+#[test]
+fn managed_restore_recovers_absent_stored_seal_through_publication_authority() -> Result<()> {
+    managed_restore_lost_reply_case(false, true)
+}
+#[test]
+fn managed_restore_recovers_absent_stored_seal_with_corrupt_payload() -> Result<()> {
+    managed_restore_lost_reply_case(false, false)?;
+    managed_restore_lost_reply_case(true, false)
+}
+fn managed_restore_lost_reply_case(cancel_on_loss: bool, missing_payload: bool) -> Result<()> {
+    use crate::catalog_session::{ExportPublicationAction, export_original_managed_session};
+
+    let temp = tempfile::tempdir()?;
+    let original = temp.path().join("managed-restore-original.png");
+    let original_bytes = b"managed restore source bytes";
+    std::fs::write(&original, original_bytes)?;
+    let destination = temp.path().join("managed-restore-output.png");
+    std::fs::write(&destination, b"managed prior destination")?;
+    let (mut managed, control) = export_original_managed_session(temp.path())?;
+    let catalog = managed.catalog.as_mut().unwrap();
+    let fingerprint = blake3::hash(original_bytes).to_hex().to_string();
+    catalog.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,'original','ready',?2,'fixture','{\"format\":\"PNG\",\"width\":1000,\"height\":1000,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",params![crate::location_bytes(&original),fingerprint])?;
+    catalog.record_storage_path("a", &NativePath::from_path(&original))?;
+    let (job, work) = queued_with_overwrite(catalog, destination.clone(), true)?;
+    let sealed = seal(temp.path(), &work)?;
+    catalog.accept_photo_export_seal(&work, &sealed)?;
+    let error = catalog
+        .publish_photo_export_item_with_hook(&job.id, 1, |phase| {
+            if phase == PhotoExportBoundary::Captured {
+                anyhow::bail!("stop after managed capture")
+            }
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("stop after managed capture"));
+    assert!(!destination.exists());
+    assert_eq!(
+        std::fs::read(sealed.recovery_directory().join("original"))?,
+        b"managed prior destination"
+    );
+    catalog.db.execute(
+        "UPDATE photo_export_items SET seal=NULL WHERE job=?1 AND sequence=1",
+        [&job.id],
+    )?;
+    let before_restore = control.publication_calls.lock().unwrap().len();
+    let payload = sealed.recovery_directory().join("payload");
+    if missing_payload {
+        std::fs::remove_file(&payload)?;
+    } else {
+        std::fs::write(&payload, b"corrupt recovery payload")?;
+    }
+    assert!(metadata_export::read_photo_seal(&sealed.snapshot, &sealed.authority_digest).is_err());
+    assert!(metadata_export::PhotoPublication::prepare(&sealed).is_err());
+    *control.lose_publication_action.lock().unwrap() = Some(ExportPublicationAction::RestoreLink);
+    control
+        .cancel_lost_publication_reply
+        .store(cancel_on_loss, std::sync::atomic::Ordering::Release);
+    let canceled = std::sync::atomic::AtomicBool::new(false);
+    let error = catalog
+        .restore_photo_export_item_cancellable(&job.id, 1, &mut ExportControl::new(&canceled))
+        .unwrap_err();
+    assert_eq!(
+        canceled.load(std::sync::atomic::Ordering::Acquire),
+        cancel_on_loss
+    );
+    assert!(format!("{error:#}").contains("lost publication mutation reply"));
+    assert_eq!(
+        error
+            .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+            .unwrap()
+            .kind,
+        crate::filesystem_worker::wire::FailureKind::Unknown
+    );
+    assert_eq!(std::fs::read(&destination)?, b"managed prior destination");
+    {
+        let calls = control.publication_calls.lock().unwrap();
+        let restore_calls: Vec<_> = calls[before_restore..]
+            .iter()
+            .filter(|request| request.action == ExportPublicationAction::RestoreLink)
+            .collect();
+        assert_eq!(restore_calls.len(), 2);
+        assert_eq!(restore_calls[0], restore_calls[1]);
+        assert!(matches!(
+            calls.last().unwrap().action,
+            ExportPublicationAction::Abort
+        ));
+    }
+    assert_eq!(
+        std::fs::read(sealed.recovery_directory().join("original"))?,
+        b"managed prior destination"
+    );
+    if missing_payload {
+        assert!(!payload.exists());
+    } else {
+        assert_eq!(std::fs::read(&payload)?, b"corrupt recovery payload");
+    }
+    canceled.store(false, std::sync::atomic::Ordering::Release);
+    let receipt = catalog.restore_photo_export_item_cancellable(
+        &job.id,
+        1,
+        &mut ExportControl::new(&canceled),
+    )?;
+    assert_eq!(receipt.state, metadata_export::ExportState::Restored);
+    assert_eq!(std::fs::read(&destination)?, b"managed prior destination");
+    assert_eq!(std::fs::read(&original)?, original_bytes);
+    assert_eq!(
+        control.publication_calls.lock().unwrap()[before_restore..]
+            .iter()
+            .map(|request| request.action.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ExportPublicationAction::Begin,
+            ExportPublicationAction::RestoreLink,
+            ExportPublicationAction::RestoreLink,
+            ExportPublicationAction::Abort,
+            ExportPublicationAction::Begin,
+            ExportPublicationAction::RestoreLink,
+            ExportPublicationAction::VerifyRestored,
+            ExportPublicationAction::RecheckRestored,
+            ExportPublicationAction::Finish,
+        ]
+    );
     managed.close()?;
     Ok(())
 }
@@ -256,13 +431,100 @@ fn managed_accept_retains_publication_lock_through_uncertain_original_cleanup() 
             (ExportOriginalAction::Abort, true),
         ]
     );
-    // Function retirement drops the publication owner even though exact F
-    // original custody remains registered for a later checked reconciliation.
-    let publication = crate::metadata_export::PhotoPublication::prepare(&sealed)?;
-    drop(publication);
+    // Both custodians remain live while original retirement is unproved.
+    assert!(crate::metadata_export::PhotoPublication::prepare(&sealed).is_err());
+    assert!(managed.close().is_err());
+    assert!(crate::metadata_export::PhotoPublication::prepare(&sealed).is_err());
     original_control.fail_abort.store(false, Ordering::Release);
     managed.close()?;
+    drop(crate::metadata_export::PhotoPublication::prepare(&sealed)?);
     Ok(())
+}
+
+#[test]
+fn managed_publication_catalog_preserves_lost_mutation_error_and_joint_custody() -> Result<()> {
+    managed_publication_lost_reply_case(false)
+}
+fn managed_publication_lost_reply_case(cancel_on_loss: bool) -> Result<()> {
+    use crate::catalog_session::{ExportPublicationAction, export_original_managed_session};
+    use std::sync::atomic::Ordering;
+    for action in [
+        ExportPublicationAction::Capture,
+        ExportPublicationAction::Link,
+    ] {
+        let temp = tempfile::tempdir()?;
+        let original = temp.path().join("managed-original.png");
+        std::fs::write(&original, b"managed source bytes unchanged")?;
+        let (mut managed, control) = export_original_managed_session(temp.path())?;
+        let destination = temp.path().join("managed-export.png");
+        std::fs::write(&destination, b"prior destination")?;
+        let sealed = {
+            let catalog = managed.catalog.as_mut().unwrap();
+            let fingerprint = blake3::hash(b"managed source bytes unchanged")
+                .to_hex()
+                .to_string();
+            catalog.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,'original','ready',?2,'fixture','{\"format\":\"PNG\",\"width\":1000,\"height\":1000,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')", params![crate::location_bytes(&original), fingerprint])?;
+            catalog.record_storage_path("a", &NativePath::from_path(&original))?;
+            let (job, work) = queued_with_overwrite(catalog, destination, true)?;
+            let sealed = seal(temp.path(), &work)?;
+            catalog.accept_photo_export_seal(&work, &sealed)?;
+            *control.lose_publication_action.lock().unwrap() = Some(action.clone());
+            control.fail_abort.store(true, Ordering::Release);
+            control
+                .cancel_lost_publication_reply
+                .store(cancel_on_loss, Ordering::Release);
+            let canceled = std::sync::atomic::AtomicBool::new(false);
+            let error = catalog
+                .publish_photo_export_item_cancellable(
+                    &job.id,
+                    1,
+                    &mut ExportControl::new(&canceled),
+                )
+                .unwrap_err();
+            assert_eq!(canceled.load(Ordering::Acquire), cancel_on_loss);
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+                    .unwrap()
+                    .kind,
+                crate::filesystem_worker::wire::FailureKind::Unknown
+            );
+            assert!(format!("{error:#}").contains("lost publication mutation reply"));
+            sealed
+        };
+        assert!(crate::metadata_export::PhotoPublication::prepare(&sealed).is_err());
+        assert!(managed.close().is_err());
+        control.fail_abort.store(false, Ordering::Release);
+        managed.close()?;
+        drop(crate::metadata_export::PhotoPublication::prepare(&sealed)?);
+        assert_eq!(
+            std::fs::read(sealed.recovery_directory().join("original"))?,
+            b"prior destination"
+        );
+        assert_eq!(
+            std::fs::read(sealed.recovery_directory().join("payload"))?,
+            b"completed encoded derivative"
+        );
+        if action == ExportPublicationAction::Capture {
+            assert!(!sealed.snapshot.destination.exists());
+        } else {
+            assert_eq!(
+                std::fs::read(&sealed.snapshot.destination)?,
+                b"completed encoded derivative"
+            );
+        }
+        let calls = control.publication_calls.lock().unwrap();
+        let matching: Vec<_> = calls.iter().filter(|r| r.action == action).collect();
+        assert_eq!(matching.len(), 2);
+        assert_eq!(matching[0], matching[1]);
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_publication_catalog_keeps_unknown_when_reply_loss_also_cancels() -> Result<()> {
+    managed_publication_lost_reply_case(true)?;
+    managed_restore_lost_reply_case(true, true)
 }
 
 #[test]
@@ -806,6 +1068,55 @@ fn cancellation_after_capture_preserves_bytes_and_allows_explicit_restore_withou
     );
     assert_eq!(std::fs::read(original)?, source);
     assert_eq!(c.photo_export_job(&j.id)?.state, "canceled");
+    Ok(())
+}
+
+#[test]
+fn local_restore_recovers_absent_stored_seal_with_missing_or_corrupt_payload() -> Result<()> {
+    for missing in [true, false] {
+        let (temp, mut catalog, original) = fixture()?;
+        let source = std::fs::read(&original)?;
+        let (job, work, sealed) = accepted_overwrite(&mut catalog, temp.path())?;
+        let error = catalog
+            .publish_photo_export_item_with_hook(&job.id, 1, |phase| {
+                if phase == PhotoExportBoundary::Captured {
+                    anyhow::bail!("stop after local capture");
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stop after local capture"));
+        assert!(!work.plan.destination.destination.exists());
+        catalog.db.execute(
+            "UPDATE photo_export_items SET seal=NULL WHERE job=?1 AND sequence=1",
+            [&job.id],
+        )?;
+        let payload = sealed.recovery_directory().join("payload");
+        assert!(payload.is_file());
+        if missing {
+            std::fs::remove_file(&payload)?;
+        } else {
+            std::fs::write(&payload, b"corrupt recovery payload")?;
+        }
+        assert!(
+            metadata_export::read_photo_seal(&sealed.snapshot, &sealed.authority_digest).is_err()
+        );
+        assert!(metadata_export::PhotoPublication::prepare(&sealed).is_err());
+        for _ in 0..2 {
+            let receipt = catalog.restore_photo_export_item(&job.id, 1)?;
+            assert_eq!(receipt.state, metadata_export::ExportState::Restored);
+            assert_eq!(
+                std::fs::read(&work.plan.destination.destination)?,
+                b"old destination bytes"
+            );
+            assert_eq!(
+                std::fs::read(sealed.recovery_directory().join("original"))?,
+                b"old destination bytes"
+            );
+            assert_eq!(catalog.photo_export_job(&job.id)?.completed, 1);
+        }
+        assert_eq!(std::fs::read(&original)?, source);
+    }
     Ok(())
 }
 

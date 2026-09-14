@@ -32,6 +32,9 @@ pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
 pub(crate) fn export_original_transfer_layout() -> (usize, usize) {
     bootstrap::export_original_transfer_layout()
 }
+pub(crate) fn export_publication_transfer_layout() -> (usize, usize) {
+    bootstrap::export_publication_transfer_layout()
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;
@@ -89,6 +92,11 @@ impl FilesystemHandler {
                 .export_original_call(&request, cancel)
                 .map_err(export_directory_failure)
                 .map(Response::ExportOriginal),
+            Operation::ExportPublication(request) => self
+                .owner
+                .export_publication_call(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::ExportPublication),
             Operation::ExportProfile(request) => self
                 .owner
                 .export_profile_call(&request, cancel)

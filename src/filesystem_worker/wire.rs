@@ -5,9 +5,10 @@ use crate::{
     catalog_session::{
         CatalogBootstrap, ConfirmSqlAdmission, ExportAliasFactReply, ExportAliasFactRequest,
         ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportOriginalReply,
-        ExportOriginalRequest, ExportProfileReply, ExportProfileRequest, InspectExportOriginal,
-        InspectedExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, validate_path,
+        ExportOriginalRequest, ExportProfileReply, ExportProfileRequest, ExportPublicationReply,
+        ExportPublicationRequest, InspectExportOriginal, InspectedExportOriginal, LeaseId,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
+        SqlAdmissionConfirmed, validate_path,
     },
     storage_volume::NativePath,
 };
@@ -125,6 +126,7 @@ pub enum Operation {
     ExportAliasFact(Box<ExportAliasFactRequest>),
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
+    ExportPublication(Box<ExportPublicationRequest>),
     ExportProfile(Box<ExportProfileRequest>),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
@@ -160,6 +162,7 @@ impl Operation {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
+            || matches!(self, Self::ExportPublication(r) if r.cleanup())
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
             || matches!(self, Self::PreviewStage(r) if r.cleanup())
@@ -175,6 +178,7 @@ impl Operation {
             Self::ExportAliasFact(value) => value.validate()?,
             Self::InspectExportOriginal(value) => value.validate()?,
             Self::ExportOriginal(value) => value.validate()?,
+            Self::ExportPublication(value) => value.validate()?,
             Self::ExportProfile(value) => value.validate()?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
@@ -282,6 +286,7 @@ pub enum Response {
     ExportAliasFact(ExportAliasFactReply),
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
+    ExportPublication(ExportPublicationReply),
     ExportProfile(ExportProfileReply),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),

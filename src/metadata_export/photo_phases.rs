@@ -268,6 +268,9 @@ impl PhotoPublication {
     pub fn timings(&self) -> &PhotoPublicationTimings {
         &self.timings
     }
+    pub(crate) fn seal(&self) -> &SealedPhotoExport {
+        &self.seal
+    }
     /// No catalog writer may be held: after a failed namespace operation acquire
     /// fresh bounded byte proofs. A successful link changes the payload's ctime,
     /// so the pre-link proof cannot establish ownership here.
@@ -671,7 +674,23 @@ mod ownership_tests {
             } else {
                 fs::write(payload, b"damaged bytes")?;
             }
-            let mut restore = PhotoPublication::prepare_restore(&seal)?;
+            assert!(read_photo_seal(&seal.snapshot, &seal.authority_digest).is_err());
+            assert!(PhotoPublication::prepare(&seal).is_err());
+            assert!(
+                read_photo_seal_for_restore_with_checkpoint(
+                    &seal.snapshot,
+                    "foreign authority",
+                    &mut |_| Ok(()),
+                )
+                .is_err()
+            );
+            let recovered = read_photo_seal_for_restore_with_checkpoint(
+                &seal.snapshot,
+                &seal.authority_digest,
+                &mut |_| Ok(()),
+            )?;
+            assert_eq!(recovered, seal);
+            let mut restore = PhotoPublication::prepare_restore(&recovered)?;
             assert!(!restore.installed());
             restore.restore_link()?;
             assert_eq!(restore.verify_restored()?.state, ExportState::Restored);

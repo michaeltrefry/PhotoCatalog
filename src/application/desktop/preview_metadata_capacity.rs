@@ -904,6 +904,21 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
         c.vec(1, 64)?,
     ])?;
+    // Publication request/reply typed roots and full prevalidation backings.
+    // The independent F parser scratch is charged below; these graphs coexist
+    // with the retained C Call and active/terminal publication graphs.
+    let publication_request = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Operation>().size,
+        Layout::of::<crate::catalog_session::ExportPublicationRequest>().size,
+        c.vec_growth(1, RELAY_BYTES)?,
+        c.mul(2, c.vec_growth(2, RELAY_BYTES / 2)?)?,
+    ])?;
+    let publication_reply = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Response>().size,
+        Layout::of::<crate::catalog_session::ExportPublicationReply>().size,
+        c.vec_growth(1, RELAY_BYTES)?,
+        c.mul(5, c.vec_growth(2, RELAY_BYTES / 2)?)?,
+    ])?;
     let export_typed_graph = [
         c.add(&[
             export_directory_request,
@@ -924,6 +939,10 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.add(&[
             original_lease_request,
             original_lease_request.max(original_lease_reply),
+        ])?,
+        c.add(&[
+            publication_request,
+            publication_request.max(publication_reply),
         ])?,
     ]
     .into_iter()
@@ -1067,6 +1086,121 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             c.vec_growth(Layout::of::<NativePath>().size, original_root_nodes)?,
             c.mul(c.mul(3, original_root_nodes)?, Layout::of::<u16>().size)?,
             c.mul(c.mul(8, original_root_nodes)?, Layout::of::<u16>().size)?,
+        ])?,
+    )?;
+    // Publication is additive with the original lease, including uncertain
+    // joint cleanup. A seal owns destination plus UUID/expected digest/authority
+    // digest/payload digest. Root paths belong to each cloned RootCapability.
+    let publication_path = c.vec(2, PATH_UNITS as u64)?;
+    let publication_derived_path = c.vec(2, c.add(&[PATH_UNITS as u64, 64])?)?;
+    let publication_authority_backing =
+        c.add(&[publication_path, c.vec(1, 36)?, c.mul(3, c.vec(1, 64)?)?])?;
+    let publication_receipt_backing =
+        c.add(&[c.mul(3, publication_derived_path)?, c.vec(1, 8192)?])?;
+    let (publication_custody_size, publication_custody_align) =
+        crate::catalog_session::export_publication_custody_layout();
+    a.push(
+        "retained.export_publication_c_custody_arc_root",
+        Phase::Retained,
+        1,
+        c.arc(Layout {
+            size: u64::try_from(publication_custody_size)?,
+            align: u64::try_from(publication_custody_align)?,
+        })?,
+    )?;
+    // source + pending source + lease seal; custody/pending root paths; 3+1
+    // custody IDs, exact original transfer ID, 3+1 pending IDs, lease transfer.
+    // The original Arc is shared, not another allocation of its pointee.
+    a.push(
+        "active.export_publication_c_custody_pending_and_lease_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(3, publication_authority_backing)?,
+            c.mul(2, publication_path)?,
+            c.mul(10, LEASE_ID_BYTES)?,
+            c.vec(1, 8192)?,
+        ])?,
+    )?;
+    // The independent caller request coexists with Proxy's boxed deep Call
+    // clone, already covered by wire_typed_graph and the relay parser entries.
+    a.push(
+        "active.export_publication_c_caller_request_backing",
+        Phase::Active,
+        1,
+        c.add(&[
+            publication_authority_backing,
+            publication_path,
+            c.mul(4, LEASE_ID_BYTES)?,
+            c.vec(1, 8192)?,
+        ])?,
+    )?;
+    let (publication_transfer_size, _) =
+        crate::filesystem_worker::export_publication_transfer_layout();
+    // The old terminal owns source/seal/cached-reply (3), and the new active
+    // candidate source/seal/PhotoPublication.seal/cached-reply (4). The local
+    // returned reply and decoded request are in the F typed graph envelope.
+    // Each record owns its outer transfer plus cached reply transfer and
+    // root's epoch/token/session: (1+1+3)*2 = 10 ID backings. Four digest
+    // strings are cached request digests and cached reply provenance digests.
+    // Unix verify_restored temporarily has five VerifiedFiles (3 held + 2
+    // replacements), plus its cloned expected FileRevision digest. Those six
+    // digest backings are charged alongside the four cached digests. The
+    // publication directory is a sixth path owner; expected adds no path.
+    a.push(
+        "active.export_publication_f_terminal_candidate_and_last_result_overlap",
+        Phase::Active,
+        1,
+        c.add(&[
+            u64::try_from(publication_transfer_size)?,
+            c.mul(7, publication_authority_backing)?,
+            c.mul(2, publication_receipt_backing)?,
+            c.mul(2, publication_path)?,
+            c.mul(6, publication_derived_path)?,
+            c.mul(10, c.vec(1, 64)?)?,
+            c.mul(10, LEASE_ID_BYTES)?,
+            c.mul(
+                2,
+                c.vec(1, crate::filesystem_worker::wire::ERROR_BYTES as u64)?,
+            )?,
+        ])?,
+    )?;
+    // F decode happens after the relay has retained C/G graphs. One parser is
+    // active; charge the larger response grammar including Failed receipts.
+    // Six Content layers cover Operation/Source/StoredPath/NativePath nesting
+    // and the response Value/Receipt alternatives before semantic validation.
+    a.push(
+        "active.export_publication_f_wire_parser_scratch",
+        Phase::Active,
+        1,
+        c.parse(RELAY_BYTES, 6, publication_request.max(publication_reply))?,
+    )?;
+    // read_journal grows through 64 KiB+1, retains raw Vec while deserializing,
+    // and may retain the first parsed seal during plan.json parsing. The partial
+    // graph bounds prevalidation strings/paths; the extra typed seal remains
+    // live across that second parse. Recovery's metadata-only reader moves its
+    // returned seal into the same candidate authority slot as the strict reader;
+    // prepare_restore's stored seal/plan parses use these existing scratch slots.
+    // Serialization conversions clone seals or
+    // receipts, then StoredPath native vectors, alongside output Vec growth.
+    let journal_bytes = 64 * 1024;
+    let journal_partial = c.add(&[
+        c.vec_growth(1, journal_bytes)?,
+        c.vec_growth(2, journal_bytes / 2)?,
+        c.mul(2, publication_authority_backing)?,
+    ])?;
+    a.push(
+        "active.export_publication_journal_and_serialization_scratch",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.parse(journal_bytes, 4, journal_partial)?,
+            c.vec_growth(1, journal_bytes + 1)?,
+            c.mul(2, publication_authority_backing)?,
+            c.mul(2, publication_receipt_backing)?,
+            c.mul(6, publication_derived_path)?,
+            c.vec_growth(1, RELAY_BYTES)?,
+            c.mul(2, c.vec(1, 64)?)?,
         ])?,
     )?;
     // The serial export worker owns at most one profile transfer. Its cache and
@@ -1484,6 +1618,22 @@ mod tests {
                 Checked.vec(1, 64)?,
             ])?
         );
+        for name in [
+            "active.export_publication_c_custody_pending_and_lease_backings",
+            "active.export_publication_c_caller_request_backing",
+            "active.export_publication_f_terminal_candidate_and_last_result_overlap",
+            "active.export_publication_f_wire_parser_scratch",
+            "active.export_publication_journal_and_serialization_scratch",
+        ] {
+            let entry = default_report
+                .contributions
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap();
+            assert_eq!(entry.phase, Phase::Active);
+            assert_eq!(entry.count, 1);
+            assert!(entry.each > 0);
+        }
         let profile_cache = default_report
             .contributions
             .iter()

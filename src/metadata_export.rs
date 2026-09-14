@@ -255,6 +255,28 @@ pub fn read_photo_seal_with_checkpoint(
     authority_digest: &str,
     checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> Result<SealedPhotoExport> {
+    let sealed =
+        read_photo_seal_for_restore_with_checkpoint(snapshot, authority_digest, checkpoint)?;
+    ensure!(
+        inspect_file_revision_with_checkpoint(
+            &sealed.recovery_directory().join("payload"),
+            sealed.max_payload_bytes,
+            checkpoint,
+        )? == sealed.payload,
+        "sealed photo payload changed"
+    );
+    Ok(sealed)
+}
+
+/// Recover seal metadata using only the authoritative job snapshot and digest.
+/// This does not establish payload or namespace ownership: callers must next
+/// prepare restoration, which locks operation.lock and rechecks seal and plan
+/// journals before acquiring current captured-original/installed-file evidence.
+pub(crate) fn read_photo_seal_for_restore_with_checkpoint(
+    snapshot: &DestinationSnapshot,
+    authority_digest: &str,
+    checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> Result<SealedPhotoExport> {
     checkpoint(0)?;
     validate_snapshot(snapshot)?;
     ensure!(
@@ -270,14 +292,6 @@ pub fn read_photo_seal_with_checkpoint(
         "photo seal does not match authoritative job"
     );
     validate_photo_seal(&sealed)?;
-    ensure!(
-        inspect_file_revision_with_checkpoint(
-            &sealed.recovery_directory().join("payload"),
-            sealed.max_payload_bytes,
-            checkpoint,
-        )? == sealed.payload,
-        "sealed photo payload changed"
-    );
     Ok(sealed)
 }
 
@@ -870,6 +884,60 @@ pub(crate) fn validate_destination_snapshot_wire(snapshot: &DestinationSnapshot)
             "invalid destination revision/admission"
         );
     }
+    Ok(())
+}
+
+/// Validate a managed publication authority without consulting the local
+/// filesystem. F performs the corresponding canonical path and journal checks
+/// while retaining the publication lease.
+pub(crate) fn validate_photo_seal_wire(sealed: &SealedPhotoExport) -> Result<()> {
+    validate_destination_snapshot_wire(&sealed.snapshot)?;
+    ensure!(
+        sealed.version == sealed.snapshot.version
+            && matches!(sealed.version, 1 | 2)
+            && valid_digest(&sealed.authority_digest),
+        "invalid managed photo seal authority/version"
+    );
+    ensure!(
+        sealed.payload.bytes > 0
+            && sealed.payload.bytes <= sealed.max_payload_bytes
+            && valid_digest(&sealed.payload.digest),
+        "invalid managed sealed photo payload/admission"
+    );
+    admit_paths(&sealed.plan())
+}
+
+pub(crate) fn validate_export_receipt_wire(
+    receipt: &ExportReceipt,
+    sealed: &SealedPhotoExport,
+) -> Result<()> {
+    validate_photo_seal_wire(sealed)?;
+    ensure!(receipt.detail.len() <= 8192, "export receipt detail limit");
+    ensure!(
+        receipt.destination == sealed.snapshot.destination
+            && receipt.recovery_directory == sealed.recovery_directory(),
+        "export receipt authority mismatch"
+    );
+    if let Some(captured) = &receipt.captured_original {
+        ensure!(
+            captured == &sealed.recovery_directory().join("original"),
+            "export receipt capture path mismatch"
+        );
+    }
+    for path in [
+        Some(&receipt.destination),
+        Some(&receipt.recovery_directory),
+        receipt.captured_original.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::catalog_session::validate_path(&crate::storage_volume::NativePath::from_path(path))?;
+    }
+    ensure!(
+        serde_json::to_vec(receipt)?.len() <= 64 * 1024,
+        "export receipt exceeds journal budget"
+    );
     Ok(())
 }
 

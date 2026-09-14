@@ -8,9 +8,9 @@ use crate::{
         CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportAliasFactReply,
         ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
         ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
-        InspectExportOriginal, InspectedExportOriginal, LeaseId, PrepareCatalog,
-        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
-        store,
+        ExportPublicationReply, ExportPublicationRequest, InspectExportOriginal,
+        InspectedExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, store,
     },
     filesystem_worker::{
         client::Client,
@@ -66,6 +66,7 @@ pub(super) enum Call {
     ExportAliasFact(Box<ExportAliasFactRequest>),
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
+    ExportPublication(Box<ExportPublicationRequest>),
     ExportProfile(Box<ExportProfileRequest>),
 }
 impl Call {
@@ -76,6 +77,7 @@ impl Call {
             || matches!(self, Self::PreviewStage(request) if request.cleanup())
             || matches!(self, Self::ExportProfile(request) if request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if request.cleanup())
+            || matches!(self, Self::ExportPublication(request) if request.cleanup())
     }
     fn cancellable(&self) -> bool {
         matches!(
@@ -92,6 +94,7 @@ impl Call {
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
             || matches!(self, Self::ExportProfile(request) if !request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if !request.cleanup())
+            || matches!(self, Self::ExportPublication(request) if !request.cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -131,6 +134,7 @@ impl Call {
             Self::ExportAliasFact(request) => request.validate(),
             Self::InspectExportOriginal(request) => request.validate(),
             Self::ExportOriginal(request) => request.validate(),
+            Self::ExportPublication(request) => request.validate(),
             Self::ExportProfile(request) => request.validate(),
             _ => Ok(()),
         }
@@ -147,6 +151,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<ExportAliasFactRequest>(),
         std::mem::size_of::<InspectExportOriginal>(),
         std::mem::size_of::<ExportOriginalRequest>(),
+        std::mem::size_of::<ExportPublicationRequest>(),
         std::mem::size_of::<ExportProfileRequest>(),
     ]
     .into_iter()
@@ -173,6 +178,7 @@ pub(super) enum Value {
     ExportAliasFact(ExportAliasFactReply),
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
+    ExportPublication(ExportPublicationReply),
     ExportProfile(ExportProfileReply),
     Unit,
 }
@@ -1094,6 +1100,9 @@ impl Parent {
                 Call::ExportOriginal(request) => {
                     Value::ExportOriginal(self.client.export_original_call(request, cancel)?)
                 }
+                Call::ExportPublication(request) => {
+                    Value::ExportPublication(self.client.export_publication_call(request, cancel)?)
+                }
                 Call::ExportProfile(request) => {
                     Value::ExportProfile(self.client.export_profile_call(request, cancel)?)
                 }
@@ -1754,6 +1763,19 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("wrong export original reply"),
         }
     }
+    fn export_publication_call(
+        &self,
+        request: &ExportPublicationRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportPublicationReply> {
+        match self.call(Call::ExportPublication(Box::new(request.clone())), cancel)? {
+            Value::ExportPublication(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("wrong export publication reply"),
+        }
+    }
 }
 fn unit(v: Value) -> Result<()> {
     ensure!(matches!(v, Value::Unit), "wrong unit reply");
@@ -1797,6 +1819,9 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
             value.validate_for(request)?
         }
         (Call::ExportOriginal(request), Value::ExportOriginal(value)) => value.validate(request)?,
+        (Call::ExportPublication(request), Value::ExportPublication(value)) => {
+            value.validate(request)?
+        }
         (Call::ExportProfile(request), Value::ExportProfile(value)) => value.validate(request)?,
         (Call::Resume { restore_id, .. }, Value::Restore(Some(v))) => ensure!(
             &v.receipt.restore_id == restore_id && !v.jobs_held,
