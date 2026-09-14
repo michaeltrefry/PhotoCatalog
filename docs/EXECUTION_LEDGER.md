@@ -6,6 +6,40 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+Desktop source `197e06e` integrates reviewed ICC component `35f5a70e`; all
+14 files match. Nine focused tests passed, including actual F PID76821 reaped.
+Final component review PASS0.99 `9ec3d5de`; exact evidence is retained in
+`sc-22847-export-profile-final-OihbpM` and the compilefix native gate HYoIfN.
+The first compile failure and bounded reviewed corrections remain recorded.
+
+Integration gate `sc-22847-icc-integration-_ih3kc24` passed package formatting,
+a fresh release CLI build, actual managed startup refusal/same-pool retry,
+actual cold-render/warm-preview delivery, and the Tauri release backend check.
+Session17681 completed/reaped0; source_changed=[] on the exact source snapshot.
+This is local integration, not installation, publication, RSS qualification,
+managed-default selection or complete S12 acceptance. Shortcut23418 is read back;
+S12 remains In Progress. No RAID/photo/original reads or canonical migration.
+
+Production LM lacks a main dispatch/body and non-test application caller.
+Revised contract v3 e99abbf7 passed independent architecture review 575846ab
+(confidence0.91), resolving G/C physical ownership, accepted document/result
+limits, and retained failed-drain ownership. Implementation order v4 is:
+1. Multipart input/admitted result primitives.
+2. Owned supervisor lifetime and typed shared-pool failure.
+3. Common seven-operation executor and worker/Source roles.
+4. G/C authority bridge and application integration.
+
+Only batch1 is currently implemented, source frozen in
+`sc-22847-lm-worker-batch1-20260914T160953Z` (diff512b86df, six source files).
+Independent source review is pending. Its eight-test native gate owns the next
+serialized CPU2 lane conditional on PASS; source must remain frozen. Sol/high
+implements and independently reviews using separate agents, reusing context
+because new-agent thread capacity was exhausted. No further batch admitted yet.
+Earlier actual Source evidence used an LM thread substitute; that limitation
+remains until production worker integration and its tests pass.
+
+## Retained verified component history
+
 Current desktop source is `96d5fa7`, including C admission `d8bb236`, LM atomic
 projection `c609abf`, and FS9 directory preparation `96d5fa7`. The combined CLI,
 actual managed startup/render and Tauri backend gate passed; component
