@@ -439,6 +439,57 @@ fn decode_raw(bytes: &[u8], length: usize, digest: &str) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
+/// Saved cursor JSON has no legacy raw-byte ceiling. Managed callers reserve
+/// its actual borrowed length before the original String/serde path allocates.
+fn admitted_cursor(
+    row: &rusqlite::Row<'_>,
+    admit: &dyn Fn(usize) -> Result<()>,
+) -> Result<Option<String>> {
+    let value = row.get_ref(0)?;
+    if matches!(value, rusqlite::types::ValueRef::Null) {
+        return Ok(None);
+    }
+    let text = value.as_str()?;
+    admit(text.len())?;
+    Ok(Some(text.to_owned()))
+}
+
+fn pending_record(
+    row: &rusqlite::Row<'_>,
+    admit: &dyn Fn(usize) -> Result<()>,
+) -> Result<(i64, EvidenceRecord, String)> {
+    let sequence = row.get(0)?;
+    let compressed = row.get_ref(1)?.as_blob()?;
+    let length = evidence::size(row, 2)?;
+    ensure!(
+        length <= RECORD_LIMIT && compressed.len() <= RECORD_LIMIT + 32768,
+        "retained record size limit"
+    );
+    let digest = evidence::retained_identity(row, 3)?;
+    let next = row.get_ref(4)?.as_str()?;
+    admit(next.len())?;
+    // SQLite owns the compressed bytes through complete integrity/JSON decoding.
+    let record = decode(compressed, length, &digest)?;
+    Ok((sequence, record, next.to_owned()))
+}
+
+fn pending_field(
+    row: &rusqlite::Row<'_>,
+    record: &EvidenceRecord,
+) -> Result<(crate::lightroom::migration_source::ByteRef, String, u64)> {
+    let field = row.get_ref(0)?.as_str()?;
+    let evidence = evidence::retained_identity(row, 1)?;
+    let offset = evidence::unsigned(row, 2)?;
+    let Field::Bytes(reference) = record
+        .fields
+        .get(field)
+        .context("missing retained field descriptor")?
+    else {
+        anyhow::bail!("retained field is not external bytes");
+    };
+    Ok((reference.clone(), evidence, offset))
+}
+
 /// Resolve completed destination evidence to its retained authorized selection.
 pub(crate) fn selected_record(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
     selected_record_with(db, sequence, |raw, _| Ok(serde_json::from_slice(raw)?))
@@ -577,8 +628,13 @@ impl Catalog {
             blake3::hash(approval).to_hex().as_str() == source.seal().approval.document_blake3,
             "selection authorization differs"
         );
+        source.admit_retention(0)?;
+        ensure!(
+            crate::lightroom::migration_source::record_json::size(source.seal(), usize::MAX)?
+                <= RECORD_LIMIT,
+            "source seal size limit"
+        );
         let seal = serde_json::to_vec(source.seal())?;
-        ensure!(seal.len() <= RECORD_LIMIT, "source seal size limit");
         let id = source.binding_blake3();
         let _permit = self.writers.enter(Priority::Background)?;
         let tx = self
@@ -588,15 +644,18 @@ impl Catalog {
             "INSERT OR IGNORE INTO migration_retention(id,seal,approval) VALUES(?1,?2,?3)",
             params![id, seal, approval],
         )?;
-        let existing: (Vec<u8>, Vec<u8>) = tx.query_row(
+        let matches = tx.query_row(
             "SELECT seal,approval FROM migration_retention WHERE id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        ensure!(
-            existing.0 == seal && existing.1 == approval,
-            "retained selection identity differs"
-        );
+            |r| {
+                Ok((|| -> Result<bool> {
+                    let stored_seal = r.get_ref(0)?.as_blob()?;
+                    let stored_approval = r.get_ref(1)?.as_blob()?;
+                    Ok(stored_seal == seal && stored_approval == approval)
+                })())
+            },
+        )??;
+        ensure!(matches, "retained selection identity differs");
         let result = progress(&tx, id)?;
         tx.commit()?;
         Ok(result)
@@ -616,29 +675,22 @@ impl Catalog {
         &mut self,
         source: &dyn MigrationRead,
     ) -> Result<RetentionProgress> {
+        source.admit_retention(0)?;
         let id = source.binding_blake3();
         let before = progress(&self.db, id)?;
         if before.complete {
             return Ok(before);
         }
-        let pending:Option<(i64,Vec<u8>,usize,String,String)>=self.db.query_row(
+        let pending = self.db.query_row(
             "SELECT sequence,compressed,raw_length,digest,next_cursor FROM migration_retained_records WHERE input=?1 AND complete=0 ORDER BY sequence LIMIT 1",
-            [id],|r|Ok((r.get(0)?,r.get(1)?,evidence::size(r,2)?,r.get(3)?,r.get(4)?))).optional()?;
-        if let Some((sequence, compressed, length, digest, next)) = pending {
-            let record = decode(&compressed, length, &digest)?;
-            let field:Option<(String,String,u64)>=self.db.query_row(
+            [id], |r| Ok(pending_record(r, &|bytes| source.admit_retention(bytes)))).optional()?.transpose()?;
+        if let Some((sequence, record, next)) = pending {
+            let field = self.db.query_row(
                 "SELECT f.field,e.id,e.committed FROM migration_retained_fields f JOIN migration_evidence e ON e.id=f.evidence WHERE f.record=?1 AND e.complete=0 ORDER BY f.field LIMIT 1",
-                [sequence],|r|Ok((r.get(0)?,r.get(1)?,evidence::unsigned(r,2)?))).optional()?;
-            let prepared = if let Some((field, evidence, offset)) = field {
-                let Field::Bytes(reference) = record
-                    .fields
-                    .get(&field)
-                    .context("missing retained field descriptor")?
-                else {
-                    anyhow::bail!("retained field is not external bytes");
-                };
+                [sequence], |r| Ok(pending_field(r, &record))).optional()?.transpose()?;
+            let prepared = if let Some((reference, evidence, offset)) = field {
                 let bytes = source.read_chunk(
-                    reference,
+                    &reference,
                     offset,
                     evidence::CHUNK_BYTES.min(source.max_chunk_bytes()),
                 )?;
@@ -689,8 +741,8 @@ impl Catalog {
         let cursor: Option<String> = self.db.query_row(
             "SELECT cursor FROM migration_retention WHERE id=?1",
             [id],
-            |r| r.get(0),
-        )?;
+            |r| Ok(admitted_cursor(r, &|bytes| source.admit_retention(bytes))),
+        )??;
         let after: Option<Cursor> = cursor.as_deref().map(serde_json::from_str).transpose()?;
         // Amortize durable commits over ordinary metadata rows. Stop at the first
         // external field so there is at most one pending record, and never advance
@@ -772,13 +824,23 @@ impl Catalog {
             progress(&tx, id)? == before,
             "migration advanced concurrently; retry step"
         );
-        let current: Option<String> = tx.query_row(
+        let unchanged = tx.query_row(
             "SELECT cursor FROM migration_retention WHERE id=?1",
             [id],
-            |r| r.get(0),
-        )?;
+            |r| {
+                Ok((|| -> Result<bool> {
+                    let value = r.get_ref(0)?;
+                    let current = if matches!(value, rusqlite::types::ValueRef::Null) {
+                        None
+                    } else {
+                        Some(value.as_str()?)
+                    };
+                    Ok(current == cursor.as_deref())
+                })())
+            },
+        )??;
         ensure!(
-            current == cursor,
+            unchanged,
             "migration cursor advanced concurrently; retry step"
         );
         if staged.is_empty() {
@@ -886,3 +948,7 @@ mod capacity_tests;
 #[cfg(test)]
 #[path = "retention_query_tests.rs"]
 mod query_tests;
+
+#[cfg(test)]
+#[path = "retention_admission_tests.rs"]
+mod admission_tests;

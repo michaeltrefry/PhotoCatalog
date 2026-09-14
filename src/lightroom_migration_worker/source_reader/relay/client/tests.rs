@@ -621,3 +621,34 @@ fn operation_admission_retains_both_opening_roles_and_result_high_water() -> Res
     assert_eq!(client.operation_memory.lock().unwrap().producer, [30, 40]);
     Ok(())
 }
+
+#[test]
+fn core_phase_grants_add_to_source_owners_and_denial_keeps_high_water() -> Result<()> {
+    let f = fixture()?;
+    let baseline = f.budget.used();
+    f.client.admit_opening(Kind::Sql, 101)?;
+    f.client.admit_producer(Kind::Raw, 103)?;
+    f.client.admit_result(107, 109)?;
+    let source = 101 + 103 + 107 + 3 * 109;
+    assert_eq!(f.budget.used(), baseline + source);
+    f.client.admit_core(113)?;
+    f.client.admit_core(11)?;
+    assert_eq!(f.budget.used(), baseline + source + 113);
+    let available = f.budget.snapshot()?.available;
+    let denied = f.client.admit_core(114 + available).unwrap_err();
+    let limit = denied
+        .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+        .expect("structured core resource limit");
+    assert_eq!(limit.required, available + 1);
+    assert_eq!(limit.available, available);
+    assert_eq!(f.budget.used(), baseline + source + 113);
+    f.client.admit_result(127, 131)?;
+    assert_eq!(f.budget.used(), baseline + 101 + 103 + 127 + 3 * 131 + 113);
+    let pool = f.budget.clone();
+    drop(f);
+    assert_eq!(pool.used(), 0);
+    println!(
+        "CORE_PHASE_ADMISSION additive=true denied_before_growth=true retained_until_client_drop=true"
+    );
+    Ok(())
+}

@@ -638,6 +638,15 @@ fn stale_quiescence_early_reuse_and_denial_retain_source_charge() -> Result<()> 
 
 #[test]
 fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> Result<()> {
+    typed_source_consumer(false)
+}
+
+#[test]
+fn typed_source_retention_reserves_core_before_destination_mutation() -> Result<()> {
+    typed_source_consumer(true)
+}
+
+fn typed_source_consumer(retention: bool) -> Result<()> {
     use crate::lightroom::migration_source::{MigrationRead, ReadLimits, tests::Fixture};
     use crate::lightroom_migration_worker::{
         protocol::{ChildFrame, Publish, SourceListener},
@@ -653,9 +662,20 @@ fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> 
                 .map_err(|e| anyhow::anyhow!("typed relay fixture output: {e}"))
         }
     }
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    let approval = b"typed retention fixture authorization";
+    if retention {
+        fixture.seal.approval.document_blake3 = blake3::hash(approval).to_hex().to_string();
+    }
     let revision = fixture.revision().to_owned();
-    let budget = MemoryBudget::new(2 * 1024 * 1024 * 1024)?;
+    let core = if retention {
+        crate::lightroom_migration_worker::memory::core::retention(0)?
+    } else {
+        0
+    };
+    let limit =
+        crate::lightroom_migration_worker::memory::layout::add(2 * 1024 * 1024 * 1024, core)?;
+    let budget = MemoryBudget::new(limit)?;
     let mut caller = budget.reservation();
     caller.grow(17)?;
     let stop = Arc::new(Stop::default());
@@ -706,6 +726,45 @@ fn typed_source_opening_uses_g_pool_and_quiesces_after_public_result_moves() -> 
             "typed opening made no parent scope reservation"
         );
         let manifest = source.capture_manifest(&revision)?;
+        if retention {
+            let temp = tempfile::tempdir()?;
+            let mut catalog = crate::Catalog::open(temp.path().join("destination"))?;
+            let before = observed.snapshot()?;
+            let mut competition = observed.reservation();
+            ensure!(
+                before.available >= core,
+                "fixture pool lacks core allowance"
+            );
+            competition.grow(before.available - (core - 1))?;
+            let denied = catalog
+                .begin_migration_retention_reader(&source, approval)
+                .unwrap_err();
+            let details = denied
+                .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+                .context("expected core ResourceLimit before destination insert")?;
+            ensure!(details.required == core && details.available == core - 1);
+            ensure!(
+                catalog
+                    .migration_retention_progress(source.binding_blake3())
+                    .is_err()
+            );
+            drop(competition);
+            let begun = catalog.begin_migration_retention_reader(&source, approval)?;
+            ensure!(
+                observed.used() == before.used + core,
+                "core did not join Source pool"
+            );
+            let stepped = catalog.step_migration_retention_reader(&source)?;
+            ensure!(
+                stepped.records > begun.records,
+                "actual Source page was not retained"
+            );
+            println!(
+                "TYPED_CORE_RETENTION required={core} denied_available={} denied_before_insert=true retained_records={} source_child_actual=true lm_thread_substitute=true",
+                core - 1,
+                stepped.records,
+            );
+        }
         let result_admitted = observed.used();
         drop(source);
         let operation_retained = observed.used();

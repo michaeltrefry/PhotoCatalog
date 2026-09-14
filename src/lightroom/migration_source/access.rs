@@ -5,6 +5,14 @@ use super::*;
 use crate::lightroom::capture::Manifest;
 
 pub(crate) trait MigrationRead {
+    /// Resource admission for destination retention, before copying/parsing a
+    /// borrowed saved cursor. Legacy CLI readers keep their existing policy;
+    /// managed readers charge their parent-owned operation pool. This is local
+    /// coordination, not a new Source query or a data-format byte limit.
+    fn admit_retention(&self, _cursor_bytes: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn seal(&self) -> &InputSeal;
     fn binding_blake3(&self) -> &str;
     fn max_chunk_bytes(&self) -> usize;

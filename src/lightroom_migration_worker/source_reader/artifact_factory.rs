@@ -32,6 +32,9 @@ impl ArtifactFactory for RemoteArtifacts {
             !stop() && !self.health.failed(),
             "artifact source admission stopped"
         );
+        self.relay.admit_core(
+            crate::lightroom_migration_worker::memory::core::artifact_constructor(&request)?,
+        )?;
         // Destination SQL only: the historical manifest locator is not opened.
         let descriptor = catalog.migration_artifact_reader_descriptor(&request)?;
         let reader_epoch = format!("artifact-{}", self.next_epoch);

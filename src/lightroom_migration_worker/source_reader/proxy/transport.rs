@@ -17,6 +17,13 @@ impl From<Remote> for Transport {
     }
 }
 impl Transport {
+    pub(super) fn admit_core(&self, bytes: usize) -> Result<()> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::Managed(remote) => remote.admit_core(bytes),
+        }
+    }
+
     pub(super) fn admit_producer(&self, bytes: usize) -> Result<()> {
         match self {
             Self::Direct(_) => Ok(()),

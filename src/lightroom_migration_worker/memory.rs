@@ -1,6 +1,7 @@
 //! Checked requested-Rust-storage admission shared by one migration operation.
 //! A configured allowance is a resource decision, never a data-format ceiling.
 pub(crate) mod channels;
+pub(crate) mod core;
 pub(crate) mod layout;
 pub(crate) mod transport;
 

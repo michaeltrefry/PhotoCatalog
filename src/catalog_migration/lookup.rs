@@ -223,21 +223,19 @@ fn key_slot(field: &str) -> usize {
     }
 }
 fn authority(db: &Connection, input: &str, revision: &str) -> Result<()> {
-    let length: i64 = db.query_row(
-        "SELECT length(seal) FROM migration_retention WHERE id=?1",
-        [input],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        (0..=MAX_BYTES as i64).contains(&length),
-        "lookup seal bound"
-    );
-    let bytes: Vec<u8> = db.query_row(
+    let seal: InputSeal = db.query_row(
         "SELECT seal FROM migration_retention WHERE id=?1",
         [input],
-        |r| r.get(0),
-    )?;
-    let seal: InputSeal = serde_json::from_slice(&bytes)?;
+        |r| {
+            Ok((|| -> Result<InputSeal> {
+                let bytes = r.get_ref(0)?.as_blob()?;
+                ensure!(bytes.len() <= MAX_BYTES, "lookup seal bound");
+                // This saved-state API has no Source roster validation. Keep
+                // direct public serde rather than the Source-only projection.
+                Ok(serde_json::from_slice(bytes)?)
+            })())
+        },
+    )??;
     ensure!(
         seal.binding_blake3()? == input
             && seal.selected.iter().any(|s| s.revision == revision)
@@ -709,6 +707,60 @@ mod tests {
     use crate::lightroom::{migration_source::tests::Fixture, plan::Cell};
     use flate2::{Compression, write::ZlibEncoder};
     use std::{collections::BTreeMap, io::Write};
+
+    #[test]
+    fn lookup_authority_preserves_wide_saved_roster_and_borrows_bounded_blob() -> Result<()> {
+        let fixture = Fixture::new();
+        let mut seal = fixture.seal.clone();
+        seal.excluded_revisions = vec![String::new(); 16_385];
+        let revision = seal.selected[0].revision.clone();
+        let input = seal.binding_blake3()?;
+        let raw = serde_json::to_vec(&seal)?;
+        assert!(raw.len() < MAX_BYTES);
+        let temp = tempfile::tempdir()?;
+        let catalog = Catalog::open(temp.path().join("catalog"))?;
+        catalog.db.execute(
+            "INSERT INTO migration_retention(id,seal,approval) VALUES(?1,?2,x'')",
+            params![input, raw],
+        )?;
+        authority(&catalog.db, &input, &revision)?;
+        assert!(authority(&catalog.db, &input, "not selected").is_err());
+        let prefix = " ".repeat(MAX_BYTES - raw.len());
+        let mut exact = prefix.into_bytes();
+        exact.extend_from_slice(&raw);
+        catalog
+            .db
+            .execute("UPDATE migration_retention SET seal=?1", [&exact])?;
+        authority(&catalog.db, &input, &revision)?;
+        exact.push(b' ');
+        catalog
+            .db
+            .execute("UPDATE migration_retention SET seal=?1", [&exact])?;
+        assert!(
+            authority(&catalog.db, &input, &revision)
+                .unwrap_err()
+                .to_string()
+                .contains("lookup seal bound")
+        );
+        for value in [
+            rusqlite::types::Value::Text(String::from_utf8(raw.clone())?),
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Blob(b"{broken".to_vec()),
+        ] {
+            catalog
+                .db
+                .execute("UPDATE migration_retention SET seal=?1", [value])?;
+            assert!(authority(&catalog.db, &input, &revision).is_err());
+        }
+        catalog
+            .db
+            .execute("UPDATE migration_retention SET seal=?1", [&raw])?;
+        authority(&catalog.db, &input, &revision)?;
+        println!(
+            "LOOKUP_AUTHORITY_GRAMMAR excluded=16385 direct_serde=true exact_limit=true oversized_before_decode=true restored=true"
+        );
+        Ok(())
+    }
 
     struct TestCatalog {
         _temp: tempfile::TempDir,

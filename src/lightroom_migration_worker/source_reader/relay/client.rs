@@ -54,6 +54,7 @@ struct OperationMemory {
     transient: usize,
     opening: [usize; 2],
     producer: [usize; 2],
+    core: usize,
     phases: Reservation,
 }
 
@@ -65,7 +66,7 @@ impl OperationMemory {
                 add(opening[0], opening[1])?,
                 add(self.producer[0], self.producer[1])?,
             )?,
-            add(transient, mul(3, graph)?)?,
+            add(add(transient, mul(3, graph)?)?, self.core)?,
         )
     }
 }
@@ -101,6 +102,7 @@ impl Client {
                 transient: 0,
                 opening: [0; 2],
                 producer: [0; 2],
+                core: 0,
                 phases: operation_memory.reservation(),
             }),
             slots: Mutex::new([None, None]),
@@ -162,6 +164,26 @@ impl Client {
         let required = owner.required(owner.transient, owner.retained_graph, opening)?;
         owner.phases.ensure_at_least(required)?;
         owner.opening = opening;
+        Ok(())
+    }
+
+    /// Core-owned graphs are distinct from the three returned Source graphs.
+    /// The worker supplies a complete phase including its still-live caller
+    /// owners. A later smaller phase cannot release a retained Policy, Evidence
+    /// cache, descriptor or prepared packet owned by this operation.
+    pub(crate) fn admit_core(&self, bytes: usize) -> Result<()> {
+        self.check()?;
+        let mut owner = self
+            .operation_memory
+            .lock()
+            .map_err(|_| anyhow::anyhow!("migration operation phase admission poisoned"))?;
+        let maximum = owner.core.max(bytes);
+        let required = crate::lightroom_migration_worker::memory::layout::add(
+            owner.required(owner.transient, owner.retained_graph, owner.opening)?,
+            maximum - owner.core,
+        )?;
+        owner.phases.ensure_at_least(required)?;
+        owner.core = maximum;
         Ok(())
     }
 
@@ -471,6 +493,9 @@ pub(crate) struct Remote {
 impl Remote {
     pub(crate) fn admit_result(&self, transient: usize, graph: usize) -> Result<()> {
         self.client.admit_result(transient, graph)
+    }
+    pub(crate) fn admit_core(&self, bytes: usize) -> Result<()> {
+        self.client.admit_core(bytes)
     }
     pub(crate) fn admit_producer(&self, bytes: usize) -> Result<()> {
         self.client.admit_producer(self.slot.kind, bytes)

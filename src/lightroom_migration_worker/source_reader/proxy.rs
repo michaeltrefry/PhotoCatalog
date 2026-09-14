@@ -534,6 +534,12 @@ impl SqlReader {
     }
 }
 impl MigrationRead for SqlReader {
+    fn admit_retention(&self, cursor_bytes: usize) -> Result<()> {
+        self.session.borrow().process.admit_core(
+            crate::lightroom_migration_worker::memory::core::retention(cursor_bytes)?,
+        )
+    }
+
     fn seal(&self) -> &InputSeal {
         &self.seal
     }
