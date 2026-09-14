@@ -2,7 +2,39 @@
 
 Source of truth: https://app.shortcut.com/trefry/epic/22835
 
-## Current delivery — 2026-09-13
+## Current delivery — 2026-09-14
+
+S12 sc-22847 is In Progress; S13 sc-22848 is unstarted. Draft PR16 at
+`f5917e19c01f648ed5af61e97f6a1b5bd7fa5de2` passed all four CI34804834306 jobs
+and all three installer/archive/payload audits. Root verified 28 artifact hashes
+in `sc-22847-ci-34804834306-z9sy0qyl/receipt.json`, SHA256
+`2de9984ef36b72e6ab8ca0bf8afce306ed23ff5ca12f44372e0785995eee239d`.
+PR description and exact head/body readback match. This qualifies the published
+FS7 checkpoint and packaging evidence, not full desktop interaction. The Mac
+observer binary was not uploaded; its reported hash is not independently verified.
+
+Lightroom admission prerequisites remain isolated from the desktop PR:
+
+- `bc759a8`: four fixed-layout allocation probes passed.
+- `4c36a57`: two bounded error-formatting regressions and formatting passed.
+- `af6b7b2`: saved artifact descriptors and IDs are validated on borrowed SQLite
+  values before copying; existence-only reads use EXISTS. Four tests and formatting
+  passed, including malformed-row pending/recheck, retry, offline raw custody and
+  authority separation. Root verified 122 committed blobs and nine runtime
+  artifacts. Receipt `sc-22847-saved-artifact-guards-giq85t1c/gate-initial-1789361046416382000/receipt.json`
+  SHA256 `46070894fd747ccfcfb80c24d68eb93e3e9b9b04066b6cbfb2d0c13ad529b213`;
+  independent final review SHA256
+  `c1448f7257a327767d10800bd84f1b86a5595b7e5fbc91d8db9e02c4b8f02747` passed.
+
+FS8 native/stage/prepared design v6 passed independent review; actual child
+ownership, header/full decode and shared scheduler implementation is in progress.
+Complete Source/core aggregate admission and migration wiring remain active,
+including Windows path preparation before original Source admission. Remaining
+filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
+the full tracked scope. Current local tests use synthetic files without RAID/GPU.
+
+## Earlier checkpoints — preserved history
+
 
 FS7 is independently accepted and integrated as
 `f13ddb30bbb6eedf3158ac00a9e718f2870c49a3` from author
