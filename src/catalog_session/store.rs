@@ -181,6 +181,7 @@ pub struct Reply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
+    pub kind: StatusKind,
     pub root: RootCapability,
     pub operation: crate::application::U64,
     pub selected: Option<LeaseId>,
@@ -189,6 +190,7 @@ pub struct Query {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusQuery {
+    pub kind: StatusKind,
     pub epoch: LeaseId,
     pub token: LeaseId,
     pub session: LeaseId,
@@ -197,9 +199,17 @@ pub struct StatusQuery {
     pub operation: crate::application::U64,
     pub selected: Option<LeaseId>,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusKind {
+    #[default]
+    Locks,
+    Objects,
+}
 impl From<&Query> for StatusQuery {
     fn from(q: &Query) -> Self {
         Self {
+            kind: q.kind,
             epoch: q.root.epoch.clone(),
             token: q.root.token.clone(),
             session: q.root.session.clone(),
@@ -212,6 +222,10 @@ impl From<&Query> for StatusQuery {
 }
 impl StatusQuery {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.kind != StatusKind::Objects || self.selected.is_none(),
+            "object status cannot select a root"
+        );
         ensure!(
             self.operation.0 > 0,
             "preview status operation sequence is zero"
@@ -240,6 +254,8 @@ pub enum Stage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Status {
+    pub kind: StatusKind,
+    pub object: Option<crate::catalog_session::preview_io::Progress>,
     pub operation: crate::application::U64,
     pub group: Option<LeaseId>,
     pub stage: Option<Stage>,
@@ -337,6 +353,17 @@ impl super::ManagedSession {
 
 impl Status {
     pub fn validate(&self, query: &StatusQuery) -> Result<()> {
+        ensure!(self.kind == query.kind, "preview status family mismatch");
+        ensure!(
+            self.kind != StatusKind::Locks || self.object.is_none(),
+            "object status in lock snapshot"
+        );
+        if self.kind == StatusKind::Objects {
+            ensure!(self.selected.is_none(), "selected path in object status");
+        }
+        if let Some(object) = &self.object {
+            object.validate()?;
+        }
         ensure!(
             self.operation == query.operation,
             "preview status operation mismatch"

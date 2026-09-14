@@ -81,8 +81,8 @@ pub(crate) fn run(
         thumbnail_root: base.join("custody-thumb"),
         large_root: base.join("custody-large"),
         layout: crate::preview::Layout::Flat,
-        thumbnail_bytes: 1024,
-        large_bytes: 1024,
+        thumbnail_bytes: 8 * 1024 * 1024,
+        large_bytes: 8 * 1024 * 1024,
     };
     let origin = if session.bootstrap.manifest.created {
         crate::preview::ManifestOrigin::CreatedByAdmission
@@ -94,14 +94,116 @@ pub(crate) fn run(
         config.clone(),
         session.manifest()?,
         origin,
-        files,
+        files.clone(),
     )?;
+    // Cache bytes are deliberately larger than either complete IPC envelope.
+    // This fixture exercises regular-file custody only: no decode or native child.
+    let cache_key = |generation| crate::preview::PreviewKey {
+        image_pixel_generation: None,
+        asset_id: "custody-asset".into(),
+        variant_id: "master".into(),
+        generation,
+        fingerprint: "a".repeat(64),
+        edit_revision: generation,
+        renderer_version: "custody-test-1".into(),
+        preparation_version: crate::preview::PREPARATION_VERSION.into(),
+        tier: crate::preview::Tier::Thumbnail,
+        edge: 256,
+        encoding: crate::preview::CodecSettings {
+            codec: crate::preview::Codec::Jpeg,
+            quality: 65,
+        },
+    };
+    let first = cache_key(1);
+    let bytes = vec![0x93; 1024 * 1024 + 7];
+    preview.desire(&first, || Ok(true))?;
+    ensure!(
+        preview.publish(&first, &bytes, |attach| attach())?
+            == crate::preview::Publication::Attached,
+        "managed publication did not attach"
+    );
+    ensure!(
+        preview
+            .read_limited(&first, false, bytes.len() as u64)?
+            .context("managed cache miss")?
+            .bytes
+            == bytes,
+        "managed raw byte transport changed bytes"
+    );
+    ensure!(
+        preview
+            .read_limited(&first, false, 1)
+            .unwrap_err()
+            .is::<crate::preview::EncodedBudgetExceeded>(),
+        "cache budget admitted full object"
+    );
+    let current = cache_key(2);
+    preview.desire(&current, || Ok(true))?;
+    ensure!(
+        preview.read(&current, false)?.is_none(),
+        "stale cache exposed without fallback"
+    );
+    ensure!(
+        preview
+            .read(&current, true)?
+            .context("missing stale fallback")?
+            .stale,
+        "thumbnail fallback lost stale tag"
+    );
+    ensure!(
+        preview.publish(&current, &bytes, |_| Ok(crate::preview::Publication::Stale))?
+            == crate::preview::Publication::Stale,
+        "stale authorizer attached"
+    );
+    ensure!(
+        preview
+            .read(&current, true)?
+            .context("stale authorizer removed old current")?
+            .bytes
+            == bytes,
+        "stale compensation changed old bytes"
+    );
+    let error = preview.publish(&current, &bytes, |attach| {
+        attach()?;
+        anyhow::bail!("injected catalog commit failure after attachment")
+    });
+    ensure!(
+        error.is_err() && preview.current_is_intact(&current)?,
+        "post-attachment failure removed current bytes"
+    );
+    preview.recover(128)?;
+    ensure!(
+        preview
+            .read(&current, false)?
+            .context("post-attachment cache miss")?
+            .bytes
+            == bytes,
+        "recovery changed attached bytes"
+    );
+    let status = files.cache_status()?;
+    ensure!(
+        status.kind == store::StatusKind::Objects && status.object.is_some(),
+        "object receipt unavailable independently of locks"
+    );
     let relocated = base.join("custody-relocated");
     preview.begin_relocation(crate::preview::Tier::Thumbnail, &relocated, &[])?;
     while !preview
-        .relocation_step(crate::preview::Tier::Thumbnail, 1, 1024)?
+        .relocation_step(crate::preview::Tier::Thumbnail, 1, 2 * 1024 * 1024)?
         .complete
     {}
+    ensure!(
+        preview
+            .read(&current, false)?
+            .context("relocated cache miss")?
+            .bytes
+            == bytes,
+        "relocation changed immutable cache bytes"
+    );
+    preview.invalidate(&current)?;
+    ensure!(
+        preview.read(&current, false)?.is_none(),
+        "managed eviction retained current cache"
+    );
     drop(preview);
     let tier_locked = |path: &std::path::Path| -> Result<bool> {
         let file = std::fs::OpenOptions::new()

@@ -236,34 +236,48 @@ impl PreviewStore {
         // can be retried only by this same manifest/tier/layout. No data objects
         // or foreign entries may be adopted. The marker lock below authenticates
         // ownership before an incomplete relocation marker is rewritten.
-        let preflight = (|| -> Result<()> {
-            if destination.exists() {
-                for entry in fs::read_dir(&destination)? {
-                    let entry = entry?;
+        let preflight = if let (Some(files), Some(reservation)) =
+            (&self.managed_files, &reservation)
+        {
+            files
+                .cache_call(
+                    crate::catalog_session::preview_io::Action::InspectRelocation {
+                        target: reservation.token.clone(),
+                    },
+                )
+                .map(|_| ())
+        } else {
+            (|| -> Result<()> {
+                if destination.exists() {
+                    for entry in fs::read_dir(&destination)? {
+                        let entry = entry?;
+                        ensure!(
+                            entry.file_type()?.is_file()
+                                && matches!(
+                                    entry.file_name().to_str(),
+                                    Some(
+                                        ".photocatalog-preview-owner" | ".photocatalog-relocation"
+                                    )
+                                ),
+                            "relocation destination contains non-admission files"
+                        );
+                    }
+                }
+                let relocation_marker = destination.join(".photocatalog-relocation");
+                ensure!(
+                    !relocation_marker.exists()
+                        || destination.join(".photocatalog-preview-owner").exists(),
+                    "relocation marker has no owning manifest"
+                );
+                if relocation_marker.exists() {
                     ensure!(
-                        entry.file_type()?.is_file()
-                            && matches!(
-                                entry.file_name().to_str(),
-                                Some(".photocatalog-preview-owner" | ".photocatalog-relocation")
-                            ),
-                        "relocation destination contains non-admission files"
+                        fs::metadata(destination.join(".photocatalog-preview-owner"))?.len() > 0,
+                        "relocation admission has no recorded owner identity"
                     );
                 }
-            }
-            let relocation_marker = destination.join(".photocatalog-relocation");
-            ensure!(
-                !relocation_marker.exists()
-                    || destination.join(".photocatalog-preview-owner").exists(),
-                "relocation marker has no owning manifest"
-            );
-            if relocation_marker.exists() {
-                ensure!(
-                    fs::metadata(destination.join(".photocatalog-preview-owner"))?.len() > 0,
-                    "relocation admission has no recorded owner identity"
-                );
-            }
-            Ok(())
-        })();
+                Ok(())
+            })()
+        };
         if let Err(error) = preflight {
             if let (Some(files), Some(reservation)) = (&self.managed_files, &reservation) {
                 files
@@ -284,31 +298,43 @@ impl PreviewStore {
                     self.config.layout,
                 )?)
             };
-        let relocation_marker = destination.join(".photocatalog-relocation");
-        let id = if relocation_marker.exists() {
-            ensure!(
-                fs::metadata(&relocation_marker)?.len() <= 36,
-                "invalid relocation admission marker"
-            );
-            let mut bytes = [0; 37];
-            let count = File::open(&relocation_marker)?.read(&mut bytes)?;
-            std::str::from_utf8(&bytes[..count])
-                .ok()
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .unwrap_or_else(uuid::Uuid::new_v4)
-                .to_string()
+        let id = if let (Some(files), Some(reservation)) = (&self.managed_files, &reservation) {
+            match files.cache_call(
+                crate::catalog_session::preview_io::Action::AdmitRelocation {
+                    target: reservation.token.clone(),
+                },
+            )? {
+                crate::catalog_session::preview_io::Value::Relocation(id) => id,
+                _ => bail!("unexpected relocation marker receipt"),
+            }
         } else {
-            uuid::Uuid::new_v4().to_string()
+            let relocation_marker = destination.join(".photocatalog-relocation");
+            let id = if relocation_marker.exists() {
+                ensure!(
+                    fs::metadata(&relocation_marker)?.len() <= 36,
+                    "invalid relocation admission marker"
+                );
+                let mut bytes = [0; 37];
+                let count = File::open(&relocation_marker)?.read(&mut bytes)?;
+                std::str::from_utf8(&bytes[..count])
+                    .ok()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .unwrap_or_else(uuid::Uuid::new_v4)
+                    .to_string()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            let mut marker = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(relocation_marker)?;
+            marker.write_all(id.as_bytes())?;
+            marker.sync_all()?;
+            #[cfg(unix)]
+            File::open(&destination)?.sync_all()?;
+            id
         };
-        let mut marker = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(relocation_marker)?;
-        marker.write_all(id.as_bytes())?;
-        marker.sync_all()?;
-        #[cfg(unix)]
-        File::open(&destination)?.sync_all()?;
         after_markers()?;
         self.db.execute(
             "INSERT INTO relocations VALUES(?1,?2,?3,?4,'copy','')",
@@ -392,18 +418,27 @@ impl PreviewStore {
                 }
             }
         }
-        let mut marker_file = File::open(target.join(".photocatalog-relocation"))?;
-        ensure!(
-            id.len() <= 128 && marker_file.metadata()?.len() == id.len() as u64,
-            "relocation marker length"
-        );
-        let mut marker = [0u8; 128];
-        marker_file.read_exact(&mut marker[..id.len()])?;
-        let mut extra = [0];
-        ensure!(
-            &marker[..id.len()] == id.as_bytes() && marker_file.read(&mut extra)? == 0,
-            "relocation destination ownership changed"
-        );
+        if let Some(files) = &self.managed_files {
+            files.cache_call(
+                crate::catalog_session::preview_io::Action::CheckRelocation {
+                    target: files.cache_root(&target)?,
+                    id: id.clone(),
+                },
+            )?;
+        } else {
+            let mut marker_file = File::open(target.join(".photocatalog-relocation"))?;
+            ensure!(
+                id.len() <= 128 && marker_file.metadata()?.len() == id.len() as u64,
+                "relocation marker length"
+            );
+            let mut marker = [0u8; 128];
+            marker_file.read_exact(&mut marker[..id.len()])?;
+            let mut extra = [0];
+            ensure!(
+                &marker[..id.len()] == id.as_bytes() && marker_file.read(&mut extra)? == 0,
+                "relocation destination ownership changed"
+            );
+        }
         let rows=self.db.prepare("SELECT key,bytes,checksum FROM objects WHERE tier=?1 AND status='ready' AND key>?2 ORDER BY key LIMIT ?3")?.query_map(params![tier.name(),cursor,limit as i64],|r|Ok((r.get::<_,String>(0)?,unsigned(r,1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut progress = RelocationProgress {
             tier,
@@ -420,60 +455,77 @@ impl PreviewStore {
                 );
                 break;
             }
-            let old = object_path(&source, self.config.layout, key)?;
-            let new = object_path(&target, self.config.layout, key)?;
-            if phase == "copy" {
-                if new.exists() {
-                    verify(&new, *length, checksum)?;
-                } else {
-                    ensure_destination_parent(&target, self.config.layout, key)?;
-                    let temporary = new.with_extension("relocation-pending");
-                    if temporary.exists() {
-                        ensure!(
-                            fs::symlink_metadata(&temporary)?.file_type().is_file(),
-                            "invalid relocation temporary file"
-                        );
-                        fs::remove_file(&temporary)?;
-                    }
-                    // This deterministic path belongs to the marker-protected job;
-                    // restart replaces only its own incomplete copy.
-                    let mut output = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&temporary)?;
-                    let mut input = File::open(&old)?;
-                    let mut hash = blake3::Hasher::new();
-                    let mut buffer = [0u8; 64 * 1024];
-                    let mut copied = 0;
-                    loop {
-                        let n = input.read(&mut buffer)?;
-                        if n == 0 {
-                            break;
-                        }
-                        copied += n as u64;
-                        ensure!(copied <= *length, "relocation source grew");
-                        output.write_all(&buffer[..n])?;
-                        hash.update(&buffer[..n]);
-                    }
-                    ensure!(
-                        copied == *length && hash.finalize().to_hex().as_str() == checksum,
-                        "relocation source checksum mismatch"
-                    );
-                    output.sync_all()?;
-                    drop(output);
-                    fs::hard_link(&temporary, &new)
-                        .context("publish relocation copy without replacing an existing file")?;
-                    fs::remove_file(&temporary)?;
-                    #[cfg(unix)]
-                    File::open(new.parent().unwrap())?.sync_all()?;
-                }
+            if let Some(files) = &self.managed_files {
+                ensure!(
+                    phase == "copy" || phase == "cleanup",
+                    "unknown relocation phase"
+                );
+                files.cache_call(crate::catalog_session::preview_io::Action::Relocate {
+                    source: files.cache_root(&source)?,
+                    target: files.cache_root(&target)?,
+                    id: id.clone(),
+                    key: key.clone(),
+                    bytes: crate::application::U64(*length),
+                    checksum: checksum.clone(),
+                    cleanup: phase == "cleanup",
+                })?;
             } else {
-                ensure!(phase == "cleanup", "unknown relocation phase");
-                // The authoritative copy is rechecked before removing the old one.
-                verify(&new, *length, checksum)?;
-                if old.exists() {
-                    verify(&old, *length, checksum)?;
-                    fs::remove_file(&old)?;
+                let old = object_path(&source, self.config.layout, key)?;
+                let new = object_path(&target, self.config.layout, key)?;
+                if phase == "copy" {
+                    if new.exists() {
+                        verify(&new, *length, checksum)?;
+                    } else {
+                        ensure_destination_parent(&target, self.config.layout, key)?;
+                        let temporary = new.with_extension("relocation-pending");
+                        if temporary.exists() {
+                            ensure!(
+                                fs::symlink_metadata(&temporary)?.file_type().is_file(),
+                                "invalid relocation temporary file"
+                            );
+                            fs::remove_file(&temporary)?;
+                        }
+                        // This deterministic path belongs to the marker-protected job;
+                        // restart replaces only its own incomplete copy.
+                        let mut output = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&temporary)?;
+                        let mut input = File::open(&old)?;
+                        let mut hash = blake3::Hasher::new();
+                        let mut buffer = [0u8; 64 * 1024];
+                        let mut copied = 0;
+                        loop {
+                            let n = input.read(&mut buffer)?;
+                            if n == 0 {
+                                break;
+                            }
+                            copied += n as u64;
+                            ensure!(copied <= *length, "relocation source grew");
+                            output.write_all(&buffer[..n])?;
+                            hash.update(&buffer[..n]);
+                        }
+                        ensure!(
+                            copied == *length && hash.finalize().to_hex().as_str() == checksum,
+                            "relocation source checksum mismatch"
+                        );
+                        output.sync_all()?;
+                        drop(output);
+                        fs::hard_link(&temporary, &new).context(
+                            "publish relocation copy without replacing an existing file",
+                        )?;
+                        fs::remove_file(&temporary)?;
+                        #[cfg(unix)]
+                        File::open(new.parent().unwrap())?.sync_all()?;
+                    }
+                } else {
+                    ensure!(phase == "cleanup", "unknown relocation phase");
+                    // The authoritative copy is rechecked before removing the old one.
+                    verify(&new, *length, checksum)?;
+                    if old.exists() {
+                        verify(&old, *length, checksum)?;
+                        fs::remove_file(&old)?;
+                    }
                 }
             }
             self.db.execute(

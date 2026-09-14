@@ -44,6 +44,7 @@ fn request(root: &RootCapability, action: store::Action) -> store::Request {
 }
 fn query(root: &RootCapability) -> store::StatusQuery {
     store::StatusQuery::from(&store::Query {
+        kind: crate::catalog_session::store::StatusKind::Locks,
         root: root.clone(),
         operation: U64(u64::MAX),
         selected: None,
@@ -51,6 +52,8 @@ fn query(root: &RootCapability) -> store::StatusQuery {
 }
 fn status(query: &store::StatusQuery) -> store::Status {
     store::Status {
+        kind: crate::catalog_session::store::StatusKind::Locks,
+        object: None,
         operation: query.operation,
         group: None,
         stage: None,
@@ -338,5 +341,133 @@ fn delivered_failure_categories_survive_relay_even_after_owner_uncertainty() -> 
     let fault = Fault::from_error(store::ResourceLimit("local admission limit").into(), false);
     assert_eq!(fault.kind, FailureKind::ResourceLimit);
     assert!(!fault.unknown);
+    Ok(())
+}
+
+#[test]
+fn cache_binary_payload_uses_raw_trailer_and_exact_relay_binding() -> Result<()> {
+    use crate::catalog_session::preview_io as io;
+    let (binding, root) = authority();
+    let bytes = vec![0xfe; io::CHUNK_BYTES];
+    let request = io::Request {
+        root,
+        group: LeaseId::new(),
+        operation: U64(3),
+        step: U64(1),
+        action: io::Action::Write {
+            offset: U64(0),
+            checksum: blake3::hash(&bytes).to_hex().to_string(),
+            bytes: bytes.clone(),
+        },
+    };
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Call {
+            id: U64(1),
+            call: Call::PreviewIo(Box::new(request.clone())),
+        },
+    };
+    let encoded = encode_packet(&packet, BYTES)?;
+    assert!(encoded.starts_with(b"PCIO"));
+    assert!(encoded.len() < 2 * io::CHUNK_BYTES);
+    let Body::Call {
+        call: Call::PreviewIo(actual),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        unreachable!()
+    };
+    actual.validate()?;
+    assert_eq!(*actual, request);
+    let mut altered = encoded.clone();
+    *altered.last_mut().unwrap() ^= 1;
+    let Body::Call { call, .. } = decode(&binding, &altered, Lane::Data)? else {
+        unreachable!()
+    };
+    assert!(call.validate().is_err());
+    assert!(decode(&binding, &encoded[..7], Lane::Data).is_err());
+    let mut output = Output::default();
+    output.push(&binding, packet.body)?;
+    let mut object_query = query(&request.root);
+    object_query.kind = store::StatusKind::Objects;
+    let mut object_status = status(&object_query);
+    object_status.kind = store::StatusKind::Objects;
+    object_status.selected = None;
+    object_status.object = Some(io::Progress {
+        step: U64(1),
+        offset: U64(0),
+        bytes: U64(io::CHUNK_BYTES as u64),
+        receiving: true,
+        unresolved: false,
+        failure: None,
+    });
+    object_status.validate(&object_query)?;
+    output.push(
+        &binding,
+        Body::StoreReply {
+            id: U64(1),
+            value: Ok(object_status),
+        },
+    )?;
+    assert!(output.next(Lane::Store).is_some());
+    assert!(output.next(Lane::Data).is_some());
+    Ok(())
+}
+#[test]
+fn cache_failure_receipt_survives_relay_but_transport_unknown_has_no_authority() -> Result<()> {
+    use crate::catalog_session::preview_io as io;
+    let (binding, root) = authority();
+    let request = io::Request {
+        root,
+        group: LeaseId::new(),
+        operation: U64(12),
+        step: U64(3),
+        action: io::Action::Finish,
+    };
+    let mut failure = Failure::new(FailureKind::Unknown, "recorded post-effect failure");
+    failure.object_receipt = Some(io::FailureReceipt {
+        operation: request.operation,
+        step: request.step,
+        request_digest: request.digest()?,
+    });
+    let fault = Fault::from_error(failure.into(), true);
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Reply {
+            id: U64(9),
+            outcome: Err(fault),
+        },
+    };
+    let bytes = encode_packet(&packet, BYTES)?;
+    let Body::Reply {
+        outcome: Err(fault),
+        ..
+    } = decode(&binding, &bytes, Lane::Data)?
+    else {
+        unreachable!()
+    };
+    fault.validate()?;
+    let error = fault.into_error();
+    let receipt = error
+        .downcast_ref::<Failure>()
+        .unwrap()
+        .object_receipt
+        .unwrap();
+    assert!(receipt.matches(&request)?);
+    let mut changed = request.clone();
+    changed.step = U64(4);
+    assert!(!receipt.matches(&changed)?);
+    let error = Fault::new("lost F transport", true).into_error();
+    assert!(
+        error
+            .downcast_ref::<Failure>()
+            .unwrap()
+            .object_receipt
+            .is_none()
+    );
+    let old: Fault = serde_json::from_str(
+        r#"{"message":"old transport error","unknown":true,"kind":"unknown"}"#,
+    )?;
+    assert!(old.object_receipt.is_none());
     Ok(())
 }

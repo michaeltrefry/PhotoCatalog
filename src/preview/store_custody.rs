@@ -10,6 +10,8 @@ pub(crate) struct ManagedFiles {
     cancel: Arc<AtomicBool>,
     group: Mutex<Option<wire::Acquired>>,
     pending: Mutex<Calls>,
+    objects: Mutex<object_io::Calls>,
+    object_operation: std::sync::atomic::AtomicU64,
 }
 struct Calls {
     next: u64,
@@ -46,6 +48,8 @@ impl ManagedFiles {
             manifest,
             cancel,
             group: Mutex::new(None),
+            objects: Mutex::new(object_io::Calls::default()),
+            object_operation: std::sync::atomic::AtomicU64::new(0),
             pending: Mutex::new(Calls {
                 next: 1,
                 pending: None,
@@ -153,6 +157,45 @@ impl ManagedFiles {
     }
 }
 impl AdmittedStoreFiles for ManagedFiles {
+    #[cfg(test)]
+    fn cache_status(&self) -> Result<crate::catalog_session::store::Status> {
+        self.filesystem
+            .preview_store_status(&crate::catalog_session::store::Query {
+                kind: crate::catalog_session::store::StatusKind::Objects,
+                root: self.root.clone(),
+                operation: crate::application::U64(
+                    self.object_operation
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+                selected: None,
+            })
+    }
+
+    fn cache_root(&self, path: &Path) -> Result<crate::catalog_session::LeaseId> {
+        self.object_root(path)
+    }
+    fn cache_call(
+        &self,
+        action: crate::catalog_session::preview_io::Action,
+    ) -> Result<crate::catalog_session::preview_io::Value> {
+        self.object_call(action)
+    }
+    fn cache_read(
+        &self,
+        expected: crate::catalog_session::preview_io::Expected,
+        allowance: u64,
+    ) -> Result<(crate::catalog_session::preview_io::Integrity, Vec<u8>)> {
+        self.object_read(expected, allowance)
+    }
+    fn cache_write(
+        &self,
+        expected: crate::catalog_session::preview_io::Expected,
+        temporary: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.object_write(expected, temporary, bytes)
+    }
+
     fn lock_tiers(&self, config: &StoreConfig, identity: &str) -> Result<Arc<dyn Send + Sync>> {
         self.admit(config, identity, None)
     }
@@ -260,6 +303,18 @@ pub(super) fn normalized(path: &Path, role: &str) -> Result<PathBuf> {
     wire::path(&crate::storage_volume::NativePath::from_path(&resolved))
         .with_context(|| format!("preview {role} path admission"))?;
     Ok(resolved)
+}
+pub(super) fn object_text<'a>(row: &'a rusqlite::Row<'_>, column: usize) -> Result<&'a str> {
+    let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(column)? else {
+        bail!("cache object metadata is not TEXT")
+    };
+    ensure!(
+        bytes.len() <= crate::catalog_session::ENVELOPE_BYTES,
+        wire::ResourceLimit(
+            "Saved cache object metadata exceeds the 1 MiB admission; no value was materialized or filesystem effect performed"
+        )
+    );
+    Ok(std::str::from_utf8(bytes)?)
 }
 pub(super) fn identity(db: &Connection, layout: Layout) -> Result<String> {
     let mut statement = db.prepare("SELECT value FROM store_identity WHERE id=1")?;
@@ -598,3 +653,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[path = "store_io.rs"]
+mod object_io;

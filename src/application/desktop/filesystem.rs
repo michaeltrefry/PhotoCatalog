@@ -52,18 +52,21 @@ pub(super) enum Call {
     },
     Release(RootCapability),
     PreviewStore(Box<store::Request>),
+    PreviewIo(Box<crate::catalog_session::preview_io::Request>),
     ReadPreviewConfiguration(NativePath),
 }
 impl Call {
     fn cleanup(&self) -> bool {
         matches!(self, Self::Abandon { .. } | Self::Release(_))
             || matches!(self, Self::PreviewStore(request) if request.is_cleanup())
+            || matches!(self, Self::PreviewIo(request) if request.cleanup())
     }
     fn cancellable(&self) -> bool {
         matches!(
             self,
             Self::Prepare(_) | Self::Confirm(_) | Self::ReadPreviewConfiguration(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
+            || matches!(self, Self::PreviewIo(request) if !request.cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -82,6 +85,7 @@ impl Call {
                 Ok(())
             }
             Self::PreviewStore(request) => request.validate(),
+            Self::PreviewIo(request) => request.validate(),
             Self::ReadPreviewConfiguration(path) => store::path(path),
             _ => Ok(()),
         }
@@ -94,12 +98,15 @@ pub(super) enum Value {
     Confirmed(SqlAdmissionConfirmed),
     Restore(Option<RestoreStatus>),
     PreviewStore(store::Reply),
+    PreviewIo(crate::catalog_session::preview_io::Reply),
     Configuration(Vec<u8>),
     Unit,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Fault {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object_receipt: Option<crate::catalog_session::preview_io::FailureReceipt>,
     message: String,
     unknown: bool,
     kind: FailureKind,
@@ -113,6 +120,7 @@ impl Fault {
         };
         let failure = Failure::new(kind, message);
         Self {
+            object_receipt: None,
             message: failure.message,
             unknown,
             kind,
@@ -130,8 +138,12 @@ impl Fault {
         };
         // Preserve delivered typed failures even if the F status changes after
         // publication. A terminal ResourceLimit is not transport uncertainty.
+        let object_receipt = error
+            .downcast_ref::<Failure>()
+            .and_then(|f| f.object_receipt);
         let failure = Failure::new(kind, error);
         Self {
+            object_receipt,
             message: failure.message,
             unknown: kind == FailureKind::Unknown,
             kind,
@@ -142,10 +154,14 @@ impl Fault {
             self.message.len() <= 4096 && self.unknown == (self.kind == FailureKind::Unknown),
             "relay failure bounds/category mismatch"
         );
+        if let Some(receipt) = &self.object_receipt {
+            receipt.validate()?;
+        }
         Ok(())
     }
     fn into_error(self) -> anyhow::Error {
         anyhow::Error::new(Failure {
+            object_receipt: self.object_receipt,
             kind: self.kind,
             message: self.message,
         })
@@ -309,7 +325,7 @@ impl Output {
             _ => (9, 0),
         };
         let control = class.0 < 7;
-        let bytes = Arc::new(encode(
+        let bytes = Arc::new(encode_packet(
             &Packet {
                 binding: binding.clone(),
                 body,
@@ -359,6 +375,21 @@ impl Output {
         Some(Out { lane, bytes })
     }
 }
+fn encode_packet(packet: &Packet, cap: usize) -> Result<Vec<u8>> {
+    let binary = match &packet.body {
+        Body::Call {
+            call: Call::PreviewIo(r),
+            ..
+        } => r.binary(),
+        Body::Reply {
+            outcome: Ok(Value::PreviewIo(r)),
+            ..
+        } => r.binary(),
+        _ => return encode(packet, cap),
+    };
+    crate::catalog_session::preview_io::pack(packet, binary, cap)
+}
+
 fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
     ensure!(
         bytes.len()
@@ -369,7 +400,19 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
             },
         "relay input byte admission"
     );
-    let packet: Packet = serde_json::from_slice(bytes)?;
+    let (mut packet, binary): (Packet, _) =
+        crate::catalog_session::preview_io::unpack(bytes, BYTES)?;
+    match &mut packet.body {
+        Body::Call {
+            call: Call::PreviewIo(r),
+            ..
+        } => r.set_binary(binary)?,
+        Body::Reply {
+            outcome: Ok(Value::PreviewIo(r)),
+            ..
+        } => r.set_binary(binary)?,
+        _ => ensure!(binary.is_empty(), "unexpected relay binary trailer"),
+    }
     ensure!(&packet.binding == binding, "relay nonce/epoch mismatch");
     let actual = match packet.body {
         Body::Control(_) => Lane::Control,
@@ -562,6 +605,12 @@ impl Parent {
                     ensure!(
                         request.root.epoch == self.binding.epoch,
                         "preview store epoch mismatch"
+                    );
+                }
+                if let Call::PreviewIo(request) = &call {
+                    ensure!(
+                        request.root.epoch == self.binding.epoch,
+                        "cache object epoch mismatch"
                     );
                 }
                 ensure!(id.0 > 0, "relay call identity");
@@ -797,7 +846,7 @@ impl Parent {
             });
             let retired = matches!(pending.call, Call::Abandon { .. } | Call::Release(_))
                 && matches!(&result, Ok(Value::Unit));
-            let bytes = Arc::new(encode(
+            let bytes = Arc::new(encode_packet(
                 &Packet {
                     binding: self.binding.clone(),
                     body: Body::Reply {
@@ -849,6 +898,9 @@ impl Parent {
                 Call::Release(r) => {
                     self.client.release_root(r)?;
                     Value::Unit
+                }
+                Call::PreviewIo(request) => {
+                    Value::PreviewIo(self.client.preview_io_call(request, cancel)?)
                 }
                 Call::PreviewStore(request) => {
                     Value::PreviewStore(self.client.preview_store_call(request, cancel)?)
@@ -915,7 +967,7 @@ impl Parent {
                         .client
                         .admission_status(operation, &session)
                         .map_err(|e| Fault::from_error(e, true));
-                    let bytes = Arc::new(encode(
+                    let bytes = Arc::new(encode_packet(
                         &Packet {
                             binding: self.binding.clone(),
                             body: Body::AdmissionReply { id: U64(id), value },
@@ -936,7 +988,7 @@ impl Parent {
                             Ok(status)
                         })
                         .map_err(|e| Fault::from_error(e, true));
-                    let bytes = Arc::new(encode(
+                    let bytes = Arc::new(encode_packet(
                         &Packet {
                             binding: self.binding.clone(),
                             body: Body::StoreReply { id: U64(id), value },
@@ -1221,6 +1273,24 @@ impl Proxy {
     }
 }
 impl CatalogFilesystem for Proxy {
+    fn preview_io_call(
+        &self,
+        request: &crate::catalog_session::preview_io::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::preview_io::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch,
+            "cache IO epoch mismatch"
+        );
+        match self.call(Call::PreviewIo(Box::new(request.clone())), cancel)? {
+            Value::PreviewIo(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected cache IO reply"),
+        }
+    }
+
     fn prepare_catalog(&self, r: &PrepareCatalog, c: &AtomicBool) -> Result<CatalogBootstrap> {
         match self.call(Call::Prepare(r.clone()), c)? {
             Value::Bootstrap(v) => {
@@ -1380,6 +1450,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         }
         (Call::Abandon { .. } | Call::Release(_), Value::Unit) => {}
         (Call::RestoreStatus(_), Value::Restore(_)) => {}
+        (Call::PreviewIo(request), Value::PreviewIo(reply)) => reply.validate(request)?,
         (Call::PreviewStore(request), Value::PreviewStore(reply)) => {
             store::validate_reply(request, reply)?
         }

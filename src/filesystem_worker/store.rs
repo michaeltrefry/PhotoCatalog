@@ -232,6 +232,10 @@ pub(super) struct Snapshot {
 impl Snapshot {
     pub fn status(&self, query: &StatusQuery) -> Result<Status> {
         query.validate()?;
+        ensure!(
+            query.kind == crate::catalog_session::store::StatusKind::Locks,
+            "wrong preview snapshot family"
+        );
         let binding = self
             .binding
             .as_ref()
@@ -259,6 +263,8 @@ impl Snapshot {
                 path: path.native(),
             });
         Ok(Status {
+            kind: crate::catalog_session::store::StatusKind::Locks,
+            object: None,
             operation: query.operation,
             group: self.group.map(lease),
             stage: receipt.map(|r| r.stage),
@@ -299,6 +305,34 @@ impl Default for StoreOwner {
     }
 }
 impl StoreOwner {
+    pub(super) fn reserved_path(&self, group: &LeaseId, token: &LeaseId) -> Result<PathBuf> {
+        self.group(group)?;
+        let slot = self.slot(id(token))?;
+        ensure!(
+            matches!(slot.stage, Stage::Reserved | Stage::Held) && !slot.retired,
+            "preview reservation is not usable"
+        );
+        slot.verify()?;
+        slot.path.path()
+    }
+    pub(super) fn object_root(
+        &self,
+        group: &LeaseId,
+        token: &LeaseId,
+    ) -> Result<(PathBuf, Layout)> {
+        self.group(group)?;
+        let slot = self.slot(id(token))?;
+        ensure!(
+            slot.stage == Stage::Held
+                && !slot.retired
+                && slot.directory.is_some()
+                && slot.lock.is_some(),
+            "cache root is not held"
+        );
+        slot.verify()?;
+        Ok((slot.path.path()?, self.layout))
+    }
+
     fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + std::mem::size_of::<Snapshot>()
@@ -525,6 +559,7 @@ impl StoreOwner {
     fn snapshot(&self, request: &Request) -> Snapshot {
         Snapshot {
             binding: Some(StatusQuery::from(&Query {
+                kind: crate::catalog_session::store::StatusKind::Locks,
                 root: request.root.clone(),
                 operation: request.operation,
                 selected: None,
@@ -907,6 +942,7 @@ mod tests {
             unreachable!()
         };
         let query = Query {
+            kind: crate::catalog_session::store::StatusKind::Locks,
             root: request.root.clone(),
             operation: request.operation,
             selected: Some(root.token.clone()),
@@ -1163,4 +1199,5 @@ mod tests {
         );
         Ok(())
     }
+    include!("preview_io_tests.rs");
 }

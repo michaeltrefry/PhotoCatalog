@@ -230,6 +230,11 @@ pub(super) fn build_identity() -> String {
         concat!(
             env!("CARGO_PKG_VERSION"),
             include_str!("wire.rs"),
+            include_str!("../../catalog_session/preview_io.rs"),
+            include_str!("../../filesystem_worker/preview_io.rs"),
+            include_str!("../../preview/store_io.rs"),
+            include_str!("../../preview/store.rs"),
+            include_str!("../../preview/relocation.rs"),
             include_str!("filesystem.rs"),
             include_str!("../../catalog_session.rs"),
             include_str!("../../catalog_session/roles.rs"),

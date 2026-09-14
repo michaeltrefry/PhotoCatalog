@@ -227,6 +227,35 @@ pub(crate) enum ManifestOrigin {
 /// Supplied by the separately owned F lease group. The callback receives only
 /// exact SQL-derived config/identity and returns retained opaque ownership.
 pub(crate) trait AdmittedStoreFiles: Send + Sync {
+    #[cfg(test)]
+    fn cache_status(&self) -> Result<crate::catalog_session::store::Status> {
+        bail!("managed cache status unsupported")
+    }
+    fn cache_root(&self, _path: &Path) -> Result<crate::catalog_session::LeaseId> {
+        bail!("managed cache object root unsupported")
+    }
+    fn cache_call(
+        &self,
+        _action: crate::catalog_session::preview_io::Action,
+    ) -> Result<crate::catalog_session::preview_io::Value> {
+        bail!("managed cache object IO unsupported")
+    }
+    fn cache_read(
+        &self,
+        _expected: crate::catalog_session::preview_io::Expected,
+        _allowance: u64,
+    ) -> Result<(crate::catalog_session::preview_io::Integrity, Vec<u8>)> {
+        bail!("managed cache read unsupported")
+    }
+    fn cache_write(
+        &self,
+        _expected: crate::catalog_session::preview_io::Expected,
+        _temporary: &str,
+        _bytes: &[u8],
+    ) -> Result<()> {
+        bail!("managed cache write unsupported")
+    }
+
     fn lock_tiers(
         &self,
         config: &StoreConfig,
@@ -582,7 +611,39 @@ impl PreviewStore {
             Layout::HashPrefix => self.root(tier).join(&key[..2]).join(&key[2..4]).join(key),
         })
     }
+    fn cache_object(
+        &self,
+        key: &str,
+        tier: Tier,
+    ) -> Result<crate::catalog_session::preview_io::Object> {
+        let files = self
+            .managed_files
+            .as_ref()
+            .context("managed cache filesystem missing")?;
+        let object = crate::catalog_session::preview_io::Object {
+            root: files.cache_root(self.root(tier))?,
+            key: key.into(),
+        };
+        object.validate()?;
+        Ok(object)
+    }
+    fn cache_expected(
+        &self,
+        key: &str,
+        tier: Tier,
+        bytes: u64,
+        checksum: &str,
+    ) -> Result<crate::catalog_session::preview_io::Expected> {
+        Ok(crate::catalog_session::preview_io::Expected {
+            object: self.cache_object(key, tier)?,
+            bytes: crate::application::U64(bytes),
+            checksum: checksum.into(),
+        })
+    }
     fn ensure_parent(&self, tier: Tier, key: &str) -> Result<()> {
+        if self.managed_files.is_some() {
+            return Ok(());
+        }
         if self.config.layout == Layout::Flat {
             return Ok(());
         }
@@ -738,33 +799,49 @@ impl PreviewStore {
     }
     fn remove(&self, digest: &str, tier: Tier) -> Result<()> {
         self.touches.borrow_mut().remove(digest);
-        let temporary: Option<String> = self
-            .db
-            .query_row(
-                "SELECT temporary FROM objects WHERE key=?1",
-                [digest],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(temporary) = temporary {
-            ensure!(
-                temporary.starts_with(digest)
-                    && temporary.ends_with(".pending")
-                    && !temporary.contains('/')
-                    && !temporary.contains('\\'),
-                "invalid temporary object name"
-            );
-            let destination = self.path(digest, tier)?;
-            match fs::remove_file(destination.parent().unwrap().join(temporary)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        let temporary: Option<String> = if self.managed_files.is_some() {
+            let mut statement = self
+                .db
+                .prepare("SELECT temporary FROM objects WHERE key=?1")?;
+            let mut rows = statement.query([digest])?;
+            rows.next()?
+                .map(|row| custody::object_text(row, 0).map(str::to_owned))
+                .transpose()?
+        } else {
+            self.db
+                .query_row(
+                    "SELECT temporary FROM objects WHERE key=?1",
+                    [digest],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        if let Some(files) = &self.managed_files {
+            files.cache_call(crate::catalog_session::preview_io::Action::Remove {
+                object: self.cache_object(digest, tier)?,
+                temporary,
+            })?;
+        } else {
+            if let Some(temporary) = temporary {
+                ensure!(
+                    temporary.starts_with(digest)
+                        && temporary.ends_with(".pending")
+                        && !temporary.contains('/')
+                        && !temporary.contains('\\'),
+                    "invalid temporary object name"
+                );
+                let destination = self.path(digest, tier)?;
+                match fs::remove_file(destination.parent().unwrap().join(temporary)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
-        }
-        match fs::remove_file(self.path(digest, tier)?) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+            match fs::remove_file(self.path(digest, tier)?) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
@@ -866,25 +943,38 @@ impl PreviewStore {
                 self.clock()?
             ],
         )?;
-        let written = (|| -> Result<()> {
-            let mut file = File::options()
-                .write(true)
-                .create_new(true)
-                .open(&temporary_path)?;
-            before_write()?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            ensure!(
-                !destination.exists(),
-                "immutable preview destination already exists"
-            );
-            fs::rename(&temporary_path, &destination)?;
-            #[cfg(unix)]
-            File::open(parent)?.sync_all()?;
-            Ok(())
-        })();
+        let written = if let Some(files) = &self.managed_files {
+            (|| -> Result<()> {
+                before_write()?;
+                files.cache_write(
+                    self.cache_expected(&digest, key.tier, bytes.len() as u64, &checksum)?,
+                    &temporary,
+                    bytes,
+                )
+            })()
+        } else {
+            (|| -> Result<()> {
+                let mut file = File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary_path)?;
+                before_write()?;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                ensure!(
+                    !destination.exists(),
+                    "immutable preview destination already exists"
+                );
+                fs::rename(&temporary_path, &destination)?;
+                #[cfg(unix)]
+                File::open(parent)?.sync_all()?;
+                Ok(())
+            })()
+        };
         if let Err(error) = written {
-            let _ = fs::remove_file(&temporary_path);
+            if self.managed_files.is_none() {
+                let _ = fs::remove_file(&temporary_path);
+            }
             self.remove(&digest, key.tier)?;
             return Err(error.context("preview staging failed; prior current thumbnail retained"));
         }
@@ -1025,27 +1115,42 @@ impl PreviewStore {
         let Some((len, checksum)) = row else {
             return Ok(false);
         };
-        let valid = (|| -> Result<bool> {
-            let mut file = File::open(self.path(&digest, expected.tier)?)?;
-            if len > 256 * 1024 * 1024 || file.metadata()?.len() != len {
-                return Ok(false);
-            }
-            let mut hash = blake3::Hasher::new();
-            let mut scratch = [0; 16384];
-            let mut total = 0u64;
-            loop {
-                let count = file.read(&mut scratch)?;
-                if count == 0 {
-                    break;
+        let valid = if let Some(files) = &self.managed_files {
+            if len > 256 * 1024 * 1024 {
+                Ok(false)
+            } else {
+                match files.cache_call(crate::catalog_session::preview_io::Action::Check(
+                    self.cache_expected(&digest, expected.tier, len, &checksum)?,
+                ))? {
+                    crate::catalog_session::preview_io::Value::Integrity(value) => {
+                        Ok(value == crate::catalog_session::preview_io::Integrity::Intact)
+                    }
+                    _ => bail!("unexpected cache integrity result"),
                 }
-                total += count as u64;
-                if total > len {
+            }
+        } else {
+            (|| -> Result<bool> {
+                let mut file = File::open(self.path(&digest, expected.tier)?)?;
+                if len > 256 * 1024 * 1024 || file.metadata()?.len() != len {
                     return Ok(false);
                 }
-                hash.update(&scratch[..count]);
-            }
-            Ok(total == len && hash.finalize().to_hex().as_str() == checksum)
-        })();
+                let mut hash = blake3::Hasher::new();
+                let mut scratch = [0; 16384];
+                let mut total = 0u64;
+                loop {
+                    let count = file.read(&mut scratch)?;
+                    if count == 0 {
+                        break;
+                    }
+                    total += count as u64;
+                    if total > len {
+                        return Ok(false);
+                    }
+                    hash.update(&scratch[..count]);
+                }
+                Ok(total == len && hash.finalize().to_hex().as_str() == checksum)
+            })()
+        };
         match valid {
             Ok(true) => Ok(true),
             Ok(false) => {
@@ -1094,32 +1199,55 @@ impl PreviewStore {
                 && key.tier == expected.tier,
             "manifest descriptor identity mismatch"
         );
-        let mut file = match File::open(self.path(&digest, key.tier)?) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let bytes = if let Some(files) = &self.managed_files {
+            if len > 256 * 1024 * 1024 {
                 self.remove(&digest, key.tier)?;
-                return Ok(None);
+                bail!("cached preview length mismatch; entry invalidated");
             }
-            Err(e) => return Err(e.into()),
+            let (integrity, bytes) = files.cache_read(
+                self.cache_expected(&digest, key.tier, len, &checksum)?,
+                max_bytes,
+            )?;
+            match integrity {
+                crate::catalog_session::preview_io::Integrity::Missing => {
+                    self.remove(&digest, key.tier)?;
+                    return Ok(None);
+                }
+                crate::catalog_session::preview_io::Integrity::Corrupt => {
+                    self.remove(&digest, key.tier)?;
+                    bail!("cached preview length mismatch; entry invalidated");
+                }
+                crate::catalog_session::preview_io::Integrity::Intact => bytes,
+            }
+        } else {
+            let mut file = match File::open(self.path(&digest, key.tier)?) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.remove(&digest, key.tier)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if len > 256 * 1024 * 1024 || file.metadata()?.len() != len {
+                drop(file);
+                self.remove(&digest, key.tier)?;
+                bail!("cached preview length mismatch; entry invalidated");
+            }
+            if len > max_bytes {
+                return Err(super::EncodedBudgetExceeded.into());
+            }
+            let mut bytes = vec![0; len as usize];
+            let read = file.read_exact(&mut bytes);
+            let mut extra = [0];
+            if read.is_err()
+                || file.read(&mut extra)? != 0
+                || blake3::hash(&bytes).to_hex().as_str() != checksum
+            {
+                self.remove(&digest, key.tier)?;
+                bail!("cached preview checksum mismatch; entry invalidated");
+            }
+            bytes
         };
-        if len > 256 * 1024 * 1024 || file.metadata()?.len() != len {
-            drop(file);
-            self.remove(&digest, key.tier)?;
-            bail!("cached preview length mismatch; entry invalidated");
-        }
-        if len > max_bytes {
-            return Err(super::EncodedBudgetExceeded.into());
-        }
-        let mut bytes = vec![0; len as usize];
-        let read = file.read_exact(&mut bytes);
-        let mut extra = [0];
-        if read.is_err()
-            || file.read(&mut extra)? != 0
-            || blake3::hash(&bytes).to_hex().as_str() != checksum
-        {
-            self.remove(&digest, key.tier)?;
-            bail!("cached preview checksum mismatch; entry invalidated");
-        }
         self.touches.borrow_mut().insert(digest, self.clock()?);
         if self.touches.borrow().len() >= 256 {
             self.flush_touches()?;
@@ -1137,15 +1265,79 @@ impl PreviewStore {
     pub fn recover(&self, limit: usize) -> Result<usize> {
         ensure!((1..=1024).contains(&limit), "recovery batch limit");
         let mut query=self.db.prepare("SELECT o.key,o.descriptor,o.temporary FROM objects o WHERE o.status IN ('pending','orphan') ORDER BY o.status,o.key LIMIT ?1")?;
-        let rows = query
-            .query_map([limit as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = if self.managed_files.is_some() {
+            // First pass validates borrowed cells and aggregate retained row bytes.
+            // No name/String allocation or filesystem effect precedes admission.
+            let mut count = 0usize;
+            let mut retained = 0usize;
+            {
+                let mut cursor = query.query([limit as i64])?;
+                while let Some(row) = cursor.next()? {
+                    count += 1;
+                    retained = retained
+                        .checked_add(std::mem::size_of::<(String, String, String)>())
+                        .context("cache recovery count overflow")?;
+                    for column in 0..3 {
+                        retained = retained
+                            .checked_add(custody::object_text(row, column)?.len())
+                            .context("cache recovery byte overflow")?;
+                    }
+                    ensure!(
+                        retained <= crate::catalog_session::ENVELOPE_BYTES,
+                        crate::catalog_session::store::ResourceLimit(
+                            "Cache recovery batch exceeds 1 MiB metadata admission; retry a smaller batch; no filesystem effect occurred"
+                        )
+                    );
+                }
+            }
+            let mut values = Vec::new();
+            values.try_reserve_exact(count)?;
+            let mut cursor = query.query([limit as i64])?;
+            let mut second_bytes = 0usize;
+            while let Some(row) = cursor.next()? {
+                let cells = [
+                    custody::object_text(row, 0)?,
+                    custody::object_text(row, 1)?,
+                    custody::object_text(row, 2)?,
+                ];
+                second_bytes = second_bytes
+                    .checked_add(
+                        std::mem::size_of::<(String, String, String)>()
+                            + cells.iter().map(|v| v.len()).sum::<usize>(),
+                    )
+                    .context("cache recovery byte overflow")?;
+                ensure!(
+                    second_bytes <= retained,
+                    crate::catalog_session::store::ResourceLimit(
+                        "Cache recovery metadata grew after admission; retry the batch; no filesystem effect occurred"
+                    )
+                );
+                ensure!(
+                    values.len() < count,
+                    "cache recovery rows changed during admission"
+                );
+                values.push((
+                    cells[0].to_owned(),
+                    cells[1].to_owned(),
+                    cells[2].to_owned(),
+                ));
+            }
+            ensure!(
+                values.len() == count,
+                "cache recovery rows changed during admission"
+            );
+            values
+        } else {
+            query
+                .query_map([limit as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
         drop(query);
         for (digest, descriptor, temporary) in &rows {
             let key: PreviewKey = serde_json::from_str(descriptor)?;
@@ -1153,11 +1345,18 @@ impl PreviewStore {
                 !temporary.contains('/') && !temporary.contains('\\'),
                 "invalid temporary cache name"
             );
-            let parent = self.path(digest, key.tier)?.parent().unwrap().to_owned();
-            match fs::remove_file(parent.join(temporary)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+            if let Some(files) = &self.managed_files {
+                files.cache_call(crate::catalog_session::preview_io::Action::Remove {
+                    object: self.cache_object(digest, key.tier)?,
+                    temporary: Some(temporary.clone()),
+                })?;
+            } else {
+                let parent = self.path(digest, key.tier)?.parent().unwrap().to_owned();
+                match fs::remove_file(parent.join(temporary)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
             self.remove(digest, key.tier)?;
         }
@@ -1220,6 +1419,162 @@ fn prospective(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_recovery_admits_long_legacy_temporary_but_rejects_sql_overbudget_before_effects()
+    -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct RemoveFiles {
+            root: PathBuf,
+            calls: AtomicUsize,
+        }
+        impl AdmittedStoreFiles for RemoveFiles {
+            fn lock_tiers(&self, _: &StoreConfig, _: &str) -> Result<Arc<dyn Send + Sync>> {
+                bail!("unused")
+            }
+            fn cache_root(&self, _: &Path) -> Result<crate::catalog_session::LeaseId> {
+                Ok(crate::catalog_session::LeaseId::new())
+            }
+            fn cache_call(
+                &self,
+                action: crate::catalog_session::preview_io::Action,
+            ) -> Result<crate::catalog_session::preview_io::Value> {
+                let crate::catalog_session::preview_io::Action::Remove { object, temporary } =
+                    action
+                else {
+                    bail!("unexpected fixture call")
+                };
+                let parent = self.root.join(&object.key[..2]).join(&object.key[2..4]);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                for path in temporary
+                    .iter()
+                    .map(|name| parent.join(name))
+                    .chain(std::iter::once(parent.join(&object.key)))
+                {
+                    match fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Ok(crate::catalog_session::preview_io::Value::Unit)
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let config = config(root.path(), 100, 100);
+        let mut store = PreviewStore::open(config.clone(), &[])?;
+        let key = key(1, Tier::Thumbnail);
+        let digest = key.digest()?;
+        store.desire(&key, || Ok(true))?;
+        store.publish(&key, b"original", authority)?;
+        let long = format!("{}.{}.pending", digest, "legacy".repeat(20));
+        assert!(long.len() > 128 && long.len() < 255);
+        let object = store.path(&digest, key.tier)?;
+        let temporary = object.parent().unwrap().join(&long);
+        fs::write(&temporary, b"pending")?;
+        store.db.execute(
+            "UPDATE objects SET status='pending',temporary=?1 WHERE key=?2",
+            params![long, digest],
+        )?;
+        let files = Arc::new(RemoveFiles {
+            root: config.thumbnail_root,
+            calls: AtomicUsize::new(0),
+        });
+        store.managed_files = Some(files.clone());
+        assert_eq!(store.recover(1)?, 1);
+        assert!(!temporary.exists() && !object.exists());
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM objects", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+        store.managed_files = None;
+        store.publish(&key, b"original", authority)?;
+        store.db.execute(
+            "UPDATE objects SET status='pending',temporary=?1 WHERE key=?2",
+            params![
+                "x".repeat(crate::catalog_session::ENVELOPE_BYTES + 1),
+                digest
+            ],
+        )?;
+        store.managed_files = Some(files.clone());
+        let before = files.calls.load(Ordering::SeqCst);
+        assert!(
+            store
+                .recover(1)
+                .unwrap_err()
+                .is::<crate::catalog_session::store::ResourceLimit>()
+        );
+        assert!(
+            store
+                .invalidate(&key)
+                .unwrap_err()
+                .is::<crate::catalog_session::store::ResourceLimit>()
+        );
+        assert_eq!(files.calls.load(Ordering::SeqCst), before);
+        assert_eq!(fs::read(&object)?, b"original");
+        store.db.execute(
+            "UPDATE objects SET temporary=zeroblob(64) WHERE key=?1",
+            [&digest],
+        )?;
+        assert!(store.recover(1).is_err());
+        assert!(store.invalidate(&key).is_err());
+        assert_eq!(files.calls.load(Ordering::SeqCst), before);
+        assert_eq!(fs::read(object)?, b"original");
+        Ok(())
+    }
+    #[test]
+    fn managed_unlink_failure_retains_sql_current_and_quota_until_success() -> Result<()> {
+        struct Denied;
+        impl AdmittedStoreFiles for Denied {
+            fn lock_tiers(
+                &self,
+                _: &StoreConfig,
+                _: &str,
+            ) -> Result<std::sync::Arc<dyn Send + Sync>> {
+                bail!("unused")
+            }
+            fn cache_root(&self, _: &Path) -> Result<crate::catalog_session::LeaseId> {
+                Ok(crate::catalog_session::LeaseId::new())
+            }
+            fn cache_call(
+                &self,
+                _: crate::catalog_session::preview_io::Action,
+            ) -> Result<crate::catalog_session::preview_io::Value> {
+                Err(crate::filesystem_worker::wire::Failure::new(
+                    crate::filesystem_worker::wire::FailureKind::Unknown,
+                    "injected unlink failure",
+                )
+                .into())
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let mut store = PreviewStore::open(config(root.path(), 100, 100), &[])?;
+        let key = key(1, Tier::Thumbnail);
+        store.desire(&key, || Ok(true))?;
+        store.publish(&key, b"unchanged", authority)?;
+        store.managed_files = Some(std::sync::Arc::new(Denied));
+        assert!(store.invalidate(&key).is_err());
+        let row: (String, u64) = store.db.query_row(
+            "SELECT status,bytes FROM objects WHERE key=?1",
+            [key.digest()?],
+            |r| Ok((r.get(0)?, unsigned(r, 1)?)),
+        )?;
+        assert_eq!(row, ("ready".into(), 9));
+        let current: Option<String> =
+            store
+                .db
+                .query_row("SELECT current FROM wanted", [], |r| r.get(0))?;
+        assert_eq!(current, Some(key.digest()?));
+        store.managed_files = None;
+        assert_eq!(store.read(&key, false)?.unwrap().bytes, b"unchanged");
+        store.invalidate(&key)?;
+        assert!(store.read(&key, false)?.is_none());
+        Ok(())
+    }
     #[test]
     fn failed_commit_rolls_back_provisional_state_and_allows_reuse() {
         let db = Connection::open_in_memory().unwrap();

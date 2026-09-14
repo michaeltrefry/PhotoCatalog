@@ -58,14 +58,19 @@ pub fn build_identity() -> String {
         concat!(
             env!("CARGO_PKG_VERSION"),
             include_str!("wire.rs"),
+            include_str!("../preview/store_custody.rs"),
+            include_str!("../preview/store_io.rs"),
+            include_str!("../preview/relocation.rs"),
             include_str!("client.rs"),
             include_str!("process.rs"),
             include_str!("../catalog_session.rs"),
             include_str!("../catalog_session/store.rs"),
+            include_str!("../catalog_session/preview_io.rs"),
             include_str!("../preview/store.rs"),
             include_str!("../filesystem_worker.rs"),
             include_str!("bootstrap.rs"),
             include_str!("store.rs"),
+            include_str!("preview_io.rs"),
             include_str!("../catalog_backup.rs"),
             include_str!("../lib.rs"),
             include_str!("../catalog_storage.rs"),
@@ -91,6 +96,7 @@ pub fn build_identity() -> String {
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
     PreviewStore(crate::catalog_session::store::Request),
+    PreviewIo(crate::catalog_session::preview_io::Request),
     ReadPreviewConfiguration(NativePath),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
@@ -125,10 +131,12 @@ impl Operation {
     pub(crate) fn is_cleanup(&self) -> bool {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
+            || matches!(self, Self::PreviewIo(r) if r.cleanup())
     }
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::PreviewStore(value) => value.validate()?,
+            Self::PreviewIo(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
@@ -228,6 +236,7 @@ impl AdmissionSnapshot {
 )]
 pub enum Response {
     PreviewStore(crate::catalog_session::store::Reply),
+    PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewConfiguration(Vec<u8>),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
@@ -250,6 +259,8 @@ pub enum FailureKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Failure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_receipt: Option<crate::catalog_session::preview_io::FailureReceipt>,
     pub kind: FailureKind,
     pub message: String,
 }
@@ -269,6 +280,7 @@ impl Failure {
         let mut message_out = Bounded(String::with_capacity(ERROR_BYTES));
         let _ = std::fmt::write(&mut message_out, format_args!("{message}"));
         Self {
+            object_receipt: None,
             kind,
             message: message_out.0.into_boxed_str().into_string(),
         }
@@ -278,6 +290,9 @@ impl Failure {
             self.message.len() <= ERROR_BYTES,
             "filesystem error byte limit"
         );
+        if let Some(receipt) = &self.object_receipt {
+            receipt.validate()?;
+        }
         Ok(())
     }
 }
@@ -586,6 +601,40 @@ pub(crate) fn encode(value: &impl Serialize, cap: usize) -> Result<Vec<u8>> {
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], cap: usize) -> Result<T> {
     ensure!(bytes.len() <= cap, "filesystem decoded envelope byte limit");
     Ok(serde_json::from_slice(bytes)?)
+}
+
+pub(crate) fn encode_operation(value: &Operation) -> Result<Vec<u8>> {
+    let binary = match value {
+        Operation::PreviewIo(r) => r.binary(),
+        _ => return encode(value, MESSAGE_BYTES),
+    };
+    crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
+}
+pub(crate) fn decode_operation(bytes: &[u8]) -> Result<Operation> {
+    let (mut value, binary): (Operation, _) =
+        crate::catalog_session::preview_io::unpack(bytes, MESSAGE_BYTES)?;
+    match &mut value {
+        Operation::PreviewIo(r) => r.set_binary(binary)?,
+        _ => ensure!(binary.is_empty(), "unexpected operation binary trailer"),
+    }
+    value.validate()?;
+    Ok(value)
+}
+pub(crate) fn encode_outcome(value: &Outcome) -> Result<Vec<u8>> {
+    let binary = match value {
+        Ok(Response::PreviewIo(r)) => r.binary(),
+        _ => return encode(value, MESSAGE_BYTES),
+    };
+    crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
+}
+pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
+    let (mut value, binary): (Outcome, _) =
+        crate::catalog_session::preview_io::unpack(bytes, MESSAGE_BYTES)?;
+    match &mut value {
+        Ok(Response::PreviewIo(r)) => r.set_binary(binary)?,
+        _ => ensure!(binary.is_empty(), "unexpected outcome binary trailer"),
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
