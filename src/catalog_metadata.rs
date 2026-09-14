@@ -752,7 +752,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current=tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[&expected.asset_id],|r|Ok(RenderIdentity{asset_id:expected.asset_id.clone(),generation:r.get(0)?,fingerprint:r.get(1)?,state:r.get(2)?,metadata_revision:r.get(3)?})).optional()?;
+        let current=tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[&expected.asset_id],|r|Ok(RenderIdentity{asset_id:expected.asset_id.clone(),generation:r.get(0)?,fingerprint:crate::catalog_row::optional_text(r,1,64)?,state:crate::catalog_row::owned_text(r,2,7)?,metadata_revision:r.get(3)?})).optional()?;
         if !current.as_ref().is_some_and(|current| {
             current.asset_id == expected.asset_id
                 && current.generation == expected.generation
@@ -770,7 +770,7 @@ impl Catalog {
         let (generation, fingerprint, state, metadata_revision) = self.db.query_row(
             "SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",
             [asset],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?)),
+            |r| Ok((r.get(0)?, crate::catalog_row::optional_text(r,1,64)?, crate::catalog_row::owned_text(r,2,7)?,r.get(3)?)),
         )?;
         Ok(RenderIdentity {
             asset_id: asset.into(),

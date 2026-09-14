@@ -4,6 +4,13 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+// Decode/header return categories. Encoder callers continue to treat any nonzero as failure.
+typedef enum PcPreviewStatus {
+    PC_PREVIEW_OK = 0,
+    PC_PREVIEW_ERROR = 1,
+    PC_PREVIEW_CORRUPT = 2,
+    PC_PREVIEW_RESOURCE_LIMIT = 3
+} PcPreviewStatus;
 typedef int (*PcPreviewCanceled)(const void *context);
 typedef struct PcPreviewBuffer {
     unsigned char *data;

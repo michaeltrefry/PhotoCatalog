@@ -247,13 +247,25 @@ impl ConfirmSqlAdmission {
 /// A health response, stale cached Prepare, EOF or lost reply is not this proof.
 pub type SqlAdmissionConfirmed = ConfirmSqlAdmission;
 
+pub mod native;
 pub mod preview_io;
+pub mod preview_stage;
 /// Calls run on the admission/operation owner, never the GUI thread. An F client
 /// must keep its independent cancel/status controls live while awaiting a reply.
 /// Implementations must not fall back to local filesystem access after failure.
 pub mod store;
 
 pub trait CatalogFilesystem: Send + Sync {
+    fn native(&self) -> Option<&dyn native::CatalogNative> {
+        None
+    }
+    fn preview_stage_call(
+        &self,
+        _request: &preview_stage::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<preview_stage::Reply> {
+        anyhow::bail!("filesystem owner does not support stage custody")
+    }
     fn preview_io_call(
         &self,
         _request: &preview_io::Request,

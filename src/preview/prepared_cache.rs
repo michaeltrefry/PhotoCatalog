@@ -18,7 +18,7 @@ use std::{
 pub(crate) const PROXY_EDGE: u32 = 1600;
 pub(crate) const MAX_PROXY_BYTES: u64 = 1600 * 1600 * 16 + 128 * 1024 + 64;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SourceInstance {
+pub struct SourceInstance {
     path: NativePath,
     device: u64,
     object: u128,
@@ -159,6 +159,7 @@ pub(crate) struct PreparedReference {
     pub source: SourceInstance,
 }
 pub(crate) struct ProducedPrepared {
+    pub managed: Option<std::sync::Arc<super::worker::managed_process::Stage>>,
     pub path: PathBuf,
     pub receipt: PreparedProxyReceipt,
     pub source: SourceInstance,
@@ -168,6 +169,7 @@ struct Entry {
     used: u64,
 }
 pub(crate) struct PreparedCache {
+    managed: Option<std::sync::Arc<super::stage_io::Calls>>,
     root: PathBuf,
     entries: HashMap<String, Entry>,
     clock: u64,
@@ -248,6 +250,28 @@ impl PreparedCache {
             fs::remove_file(entry.path())?;
         }
         Ok(Self {
+            managed: None,
+            root,
+            entries: HashMap::new(),
+            clock: 0,
+            bytes: 0,
+            limit,
+            count,
+        })
+    }
+    pub(crate) fn open_managed(
+        root: PathBuf,
+        limit: u64,
+        count: usize,
+        calls: std::sync::Arc<super::stage_io::Calls>,
+    ) -> Result<Self> {
+        ensure!(
+            count <= 1024 && limit <= 16 * 1024 * 1024 * 1024,
+            "prepared cache configuration"
+        );
+        calls.unit(crate::catalog_session::preview_stage::Action::PreparedInitialize)?;
+        Ok(Self {
+            managed: Some(calls),
             root,
             entries: HashMap::new(),
             clock: 0,
@@ -263,6 +287,9 @@ impl PreparedCache {
         fingerprint: &str,
         wb: &WhiteBalance,
     ) -> Result<Option<PreparedReference>> {
+        if self.managed.is_some() {
+            return self.managed_candidate(generation, fingerprint, wb);
+        }
         let key = identity(generation, fingerprint, wb)?;
         let Some(entry) = self.entries.get_mut(&key) else {
             return Ok(None);
@@ -280,12 +307,32 @@ impl PreparedCache {
         entry.used = self.clock;
         Ok(Some(entry.value.clone()))
     }
+    fn managed_candidate(
+        &mut self,
+        generation: u64,
+        fingerprint: &str,
+        wb: &WhiteBalance,
+    ) -> Result<Option<PreparedReference>> {
+        let key = identity(generation, fingerprint, wb)?;
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return Ok(None);
+        };
+        // N verifies the actual source instance and complete proxy before use,
+        // falling back to original decode on a stale or corrupt candidate.
+        // Selecting a candidate touches recency even if N later rejects it;
+        // this C-only lookup neither frees disk charge nor removes an entry.
+        self.clock = self.clock.checked_add(1).context("prepared LRU overflow")?;
+        entry.used = self.clock;
+        Ok(Some(entry.value.clone()))
+    }
     pub(crate) fn adopt(&mut self, generation: u64, produced: &ProducedPrepared) -> Result<()> {
         let receipt = &produced.receipt;
         if self.count == 0 || receipt.bytes > self.limit {
             return Ok(());
         }
-        verify_file(&produced.path, receipt, MAX_PROXY_BYTES)?;
+        if self.managed.is_none() {
+            verify_file(&produced.path, receipt, MAX_PROXY_BYTES)?;
+        }
         let key = identity(
             generation,
             &receipt.identity.source_fingerprint,
@@ -305,7 +352,33 @@ impl PreparedCache {
         }
         let path = self.root.join(format!("{key}.linear"));
         let clock = self.clock.checked_add(1).context("prepared LRU overflow")?;
-        fs::hard_link(&produced.path, &path)?;
+        if let Some(calls) = &self.managed {
+            let stage = produced
+                .managed
+                .as_ref()
+                .context("managed prepared output lacks stage")?;
+            ensure!(
+                stage.calls.root == calls.root,
+                "prepared stage catalog mismatch"
+            );
+            let adopted = calls.call(
+                crate::catalog_session::preview_stage::Action::PreparedAdopt {
+                    stage: stage.id.clone(),
+                    key: key.clone(),
+                    receipt: receipt.clone(),
+                },
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+            let crate::catalog_session::preview_stage::Value::Path(adopted) = adopted else {
+                anyhow::bail!("wrong prepared adoption reply")
+            };
+            ensure!(
+                adopted == NativePath::from_path(&path),
+                "prepared adoption path mismatch"
+            );
+        } else {
+            fs::hard_link(&produced.path, &path)?;
+        }
         self.clock = clock;
         self.bytes += receipt.bytes;
         self.entries.insert(
@@ -327,7 +400,15 @@ impl PreparedCache {
         remove: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> Result<()> {
         let old = self.entries.get(key).context("prepared entry missing")?;
-        match remove(&old.value.path.to_path()?) {
+        let removed = if let Some(calls) = &self.managed {
+            calls.unit(
+                crate::catalog_session::preview_stage::Action::PreparedRemove { key: key.into() },
+            )?;
+            Ok(())
+        } else {
+            remove(&old.value.path.to_path()?)
+        };
+        match removed {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -350,6 +431,7 @@ mod tests {
         let bytes = b"bounded proxy storage fixture";
         fs::write(&path, bytes).unwrap();
         ProducedPrepared {
+            managed: None,
             source: SourceInstance::read(&path).unwrap(),
             path,
             receipt: PreparedProxyReceipt {
@@ -401,6 +483,37 @@ mod tests {
             assert!(cache.entries.contains_key(&next_key));
             assert_eq!(fs::read_dir(&cache.root).unwrap().count(), 1);
         }
+    }
+    #[test]
+    fn managed_candidate_is_read_only_and_retains_charge_until_native_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let produced = produced(root.path());
+        let mut cache =
+            PreparedCache::open(root.path().join("cache"), produced.receipt.bytes, 1).unwrap();
+        cache.adopt(1, &produced).unwrap();
+        let key = identity(1, &"a".repeat(64), &WhiteBalance::AsShot).unwrap();
+        let path = cache.entries[&key].value.path.to_path().unwrap();
+        let receipt = cache.entries[&key].value.receipt.clone();
+        fs::remove_file(&produced.path).unwrap();
+        fs::write(&path, b"changed candidate").unwrap();
+        let before = cache.clock;
+        let candidate = cache
+            .managed_candidate(1, &"a".repeat(64), &WhiteBalance::AsShot)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.receipt, receipt);
+        assert_eq!(candidate.source, produced.source);
+        assert_eq!(cache.entries[&key].used, before + 1);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, produced.receipt.bytes);
+        assert_eq!(fs::read(&path).unwrap(), b"changed candidate");
+        assert!(
+            cache
+                .managed_candidate(2, &"a".repeat(64), &WhiteBalance::AsShot)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cache.bytes, produced.receipt.bytes);
     }
     #[test]
     fn missing_cache_file_releases_its_charge_and_allows_readmission() {

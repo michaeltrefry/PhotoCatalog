@@ -11,6 +11,7 @@ pub mod catalog_image_exports;
 pub mod catalog_images;
 pub mod catalog_metadata;
 pub mod catalog_migration;
+mod catalog_row;
 pub mod catalog_session;
 pub mod catalog_storage;
 mod catalog_writer;
@@ -695,12 +696,15 @@ impl Catalog {
         self.read_preview_hash(&hash.context("missing preview reference")?)
     }
     pub(crate) fn preview_original_path(&self, asset: &str) -> Result<storage_volume::NativePath> {
-        let encoded: String = self.db.query_row(
-            "SELECT native_path FROM storage_bindings WHERE asset_id=?1",
-            [asset],
-            |r| r.get(0),
-        )?;
-        let path: storage_volume::NativePath = serde_json::from_str(&encoded)?;
+        let mut statement = self
+            .db
+            .prepare("SELECT native_path FROM storage_bindings WHERE asset_id=?1")?;
+        let mut rows = statement.query([asset])?;
+        let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        // Preserve lossless native units within the existing 1 MiB managed
+        // transport envelope; do not copy arbitrary stored JSON before admission.
+        let encoded = catalog_row::text(row, 0, 1024 * 1024)?;
+        let path: storage_volume::NativePath = serde_json::from_str(encoded)?;
         ensure!(
             path.to_path()?.is_absolute(),
             "original path is not absolute"

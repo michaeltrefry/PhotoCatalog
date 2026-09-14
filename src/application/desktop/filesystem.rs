@@ -1,5 +1,6 @@
 //! Private C→G→F relay. G owns the real F process; C holds only this proxy.
-//! This is additive until every managed actor dependency (including FS6) exists.
+//! This is additive until every managed actor dependency exists.
+mod native;
 use crate::{
     application::U64,
     catalog_backup::RestoreStatus,
@@ -53,6 +54,8 @@ pub(super) enum Call {
     Release(RootCapability),
     PreviewStore(Box<store::Request>),
     PreviewIo(Box<crate::catalog_session::preview_io::Request>),
+    PreviewStage(Box<crate::catalog_session::preview_stage::Request>),
+    Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
 }
 impl Call {
@@ -60,6 +63,7 @@ impl Call {
         matches!(self, Self::Abandon { .. } | Self::Release(_))
             || matches!(self, Self::PreviewStore(request) if request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if request.cleanup())
+            || matches!(self, Self::PreviewStage(request) if request.cleanup())
     }
     fn cancellable(&self) -> bool {
         matches!(
@@ -67,6 +71,7 @@ impl Call {
             Self::Prepare(_) | Self::Confirm(_) | Self::ReadPreviewConfiguration(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
+            || matches!(self, Self::PreviewStage(request) if !request.cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -84,8 +89,22 @@ impl Call {
                 uuid::Uuid::parse_str(restore_id)?;
                 Ok(())
             }
+            Self::Native(request) => {
+                ensure!(
+                    !request.cleanup(),
+                    "native cleanup requires reserved control"
+                );
+                request.validate()
+            }
             Self::PreviewStore(request) => request.validate(),
             Self::PreviewIo(request) => request.validate(),
+            Self::PreviewStage(request) => {
+                ensure!(
+                    !request.supervisor,
+                    "C cannot assert supervisor stage transitions"
+                );
+                request.validate()
+            }
             Self::ReadPreviewConfiguration(path) => store::path(path),
             _ => Ok(()),
         }
@@ -99,6 +118,8 @@ pub(super) enum Value {
     Restore(Option<RestoreStatus>),
     PreviewStore(store::Reply),
     PreviewIo(crate::catalog_session::preview_io::Reply),
+    PreviewStage(crate::catalog_session::preview_stage::Reply),
+    Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
     Unit,
 }
@@ -171,6 +192,18 @@ type Outcome = std::result::Result<Value, Fault>;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(super) enum Control {
+    NativeStop {
+        key: crate::catalog_session::native::Key,
+    },
+    NativeQuery {
+        id: U64,
+        query: crate::catalog_session::native::Query,
+    },
+    NativeReply {
+        id: U64,
+        query: crate::catalog_session::native::Query,
+        value: std::result::Result<crate::catalog_session::native::Status, Fault>,
+    },
     Failed(Fault),
     Cancel {
         id: U64,
@@ -307,12 +340,18 @@ struct Output {
     admission: Slot,
     store_query: Slot,
     store_reply: Slot,
+    native_stop: Slot,
+    native_query: Slot,
+    native_reply: Slot,
     data: VecDeque<Arc<Vec<u8>>>,
 }
 impl Output {
     fn push(&mut self, binding: &Binding, body: Body) -> Result<()> {
         // Classify by borrowed scalars before moving the potentially large body.
         let class = match &body {
+            Body::Control(Control::NativeStop { key }) => (10, key.operation.0),
+            Body::Control(Control::NativeQuery { id, .. }) => (11, id.0),
+            Body::Control(Control::NativeReply { id, .. }) => (12, id.0),
             Body::Control(Control::Failed(_)) => (0, 0),
             Body::Control(Control::Cancel { id }) => (1, id.0),
             Body::Control(Control::Ack { id, .. }) => (2, id.0),
@@ -324,7 +363,7 @@ impl Output {
             Body::StoreReply { id, .. } => (8, id.0),
             _ => (9, 0),
         };
-        let control = class.0 < 7;
+        let control = class.0 < 7 || class.0 >= 10;
         let bytes = Arc::new(encode_packet(
             &Packet {
                 binding: binding.clone(),
@@ -345,6 +384,9 @@ impl Output {
             (6, id) => self.store_query.push(id, bytes, 1),
             (7, id) => self.admission.push(id, bytes, 1),
             (8, id) => self.store_reply.push(id, bytes, 1),
+            (10, id) => self.native_stop.push(id, bytes, 16),
+            (11, id) => self.native_query.push(id, bytes, 1),
+            (12, id) => self.native_reply.push(id, bytes, 1),
             _ => self.encoded(bytes),
         }
     }
@@ -362,6 +404,9 @@ impl Output {
             Lane::Control => self
                 .failed
                 .take()
+                .or_else(|| self.native_stop.take())
+                .or_else(|| self.native_query.take())
+                .or_else(|| self.native_reply.take())
                 .or_else(|| self.cancel.take())
                 .or_else(|| self.ack.take())
                 .or_else(|| self.query.take())
@@ -378,9 +423,17 @@ impl Output {
 fn encode_packet(packet: &Packet, cap: usize) -> Result<Vec<u8>> {
     let binary = match &packet.body {
         Body::Call {
+            call: Call::PreviewStage(r),
+            ..
+        } => (!r.binary().is_empty()).then(|| r.binary()),
+        Body::Call {
             call: Call::PreviewIo(r),
             ..
         } => r.binary(),
+        Body::Reply {
+            outcome: Ok(Value::PreviewStage(r)),
+            ..
+        } => (!r.binary().is_empty()).then(|| r.binary()),
         Body::Reply {
             outcome: Ok(Value::PreviewIo(r)),
             ..
@@ -404,9 +457,17 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
         crate::catalog_session::preview_io::unpack(bytes, BYTES)?;
     match &mut packet.body {
         Body::Call {
+            call: Call::PreviewStage(r),
+            ..
+        } => r.set_binary(binary.to_vec())?,
+        Body::Call {
             call: Call::PreviewIo(r),
             ..
         } => r.set_binary(binary)?,
+        Body::Reply {
+            outcome: Ok(Value::PreviewStage(r)),
+            ..
+        } => r.set_binary(binary.to_vec())?,
         Body::Reply {
             outcome: Ok(Value::PreviewIo(r)),
             ..
@@ -455,6 +516,8 @@ enum ReadQuery {
     Store(u64, store::StatusQuery),
 }
 struct ParentState {
+    native_next: u64,
+    native_result: Option<(u64, crate::catalog_session::native::Query, Body)>,
     next: u64,
     queue: VecDeque<Pending>,
     active: Option<(u64, Arc<AtomicBool>, String)>,
@@ -482,6 +545,7 @@ type Observer = Arc<dyn Fn(&Call, bool) -> Result<()> + Send + Sync>;
 pub(super) struct Parent {
     pub binding: Binding,
     client: Arc<Client>,
+    native: Mutex<Option<Arc<super::native::Owner>>>,
     state: Mutex<ParentState>,
     wake: Condvar,
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -496,7 +560,10 @@ impl Parent {
                 epoch: client.epoch().clone(),
             },
             client,
+            native: Mutex::new(None),
             state: Mutex::new(ParentState {
+                native_next: 1,
+                native_result: None,
                 next: 1,
                 queue: VecDeque::new(),
                 active: None,
@@ -544,8 +611,12 @@ impl Parent {
                             owner.run()
                         }
                     }));
-                    if !matches!(result, Ok(Ok(()))) {
-                        owner.fail("filesystem relay owner failed; outcomes unknown");
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => owner.fail(format_args!(
+                            "filesystem relay owner failed; outcomes unknown: {error:#}"
+                        )),
+                        Err(_) => owner.fail("filesystem relay owner panicked; outcomes unknown"),
                     }
                 });
             match result {
@@ -560,13 +631,15 @@ impl Parent {
     }
     pub fn healthy(&self) -> Result<()> {
         let s = self.state.lock().unwrap();
-        ensure!(
-            s.fault.is_none(),
-            "filesystem relay startup/transport failed"
-        );
-        Ok(())
+        match &s.fault {
+            Some(fault) => Err(fault.clone().into_error()),
+            None => Ok(()),
+        }
     }
     pub fn fail(&self, error: impl std::fmt::Display) {
+        if let Ok(native) = self.native_owner() {
+            native.stop_all();
+        }
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let fault = Fault::new(error, true);
         s.fault.get_or_insert_with(|| fault.clone());
@@ -580,6 +653,9 @@ impl Parent {
         self.wake.notify_all();
     }
     pub fn closing(&self) {
+        if let Ok(native) = self.native_owner() {
+            native.stop_all();
+        }
         let mut s = self.state.lock().unwrap();
         s.closing = true;
         if let Some((_, cancel, _)) = &s.active {
@@ -597,6 +673,9 @@ impl Parent {
     }
     pub fn receive(&self, bytes: &[u8], lane: Lane) -> Result<()> {
         let body = decode(&self.binding, bytes, lane)?;
+        if self.receive_native(&body)? {
+            return Ok(());
+        }
         let mut s = self.state.lock().unwrap();
         match body {
             Body::Call { id, call } => {
@@ -884,7 +963,13 @@ impl Parent {
                     self.client.abandon_prepare(*operation, session)?;
                     Value::Unit
                 }
-                Call::Confirm(r) => Value::Confirmed(self.client.confirm_sql_admission(r, cancel)?),
+                Call::Confirm(r) => {
+                    let confirmed = self.client.confirm_sql_admission(r, cancel)?;
+                    if let Ok(native) = self.native_owner() {
+                        native.bind(&confirmed.root)?;
+                    }
+                    Value::Confirmed(confirmed)
+                }
                 Call::RestoreStatus(r) => Value::Restore(self.client.restore_status(r)?),
                 Call::Resume {
                     root,
@@ -896,8 +981,18 @@ impl Parent {
                     *acknowledge,
                 )?)),
                 Call::Release(r) => {
+                    if let Ok(native) = self.native_owner() {
+                        native.retire_root(r)?;
+                    }
                     self.client.release_root(r)?;
+                    if let Ok(native) = self.native_owner() {
+                        native.forget_released_root(r)?;
+                    }
                     Value::Unit
+                }
+                Call::Native(request) => Value::Native(self.native_owner()?.call(request)?),
+                Call::PreviewStage(request) => {
+                    Value::PreviewStage(self.client.preview_stage_call(request, cancel)?)
                 }
                 Call::PreviewIo(request) => {
                     Value::PreviewIo(self.client.preview_io_call(request, cancel)?)
@@ -928,7 +1023,8 @@ impl Parent {
                     if s.stop {
                         return Ok(());
                     }
-                    let phase = self.client.status().phase;
+                    let status = self.client.status();
+                    let phase = status.phase;
                     if !s.retiring
                         && s.fault.is_none()
                         && matches!(
@@ -939,7 +1035,15 @@ impl Parent {
                         )
                     {
                         drop(s);
-                        self.fail("filesystem owner failed; C must drain");
+                        if let Some(error) = status.error {
+                            self.fail(format_args!(
+                                "filesystem owner failed; C must drain: {error}"
+                            ));
+                        } else {
+                            self.fail(format_args!(
+                                "filesystem owner phase {phase:?}; C must drain"
+                            ));
+                        }
                         s = self.state.lock().unwrap();
                     }
                     if (store_turn || s.admission.is_none())
@@ -1006,6 +1110,9 @@ impl Parent {
     /// Only after C and every dependent native owner has been verified drained.
     /// F retirement releases any blocked F calls; only then can these threads join.
     pub fn finish_after_dependents(&self, terminate: bool) -> Result<()> {
+        if let Ok(native) = self.native_owner() {
+            native.finish_after_catalog()?;
+        }
         self.state.lock().unwrap().retiring = true;
         if terminate {
             self.client.terminate_after_dependents_drained()?;
@@ -1045,6 +1152,9 @@ struct StoreQuery {
     result: Option<std::result::Result<store::Status, Fault>>,
 }
 struct ChildState {
+    native_next: u64,
+    native_query: Option<native::Pending>,
+    native_dead: bool,
     next: u64,
     calls: Vec<ChildCall>,
     output: Output,
@@ -1069,6 +1179,9 @@ impl Proxy {
         Arc::new(Self {
             binding,
             state: Mutex::new(ChildState {
+                native_next: 1,
+                native_query: None,
+                native_dead: false,
                 next: 1,
                 calls: Vec::new(),
                 output: Output::default(),
@@ -1089,6 +1202,7 @@ impl Proxy {
     pub fn fail(&self, message: impl std::fmt::Display) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.fault.get_or_insert_with(|| Fault::new(message, true));
+        s.native_dead = true;
         self.wake.notify_all();
     }
     pub fn closing(&self) {
@@ -1097,6 +1211,9 @@ impl Proxy {
     }
     pub fn receive(&self, bytes: &[u8], lane: Lane) -> Result<()> {
         let body = decode(&self.binding, bytes, lane)?;
+        if self.receive_native_reply(&body)? {
+            return Ok(());
+        }
         let mut s = self.state.lock().unwrap();
         match body {
             Body::Control(Control::Failed(fault)) => {
@@ -1187,7 +1304,10 @@ impl Proxy {
             return Err(fault.clone().into_error());
         }
         ensure!(!s.closing || call.cleanup(), "filesystem relay closing");
-        ensure!(s.calls.len() < 2, "filesystem relay busy");
+        ensure!(
+            s.calls.len() < 2,
+            crate::preview::stage_io::Busy("filesystem relay busy")
+        );
         let id = s.next;
         let next = id.checked_add(1).context("relay ID exhausted")?;
         s.output.push(
@@ -1273,6 +1393,26 @@ impl Proxy {
     }
 }
 impl CatalogFilesystem for Proxy {
+    fn native(&self) -> Option<&dyn crate::catalog_session::native::CatalogNative> {
+        Some(self)
+    }
+    fn preview_stage_call(
+        &self,
+        request: &crate::catalog_session::preview_stage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::preview_stage::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch && !request.supervisor,
+            "stage relay authority"
+        );
+        match self.call(Call::PreviewStage(Box::new(request.clone())), cancel)? {
+            Value::PreviewStage(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected stage relay reply"),
+        }
+    }
     fn preview_io_call(
         &self,
         request: &crate::catalog_session::preview_io::Request,
@@ -1438,6 +1578,7 @@ fn unit(v: Value) -> Result<()> {
 
 fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
     match (call, value) {
+        (Call::Native(r), Value::Native(v)) => v.validate(&r.root, r.operation)?,
         (Call::Prepare(r), Value::Bootstrap(v)) => {
             v.validate()?;
             ensure!(
@@ -1451,6 +1592,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::Abandon { .. } | Call::Release(_), Value::Unit) => {}
         (Call::RestoreStatus(_), Value::Restore(_)) => {}
         (Call::PreviewIo(request), Value::PreviewIo(reply)) => reply.validate(request)?,
+        (Call::PreviewStage(request), Value::PreviewStage(reply)) => reply.validate(request)?,
         (Call::PreviewStore(request), Value::PreviewStore(reply)) => {
             store::validate_reply(request, reply)?
         }
@@ -1509,3 +1651,6 @@ mod tests;
 
 #[cfg(test)]
 mod store_tests;
+
+#[cfg(test)]
+mod preview_tests;

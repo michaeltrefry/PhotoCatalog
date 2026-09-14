@@ -11,6 +11,7 @@ pub mod lightroom;
 pub mod lightroom_bridge;
 pub mod metadata;
 pub mod organization;
+mod preview_delivery;
 pub mod relink;
 use crate::{
     Catalog,
@@ -979,6 +980,7 @@ impl Bridge {
 }
 
 struct Ticket {
+    read: Option<preview::ReadTicket>,
     dto: PreviewStatus,
     identity: crate::catalog_edits::EditRenderIdentity,
     consumer: Option<preview::Consumer>,
@@ -997,6 +999,7 @@ struct Open {
     catalog: Catalog,
     service: PreviewService,
     tickets: HashMap<String, Ticket>,
+    deliveries: preview_delivery::Queue,
     index_pending: bool,
     jobs_held: bool,
     import: Option<ImportTask>,
@@ -1081,6 +1084,9 @@ fn identity_equal(
 fn cancel_relink_consumers(open: &mut Open) {
     open.hydration.request_cancel();
     for ticket in open.tickets.values_mut() {
+        if let Some(read) = ticket.read.take() {
+            open.service.cancel_read(read);
+        }
         if let Some(consumer) = ticket.consumer.take() {
             let _ = open.service.cancel(consumer);
             ticket.dto.state = PreviewState::CancelRequested;
@@ -1284,8 +1290,12 @@ impl Actor {
                             reply,
                             ..
                         } => {
-                            let result = self.bytes(&catalog, &ticket, &e.cancel);
-                            let _ = reply.send(result);
+                            if self.managed.is_some() {
+                                self.enqueue_encoded_delivery(catalog, ticket, e.cancel, reply);
+                            } else {
+                                let result = self.bytes(&catalog, &ticket, &e.cancel);
+                                let _ = reply.send(result);
+                            }
                         }
                     }
                 }
@@ -1366,6 +1376,7 @@ impl Actor {
                 managed.close().map_err(native)?;
             }
             if !open.managed.as_ref().is_some_and(|m| m.sql_returned) {
+                open.deliveries.signal_shutdown(&mut open.service);
                 open.exports.signal_shutdown(&self.shared.exports);
                 open.service.signal_shutdown();
                 self.shared.relink.lock().unwrap().request_cancel();
@@ -1374,10 +1385,14 @@ impl Actor {
                     import.request_cancel_owned(&mut open.service);
                 }
                 for (_, t) in open.tickets.drain() {
+                    if let Some(read) = t.read {
+                        open.service.cancel_read(read);
+                    }
                     if let Some(c) = t.consumer {
                         let _ = open.service.cancel(c);
                     }
                 }
+                open.deliveries.shutdown(&mut open.service)?;
                 self.shared
                     .backups
                     .lock()
@@ -1617,6 +1632,7 @@ impl Actor {
                 catalog,
                 service,
                 tickets: HashMap::new(),
+                deliveries: preview_delivery::Queue::default(),
                 index_pending: true,
                 jobs_held,
                 import: None,
@@ -1759,6 +1775,7 @@ impl Actor {
                     catalog,
                     service,
                     tickets: HashMap::new(),
+                    deliveries: preview_delivery::Queue::default(),
                     index_pending: true,
                     jobs_held,
                     import: None,
@@ -2266,13 +2283,32 @@ impl Actor {
                     PreviewTier::Thumbnail => preview::Tier::Thumbnail,
                     PreviewTier::Large => preview::Tier::Large,
                 };
-                let cached = if interactive {
+                let read = if o.managed.is_some() {
+                    Some(core!(o.service.queue_read_variant(
+                        &o.catalog,
+                        &key,
+                        tier,
+                        false,
+                        if foreground {
+                            preview::Priority::Foreground
+                        } else {
+                            preview::Priority::Background
+                        },
+                        interactive
+                    )))
+                } else {
+                    None
+                };
+                let cached = if read.is_some() {
+                    None
+                } else if interactive {
                     core!(o.service.cached_interactive(&o.catalog, &key, tier, false))
                 } else {
                     core!(o.service.cached_variant(&o.catalog, &key, tier, false))
                 };
                 if (o.relink.write_hold() || o.exports.write_hold(&shared.exports))
                     && cached.is_none()
+                    && read.is_none()
                 {
                     return Err(error(
                         ErrorCode::Busy,
@@ -2287,7 +2323,9 @@ impl Actor {
                             crate::initial_hydration_source(&o.catalog.db, &key.asset_id, &path)
                                 .unwrap_or(false)
                         });
-                let (state, consumer, message) = if cached.is_some() {
+                let (state, consumer, message) = if read.is_some() {
+                    (PreviewState::Queued, None, None)
+                } else if cached.is_some() {
                     (PreviewState::Ready, None, None)
                 } else if needs_hydration {
                     (
@@ -2323,6 +2361,9 @@ impl Actor {
                     if let Some(c) = consumer {
                         core!(o.service.cancel(c));
                     }
+                    if let Some(read) = read {
+                        o.service.cancel_read(read);
+                    }
                     return Err(error(
                         ErrorCode::Superseded,
                         "viewport released during preview admission",
@@ -2342,13 +2383,14 @@ impl Actor {
                 o.tickets.insert(
                     id.clone(),
                     Ticket {
+                        read,
                         dto: dto.clone(),
                         identity,
                         consumer,
                         tier,
                         interactive,
                         foreground,
-                        hydration: needs_hydration && cached.is_none(),
+                        hydration: needs_hydration && cached.is_none() && read.is_none(),
                         touched: Instant::now(),
                         cancel: cancel.clone(),
                     },
@@ -2378,6 +2420,9 @@ impl Actor {
                     .tickets
                     .get_mut(&ticket)
                     .ok_or_else(|| error(ErrorCode::StaleSession, "preview ticket expired"))?;
+                if let Some(read) = t.read.take() {
+                    o.service.cancel_read(read);
+                }
                 if let Some(c) = t.consumer.take() {
                     core!(o.service.cancel(c));
                     t.dto.state = PreviewState::CancelRequested;
@@ -2477,6 +2522,7 @@ impl Actor {
         if o.closing {
             return;
         }
+        preview_delivery::advance(o, &self.shared, &self.config.preview_policy);
         let hold_since = o.exports.hold_since(&self.shared.exports);
         let prior_foreground = self
             .shared
@@ -2573,6 +2619,7 @@ impl Actor {
                     o.relink
                         .fail(&self.shared.relink, format!("draining previews: {e:#}"));
                 }
+                o.service.tick_read(&o.catalog);
                 if readers_drained
                     && o.service.native_work_drained()
                     && let Err(e) = o.relink.start_commit(&self.shared.relink)
@@ -2605,6 +2652,9 @@ impl Actor {
                     .ticket_foreground
                     .contains_key(&(o.token.clone(), id.clone()));
             if obsolete || t.cancel.is_canceled() || t.touched.elapsed() > ttl {
+                if let Some(read) = t.read.take() {
+                    o.service.cancel_read(read);
+                }
                 if let Some(c) = t.consumer.take() {
                     let _ = o.service.cancel(c);
                 }
@@ -2631,7 +2681,103 @@ impl Actor {
             self.shared.queue.lock().unwrap().status.message =
                 Some(format!("preview service: {e:#}"));
         }
+        o.service.tick_read(&o.catalog);
+        preview_delivery::advance(o, &self.shared, &self.config.preview_policy);
         for t in o.tickets.values_mut() {
+            if let Some(read) = t.read
+                && let Some(done) = o.service.take_read(read)
+            {
+                t.read = None;
+                let current = o.catalog.edit_render_identity(&t.dto.key);
+                if !current
+                    .as_ref()
+                    .is_ok_and(|v| identity_equal(v, &t.identity))
+                {
+                    t.dto.state = PreviewState::Stale;
+                    continue;
+                }
+                match done.outcome {
+                    preview::ReadOutcome::Ready(_) => {
+                        t.dto.state = PreviewState::Ready;
+                        t.dto.message = None;
+                    }
+                    preview::ReadOutcome::Stale => t.dto.state = PreviewState::Stale,
+                    preview::ReadOutcome::Failed {
+                        resource_limit,
+                        message,
+                    } => {
+                        t.dto.state = if resource_limit {
+                            PreviewState::NeedsResources
+                        } else {
+                            PreviewState::Failed
+                        };
+                        t.dto.message = Some(message);
+                    }
+                    preview::ReadOutcome::Missing => {
+                        if o.relink.write_hold() || o.exports.write_hold(&self.shared.exports) {
+                            t.dto.state = PreviewState::Unavailable;
+                            t.dto.message = Some(
+                                "catalog write hold; request original rendering after completion"
+                                    .into(),
+                            );
+                            continue;
+                        }
+                        let identity = current.unwrap();
+                        let hydration = identity.source.state == "pending"
+                            && identity.source.fingerprint.is_none()
+                            && o.catalog
+                                .preview_original_path(&t.dto.key.asset_id)
+                                .is_ok_and(|path| {
+                                    crate::initial_hydration_source(
+                                        &o.catalog.db,
+                                        &t.dto.key.asset_id,
+                                        &path,
+                                    )
+                                    .unwrap_or(false)
+                                });
+                        if hydration {
+                            t.hydration = true;
+                            t.dto.state = PreviewState::Queued;
+                            t.dto.message = Some("preparing original".into());
+                        } else if identity.source.state != "ready" {
+                            t.dto.state = PreviewState::Unavailable;
+                            t.dto.message =
+                                Some("original unavailable; no current retained preview".into());
+                        } else {
+                            let priority = if t.foreground {
+                                preview::Priority::Foreground
+                            } else {
+                                preview::Priority::Background
+                            };
+                            let request = if t.interactive {
+                                o.service.request_interactive(
+                                    &mut o.catalog,
+                                    &t.dto.key,
+                                    t.tier,
+                                    priority,
+                                )
+                            } else {
+                                o.service.request_variant(
+                                    &mut o.catalog,
+                                    &t.dto.key,
+                                    t.tier,
+                                    priority,
+                                )
+                            };
+                            match request {
+                                Ok(c) => {
+                                    t.consumer = Some(c);
+                                    t.dto.state = PreviewState::Queued;
+                                }
+                                Err(e) => {
+                                    t.dto.state = PreviewState::Failed;
+                                    t.dto.message = Some(e.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(c) = t.consumer {
                 if let Some(done) = o.service.take_completion(c) {
                     t.consumer = None;

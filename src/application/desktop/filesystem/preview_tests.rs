@@ -1,0 +1,604 @@
+//! Configured C/G/F/N preview routes. No export/import command is dispatched.
+use super::super::DesktopBridge;
+use super::{Call, Parent};
+use crate::application::{
+    Config, Limits, PreviewState, PreviewStatus, PreviewTier, Reply, Request, Response, U64,
+};
+use crate::catalog_edits::VariantKey;
+use crate::catalog_session::{RootCapability, native as n};
+use crate::filesystem_worker::client::Client;
+use crate::storage_volume::NativePath;
+use anyhow::{Context, Result, ensure};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+struct Observation {
+    root: RootCapability,
+    operation: U64,
+    pid: u32,
+    render: bool,
+}
+// Only held before C construction; no catalog or native request can exist yet.
+struct BeforeCatalog(Option<Arc<Parent>>);
+impl Drop for BeforeCatalog {
+    fn drop(&mut self) {
+        if let Some(parent) = self.0.take()
+            && let Err(orderly) = parent.finish_after_dependents(false)
+            && let Err(retained) = parent.finish_after_dependents(true)
+        {
+            // No C/N was admitted, so forced F retirement is legal here only.
+            eprintln!(
+                "pre-catalog fixture cleanup retained: orderly={orderly:#}; forced={retained:#}"
+            );
+            std::mem::forget(parent);
+        }
+    }
+}
+struct Running {
+    bridge: DesktopBridge,
+    parent: Arc<Parent>,
+    client: Arc<Client>,
+    observed: Arc<Mutex<Vec<Observation>>>,
+}
+fn command(bridge: &DesktopBridge, request: Request) -> Result<Response> {
+    let result = bridge
+        .submit(request)
+        .with_context(|| format!("configured command admission: {:?}", bridge.status()))?
+        .receiver
+        .recv_timeout(Duration::from_secs(30))?;
+    match result {
+        Reply::Ok { value } => Ok(value),
+        Reply::Error { error } => Err(error.into()),
+    }
+}
+impl Running {
+    fn start(
+        executable: &Path,
+        root: &Path,
+        originals: &Path,
+        small: bool,
+    ) -> Result<(Self, String)> {
+        Self::start_codec(
+            executable,
+            root,
+            originals,
+            small,
+            crate::preview::Codec::Jpeg,
+        )
+    }
+    fn start_codec(
+        executable: &Path,
+        root: &Path,
+        originals: &Path,
+        small: bool,
+        codec: crate::preview::Codec,
+    ) -> Result<(Self, String)> {
+        Self::start_options(executable, root, originals, small, codec, 1)
+    }
+    fn start_options(
+        executable: &Path,
+        root: &Path,
+        originals: &Path,
+        small: bool,
+        codec: crate::preview::Codec,
+        workers: usize,
+    ) -> Result<(Self, String)> {
+        ensure!((1..=2).contains(&workers), "fixture worker count");
+        let client = Arc::new(Client::spawn(
+            executable,
+            vec![NativePath::from_path(originals)],
+        )?);
+        let parent = Parent::new(client.clone());
+        let mut before_catalog = BeforeCatalog(Some(parent.clone()));
+        let limits = crate::preview::ServiceLimits {
+            workers,
+            working_bytes: if small {
+                2 * 1024 * 1024
+            } else {
+                128 * 1024 * 1024 * workers as u64
+            },
+            per_worker_bytes: if small { 64 * 1024 } else { 64 * 1024 * 1024 },
+            cache_header_scratch_bytes: 4096,
+            cache_codec_scratch_bytes: 64 * 1024,
+            encoded_staging_bytes: 8 * 1024 * 1024 * workers as u64,
+            per_worker_encoded_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut policy = crate::preview::PreviewPolicy::default();
+        policy.thumbnail.edge = 256;
+        policy.large.edge = 512;
+        policy.thumbnail.encoding.codec = codec;
+        policy.large.encoding.codec = codec;
+        let config = Config {
+            worker_executable: executable.to_owned(),
+            cache_root: None,
+            original_roots: vec![originals.to_owned()],
+            preview_policy: policy,
+            preview_limits: limits.clone(),
+            limits: Limits::default(),
+            import_checkpoint: None,
+        };
+        parent.configure_native(executable.to_owned(), limits)?;
+        let observed: Arc<Mutex<Vec<Observation>>> = Default::default();
+        let weak = Arc::downgrade(&parent);
+        let observations = observed.clone();
+        *parent.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
+            if after
+                && let Call::Native(request) = call
+                && let n::Action::Spawn { work, .. } = &request.action
+            {
+                let parent = weak.upgrade().context("fixture parent dropped")?;
+                let status = parent
+                    .native_owner()?
+                    .status(&request.root, request.operation)?;
+                if let Some(pid) = status.pid {
+                    let mut rows = observations.lock().unwrap();
+                    ensure!(rows.len() < 32, "fixture observation cap");
+                    rows.push(Observation {
+                        root: request.root.clone(),
+                        operation: request.operation,
+                        pid,
+                        render: matches!(work, n::Work::Render(_)),
+                    });
+                    eprintln!(
+                        "configured preview N pid={pid} operation={} render={}",
+                        request.operation.0,
+                        matches!(work, n::Work::Render(_))
+                    );
+                }
+            }
+            Ok(())
+        }));
+        config.validate()?;
+        // Validation passed while guarded; spawn_inner now owns C creation/retirement.
+        before_catalog.0.take();
+        let bridge = DesktopBridge::spawn_inner(config, Some(parent.clone()))?;
+        eprintln!(
+            "configured preview G={} C={} F={}",
+            std::process::id(),
+            bridge.status().pid,
+            client.pid()
+        );
+        let Response::Status(status) = command(
+            &bridge,
+            Request::OpenExisting {
+                path: NativePath::from_path(root),
+            },
+        )?
+        else {
+            anyhow::bail!("wrong open reply")
+        };
+        let token = status.catalog.context("missing catalog token")?;
+        Ok((
+            Self {
+                bridge,
+                parent,
+                client,
+                observed,
+            },
+            token,
+        ))
+    }
+    fn ready(&self, token: &str, key: &VariantKey, generation: u64) -> Result<PreviewStatus> {
+        let Response::Preview(mut status) = command(
+            &self.bridge,
+            Request::Preview {
+                catalog: token.into(),
+                key: key.clone(),
+                tier: PreviewTier::Thumbnail,
+                interactive: false,
+                viewport: "fixture".into(),
+                generation: U64(generation),
+                foreground: true,
+            },
+        )?
+        else {
+            anyhow::bail!("wrong preview reply")
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !matches!(status.state, PreviewState::Ready) {
+            ensure!(
+                matches!(status.state, PreviewState::Queued),
+                "preview failed: {:?} {:?}",
+                status.state,
+                status.message
+            );
+            ensure!(Instant::now() < deadline, "preview ready timeout");
+            thread::sleep(Duration::from_millis(5));
+            let Response::Preview(next) = command(
+                &self.bridge,
+                Request::PreviewStatus {
+                    catalog: token.into(),
+                    ticket: status.ticket,
+                },
+            )?
+            else {
+                anyhow::bail!("wrong status reply")
+            };
+            status = next;
+        }
+        Ok(status)
+    }
+    fn bytes(&self, token: &str, ticket: &str) -> Result<crate::application::PreviewBytes> {
+        Ok(self
+            .bridge
+            .preview_bytes(token.into(), ticket.into(), true)?
+            .receiver
+            .recv_timeout(Duration::from_secs(30))??)
+    }
+    fn finish(self, token: String) -> Result<()> {
+        command(&self.bridge, Request::Close { catalog: token })?;
+        self.bridge.try_shutdown()?;
+        self.parent.finish_after_dependents(false)?;
+        let owner = self.parent.native_owner()?;
+        for row in self.observed.lock().unwrap().iter() {
+            ensure!(
+                owner.status(&row.root, row.operation).is_err(),
+                "native operation retained after checked close"
+            );
+            #[cfg(unix)]
+            ensure!(
+                unsafe { libc::kill(row.pid as libc::pid_t, 0) } == -1,
+                "native PID remains live after checked retirement"
+            );
+            eprintln!(
+                "configured preview verified N pid={} retired after wait/pipe joins",
+                row.pid
+            );
+        }
+        eprintln!(
+            "configured preview verified C={} F={} checked retirement",
+            self.bridge.status().pid,
+            self.client.pid()
+        );
+        Ok(())
+    }
+}
+fn fixture() -> Result<(tempfile::TempDir, PathBuf, PathBuf, VariantKey, String)> {
+    let temp = tempfile::tempdir()?;
+    let base = temp.path().canonicalize()?;
+    let originals = base.join("originals");
+    std::fs::create_dir(&originals)?;
+    let path = originals.join("original.png");
+    let mut image = image::RgbImage::new(256, 256);
+    let mut state = 7u32;
+    for pixel in image.pixels_mut() {
+        for v in &mut pixel.0 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (state >> 24) as u8;
+        }
+    }
+    image.save(&path)?;
+    let checksum = blake3::hash(&std::fs::read(&path)?).to_hex().to_string();
+    let root = base.join("catalog");
+    let mut catalog = crate::Catalog::open(&root)?;
+    catalog.import(&originals, None, |_| Ok(()))?;
+    let key = VariantKey::master(catalog.browse(0, 1)?[0].id.clone());
+    // Import retains a legacy preview. Managed tickets request current output
+    // with allow_stale=false, so the empty current manifest forces Render N.
+    drop(catalog);
+    Ok((temp, root, originals, key, checksum))
+}
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual C/G/F/N fixture"]
+fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (_temp, root, originals, key, original) = fixture()?;
+    let (running, token) = Running::start(&executable, &root, &originals, false)?;
+    let status = running.ready(&token, &key, 1)?;
+    let bytes = running.bytes(&token, &status.ticket)?;
+    ensure!(
+        bytes.bytes().len() > 16 * 1024,
+        "fixture must span multiple F chunks"
+    );
+    let digest = blake3::hash(bytes.bytes());
+    drop(bytes);
+    ensure!(
+        running.observed.lock().unwrap().iter().any(|r| r.render),
+        "cold request did not render in N"
+    );
+    running.finish(token)?;
+    let (running, token) = Running::start(&executable, &root, &originals, true)?;
+    let cold = Instant::now();
+    let status = running.ready(&token, &key, 1)?;
+    let bytes = running.bytes(&token, &status.ticket)?;
+    ensure!(
+        blake3::hash(bytes.bytes()) == digest,
+        "cached encoded bytes changed"
+    );
+    drop(bytes);
+    let cold_elapsed = cold.elapsed();
+    let initial = running.observed.lock().unwrap().len();
+    ensure!(
+        initial > 0 && running.observed.lock().unwrap().iter().all(|r| !r.render),
+        "cold cache did not use DecodeEncoded only"
+    );
+    let warm = Instant::now();
+    for generation in 2..=9 {
+        let status = running.ready(&token, &key, generation)?;
+        let bytes = running.bytes(&token, &status.ticket)?;
+        ensure!(
+            blake3::hash(bytes.bytes()) == digest,
+            "warm encoded bytes changed"
+        );
+        drop(bytes);
+    }
+    ensure!(
+        running.observed.lock().unwrap().len() == initial,
+        "warm decoded hits launched N"
+    );
+    eprintln!(
+        "bounded cache batch cold_ms={} warm8_ms={} (not 200-preview performance acceptance)",
+        cold_elapsed.as_millis(),
+        warm.elapsed().as_millis()
+    );
+    running.finish(token)?;
+    ensure!(
+        blake3::hash(&std::fs::read(originals.join("original.png"))?)
+            .to_hex()
+            .as_str()
+            == original,
+        "original bytes changed"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum HeldRead {
+    Object(u64),
+    Stage(u64),
+}
+struct Hold {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: Option<std::sync::mpsc::SyncSender<()>>,
+}
+impl Hold {
+    fn install(running: &Running, kind: HeldRead) -> Self {
+        let original = running.parent.observer.lock().unwrap().clone();
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let gate = Mutex::new(Some((entered_tx, release_rx)));
+        *running.parent.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
+            if let Some(original) = &original {
+                original(call, after)?;
+            }
+            let matching = !after
+                && match (kind, call) {
+                    (HeldRead::Object(wanted), Call::PreviewIo(r)) => {
+                        matches!(&r.action,crate::catalog_session::preview_io::Action::Read{offset} if offset.0==wanted)
+                    }
+                    (HeldRead::Stage(wanted), Call::PreviewStage(r)) => {
+                        matches!(&r.action,crate::catalog_session::preview_stage::Action::Read{offset,..} if offset.0==wanted)
+                    }
+                    _ => false,
+                };
+            if matching && let Some((entered, release)) = gate.lock().unwrap().take() {
+                entered.send(())?;
+                release.recv()?;
+            }
+            Ok(())
+        }));
+        Self {
+            entered,
+            release: Some(release),
+        }
+    }
+    fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+fn request(
+    running: &Running,
+    token: &str,
+    key: &VariantKey,
+    generation: u64,
+) -> Result<PreviewStatus> {
+    match command(
+        &running.bridge,
+        Request::Preview {
+            catalog: token.into(),
+            key: key.clone(),
+            tier: PreviewTier::Thumbnail,
+            interactive: false,
+            viewport: "fixture".into(),
+            generation: U64(generation),
+            foreground: true,
+        },
+    )? {
+        Response::Preview(status) => Ok(status),
+        _ => anyhow::bail!("wrong preview request reply"),
+    }
+}
+fn held_status(running: &Running, token: &str, ticket: &str) -> Result<()> {
+    let pending = running.bridge.submit(Request::PreviewStatus {
+        catalog: token.into(),
+        ticket: ticket.into(),
+    })?;
+    let before = Instant::now();
+    let response = pending.receiver.recv_timeout(Duration::from_secs(1))?;
+    ensure!(
+        matches!(
+            response,
+            Reply::Ok {
+                value: Response::Preview(_)
+            }
+        ),
+        "status failed while F held"
+    );
+    eprintln!(
+        "configured held F C-status latency_ms={}",
+        before.elapsed().as_millis()
+    );
+    Ok(())
+}
+#[test]
+#[ignore = "requires explicitly configured built CLI; held C/G/F/N fixture"]
+fn actual_managed_first_and_middle_transfers_keep_actor_cancel_responsive() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    let (_temp, root, originals, key, original) = fixture()?;
+    let (warm, token) = Running::start(&executable, &root, &originals, false)?;
+    let status = warm.ready(&token, &key, 1)?;
+    let bytes = warm.bytes(&token, &status.ticket)?;
+    let digest = blake3::hash(bytes.bytes());
+    ensure!(bytes.bytes().len() > 16 * 1024, "multi-chunk fixture");
+    drop(bytes);
+    warm.finish(token)?;
+    let (running, token) = Running::start(&executable, &root, &originals, true)?;
+    let result = (|| -> Result<()> {
+        // First cache-object chunk, before native admission.
+        {
+            let mut hold = Hold::install(&running, HeldRead::Object(0));
+            let ticket = request(&running, &token, &key, 1)?;
+            hold.entered.recv_timeout(Duration::from_secs(30))?;
+            held_status(&running, &token, &ticket.ticket)?;
+            ensure!(
+                running.observed.lock().unwrap().is_empty(),
+                "N spawned before encoded input transfer"
+            );
+            command(
+                &running.bridge,
+                Request::CancelPreview {
+                    catalog: token.clone(),
+                    ticket: ticket.ticket,
+                },
+            )?;
+            hold.release();
+        }
+        // Middle verified RGB chunk after N has completed; C must still admit cancellation.
+        {
+            let mut hold = Hold::install(&running, HeldRead::Stage(16 * 1024));
+            let ticket = request(&running, &token, &key, 2)?;
+            hold.entered.recv_timeout(Duration::from_secs(30))?;
+            held_status(&running, &token, &ticket.ticket)?;
+            command(
+                &running.bridge,
+                Request::CancelPreview {
+                    catalog: token.clone(),
+                    ticket: ticket.ticket,
+                },
+            )?;
+            hold.release();
+        }
+        let ticket = running.ready(&token, &key, 3)?;
+        // Ready-ticket encoded delivery is a distinct task and binary envelope.
+        {
+            let mut hold = Hold::install(&running, HeldRead::Object(16 * 1024));
+            let pending =
+                running
+                    .bridge
+                    .preview_bytes(token.clone(), ticket.ticket.clone(), true)?;
+            hold.entered.recv_timeout(Duration::from_secs(30))?;
+            held_status(&running, &token, &ticket.ticket)?;
+            pending.cancellation().cancel();
+            hold.release();
+            let canceled = pending.receiver.recv_timeout(Duration::from_secs(30))?;
+            ensure!(
+                matches!(
+                    canceled,
+                    Err(crate::application::BridgeError {
+                        code: crate::application::ErrorCode::Canceled,
+                        ..
+                    })
+                ),
+                "byte cancellation category"
+            );
+        }
+        let bytes = running.bytes(&token, &ticket.ticket)?;
+        ensure!(
+            blake3::hash(bytes.bytes()) == digest,
+            "cancellation invalidated or changed cache"
+        );
+        drop(bytes);
+        Ok(())
+    })();
+    let retirement = running.finish(token);
+    result?;
+    retirement?;
+    ensure!(
+        blake3::hash(&std::fs::read(originals.join("original.png"))?)
+            .to_hex()
+            .as_str()
+            == original,
+        "original bytes changed"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual C/G/F/N codec fixture"]
+fn actual_managed_webp_avif_render_and_cold_cache_delivery() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    for (codec, mime) in [
+        (crate::preview::Codec::Webp, "image/webp"),
+        (crate::preview::Codec::Avif, "image/avif"),
+    ] {
+        let (_temp, root, originals, key, original) = fixture()?;
+        let (running, token) = Running::start_codec(&executable, &root, &originals, false, codec)?;
+        let status = running.ready(&token, &key, 1)?;
+        let bytes = running.bytes(&token, &status.ticket)?;
+        ensure!(
+            bytes.mime == mime && !bytes.bytes().is_empty(),
+            "wrong codec delivery"
+        );
+        let digest = blake3::hash(bytes.bytes());
+        drop(bytes);
+        ensure!(
+            running
+                .observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|row| row.render),
+            "codec cold request did not render in N"
+        );
+        running.finish(token)?;
+        let (running, token) = Running::start_codec(&executable, &root, &originals, true, codec)?;
+        let status = running.ready(&token, &key, 1)?;
+        let bytes = running.bytes(&token, &status.ticket)?;
+        ensure!(
+            bytes.mime == mime && blake3::hash(bytes.bytes()) == digest,
+            "cold codec bytes changed"
+        );
+        drop(bytes);
+        let observed = running.observed.lock().unwrap();
+        ensure!(
+            !observed.is_empty() && observed.iter().all(|row| !row.render),
+            "codec cache did not use DecodeEncoded only"
+        );
+        drop(observed);
+        running.finish(token)?;
+        ensure!(
+            blake3::hash(&std::fs::read(originals.join("original.png"))?)
+                .to_hex()
+                .as_str()
+                == original,
+            "original bytes changed"
+        );
+        eprintln!(
+            "configured codec {codec:?}: Render, N header/decode, encoded delivery and checked C/F/N retirement verified"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+mod abnormal_tests;

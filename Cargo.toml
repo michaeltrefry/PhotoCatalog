@@ -10,6 +10,9 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
+# Match the image backend versions so decode errors retain typed categories.
+image-webp = "=0.2.4"
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 lcms2 = { version = "6", features = ["static"] }
 flate2 = "1"
 png = "=0.18.1"

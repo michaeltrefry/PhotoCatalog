@@ -2573,6 +2573,7 @@ dependencies = [
  "flate2",
  "fs2",
  "image",
+ "image-webp",
  "kamadak-exif",
  "lcms2",
  "libc",
@@ -2589,6 +2590,7 @@ dependencies = [
  "vcpkg",
  "walkdir",
  "xmp_toolkit",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

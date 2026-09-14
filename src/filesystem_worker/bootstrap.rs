@@ -44,6 +44,7 @@ struct RootRecord {
     manifest_directory: File,
     store: super::store::StoreOwner,
     objects: super::preview_io::ObjectOwner,
+    stages: super::preview_stage::Owner,
 }
 struct ManifestLock(File);
 impl ManifestLock {
@@ -249,6 +250,7 @@ impl BootstrapOwner {
             manifest_directory: open_directory(&manifest_root)?,
             store: super::store::StoreOwner::default(),
             objects: super::preview_io::ObjectOwner::default(),
+            stages: super::preview_stage::Owner::default(),
         };
         record.verify_root_binding()?;
         self.record = Some(record);
@@ -320,6 +322,10 @@ impl BootstrapOwner {
                 &record.bootstrap.root_capability() == root,
                 "root belongs to another session"
             );
+            ensure!(
+                record.stages.empty(),
+                "worker stages/native/output owners have not drained"
+            );
             record.objects.drain();
             record.store.release()?;
             record.manifest_lock.release()?;
@@ -343,6 +349,37 @@ impl BootstrapOwner {
         self.with_root(root, |path| catalog_backup::restore_status(path))
     }
 
+    pub fn stage_call(
+        &mut self,
+        request: &crate::catalog_session::preview_stage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::preview_stage::Reply> {
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "stage custody requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("stage catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "stage session mismatch"
+        );
+        record.verify_root_binding()?;
+        let database = record.bootstrap.manifest.path.to_path()?;
+        let manifest = database.parent().context("manifest parent")?;
+        ensure!(
+            physical_object_id(&record.manifest_directory)?
+                == physical_object_id(&open_directory(manifest)?)?,
+            "stage manifest directory changed"
+        );
+        let result = record.stages.call(manifest, request, cancel);
+        record.verify_root_binding()?;
+        result
+    }
     pub fn preview_io_call(
         &mut self,
         request: &crate::catalog_session::preview_io::Request,

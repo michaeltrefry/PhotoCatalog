@@ -4,6 +4,7 @@ use crate::catalog_session::{CatalogFilesystem, RootCapability, store as wire};
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 pub(crate) struct ManagedFiles {
+    stages: Arc<super::super::stage_io::Calls>,
     filesystem: Arc<dyn CatalogFilesystem>,
     root: RootCapability,
     manifest: crate::storage_volume::NativePath,
@@ -42,7 +43,9 @@ impl ManagedFiles {
         manifest: crate::storage_volume::NativePath,
         cancel: Arc<AtomicBool>,
     ) -> Arc<Self> {
+        let stages = super::super::stage_io::Calls::new(filesystem.clone(), root.clone(), false);
         Arc::new(Self {
+            stages,
             filesystem,
             root,
             manifest,
@@ -157,6 +160,9 @@ impl ManagedFiles {
     }
 }
 impl AdmittedStoreFiles for ManagedFiles {
+    fn stage_calls(&self) -> Option<Arc<super::super::stage_io::Calls>> {
+        Some(self.stages.clone())
+    }
     #[cfg(test)]
     fn cache_status(&self) -> Result<crate::catalog_session::store::Status> {
         self.filesystem
@@ -186,6 +192,14 @@ impl AdmittedStoreFiles for ManagedFiles {
         allowance: u64,
     ) -> Result<(crate::catalog_session::preview_io::Integrity, Vec<u8>)> {
         self.object_read(expected, allowance)
+    }
+    fn cache_read_cancel(
+        &self,
+        expected: crate::catalog_session::preview_io::Expected,
+        allowance: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(crate::catalog_session::preview_io::Integrity, Vec<u8>)> {
+        self.object_read_cancel(expected, allowance, cancel)
     }
     fn cache_write(
         &self,

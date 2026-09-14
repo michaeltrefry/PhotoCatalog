@@ -51,6 +51,16 @@ pub struct Completion {
     /// must not remove that replacement's descriptor or recovery journal.
     pub superseded: bool,
 }
+pub(crate) struct NativeReadRequest {
+    pub id: u64,
+    pub preempted: Arc<AtomicBool>,
+}
+struct NativeRead {
+    priority: Priority,
+    cost: u64,
+    lease: Option<u64>,
+    preempted: Arc<AtomicBool>,
+}
 struct Job {
     key: String,
     cost: u64,
@@ -78,6 +88,7 @@ pub struct PreviewScheduler {
     keys: HashMap<String, u64>,
     consumers: HashMap<Consumer, u64>,
     reserved: u64,
+    external: HashMap<u64, NativeRead>,
 }
 impl PreviewScheduler {
     pub fn new(limits: SchedulerLimits) -> Result<Self> {
@@ -96,7 +107,124 @@ impl PreviewScheduler {
             keys: HashMap::new(),
             consumers: HashMap::new(),
             reserved: 0,
+            external: HashMap::new(),
         })
+    }
+    /// Register before the actor selects more background renders, including
+    /// while F is resolving the encoded object and its eventual native cost.
+    pub(crate) fn queue_native_read(&mut self, priority: Priority) -> Result<NativeReadRequest> {
+        ensure!(
+            self.consumers.len() + self.external.len() < self.limits.requests,
+            "preview request queue full"
+        );
+        let id = self.serial()?;
+        let preempted = Arc::new(AtomicBool::new(false));
+        self.external.insert(
+            id,
+            NativeRead {
+                priority,
+                cost: 0,
+                lease: None,
+                preempted: preempted.clone(),
+            },
+        );
+        self.preempt_background();
+        Ok(NativeReadRequest { id, preempted })
+    }
+    fn read_cost(&self, cost: u64) -> Result<()> {
+        ensure!(
+            cost > 0 && cost <= self.limits.working_bytes,
+            crate::catalog_session::store::ResourceLimit(
+                "Encoded preview exceeds native working allowance; increase it and retry"
+            )
+        );
+        Ok(())
+    }
+    /// The request keeps its queue age; every native attempt gets a fresh
+    /// lease so a delayed predecessor release cannot retire its successor.
+    pub(crate) fn admit_native_read(&mut self, request: u64, cost: u64) -> Result<Option<u64>> {
+        self.read_cost(cost)?;
+        let read = self
+            .external
+            .get_mut(&request)
+            .ok_or_else(|| anyhow::anyhow!("native read request missing"))?;
+        ensure!(read.lease.is_none(), "native read already admitted");
+        read.cost = cost;
+        self.preempt_background();
+        if self.usage().active >= self.limits.workers
+            || cost > self.limits.working_bytes - self.reserved
+            || self
+                .front()
+                .is_none_or(|(_, id, native)| !native || id != request)
+        {
+            return Ok(None);
+        }
+        let lease = self.serial()?;
+        self.external.get_mut(&request).unwrap().lease = Some(lease);
+        self.reserved += cost;
+        Ok(Some(lease))
+    }
+    pub(crate) fn upgrade_native_read(&mut self, id: u64, cost: u64) -> Result<bool> {
+        self.read_cost(cost)?;
+        let request = self.read_request(id)?;
+        let old = self.external[&request].cost;
+        if cost > self.limits.working_bytes - (self.reserved - old) {
+            return Ok(false);
+        }
+        self.reserved = self.reserved - old + cost;
+        self.external.get_mut(&request).unwrap().cost = cost;
+        Ok(true)
+    }
+    fn read_request(&self, lease: u64) -> Result<u64> {
+        self.external
+            .iter()
+            .find_map(|(id, read)| (read.lease == Some(lease)).then_some(*id))
+            .ok_or_else(|| anyhow::anyhow!("native read lease missing"))
+    }
+    /// Only after native wait and transport joins. A full-cost retry retains
+    /// the original queue age and priority but no longer owns the old worker.
+    pub(crate) fn requeue_native_read(&mut self, lease: u64, cost: u64) -> Result<()> {
+        self.read_cost(cost)?;
+        let request = self.read_request(lease)?;
+        let read = self.external.get_mut(&request).unwrap();
+        self.reserved -= read.cost;
+        read.lease = None;
+        read.cost = cost;
+        read.preempted.store(false, Ordering::Release);
+        self.preempt_background();
+        Ok(())
+    }
+    /// Remove a hit, miss or canceled request that never acquired a native
+    /// lease. Active requests require checked drain and release instead.
+    pub(crate) fn cancel_queued_native_read(&mut self, request: u64) -> Result<()> {
+        let read = self
+            .external
+            .get(&request)
+            .ok_or_else(|| anyhow::anyhow!("native read request missing"))?;
+        ensure!(read.lease.is_none(), "native read owner remains active");
+        self.external.remove(&request);
+        Ok(())
+    }
+    pub(crate) fn release_native_read(&mut self, id: u64) -> Result<()> {
+        let request = self.read_request(id)?;
+        let read = self.external.remove(&request).unwrap();
+        self.reserved -= read.cost;
+        Ok(())
+    }
+    /// One order for Render and native cache work. A registered read whose
+    /// byte cost is still being resolved keeps its place without reserving RAM.
+    fn front(&self) -> Option<(Priority, u64, bool)> {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| !job.running && !job.canceled.load(Ordering::Acquire))
+            .map(|(id, job)| (job.priority(), *id, false))
+            .chain(
+                self.external
+                    .iter()
+                    .filter(|(_, read)| read.lease.is_none())
+                    .map(|(id, read)| (read.priority, *id, true)),
+            )
+            .min_by_key(|(priority, id, _)| (std::cmp::Reverse(*priority), *id))
     }
     fn serial(&mut self) -> Result<u64> {
         let value = self.next;
@@ -116,7 +244,7 @@ impl PreviewScheduler {
             "request exceeds worker allowance"
         );
         ensure!(
-            self.consumers.len() < self.limits.requests,
+            self.consumers.len() + self.external.len() < self.limits.requests,
             "preview request queue full"
         );
         let consumer = Consumer(self.serial()?);
@@ -157,23 +285,53 @@ impl PreviewScheduler {
     fn preempt_background(&mut self) {
         // Native calls can be uninterruptible. The owner observes this token,
         // terminates an isolated background worker and calls finished after wait.
-        let active = self.jobs.values().filter(|job| job.running).count();
-        let foreground = self
-            .jobs
-            .iter()
-            .filter(|(_, job)| !job.running && job.priority() == Priority::Foreground)
-            .min_by_key(|(id, _)| **id)
-            .map(|(_, job)| job.cost);
+        let active = self.usage().active;
+        let foreground_request = self
+            .front()
+            .filter(|(priority, _, _)| *priority == Priority::Foreground);
+        // ReadQueue owns one header/transfer candidate. A background cache
+        // read must yield that candidate even when a render slot is still free.
+        if foreground_request.is_some_and(|(_, _, native)| native)
+            && let Some((_, read)) = self
+                .external
+                .iter()
+                .filter(|(_, read)| read.lease.is_some() && read.priority == Priority::Background)
+                .min_by_key(|(id, _)| **id)
+        {
+            read.preempted.store(true, Ordering::Release);
+            return;
+        }
+        let foreground = foreground_request.map(|(_, id, native)| {
+            if native {
+                self.external[&id].cost
+            } else {
+                self.jobs[&id].cost
+            }
+        });
         if foreground.is_some_and(|cost| {
             active >= self.limits.workers || cost > self.limits.working_bytes - self.reserved
-        }) && let Some((_, job)) = self
+        }) && let Some((id, native)) = self
             .jobs
-            .iter_mut()
+            .iter()
             .filter(|(_, job)| job.running && job.priority() == Priority::Background)
-            .min_by_key(|(id, _)| **id)
+            .map(|(id, _)| (*id, false))
+            .chain(
+                self.external
+                    .iter()
+                    .filter(|(_, read)| {
+                        read.lease.is_some() && read.priority == Priority::Background
+                    })
+                    .map(|(id, _)| (*id, true)),
+            )
+            .min_by_key(|(id, _)| *id)
         {
-            job.preempted = true;
-            job.canceled.store(true, Ordering::Release);
+            if native {
+                self.external[&id].preempted.store(true, Ordering::Release);
+            } else {
+                let job = self.jobs.get_mut(&id).unwrap();
+                job.preempted = true;
+                job.canceled.store(true, Ordering::Release);
+            }
         }
     }
     pub fn cancel(&mut self, consumer: Consumer) -> bool {
@@ -202,16 +360,10 @@ impl PreviewScheduler {
     }
     pub fn next_ready(&mut self) -> Result<Option<WorkLease>> {
         self.preempt_background();
-        if self.jobs.values().filter(|job| job.running).count() >= self.limits.workers {
+        if self.usage().active >= self.limits.workers {
             return Ok(None);
         }
-        let Some(id) = self
-            .jobs
-            .iter()
-            .filter(|(_, job)| !job.running && !job.canceled.load(Ordering::Acquire))
-            .min_by_key(|(id, job)| (std::cmp::Reverse(job.priority()), **id))
-            .map(|(id, _)| *id)
-        else {
+        let Some((_, id, false)) = self.front() else {
             return Ok(None);
         };
         if self.jobs[&id].cost > self.limits.working_bytes - self.reserved {
@@ -272,10 +424,20 @@ impl PreviewScheduler {
         })
     }
     pub fn usage(&self) -> SchedulerUsage {
-        let active = self.jobs.values().filter(|job| job.running).count();
+        let active = self.jobs.values().filter(|job| job.running).count()
+            + self
+                .external
+                .values()
+                .filter(|read| read.lease.is_some())
+                .count();
         SchedulerUsage {
-            consumers: self.consumers.len(),
-            queued: self.jobs.len() - active,
+            consumers: self.consumers.len() + self.external.len(),
+            queued: self.jobs.values().filter(|job| !job.running).count()
+                + self
+                    .external
+                    .values()
+                    .filter(|read| read.lease.is_none())
+                    .count(),
             active,
             reserved_bytes: self.reserved,
         }
@@ -387,3 +549,6 @@ mod tests {
         assert_eq!(queue.usage().queued, 1);
     }
 }
+
+#[cfg(test)]
+mod fs8_tests;

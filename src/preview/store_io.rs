@@ -60,19 +60,29 @@ impl Calls {
         Ok(request)
     }
     fn call(&mut self, owner: &ManagedFiles, action: Action) -> Result<Value> {
+        self.call_cancel(owner, action, &owner.cancel)
+    }
+    fn call_cancel(
+        &mut self,
+        owner: &ManagedFiles,
+        action: Action,
+        cancel: &AtomicBool,
+    ) -> Result<Value> {
         let request = self.request(owner, action)?;
         owner
             .object_operation
             .store(request.operation.0, std::sync::atomic::Ordering::Release);
         let uncanceled = AtomicBool::new(false);
-        let result = owner.filesystem.preview_io_call(
-            &request,
-            if request.cleanup() {
-                &uncanceled
-            } else {
-                &owner.cancel
-            },
-        );
+        let result = crate::preview::stage_io::retry_busy(|| {
+            owner.filesystem.preview_io_call(
+                &request,
+                if request.cleanup() {
+                    &uncanceled
+                } else {
+                    cancel
+                },
+            )
+        });
         match result {
             Ok(reply) => {
                 reply.validate(&request)?;
@@ -196,6 +206,14 @@ impl ManagedFiles {
         expected: Expected,
         allowance: u64,
     ) -> Result<(Integrity, Vec<u8>)> {
+        self.object_read_cancel(expected, allowance, &self.cancel)
+    }
+    pub(super) fn object_read_cancel(
+        &self,
+        expected: Expected,
+        allowance: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(Integrity, Vec<u8>)> {
         let mut calls = self.objects.lock().unwrap_or_else(|p| p.into_inner());
         // An earlier failed read never authorizes mutation or buffer publication.
         if calls.pending.as_ref().is_some_and(|p| {
@@ -207,12 +225,13 @@ impl ManagedFiles {
             calls.abort(self)?;
         }
         let result = (|| -> Result<(Integrity, Vec<u8>)> {
-            let Value::Integrity(state) = calls.call(
+            let Value::Integrity(state) = calls.call_cancel(
                 self,
                 Action::BeginRead {
                     expected: expected.clone(),
                     allowance: U64(allowance),
                 },
+                cancel,
             )?
             else {
                 anyhow::bail!("wrong read begin reply")
@@ -225,11 +244,12 @@ impl ManagedFiles {
             let mut output = Vec::new();
             output.try_reserve_exact(length)?;
             while output.len() < length {
-                let value = calls.call(
+                let value = calls.call_cancel(
                     self,
                     Action::Read {
                         offset: U64(output.len() as u64),
                     },
+                    cancel,
                 )?;
                 let bytes = match value {
                     Value::Chunk { bytes, .. } => bytes,
@@ -245,7 +265,7 @@ impl ManagedFiles {
                 output.extend_from_slice(&bytes);
             }
             if matches!(
-                calls.call(self, Action::Finish)?,
+                calls.call_cancel(self, Action::Finish, cancel)?,
                 Value::Integrity(Integrity::Corrupt)
             ) {
                 return Ok((Integrity::Corrupt, vec![]));
@@ -265,7 +285,7 @@ impl ManagedFiles {
                     .downcast_ref::<Failure>()
                     .is_some_and(|f| f.kind == FailureKind::ResourceLimit) =>
             {
-                Err(crate::preview::EncodedBudgetExceeded.into())
+                Err(error.context(crate::preview::EncodedBudgetExceeded))
             }
             value => value,
         }
@@ -543,6 +563,29 @@ mod tests {
             assert_eq!(requests[2].as_ref().unwrap().operation, U64(2));
             assert_eq!(fake.count.load(Ordering::SeqCst), 3);
         }
+        Ok(())
+    }
+    #[test]
+    fn cache_resource_diagnostic_preserves_typed_failure_and_admission_category() -> Result<()> {
+        let fake = Arc::new(Fake {
+            count: AtomicUsize::new(2),
+            requests: Mutex::new(std::array::from_fn(|_| None)),
+            replay: None,
+        });
+        let (_directory, adapter, expected) = read_adapter(fake.clone())?;
+        let error = adapter.object_read(expected, 3).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::preview::EncodedBudgetExceeded>()
+                .is_some()
+        );
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::ResourceLimit
+        );
+        assert!(format!("{error:#}").contains("known no-effect admission"));
+        assert!(adapter.objects.lock().unwrap().pending.is_none());
+        assert_eq!(fake.count.load(Ordering::SeqCst), 3);
         Ok(())
     }
     #[test]
