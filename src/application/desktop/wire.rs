@@ -9,7 +9,7 @@ pub(super) const CONFIG_BYTES: usize = 4 * 1024 * 1024;
 // reply budget is smaller than a serialized ResourceLimit error.
 pub(super) const ERROR_BYTES: usize = 1024;
 const HEADER: usize = 48;
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -27,6 +27,13 @@ pub(super) enum Kind {
     BinaryChunk = 11,
     BinaryEnd = 12,
     DrainError = 13,
+    Filesystem = 14,
+    FilesystemControl = 15,
+    Drained = 16,
+    DrainAck = 17,
+    FilesystemAdmission = 18,
+    #[cfg(test)]
+    Fixture = 250,
 }
 impl Kind {
     fn decode(v: u8) -> std::io::Result<Self> {
@@ -44,6 +51,13 @@ impl Kind {
             11 => Ok(Self::BinaryChunk),
             12 => Ok(Self::BinaryEnd),
             13 => Ok(Self::DrainError),
+            14 => Ok(Self::Filesystem),
+            15 => Ok(Self::FilesystemControl),
+            16 => Ok(Self::Drained),
+            17 => Ok(Self::DrainAck),
+            18 => Ok(Self::FilesystemAdmission),
+            #[cfg(test)]
+            250 => Ok(Self::Fixture),
             _ => Err(invalid("unknown desktop frame kind")),
         }
     }
@@ -198,6 +212,9 @@ impl Assembly {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ConfigWire {
+    pub filesystem: Option<super::filesystem::Binding>,
+    #[cfg(test)]
+    pub fixture: Option<super::filesystem_tests::Fixture>,
     build: String,
     executable: NativePath,
     cache: Option<NativePath>,
@@ -211,6 +228,14 @@ pub(super) fn build_identity() -> String {
         concat!(
             env!("CARGO_PKG_VERSION"),
             include_str!("wire.rs"),
+            include_str!("filesystem.rs"),
+            include_str!("../../catalog_session.rs"),
+            include_str!("../../catalog_session/roles.rs"),
+            include_str!("../../filesystem_worker.rs"),
+            include_str!("../../filesystem_worker/bootstrap.rs"),
+            include_str!("../../filesystem_worker/client.rs"),
+            include_str!("../../filesystem_worker/process.rs"),
+            include_str!("../../filesystem_worker/wire.rs"),
             include_str!("process.rs"),
             include_str!("../desktop.rs"),
             include_str!("../../application.rs"),
@@ -232,6 +257,9 @@ pub(super) fn build_identity() -> String {
 impl ConfigWire {
     pub fn from_config(c: &Config) -> Self {
         Self {
+            filesystem: None,
+            #[cfg(test)]
+            fixture: None,
             build: build_identity(),
             executable: NativePath::from_path(&c.worker_executable),
             cache: c.cache_root.as_deref().map(NativePath::from_path),
@@ -312,5 +340,14 @@ impl Seen {
             return Err(invalid("request gap budget exceeded"));
         }
         Ok(())
+    }
+}
+
+pub(super) fn ready_bytes(filesystem: Option<&super::filesystem::Binding>) -> Vec<u8> {
+    match filesystem {
+        None => build_identity().into_bytes(),
+        Some(binding) => {
+            serde_json::to_vec(&(build_identity(), binding)).expect("fixed handshake serialization")
+        }
     }
 }

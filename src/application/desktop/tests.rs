@@ -25,9 +25,13 @@ pub(super) fn shared(cap: usize) -> Arc<Shared> {
             reaped: false,
             child_finished: false,
             local_verified: false,
+            filesystem_verified: true,
+            child_exit: None,
         }),
         wake: Condvar::new(),
         binary: Arc::new(AtomicUsize::new(0)),
+        filesystem: None,
+        fixture: Mutex::new(None),
     })
 }
 
@@ -133,7 +137,7 @@ fn frame_header_rejects_future_version_and_size_before_payload_read() {
         .write([9; 16], &mut bytes)
         .unwrap();
     let mut future = bytes.clone();
-    future[4] = 2;
+    future[4] = future[4].checked_add(1).unwrap();
     let mut input = Cursor::new(future);
     assert!(Frame::read(&mut input).is_err());
     assert_eq!(input.position(), 48);

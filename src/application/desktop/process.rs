@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use std::{
     io::{Read, Write},
     process::{Child, Command, Stdio},
@@ -6,6 +7,74 @@ use std::{
 };
 use wire::{Assembly, BinaryHeader, Frame, Seen};
 
+struct RelayOutput {
+    out: filesystem::Out,
+    offset: usize,
+}
+impl RelayOutput {
+    fn frame(&mut self, session: [u8; 16]) -> Frame {
+        let end = (self.offset + wire::CHUNK).min(self.out.bytes.len());
+        let frame = Frame {
+            kind: match self.out.lane {
+                filesystem::Lane::Control => Kind::FilesystemControl,
+                filesystem::Lane::Data => Kind::Filesystem,
+                filesystem::Lane::Admission => Kind::FilesystemAdmission,
+            },
+            session,
+            id: 0,
+            offset: self.offset,
+            total: self.out.bytes.len(),
+            payload: self.out.bytes[self.offset..end].to_vec(),
+        };
+        self.offset = end;
+        frame
+    }
+    fn done(&self) -> bool {
+        self.offset == self.out.bytes.len()
+    }
+}
+#[derive(Default)]
+struct RelayAssembly {
+    data: Option<Assembly>,
+    admission: Option<Assembly>,
+}
+impl RelayAssembly {
+    fn incomplete(&self) -> bool {
+        self.data.is_some() || self.admission.is_some()
+    }
+}
+fn relay_input(
+    active: &mut RelayAssembly,
+    f: Frame,
+) -> anyhow::Result<Option<(Vec<u8>, filesystem::Lane)>> {
+    anyhow::ensure!(f.id == 0, "filesystem frame envelope identity");
+    let lane = match f.kind {
+        Kind::FilesystemControl => filesystem::Lane::Control,
+        Kind::Filesystem => filesystem::Lane::Data,
+        Kind::FilesystemAdmission => filesystem::Lane::Admission,
+        _ => anyhow::bail!("unexpected relay frame"),
+    };
+    if lane == filesystem::Lane::Control {
+        anyhow::ensure!(
+            f.offset == 0 && f.total == f.payload.len() && f.total <= filesystem::CONTROL_BYTES,
+            "filesystem control frame bounds"
+        );
+        return Ok(Some((f.payload, lane)));
+    }
+    let slot = if lane == filesystem::Lane::Admission {
+        &mut active.admission
+    } else {
+        &mut active.data
+    };
+    let a = match slot.as_mut() {
+        Some(a) => a,
+        None => slot.insert(Assembly::start(&f, filesystem::BYTES)?),
+    };
+    if !a.push(f)? {
+        return Ok(None);
+    }
+    Ok(Some((slot.take().unwrap().finish().2, lane)))
+}
 type IoThreads = Vec<thread::JoinHandle<()>>;
 type DrainResult = (Option<Child>, IoThreads);
 /// Remove the owned process only after an affirmative OS wait result.
@@ -23,6 +92,8 @@ pub(super) struct Owner {
     supervisor: Option<thread::JoinHandle<DrainResult>>,
     shared: Arc<Shared>,
     pid: u32,
+    #[cfg(test)]
+    fixture_child: Option<Arc<Mutex<Option<Child>>>>,
 }
 fn finish_wait(shared: &Shared, status: std::process::ExitStatus, threads: IoThreads) {
     if !status.success() {
@@ -30,7 +101,11 @@ fn finish_wait(shared: &Shared, status: std::process::ExitStatus, threads: IoThr
             "desktop process exited {status}; unacknowledged outcomes unknown"
         ));
     }
-    shared.state.lock().unwrap().reaped = true;
+    {
+        let mut s = shared.state.lock().unwrap();
+        s.reaped = true;
+        s.child_exit = status.code();
+    }
     shared.wake.notify_all();
     for thread in threads {
         if thread.join().is_err() {
@@ -49,8 +124,23 @@ impl Owner {
         shared: Arc<Shared>,
         hello: Vec<u8>,
     ) -> anyhow::Result<Self> {
+        Self::spawn_configured(
+            executable,
+            &[std::ffi::OsString::from("--catalog-desktop-worker")],
+            shared,
+            hello,
+            false,
+        )
+    }
+    fn spawn_configured(
+        executable: &std::path::Path,
+        args: &[std::ffi::OsString],
+        shared: Arc<Shared>,
+        hello: Vec<u8>,
+        harness: bool,
+    ) -> anyhow::Result<Self> {
         let mut child = Command::new(executable)
-            .arg("--catalog-desktop-worker")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -65,6 +155,8 @@ impl Owner {
             supervisor: None,
             shared: shared.clone(),
             pid,
+            #[cfg(test)]
+            fixture_child: None,
         };
         let result =
             (|| -> std::io::Result<()> {
@@ -93,6 +185,14 @@ impl Owner {
                     .threads
                     .push(thread::Builder::new().name("desktop-binary".into()).spawn(
                         move || {
+                            #[cfg(test)]
+                            let output: Box<dyn Read> = if harness {
+                                Box::new(super::filesystem_tests::HarnessOutput::new(output))
+                            } else {
+                                Box::new(output)
+                            };
+                            #[cfg(not(test))]
+                            let _ = harness;
                             if let Err(e) = parent_binary(output, &state) {
                                 state.fail(format!("desktop binary: {e}"));
                             }
@@ -101,9 +201,57 @@ impl Owner {
                 Ok(())
             })();
         if let Err(e) = result {
-            owner.shared.stop();
-            let _ = owner.drain();
-            return Err(e.into());
+            owner.shared.fail(format!(
+                "catalog pipe startup failed; process retained: {e}"
+            ));
+            return Ok(owner);
+        }
+        #[cfg(test)]
+        if harness {
+            let child = Arc::new(Mutex::new(owner.child.take()));
+            owner.fixture_child = Some(child.clone());
+            let retained = Arc::new(Mutex::new(Some(std::mem::take(&mut owner.threads))));
+            let io = retained.clone();
+            let state = shared.clone();
+            match thread::Builder::new()
+                .name("fixture-catalog-reap".into())
+                .spawn(move || {
+                    loop {
+                        let result = {
+                            let mut slot = child.lock().unwrap_or_else(|e| e.into_inner());
+                            match slot.as_mut().unwrap().try_wait() {
+                                Ok(Some(status)) => {
+                                    slot.take();
+                                    Some(Ok(status))
+                                }
+                                Ok(None) => None,
+                                Err(e) => Some(Err(e)),
+                            }
+                        };
+                        if let Some(result) = result {
+                            let threads = io.lock().unwrap().take().unwrap();
+                            match result {
+                                Ok(status) => {
+                                    finish_wait(&state, status, threads);
+                                    return (None, vec![]);
+                                }
+                                Err(e) => {
+                                    state.fail(format!("fixture C wait failed: {e}"));
+                                    return (child.lock().unwrap().take(), threads);
+                                }
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }) {
+                Ok(thread) => owner.supervisor = Some(thread),
+                Err(e) => {
+                    owner.child = owner.fixture_child.as_ref().unwrap().lock().unwrap().take();
+                    owner.threads = retained.lock().unwrap().take().unwrap();
+                    owner.shared.fail(format!("fixture reaper startup: {e}"));
+                }
+            }
+            return Ok(owner);
         }
         // Put ownership in a shared slot before spawning so failed thread creation
         // cannot drop an un-waited Child or lose its live pipe owners.
@@ -136,12 +284,43 @@ impl Owner {
                 let (child, threads) = slot.lock().unwrap().take().unwrap();
                 owner.child = Some(child);
                 owner.threads = threads;
-                owner.shared.stop();
-                let _ = owner.drain();
-                return Err(e.into());
+                owner.shared.fail(format!(
+                    "catalog supervisor startup failed; process retained: {e}"
+                ));
+                return Ok(owner);
             }
         }
         Ok(owner)
+    }
+    #[cfg(test)]
+    pub fn terminate_no_descendant_fixture(&mut self) -> Result<()> {
+        if let Some(slot) = &self.fixture_child {
+            let mut child = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(child) = child.as_mut() {
+                child
+                    .kill()
+                    .map_err(|e| error(ErrorCode::Native, e.to_string()))?;
+            }
+        } else if let Some(child) = &mut self.child {
+            child
+                .kill()
+                .map_err(|e| error(ErrorCode::Native, e.to_string()))?;
+        }
+        let result = self.drain();
+        if self.shared.state.lock().unwrap().child_finished {
+            Ok(())
+        } else {
+            result
+        }
+    }
+    #[cfg(test)]
+    pub fn spawn_test(
+        executable: &std::path::Path,
+        args: &[std::ffi::OsString],
+        shared: Arc<Shared>,
+        hello: Vec<u8>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_configured(executable, args, shared, hello, true)
     }
     pub fn drain(&mut self) -> Result<()> {
         if self.supervisor.as_ref().is_some_and(|s| !s.is_finished()) {
@@ -211,14 +390,25 @@ pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Op
             return None;
         }
         if s.stopping {
-            if let Some(index) = s.control.iter().position(|m| m.kind == Kind::Ack) {
+            if let Some(index) = s
+                .control
+                .iter()
+                .position(|m| matches!(m.kind, Kind::Ack | Kind::DrainAck))
+            {
                 return s.control.remove(index);
             }
             if s.shutdown_sent < s.shutdown_attempt {
                 s.shutdown_sent = s.shutdown_attempt;
                 return Some(Message::new(Kind::Shutdown, s.shutdown_attempt, vec![]));
             }
-            s = shared.wake.wait(s).unwrap();
+            s = shared
+                .wake
+                .wait_timeout(s, Duration::from_millis(2))
+                .unwrap()
+                .0;
+            if shared.filesystem.is_some() {
+                return None;
+            }
             continue;
         }
         if let Some((&id, entry)) = s
@@ -238,19 +428,64 @@ pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Op
         if let Some(m) = s.data.pop_front() {
             return Some(m);
         }
-        s = shared.wake.wait(s).unwrap();
+        s = shared
+            .wake
+            .wait_timeout(s, Duration::from_millis(2))
+            .unwrap()
+            .0;
+        if shared.filesystem.is_some() {
+            return None;
+        }
     }
 }
 fn parent_write(mut w: impl Write, shared: &Shared, hello: Vec<u8>) -> std::io::Result<()> {
     Message::new(Kind::Hello, 0, hello).write(shared.session, &mut w)?;
     let mut active = None;
-    while let Some(mut m) = next_outgoing(shared, &mut active) {
-        m.next(shared.session).write(&mut w)?;
-        if !m.finished() {
-            active = Some(m);
+    let mut relay: Option<RelayOutput> = None;
+    let mut admission: Option<RelayOutput> = None;
+    loop {
+        if shared.state.lock().unwrap().reaped {
+            return Ok(());
+        }
+        if let Some(owner) = &shared.filesystem {
+            if owner.healthy().is_err() && !shared.state.lock().unwrap().stopping {
+                shared.fail("filesystem owner is unavailable; paired C must drain");
+            }
+            if admission.is_none() {
+                admission = owner
+                    .next(filesystem::Lane::Admission)
+                    .map(|out| RelayOutput { out, offset: 0 });
+            }
+            if let Some(m) = &mut admission {
+                m.frame(shared.session).write(&mut w)?;
+                if m.done() {
+                    admission = None;
+                }
+            }
+            if let Some(out) = owner.next(filesystem::Lane::Control) {
+                RelayOutput { out, offset: 0 }
+                    .frame(shared.session)
+                    .write(&mut w)?;
+            }
+            if relay.is_none() {
+                relay = owner
+                    .next(filesystem::Lane::Data)
+                    .map(|out| RelayOutput { out, offset: 0 });
+            }
+            if let Some(m) = &mut relay {
+                m.frame(shared.session).write(&mut w)?;
+                if m.done() {
+                    relay = None;
+                }
+            }
+        }
+        if let Some(mut m) = next_outgoing(shared, &mut active) {
+            m.next(shared.session).write(&mut w)?;
+            if !m.finished() {
+                active = Some(m);
+            }
         }
     }
-    Ok(())
 }
 fn session(f: &Frame, shared: &Shared) -> std::io::Result<()> {
     if f.session != shared.session {
@@ -259,12 +494,40 @@ fn session(f: &Frame, shared: &Shared) -> std::io::Result<()> {
     Ok(())
 }
 fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
+    let mut relay = RelayAssembly::default();
     let mut assembly: Option<Assembly> = None;
     while let Some(f) = Frame::read(&mut r)? {
         session(&f, shared)?;
+        #[cfg(test)]
+        if f.kind == Kind::Fixture {
+            if f.offset != 0 || f.total != f.payload.len() || f.total > wire::CHUNK {
+                return Err(wire::invalid("fixture report bound"));
+            }
+            let report = serde_json::from_slice(&f.payload).map_err(std::io::Error::other)?;
+            *shared.fixture.lock().unwrap() = Some(report);
+            shared.wake.notify_all();
+            continue;
+        }
+        if matches!(
+            f.kind,
+            Kind::Filesystem | Kind::FilesystemControl | Kind::FilesystemAdmission
+        ) {
+            let owner = shared
+                .filesystem
+                .as_ref()
+                .ok_or_else(|| wire::invalid("unselected filesystem relay"))?;
+            if let Some((bytes, control)) =
+                relay_input(&mut relay, f).map_err(std::io::Error::other)?
+            {
+                owner
+                    .receive(&bytes, control)
+                    .map_err(std::io::Error::other)?;
+            }
+            continue;
+        }
         if !matches!(
             f.kind,
-            Kind::Ready | Kind::Reply | Kind::BytesError | Kind::DrainError
+            Kind::Ready | Kind::Reply | Kind::BytesError | Kind::DrainError | Kind::Drained
         ) {
             return Err(wire::invalid("unexpected control frame"));
         }
@@ -272,7 +535,7 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
             Some(a) => a,
             None => assembly.insert(Assembly::start(
                 &f,
-                if matches!(f.kind, Kind::Ready | Kind::DrainError) {
+                if matches!(f.kind, Kind::Ready | Kind::DrainError | Kind::Drained) {
                     wire::CHUNK
                 } else {
                     shared.limits.reply_bytes.max(wire::ERROR_BYTES)
@@ -283,6 +546,19 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
             continue;
         }
         let (kind, id, bytes) = assembly.take().unwrap().finish();
+        if kind == Kind::Drained {
+            let mut s = shared.state.lock().unwrap();
+            if id < s.shutdown_attempt {
+                continue;
+            }
+            if id == 0 || id != s.shutdown_attempt || !bytes.is_empty() {
+                return Err(wire::invalid("unowned catalog drain completion"));
+            }
+            s.control
+                .push_back(Message::new(Kind::DrainAck, id, vec![]));
+            shared.wake.notify_all();
+            continue;
+        }
         if kind == Kind::DrainError {
             let error: BridgeError = serde_json::from_slice(&bytes)
                 .map_err(|_| wire::invalid("drain error response"))?;
@@ -290,7 +566,8 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
             continue;
         }
         if kind == Kind::Ready {
-            if id != 0 || bytes != wire::build_identity().as_bytes() {
+            if id != 0 || bytes != wire::ready_bytes(shared.filesystem.as_ref().map(|f| &f.binding))
+            {
                 return Err(wire::invalid("desktop handshake identity"));
             }
             let mut s = shared.state.lock().unwrap();
@@ -355,7 +632,7 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
             _ => return Err(wire::invalid("reply kind does not match request")),
         }
     }
-    if assembly.is_some() {
+    if assembly.is_some() || relay.incomplete() {
         return Err(wire::invalid("truncated control message"));
     }
     if !shared.state.lock().unwrap().stopping {
@@ -513,9 +790,65 @@ struct BinaryOutput {
     request: BytesRequest,
     value: Arc<PreviewBytes>,
 }
-fn output_writer(mut w: impl Write, rx: mpsc::Receiver<Message>, session: [u8; 16]) {
-    for m in rx {
-        if m.write(session, &mut w).is_err() {
+fn output_writer(
+    mut w: impl Write,
+    rx: mpsc::Receiver<Message>,
+    session: [u8; 16],
+    proxy: Option<Arc<filesystem::Proxy>>,
+) {
+    let mut ordinary: Option<Message> = None;
+    let mut relay: Option<RelayOutput> = None;
+    let mut admission: Option<RelayOutput> = None;
+    loop {
+        let result = (|| -> std::io::Result<bool> {
+            if let Some(proxy) = &proxy {
+                if admission.is_none() {
+                    admission = proxy
+                        .next(filesystem::Lane::Admission)
+                        .map(|out| RelayOutput { out, offset: 0 });
+                }
+                if let Some(m) = &mut admission {
+                    m.frame(session).write(&mut w)?;
+                    if m.done() {
+                        admission = None;
+                    }
+                }
+                if let Some(out) = proxy.next(filesystem::Lane::Control) {
+                    RelayOutput { out, offset: 0 }
+                        .frame(session)
+                        .write(&mut w)?;
+                }
+                if relay.is_none() {
+                    relay = proxy
+                        .next(filesystem::Lane::Data)
+                        .map(|out| RelayOutput { out, offset: 0 });
+                }
+                if let Some(m) = &mut relay {
+                    m.frame(session).write(&mut w)?;
+                    if m.done() {
+                        relay = None;
+                    }
+                }
+            }
+            if ordinary.is_none() {
+                match rx.recv_timeout(Duration::from_millis(2)) {
+                    Ok(m) => ordinary = Some(m),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(false),
+                }
+            }
+            if let Some(m) = &mut ordinary {
+                m.next(session).write(&mut w)?;
+                if m.finished() {
+                    ordinary = None;
+                }
+            }
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            if let Some(proxy) = &proxy {
+                proxy.fail("catalog control output ended");
+            }
             break;
         }
     }
@@ -646,37 +979,117 @@ fn collect(
 
 /// Even an early transport error or unwinding must not exit a descendant-owning
 /// process after a failed checked drain. There is no force-exit fallback.
+struct DrainState {
+    attempt: u64,
+    verified: bool,
+    failed: bool,
+    running: bool,
+}
 struct ChildEngine {
     bridge: Bridge,
-    verified: std::cell::Cell<bool>,
-    failed: std::cell::Cell<bool>,
+    state: Arc<Mutex<DrainState>>,
+    owner: Mutex<Option<thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    fixture: Arc<Mutex<Option<super::filesystem_tests::Driver>>>,
 }
 impl ChildEngine {
-    fn drain(&self) -> Result<()> {
-        if self.verified.get() {
-            return Ok(());
+    fn request(&self, attempt: u64, tx: &mpsc::SyncSender<Message>) -> Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if state.verified {
+            return Ok(true);
         }
-        match self.bridge.try_shutdown() {
-            Ok(()) => {
-                self.verified.set(true);
-                self.failed.set(false);
-                Ok(())
+        if state.attempt == attempt {
+            return Ok(false);
+        }
+        if state.running {
+            return Err(error(ErrorCode::Busy, "catalog drain already running"));
+        }
+        if attempt <= state.attempt {
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "catalog drain attempt identity",
+            ));
+        }
+        if let Some(owner) = self.owner.lock().unwrap().take() {
+            drop(state);
+            let joined = owner.join();
+            state = self.state.lock().unwrap();
+            if joined.is_err() {
+                return Err(error(ErrorCode::Native, "catalog drain owner panicked"));
             }
-            Err(error) => {
-                self.failed.set(true);
-                Err(error)
+        }
+        state.attempt = attempt;
+        state.running = true;
+        state.failed = false;
+        #[cfg(test)]
+        let fixture = self.fixture.clone();
+        let bridge = self.bridge.clone();
+        let status = self.state.clone();
+        let tx = tx.clone();
+        let worker = thread::Builder::new()
+            .name("catalog-checked-drain".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if let Some(owner) = fixture.lock().unwrap().take() {
+                        let _ = owner.release.send(());
+                        owner
+                            .owner
+                            .join()
+                            .map_err(|_| error(ErrorCode::Native, "SQL fixture owner panic"))?
+                            .map_err(|e| error(ErrorCode::Native, e.to_string()))?;
+                    }
+                    bridge.try_shutdown()
+                }))
+                .unwrap_or_else(|_| {
+                    Err(error(
+                        ErrorCode::Native,
+                        "catalog drain panicked; owners retained",
+                    ))
+                });
+                {
+                    let mut s = status.lock().unwrap();
+                    s.running = false;
+                    s.verified = result.is_ok();
+                    s.failed = result.is_err();
+                }
+                let message = match result {
+                    Ok(()) => Message::new(Kind::Drained, attempt, vec![]),
+                    Err(e) => checked_message(Kind::DrainError, attempt, &e, wire::CHUNK),
+                };
+                let _ = tx.send(message);
+            });
+        match worker {
+            Ok(owner) => *self.owner.lock().unwrap() = Some(owner),
+            Err(e) => {
+                state.running = false;
+                state.failed = true;
+                return Err(error(ErrorCode::Native, e.to_string()));
             }
+        }
+        Ok(false)
+    }
+    fn verified(&self) -> bool {
+        self.state.lock().unwrap().verified
+    }
+    fn finish(&self) -> Result<()> {
+        if let Some(owner) = self.owner.lock().unwrap().take() {
+            owner
+                .join()
+                .map_err(|_| error(ErrorCode::Native, "catalog drain join failed"))?;
+        }
+        if self.verified() {
+            Ok(())
+        } else {
+            Err(error(ErrorCode::Native, "catalog engine drain unresolved"))
         }
     }
 }
 impl Drop for ChildEngine {
     fn drop(&mut self) {
-        if !self.verified.get() && !self.failed.get() {
-            let _ = self.drain();
-        }
-        if !self.verified.get() {
-            // EOF has removed the explicit retry channel. Retain every actor,
-            // lease and descendant owner instead of releasing them via process exit.
+        // With no reply channel, an unresolved managed close may be waiting on F.
+        // Retain the entire process; EOF is never permission to exit with owners.
+        if !self.verified() {
             loop {
                 thread::park();
             }
@@ -684,6 +1097,8 @@ impl Drop for ChildEngine {
     }
 }
 pub(super) fn worker_main() -> anyhow::Result<()> {
+    // Dedicated helper stderr is framed; caught panics must not corrupt it.
+    std::panic::set_hook(Box::new(|_| {}));
     let mut input = std::io::stdin().lock();
     let first =
         Frame::read(&mut input)?.ok_or_else(|| wire::invalid("missing desktop configuration"))?;
@@ -700,12 +1115,22 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
         done = assembly.push(f)?;
     }
     let config: wire::ConfigWire = serde_json::from_slice(&assembly.finish().2)?;
+    let proxy = config.filesystem.clone().map(filesystem::Proxy::new);
+    #[cfg(test)]
+    let fixture = config.fixture.clone();
     let config = config.into_config()?;
     let limits = config.limits.clone();
     let engine = ChildEngine {
         bridge: Bridge::spawn(config)?,
-        verified: false.into(),
-        failed: false.into(),
+        state: Arc::new(Mutex::new(DrainState {
+            attempt: 0,
+            verified: false,
+            failed: false,
+            running: false,
+        })),
+        owner: Mutex::new(None),
+        #[cfg(test)]
+        fixture: Arc::new(Mutex::new(None)),
     };
     let bridge = &engine.bridge;
     let shared = Arc::new(Mutex::new(ChildState {
@@ -717,7 +1142,9 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
     }));
     let (tx, rx) = mpsc::sync_channel(limits.queued + CONTROL_SLOTS);
     let (binary, binary_rx) = mpsc::sync_channel(1);
-    let control = thread::spawn(move || output_writer(std::io::stderr().lock(), rx, session));
+    let output_proxy = proxy.clone();
+    let control =
+        thread::spawn(move || output_writer(std::io::stderr().lock(), rx, session, output_proxy));
     let data = thread::spawn(move || binary_writer(std::io::stdout().lock(), binary_rx, session));
     let state = shared.clone();
     let results = tx.clone();
@@ -728,20 +1155,38 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
             thread::sleep(Duration::from_millis(2));
         }
     });
+    #[cfg(test)]
+    if let Some(proxy) = &proxy
+        && let Some(driver) =
+            super::filesystem_tests::start_driver(fixture, proxy.clone(), tx.clone(), session)?
+    {
+        *engine.fixture.lock().unwrap() = Some(driver);
+    }
     let ready = tx.send(Message::new(
         Kind::Ready,
         0,
-        wire::build_identity().into_bytes(),
+        wire::ready_bytes(proxy.as_ref().map(|p| p.binding())),
     ));
     let result = ready.map_err(anyhow::Error::from).and_then(|_| {
-        child_input(
+        child_input_relay(
             &mut input,
             session,
-            &mut |kind, bytes| dispatch(bridge, kind, bytes),
+            &mut |kind, bytes| {
+                if proxy.is_some() {
+                    let request: Request = serde_json::from_slice(bytes)?;
+                    anyhow::ensure!(
+                        kind == Kind::Command
+                            && matches!(request, Request::Status | Request::Close { .. }),
+                        "managed actor routing awaits FS6"
+                    );
+                }
+                dispatch(bridge, kind, bytes)
+            },
             &shared,
             &limits,
             &tx,
-            &mut || engine.drain(),
+            &mut |attempt| engine.request(attempt, &tx),
+            proxy.as_deref(),
         )
     });
     // Never force-exit: first drain the engine and its descendants, then transport.
@@ -751,12 +1196,16 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
             c.cancel();
         }
     }
-    // A failed explicit drain is not retried automatically when the parent
-    // disappears. ChildEngine keeps the process alive if that owner is unresolved.
-    if !engine.failed.get() {
-        engine.drain()?;
+    if let Some(proxy) = &proxy {
+        proxy.fail("catalog input ended; filesystem outcomes unknown");
     }
-    anyhow::ensure!(engine.verified.get(), "desktop engine drain unresolved");
+    // Keep ordinary legacy EOF cleanup compatible. Managed errors preserve R0
+    // and retain unresolved process ownership instead of fabricating cleanup.
+    if !engine.verified() && proxy.is_none() {
+        let attempt = engine.state.lock().unwrap().attempt + 1;
+        let _ = engine.request(attempt, &tx);
+    }
+    engine.finish()?;
     shared.lock().unwrap().stopping = true;
     let _ = collector.join();
     {
@@ -784,33 +1233,69 @@ fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<
             .map(|p| ChildPending::Bytes(p, r)))
     }
 }
-fn child_input(
+// Keep the distinct input, completion, drain, and optional filesystem owners
+// explicit at this single protocol dispatch boundary.
+#[allow(clippy::too_many_arguments)]
+fn child_input_relay(
     input: &mut impl Read,
     session: [u8; 16],
     dispatch: &mut impl FnMut(Kind, &[u8]) -> anyhow::Result<Result<ChildPending>>,
     shared: &ChildShared,
     limits: &Limits,
     tx: &mpsc::SyncSender<Message>,
-    drain: &mut impl FnMut() -> Result<()>,
+    drain: &mut impl FnMut(u64) -> Result<bool>,
+    proxy: Option<&filesystem::Proxy>,
 ) -> anyhow::Result<()> {
     let mut active: Option<Assembly> = None;
     let mut seen = Seen::default();
     let mut drain_attempt = 0;
+    let mut closing = false;
+    let mut relay = RelayAssembly::default();
     while let Some(f) = Frame::read(input)? {
         anyhow::ensure!(f.session == session, "stale child session");
-        if matches!(f.kind, Kind::Cancel | Kind::Ack | Kind::Shutdown) {
+        if matches!(
+            f.kind,
+            Kind::Filesystem | Kind::FilesystemControl | Kind::FilesystemAdmission
+        ) {
+            let proxy = proxy.context("unselected child filesystem relay")?;
+            if let Some((bytes, control)) = relay_input(&mut relay, f)? {
+                proxy.receive(&bytes, control)?;
+            }
+            continue;
+        }
+        if matches!(
+            f.kind,
+            Kind::Cancel | Kind::Ack | Kind::Shutdown | Kind::DrainAck
+        ) {
             anyhow::ensure!(
                 f.offset == 0 && f.total == 0 && f.payload.is_empty(),
                 "invalid control payload"
             );
             let mut state = shared.lock().unwrap();
             match f.kind {
+                Kind::DrainAck => {
+                    anyhow::ensure!(
+                        f.id == drain_attempt && f.id != 0,
+                        "catalog drain acknowledgement identity"
+                    );
+                    drop(state);
+                    anyhow::ensure!(
+                        drain(f.id)?,
+                        "catalog drain acknowledgement before completion"
+                    );
+                    return Ok(());
+                }
                 Kind::Shutdown => {
                     anyhow::ensure!(f.id > drain_attempt, "shutdown attempt identity");
                     drain_attempt = f.id;
+                    closing = true;
                     drop(state);
-                    match drain() {
-                        Ok(()) => return Ok(()),
+                    if let Some(proxy) = proxy {
+                        proxy.closing();
+                    }
+                    match drain(f.id) {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => continue,
                         Err(error) => {
                             tx.send(checked_message(Kind::DrainError, f.id, &error, wire::CHUNK))?;
                             continue;
@@ -869,7 +1354,16 @@ fn child_input(
             );
             state.early.remove(&id)
         };
-        let admitted = if canceled {
+        let during_close = closing
+            && !(kind == Kind::Command
+                && serde_json::from_slice::<Request>(&bytes)
+                    .is_ok_and(|request| matches!(request, Request::Status)));
+        let admitted = if during_close {
+            Err(error(
+                ErrorCode::Closed,
+                "catalog transport is closing; new actor work rejected",
+            ))
+        } else if canceled {
             Err(error(
                 ErrorCode::Canceled,
                 "request canceled before desktop admission",
@@ -906,8 +1400,33 @@ fn child_input(
         drop(state);
         let _ = tx; // completion publication stays independent of this input loop.
     }
-    anyhow::ensure!(active.is_none(), "truncated desktop request");
+    anyhow::ensure!(
+        active.is_none() && !relay.incomplete(),
+        "truncated desktop request"
+    );
     Ok(())
+}
+
+#[cfg(test)]
+fn child_input(
+    input: &mut impl Read,
+    session: [u8; 16],
+    dispatch: &mut impl FnMut(Kind, &[u8]) -> anyhow::Result<Result<ChildPending>>,
+    shared: &ChildShared,
+    limits: &Limits,
+    tx: &mpsc::SyncSender<Message>,
+    drain: &mut impl FnMut() -> Result<()>,
+) -> anyhow::Result<()> {
+    child_input_relay(
+        input,
+        session,
+        dispatch,
+        shared,
+        limits,
+        tx,
+        &mut |_| drain().map(|()| true),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1265,5 +1784,146 @@ mod tests {
         let failure = rx.try_recv().unwrap();
         assert_eq!((failure.kind, failure.id), (Kind::DrainError, 1));
         assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn held_async_drain_rejects_new_work_before_dispatch_but_keeps_controls() {
+        let shared = child_state();
+        let (tx, _rx) = mpsc::sync_channel(2);
+        let mut input = Vec::new();
+        Message::new(Kind::Shutdown, 1, vec![])
+            .write([9; 16], &mut input)
+            .unwrap();
+        let create = Request::Create {
+            path: NativePath::from_path(std::path::Path::new("/never-created")),
+        };
+        Message::new(Kind::Command, 1, serde_json::to_vec(&create).unwrap())
+            .write([9; 16], &mut input)
+            .unwrap();
+        Message::new(
+            Kind::Command,
+            2,
+            serde_json::to_vec(&Request::Status).unwrap(),
+        )
+        .write([9; 16], &mut input)
+        .unwrap();
+        Message::new(Kind::Cancel, 3, vec![])
+            .write([9; 16], &mut input)
+            .unwrap();
+        Message::new(Kind::DrainAck, 1, vec![])
+            .write([9; 16], &mut input)
+            .unwrap();
+        let mut status_calls = 0;
+        let mut drains = 0;
+        child_input_relay(
+            &mut std::io::Cursor::new(input),
+            [9; 16],
+            &mut |kind, bytes| {
+                assert_eq!(kind, Kind::Command);
+                assert!(
+                    matches!(
+                        serde_json::from_slice::<Request>(bytes).unwrap(),
+                        Request::Status
+                    ),
+                    "mutation escaped Closing admission"
+                );
+                status_calls += 1;
+                Ok(Err(error(ErrorCode::Busy, "synthetic cached status")))
+            },
+            &shared,
+            &Limits::default(),
+            &tx,
+            &mut |attempt| {
+                assert_eq!(attempt, 1);
+                drains += 1;
+                Ok(drains == 2) // first request remains held; exact acknowledgement settles it
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(drains, 2);
+        assert_eq!(status_calls, 1);
+        let state = shared.lock().unwrap();
+        let ChildPending::Reply(reply) = state.pending.get(&1).unwrap() else {
+            panic!("Closed reply required")
+        };
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&reply.bytes).unwrap(),
+            Reply::Error {
+                error: BridgeError {
+                    code: ErrorCode::Closed,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            state.early.contains(&3),
+            "reserved cancellation still consumed during held drain"
+        );
+        assert!(
+            !state.stopping,
+            "input Closing must not stop collectors before verified drain"
+        );
+    }
+    #[test]
+    fn admission_frames_complete_independently_of_held_ordinary_packet() {
+        use filesystem::{Lane, Out};
+        let make = |lane, byte| RelayOutput {
+            out: Out {
+                lane,
+                bytes: Arc::new(vec![byte; wire::CHUNK + 7]),
+            },
+            offset: 0,
+        };
+        let mut ordinary = make(Lane::Data, 1);
+        let mut admission = make(Lane::Admission, 2);
+        let mut assembly = RelayAssembly::default();
+        assert!(
+            relay_input(&mut assembly, ordinary.frame([9; 16]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            relay_input(&mut assembly, admission.frame([9; 16]))
+                .unwrap()
+                .is_none()
+        );
+        let control = Frame {
+            kind: Kind::FilesystemControl,
+            session: [9; 16],
+            id: 0,
+            offset: 0,
+            total: 1,
+            payload: vec![3],
+        };
+        assert_eq!(
+            relay_input(&mut assembly, control).unwrap().unwrap(),
+            (vec![3], Lane::Control)
+        );
+        let (bytes, lane) = relay_input(&mut assembly, admission.frame([9; 16]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lane, Lane::Admission);
+        assert_eq!(bytes, vec![2; wire::CHUNK + 7]);
+        assert!(
+            assembly.incomplete(),
+            "ordinary packet remains separately owned"
+        );
+        let (bytes, lane) = relay_input(&mut assembly, ordinary.frame([9; 16]))
+            .unwrap()
+            .unwrap();
+        assert_eq!((bytes, lane), (vec![1; wire::CHUNK + 7], Lane::Data));
+        assert!(!assembly.incomplete());
+        let mut bad = make(Lane::Admission, 4);
+        assert!(
+            relay_input(&mut assembly, bad.frame([9; 16]))
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = bad.frame([9; 16]);
+        changed.offset += 1;
+        assert!(
+            relay_input(&mut assembly, changed).is_err(),
+            "interleaving must not relax packet continuity"
+        );
     }
 }

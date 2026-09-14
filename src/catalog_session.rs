@@ -840,3 +840,6 @@ impl Drop for ManagedSession {
 mod tests;
 #[cfg(test)]
 pub(crate) use tests::{retained_admission, unused_filesystem};
+
+#[cfg(test)]
+pub(crate) mod overlap_tests;

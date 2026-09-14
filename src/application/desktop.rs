@@ -14,6 +14,10 @@ use std::{
     },
     thread,
 };
+#[allow(dead_code)] // Additive, unselected until the FS6 managed actor dependency is admitted.
+mod filesystem;
+#[cfg(test)]
+mod filesystem_tests;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -68,6 +72,8 @@ struct State {
     reaped: bool,
     child_finished: bool,
     local_verified: bool,
+    filesystem_verified: bool,
+    child_exit: Option<i32>,
 }
 struct Shared {
     session: [u8; 16],
@@ -75,12 +81,15 @@ struct Shared {
     state: Mutex<State>,
     wake: Condvar,
     binary: Arc<AtomicUsize>,
+    filesystem: Option<Arc<filesystem::Parent>>,
+    #[cfg(test)]
+    fixture: Mutex<Option<std::result::Result<String, String>>>,
 }
 impl Shared {
     fn child_finished(&self) {
         let mut state = self.state.lock().unwrap();
         state.child_finished = true;
-        if state.local_verified {
+        if state.local_verified && state.filesystem_verified {
             state.phase = TransportPhase::Closed;
         } else if state.phase != TransportPhase::Failed {
             state.phase = TransportPhase::Draining;
@@ -102,7 +111,7 @@ impl Shared {
             }
             Ok(()) => {
                 state.local_verified = true;
-                if state.child_finished {
+                if state.child_finished && state.filesystem_verified {
                     state.phase = TransportPhase::Closed;
                     state.drain_error = None;
                 }
@@ -112,12 +121,16 @@ impl Shared {
         result
     }
     fn fail(&self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(f) = &self.filesystem {
+            f.fail(&message);
+        }
         let mut s = self.state.lock().unwrap();
         if s.phase == TransportPhase::Closed {
             return;
         }
         s.unknown |= !s.pending.is_empty();
-        s.message.get_or_insert(message.into());
+        s.message.get_or_insert(message);
         s.phase = TransportPhase::Failed;
         if !s.stopping {
             s.shutdown_attempt += 1;
@@ -126,6 +139,9 @@ impl Shared {
         self.wake.notify_all();
     }
     fn stop(&self) {
+        if let Some(f) = &self.filesystem {
+            f.closing();
+        }
         let mut s = self.state.lock().unwrap();
         if s.phase == TransportPhase::Closed {
             return;
@@ -214,8 +230,30 @@ impl Handle {
             .unwrap_or_else(|e| e.into_inner())
             .signal_shutdown();
         let result = self.process.lock().unwrap().drain();
+        // Exit74 is the managed bootstrap R0 path: that admission forbids native
+        // descendants. Other abnormal exits do not prove descendant retirement.
+        let (reaped, exit) = {
+            let s = self.shared.state.lock().unwrap();
+            (s.child_finished, s.child_exit)
+        };
+        let filesystem = if let Some(f) = &self.shared.filesystem {
+            if reaped && matches!(exit, Some(0 | 74)) {
+                f.finish_after_dependents(exit != Some(0))
+                    .map_err(|e| error(ErrorCode::Native, e.to_string()))
+            } else {
+                Err(error(
+                    ErrorCode::Native,
+                    "catalog dependents not verified drained; F retained",
+                ))
+            }
+        } else {
+            Ok(())
+        };
+        if filesystem.is_ok() {
+            self.shared.state.lock().unwrap().filesystem_verified = true;
+        }
         let local = self.shared.drain_local(|| self.local.try_shutdown());
-        result.and(local)
+        result.and(filesystem).and(local)
     }
 }
 impl Drop for Handle {
@@ -231,12 +269,33 @@ impl Drop for Handle {
 pub struct DesktopBridge(Arc<Handle>);
 impl DesktopBridge {
     pub fn spawn(config: Config) -> anyhow::Result<Self> {
+        Self::spawn_inner(config, None)
+    }
+    /// Unselected paired transport. Managed actor use remains blocked on FS6.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_with_filesystem(
+        config: Config,
+        client: Arc<crate::filesystem_worker::client::Client>,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
-        let hello = serde_json::to_vec(&wire::ConfigWire::from_config(&config))?;
-        anyhow::ensure!(
-            hello.len() <= wire::CONFIG_BYTES,
-            "desktop configuration byte limit"
-        );
+        Self::spawn_inner(config, Some(filesystem::Parent::new(client)))
+    }
+    fn spawn_inner(
+        config: Config,
+        filesystem: Option<Arc<filesystem::Parent>>,
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
+        let paired = filesystem.is_some();
+        let mut configuration = wire::ConfigWire::from_config(&config);
+        configuration.filesystem = filesystem.as_ref().map(|f| f.binding.clone());
+        let hello = serde_json::to_vec(&configuration)
+            .map_err(|e| filesystem::before_child_failure(&filesystem, e))?;
+        if hello.len() > wire::CONFIG_BYTES {
+            return Err(filesystem::before_child_failure(
+                &filesystem,
+                "desktop configuration byte limit",
+            ));
+        }
         let shared = Arc::new(Shared {
             session: *uuid::Uuid::new_v4().as_bytes(),
             limits: config.limits.clone(),
@@ -256,15 +315,29 @@ impl DesktopBridge {
                 reaped: false,
                 child_finished: false,
                 local_verified: false,
+                filesystem_verified: filesystem.is_none(),
+                child_exit: None,
             }),
             wake: Condvar::new(),
             binary: Arc::new(AtomicUsize::new(0)),
+            filesystem,
+            #[cfg(test)]
+            fixture: Mutex::new(None),
         });
-        let local = Bridge::spawn(config.clone())?;
+        let local = Bridge::spawn(config.clone())
+            .map_err(|e| filesystem::before_child_failure(&shared.filesystem, e))?;
         let owner = match process::Owner::spawn(&config.worker_executable, shared.clone(), hello) {
             Ok(owner) => owner,
             Err(e) => {
                 local.shutdown();
+                if let Some(f) = &shared.filesystem
+                    && f.finish_after_dependents(true).is_err()
+                {
+                    return Err(anyhow::Error::new(filesystem::Unstarted {
+                        owner: f.clone(),
+                        message: e.to_string(),
+                    }));
+                }
                 return Err(e);
             }
         };
@@ -289,6 +362,13 @@ impl DesktopBridge {
         let ready = s.ready && !s.stopping;
         let message = s.message.clone();
         drop(s);
+        if paired && (!ready || timeout.timed_out()) {
+            result
+                .0
+                .shared
+                .fail(message.unwrap_or_else(|| "paired handshake failed; owners retained".into()));
+            return Ok(result);
+        }
         anyhow::ensure!(
             ready && !timeout.timed_out(),
             "desktop handshake failed: {}",
