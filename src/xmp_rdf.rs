@@ -10,6 +10,11 @@ use crate::lightroom_migration_worker::memory::{
     requested::{Requested, Scope},
 };
 
+#[cfg(test)]
+mod derivative_tests;
+#[cfg(test)]
+mod tests;
+
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML: &str = "http://www.w3.org/XML/1998/namespace";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
