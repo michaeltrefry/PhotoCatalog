@@ -247,12 +247,21 @@ impl ConfirmSqlAdmission {
 /// A health response, stale cached Prepare, EOF or lost reply is not this proof.
 pub type SqlAdmissionConfirmed = ConfirmSqlAdmission;
 
+pub mod preview_io;
 /// Calls run on the admission/operation owner, never the GUI thread. An F client
 /// must keep its independent cancel/status controls live while awaiting a reply.
 /// Implementations must not fall back to local filesystem access after failure.
 pub mod store;
 
 pub trait CatalogFilesystem: Send + Sync {
+    fn preview_io_call(
+        &self,
+        _request: &preview_io::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<preview_io::Reply> {
+        anyhow::bail!("filesystem owner does not support cache object custody")
+    }
+
     fn preview_store_call(
         &self,
         _request: &store::Request,

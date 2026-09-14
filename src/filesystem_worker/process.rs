@@ -48,6 +48,7 @@ struct State {
     admission: Option<AdmissionSnapshot>,
     admission_reply: Option<(u64, Control)>,
     store: Option<super::store::Snapshot>,
+    objects: Option<super::preview_io::Snapshot>,
     store_reply: Option<(u64, Control)>,
     error: Option<Failure>,
     last_sequence: u64,
@@ -116,6 +117,7 @@ impl Shared {
                 admission: None,
                 admission_reply: None,
                 store: None,
+                objects: None,
                 store_reply: None,
                 error: None,
                 last_sequence: 0,
@@ -153,6 +155,20 @@ impl OperationContext {
     pub fn cancellation(&self) -> &AtomicBool {
         &self.cancel
     }
+    pub(super) fn publish_objects(&self, snapshot: super::preview_io::Snapshot) -> Result<()> {
+        let query = self
+            .store
+            .as_ref()
+            .context("operation cannot publish cache status")?;
+        ensure!(
+            query.kind == crate::catalog_session::store::StatusKind::Objects,
+            "cache snapshot family mismatch"
+        );
+        snapshot.status(query)?.validate(query)?;
+        self.shared.state.lock().unwrap().objects = Some(snapshot);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
     pub(super) fn publish_store(&self, snapshot: super::store::Snapshot) -> Result<()> {
         let query = self
             .store
@@ -172,6 +188,7 @@ impl OperationContext {
         if let Some(snapshot) = &state.store {
             let query = crate::catalog_session::store::StatusQuery::from(
                 &crate::catalog_session::store::Query {
+                    kind: crate::catalog_session::store::StatusKind::Locks,
                     root: root.clone(),
                     operation: U64(1),
                     selected: None,
@@ -180,6 +197,7 @@ impl OperationContext {
             snapshot.status(&query)?;
         }
         state.store = None;
+        state.objects = None;
         Ok(())
     }
     pub fn publish_admission(&self, snapshot: AdmissionSnapshot) -> Result<()> {
@@ -381,7 +399,7 @@ fn input_loop(input: &mut impl Read, nonce: [u8; 16], shared: &Arc<Shared>) -> R
                 }
                 if assembly.as_mut().unwrap().push(frame)? {
                     let message = assembly.take().unwrap().finish()?;
-                    let operation: Operation = decode(&message.bytes, MESSAGE_BYTES)?;
+                    let operation: Operation = super::wire::decode_operation(&message.bytes)?;
                     operation.validate()?;
                     let mut state = shared.state.lock().unwrap();
                     // A duplicate is only a status request; it must not replace
@@ -514,12 +532,19 @@ fn input_loop(input: &mut impl Read, nonce: [u8; 16], shared: &Arc<Shared>) -> R
                             query.epoch == shared.epoch,
                             "preview status helper epoch mismatch"
                         );
-                        let value = state
-                            .store
-                            .as_ref()
-                            .context("preview ownership has no published status")
-                            .and_then(|s| s.status(&query))
-                            .map_err(|e| Failure::new(FailureKind::Rejected, e));
+                        let value = match query.kind {
+                            crate::catalog_session::store::StatusKind::Locks => state
+                                .store
+                                .as_ref()
+                                .context("preview ownership has no published status")
+                                .and_then(|s| s.status(&query)),
+                            crate::catalog_session::store::StatusKind::Objects => state
+                                .objects
+                                .as_ref()
+                                .context("cache IO has no published status")
+                                .and_then(|s| s.status(&query)),
+                        }
+                        .map_err(|e| Failure::new(FailureKind::Rejected, e));
                         state.store_reply = Some((frame.sequence, Control::Store(value)));
                     }
                     Kind::AdmissionStatus => {
@@ -675,9 +700,18 @@ fn execution_loop<H: Handler, F: FnOnce(Startup) -> Result<H>>(
             shared: shared.clone(),
             admission,
             store: match &pending.operation {
+                Operation::PreviewIo(r) => Some(crate::catalog_session::store::StatusQuery::from(
+                    &crate::catalog_session::store::Query {
+                        kind: crate::catalog_session::store::StatusKind::Objects,
+                        root: r.root.clone(),
+                        operation: r.operation,
+                        selected: None,
+                    },
+                )),
                 Operation::PreviewStore(r) => {
                     Some(crate::catalog_session::store::StatusQuery::from(
                         &crate::catalog_session::store::Query {
+                            kind: crate::catalog_session::store::StatusKind::Locks,
                             root: r.root.clone(),
                             operation: r.operation,
                             selected: None,
@@ -716,7 +750,7 @@ fn execution_loop<H: Handler, F: FnOnce(Startup) -> Result<H>>(
             )),
             value => value,
         };
-        let bytes = match encode(&result, MESSAGE_BYTES) {
+        let bytes = match super::wire::encode_outcome(&result) {
             Ok(bytes) => bytes,
             Err(error) => encode(
                 &Outcome::Err(Failure::new(
@@ -1040,6 +1074,7 @@ mod tests {
         assert!(matches!(
             h.result(1)?,
             Err(Failure {
+                object_receipt: None,
                 kind: FailureKind::Canceled,
                 ..
             })

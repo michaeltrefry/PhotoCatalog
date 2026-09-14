@@ -372,7 +372,7 @@ impl Client {
             CallSlot(&self.shared)
         };
         operation.validate()?;
-        let bytes = encode(&operation, MESSAGE_BYTES)?;
+        let bytes = super::wire::encode_operation(&operation)?;
         let _call = self.calls.lock().unwrap();
         let mut state = self.shared.state.lock().unwrap();
         while state.status.phase == Phase::Starting && state.failure.is_none() {
@@ -875,7 +875,7 @@ fn read_loop(mut input: impl Read, control: bool, shared: &Shared) -> Result<()>
             }
             shared.wake.notify_all();
         } else {
-            let value: Outcome = decode(&message.bytes, MESSAGE_BYTES)?;
+            let value: Outcome = super::wire::decode_outcome(&message.bytes)?;
             if let Err(error) = &value {
                 error.validate()?;
             }
@@ -913,6 +913,20 @@ fn read_loop(mut input: impl Read, control: bool, shared: &Shared) -> Result<()>
 }
 
 impl CatalogFilesystem for Client {
+    fn preview_io_call(
+        &self,
+        request: &crate::catalog_session::preview_io::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::preview_io::Reply> {
+        match self.execute(Operation::PreviewIo(request.clone()), cancel)? {
+            Response::PreviewIo(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected cache IO response"),
+        }
+    }
+
     fn preview_store_call(
         &self,
         request: &crate::catalog_session::store::Request,
@@ -1107,6 +1121,7 @@ mod tests {
         let file = tempfile::tempfile()?;
         let physical = crate::catalog_storage::physical_object_id(&file)?;
         Ok(crate::catalog_session::store::StatusQuery {
+            kind: crate::catalog_session::store::StatusKind::Locks,
             epoch: client.epoch.clone(),
             token: LeaseId::new(),
             session: LeaseId::new(),
@@ -1151,6 +1166,7 @@ mod tests {
                 client.shared.state.lock().unwrap().store_waiting = Some((9, query));
             }
             let failure = Failure {
+                object_receipt: None,
                 kind: FailureKind::Unknown,
                 message: "x".repeat(if invalid == 1 { ERROR_BYTES + 1 } else { 1 }),
             };
@@ -1169,6 +1185,8 @@ mod tests {
         let query = store_query(&client)?;
         client.shared.state.lock().unwrap().store_waiting = Some((9, query.clone()));
         let status = crate::catalog_session::store::Status {
+            kind: crate::catalog_session::store::StatusKind::Locks,
+            object: None,
             operation: query.operation,
             group: None,
             stage: None,

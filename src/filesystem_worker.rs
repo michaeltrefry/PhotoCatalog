@@ -3,6 +3,7 @@
 //! on the remaining managed filesystem and SQL routes.
 mod bootstrap;
 pub mod client;
+mod preview_io;
 pub mod process;
 mod store;
 pub mod wire;
@@ -39,6 +40,12 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::PreviewIo(request) => self
+                .owner
+                .preview_io_call(&request, cancel, |snapshot| {
+                    context.publish_objects(snapshot)
+                })
+                .map(Response::PreviewIo),
             Operation::PreviewStore(request) => self
                 .owner
                 .store_call(&request, cancel, |snapshot| context.publish_store(snapshot))
@@ -144,7 +151,12 @@ fn filesystem_failure(error: anyhow::Error) -> Failure {
     } else {
         FailureKind::Unknown
     };
-    Failure::new(kind, error)
+    let object_receipt = error
+        .downcast_ref::<Failure>()
+        .and_then(|f| f.object_receipt);
+    let mut failure = Failure::new(kind, error);
+    failure.object_receipt = object_receipt;
+    failure
 }
 fn snapshot(value: &PreparationProgress) -> AdmissionSnapshot {
     AdmissionSnapshot {

@@ -43,6 +43,7 @@ struct RootRecord {
     manifest_lock: ManifestLock,
     manifest_directory: File,
     store: super::store::StoreOwner,
+    objects: super::preview_io::ObjectOwner,
 }
 struct ManifestLock(File);
 impl ManifestLock {
@@ -247,6 +248,7 @@ impl BootstrapOwner {
             manifest_lock,
             manifest_directory: open_directory(&manifest_root)?,
             store: super::store::StoreOwner::default(),
+            objects: super::preview_io::ObjectOwner::default(),
         };
         record.verify_root_binding()?;
         self.record = Some(record);
@@ -318,6 +320,7 @@ impl BootstrapOwner {
                 &record.bootstrap.root_capability() == root,
                 "root belongs to another session"
             );
+            record.objects.drain();
             record.store.release()?;
             record.manifest_lock.release()?;
             self.record.take();
@@ -338,6 +341,31 @@ impl BootstrapOwner {
 
     pub fn restore_status(&self, root: &RootCapability) -> Result<Option<RestoreStatus>> {
         self.with_root(root, |path| catalog_backup::restore_status(path))
+    }
+
+    pub fn preview_io_call(
+        &mut self,
+        request: &crate::catalog_session::preview_io::Request,
+        cancel: &AtomicBool,
+        publish: impl FnMut(super::preview_io::Snapshot) -> Result<()>,
+    ) -> Result<crate::catalog_session::preview_io::Reply> {
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "cache IO requires confirmed SQL admission"
+        );
+        let record = self.record.as_mut().context("cache root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "cache IO session mismatch"
+        );
+        record.verify_root_binding()?;
+        let result = record
+            .objects
+            .execute(&record.store, request, cancel, publish);
+        record.verify_root_binding()?;
+        result
     }
 
     pub fn store_call(
