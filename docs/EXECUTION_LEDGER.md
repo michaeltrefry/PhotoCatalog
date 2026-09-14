@@ -6,7 +6,11 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
-Desktop source `197e06e` integrates reviewed ICC component `35f5a70e`; all
+Current component integration is `786be8c` (FS9 facts `8f03d7d3`, fifteen exact
+reviewed/tested blobs matched; integrated formatting passes), including LM
+transport `d8f5a6e`. The next combined build waits for LM supervisor batch2.
+
+Last combined-tested source `197e06e` integrates ICC `35f5a70e`; all
 14 files match. Nine focused tests passed, including actual F PID76821 reaped.
 Final component review PASS0.99 `9ec3d5de`; exact evidence is retained in
 `sc-22847-export-profile-final-OihbpM` and the compilefix native gate HYoIfN.
@@ -41,7 +45,20 @@ It retains partial post-spawn owners and typed DrainPending, distinguishes
 confirmed join panic from unknown child wait, and checks release acknowledgements.
 Blocking Drop drain is the final ownership guard; normal controls stay pollable.
 Exact shared-pool reservation/result paging and multipart consumption belong
-to this batch. No executor/G-C caller is claimed yet. CPU2 is currently idle.
+to this batch. Freeze T170418Z/2f99c89a failed review0.98 (f155403f): guard/drop
+ordering, independently admitted retained failure text, and typed cancellation
+with UTF-8 byte bounds. Corrected T172354Z/01084eb6 passed review0.98 (600addc6),
+including one stale test-call correction. Its exact sixteen-test native gate
+compiled and stopped before tests on four mechanical groups (negative f075f5e4).
+Corrected T172859Z/81d4c766 is frozen for changed-line review before the same
+sixteen-test retry (review9f679e71). While that frozen gate runs, root/reviewer
+confirmed another typed-cause loss (addendum6b668079): Broker Reserve ResourceLimit
+sets shared Stop, then supervisor retains Canceled and discards exact limit at
+drain. Frozen gate passed16/0 (906filtered), cargo60713 and all reported child
+PIDs absent; raw4726f042 and passing-receipt885bb117 retained. The one bounded
+fix/test now preserves actual Broker failure over internal cancellation. No
+batch2 completion claim until its successor review and affected gate pass.
+No executor/G-C caller exists.
 Sol/high implements and independently reviews using separate agents, reusing
 context because new-agent thread capacity was exhausted.
 Earlier actual Source evidence used an LM thread substitute; that limitation
@@ -52,7 +69,23 @@ Parallel FS9 source component `sc-22847-export-facts` starts from checkpoint
 preserve C SQL transactions, alias decisions and current recheck points; no
 cross-request alias session is justified by existing semantics. All existing
 alias callsites remain in scope; capture/link publication and original reads
-remain separately open. No native grant while LM transport holds CPU2.
+remain separately open. Source freeze BHm4KWtG/009c7744 failed independent review
+0.95 (77ba1f76): build identity omits three changed export modules, and the
+cancellation tests only exercise Client pre-admission, not F mid-read translation.
+Successor cancel-wkjznarn/320bebc8 passed independent review0.97 (6f1ce913):
+three fingerprint inputs and deterministic F mid-read cancellation are verified
+at source level. Its exclusive CPU2 ten-test gate is authorized; no native
+result yet. First test failed before routing on the shared synthetic restore
+marker. Fixture-only successor rnyuzas_/77b23d5f passed review0.99 (ab3dd235);
+the second attempt reached the final routing assertion but compared caller
+/var spelling with the canonical /private/var destination. Test-only canonical
+successor tceoyzrk/d41fb3ab passed review0.99 (24f1699b), preserves >=2 rechecks,
+and audits the remaining nine expectations. Third gate eeIDx4 passed all10 exact
+tests, each1selected/910filtered/exit0; F55110 was reaped and no owned process
+remains. Both prior failures are preserved. Docs-only final8_6xi_8s/9d35c2c4 is
+final evidence PASS0.99 (3e33a444); Rust hashes are identical. Component8f03d7d3
+is integrated as786be8c with fifteen blob matches and formatting PASS. Combined
+integration is held until LM batch2 passes; its conditional retry owns CPU2.
 
 
 ## Retained verified component history
