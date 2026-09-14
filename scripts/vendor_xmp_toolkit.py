@@ -75,6 +75,34 @@ def main():
     line = '\tif ( isTopLevel && (xmlNode.name == "iX:changes") ) return;\t// Strip old "punchcard" chaff.'
     patch(core + "ParseRDF.cpp", line,
           "#ifndef PHOTOCATALOG_XMP_SOURCE_PRESERVATION\n" + line + "\n#endif")
+    # Local Rust wrapper patches include their exact input and output identities.
+    patches = json.loads(Path(__file__).with_name("xmp_toolkit_patches.json").read_text())
+    for change in patches:
+        relative = Path(change["file"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("unsafe local patch path")
+        target = args.destination / relative
+        before = change["before_sha256"]
+        if before is None:
+            if target.exists():
+                raise ValueError(f"new local patch path exists: {relative}")
+            updated = change["content"].encode()
+        else:
+            original = target.read_bytes()
+            if hashlib.sha256(original).hexdigest() != before:
+                raise ValueError(f"local patch input mismatch: {relative}")
+            updated = original
+            for replacement in change["replacements"]:
+                old, new = replacement["before"].encode(), replacement["after"].encode()
+                if updated.count(old) != 1:
+                    raise ValueError(f"local patch anchor mismatch: {relative}")
+                updated = updated.replace(old, new)
+        if hashlib.sha256(updated).hexdigest() != change["after_sha256"]:
+            raise ValueError(f"local patch output mismatch: {relative}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(updated)
+        changes.append({key: change[key] for key in ("file", "before_sha256", "after_sha256")})
+
     (args.destination / "PHOTOCATALOG_PATCHES.json").write_text(json.dumps({
         "upstream_version": VERSION, "upstream_crate_sha256": SHA256,
         "feature": "source-preservation", "changes": changes,

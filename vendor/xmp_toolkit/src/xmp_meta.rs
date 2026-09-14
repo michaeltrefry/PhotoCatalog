@@ -20,9 +20,9 @@ use std::{
 };
 
 use crate::{
+    ffi::{self, CXmpString},
     IterOptions, OpenFileOptions, XmpDateTime, XmpError, XmpErrorType, XmpFile, XmpIterator,
     XmpProperty, XmpResult, XmpValue,
-    ffi::{self, CXmpString},
 };
 
 /// Represents the data model of an XMP packet.
@@ -2030,6 +2030,27 @@ impl XmpMeta {
     ///
     /// [`Display`]: std::fmt::Display
     pub fn to_string_with_options(&self, options: ToStringOptions) -> XmpResult<String> {
+        self.serialize_with(options, |result| Ok(result.as_string()))
+    }
+
+    /// Serializes RDF with an inclusive bound on the Rust-owned UTF-8 output.
+    ///
+    /// Returns `Ok(None)` if the lossy UTF-8 output would exceed `max_bytes`,
+    /// before allocating that Rust string. Native serialization and its errors
+    /// are unchanged; this does not limit the C++ toolkit's own allocations.
+    pub fn to_string_with_options_bounded(
+        &self,
+        options: ToStringOptions,
+        max_bytes: usize,
+    ) -> XmpResult<Option<String>> {
+        self.serialize_with(options, |result| result.as_string_bounded(max_bytes))
+    }
+
+    fn serialize_with<T>(
+        &self,
+        options: ToStringOptions,
+        copy: impl FnOnce(&CXmpString) -> XmpResult<T>,
+    ) -> XmpResult<T> {
         if let Some(m) = self.m {
             let c_newline = CString::new(options.newline).unwrap_or_default();
             let c_indent = CString::new(options.indent).unwrap_or_default();
@@ -2049,7 +2070,7 @@ impl XmpMeta {
 
                 XmpError::raise_from_c(&err)?;
 
-                Ok(result.as_string())
+                copy(&result)
             }
         } else {
             Err(no_cpp_toolkit())

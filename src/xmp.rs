@@ -167,11 +167,13 @@ pub fn parse(bytes: &[u8]) -> Result<XmpMeta> {
     Ok(model)
 }
 fn serialize(meta: &XmpMeta) -> Result<Vec<u8>> {
-    let bytes = meta
-        .to_string_with_options(ToStringOptions::default().use_compact_format())?
-        .into_bytes();
-    ensure!(bytes.len() <= MAX_PACKET_BYTES, "edited XMP exceeds limit");
-    Ok(bytes)
+    Ok(meta
+        .to_string_with_options_bounded(
+            ToStringOptions::default().use_compact_format(),
+            MAX_PACKET_BYTES,
+        )?
+        .context("edited XMP exceeds limit")?
+        .into_bytes())
 }
 /// Full fallible serialization avoids the SDK wrapper's lossy Clone/iterator error paths.
 pub fn canonical(meta: &XmpMeta) -> Result<String> {
