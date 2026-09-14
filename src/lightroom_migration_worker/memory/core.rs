@@ -1,8 +1,8 @@
 //! Core-owned phase graphs. These are additional to Source/relay owners and
 //! depend on the existing retained-document limits, never a new format ceiling.
 use super::layout::{
-    add, content_containers, manifest_dynamic, mul, saved_policy_dynamic, seal_dynamic,
-    seal_validation, tree,
+    add, content_containers, manifest_dynamic, mul, record_dynamic, saved_policy_dynamic,
+    seal_dynamic, seal_validation, tree, tree_layout, vector, vector_layout,
 };
 use crate::{
     catalog_migration::artifacts::ArtifactRequest,
@@ -19,6 +19,125 @@ use std::mem::size_of;
 
 const RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const DESCRIPTOR_BYTES: usize = 64 * 1024;
+const FILE_METADATA_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Requested backing during roxmltree 0.21.1 parsing. The pinned parser starts
+/// node/attribute vectors from spelling counts, keeps its temporary vectors
+/// beside the growing Document, and has DTD disabled on every admitted caller.
+/// The word-count layouts are portable upper expressions for the pinned private
+/// fields: NodeData <=16 words, AttributeData <=8, Namespace <=4 and
+/// TempAttributeData <=10. Each vector term includes its pinned minimum capacity
+/// and the old/new RawVec overlap. Owned normalized strings, Arc headers, the
+/// TextBuffer/join buffer and the previous first-text owner are separate.
+pub(crate) fn xml_document(text: &str) -> Result<usize> {
+    let tag_spellings = text.as_bytes().iter().filter(|byte| **byte == b'<').count();
+    let attribute_spellings = text.as_bytes().iter().filter(|byte| **byte == b'=').count();
+    let namespace_declarations = text.match_indices("xmlns").count();
+    let namespace_values = add(namespace_declarations, 1)?; // implicit xml binding
+    let syntactic_nodes = add(mul(2, tag_spellings)?, 2)?;
+    let words = size_of::<usize>();
+    let overlapping_vector = |entries: usize, minimum: usize, item: usize| {
+        mul(add(mul(3, entries.max(minimum))?, 8)?, item)
+    };
+    let node_backing = overlapping_vector(syntactic_nodes, tag_spellings, mul(16, words)?)?;
+    let attribute_backing =
+        overlapping_vector(attribute_spellings, attribute_spellings, mul(8, words)?)?;
+    let namespace_backing = overlapping_vector(namespace_values, 0, mul(4, words)?)?;
+    // tree_order only inherits a parent's namespace slice when the current
+    // element declares a namespace (parse.rs resolve_namespaces). There are at
+    // most d declaration events and d values, plus the implicit xml index.
+    let tree_order = mul(namespace_values, add(namespace_values, 1)?)?;
+    let namespace_indices = add(
+        overlapping_vector(tree_order, 0, size_of::<u16>())?,
+        overlapping_vector(namespace_values, 0, size_of::<u16>())?,
+    )?;
+    let temporary_attributes = overlapping_vector(attribute_spellings, 16, mul(10, words)?)?;
+    // awaiting_subtree stores NodeId, parent_prefixes stores &str and after_text
+    // stores Cow<str>. Their initial capacities are respectively 0, 1 and 1.
+    let parser_vectors = add(
+        overlapping_vector(tag_spellings, 0, words)?,
+        add(
+            overlapping_vector(add(tag_spellings, 1)?, 1, mul(2, words)?)?,
+            overlapping_vector(syntactic_nodes, 1, mul(3, words)?)?,
+        )?,
+    )?;
+    let normalized_owners = add(
+        mul(4, text.len())?,
+        mul(add(attribute_spellings, syntactic_nodes)?, mul(2, words)?)?,
+    )?;
+    add(
+        add(node_backing, attribute_backing)?,
+        add(
+            add(namespace_backing, namespace_indices)?,
+            add(
+                temporary_attributes,
+                add(parser_vectors, normalized_owners)?,
+            )?,
+        )?,
+    )
+}
+
+/// Selected file-metadata caller owners present before Prepared starts. The
+/// Evidence cache's accepted canonical bytes share R across the actual selected
+/// records. Evidence retains one graph while returned/path/Historical clones
+/// retain the second. The fixed extra two records are the selected file and
+/// retained path; the existing call-site ceiling is 2*COUNT+4, not a new cap.
+/// Reconstructed/supplemental Inspection retains the existing 64 MiB raw and
+/// 64 MiB decoded payload ceilings while Prepared is built. Every vector/tree
+/// uses the actual requested roster and the pinned RawVec/BTree expressions.
+pub(crate) fn file_metadata_selected(packet_records: usize) -> Result<usize> {
+    use crate::lightroom::migration_source::EvidenceRecord;
+    let evidence_records = add(packet_records, 2)?;
+    let evidence = add(
+        mul(2, record_dynamic(RETAINED_BYTES, evidence_records)?)?,
+        add(
+            tree_layout(
+                evidence_records,
+                std::alloc::Layout::new::<i64>(),
+                crate::catalog_migration::organization::evidence_cache_entry_layout(),
+            )?,
+            vector::<(i64, EvidenceRecord)>(packet_records)?,
+        )?,
+    )?;
+    // The serde family is the already-pinned direct R-byte historical/seal/
+    // supplemental parser envelope. The returned typed graph and the raw/typed
+    // overlap are named independently from the two retained packet byte sums.
+    let parser_family = add(
+        content_containers(RETAINED_BYTES, 1)?,
+        add(mul(32, RETAINED_BYTES)?, mul(8, FRAME_BYTES)?)?,
+    )?;
+    let retained_inspection = add(
+        mul(2, FILE_METADATA_PAYLOAD_BYTES)?,
+        add(
+            vector_layout(
+                packet_records,
+                std::alloc::Layout::new::<crate::xmp_packets::Packet>(),
+            )?,
+            vector_layout(
+                packet_records,
+                std::alloc::Layout::new::<crate::xmp_packets::ParseInput>(),
+            )?,
+        )?,
+    )?;
+    let historical = add(parser_family, add(seal_dynamic()?, retained_inspection)?)?;
+    let roster = add(
+        add(
+            vector_layout(
+                packet_records,
+                crate::catalog_migration::file_metadata::packet_guard_layout(),
+            )?,
+            vector::<i64>(packet_records)?,
+        )?,
+        add(
+            tree::<i64, ()>(packet_records)?,
+            mul(2, tree::<usize, usize>(packet_records)?)?,
+        )?,
+    )?;
+    add(
+        saved_state_retained()?,
+        add(evidence, add(historical, roster)?)?,
+    )
+}
 
 /// Caller-owned state persists after importer::read returns. The fifth Progress
 /// is Worker's outer `before`; the other four cover nested reconciliation.

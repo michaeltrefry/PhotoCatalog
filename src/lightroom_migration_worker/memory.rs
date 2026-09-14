@@ -3,6 +3,7 @@
 pub(crate) mod channels;
 pub(crate) mod core;
 pub(crate) mod layout;
+pub(crate) mod requested;
 pub(crate) mod transport;
 
 use anyhow::{Context, Result, ensure};

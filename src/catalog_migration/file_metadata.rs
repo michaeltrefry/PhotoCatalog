@@ -1063,6 +1063,16 @@ impl Catalog {
         source: Option<&dyn MigrationRead>,
         request: &Projection,
     ) -> Result<ProjectionResult> {
+        let admit = |bytes| match source {
+            Some(source) => source.admit_file_metadata(bytes),
+            None => Ok(()),
+        };
+        let requested =
+            crate::lightroom_migration_worker::memory::requested::Requested::new(&admit);
+        let selected = crate::lightroom_migration_worker::memory::core::file_metadata_selected(
+            request.packet_records.len(),
+        )?;
+        let _selected_scope = requested.scope(selected)?;
         request.file.source.identity()?;
         ensure!(
             request.file.source.table == "AgLibraryFile",
@@ -1153,7 +1163,8 @@ impl Catalog {
         let prepared=inspection.as_ref().map(|inspection| {
             let location=origin_path(&historical.path,request.origin)?;
             let source=Source{kind:request.origin.kind().into(),locator:format!("lightroom:{}:{}:{}",request.file.source.identity()?,request.origin.name(),supplement_semantic).into_bytes(),display:format!("Lightroom retained {}",request.origin.name()),ambiguous,provenance:serde_json::json!({"adapter":ADAPTER,"file":request.file.source,"origin":request.origin,"source_path":location,"historical_observation":historical.observation,"association":request.association,"supplement_proof_blake3":supplemental.as_ref().map(|s|&s.0)})};
-            Ok::<_,anyhow::Error>((Prepared::new(inspection,&source)?,source))
+            let prepared = Prepared::new_admitted(inspection, &source, &requested)?;
+            Ok::<_,anyhow::Error>((prepared, source))
         }).transpose()?;
         let mut result = ProjectionResult {
             input_digest: digest,
@@ -1206,7 +1217,8 @@ impl Catalog {
             return Ok(old);
         }
         if let Some((prepared, source)) = prepared {
-            let change = catalog_metadata::retain_prepared(&tx, &asset, &source, &prepared, true)?;
+            let change =
+                catalog_metadata::retain_prepared(&tx, &asset, &source, &prepared.value, true)?;
             result.observation = Some(change.observation_id);
         }
         tx.execute(

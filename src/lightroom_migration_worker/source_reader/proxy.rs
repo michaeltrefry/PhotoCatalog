@@ -540,6 +540,10 @@ impl MigrationRead for SqlReader {
         )
     }
 
+    fn admit_file_metadata(&self, bytes: usize) -> Result<()> {
+        self.session.borrow().process.admit_core(bytes)
+    }
+
     fn seal(&self) -> &InputSeal {
         &self.seal
     }

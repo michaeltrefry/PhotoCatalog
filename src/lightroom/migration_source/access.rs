@@ -13,6 +13,13 @@ pub(crate) trait MigrationRead {
         Ok(())
     }
 
+    /// Complete selected file-metadata phase high water. Managed readers join
+    /// this contribution to the same operation core owner; legacy readers keep
+    /// their existing no-admission behavior.
+    fn admit_file_metadata(&self, _bytes: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn seal(&self) -> &InputSeal;
     fn binding_blake3(&self) -> &str;
     fn max_chunk_bytes(&self) -> usize;
