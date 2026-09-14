@@ -4,6 +4,42 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-14
 
+Latest local checkpoint (supersedes older pending notes below):
+
+- LM retained-core admission is committed at `2b742e8568055b104b9235994cde594f5f6a22c7`.
+  v55 passed 16 functional tests and three formatting checks; independent evidence
+  review v2 `b02c27fac4203884e5f6a6d72519cb576ef3de8f3dbdd65dcd9b3bb55f8024f5`
+  confirms denial before insert and one retained record after retry. This includes
+  actual Source children with an LM thread substitute, not full LM production proof.
+- XMP now supports exact-length admission before copying SDK output into an owned
+  Rust string, retaining the admission guard until that string is freed. Local
+  commit `803c2bdce9e3269d241193a0ba227591a454f8e9` passed four allocation probes,
+  15 SDK tests, two formatting checks and vendor-only strict Clippy; receipt
+  `sc-22847-xmp-admitted-tqric7zx/sdk-gate-1789382376301164000/receipt.json`, SHA256
+  `3edd4a5d08b592ba819612813d5fa290850ba807bc75288f5ff880311dae1029`.
+  Both XMP prerequisites are cherry-picked into LM at `a31c52a8e9d73378d52400aab1feeb0f50be98f6`.
+  The selected-import Prepared/XML ownership integration is active; opaque SDK
+  allocations remain a separate boundary. Earlier whole-app Clippy failed on
+  182 unchanged baseline diagnostics, so vendor success is not an app Clippy claim.
+- FS8 v31 passed eight SQL/edit/image rollback tests and whole-app strict Clippy.
+  Only fixture formatting failed; receipt
+  `sc-22847-fs8-implementation-glc4j7lt/gate-initial-1789383275716977000/receipt.json`,
+  SHA256 `beb4fd5032823ad49503c60980866ea6bb65d111d99ae693a752cdd99f9758a3`.
+  All direct commands were waited; the outer runner exited 1. The earlier v29/v30
+  negatives exposed test setup transactions/identity triggers and are preserved.
+  The successor combines formatting with reviewed count-before-copy SavedJob
+  serialization, then runs affected checks and the three actual preview fixtures.
+- Execution uses the reloaded shortcut-epic model policy: Luna/low for mechanical
+  evidence verification, Terra/medium for localized review and fixture repair,
+  Sol/high for cross-layer XMP implementation. Each received an explicit model and
+  a self-contained brief without inherited conversation history. Earlier inherited
+  agents were stopped. Valid unchanged tests and reviews are retained.
+
+S12 remains In Progress. Full preview aggregate admission, production migration,
+remaining desktop surfaces and S13 acceptance are open. No RAID/original reads,
+installed-app replacement, remote push or new Actions run at this checkpoint.
+
+
 S12 sc-22847 is In Progress; S13 sc-22848 is unstarted. Draft PR16 at
 `f5917e19c01f648ed5af61e97f6a1b5bd7fa5de2` passed all four CI34804834306 jobs
 and all three installer/archive/payload audits. Root verified 28 artifact hashes
