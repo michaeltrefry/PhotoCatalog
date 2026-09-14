@@ -6,6 +6,32 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+Publication runtime17: thirteen exact passes, four failures (real-F interrupted
+capture ENOENT; three catalog fixtures lack explicit overwrite). Four old plan
+filters selected zero and were corrected to ownership_tests, then all four
+passed; invalid attempts remain preserved. Evidence ob0ff0a3, suno07sx and
+ownership4-fsgctyr4; source verified, all cargos and F30242 retired. Sol/high
+owns bounded test-fixture diagnosis; no production change inferred. LM startup
+FIFO candidate204ce2c2 is frozen, full test-target compile active in
+sc-22847-lm3-fifo-preflight-r111qniu (outer49187), independent review next.
+
+LM corrected exact-name four-case runtime entpshlh passes three cases; the
+remaining seven-operation fixture reaches current repair and exposes a startup
+multipart ordering race (grant on urgent queue, subsequent data on ordinary
+queue). Stronger author owns bounded transport repair plus deterministic test.
+Invalid zero-selection run mb5e6na7 remains explicitly nonpassing. All native
+processes retired and source unchanged. Publication R4a/R5a successor26a49207
+passes compilee5722759 with exact source/retirement verified; independent closure
+review precedes seventeen prepared tests in publication-runtime17-ob0ff0a3.
+
+LM test-only fixture repair plus two borrowed serialization fixes passes full
+test-target compile e9874267 and separate source review 2a2e8be7 (0.98).
+Exact content assertions derive three evidence identities from dedup semantics.
+Four-case runtime is active in sc-22847-lm3-fixture-runtime4-mb5e6na7,
+outer38328; no result yet. Publication stronger-author successor080e44ab passes
+compile6b735935. Different reviewer is checking all six prior findings and has
+identified remaining allocation-ID coverage and cancellation/error-priority gaps.
+
 LM3 R8 runtime completed five passes and four failures across nine exact tests;
 receipts sc-22847-lm3-runtime9-l1ctuiya and runtime9-remaining-8fi_fbox preserve
 all logs/source identity. Cargo waits verified; no shared-target workers remain.
