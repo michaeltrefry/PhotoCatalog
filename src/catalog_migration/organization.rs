@@ -2011,3 +2011,40 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[test]
+fn capacity_fixed_evidence_and_decision_layouts() {
+    use crate::capacity_probes as probe;
+    let baseline = probe::begin();
+    probe::fixed_layout::<Kept>("Kept");
+    probe::fixed_layout::<(SourceRecord, Decision)>("SourceRecord_Decision_pair");
+    let rows: Vec<_> = (0..12i64)
+        .map(|i| {
+            (
+                i,
+                Kept {
+                    record: EvidenceRecord {
+                        revision: format!("{i:064x}"),
+                        collection: Collection::Rows,
+                        rowid: i,
+                        key: Vec::new(),
+                        fields: BTreeMap::new(),
+                    },
+                    input: "i".repeat(64),
+                    digest: "d".repeat(64),
+                },
+            )
+        })
+        .collect();
+    let records = probe::fixed_btree("BTreeMap_i64_Kept", || {
+        let mut map = BTreeMap::new();
+        for (key, value) in rows {
+            assert!(map.insert(key, value).is_none());
+        }
+        map
+    });
+    assert_eq!(records.len(), 12);
+    drop(records);
+    probe::report("fixed-evidence-decision", baseline);
+}

@@ -327,3 +327,12 @@ pub(super) fn exact_json<T: Serialize>(
     );
     Ok(bytes)
 }
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[test]
+fn capacity_fixed_source_transport_layouts() {
+    let baseline = crate::capacity_probes::begin();
+    crate::capacity_probes::fixed_layout::<Request>("SourceRequest");
+    crate::capacity_probes::fixed_layout::<Reply>("SourceReply");
+    crate::capacity_probes::report("fixed-source-transport", baseline);
+}

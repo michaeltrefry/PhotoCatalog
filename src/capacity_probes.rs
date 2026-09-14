@@ -297,7 +297,7 @@ fn capacity_allocator_accounting_preserves_failed_realloc_charge() {
 // Dedicated BTree probes tag only the insertion interval after all borrowed
 // Strings and iteration storage are allocated. Unexpected Layouts remain visible.
 static NODE_TAG: AtomicUsize = AtomicUsize::new(0);
-static NODES: [[NodeLayout; 16]; 2] = [const { [const { NodeLayout::new() }; 16] }; 2];
+static NODES: [[NodeLayout; 16]; 3] = [const { [const { NodeLayout::new() }; 16] }; 3];
 struct NodeLayout {
     size: AtomicUsize,
     align: AtomicUsize,
@@ -368,7 +368,7 @@ fn capacity_btree_actual_reference_layouts_include_split_cascade_bound() {
     assert_eq!(references.len(), 16_384);
     assert_eq!(tuples.len(), 16_384);
     let mut maximum = [0usize; 2];
-    for (tag, entries) in NODES.iter().enumerate() {
+    for (tag, entries) in NODES.iter().take(2).enumerate() {
         let mut types = 0;
         for entry in entries {
             let size = entry.size.load(SeqCst);
@@ -394,4 +394,127 @@ fn capacity_btree_actual_reference_layouts_include_split_cascade_bound() {
     );
     drop((references, tuples));
     report("btree-layouts", baseline);
+}
+
+/// Observe the actual root type, not a mirrored representation. Roots may live
+/// inline on a stack or inside another allocation; this is not a heap charge.
+pub(crate) fn fixed_layout<T>(name: &str) {
+    let layout = Layout::new::<T>();
+    println!(
+        "FIXED_LAYOUT name={name} size={} align={} pointer_bytes={} arch={} os={}",
+        layout.size(),
+        layout.align(),
+        std::mem::size_of::<usize>(),
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+}
+
+/// The caller prebuilds exactly twelve ordered, distinct keys and all payloads,
+/// then moves them into an empty BTree. On pinned Rust 1.98 this reaches the
+/// first split: two leaf allocations and one internal root. Only slot 3 is reset;
+/// the two independently qualified borrowed-reference observations stay intact.
+pub(crate) fn fixed_btree<T>(name: &str, insert: impl FnOnce() -> T) -> T {
+    assert_eq!(NODE_TAG.load(SeqCst), 0);
+    for entry in &NODES[2] {
+        entry.size.store(0, SeqCst);
+        entry.align.store(0, SeqCst);
+        entry.count.store(0, SeqCst);
+    }
+    let value = {
+        let _tag = tag_nodes(3);
+        insert()
+    };
+    let mut layouts = [(0usize, 0usize, 0usize); 2];
+    let mut count = 0;
+    for entry in &NODES[2] {
+        let size = entry.size.load(SeqCst);
+        if size != 0 {
+            assert!(
+                count < layouts.len(),
+                "unexpected allocation while inserting {name}"
+            );
+            layouts[count] = (size, entry.align.load(SeqCst), entry.count.load(SeqCst));
+            count += 1;
+        }
+    }
+    assert_eq!(count, 2, "missing node class for {name}");
+    layouts.sort_unstable();
+    let [leaf, internal] = layouts;
+    // Exact pinned node.rs: InternalNode embeds LeafNode then CAPACITY+1
+    // edges, each a pointer. The observed alignments must also match.
+    assert_eq!(internal.0, leaf.0 + 12 * std::mem::size_of::<usize>());
+    assert_eq!(leaf.1, internal.1);
+    assert_eq!((leaf.2, internal.2), (2, 1));
+    assert!(
+        !INVALID.load(SeqCst),
+        "allocation observation lost exactness"
+    );
+    println!(
+        "FIXED_BTREE name={name} leaf_size={} internal_size={} align={} leaf_allocations={} internal_allocations={} keys=12 rust_source=1.98.0",
+        leaf.0, internal.0, leaf.1, leaf.2, internal.2
+    );
+    value
+}
+
+#[test]
+fn capacity_fixed_public_and_parser_layouts() {
+    use crate::{
+        catalog_migration::importer::{ArtifactInput, SupplementInput},
+        lightroom::{migration_source::Field, plan::Cell},
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    // This is serde's actual pinned private type. A dependency upgrade must
+    // explicitly revisit this test and its source proof, not substitute a mirror.
+    use serde::__private229::de::Content;
+    let baseline = begin();
+    fixed_layout::<ArtifactInput>("ArtifactInput");
+    fixed_layout::<SupplementInput>("SupplementInput");
+    fixed_layout::<Cell>("Cell");
+    fixed_layout::<Content<'static>>("serde229_Content");
+    fixed_layout::<(Content<'static>, Content<'static>)>("serde229_Content_pair");
+    assert_eq!(
+        std::mem::size_of::<(Content<'static>, Content<'static>)>(),
+        2 * std::mem::size_of::<Content<'static>>()
+    );
+    let fields: Vec<_> = (0..12)
+        .map(|i| (format!("{i:064x}"), Field::Inline(Cell::Null)))
+        .collect();
+    let map = fixed_btree("BTreeMap_String_Field", || {
+        let mut map = BTreeMap::new();
+        for (key, value) in fields {
+            assert!(map.insert(key, value).is_none());
+        }
+        map
+    });
+    assert_eq!(map.len(), 12);
+    let ids: Vec<_> = (0..12usize).collect();
+    let packet = fixed_btree("BTreeMap_usize_usize", || {
+        let mut map = BTreeMap::new();
+        for i in ids {
+            assert!(map.insert(i, i).is_none());
+        }
+        map
+    });
+    assert_eq!(packet.len(), 12);
+    let ids: Vec<_> = (0..12i64).collect();
+    let set = fixed_btree("BTreeSet_i64", || {
+        let mut set = BTreeSet::new();
+        for i in ids {
+            assert!(set.insert(i));
+        }
+        set
+    });
+    assert_eq!(set.len(), 12);
+    let names: Vec<_> = (0..12).map(|i| format!("{i:064x}")).collect();
+    let dictionary = fixed_btree("BTreeSet_String", || {
+        let mut set = BTreeSet::new();
+        for name in names {
+            assert!(set.insert(name));
+        }
+        set
+    });
+    assert_eq!(dictionary.len(), 12);
+    drop((map, packet, set, dictionary));
+    report("fixed-public-parser", baseline);
 }

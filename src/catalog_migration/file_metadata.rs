@@ -2172,3 +2172,11 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[test]
+fn capacity_fixed_packet_guard_layout() {
+    let baseline = crate::capacity_probes::begin();
+    crate::capacity_probes::fixed_layout::<PacketGuard>("PacketGuard");
+    crate::capacity_probes::report("fixed-packet-guard", baseline);
+}
