@@ -6,6 +6,15 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+Active next wave: C preview metadata aggregate assembly (Sol/high, cross-module
+ownership arithmetic), managed SqlReader selected-XMP denial/retry fixture
+(Sol/high, same subsystem context), and a private actual-native corruption/cache
+fixture (Terra/medium, localized test work). Native execution is serialized under
+root grants; proof-only and private fixture work can proceed together. Existing
+verified checkpoints are retained rather than re-audited. These are model choices
+for this wave, not a permanent mapping. Live read-back confirms sc-22847 In
+Progress, sc-22848 To Do, and the remaining epic stories Done.
+
 - LM retained-core admission is committed at `2b742e8568055b104b9235994cde594f5f6a22c7`.
   v55 passed 16 functional tests and three formatting checks; independent evidence
   review v2 `b02c27fac4203884e5f6a6d72519cb576ef3de8f3dbdd65dcd9b3bb55f8024f5`
