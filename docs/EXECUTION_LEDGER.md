@@ -114,8 +114,8 @@ reserved, prepared paths are admitted before filesystem changes, and exhausted
 metadata allowance cannot block authorized cleanup. Three new regression tests
 and the two-file source passed independent review
 `9b5ff283fa43ae6d10e662f60b2501a55748362c3b7e95f7485d457207c2f0f2`;
-runtime remains pending. Source files are retained privately in
-`sc-22847-stage-capacity-czfw9qcf` for exact comparison.
+all three added regressions subsequently passed in v12. Source files are retained
+privately in `sc-22847-stage-capacity-czfw9qcf` for exact comparison.
 
 The next encoded-delivery implementation has source review for its retained
 read/native pause, SQL identity checks, off-actor transfer and exact E/binary
@@ -145,9 +145,15 @@ isolation and held first/middle cancellation with retained task/result charges;
 independent test review `a6c1d286ddb86adfd9059d369581afcad1b2f7a5f3f5283ed6f3a2ab80026b7b`
 passed. V13 composition review verified all 44 pins and the exact seven-file delta,
 `ba0aeef713296dc29ff3bef7d7387dd3b77739709f474b9f87642556504c8215`.
-The 38-test focused gate is queued behind the active Lightroom pure gate. Source
-is preserved in `sc-22847-legacy-read-lrx3ovg7`; configured C/G/F/N proof remains
-required after these focused tests.
+The v13 gate passed all 38 tests, strict Clippy and formatting; receipt
+`fdae94d1ab0069af7b8af3e24bf76a64bd325efc55ed617cee69a8df89f73005`
+has fourteen verified artifacts and nine directly waited commands. Source is
+preserved in `sc-22847-legacy-read-lrx3ovg7`. V14 added two configured preview
+fixtures and a fifth delivery regression. Independent review found test-only
+pre-C cleanup custody CF-1; v15 corrects the sole fixture file and passed source
+review `f9bec6b855e1c7541f06ae9163a47e9cb9c2f05fe3679cb2355ca4c4ee374ff7`.
+All 45 current pins match. Its initial discovery/delivery5/Clippy/format gate is
+active; actual configured C/G/F/N execution remains separately pending.
 
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
@@ -196,11 +202,18 @@ V50 removes only that invalid fixture call after capture_manifest; production
 source review passed (`b5b9512f05098c5134f6107618e9804c52d21406c4f33013f6ec24518d498fc8`)
 and the one-line successor review passed
 `84e435ffaf89a48cd9d8b3955d3170c6ac30ca5b47c24a626d8aa40e0e5bc1e3`.
-Its nine-test pure gate is active; actual-process scoped retirement and complete
-numerical phase admission/coordinator remain unqualified.
-Source-scoped allocation retirement design passed independent review, requiring
-both G process/pipe/relay drain and LM proxy quiescence; v50 enforcement awaits
-runtime qualification, and operation/caller allocations remain charged separately.
+V50 passed nine pure and eight actual Source-process tests plus two formatting
+checks. Independent final review
+`be35c80eb3db06a7bd39c834cb7e470f3780a76eff66bc0b02d27cfbf8da2ad3`
+verified 135 pins, 41 artifacts and 20 direct waits including preserved v49 failure.
+The bounded nine-file checkpoint is committed as
+`4047c17f502b8655019f47a146bcb20cbbd0d243`; root verified all 135 committed blobs.
+Runtime markers prove scope 60→30→60→10→0 and typed pool 341→17→0. The typed
+fixture uses a joined LM thread, so it does not qualify abrupt actual LM death.
+Source charges require both G process/pipe/relay drain and LM proxy quiescence;
+operation/caller allocations remain separate. Eighteen compiler warnings are
+not a strict Clippy pass. Full numerical admission and coordinator wiring remain
+active and unqualified.
 Remaining
 filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
 the full tracked scope. Current local tests use synthetic files without RAID/GPU.
