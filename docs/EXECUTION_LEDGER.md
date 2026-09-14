@@ -152,8 +152,35 @@ preserved in `sc-22847-legacy-read-lrx3ovg7`. V14 added two configured preview
 fixtures and a fifth delivery regression. Independent review found test-only
 pre-C cleanup custody CF-1; v15 corrects the sole fixture file and passed source
 review `f9bec6b855e1c7541f06ae9163a47e9cb9c2f05fe3679cb2355ca4c4ee374ff7`.
-All 45 current pins match. Its initial discovery/delivery5/Clippy/format gate is
-active; actual configured C/G/F/N execution remains separately pending.
+V15 delivery5 passed; test-only Clippy correction v16 then passed strict Clippy
+and formatting. Configured v16 stopped on invalid fixture SQL before workers;
+v17 reached workers but rejected the test-only null ConfigWire field. V18 omits
+that field, passed strict Clippy/formatting, and reached real G/C/F startup. It
+then exposed the obsolete FS6 helper gate: Proxy-backed worker_main still chose
+legacy Bridge, rejected OpenExisting and parked cleanup. The hung fixture was
+explicitly interrupted and directly waited; ten receipt artifacts and no observed
+survivors verified (`0eb7180c6867eefc5015019f3a581a7344cea3e62f11cdc8c49e04073c6d279d`).
+No actual preview success is awarded. Next coherent source selects the existing
+managed helper for Proxy-backed work and permits only already-converted routes.
+
+Root codec error correction passed independent successor source review
+`83c73a4e1d9e71edb1d3b2714b2ebb5685833c45f9910be7312054d69607b6e0`.
+It retains typed native/JPEG/WebP resource and unknown failures, marks explicit
+cache data rejection Corrupt, and removes the broad managed error wrapper.
+Only direct edges to already-locked backend versions are added. Four tests await
+runtime. Source and preserved initial negative review are private under
+`sc-22847-codec-errors-6l024y0_`.
+
+Saved preview job recovery and schema-upgrade descriptors now have a reviewed
+private two-file candidate checking borrowed TEXT, existing 64hex identities and
+64KiB descriptor bounds before copying/JSON. Three tests await runtime; review
+`f41ac8871f0ce71994190b9afbf12f5224eb966758a4a64e0642004fda507b4b`.
+The guard-only upgrade fixture does not replace existing complete upgrade tests.
+Root RenderWork/receipt/RenderRecord graph note passed shape review
+`dbb25958b65a3613b720946e3dd033f09c9f61aa4027a7166a95d1238c9da95d`;
+final aggregate admission and std/serde allocation coefficient proof remain open.
+Both private corrections are handed to the FS8 author for coherent composition;
+no current installed-app or full FS8 acceptance follows.
 
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
@@ -213,7 +240,12 @@ fixture uses a joined LM thread, so it does not qualify abrupt actual LM death.
 Source charges require both G process/pipe/relay drain and LM proxy quiescence;
 operation/caller allocations remain separate. Eighteen compiler warnings are
 not a strict Clippy pass. Full numerical admission and coordinator wiring remain
-active and unqualified.
+active and unqualified. Root retained-migration query guards passed independent
+source review `7770f4ea724a4c7bb419a189634ae267185aac253805d4b625b8a0f76caf0d3a`:
+compressed SQLite bytes are borrowed under the existing cap, and digest/field
+identities are checked before copying. Three public-query regression tests await
+the coherent numerical source gate. This query is also reached by current
+import_artifacts::request, not only planned metadata browsing.
 Remaining
 filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
 the full tracked scope. Current local tests use synthetic files without RAID/GPU.
