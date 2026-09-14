@@ -6,6 +6,17 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+LM batch3 T192424 (28 files, manifest e1ca27fa) passed the full test-target
+compile preflight in `sc-22847-lm3-preflight3-xyyrpsrk`: cargo67371 waited exit0,
+source unchanged, logd272c6ce. Independent review4d1effbd requires seven repairs:
+startup grant reception, first-use lock creation, typed/retained allocation
+admission, validation before Bootstrap, source/destination separation, fixture
+protocol isolation, and status schema parity. One bounded repair batch is active;
+runtime remains unstarted. General coding author handles the explicit repairs;
+stronger independent review is reserved for cross-process ownership/accounting.
+Coordinator alone owns the serialized native lane. Shortcut23445 records this
+checkpoint. FS9 original-verification ownership remains an independent source lane.
+
 Current combined-tested source is `d3b5c24`, including FS9 facts `786be8c`,
 LM transport `d8f5a6e`, and LM supervisor batch2 `b9e8177a` cherry-picked with
 eleven exact frozen blob matches. T180722 passed four focused tests (each1,
