@@ -127,10 +127,7 @@ pub(super) fn serve(input: impl IoRead + Send + 'static, mut output: impl Write)
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(epoch) = epoch {
-            let mut detail = format!("{error:#}");
-            while detail.len() > 4096 {
-                detail.pop();
-            }
+            let detail = reply_error_text(error);
             let _ = write_frame(&mut output, &Reply::Failed { epoch, detail });
         }
     }
@@ -309,10 +306,7 @@ fn run(controls: &Controls, output: &mut impl Write) -> Result<()> {
                 if let Err(error) = read {
                     poisoned = true;
                     controls.cancel.store(true, Ordering::Release);
-                    let mut detail = format!("{error:#}");
-                    while detail.len() > 4096 {
-                        detail.pop();
-                    }
+                    let detail = reply_error_text(&error);
                     write_frame(
                         output,
                         &Reply::Failed {
@@ -349,5 +343,115 @@ fn run(controls: &Controls, output: &mut impl Write) -> Result<()> {
                 )?;
             }
         }
+    }
+}
+
+// This is the existing wire error-prefix limit, enforced before formatting can
+// grow an intermediate String. Underlying error/context storage is separate.
+const REPLY_ERROR_BYTES: usize = 4096;
+struct ReplyErrorText {
+    text: String,
+    stopped: bool,
+}
+impl std::fmt::Write for ReplyErrorText {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if self.stopped {
+            return Err(std::fmt::Error);
+        }
+        let remaining = REPLY_ERROR_BYTES - self.text.len();
+        let mut end = remaining.min(value.len());
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&value[..end]);
+        if end < value.len() || self.text.len() == REPLY_ERROR_BYTES {
+            // Sticky even when a Display implementation ignores fmt::Error:
+            // later short pieces must not replace the first truncated scalar.
+            self.stopped = true;
+            return Err(std::fmt::Error);
+        }
+        Ok(())
+    }
+}
+fn reply_prefix(arguments: std::fmt::Arguments<'_>) -> String {
+    let mut output = ReplyErrorText {
+        text: String::with_capacity(REPLY_ERROR_BYTES),
+        stopped: false,
+    };
+    // fmt::Error is our bounded-output stop signal. This never materializes the
+    // complete formatted chain and asks standard formatters to stop immediately.
+    let _ = std::fmt::write(&mut output, arguments);
+    output.text
+}
+fn reply_error_text(error: &anyhow::Error) -> String {
+    reply_prefix(format_args!("{error:#}"))
+}
+
+#[cfg(test)]
+mod reply_error_tests {
+    use super::*;
+    use std::{cell::Cell, fmt};
+
+    #[test]
+    fn bounded_reply_prefix_matches_existing_chain_and_utf8_behavior() {
+        for value in [
+            String::new(),
+            "short".into(),
+            "a".repeat(4096),
+            "a".repeat(4097),
+            "🦀".repeat(1025),
+            format!("{}🦀tail", "a".repeat(4095)),
+        ] {
+            let error = anyhow::anyhow!(value).context("inner").context("outer");
+            let mut expected = format!("{error:#}");
+            while expected.len() > REPLY_ERROR_BYTES {
+                expected.pop();
+            }
+            let actual = reply_error_text(&error);
+            assert_eq!(actual, expected);
+            assert!(actual.len() <= REPLY_ERROR_BYTES);
+            assert_eq!(actual.capacity(), REPLY_ERROR_BYTES);
+        }
+    }
+
+    #[test]
+    fn bounded_reply_prefix_stops_formatting_without_full_intermediate_or_suffix() {
+        struct StopAfterHead<'a> {
+            head: &'a str,
+            tail_seen: &'a Cell<bool>,
+        }
+        impl fmt::Display for StopAfterHead<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.head)?;
+                self.tail_seen.set(true);
+                f.write_str("tail")
+            }
+        }
+        let head = "x".repeat(8192);
+        let tail_seen = Cell::new(false);
+        let actual = reply_prefix(format_args!(
+            "{}",
+            StopAfterHead {
+                head: &head,
+                tail_seen: &tail_seen
+            }
+        ));
+        assert_eq!(actual, &head[..4096]);
+        // Eager format!(...) would visit this tail before truncating its String.
+        assert!(!tail_seen.get());
+
+        struct IgnoresWriteError<'a>(&'a str);
+        impl fmt::Display for IgnoresWriteError<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)?;
+                let _ = f.write_str("🦀");
+                let _ = f.write_str("z");
+                Ok(())
+            }
+        }
+        let head = "x".repeat(4095);
+        let actual = reply_prefix(format_args!("{}", IgnoresWriteError(&head)));
+        assert_eq!(actual, head);
+        assert_eq!(actual.capacity(), REPLY_ERROR_BYTES);
     }
 }
