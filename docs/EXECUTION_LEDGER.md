@@ -135,9 +135,18 @@ on fixture EAGAIN in the fifth case. Root verified nine artifacts and all five
 waited commands, with no observed survivors; receipt
 `caf8378944e0caed4835ca5063f493987a90fee514709736fa18dfee0ed7ba86`.
 V48 changes only that fixture to set an accepted socket explicitly blocking with
-finite timeouts and contextual errors. The exact failed case will run first; six
-unrun process cases and formatting remain. The original EAGAIN attribution is
-an inference pending the corrective result.
+finite timeouts and contextual errors. The targeted corrective test passed both
+malformed-output and actual stdin-write-failure modes with no ordinary event
+consumption before reserved failure. Receipt
+`24c6b2fbf3dd29ec293cef55223e63a08d5de620974ac0d498691a4c7623679c`
+has five verified artifacts and one waited command. The remaining six exact
+process tests and formatting then passed; receipt
+`a7e7237132cacd3c11522b0004dd9da442697f991083a79b639c17edd14b2fe8`
+has eleven verified artifacts and seven waited commands. No observed owners
+remain. This yields 28 distinct functional positives (17 in-process and eleven
+actual-process) across the preserved phases; compatibility and independent
+combined qualification remain pending. Original EAGAIN attribution remains an
+inference because the failed log did not identify its precise I/O operation.
 Source-scoped allocation retirement design passed independent review, requiring
 both G process/pipe/relay drain and LM proxy quiescence; its enforcement is not yet
 implemented, and operation/caller allocations remain charged separately.
