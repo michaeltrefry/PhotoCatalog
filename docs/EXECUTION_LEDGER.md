@@ -6,6 +6,27 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+LM3 T212233 compile passed (ffb91e3a), but independent review found that an
+alias to an empty destination can reach Bootstrap before managed no-link
+validation. Author is repairing validation before any create/upgrade authority
+and adding an empty-destination no-write regression; runtime8 remains unexecuted.
+FS9 publication compiler successor 720cdb56 passes the full test-target check
+(aeb05f57, source unchanged, checked process retirement); separate independent
+source review is active. Both components remain uncommitted and unaccepted.
+
+LM3 T205842 passed independent source review b95ead09, but the root runtime
+selected 22 tests and returned 15 passed / 7 failed. Negative log 4d662a21 and
+checked process retirement are preserved in sc-22847-lm3-runtime22-83eq74mn.
+Successor T212233 changes three files: shared canonical destination resolution,
+canonical synthetic fixture paths, and result/error assertions. Manifest 9ab70779;
+root full test-target compile passed in sc-22847-lm3-runtime7-preflight-b0j3hbl0
+(log ffb91e3a, source unchanged, checked process retirement). Independent review
+is active; eight affected tests remain before this repair can be accepted.
+FS9 publication first candidate 6cd318d6 failed compilation with seven type/API
+errors (log ea704de6); source hashes and cargo retirement verified in
+sc-22847-publication-preflight-dwv5x85v. One bounded compiler repair is active.
+No integrated LM3 or publication acceptance, external-drive reads, push, or CI.
+
 LM3 stronger-model candidate T203411 (41 files, manifestc4b97d4f) passes full
 Rust test-target and Tauri compile checks, logs1dca6e22/a1b9196f, source unchanged.
 Different independent reviewcdcf4d07 requires four repairs: Run shared parser/SQL
