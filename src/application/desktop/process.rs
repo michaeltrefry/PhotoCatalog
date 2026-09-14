@@ -118,6 +118,7 @@ fn finish_wait(shared: &Shared, status: std::process::ExitStatus, threads: IoThr
     }
     shared.complete_failure();
     shared.child_finished();
+    shared.metadata.retire();
 }
 impl Owner {
     pub fn pid(&self) -> u32 {
@@ -143,12 +144,22 @@ impl Owner {
         hello: Vec<u8>,
         harness: bool,
     ) -> anyhow::Result<Self> {
-        let mut child = Command::new(executable)
+        // Arm before OS spawn: any unwind after a successful spawn must retain
+        // admission. Only a proven no-child error or checked wait retires it.
+        shared.metadata.arm();
+        let mut child = match Command::new(executable)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                shared.metadata.retire();
+                return Err(error.into());
+            }
+        };
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let control = child.stderr.take().unwrap();

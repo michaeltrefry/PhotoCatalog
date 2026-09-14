@@ -43,6 +43,7 @@ struct Running {
     parent: Arc<Parent>,
     client: Arc<Client>,
     observed: Arc<Mutex<Vec<Observation>>>,
+    metadata: crate::preview::ByteBudget,
 }
 fn command(bridge: &DesktopBridge, request: Request) -> Result<Response> {
     let result = bridge
@@ -156,7 +157,8 @@ impl Running {
         config.validate()?;
         // Validation passed while guarded; spawn_inner now owns C creation/retirement.
         before_catalog.0.take();
-        let bridge = DesktopBridge::spawn_inner(config, Some(parent.clone()))?;
+        let metadata = crate::preview::ByteBudget::new(config.requested_preview_metadata_bytes()?)?;
+        let bridge = DesktopBridge::spawn_inner(config, Some(parent.clone()), Some(&metadata))?;
         eprintln!(
             "configured preview G={} C={} F={}",
             std::process::id(),
@@ -179,6 +181,7 @@ impl Running {
                 parent,
                 client,
                 observed,
+                metadata,
             },
             token,
         ))
@@ -256,6 +259,12 @@ impl Running {
             "configured preview verified C={} F={} checked retirement",
             self.bridge.status().pid,
             self.client.pid()
+        );
+        let metadata = self.metadata.clone();
+        drop(self);
+        ensure!(
+            metadata.used() == 0,
+            "metadata retained after final C/F owners dropped"
         );
         Ok(())
     }
@@ -948,3 +957,99 @@ fn actual_managed_jpeg_webp_avif_corruption_is_typed_and_exactly_invalidated() -
 
 #[cfg(unix)]
 mod abnormal_tests;
+
+#[cfg(unix)]
+#[test]
+#[ignore = "configured actual C/F metadata allowance lifetime"]
+fn actual_managed_metadata_is_held_through_close_until_checked_wait() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    let (temporary, root, originals, _, checksum) = fixture()?;
+    let (started, gate) = crate::application::desktop::process::test_reap::armed(|| {
+        Running::start(&executable, &root, &originals, true)
+    });
+    let (running, token) = match started {
+        Ok(value) => value,
+        Err(error) => {
+            drop(gate);
+            eprintln!("metadata fixture retained at {:?}", temporary.keep());
+            return Err(error);
+        }
+    };
+    let pool = running.metadata.clone();
+    let charge = pool.used();
+    let mut shutdown = None;
+    let result = (|| -> Result<()> {
+        ensure!(charge > 0, "managed startup did not reserve metadata");
+        command(&running.bridge, Request::Close { catalog: token })?;
+        ensure!(
+            pool.used() == charge,
+            "catalog close released live C metadata"
+        );
+        let bridge = running.bridge.clone();
+        shutdown = Some(thread::spawn(move || bridge.try_shutdown()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !running.bridge.0.shared.state.lock().unwrap().stopping {
+            ensure!(Instant::now() < deadline, "shutdown never started");
+            thread::sleep(Duration::from_millis(2));
+        }
+        ensure!(
+            !running.bridge.0.shared.state.lock().unwrap().reaped,
+            "wait gate bypassed"
+        );
+        ensure!(
+            pool.used() == charge && pool.try_reserve(1).is_none(),
+            "unwaited C released admission"
+        );
+        Ok(())
+    })();
+    // Always release the test gate and join shutdown before touching fixture files.
+    drop(gate);
+    let retired = (|| -> Result<()> {
+        if let Some(shutdown) = shutdown {
+            shutdown
+                .join()
+                .map_err(|_| anyhow::anyhow!("shutdown thread panicked"))??;
+        } else {
+            running.bridge.try_shutdown()?;
+        }
+        let state = running.bridge.0.shared.state.lock().unwrap();
+        ensure!(
+            state.reaped && state.child_finished && state.filesystem_verified,
+            "C/F retirement unverified"
+        );
+        drop(state);
+        ensure!(
+            pool.used() == charge && pool.try_reserve(1).is_none(),
+            "live parent relay backing released after wait"
+        );
+        running.parent.finish_after_dependents(false)?;
+        ensure!(
+            blake3::hash(&std::fs::read(originals.join("original.png"))?)
+                .to_hex()
+                .to_string()
+                == checksum,
+            "synthetic original changed"
+        );
+        Ok(())
+    })();
+    if result.is_err() || retired.is_err() {
+        eprintln!(
+            "metadata fixture retained at {:?}; assertions={result:?}; retirement={retired:?}",
+            temporary.keep()
+        );
+        return result.and(retired);
+    }
+    drop(running);
+    ensure!(
+        pool.used() == 0,
+        "final parent owners did not release allowance"
+    );
+    let retry = pool.try_reserve(charge).context("same-pool retry denied")?;
+    drop(retry);
+    eprintln!(
+        "metadata charge={charge}; held through catalog close, blocked OS wait and surviving parent; same-pool retry and C/F retirement passed"
+    );
+    Ok(())
+}

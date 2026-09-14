@@ -6,6 +6,23 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+Current wave from `95ce173`: C preview metadata admission is reviewed and
+verified locally. Its mandatory explicit shared allowance precedes ConfigWire
+copy and C launch; the guard spans OS wait/pipe joins plus final Shared/Parent
+owner drop. Typed refusal preserves F startup custody and supports same-pool
+retry. Nine tests, fresh CLI build and package formatting pass; source review
+PASS (confidence0.99). Evidence `sc-22847-c-admission-c5xhb6jj/passing-v3.json`
+verifies nine source hashes and seven qualifying command receipts. Initial
+passing tests missed surviving G relay storage; reviewer found that issue and
+final configured tests now keep the charge until parent drop, then start a
+second actual C/F pair. Superseded evidence remains visible. Requested aggregate
+adds96 bytes for its exact guard storage; it is not RSS or a native/image budget.
+Sol/high implements LM preprojection in a separate worktree; independent
+Sol/high review follows C closeout (new-agent thread capacity was exhausted).
+Native runs remain serialized CPU2 and unchanged checks are retained. Production
+route/shared-pool policy, full LM/S12 and S13 remain open. No RAID reads,
+installed-app replacement, push or Actions.
+
 The bounded wave is integrated locally: metadata aggregate (Sol/high), managed
 SqlReader selected-XMP proof (Sol/high with existing subsystem context), and
 actual-native corrupt-cache fixture (Sol/medium after Terra/medium returned

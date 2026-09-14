@@ -951,6 +951,17 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         size: u64::try_from(budget.0)?,
         align: u64::try_from(budget.1)?,
     };
+    let admission = super::preview_metadata_admission::owned_layout();
+    a.push(
+        "fixed.metadata_admission_owner_backing",
+        Phase::Retained,
+        1,
+        c.add(&[
+            c.arc(Layout { size: u64::try_from(admission.0)?, align: u64::try_from(admission.1)? })?,
+            std::mem::size_of::<super::preview_metadata_admission::ProcessReservation>() as u64,
+            std::mem::size_of::<Mutex<Option<super::preview_metadata_admission::ProcessReservation>>>() as u64,
+        ])?,
+    )?;
     a.push(
         "fixed.preview_byte_budget_arc_backings",
         Phase::Retained,

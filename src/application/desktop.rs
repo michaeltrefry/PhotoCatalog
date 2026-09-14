@@ -19,6 +19,7 @@ mod filesystem;
 #[cfg(test)]
 mod filesystem_tests;
 mod native;
+mod preview_metadata_admission;
 pub(crate) mod preview_metadata_capacity;
 mod process;
 #[cfg(test)]
@@ -84,6 +85,7 @@ struct Shared {
     wake: Condvar,
     binary: Arc<AtomicUsize>,
     filesystem: Option<Arc<filesystem::Parent>>,
+    metadata: preview_metadata_admission::ProcessReservation,
     #[cfg(test)]
     fixture: Mutex<Option<std::result::Result<String, String>>>,
 }
@@ -271,13 +273,14 @@ impl Drop for Handle {
 pub struct DesktopBridge(Arc<Handle>);
 impl DesktopBridge {
     pub fn spawn(config: Config) -> anyhow::Result<Self> {
-        Self::spawn_inner(config, None)
+        Self::spawn_inner(config, None, None)
     }
     /// Unselected paired transport. Managed actor use remains blocked on FS6.
     #[allow(dead_code)]
     pub(crate) fn spawn_with_filesystem(
         config: Config,
         client: Arc<crate::filesystem_worker::client::Client>,
+        metadata: &crate::preview::ByteBudget,
     ) -> anyhow::Result<Self> {
         config.validate()?;
         {
@@ -286,14 +289,39 @@ impl DesktopBridge {
                 config.worker_executable.clone(),
                 config.preview_limits.clone(),
             )?;
-            Self::spawn_inner(config, Some(parent))
+            Self::spawn_inner(config, Some(parent), Some(metadata))
         }
     }
     fn spawn_inner(
         config: Config,
         filesystem: Option<Arc<filesystem::Parent>>,
+        metadata_budget: Option<&crate::preview::ByteBudget>,
     ) -> anyhow::Result<Self> {
-        config.validate()?;
+        let metadata = (|| {
+            config.validate()?;
+            anyhow::ensure!(
+                filesystem.is_some() == metadata_budget.is_some(),
+                "managed catalog requires an explicit preview metadata allowance"
+            );
+            match metadata_budget {
+                Some(budget) => {
+                    let reservation =
+                        preview_metadata_admission::ProcessReservation::reserve(&config, budget)?;
+                    Ok(reservation)
+                }
+                None => Ok(Default::default()),
+            }
+        })()
+        .map_err(|e: anyhow::Error| match &filesystem {
+            Some(owner) => {
+                let message = e.to_string();
+                e.context(filesystem::Unstarted {
+                    owner: owner.clone(),
+                    message,
+                })
+            }
+            None => e,
+        })?;
         let paired = filesystem.is_some();
         let mut configuration = wire::ConfigWire::from_config(&config);
         configuration.filesystem = filesystem.as_ref().map(|f| f.binding.clone());
@@ -304,6 +332,11 @@ impl DesktopBridge {
                 &filesystem,
                 "desktop configuration byte limit",
             ));
+        }
+        if let Some(parent) = &filesystem {
+            parent
+                .retain_metadata(metadata.clone())
+                .map_err(|e| filesystem::before_child_failure(&filesystem, e))?;
         }
         let shared = Arc::new(Shared {
             session: *uuid::Uuid::new_v4().as_bytes(),
@@ -330,6 +363,7 @@ impl DesktopBridge {
             wake: Condvar::new(),
             binary: Arc::new(AtomicUsize::new(0)),
             filesystem,
+            metadata,
             #[cfg(test)]
             fixture: Mutex::new(None),
         });

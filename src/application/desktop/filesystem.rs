@@ -566,8 +566,22 @@ pub(super) struct Parent {
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
     #[cfg(test)]
     pub observer: Mutex<Option<Observer>>,
+    // Last: named parent relay backings must drop before their allowance owner.
+    metadata: Mutex<Option<super::preview_metadata_admission::ProcessReservation>>,
 }
 impl Parent {
+    pub fn retain_metadata(
+        &self,
+        reservation: super::preview_metadata_admission::ProcessReservation,
+    ) -> Result<()> {
+        let mut held = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            held.is_none(),
+            "filesystem parent already owns catalog metadata admission"
+        );
+        *held = Some(reservation);
+        Ok(())
+    }
     pub fn new(client: Arc<Client>) -> Arc<Self> {
         let this = Arc::new(Self {
             binding: Binding {
@@ -605,6 +619,7 @@ impl Parent {
             threads: Mutex::new(Vec::new()),
             #[cfg(test)]
             observer: Mutex::new(None),
+            metadata: Mutex::new(None),
         });
         // Construction always returns the retained owner, including partial startup.
         for admission in [false, true] {

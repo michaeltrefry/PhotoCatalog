@@ -110,10 +110,31 @@ per-owner capacity and total. Focused tests cover default, minimum and maximum
 supported owner counts, uniqueness and phase assembly, arithmetic/table/Vec
 overflow rejection, independence from all image/native byte budgets, and
 bounded retained-error classification round trips.
-`Config::validate` evaluates representability only; it does not reserve these
-bytes or enforce the report against a process budget. A full C admission still
-needs a reservation owner and release lifetime at the managed catalog-open
-boundary.
+`Config::validate` evaluates representability. The managed desktop spawn route
+also requires an explicit shared `ByteBudget` for this metadata and reserves the
+complete report before copying `ConfigWire` or launching C. Refusal retains its
+typed metadata error and the existing retryable F startup owner. Multiple C
+starts using the same pool compete for that allowance; a failed reservation
+never changes its used count. Native working, encoded staging and decoded pixel
+budgets remain separate.
+
+G owns this reservation. Catalog close, a drain acknowledgement and pipe EOF do
+not retire it: C can still hold configuration or process-level objects. Only an
+OS spawn error proving no child exists, or successful `Child::wait` followed by
+transport joins, permits release. The charge remains held until the final
+transport and filesystem relay parent owners are dropped, because the report
+also names parent fault/queue backing that survives C. One Arc guard is shared
+by those owners; its backing and added handles are included in the report. A
+second C cannot replace an existing parent's admission guard. A lost/panicked
+wait owner deliberately retains the charge. Configuration failure before guard
+installation and an attempted spawn releases normally.
+
+The private managed route has this admission contract; selecting that route in
+the desktop app and choosing the production shared-pool policy remain open.
+There is no automatically manufactured allowance equal to the request in
+production and no deduction from existing small native working limits. Tests
+explicitly supply synthetic allowances. This accounting does not establish the
+4 GiB browse RSS requirement or include opaque native/runtime storage.
 
 Fixed control backing includes each Calls root's three root-capability IDs and
 canonical path plus its two optional retained stage IDs. Every active render or
@@ -126,12 +147,20 @@ not observed allocations or RSS measurements.
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 3,261,278 | 5,868,572,026 | 5,364,516,472 | 5,871,833,304 |
-| Default | 717,356,644 | 5,868,581,602 | 5,364,516,472 | 6,585,938,246 |
-| Maximum | 1,065,973,174,780 | 10,385,736,502 | 5,364,516,472 | 1,076,358,911,282 |
+| Minimum | 3,261,374 | 5,868,572,026 | 5,364,516,472 | 5,871,833,400 |
+| Default | 717,356,740 | 5,868,581,602 | 5,364,516,472 | 6,585,938,342 |
+| Maximum | 1,065,973,174,876 | 10,385,736,502 | 5,364,516,472 | 1,076,358,911,378 |
 
 The integrated gate passed three formula tests and 21 affected transport, codec,
 cache and real-process tests. The bounded error representation preserves typed
 `anyhow` context through `Error::downcast_ref`; walking only standard error
 sources loses context markers. A regression test covers a filesystem failure
 receipt together with encoded-budget and stage-busy markers.
+
+The admission gate passed nine focused tests: three formula cases, three
+reservation/startup-error cases and three actual managed-process cases covering
+refusal/retry, blocked wait with a surviving parent, and cold/warm delivery.
+A fresh CLI build and package formatting passed. Source review caught the
+initial premature release at C wait; final tests require the old parent to drop
+before the pool can admit a second actual C/F pair. Evidence and the superseded
+initial gate are retained in `sc-22847-c-admission-c5xhb6jj` under private results.
