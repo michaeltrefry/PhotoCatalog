@@ -51,6 +51,10 @@ fn session_with_memory(
     read_ms: u64,
     memory: MemoryBudget,
 ) -> Result<Session> {
+    let kind = match &authority {
+        Authority::Sql { .. } => Kind::Sql,
+        Authority::Artifact { .. } => Kind::Raw,
+    };
     let binding = authority.binding()?;
     let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
     let stop = Arc::new(Stop::default());
@@ -66,6 +70,7 @@ fn session_with_memory(
         stop,
         SourceAdmission {
             epoch: epoch(),
+            kind,
             binding,
             encoded,
             cancel,

@@ -127,6 +127,31 @@ fn path_bound(path: &NativePath) -> Result<()> {
     ensure!(n > 0 && n <= 16384, "supplement path bound");
     Ok(())
 }
+pub(crate) fn validate_request(request: &Request) -> Result<()> {
+    path_bound(&request.proof_root)?;
+    path_bound(&request.inspection_relative)?;
+    digest(&request.capture_revision)?;
+    digest(&request.source_revision.blake3)?;
+    ensure!(
+        !request.source_id.is_empty() && request.source_id.len() <= 4096,
+        "supplement source ID bounds"
+    );
+    ensure!(
+        request.historical_status == Status::Malformed,
+        "qualified PSD supplement requires historical malformed observation"
+    );
+    let root = request.proof_root.to_path()?;
+    let relative = request.inspection_relative.to_path()?;
+    ensure!(
+        root.is_absolute()
+            && relative
+                .components()
+                .all(|p| matches!(p, Component::Normal(_)))
+            && relative.file_name() == Some(std::ffi::OsStr::new("inspection.json")),
+        "supplement root/relative path invalid"
+    );
+    Ok(())
+}
 fn read(
     path: &Path,
     maximum: usize,
@@ -244,28 +269,9 @@ impl Catalog {
     ) -> Result<Prepared> {
         self.require_jobs_released()?;
         let deadline = Instant::now() + Duration::from_secs(120);
-        path_bound(&request.proof_root)?;
-        path_bound(&request.inspection_relative)?;
-        digest(&request.capture_revision)?;
-        digest(&request.source_revision.blake3)?;
-        ensure!(
-            !request.source_id.is_empty() && request.source_id.len() <= 4096,
-            "supplement source ID bounds"
-        );
-        ensure!(
-            request.historical_status == Status::Malformed,
-            "qualified PSD supplement requires historical malformed observation"
-        );
+        validate_request(request)?;
         let root = request.proof_root.to_path()?;
         let relative = request.inspection_relative.to_path()?;
-        ensure!(
-            root.is_absolute()
-                && relative
-                    .components()
-                    .all(|p| matches!(p, Component::Normal(_)))
-                && relative.file_name() == Some(std::ffi::OsStr::new("inspection.json")),
-            "supplement root/relative path invalid"
-        );
         reject_links(&root)?;
         ensure!(root.is_dir(), "supplement root is not a directory");
         let path = root.join(relative);
@@ -423,17 +429,17 @@ impl Catalog {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::{Value, json};
-    struct Fixture {
+    pub(crate) struct Fixture {
         _temp: tempfile::TempDir,
         root: std::path::PathBuf,
-        request: Request,
+        pub(crate) request: Request,
         doc: Value,
     }
     impl Fixture {
-        fn new() -> Result<Self> {
+        pub(crate) fn new() -> Result<Self> {
             let temp = tempfile::tempdir()?;
             let root = temp.path().canonicalize()?;
             std::fs::create_dir(root.join("00"))?;
@@ -474,6 +480,9 @@ mod tests {
         }
         fn catalog(&self) -> Result<Catalog> {
             Catalog::open(self.root.join("destination"))
+        }
+        pub(crate) fn destination(&self) -> std::path::PathBuf {
+            self.root.join("destination")
         }
     }
     fn bytes(c: &Catalog, id: &str) -> Result<Vec<u8>> {

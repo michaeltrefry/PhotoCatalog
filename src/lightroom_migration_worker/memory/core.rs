@@ -26,6 +26,216 @@ const FILE_METADATA_PACKET_RECORDS: usize = 2048;
 // lookup::page checks the stored classification before parsing each hit.
 const LOOKUP_CLASSIFICATION_BYTES: usize = 4096;
 
+/// Complete direct-serde phase for one already admitted JSON document. The
+/// `Content` term covers buffered internally/externally tagged containers and
+/// `Value`; 32 bytes per source byte covers typed Vec/map/string roots and
+/// their pinned growth overlap (the same established parser family used by
+/// selected metadata and Artifact construction). Eight maximum wire frames
+/// cover serde error/path and current chunk owners without borrowing another
+/// document's allowance. Callers add raw input and named retained type graphs.
+fn worker_json(bytes: usize, content_layers: usize) -> Result<usize> {
+    add(
+        content_containers(bytes, content_layers)?,
+        add(mul(32, bytes)?, mul(8, FRAME_BYTES)?)?,
+    )
+}
+
+/// The small operation envelope is decoded before LM can receive grants. Its
+/// parent therefore admits this complete typed/direct-serde graph before spawn;
+/// the existing separate INPUT_BYTES reservation retains the raw child String.
+pub(crate) fn worker_envelope(bytes: usize) -> Result<usize> {
+    worker_json(bytes, 2)
+}
+
+/// Run keeps its parsed seal and Policy, temporarily owns both approval Value
+/// and ApprovalDocument, and clones the seal once while the original remains.
+/// Raw multipart Strings are separately admitted by `input` and remain live.
+pub(crate) fn worker_run_documents(
+    seal_bytes: usize,
+    approval_bytes: usize,
+    policy_bytes: usize,
+    authorization_bytes: usize,
+) -> Result<usize> {
+    let seal = seal_dynamic()?;
+    let policy = saved_policy_dynamic(policy_bytes)?;
+    let seal_parse = add(worker_json(seal_bytes, 2)?, seal)?;
+    let approval_parse = add(seal, mul(2, worker_json(approval_bytes, 1)?)?)?;
+    let policy_parse = add(seal, add(worker_json(policy_bytes, 2)?, policy)?)?;
+    let authorization_parse = if authorization_bytes == 0 {
+        add(seal, policy)?
+    } else {
+        add(add(seal, policy)?, worker_json(authorization_bytes, 2)?)?
+    };
+    let retained_and_clone = add(
+        add(add(mul(2, seal)?, policy)?, 3 * 64)?,
+        mul(3, MANIFEST_BYTES)?,
+    )?;
+    Ok(seal_parse
+        .max(approval_parse)
+        .max(policy_parse)
+        .max(authorization_parse)
+        .max(retained_and_clone))
+}
+
+/// Repair keeps the parsed request beside one original and one Source-bound
+/// seal clone. Approval bytes are hashed in place and own only the 64-byte
+/// digest result.
+pub(crate) fn worker_repair_documents(seal_bytes: usize, request_bytes: usize) -> Result<usize> {
+    let seal = seal_dynamic()?;
+    let seal_parse = add(worker_json(seal_bytes, 2)?, seal)?;
+    let request = worker_json(request_bytes, 2)?;
+    Ok(seal_parse.max(add(seal, request)?).max(add(
+        add(mul(2, seal)?, add(request, 64)?)?,
+        mul(3, MANIFEST_BYTES)?,
+    )?))
+}
+
+/// Repair execution is independent of the incoming request graph. These are
+/// existing 8 MiB stored-document ceilings, including invalid direct-serde
+/// input before its semantic checks. The four control owners are the outer and
+/// transaction-check Binding/Progress pairs. The four item owners cover old
+/// Outcome + old receipt/archive + replacement Outcome + receipt verification;
+/// each includes raw, typed, Content and encoder overlap rather than only the
+/// eventual successful shape. The saved importer Policy and reconciliation
+/// before/after cursors remain separately live during those checks.
+pub(crate) fn worker_repair_execution() -> Result<usize> {
+    let document = add(worker_json(RETAINED_BYTES, 2)?, mul(4, RETAINED_BYTES)?)?;
+    let controls = mul(4, document)?;
+    let item = mul(4, document)?;
+    // Two PreparedKeywordProjection proofs can coexist with the currently
+    // loading proof. Each Evidence has the established 100-record/8 MiB
+    // aggregate ceiling; returned row/field clones own a second complete graph.
+    let proof = add(
+        mul(2, record_dynamic(RETAINED_BYTES, 100)?)?,
+        tree_layout(
+            100,
+            std::alloc::Layout::new::<i64>(),
+            crate::catalog_migration::organization::evidence_cache_entry_layout(),
+        )?,
+    )?;
+    let proofs = mul(3, proof)?;
+    let field_maps = mul(
+        2,
+        add(
+            record_dynamic(RETAINED_BYTES, 1)?,
+            retained_field_work(RETAINED_BYTES)?,
+        )?,
+    )?;
+    // Parent archives retire one at a time, but each copied name can survive in
+    // the 64-ancestor path until native comparison. Do not assume name validity
+    // before that comparison. The Order query includes its 1025th refusal row.
+    let hierarchy = add(mul(65, RETAINED_BYTES)?, vector::<String>(65)?)?;
+    let order = add(
+        tree::<i64, (Option<i64>, String)>(1025)?,
+        mul(2, tree::<i64, i64>(1025)?)?,
+    )?;
+    // Current repair retains two compressed archives. Each Zlib output can grow
+    // with its old backing present; decoding additionally owns R+1 refusal bytes.
+    // flate2's pinned default 32 KiB window backends use bounded window/hash/
+    // pending/Huffman workspaces, each below 32 windows including their Boxes.
+    let archives = add(
+        mul(2, vector::<u8>(add(RETAINED_BYTES, 65536)?)?)?,
+        add(vector::<u8>(add(RETAINED_BYTES, 1)?)?, mul(32, 32768)?)?,
+    )?;
+    add(
+        controls,
+        add(
+            item,
+            add(
+                saved_state()?,
+                add(
+                    proofs,
+                    add(
+                        selected_record_load_work()?,
+                        add(field_maps, add(hierarchy, add(order, archives)?)?)?,
+                    )?,
+                )?,
+            )?,
+        )?,
+    )
+}
+
+/// CatalogData is parsed before Adobe's final 8 MiB output check. Every
+/// Property consumes at least one input byte, and every copied ancestor name,
+/// lexical token or value originates in that same input. Include the first
+/// refusal Property and 33 recursive path owners, pinned Vec growth and BTree
+/// key storage. This uses actual borrowed input bytes, never a smaller cap.
+pub(crate) fn repair_adobe_catalog(bytes: usize) -> Result<usize> {
+    use crate::lightroom::adobe::{Key, Limits, Property};
+    let limits = Limits::default();
+    if bytes > limits.bytes {
+        return Ok(0);
+    } // existing parser returns before allocation
+    let properties = add(bytes.min(limits.properties), 1)?;
+    let paths = add(properties, add(limits.depth, 1)?)?;
+    let path = add(vector::<Key>(add(limits.depth, 1)?)?, mul(4, bytes)?)?;
+    let properties = vector::<Property>(properties)?;
+    let keys = tree::<Key, ()>(bytes.min(limits.tokens))?;
+    add(
+        properties,
+        add(
+            mul(paths, path)?,
+            add(
+                keys,
+                add(mul(4, bytes)?, vector::<u8>(limits.output_bytes)?)?,
+            )?,
+        )?,
+    )
+}
+
+pub(crate) fn worker_supplement_documents(bytes: usize) -> Result<usize> {
+    worker_json(bytes, 2)
+}
+
+/// Status queries accept at most the shared executor's existing 16 MiB stored
+/// document. SQLite's raw Vec coexists with the decoded typed progress owner.
+pub(crate) fn worker_status() -> Result<usize> {
+    add(
+        crate::catalog_migration::lightroom_executor::DOCUMENT_BYTES as usize,
+        worker_json(
+            crate::catalog_migration::lightroom_executor::DOCUMENT_BYTES as usize,
+            2,
+        )?,
+    )
+}
+
+/// One supplement preparation retains the 4 MiB inspection and decoded
+/// Document, both existing 64 MiB payload classes, their 1024-member outer
+/// vectors/proof vectors, the 8 MiB normalized proof encoder's old/new overlap,
+/// and the established evidence chunk/descriptor workspace. Prior Prepared
+/// values remain live in the growing result roster.
+pub(crate) fn worker_supplement_execution(requests: usize) -> Result<usize> {
+    use crate::catalog_migration::{evidence, file_metadata, supplements};
+    const DOCUMENT: usize = 4 * 1024 * 1024;
+    const PAYLOAD_CLASS: usize = 64 * 1024 * 1024;
+    const MEMBERS: usize = 1024;
+    const NORMALIZED: usize = 8 * 1024 * 1024;
+    const PATH: usize = 16_384;
+    let document = add(DOCUMENT, worker_json(DOCUMENT, 2)?)?;
+    let payloads = add(mul(2, PAYLOAD_CLASS)?, mul(2, vector::<Vec<u8>>(MEMBERS)?)?)?;
+    let proof = add(
+        vector::<file_metadata::SupplementPacket>(MEMBERS)?,
+        vector::<file_metadata::SupplementInput>(MEMBERS)?,
+    )?;
+    let encoder = mul(3, NORMALIZED)?;
+    let evidence = add(
+        mul(5, evidence::CHUNK_BYTES)?,
+        add(mul(3, DESCRIPTOR_BYTES)?, mul(4, PATH)?)?,
+    )?;
+    let prepared_payload = add(4096, add(mul(5, 64)?, "embedded".len())?)?;
+    let prepared = add(
+        vector::<supplements::Prepared>(requests)?,
+        mul(requests, prepared_payload)?,
+    )?;
+    add(
+        prepared,
+        add(
+            document,
+            add(payloads, add(proof, add(encoder, evidence)?)?)?,
+        )?,
+    )
+}
+
 /// Requested backing during roxmltree 0.21.1 parsing. The pinned parser starts
 /// node/attribute vectors from spelling counts, keeps its temporary vectors
 /// beside the growing Document, and has DTD disabled on every admitted caller.
@@ -846,6 +1056,35 @@ mod tests {
         println!(
             "CORE_ARTIFACT_EXPRESSION bytes={cost} identity_object_bytes=1000 identity_changed_bytes=600 native_layout=true"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lm_executor_batch3_raw_typed_source_and_supplement_phases_share_one_pool() -> Result<()> {
+        use crate::lightroom_migration_worker::memory::{MemoryBudget, ResourceLimit};
+        let seal = 31_337;
+        let approval = 17_003;
+        let policy = 11_111;
+        let raw = add(seal, add(approval, policy)?)?;
+        let typed = worker_run_documents(seal, approval, policy, 0)?;
+        let budget = MemoryBudget::new(add(raw, typed)?)?;
+        let mut documents = budget.reservation();
+        documents.grow(raw)?;
+        let mut competing = budget.reservation();
+        competing.grow(1)?;
+        let mut operation = budget.reservation();
+        let error = operation.grow(typed).unwrap_err();
+        let limit = error.downcast_ref::<ResourceLimit>().unwrap();
+        assert_eq!((limit.required, limit.available), (typed, typed - 1));
+        drop(competing);
+        operation.grow(typed)?;
+        assert_eq!(budget.used(), add(raw, typed)?);
+        assert!(worker_supplement_execution(1024)? > 2 * 64 * 1024 * 1024);
+        assert!(worker_status()? > 16 * 1024 * 1024);
+        drop(operation);
+        assert_eq!(budget.used(), raw);
+        drop(documents);
+        assert_eq!(budget.used(), 0);
         Ok(())
     }
 }

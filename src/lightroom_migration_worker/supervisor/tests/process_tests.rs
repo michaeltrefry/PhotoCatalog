@@ -114,6 +114,7 @@ fn owned_executor_fixture() -> Result<()> {
     output.publish(&ChildFrame::Admitted {
         guard: request.guard.clone(),
         request_blake3: request.digest,
+        build: crate::lightroom_migration_worker::worker::build_identity().into(),
     })?;
     let audit = Audit::new(Arc::new(AtomicBool::new(false)), vec![])?;
     let scope = audit.install()?;
@@ -149,10 +150,10 @@ fn owned_executor_fixture() -> Result<()> {
         }
     });
     let memory = MemoryBudget::from_parent(Arc::new(
-        crate::lightroom_migration_worker::protocol::MemoryGrants {
-            controls: controls.clone(),
-            output: output.clone(),
-        },
+        crate::lightroom_migration_worker::protocol::MemoryGrants::new(
+            controls.clone(),
+            output.clone(),
+        ),
     ));
     let mut phase = memory.reservation();
     phase.grow(12345)?;
@@ -275,12 +276,22 @@ fn command(mode: &str) -> Result<Command> {
 
 #[test]
 fn lm_supervisor_batch2_multipart_pumps_memory_grant_before_multichunk_content() -> Result<()> {
+    multipart_transfer(false)
+}
+
+#[test]
+fn lm_executor_batch3_startup_grant_fifo_when_writer_is_waiting_for_data() -> Result<()> {
+    multipart_transfer(true)
+}
+
+fn multipart_transfer(force_receive_window: bool) -> Result<()> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["--exact", PART_HELPER, "--nocapture"])
         .env(PART_FIXTURE, "1");
     let stop = Arc::new(Stop::default());
     let process = Process::spawn_test_command(command, stop.clone())?;
+    let gate = force_receive_window.then(|| process.force_startup_data_receive_window());
     let pid = process.pid();
     let text = format!("qualified-é-🦀-{}", "x".repeat(3 * TEXT_CHUNK));
     let budget = MemoryBudget::new(text.len())?;
@@ -311,21 +322,36 @@ fn lm_supervisor_batch2_multipart_pumps_memory_grant_before_multichunk_content()
         &stop,
         Instant::now() + Duration::from_secs(10),
     )?;
+    if let Some(gate) = gate {
+        assert!(gate.exercised());
+    }
     assert_eq!(owner.state.next_memory, 2);
     assert_eq!(budget.used(), text.len());
     let until = Instant::now() + Duration::from_secs(10);
-    while owner.process.as_mut().unwrap().try_reap()?.is_none() {
+    let status = loop {
+        if let Some(status) = owner.process.as_mut().unwrap().try_reap()? {
+            break status;
+        }
         ensure!(Instant::now() < until, "multipart receiver exit deadline");
         thread::sleep(Duration::from_millis(2));
-    }
+    };
     while !owner.retry_drain()? {
         ensure!(Instant::now() < until, "multipart receiver drain deadline");
         thread::sleep(Duration::from_millis(2));
     }
+    let drain_fault = owner.drain_fault.take();
     drop(owner);
     assert_eq!(budget.used(), 0);
     #[cfg(unix)]
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    ensure!(
+        status.success(),
+        "multipart receiver rejected input: {status}"
+    );
+    ensure!(
+        drain_fault.is_none(),
+        "multipart receiver drain fault: {drain_fault:?}"
+    );
     println!("LM_MULTIPART child_pid={pid} grant_before_content=true chunks>3 retired=0");
     Ok(())
 }

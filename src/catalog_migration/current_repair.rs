@@ -8,6 +8,7 @@ use super::{
     metadata::{self, CurrentDevelop, ResultRecord},
     walk::{LinkResolution, Walk},
 };
+use crate::catalog_migration::repair_memory;
 use crate::lightroom::migration_source::MigrationRead;
 use crate::{Catalog, catalog_writer::Priority, lightroom::migration_source::MigrationSource};
 use anyhow::{Context, Result, ensure};
@@ -132,12 +133,12 @@ fn epoch(db: &Connection) -> Result<i64> {
     Ok(db.query_row(
         "SELECT epoch FROM migration_mapping_epoch WHERE id=1",
         [],
-        |r| r.get(0),
+        |r| repair_memory::get(r, 0),
     )?)
 }
 fn read(db: &Connection, id: &str) -> Result<(Binding, Progress)> {
     ensure!(hash(id), "repair identity bounds");
-    let (a,b):(Option<Vec<u8>>,Option<Vec<u8>>)=db.query_row("SELECT CASE WHEN length(binding)<=8388608 THEN binding END,CASE WHEN length(progress)<=8388608 THEN progress END FROM migration_current_repairs WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let (a,b):(Option<Vec<u8>>,Option<Vec<u8>>)=db.query_row("SELECT CASE WHEN length(CAST(binding AS BLOB))<=8388608 THEN binding END,CASE WHEN length(CAST(progress AS BLOB))<=8388608 THEN progress END FROM migration_current_repairs WHERE id=?",[id],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?)))?;
     let a = a.context("repair binding bound")?;
     let b = b.context("repair progress bound")?;
     let binding: Binding = serde_json::from_slice(&a)?;
@@ -166,7 +167,7 @@ pub(crate) fn require_not_pending(db: &Connection, run: &str) -> Result<()> {
         .query_row(
             "SELECT id FROM migration_current_repairs WHERE run=?",
             [run],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )
         .optional()?;
     if let Some(id) = id {
@@ -249,8 +250,8 @@ impl Catalog {
         // The supplied source must be exactly the already admitted custody seal,
         // including its selection/approval; a new selection is not a repair input.
         let (seal,approval,complete):(Option<Vec<u8>>,Option<Vec<u8>>,bool)=self.db.query_row(
-            "SELECT CASE WHEN length(seal)<=8388608 THEN seal END,CASE WHEN length(approval)<=8388608 THEN approval END,complete FROM migration_retention WHERE id=?",
-            [&before.input],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            "SELECT CASE WHEN length(CAST(seal AS BLOB))<=8388608 THEN seal END,CASE WHEN length(CAST(approval AS BLOB))<=8388608 THEN approval END,complete FROM migration_retention WHERE id=?",
+            [&before.input],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?)))?;
         ensure!(
             complete
                 && seal.context("retained seal bound")? == encode(source.seal())?
@@ -271,7 +272,7 @@ impl Catalog {
             .query_row(
                 "SELECT id FROM migration_current_repairs WHERE run=?",
                 [&request.run],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )
             .optional()?;
         if let Some(old) = old {
@@ -284,7 +285,7 @@ impl Catalog {
                 && epoch(&self.db)? == request.expected_mapping_epoch,
             "repair requires the pinned completed run/epoch"
         );
-        let original:Option<Vec<u8>>=self.db.query_row("SELECT CASE WHEN length(progress)<=8388608 THEN progress END FROM migration_runs WHERE id=?",[&request.run],|r|r.get(0))?;
+        let original:Option<Vec<u8>>=self.db.query_row("SELECT CASE WHEN length(CAST(progress AS BLOB))<=8388608 THEN progress END FROM migration_runs WHERE id=?",[&request.run],|r|repair_memory::get(r, 0))?;
         let original = original.context("complete progress bound")?;
         ensure!(
             digest(&original) == request.expected_complete_progress_blake3
@@ -409,7 +410,7 @@ impl Catalog {
     ) -> Result<Step> {
         let mut after = before.clone();
         if let Some(capture) = source.seal().selected.get(before.report_index) {
-            let (bytes,old_epoch):(Option<Vec<u8>>,i64)=self.db.query_row("SELECT CASE WHEN length(report)<=8388608 THEN report END,epoch FROM migration_reconciliation WHERE run=?1 AND revision=?2",params![before.run,capture.revision],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let (bytes,old_epoch):(Option<Vec<u8>>,i64)=self.db.query_row("SELECT CASE WHEN length(CAST(report AS BLOB))<=8388608 THEN report END,epoch FROM migration_reconciliation WHERE run=?1 AND revision=?2",params![before.run,capture.revision],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?)))?;
             let bytes = bytes.context("old reconciliation report bound")?;
             ensure!(
                 old_epoch == b.request.expected_mapping_epoch,
@@ -450,7 +451,7 @@ impl Catalog {
                 !tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM migration_reconciliation WHERE run=?)",
                     [&before.run],
-                    |r| r.get::<_, bool>(0)
+                    |r| repair_memory::get::<_, bool>(r, 0)
                 )?,
                 "unexpected old reconciliation report"
             );
@@ -472,8 +473,8 @@ impl Catalog {
     ) -> Result<Step> {
         // The installed (run,stage,record) primary key makes each step a seek.
         let next:Option<(i64,String,Option<Vec<u8>>)>=self.db.query_row(
-            "SELECT record,revision,CASE WHEN length(outcome)<=8388608 THEN outcome END FROM migration_run_items WHERE run=?1 AND stage=?2 AND record>?3 ORDER BY record LIMIT 1",
-            params![before.run,CURRENT,before.after_record],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            "SELECT record,revision,CASE WHEN length(CAST(outcome AS BLOB))<=8388608 THEN outcome END FROM migration_run_items WHERE run=?1 AND stage=?2 AND record>?3 ORDER BY record LIMIT 1",
+            params![before.run,CURRENT,before.after_record],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?))).optional()?;
         let Some((record, revision, old_outcome)) = next else {
             let mut after = before.clone();
             after.phase = Phase::Reconciliation;
@@ -515,8 +516,8 @@ impl Catalog {
             let image = origin.source.identity()?;
             let payload = link.target.source.identity()?;
             let (old_owner,old_digest,retained,bytes):(String,String,i64,Option<Vec<u8>>)=self.db.query_row(
-                "SELECT owner,input_digest,retained_record,CASE WHEN length(result)<=8388608 THEN result END FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot='current_develop'",
-                params![image,payload],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+                "SELECT owner,input_digest,retained_record,CASE WHEN length(CAST(result AS BLOB))<=8388608 THEN result END FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot='current_develop'",
+                params![image,payload],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?,repair_memory::get(r, 3)?)))?;
             let bytes = bytes.context("old metadata result bound")?;
             let old: ResultRecord = serde_json::from_slice(&bytes)?;
             ensure!(
@@ -620,7 +621,7 @@ impl Catalog {
             let input: String = self.db.query_row(
                 "SELECT input FROM migration_retained_records WHERE sequence=?1",
                 [record],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )?;
             ensure!(
                 input == source.binding_blake3()
@@ -661,7 +662,7 @@ impl Catalog {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check(&tx, b, before)?;
-        let still:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM migration_run_items WHERE run=?1 AND stage=?2 AND record=?3 AND revision=?4 AND outcome=?5)",params![before.run,CURRENT,record,revision,old_outcome],|r|r.get(0))?;
+        let still:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM migration_run_items WHERE run=?1 AND stage=?2 AND record=?3 AND revision=?4 AND outcome=?5)",params![before.run,CURRENT,record,revision,old_outcome],|r|repair_memory::get(r, 0))?;
         ensure!(still, "old current run outcome changed");
         let mut new_outcome = old_outcome.clone();
         let mut new_result_digest = old_result.as_deref().map(digest);
@@ -674,7 +675,7 @@ impl Catalog {
             new_result_digest = Some(digest(&encode(&result)?));
             ensure!(tx.execute("UPDATE migration_run_items SET outcome=?6 WHERE run=?1 AND stage=?2 AND record=?3 AND revision=?4 AND outcome=?5",params![before.run,CURRENT,record,revision,old_outcome,new_outcome])?==1,"repair outcome CAS failed");
         } else if let Some(h) = &header {
-            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot=?3 AND owner=?4 AND input_digest=?5 AND retained_record=?6 AND result=?7)",params![h.image_source,h.payload_source,h.slot,h.owner,h.input_digest,h.retained_record,old_result.as_ref().context("old result absent")?],|r|r.get::<_,bool>(0))?,"unchanged metadata receipt changed");
+            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot=?3 AND owner=?4 AND input_digest=?5 AND retained_record=?6 AND result=?7)",params![h.image_source,h.payload_source,h.slot,h.owner,h.input_digest,h.retained_record,old_result.as_ref().context("old result absent")?],|r|repair_memory::get::<_,bool>(r, 0))?,"unchanged metadata receipt changed");
         }
         tx.execute("INSERT INTO migration_current_repair_items VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![before.id,record,revision,disposition,archived_outcome,i64::try_from(old_outcome.len())?,digest(&old_outcome),header_bytes,archived_result,old_result.as_ref().map(|v|i64::try_from(v.len())).transpose()?,old_result.as_deref().map(digest),new_result_digest,digest(&new_outcome)])?;
         advance(&tx, before, &after)?;
@@ -690,7 +691,7 @@ impl Catalog {
     pub fn current_develop_repair_predecessor(&self, id: &str, record: i64) -> Result<Predecessor> {
         read(&self.db, id)?;
         ensure!(record > 0, "repair record bounds");
-        let row=self.db.query_row("SELECT CASE WHEN length(old_outcome)<=8454144 THEN old_outcome END,outcome_length,outcome_digest,CASE WHEN length(metadata_header)<=8388608 THEN metadata_header END,CASE WHEN length(old_result)<=8454144 THEN old_result END,result_length,result_digest,new_result_digest,new_outcome_digest,disposition FROM migration_current_repair_items WHERE repair=?1 AND record=?2",params![id,record],|r|Ok((r.get::<_,Option<Vec<u8>>>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<Vec<u8>>>(3)?,r.get::<_,Option<Vec<u8>>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?)))?;
+        let row=self.db.query_row("SELECT CASE WHEN length(CAST(old_outcome AS BLOB))<=8454144 THEN old_outcome END,outcome_length,outcome_digest,CASE WHEN length(CAST(metadata_header AS BLOB))<=8388608 THEN metadata_header END,CASE WHEN length(CAST(old_result AS BLOB))<=8454144 THEN old_result END,result_length,result_digest,new_result_digest,new_outcome_digest,disposition FROM migration_current_repair_items WHERE repair=?1 AND record=?2",params![id,record],|r|Ok((repair_memory::get::<_,Option<Vec<u8>>>(r, 0)?,repair_memory::get::<_,i64>(r, 1)?,repair_memory::get::<_,String>(r, 2)?,repair_memory::get::<_,Option<Vec<u8>>>(r, 3)?,repair_memory::get::<_,Option<Vec<u8>>>(r, 4)?,repair_memory::get::<_,Option<i64>>(r, 5)?,repair_memory::get::<_,Option<String>>(r, 6)?,repair_memory::get::<_,Option<String>>(r, 7)?,repair_memory::get::<_,String>(r, 8)?,repair_memory::get::<_,String>(r, 9)?)))?;
         let outcome = decompress(
             &row.0.context("repair outcome compressed bound")?,
             row.1,
@@ -736,7 +737,7 @@ fn check_recipe_tx(db: &Connection, request: &CurrentDevelop, old: &ResultRecord
         .context("old recipe revision unavailable")?;
     let (kind,provenance,node,cursor,current_revision,digest,stored_digest):(String,Option<String>,i64,Option<i64>,i64,String,String)=db.query_row(
         "SELECT c.kind,CASE WHEN length(CAST(c.provenance AS BLOB))<=65536 THEN c.provenance END,c.current_node,v.cursor,v.revision,n.digest,current.digest FROM edit_changes c JOIN edit_variants v ON v.asset_id=c.asset_id AND v.id=c.variant_id JOIN edit_recipe_nodes n ON n.id=c.current_node JOIN edit_recipe_nodes current ON current.id=v.cursor WHERE c.asset_id=?1 AND c.variant_id=?2 AND c.revision=?3",
-        params![old.image.asset_id,old.image.variant_id,revision],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+        params![old.image.asset_id,old.image.variant_id,revision],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?,repair_memory::get(r, 3)?,repair_memory::get(r, 4)?,repair_memory::get(r, 5)?,repair_memory::get(r, 6)?)))?;
     let provenance: serde_json::Value =
         serde_json::from_str(&provenance.context("old import provenance bound")?)?;
     ensure!(

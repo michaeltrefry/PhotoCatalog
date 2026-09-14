@@ -193,6 +193,49 @@ impl Audit {
             path: NativePath::from_path(path),
         })
     }
+    /// Create the persistent first-use import-lock inode only while the parent
+    /// writer grant is held. An existing-file race reopens that exact object;
+    /// neither path truncates it.
+    pub(crate) fn create_import_lock(&self, path: &Path) -> Result<OwnedFile> {
+        self.check()?;
+        ensure!(
+            self.0
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("helper role state poisoned"))?
+                .writing,
+            "import lock creation requires a parent writer grant"
+        );
+        crate::lightroom::source::reject_links(path.parent().context("file has no parent")?)?;
+        let configure = |create_new| {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(create_new);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.custom_flags(0x0020_0000).share_mode(1 | 2);
+            }
+            options
+        };
+        let file = match configure(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                configure(false).open(path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let lease = self.admit(&file, Role::ImportLock)?;
+        Ok(OwnedFile {
+            file,
+            lease,
+            path: NativePath::from_path(path),
+        })
+    }
 }
 /// File closes before its role is retired. Outer DestinationLease owns the
 /// import lock until every inner reader, connection and transaction has closed.

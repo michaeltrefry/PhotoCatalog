@@ -164,3 +164,45 @@ fn foreign_local_destination_and_overbudget_documents_are_rejected_lexically() -
     assert!(parse(d).is_err());
     Ok(())
 }
+
+#[test]
+fn lm_executor_batch3_borrowed_approved_documents_preserve_raw_identity_and_semantics() -> Result<()>
+{
+    let documents = fixture()?;
+    let expected = blake3::hash(documents.approval_json.as_bytes())
+        .to_hex()
+        .to_string();
+    let owned = ApprovedDocuments::parse(documents.clone(), root(), &expected)?;
+    let admitted = ApprovedAdmitted::parse(
+        &documents.seal_json,
+        &documents.approval_json,
+        &documents.policy_json,
+        documents.execution_authorization_json.as_deref(),
+        root(),
+        &expected,
+    )?;
+    assert_eq!(admitted.token(), owned.token());
+    assert_eq!(admitted.policy_blake3(), owned.policy_blake3());
+    assert_eq!(
+        serde_json::to_vec(admitted.seal())?,
+        serde_json::to_vec(owned.seal())?
+    );
+    assert_eq!(
+        serde_json::to_vec(admitted.policy())?,
+        serde_json::to_vec(owned.policy())?
+    );
+    assert_eq!(
+        admitted.exact_documents(),
+        (
+            documents.seal_json.as_str(),
+            documents.approval_json.as_str(),
+            documents.policy_json.as_str(),
+            documents.execution_authorization_json.as_deref(),
+        )
+    );
+    assert_eq!(
+        admitted.approval_bytes(),
+        documents.approval_json.as_bytes()
+    );
+    Ok(())
+}

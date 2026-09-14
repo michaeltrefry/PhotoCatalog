@@ -3,6 +3,7 @@ use super::{
     organization::{Evidence, Link, SourceRecord, verify_unique_link},
     retention,
 };
+use crate::catalog_migration::repair_memory;
 use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
@@ -180,7 +181,13 @@ fn existing(
         .query_row(
             "SELECT owner,input_digest,result FROM migration_images WHERE source_identity=?",
             [identity],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    repair_memory::get(r, 0)?,
+                    repair_memory::get(r, 1)?,
+                    repair_memory::get(r, 2)?,
+                ))
+            },
         )
         .optional()?;
     found
@@ -200,7 +207,7 @@ pub(crate) fn mapped_image(
     source: &super::originals::SourceKey,
 ) -> Result<VariantKey> {
     let identity = source.identity()?;
-    db.query_row("SELECT i.asset_id,i.variant_id FROM image_import_map m JOIN catalog_images i ON i.id=m.image_id WHERE m.import_source=?1 AND m.capture_revision=?2 AND m.source_table=?3 AND m.source_id=?4",params![owner,source.capture_revision,source.table,identity],|r|Ok(VariantKey{asset_id:r.get(0)?,variant_id:r.get(1)?})).context("selected image has no native mapping")
+    db.query_row("SELECT i.asset_id,i.variant_id FROM image_import_map m JOIN catalog_images i ON i.id=m.image_id WHERE m.import_source=?1 AND m.capture_revision=?2 AND m.source_table=?3 AND m.source_id=?4",params![owner,source.capture_revision,source.table,identity],|r|Ok(VariantKey{asset_id:repair_memory::get(r, 0)?,variant_id:repair_memory::get(r, 1)?})).context("selected image has no native mapping")
 }
 impl Catalog {
     pub fn project_migration_image(
@@ -259,7 +266,7 @@ impl Catalog {
             let source = source.context("first image projection requires the sealed source")?;
             verify_unique_link(&self.db, &mut proof, &request.origin, file, source)?;
             let file_identity = file.target.source.identity()?;
-            let (asset,owner):(String,String)=self.db.query_row("SELECT asset_id,import_source FROM migration_originals WHERE source_identity=?",[&file_identity],|r|Ok((r.get(0)?,r.get(1)?))).context("file must be explicitly registered before image")?;
+            let (asset,owner):(String,String)=self.db.query_row("SELECT asset_id,import_source FROM migration_originals WHERE source_identity=?",[&file_identity],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?))).context("file must be explicitly registered before image")?;
             ensure!(
                 owner == request.import_source,
                 "file belongs to a different importer"
@@ -310,7 +317,7 @@ impl Catalog {
             return Ok(result);
         }
         let outcome = if let Some((file_identity, asset, role, parent, label)) = resolved {
-            ensure!(tx.query_row("SELECT asset_id=?2 AND import_source=?3 FROM migration_originals WHERE source_identity=?1",params![file_identity,asset,request.import_source],|r|r.get::<_,bool>(0))?,"original mapping changed");
+            ensure!(tx.query_row("SELECT asset_id=?2 AND import_source=?3 FROM migration_originals WHERE source_identity=?1",params![file_identity,asset,request.import_source],|r|repair_memory::get::<_,bool>(r, 0))?,"original mapping changed");
             if let (
                 Decision::Register {
                     role: Role::Virtual { master },
@@ -324,7 +331,7 @@ impl Catalog {
                     "virtual parent mapping changed"
                 );
             }
-            let reserved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM image_import_reservations WHERE asset_id=?1 AND owner=?2)",params![asset,request.import_source],|r|r.get(0))?;
+            let reserved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM image_import_reservations WHERE asset_id=?1 AND owner=?2)",params![asset,request.import_source],|r|repair_memory::get(r, 0))?;
             let image = catalog_images::register_import_image(
                 &tx,
                 &ImportImageRequest {

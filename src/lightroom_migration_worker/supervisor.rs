@@ -199,12 +199,30 @@ impl<A: Admission> State<A> {
                 bytes,
             }));
         }
-        if let ChildFrame::Admitted { request_blake3, .. } = frame {
+        if let ChildFrame::Admitted {
+            request_blake3,
+            build,
+            ..
+        } = frame
+        {
             ensure!(
-                !self.admitted && request_blake3 == self.input_digest,
+                !self.admitted
+                    && request_blake3 == self.input_digest
+                    && build == super::worker::build_identity(),
                 "helper admission digest/replay differs"
             );
             self.admitted = true;
+            return Ok(None);
+        }
+        // A failed startup conveys no authority. Preserve its bounded terminal
+        // cause even if multipart admission never reached Admitted.
+        if let ChildFrame::Failed {
+            detail, poisoned, ..
+        } = frame
+        {
+            ensure!(detail.len() <= 32 * 1024, "migration error byte admission");
+            self.terminal = Some(Err(anyhow::anyhow!("{detail}")));
+            self.terminal_poisoned = poisoned;
             return Ok(None);
         }
         ensure!(self.admitted, "helper acted before exact input admission");
@@ -391,13 +409,7 @@ impl<A: Admission> State<A> {
                 }
                 self.terminal = Some(Ok(()));
             }
-            ChildFrame::Failed {
-                detail, poisoned, ..
-            } => {
-                ensure!(detail.len() <= 32 * 1024, "migration error byte admission");
-                self.terminal = Some(Err(anyhow::anyhow!("{detail}")));
-                self.terminal_poisoned = poisoned;
-            }
+            ChildFrame::Failed { .. } => unreachable!(),
             ChildFrame::Admitted { .. } => unreachable!(),
         }
         Ok(None)
@@ -626,7 +638,9 @@ fn send(process: &Process, mut frame: ParentFrame, stop: &Stop, until: Instant) 
 /// Send one described document without nesting it in operation JSON. The
 /// worker requests its retained capacity after BeginPart and before it reads
 /// content, so the supervisor pumps that exact NeedMemory/MemoryGrant exchange
-/// before filling the bounded input queue.
+/// before filling the bounded input queue. The startup grant uses that same
+/// FIFO: queueing it on the urgent channel could let content wake a writer
+/// already blocked on the data queue and overtake the grant.
 fn send_part_admitted<A: Admission>(
     owner: &mut Owned<A>,
     guard: &Guard,
@@ -659,7 +673,7 @@ fn send_part_admitted<A: Admission>(
                 .process
                 .as_ref()
                 .context("migration process absent")?
-                .try_send_control(frame)?;
+                .try_send(frame)?;
         }
         if control.is_none() && owner.state.next_memory == before {
             match owner
@@ -679,6 +693,16 @@ fn send_part_admitted<A: Admission>(
                         "multipart retained byte request differs"
                     );
                     control = owner.state.accept(frame, stop, until)?;
+                }
+                Output::Frame(frame @ ChildFrame::Failed { .. }) => {
+                    owner.state.accept(frame, stop, until)?;
+                    let error = owner
+                        .state
+                        .terminal
+                        .as_ref()
+                        .and_then(|r| r.as_ref().err())
+                        .context("startup failure lacks terminal cause")?;
+                    anyhow::bail!("{error:#}")
                 }
                 Output::Frame(_) => {
                     anyhow::bail!("worker acted before multipart input admission")
@@ -1179,6 +1203,12 @@ fn execute_operation_with_broker<A: Admission>(
         // Full typed/core phase admission is added by the coordinator separately.
         let mut memory = budget.reservation();
         memory.grow(INPUT_BYTES)?;
+        if streamed_result_maximum.is_some() {
+            // LM decodes this bounded envelope before its control listener can
+            // receive a child-originated grant. Admit the complete typed graph
+            // in G before spawn; raw INPUT_BYTES remains a separate owner.
+            memory.grow(super::memory::core::worker_envelope(request.len())?)?;
+        }
         // Reserve current-target backing before constructing the broker or any
         // Child/pipe owner. Two Sources are the complete concurrent role roster.
         // These fixed owners remain operation-scoped through every checked join.

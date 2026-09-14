@@ -320,6 +320,8 @@ fn observed_full_event_queue_cannot_delay_revoking_both_sources() -> Result<()> 
         &token,
         &Request::Begin {
             epoch: epoch("sql"),
+            role: Kind::Sql,
+            build: crate::lightroom_migration_worker::worker::build_identity().into(),
             bytes: U64(0),
             blake3: blake3::hash(b"").to_hex().to_string(),
         },
@@ -416,6 +418,8 @@ fn live_transport_errors_bypass_observed_full_events_before_any_dequeue() -> Res
             &token,
             &Request::Begin {
                 epoch: epoch("sql"),
+                role: Kind::Sql,
+                build: crate::lightroom_migration_worker::worker::build_identity().into(),
                 bytes: U64(0),
                 blake3: blake3::hash(b"").to_hex().to_string(),
             },

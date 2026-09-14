@@ -129,6 +129,8 @@ pub(super) enum Read {
 pub(super) enum Request {
     Begin {
         epoch: Epoch,
+        role: super::relay::Kind,
+        build: String,
         bytes: U64,
         blake3: String,
     },

@@ -32,3 +32,19 @@ pub fn managed_source_reader_main(raw: bool) -> anyhow::Result<()> {
         }),
     )
 }
+
+#[cfg(test)]
+pub(crate) fn test_source_reader_main(
+    raw: bool,
+    output: impl std::io::Write,
+) -> anyhow::Result<()> {
+    owner::serve_mode(
+        std::io::stdin(),
+        output,
+        Some(if raw {
+            relay::Kind::Raw
+        } else {
+            relay::Kind::Sql
+        }),
+    )
+}

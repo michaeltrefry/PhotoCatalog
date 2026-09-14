@@ -254,12 +254,15 @@ fn run(
 ) -> Result<()> {
     let Request::Begin {
         epoch,
+        role,
+        build,
         bytes,
         blake3,
     } = controls.receive()?
     else {
         anyhow::bail!("source Begin required");
     };
+    validate_managed_handshake(role, &build, expected)?;
     let length: usize = bytes.0.try_into()?;
     ensure!(
         (1..=AUTHORITY_BYTES).contains(&length) && digest_valid(&blake3),
@@ -292,16 +295,14 @@ fn run(
     );
     let authority =
         super::authority_json::decode(&encoded, &|| controls.cancel.load(Ordering::Acquire))?;
-    if let Some(expected) = expected {
-        ensure!(
-            matches!(
-                (&authority, expected),
-                (Authority::Sql { .. }, super::relay::Kind::Sql)
-                    | (Authority::Artifact { .. }, super::relay::Kind::Raw)
-            ),
-            "managed Source role/authority mismatch"
-        );
-    }
+    ensure!(
+        matches!(
+            (&authority, role),
+            (Authority::Sql { .. }, super::relay::Kind::Sql)
+                | (Authority::Artifact { .. }, super::relay::Kind::Raw)
+        ),
+        "managed Source role/authority mismatch"
+    );
     #[cfg(all(test, feature = "internal-capacity-probes"))]
     crate::capacity_probes::observe(crate::capacity_probes::OPEN_DECODED, encoded.capacity());
     drop(encoded);
@@ -436,6 +437,19 @@ fn run(
             }
         }
     }
+}
+
+fn validate_managed_handshake(
+    kind: super::relay::Kind,
+    build: &str,
+    expected: Option<super::relay::Kind>,
+) -> Result<()> {
+    ensure!(
+        build == crate::lightroom_migration_worker::worker::build_identity(),
+        "managed Source build mismatch"
+    );
+    ensure!(expected == Some(kind), "managed Source role mismatch");
+    Ok(())
 }
 
 // This is the existing wire error-prefix limit, enforced before formatting can
@@ -617,5 +631,44 @@ mod allocation_tests {
         });
         c.reserved(1, 10)?;
         Ok(())
+    }
+
+    #[test]
+    fn lm_executor_batch3_source_build_and_role_are_exact_before_authority_admission() {
+        let build = crate::lightroom_migration_worker::worker::build_identity();
+        assert!(
+            validate_managed_handshake(
+                super::super::relay::Kind::Sql,
+                build,
+                Some(super::super::relay::Kind::Sql)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_handshake(
+                super::super::relay::Kind::Raw,
+                build,
+                Some(super::super::relay::Kind::Raw)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_handshake(
+                super::super::relay::Kind::Raw,
+                build,
+                Some(super::super::relay::Kind::Sql)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_managed_handshake(
+                super::super::relay::Kind::Sql,
+                "different-build",
+                Some(super::super::relay::Kind::Sql)
+            )
+            .is_err()
+        );
+        // The legacy unpinned Source entrypoint cannot accept a managed Begin.
+        assert!(validate_managed_handshake(super::super::relay::Kind::Sql, build, None).is_err());
     }
 }

@@ -145,7 +145,7 @@ pub(crate) trait ArtifactFactory {
         stop: &dyn Fn() -> bool,
     ) -> Result<Box<dyn ArtifactRead>>;
 }
-struct LocalArtifacts;
+pub(crate) struct LocalArtifacts;
 impl ArtifactFactory for LocalArtifacts {
     fn open(
         &mut self,

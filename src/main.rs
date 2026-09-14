@@ -474,6 +474,9 @@ enum MetadataCommand {
 
 fn main() -> Result<()> {
     match std::env::args_os().nth(1).as_deref() {
+        Some(arg) if arg == "--lightroom-migration-worker" => {
+            return photocatalog::lightroom_migration_worker::worker_main();
+        }
         Some(arg) if arg == "--lightroom-source-reader-sql" => {
             return photocatalog::lightroom_migration_worker::managed_source_reader_main(false);
         }

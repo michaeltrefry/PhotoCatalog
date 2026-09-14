@@ -76,6 +76,7 @@ fn reserve_opening(
 }
 struct SourceAdmission {
     epoch: Epoch,
+    kind: Kind,
     binding: String,
     encoded: Vec<u8>,
     cancel: Arc<AtomicBool>,
@@ -148,6 +149,7 @@ impl Session {
             process_stop,
             SourceAdmission {
                 epoch,
+                kind,
                 binding,
                 encoded,
                 cancel,
@@ -165,6 +167,7 @@ impl Session {
     ) -> Result<Self> {
         let SourceAdmission {
             epoch,
+            kind,
             binding,
             encoded,
             cancel,
@@ -200,6 +203,8 @@ impl Session {
         session.send(
             Request::Begin {
                 epoch: session.epoch.clone(),
+                role: kind,
+                build: crate::lightroom_migration_worker::worker::build_identity().into(),
                 bytes: U64(encoded.len() as u64),
                 blake3: digest,
             },

@@ -7,6 +7,7 @@
 //! of internal SQLite rows refreshed by the existing per-image organization
 //! engine. Original paths are never opened by this component.
 use super::{evidence, originals::SourceKey, retention};
+use crate::catalog_migration::repair_memory;
 use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
@@ -343,7 +344,7 @@ impl Evidence {
             );
             let (input, length, digest): (String, i64, String) = db.query_row(
                 "SELECT input,raw_length,digest FROM migration_retained_records WHERE sequence=? AND complete=1",
-                [sequence], |r| Ok((evidence::retained_identity(r, 0)?, r.get(1)?, evidence::retained_identity(r, 2)?)))?;
+                [sequence], |r| Ok((evidence::retained_identity(r, 0)?, repair_memory::get(r, 1)?, evidence::retained_identity(r, 2)?)))?;
             let length = usize::try_from(length)?;
             ensure!(
                 length <= MAX_BYTES - self.bytes,
@@ -396,7 +397,7 @@ impl Evidence {
                     Ok((
                         evidence::retained_identity(r, 0)?,
                         evidence::retained_identity(r, 1)?,
-                        r.get(2)?,
+                        repair_memory::get(r, 2)?,
                     ))
                 },
             )?;
@@ -585,7 +586,7 @@ fn image(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<Image
         reference.source.table == "Adobe_images",
         "image endpoint requires Adobe_images"
     );
-    let id:String=db.query_row("SELECT image_id FROM image_import_map WHERE import_source=? AND capture_revision=? AND source_table=? AND source_id=?",params![owner,reference.source.capture_revision,reference.source.table,reference.source.identity()?],|r|r.get(0))?;
+    let id:String=db.query_row("SELECT image_id FROM image_import_map WHERE import_source=? AND capture_revision=? AND source_table=? AND source_id=?",params![owner,reference.source.capture_revision,reference.source.table,reference.source.identity()?],|r|repair_memory::get(r, 0))?;
     catalog_images::identity(db, &id)
 }
 fn collection(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<String> {
@@ -639,7 +640,7 @@ fn keyword(
     let (kind, path): (String, String) = db.query_row(
         "SELECT kind,path FROM organization_keywords WHERE id=?",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((repair_memory::get(r, 0)?, repair_memory::get(r, 1)?)),
     )?;
     ensure!(path.len() <= 65536, "keyword path bounds");
     let kind = match kind.as_str() {
@@ -1138,7 +1139,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                 DictionaryDecision::Reuse { native_id }
                 | DictionaryDecision::ReuseExactHierarchy { native_id, .. } => {
                     text(native_id, 1024)?;
-                    let (actual,old_parent,old_position):(String,Option<String>,i64)=db.query_row("SELECT c.name,s.parent,COALESCE(s.position,0) FROM organization_collections c LEFT JOIN organization_collection_structure s ON s.collection=c.id WHERE c.id=?",[native_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                    let (actual,old_parent,old_position):(String,Option<String>,i64)=db.query_row("SELECT c.name,s.parent,COALESCE(s.position,0) FROM organization_collections c LEFT JOIN organization_collection_structure s ON s.collection=c.id WHERE c.id=?",[native_id],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?)))?;
                     ensure!(
                         actual == *name && old_parent == parent && old_position == *position,
                         "explicit reused collection differs"
@@ -1159,7 +1160,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
             let revision = db.query_row(
                 "SELECT revision FROM organization_collections WHERE id=?",
                 [&id],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )?;
             Ok(NativeTarget::Collection { id, revision })
         }
@@ -1188,7 +1189,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                         dictionary_kind(*keyword_kind),
                         serde_json::to_string(&path)?
                     ],
-                    |r| r.get(0),
+                    |r| repair_memory::get(r, 0),
                 )
                 .optional()?;
             let id = match decision {
@@ -1214,7 +1215,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
             value,
         } => {
             let (id, _, _) = keyword(db, &request.import_source, &term.target)?;
-            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|r.get(0))?;
+            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|repair_memory::get(r, 0))?;
             ensure!(
                 !exists,
                 "synonym already exists; explicit reconciliation required"
@@ -1228,7 +1229,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
             ..
         } => {
             let (id, _, _) = keyword(db, &request.import_source, &term.target)?;
-            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|r.get(0))?;
+            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|repair_memory::get(r, 0))?;
             ensure!(exists, "explicit reused synonym differs");
             Ok(NativeTarget::Synonym { keyword: id })
         }
@@ -1239,7 +1240,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
         } => {
             let image = image(db, &request.import_source, &member.target)?;
             let collection = collection(db, &request.import_source, &group.target)?;
-            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence WHERE m.collection=? AND i.id=?)",params![collection,image.image_id],|r|r.get(0))?;
+            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence WHERE m.collection=? AND i.id=?)",params![collection,image.image_id],|r|repair_memory::get(r, 0))?;
             ensure!(
                 !exists,
                 "membership already exists; explicit reconciliation required"

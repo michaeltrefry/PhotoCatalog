@@ -7,6 +7,7 @@ use super::{
     originals::SourceKey,
     retention,
 };
+use crate::catalog_migration::repair_memory;
 use crate::lightroom::migration_source::MigrationRead;
 #[cfg(test)]
 use crate::lightroom::migration_source::MigrationSource;
@@ -63,7 +64,13 @@ impl<'a> Walk<'a> {
         let (input, revision, complete): (String, String, bool) = self.catalog.db.query_row(
             "SELECT input,revision,complete FROM migration_retained_records WHERE sequence=?1",
             [sequence],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    repair_memory::get(r, 0)?,
+                    repair_memory::get(r, 1)?,
+                    repair_memory::get(r, 2)?,
+                ))
+            },
         )?;
         ensure!(
             input == self.source.binding_blake3() && revision == self.revision && complete,

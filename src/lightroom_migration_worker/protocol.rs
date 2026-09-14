@@ -126,6 +126,7 @@ pub enum ChildFrame {
     Admitted {
         guard: Guard,
         request_blake3: String,
+        build: String,
     },
     LockAcquired {
         guard: Guard,
@@ -397,6 +398,9 @@ impl Controls {
         ensure!(Instant::now() < self.until, "helper execution deadline");
         Ok(())
     }
+    pub(crate) fn check_active(&self) -> Result<()> {
+        self.check()
+    }
 
     pub(crate) fn request_result(
         &self,
@@ -455,8 +459,46 @@ impl Controls {
 /// There is deliberately no release frame: an uncertain child lifetime cannot
 /// free a parent charge. The supervisor keeps grants through verified drain.
 pub(crate) struct MemoryGrants {
-    pub controls: Arc<Controls>,
-    pub output: Arc<dyn Publish>,
+    controls: Arc<Controls>,
+    output: Arc<dyn Publish>,
+    startup: Mutex<Option<Box<dyn FnMut() -> Result<ParentFrame> + Send>>>,
+}
+impl MemoryGrants {
+    pub(crate) fn new(controls: Arc<Controls>, output: Arc<dyn Publish>) -> Self {
+        Self {
+            controls,
+            output,
+            startup: Mutex::new(None),
+        }
+    }
+    pub(crate) fn with_startup(
+        controls: Arc<Controls>,
+        output: Arc<dyn Publish>,
+        pump: impl FnMut() -> Result<ParentFrame> + Send + 'static,
+    ) -> Self {
+        Self {
+            controls,
+            output,
+            startup: Mutex::new(Some(Box::new(pump))),
+        }
+    }
+    /// End the single-reader startup phase before the control-listener thread
+    /// starts. No memory request may be waiting across this handoff.
+    pub(crate) fn finish_startup(&self) -> Result<()> {
+        ensure!(
+            self.controls
+                .memory_waiting
+                .lock()
+                .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?
+                .is_none(),
+            "helper memory request remains at listener handoff"
+        );
+        self.startup
+            .lock()
+            .map_err(|_| anyhow::anyhow!("helper startup input state poisoned"))?
+            .take();
+        Ok(())
+    }
 }
 impl super::memory::AllocationGrant for MemoryGrants {
     fn reserve(&self, bytes: usize) -> Result<()> {
@@ -486,26 +528,66 @@ impl super::memory::AllocationGrant for MemoryGrants {
                 sequence: U64(sequence),
                 bytes: U64(bytes.try_into()?),
             })?;
-            let mut slot = self
-                .controls
-                .memory_waiting
+            let mut startup = self
+                .startup
                 .lock()
-                .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?;
-            loop {
-                self.controls.check()?;
-                if slot
-                    .as_ref()
-                    .is_some_and(|v| v.sequence == sequence && v.granted)
-                {
-                    slot.take();
-                    return Ok(());
+                .map_err(|_| anyhow::anyhow!("helper startup input state poisoned"))?
+                .take();
+            if let Some(mut pump) = startup.take() {
+                // Never hold the startup-mode or pending-request mutex while
+                // Controls::accept validates and wakes the exact waiter.
+                loop {
+                    self.controls.check()?;
+                    if self
+                        .controls
+                        .memory_waiting
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?
+                        .as_ref()
+                        .is_some_and(|v| v.sequence == sequence && v.granted)
+                    {
+                        self.controls
+                            .memory_waiting
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?
+                            .take();
+                        *self.startup.lock().map_err(|_| {
+                            anyhow::anyhow!("helper startup input state poisoned")
+                        })? = Some(pump);
+                        return Ok(());
+                    }
+                    let frame = pump()?;
+                    ensure!(
+                        matches!(
+                            &frame,
+                            ParentFrame::MemoryGrant { .. } | ParentFrame::Cancel { .. }
+                        ),
+                        "unexpected frame while awaiting startup memory grant"
+                    );
+                    self.controls.accept(frame)?;
                 }
-                slot = self
+            } else {
+                let mut slot = self
                     .controls
-                    .memory_changed
-                    .wait_timeout(slot, Duration::from_millis(50))
-                    .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?
-                    .0;
+                    .memory_waiting
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?;
+                loop {
+                    self.controls.check()?;
+                    if slot
+                        .as_ref()
+                        .is_some_and(|v| v.sequence == sequence && v.granted)
+                    {
+                        slot.take();
+                        return Ok(());
+                    }
+                    slot = self
+                        .controls
+                        .memory_changed
+                        .wait_timeout(slot, Duration::from_millis(50))
+                        .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?
+                        .0;
+                }
             }
         })();
         if result.is_err() {

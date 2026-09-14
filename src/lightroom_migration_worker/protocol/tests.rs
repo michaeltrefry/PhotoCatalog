@@ -151,10 +151,10 @@ fn memory_grant_exact_echo_cancel_and_parent_owned_retirement() -> Result<()> {
             Instant::now() + Duration::from_secs(5),
         )?;
         let (tx, rx) = mpsc::channel();
-        let budget = MemoryBudget::from_parent(Arc::new(MemoryGrants {
-            controls: controls.clone(),
-            output: Arc::new(Output(tx)),
-        }));
+        let budget = MemoryBudget::from_parent(Arc::new(MemoryGrants::new(
+            controls.clone(),
+            Arc::new(Output(tx)),
+        )));
         assert!(budget.snapshot().is_err());
         let worker = std::thread::spawn(move || -> Result<()> {
             let mut reservation = budget.reservation();
@@ -195,6 +195,95 @@ fn memory_grant_exact_echo_cancel_and_parent_owned_retirement() -> Result<()> {
             );
             assert!(audit.is_poisoned());
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn lm_executor_batch3_startup_memory_pump_precedes_content_and_hands_off_exactly() -> Result<()> {
+    use crate::lightroom_migration_worker::memory::MemoryBudget;
+    let audit = Audit::new(Arc::new(AtomicBool::new(false)), vec![])?;
+    let controls = Controls::new(guard(), audit, Instant::now() + Duration::from_secs(5))?;
+    let mut startup = Vec::new();
+    write_frame(
+        &mut startup,
+        &ParentFrame::MemoryGrant {
+            guard: guard(),
+            sequence: U64(1),
+            bytes: U64(123),
+        },
+    )?;
+    let mut startup = Cursor::new(startup);
+    let (tx, rx) = mpsc::channel();
+    let grants = Arc::new(MemoryGrants::with_startup(
+        controls.clone(),
+        Arc::new(Output(tx)),
+        move || read_frame(&mut startup),
+    ));
+    let budget = MemoryBudget::from_parent(grants.clone());
+    let mut retained = budget.reservation();
+    retained.grow(123)?;
+    let need: ChildFrame = read_frame(&mut Cursor::new(rx.recv()?))?;
+    assert!(matches!(
+        need,
+        ChildFrame::NeedMemory {
+            sequence: U64(1),
+            bytes: U64(123),
+            ..
+        }
+    ));
+    grants.finish_startup()?;
+
+    // The next request is serviced through the listener/Condvar path. A
+    // successful handoff cannot strand it in the removed startup pump.
+    let mut later = budget.reservation();
+    let worker = std::thread::spawn(move || later.grow(7));
+    let need: ChildFrame = read_frame(&mut Cursor::new(rx.recv()?))?;
+    let ChildFrame::NeedMemory {
+        sequence, bytes, ..
+    } = need
+    else {
+        anyhow::bail!("post-startup memory request required")
+    };
+    assert_eq!((sequence.0, bytes.0), (2, 7));
+    controls.accept(ParentFrame::MemoryGrant {
+        guard: guard(),
+        sequence,
+        bytes,
+    })?;
+    worker.join().unwrap()?;
+
+    let mut refused = Vec::new();
+    for frame in [
+        ParentFrame::Cancel { guard: guard() },
+        ParentFrame::Part {
+            guard: guard(),
+            role: InputRole::Policy,
+            offset: U64(0),
+            text: "content-before-grant".into(),
+        },
+    ] {
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &frame)?;
+        refused.push(encoded);
+    }
+    refused.push(Vec::new());
+    for encoded in refused {
+        let audit = Audit::new(Arc::new(AtomicBool::new(false)), vec![])?;
+        let controls = Controls::new(guard(), audit, Instant::now() + Duration::from_secs(5))?;
+        let mut encoded = Cursor::new(encoded);
+        let (tx, rx) = mpsc::channel();
+        let grants = Arc::new(MemoryGrants::with_startup(
+            controls,
+            Arc::new(Output(tx)),
+            move || read_frame(&mut encoded),
+        ));
+        let budget = MemoryBudget::from_parent(grants);
+        assert!(budget.reservation().grow(1).is_err());
+        assert!(matches!(
+            read_frame::<ChildFrame>(&mut Cursor::new(rx.recv()?))?,
+            ChildFrame::NeedMemory { bytes: U64(1), .. }
+        ));
     }
     Ok(())
 }

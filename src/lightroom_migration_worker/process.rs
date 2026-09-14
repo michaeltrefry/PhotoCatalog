@@ -21,6 +21,25 @@ pub(crate) fn source_environment(command: &mut Command) {
     command.env("RUST_LIB_BACKTRACE", "0");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    LightroomMigration,
+    SourceSql,
+    SourceRaw,
+}
+impl Role {
+    pub(crate) fn argument(self) -> &'static str {
+        match self {
+            Self::LightroomMigration => "--lightroom-migration-worker",
+            Self::SourceSql => "--lightroom-source-reader-sql",
+            Self::SourceRaw => "--lightroom-source-reader-raw",
+        }
+    }
+    fn source(self) -> bool {
+        matches!(self, Self::SourceSql | Self::SourceRaw)
+    }
+}
+
 /// At most one encoded input and one decoded output are queued, in addition to
 /// the frame currently owned by each I/O thread. Joining is supervisor-only.
 pub(crate) struct Process<T = ChildFrame> {
@@ -38,7 +57,61 @@ pub(crate) struct Process<T = ChildFrame> {
     injected_input: Arc<Mutex<Option<Vec<u8>>>>,
     #[cfg(test)]
     injected_wait_failures: usize,
+    #[cfg(test)]
+    startup_order_gate: Arc<Mutex<Option<Arc<StartupOrderGate>>>>,
 }
+/// Forces the writer's control-poll/data-receive window without changing its
+/// production queue order or holding another encoded frame. All waits are
+/// bounded so a failed assertion cannot strand an owned I/O thread.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct StartupOrderGate {
+    state: Mutex<(usize, bool, bool)>, // successful sends, waiting, released
+    changed: std::sync::Condvar,
+}
+#[cfg(test)]
+impl StartupOrderGate {
+    fn before_send(&self) {
+        let state = self.state.lock().unwrap();
+        if state.0 == 1 {
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(10), |state| !state.1)
+                .unwrap();
+            assert!(state.1, "writer did not enter data receive window");
+        }
+    }
+    fn sent(&self, urgent: bool) {
+        let mut state = self.state.lock().unwrap();
+        let previous_sends = state.0;
+        state.0 += 1;
+        if !urgent && previous_sends >= 1 && state.1 {
+            state.2 = true;
+            self.changed.notify_all();
+        }
+    }
+    fn before_data_receive(&self, writes: usize) {
+        if writes != 1 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.1 {
+            return;
+        }
+        state.1 = true;
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(10), |state| !state.2)
+            .unwrap();
+        assert!(state.2, "startup sender did not queue its next data frame");
+    }
+    pub(crate) fn exercised(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.1 && state.2
+    }
+}
+
 #[derive(Default)]
 struct TransportHealth {
     failed: AtomicBool,
@@ -145,18 +218,14 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
                 "absolute configured migration executable required"
             )));
         }
-        Self::spawn_role_owned(executable, "--lightroom-migration-worker", stop)
+        Self::spawn_role_owned(executable, Role::LightroomMigration, stop)
     }
-    pub(crate) fn spawn_role(
-        executable: &Path,
-        role: &'static str,
-        stop: Arc<Stop>,
-    ) -> Result<Self> {
+    pub(crate) fn spawn_role(executable: &Path, role: Role, stop: Arc<Stop>) -> Result<Self> {
         Self::spawn_role_with_cleanup(executable, role, stop, None)
     }
     fn spawn_role_owned(
         executable: &Path,
-        role: &'static str,
+        role: Role,
         stop: Arc<Stop>,
     ) -> std::result::Result<Self, SpawnFailure<T>> {
         if !executable.is_absolute() {
@@ -165,20 +234,15 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
             )));
         }
         let mut command = Command::new(executable);
-        command.arg(role);
-        if matches!(
-            role,
-            "--lightroom-source-reader"
-                | "--lightroom-source-reader-sql"
-                | "--lightroom-source-reader-raw"
-        ) {
+        command.arg(role.argument());
+        if role.source() {
             source_environment(&mut command);
         }
         Self::spawn_command_owned(command, stop)
     }
     pub(crate) fn spawn_role_with_cleanup(
         executable: &Path,
-        role: &'static str,
+        role: Role,
         stop: Arc<Stop>,
         before_wait: Option<&mut dyn FnMut()>,
     ) -> Result<Self> {
@@ -251,6 +315,8 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
             injected_input: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             injected_wait_failures: 0,
+            #[cfg(test)]
+            startup_order_gate: Arc::new(Mutex::new(None)),
         };
         let configured = (|| -> Result<()> {
             let mut stdin = owner.child.stdin.take().context("migration input pipe")?;
@@ -267,6 +333,8 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
             let read_health = owner.transport.clone();
             #[cfg(test)]
             let injected = owner.injected_input.clone();
+            #[cfg(test)]
+            let startup_order_gate = owner.startup_order_gate.clone();
             owner.writer = Some(
                 thread::Builder::new()
                     .name("migration-input".into())
@@ -275,6 +343,8 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
                             health: write_health,
                             completed: false,
                         };
+                        #[cfg(test)]
+                        let mut writes = 0usize;
                         loop {
                             #[cfg(test)]
                             let injected_frame =
@@ -287,6 +357,13 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
                                 match controls.try_recv() {
                                     Ok(frame) => frame,
                                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                                        #[cfg(test)]
+                                        {
+                                            let gate = startup_order_gate.lock().unwrap().clone();
+                                            if let Some(gate) = gate {
+                                                gate.before_data_receive(writes);
+                                            }
+                                        }
                                         match incoming.recv_timeout(Duration::from_millis(2)) {
                                             Ok(frame) => frame,
                                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -296,6 +373,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
                                 }
                             };
                             let result = stdin.write_all(&frame).and_then(|_| stdin.flush());
+                            #[cfg(test)]
+                            {
+                                writes += usize::from(result.is_ok());
+                            }
                             if let Err(error) = result {
                                 completion.health.failed.store(true, Ordering::Release);
                                 *errors.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -379,7 +460,19 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     pub(crate) fn try_send_control<F: serde::Serialize>(&self, frame: F) -> Result<Option<F>> {
         self.try_send_to(frame, true)
     }
+    #[cfg(test)]
+    pub(crate) fn force_startup_data_receive_window(&self) -> Arc<StartupOrderGate> {
+        let gate = Arc::new(StartupOrderGate::default());
+        *self.startup_order_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
     fn try_send_to<F: serde::Serialize>(&self, frame: F, urgent: bool) -> Result<Option<F>> {
+        #[cfg(test)]
+        let gate = self.startup_order_gate.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            gate.before_send();
+        }
         if let Some(error) = self
             .input_error
             .lock()
@@ -398,7 +491,13 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
             .context("migration input closed")?
             .try_send(bytes)
         {
-            Ok(()) => Ok(None),
+            Ok(()) => {
+                #[cfg(test)]
+                if let Some(gate) = &gate {
+                    gate.sent(urgent);
+                }
+                Ok(None)
+            }
             Err(TrySendError::Full(_)) => Ok(Some(frame)),
             Err(TrySendError::Disconnected(_)) => anyhow::bail!("migration input disconnected"),
         }

@@ -4,7 +4,7 @@ use super::super::transport::Reply;
 use super::{Command, Event, Kind, server::Owner};
 use crate::lightroom_migration_worker::{
     memory::MemoryBudget,
-    process::{Process, Stop},
+    process::{Process, Role as ProcessRole, Stop},
     protocol::Guard,
 };
 use anyhow::{Context, Result, ensure};
@@ -102,8 +102,8 @@ impl Broker {
         );
         Self::start_with(guard, stop, memory, move |kind, stop, before_wait| {
             let role = match kind {
-                Kind::Sql => "--lightroom-source-reader-sql",
-                Kind::Raw => "--lightroom-source-reader-raw",
+                Kind::Sql => ProcessRole::SourceSql,
+                Kind::Raw => ProcessRole::SourceRaw,
             };
             Process::spawn_role_with_cleanup(&executable, role, stop, Some(before_wait))
         })

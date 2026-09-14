@@ -52,6 +52,7 @@ fn admitted<A: Admission>(state: &mut State<A>, stop: &Arc<Stop>) -> Result<()> 
         ChildFrame::Admitted {
             guard: guard(),
             request_blake3: "a".repeat(64),
+            build: super::super::worker::build_identity().into(),
         },
         stop,
         Instant::now() + Duration::from_secs(5),
@@ -822,5 +823,64 @@ fn lm_supervisor_batch2_shared_pool_guard_outlives_funded_state_owner() -> Resul
     drop(operation);
     assert_eq!(observed.load(Ordering::Acquire), 23);
     assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_executor_batch3_pre_admission_failure_is_bounded_guarded_and_terminal() -> Result<()> {
+    let stop = Arc::new(Stop::default());
+    let until = Instant::now() + Duration::from_secs(5);
+    let failure = |guard: Guard, detail: String| ChildFrame::Failed {
+        guard,
+        detail,
+        poisoned: true,
+    };
+    let mut stale = state(
+        Arc::new(Writers::default()),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let mut wrong = guard();
+    wrong.generation = "stale".into();
+    assert!(
+        stale
+            .accept(failure(wrong, "refused".into()), &stop, until)
+            .is_err()
+    );
+    assert!(stale.terminal.is_none());
+    let mut oversized = state(
+        Arc::new(Writers::default()),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    assert!(
+        oversized
+            .accept(failure(guard(), "x".repeat(32 * 1024 + 1)), &stop, until)
+            .is_err()
+    );
+    assert!(oversized.terminal.is_none());
+    let mut valid = state(
+        Arc::new(Writers::default()),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    assert!(valid.accept(need(), &stop, until).is_err());
+    valid.accept(failure(guard(), "startup refused".into()), &stop, until)?;
+    assert!(!valid.admitted);
+    assert!(valid.terminal_poisoned);
+    assert_eq!(
+        valid
+            .terminal
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .to_string(),
+        "startup refused"
+    );
+    assert!(valid.accept(need(), &stop, until).is_err());
+    assert!(
+        valid
+            .accept(failure(guard(), "repeated".into()), &stop, until)
+            .is_err()
+    );
+    assert!(valid.held.is_none());
     Ok(())
 }

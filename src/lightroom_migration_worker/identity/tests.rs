@@ -64,3 +64,23 @@ fn source_open_under_writer_is_rejected_before_path_open() -> Result<()> {
     audit.writing(false)?;
     Ok(())
 }
+
+#[test]
+fn lm_executor_batch3_first_use_import_lock_requires_writer_and_never_truncates() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().canonicalize()?.join(".lightroom-import.lock");
+    let audit = Audit::new(Arc::new(AtomicBool::new(false)), vec![])?;
+    assert!(audit.create_import_lock(&path).is_err());
+    assert!(!path.exists());
+    audit.writing(true)?;
+    let first = audit.create_import_lock(&path)?;
+    assert_eq!(std::fs::read(&path)?, b"");
+    drop(first);
+    std::fs::write(&path, b"retained-lock-identity")?;
+    let existing = audit.create_import_lock(&path)?;
+    assert_eq!(std::fs::read(&path)?, b"retained-lock-identity");
+    existing.verify()?;
+    drop(existing);
+    audit.writing(false)?;
+    Ok(())
+}

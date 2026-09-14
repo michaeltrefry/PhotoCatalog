@@ -5,6 +5,7 @@ use super::{
     organization::{Evidence, Link, SourceRecord, verify_unique_link},
     retention,
 };
+use crate::catalog_migration::repair_memory;
 use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
@@ -89,7 +90,7 @@ fn previous(
     owner: &str,
     digest: &str,
 ) -> Result<Option<ResultRecord>> {
-    let old:Option<(String,String,Vec<u8>)>=db.query_row("SELECT owner,input_digest,result FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot=?3",params![image,payload,slot],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let old:Option<(String,String,Vec<u8>)>=db.query_row("SELECT owner,input_digest,result FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot=?3",params![image,payload,slot],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?))).optional()?;
     old.map(|(old_owner, old_digest, bytes)| {
         ensure!(
             old_owner == owner && old_digest == digest,
@@ -463,7 +464,10 @@ impl Catalog {
             request.settings_table,
         )?;
         if let Some(Cell::Text(bytes) | Cell::Blob(bytes)) = fields.get("text")
-            && let Ok(path) = adobe::catalog_settings_path(bytes, adobe::Limits::default())?
+            && let Ok(path) = {
+                super::repair_memory::adobe(bytes)?;
+                adobe::catalog_settings_path(bytes, adobe::Limits::default())?
+            }
         {
             request.settings_path = path;
         }
@@ -583,6 +587,7 @@ impl Catalog {
         };
         let extraction = body
             .map(|bytes| {
+                super::repair_memory::adobe(bytes)?;
                 adobe::extract(
                     bytes,
                     adobe::Input {
