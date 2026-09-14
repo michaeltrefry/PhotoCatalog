@@ -18,8 +18,20 @@ Latest local checkpoint (supersedes older pending notes below):
   `sc-22847-xmp-admitted-tqric7zx/sdk-gate-1789382376301164000/receipt.json`, SHA256
   `3edd4a5d08b592ba819612813d5fa290850ba807bc75288f5ff880311dae1029`.
   Both XMP prerequisites are cherry-picked into LM at `a31c52a8e9d73378d52400aab1feeb0f50be98f6`.
-  The selected-import Prepared/XML ownership integration is active; opaque SDK
-  allocations remain a separate boundary. Earlier whole-app Clippy failed on
+  Opaque SDK
+  allocations remain a separate boundary. The selected-import XMP/Prepared
+  component is now committed at `3b6752b797ac6b9154ebad13ebeb4f3c677aa8f4`:
+  scoped admission precedes XML/RDF/Prepared construction, guards retain owner
+  lifetimes, typed resource denial propagates, and streaming semantic hashes
+  preserve prior bytes. Eleven focused tests pass (eight unchanged results plus
+  final-source selected-import one and JPEG two). Source and identity addendum
+  reviews pass; all 11 committed files match the reviewed freeze and the worktree
+  is clean. Final evidence is `sc-22847-lightroom-migration-bridge-xksnotzh/core-xmp-freeze-20260914T113402Z`;
+  artifact manifest SHA256 `4c63d5d5741cadcc01290d95758da52146d08debbc0a75aec97aab1f1cc416d8`.
+  The initial two compile errors and recovered JPEG transcript/count correction
+  remain recorded. This does not establish actual managed SqlReader integration,
+  large canonical/shared-extension stress cases, or native SDK memory bounds.
+  Earlier whole-app Clippy failed on
   182 unchanged baseline diagnostics, so vendor success is not an app Clippy claim.
 - FS8 v31 passed eight SQL/edit/image rollback tests and whole-app strict Clippy.
   Only fixture formatting failed; receipt
