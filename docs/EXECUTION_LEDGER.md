@@ -32,6 +32,30 @@ custody repair is authorized from d3b5c24, preserving production fail-closed
 behavior. LM batch3 shared executor/roles is the independent next source lane;
 neither lane has native authorization yet. G/C application bridge remains batch4.
 
+Current follow-up validation: fixture ownerfix Lvaq3LHQ/d650f744 source PASS0.99
+97ae705f retains the entire unresolved Unstarted owner plus temporary directory.
+Root-owned runtime-sqpgu3te passed early-error, normal-render and metadata-wait
+cases; the fourth plan name selected zero and was rejected. Exact source function
+`actual_catalog_loss_after_start_retains_f` then passed alone in abnormal-_h1h3kax,
+logdc90194b; no source change or repeated first-three tests. Final evidence audit
+pending. Original compiler and invocation negatives remain preserved. JYL1Ia
+freeze and precompile hashes match; an incorrect stale-manifest report was
+explicitly corrected after root comparison.
+
+The broader compile preflight exposed an earlier3b6752b test-harness regression:
+two standalone suites path-included private xmp_rdf, now dependent on LM memory.
+Root xmp-test-harness branch moves all12 unchanged tests into private unit-test
+modules. Full `cargo check --locked --release --tests` passed, source unchanged;
+source/compile review PASS0.99 a140a9af. Runtime12-test gate is active session5342
+under `sc-22847-xmp-test-harness-runtime-4lvmwx83`; no result yet.
+
+LM batch3 initial24-file freeze T185710 is retained; root found its seven-operation
+table covered envelopes, while actual worker execution covered only Run/Status.
+Author is completing the other five successful worker operations before a new
+freeze. Root will apply the disjoint verified XMP test fix before the all-tests
+compile preflight. Root now owns native invocations through verified wrappers;
+authors own code and independent agents review exact evidence.
+
 Last combined-tested source `197e06e` integrates ICC `35f5a70e`; all
 14 files match. Nine focused tests passed, including actual F PID76821 reaped.
 Final component review PASS0.99 `9ec3d5de`; exact evidence is retained in
