@@ -56,6 +56,23 @@ freeze. Root will apply the disjoint verified XMP test fix before the all-tests
 compile preflight. Root now owns native invocations through verified wrappers;
 authors own code and independent agents review exact evidence.
 
+Follow-up completion: fixture c278ce1 integrated00457cc with exact two blobs;
+four-case evidence review PASS0.99 b2369400. XMP harness93c6806 integrated4911cac;
+all12 tests passed (935filtered), direct cargo97021/outer5342 reaped0, log762cb5d5;
+final evidence review PASS0.99 108fd2a0. No production RDF semantics/public API
+changed. Original-check and runtime snapshots preserve exact moved assertions.
+
+LM batch3 coverage successor T190340/e9da4b3a now includes source tests for all
+seven successful worker paths (still unexecuted). Root cherry-picked disjoint
+XMP harness as08daa03 into that dirty worktree; all27 authored hashes unchanged.
+Root preflight `sc-22847-lm3-preflight-m64jfs7t` checked tracked+untracked sources,
+then stopped on introduced compiler groups: serde tag collision/cascades, role
+threading, supplements borrowing, trait scope, match-guard move and Arc ownership.
+Cargo30781 exit101/absent, outer74182 reaped1, no tests; negative8a31f249 and
+negative-source-receipt verify source_changed=[]. One bounded compiler repair is
+authorized; no native lane active. FS9 original-verification remains read-only
+owner/API clarification, especially lost-ack addressability and retained records.
+
 Last combined-tested source `197e06e` integrates ICC `35f5a70e`; all
 14 files match. Nine focused tests passed, including actual F PID76821 reaped.
 Final component review PASS0.99 `9ec3d5de`; exact evidence is retained in
