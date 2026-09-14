@@ -7,13 +7,130 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeSeq};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
+
+use crate::lightroom_migration_worker::memory::{
+    ResourceLimit,
+    layout::{add, mul, tree, vector},
+    requested::{Requested, Scope},
+};
+
+struct JsonCount(usize);
+impl Write for JsonCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn json_bytes(value: &impl Serialize) -> Result<usize> {
+    let mut count = JsonCount(0);
+    serde_json::to_writer(&mut count, value)?;
+    Ok(count.0)
+}
+
+#[derive(Serialize)]
+struct PacketDescriptor<'a> {
+    attributes: &'a BTreeMap<String, String>,
+    container: &'a xmp_packets::Container,
+    group: &'a str,
+    ranges: &'a [xmp_packets::ByteRange],
+}
+#[derive(Serialize)]
+struct ParseDescriptor<'a> {
+    group: &'a str,
+    packet_indices: &'a [usize],
+    transformation: &'a xmp_packets::Transformation,
+}
+struct CombinedIndices<'a> {
+    first: &'a [usize],
+    second: &'a [usize],
+}
+impl Serialize for CombinedIndices<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.first.len() + self.second.len()))?;
+        for index in self.first.iter().chain(self.second) {
+            sequence.serialize_element(index)?;
+        }
+        sequence.end()
+    }
+}
+#[derive(Serialize)]
+struct MergedDescriptor<'a> {
+    derived_from_inputs: [usize; 2],
+    guid: &'a str,
+    packet_indices: CombinedIndices<'a>,
+    transformation: &'static str,
+}
+#[derive(Serialize)]
+struct SourceLocation<'a> {
+    display: &'a str,
+    kind: &'a str,
+    locator: &'a [u8],
+}
+#[derive(Serialize)]
+struct PreparedProvenance<'a> {
+    file_revision: &'a xmp_packets::SourceRevision,
+    source: &'a serde_json::Value,
+    source_location: SourceLocation<'a>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedRevision {
+    file_revision: xmp_packets::SourceRevision,
+}
+#[derive(Serialize)]
+struct CanonicalSourceRevision<'a> {
+    blake3: &'a str,
+    length: u64,
+    modified_unix_ns: Option<u128>,
+}
+struct ModelIdentities<'a>(&'a [PreparedModel]);
+impl Serialize for ModelIdentities<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for model in self.0 {
+            sequence.serialize_element(&(
+                &model.hash,
+                &model.descriptor,
+                &model.projection,
+                &model.error,
+            ))?;
+        }
+        sequence.end()
+    }
+}
+#[derive(Serialize)]
+struct RevisionIdentity<'a> {
+    issues: &'a str,
+    models: ModelIdentities<'a>,
+    packets: &'a [(String, String)],
+    provenance: &'a str,
+    source_revision: CanonicalSourceRevision<'a>,
+    status: &'a str,
+    version: u8,
+}
+struct JsonDigest(blake3::Hasher);
+impl Write for JsonDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 pub(crate) const SCHEMA: &str = "
 ALTER TABLE assets ADD COLUMN render_generation INTEGER NOT NULL DEFAULT 0;
@@ -171,8 +288,23 @@ pub(crate) struct Prepared {
     packets: Vec<(String, String)>,
     models: Vec<PreparedModel>,
 }
+pub(crate) struct AdmittedPrepared<'a> {
+    pub(crate) value: Prepared,
+    // Struct fields drop in declaration order, so this outlives value.
+    _scope: Scope<'a>,
+}
 impl Prepared {
     pub(crate) fn new(inspection: &Inspection, source: &Source) -> Result<Self> {
+        let admit = |_| Ok(());
+        let requested = Requested::new(&admit);
+        Ok(Self::new_admitted(inspection, source, &requested)?.value)
+    }
+
+    pub(crate) fn new_admitted<'a>(
+        inspection: &Inspection,
+        source: &Source,
+        requested: &'a Requested<'a>,
+    ) -> Result<AdmittedPrepared<'a>> {
         ensure!(
             inspection.packets.len() <= 1024 && inspection.parse_inputs.len() <= 1024,
             "metadata observation exceeds packet count limit"
@@ -192,13 +324,20 @@ impl Prepared {
                     <= 64 * 1024 * 1024,
             "metadata observation exceeds retained/parse byte limit"
         );
+        let prepared_scope = requested.scope(prepared_storage(inspection, source)?)?;
         let mut value = Self {
             revision: String::new(),
             status: format!("{:?}", inspection.status),
             issues: serde_json::to_string(&inspection.issues)?,
-            provenance: serde_json::to_string(
-                &serde_json::json!({"source":source.provenance,"source_location":{"kind":source.kind,"locator":source.locator,"display":source.display},"file_revision":inspection.revision}),
-            )?,
+            provenance: serde_json::to_string(&PreparedProvenance {
+                file_revision: &inspection.revision,
+                source: &source.provenance,
+                source_location: SourceLocation {
+                    display: &source.display,
+                    kind: &source.kind,
+                    locator: &source.locator,
+                },
+            })?,
             blobs: BTreeMap::new(),
             packets: Vec::new(),
             models: Vec::new(),
@@ -206,7 +345,15 @@ impl Prepared {
         for packet in &inspection.packets {
             let hash = value.blob(&packet.bytes)?;
             ensure!(hash == packet.blake3, "packet digest mismatch");
-            value.packets.push((hash,serde_json::to_string(&serde_json::json!({"container":packet.container,"ranges":packet.ranges,"group":packet.group,"attributes":packet.attributes}))?));
+            value.packets.push((
+                hash,
+                serde_json::to_string(&PacketDescriptor {
+                    attributes: &packet.attributes,
+                    container: &packet.container,
+                    group: &packet.group,
+                    ranges: &packet.ranges,
+                })?,
+            ));
         }
         for input in &inspection.parse_inputs {
             ensure!(
@@ -218,11 +365,26 @@ impl Prepared {
             );
             let hash = value.blob(&input.bytes)?;
             ensure!(hash == input.blake3, "parse input digest mismatch");
-            let (projection, error) = match xmp::project(&input.bytes) {
+            let (projection, error) = match xmp::project_admitted(&input.bytes, requested) {
                 Ok(p) => (p, None),
+                Err(error) if error.downcast_ref::<ResourceLimit>().is_some() => return Err(error),
                 Err(e) => (Projection::default(), Some(format!("{e:#}"))),
             };
-            value.models.push(PreparedModel {semantics:if error.is_none() {xmp::field_semantics(&input.bytes)?} else {BTreeMap::new()},hash,descriptor:serde_json::to_string(&serde_json::json!({"packet_indices":input.packet_indices,"transformation":input.transformation,"group":input.group}))?,projection,error});
+            value.models.push(PreparedModel {
+                semantics: if error.is_none() {
+                    xmp::field_semantics_admitted(&input.bytes, requested)?
+                } else {
+                    BTreeMap::new()
+                },
+                hash,
+                descriptor: serde_json::to_string(&ParseDescriptor {
+                    group: &input.group,
+                    packet_indices: &input.packet_indices,
+                    transformation: &input.transformation,
+                })?,
+                projection,
+                error,
+            });
         }
         // Extended JPEG data is linked by its declared GUID, never by adjacency.
         let mut joined = BTreeSet::new();
@@ -234,8 +396,10 @@ impl Prepared {
             {
                 continue;
             }
-            let Ok(meta) = xmp::parse(&input.bytes) else {
-                continue;
+            let meta = match xmp::parse_admitted(&input.bytes, requested) {
+                Ok(meta) => meta,
+                Err(error) if error.downcast_ref::<ResourceLimit>().is_some() => return Err(error),
+                Err(_) => continue,
             };
             let Some(guid) = meta.property("http://ns.adobe.com/xmp/note/", "HasExtendedXMP")
             else {
@@ -247,31 +411,43 @@ impl Prepared {
                 .next()
                 .context("JPEG main group missing")?;
             let target = format!("{prefix}:extended:{}", guid.value.to_ascii_uppercase());
-            let extensions = inspection
-                .parse_inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    p.group == target
-                        && p.transformation == xmp_packets::Transformation::JpegExtendedReassembled
-                })
-                .collect::<Vec<_>>();
+            let mut extensions = inspection.parse_inputs.iter().enumerate().filter(|(_, p)| {
+                p.group == target
+                    && p.transformation == xmp_packets::Transformation::JpegExtendedReassembled
+            });
+            let extension = extensions.next();
             value.models[index].projection = Projection::default();
-            if extensions.len() != 1 {
+            if extension.is_none() || extensions.next().is_some() {
                 value.models[index].error=Some("JPEG extended XMP association is missing or ambiguous; original main packet retained".into());
                 continue;
             }
-            let (extension_index, extension) = extensions[0];
+            let (extension_index, extension) = extension.unwrap();
             joined.insert(extension_index);
-            match xmp::merge_jpeg(&input.bytes, &extension.bytes) {
-                Ok(bytes) => {
-                    let hash = value.blob(&bytes)?;
-                    value.models.push(PreparedModel{semantics:xmp::field_semantics(&bytes)?,hash,descriptor:serde_json::to_string(&serde_json::json!({"transformation":"JpegMainAndExtendedMerged","derived_from_inputs":[index,extension_index],"packet_indices":input.packet_indices.iter().chain(extension.packet_indices.iter()).collect::<Vec<_>>(),"guid":guid.value}))?,projection:xmp::project(&bytes)?,error:None});
+            match xmp::merge_jpeg_admitted(&input.bytes, &extension.bytes, requested) {
+                Ok(merged) => {
+                    let bytes = &merged.0;
+                    let hash = value.blob(bytes)?;
+                    value.models.push(PreparedModel {
+                        semantics: xmp::field_semantics_admitted(bytes, requested)?,
+                        hash,
+                        descriptor: serde_json::to_string(&MergedDescriptor {
+                            derived_from_inputs: [index, extension_index],
+                            guid: &guid.value,
+                            packet_indices: CombinedIndices {
+                                first: &input.packet_indices,
+                                second: &extension.packet_indices,
+                            },
+                            transformation: "JpegMainAndExtendedMerged",
+                        })?,
+                        projection: xmp::project_admitted(bytes, requested)?,
+                        error: None,
+                    });
                     value.models[index].error = Some(
                         "JPEG main fragment; use the associated merged model for editing/export"
                             .into(),
                     );
                 }
+                Err(error) if error.downcast_ref::<ResourceLimit>().is_some() => return Err(error),
                 Err(error) => {
                     value.models[index].error = Some(format!(
                         "JPEG main/extended reconciliation failed: {error:#}"
@@ -287,17 +463,31 @@ impl Prepared {
         }
         // Distinguish repeated observations with changed extraction/parser status as well as bytes.
         value.revision = value.revision_with_provenance(&value.provenance)?;
-        Ok(value)
+        Ok(AdmittedPrepared {
+            value,
+            _scope: prepared_scope,
+        })
     }
     fn revision_with_provenance(&self, provenance: &str) -> Result<String> {
-        let parsed: serde_json::Value = serde_json::from_str(provenance)?;
-        let source_revision = parsed
-            .get("file_revision")
-            .context("missing source revision")?;
-        let identity = serde_json::to_vec(
-            &serde_json::json!({"version":1,"source_revision":source_revision,"status":self.status,"issues":self.issues,"packets":self.packets,"models":self.models.iter().map(|m| (&m.hash,&m.descriptor,&m.projection,&m.error)).collect::<Vec<_>>(),"provenance":provenance}),
+        let parsed: BorrowedRevision = serde_json::from_str(provenance)?;
+        let mut digest = JsonDigest(blake3::Hasher::new());
+        serde_json::to_writer(
+            &mut digest,
+            &RevisionIdentity {
+                issues: &self.issues,
+                models: ModelIdentities(&self.models),
+                packets: &self.packets,
+                provenance,
+                source_revision: CanonicalSourceRevision {
+                    blake3: &parsed.file_revision.blake3,
+                    length: parsed.file_revision.length,
+                    modified_unix_ns: parsed.file_revision.modified_unix_ns,
+                },
+                status: &self.status,
+                version: 1,
+            },
         )?;
-        Ok(blake3::hash(&identity).to_hex().to_string())
+        Ok(digest.0.finalize().to_hex().to_string())
     }
     /// Compare the current observation with its original file-instance provenance.
     /// File bytes, source provenance, packet layout and parser results must all match.
@@ -335,12 +525,331 @@ impl Prepared {
         );
         let hash = blake3::hash(bytes).to_hex().to_string();
         if !self.blobs.contains_key(&hash) {
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+            let mut encoder = ZlibEncoder::new(
+                Vec::with_capacity(zlib_bound(bytes.len())?),
+                Compression::fast(),
+            );
             encoder.write_all(bytes)?;
             self.blobs
                 .insert(hash.clone(), (bytes.len(), encoder.finish()?));
         }
         Ok(hash)
+    }
+}
+
+fn zlib_bound(bytes: usize) -> Result<usize> {
+    // zlib's public compressBound expression, including wrapper bytes.
+    add(
+        bytes,
+        add(add(bytes >> 12, bytes >> 14)?, add(bytes >> 25, 13)?)?,
+    )
+}
+
+fn merged_descriptor_storage(inspection: &Inspection) -> Result<(usize, usize)> {
+    if !inspection
+        .parse_inputs
+        .iter()
+        .any(|input| input.transformation == xmp_packets::Transformation::JpegExtendedReassembled)
+    {
+        return Ok((0, 0));
+    }
+    let mut mains = 0usize;
+    let mut bytes = 0usize;
+    for (index, input) in inspection.parse_inputs.iter().enumerate() {
+        if !input.packet_indices.iter().any(|packet| {
+            inspection
+                .packets
+                .get(*packet)
+                .is_some_and(|packet| packet.container == xmp_packets::Container::JpegMain)
+        }) {
+            continue;
+        }
+        mains = add(mains, 1)?;
+        let fixed = inspection
+            .parse_inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, extension)| {
+                extension.transformation == xmp_packets::Transformation::JpegExtendedReassembled
+            })
+            .try_fold(0usize, |maximum, (extension_index, extension)| {
+                Ok::<_, anyhow::Error>(maximum.max(json_bytes(&MergedDescriptor {
+                    derived_from_inputs: [index, extension_index],
+                    guid: "",
+                    packet_indices: CombinedIndices {
+                        first: &input.packet_indices,
+                        second: &extension.packet_indices,
+                    },
+                    transformation: "JpegMainAndExtendedMerged",
+                })?))
+            })?;
+        // serde_json can spell one source byte as a six-byte \u00XX escape.
+        // The GUID is borrowed from this main's decoded XMP and cannot exceed
+        // the encoding-derived maximum valid UTF-8 length.
+        bytes = add(
+            bytes,
+            add(fixed, mul(6, xmp::decoded_text_bound(&input.bytes)?)?)?,
+        )?;
+    }
+    Ok((mains, bytes))
+}
+
+/// Persistent Prepared owners are admitted before the first String, Vec, map
+/// node or compressed blob is constructed. Counts come from the selected
+/// Inspection. One generated merged model is possible for every actual JPEG
+/// main; the same extension may lawfully feed all of them, so merged storage is
+/// multiplied by main count rather than extension count.
+fn prepared_storage(inspection: &Inspection, source: &Source) -> Result<usize> {
+    let (mains, merged_descriptors) = merged_descriptor_storage(inspection)?;
+    let models = add(inspection.parse_inputs.len(), mains)?;
+    let blobs = add(
+        add(inspection.packets.len(), inspection.parse_inputs.len())?,
+        mains,
+    )?;
+    let mut compressed = 0usize;
+    let mut source_error_bytes = 0usize;
+    for bytes in inspection
+        .packets
+        .iter()
+        .map(|packet| packet.bytes.len())
+        .chain(
+            inspection
+                .parse_inputs
+                .iter()
+                .map(|input| input.bytes.len()),
+        )
+    {
+        compressed = add(compressed, zlib_bound(bytes)?)?;
+    }
+    for input in &inspection.parse_inputs {
+        source_error_bytes = add(source_error_bytes, xmp::decoded_text_bound(&input.bytes)?)?;
+    }
+    compressed = add(compressed, mul(mains, zlib_bound(xmp::MAX_PACKET_BYTES)?)?)?;
+    // Prepared retains every earlier projection and semantics map while the
+    // next model is built. The fixed model expression includes the existing
+    // 17-field/10,000-item grammar and one compact packet's value payload.
+    let interpreted = mul(models, xmp::prepared_model_storage()?)?;
+
+    let packet_strings = inspection
+        .packets
+        .iter()
+        .try_fold(0usize, |bytes, packet| {
+            add(
+                bytes,
+                json_bytes(&PacketDescriptor {
+                    attributes: &packet.attributes,
+                    container: &packet.container,
+                    group: &packet.group,
+                    ranges: &packet.ranges,
+                })?,
+            )
+        })?;
+    let input_strings = inspection
+        .parse_inputs
+        .iter()
+        .try_fold(0usize, |bytes, input| {
+            add(
+                bytes,
+                json_bytes(&ParseDescriptor {
+                    group: &input.group,
+                    packet_indices: &input.packet_indices,
+                    transformation: &input.transformation,
+                })?,
+            )
+        })?;
+    let issue_strings = json_bytes(&inspection.issues)?;
+    let provenance_strings = json_bytes(&PreparedProvenance {
+        file_revision: &inspection.revision,
+        source: &source.provenance,
+        source_location: SourceLocation {
+            display: &source.display,
+            kind: &source.kind,
+            locator: &source.locator,
+        },
+    })?;
+    let containers = add(
+        vector::<(String, String)>(inspection.packets.len())?,
+        add(
+            vector::<PreparedModel>(models)?,
+            tree::<String, (usize, Vec<u8>)>(blobs)?,
+        )?,
+    )?;
+    let fixed_strings = mul(
+        64,
+        add(add(add(blobs, inspection.packets.len())?, models)?, 2)?,
+    )?;
+    // At most one retained error belongs to each input/generated model. Source
+    // names and XML excerpts cannot exceed two copies of the actual decoded
+    // input family; constant diagnostics are the longest local catch-all text.
+    let diagnostic = [
+        "JPEG extended XMP association is missing or ambiguous; original main packet retained",
+        "JPEG main fragment; use the associated merged model for editing/export",
+        "unassociated JPEG extended fragment retained; explicit association review required",
+    ]
+    .iter()
+    .map(|text| text.len())
+    .max()
+    .unwrap_or(0);
+    let errors = add(mul(2, source_error_bytes)?, mul(models, diagnostic)?)?;
+    add(
+        add(compressed, interpreted)?,
+        add(
+            containers,
+            add(
+                fixed_strings,
+                add(
+                    add(add(packet_strings, input_strings)?, merged_descriptors)?,
+                    add(add(issue_strings, provenance_strings)?, errors)?,
+                )?,
+            )?,
+        )?,
+    )
+}
+
+#[cfg(test)]
+mod prepared_admission_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    const XMP: &[u8] = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"/></rdf:RDF>"#;
+
+    fn empty() -> (Inspection, Source) {
+        (
+            Inspection {
+                revision: xmp_packets::SourceRevision {
+                    length: 0,
+                    blake3: "0".repeat(64),
+                    modified_unix_ns: None,
+                },
+                status: Status::Absent,
+                packets: Vec::new(),
+                parse_inputs: Vec::new(),
+                issues: Vec::new(),
+            },
+            Source {
+                kind: "selected".into(),
+                locator: b"fixture".to_vec(),
+                display: "fixture".into(),
+                ambiguous: false,
+                provenance: serde_json::json!({"fixture":true}),
+            },
+        )
+    }
+
+    #[test]
+    fn prepared_denial_is_typed_and_precedes_first_prepared_owner() -> Result<()> {
+        let (inspection, source) = empty();
+        let calls = RefCell::new(Vec::new());
+        let admit = |required| {
+            calls.borrow_mut().push(required);
+            Err(ResourceLimit {
+                required,
+                available: required.saturating_sub(1),
+            }
+            .into())
+        };
+        let requested = Requested::new(&admit);
+        let error = match Prepared::new_admitted(&inspection, &source, &requested) {
+            Err(error) => error,
+            Ok(_) => panic!("Prepared construction should have been denied"),
+        };
+        let limit = error
+            .downcast_ref::<ResourceLimit>()
+            .context("typed Prepared ResourceLimit")?;
+        assert_eq!(calls.borrow().as_slice(), [limit.required]);
+        assert_eq!(requested.live(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_scope_retains_its_graph_through_nested_requested_storage() -> Result<()> {
+        let (mut inspection, source) = empty();
+        let bytes = b"retained original packet".to_vec();
+        inspection.packets.push(xmp_packets::Packet {
+            container: xmp_packets::Container::Sidecar,
+            blake3: blake3::hash(&bytes).to_hex().to_string(),
+            bytes,
+            ranges: Vec::new(),
+            group: "retained".into(),
+            attributes: BTreeMap::new(),
+        });
+        let calls = RefCell::new(Vec::new());
+        let admit = |required| {
+            calls.borrow_mut().push(required);
+            Ok(())
+        };
+        let requested = Requested::new(&admit);
+        let prepared = Prepared::new_admitted(&inspection, &source, &requested)?;
+        let retained = requested.live();
+        assert!(retained > 0);
+        let nested = requested.scope(17)?;
+        assert_eq!(requested.live(), retained + 17);
+        drop(nested);
+        assert_eq!(requested.live(), retained);
+        drop(prepared);
+        assert_eq!(requested.live(), 0);
+        assert_eq!(calls.borrow().last().copied(), Some(retained + 17));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_resource_limit_is_not_recorded_as_an_xmp_parse_observation() -> Result<()> {
+        let (mut inspection, source) = empty();
+        inspection.parse_inputs.push(xmp_packets::ParseInput {
+            bytes: XMP.to_vec(),
+            blake3: blake3::hash(XMP).to_hex().to_string(),
+            packet_indices: Vec::new(),
+            transformation: xmp_packets::Transformation::Identity,
+            group: "xmp".into(),
+        });
+        let calls = RefCell::new(0usize);
+        let admit = |required| {
+            let mut calls = calls.borrow_mut();
+            *calls += 1;
+            if *calls == 1 {
+                Ok(())
+            } else {
+                Err(ResourceLimit {
+                    required,
+                    available: required.saturating_sub(1),
+                }
+                .into())
+            }
+        };
+        let requested = Requested::new(&admit);
+        let error = match Prepared::new_admitted(&inspection, &source, &requested) {
+            Err(error) => error,
+            Ok(_) => panic!("nested XMP admission should have been denied"),
+        };
+        assert!(error.downcast_ref::<ResourceLimit>().is_some());
+        assert!(*calls.borrow() >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_revision_identity_matches_previous_json_value_digest() -> Result<()> {
+        let (inspection, source) = empty();
+        let prepared = Prepared::new(&inspection, &source)?;
+        let parsed: serde_json::Value = serde_json::from_str(&prepared.provenance)?;
+        let source_revision = parsed
+            .get("file_revision")
+            .context("missing source revision")?;
+        let identity = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source_revision": source_revision,
+            "status": prepared.status,
+            "issues": prepared.issues,
+            "packets": prepared.packets,
+            "models": prepared.models.iter().map(|model| (
+                &model.hash,
+                &model.descriptor,
+                &model.projection,
+                &model.error,
+            )).collect::<Vec<_>>(),
+            "provenance": prepared.provenance,
+        }))?;
+        assert_eq!(prepared.revision, blake3::hash(&identity).to_hex().as_str());
+        Ok(())
     }
 }
 pub(crate) fn revision(db: &Connection, asset: &str) -> Result<i64> {

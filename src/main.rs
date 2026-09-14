@@ -473,6 +473,15 @@ enum MetadataCommand {
 }
 
 fn main() -> Result<()> {
+    match std::env::args_os().nth(1).as_deref() {
+        Some(arg) if arg == "--lightroom-source-reader-sql" => {
+            return photocatalog::lightroom_migration_worker::managed_source_reader_main(false);
+        }
+        Some(arg) if arg == "--lightroom-source-reader-raw" => {
+            return photocatalog::lightroom_migration_worker::managed_source_reader_main(true);
+        }
+        _ => {}
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--catalog-filesystem-worker")

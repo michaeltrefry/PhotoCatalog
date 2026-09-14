@@ -3,6 +3,7 @@ use super::{
     organization::{Evidence, Link, SourceRecord, verify_unique_link},
     retention,
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_edits::VariantKey,
@@ -205,6 +206,16 @@ impl Catalog {
     pub fn project_migration_image(
         &mut self,
         source: Option<&MigrationSource>,
+        request: &Projection,
+    ) -> Result<ProjectionResult> {
+        self.project_migration_image_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_image_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
         request: &Projection,
     ) -> Result<ProjectionResult> {
         ensure!(

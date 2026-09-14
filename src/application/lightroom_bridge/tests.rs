@@ -356,6 +356,32 @@ fn complete_retained_surface_selection_seal_and_catalog_lifetime_are_independent
     let token = summary["token"].as_str().unwrap().to_owned();
     assert_eq!(summary["selected"], 1);
     assert_eq!(summary["excluded"], 1);
+    let prepared_sources = read(
+        &b,
+        Query::SelectionSources {
+            review_token: token.clone(),
+            revision: revision.clone(),
+            after: I64(0),
+            limit: U64(1),
+        },
+    );
+    assert_eq!(prepared_sources["sources"][0]["source_id"], "file-selected");
+    let prepared_evidence = read(
+        &b,
+        Query::SelectionPreparation {
+            review_token: token.clone(),
+            document: crate::lightroom::selection::PreparationDocument::OriginalEvidence {
+                revision: revision.clone(),
+                source_id: "file-selected".into(),
+            },
+            offset: U64(0),
+            limit: U64(65536),
+        },
+    );
+    let exact: Vec<u8> = serde_json::from_value(prepared_evidence["bytes"].clone()).unwrap();
+    assert_eq!(exact, b"{\"missing\":true}");
+    assert_eq!(prepared_evidence["review_token"], token);
+
     assert!(
         call(
             &b,
@@ -452,6 +478,8 @@ fn uploads_envelopes_stale_guards_and_foreign_evidence_are_exact() {
         panic!()
     };
     assert_eq!(o.envelope_bytes, U64(ENVELOPE as u64));
+    assert_eq!(o.selection_preparation_chunk_bytes, U64(64 * 1024));
+    assert_eq!(o.selection_preparation_page_rows, U64(256));
     let stale = g(&s);
     read(&b, Query::Families {});
     assert!(

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
 pub const CHUNK_BYTES: usize = 1024 * 1024;
-const DESCRIPTOR_BYTES: usize = 64 * 1024;
+pub(super) const DESCRIPTOR_BYTES: usize = 64 * 1024;
 
 /// A private admission domain: public byte uploads never confer sealed-source custody.
 #[derive(Clone, Copy)]
@@ -70,6 +70,46 @@ pub struct EvidenceState {
     pub complete: bool,
 }
 
+/// Admit retained identities from borrowed SQLite bytes before allocating them.
+pub(crate) fn retained_identity(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    let value = row.get_ref(index)?;
+    if let rusqlite::types::ValueRef::Text(bytes) = value
+        && bytes.len() == 64
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return Ok(text.to_owned());
+    }
+    Err(rusqlite::Error::FromSqlConversionFailure(
+        index,
+        value.data_type(),
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "retained identity must be 64 bytes of UTF-8 TEXT",
+        )),
+    ))
+}
+
+/// Validate stored descriptors while SQLite still owns the bytes.
+pub(super) fn retained_descriptor<'r>(
+    row: &'r rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<&'r [u8]> {
+    let value = row.get_ref(index)?;
+    if let rusqlite::types::ValueRef::Blob(bytes) = value
+        && bytes.len() <= DESCRIPTOR_BYTES
+    {
+        return Ok(bytes);
+    }
+    Err(rusqlite::Error::FromSqlConversionFailure(
+        index,
+        value.data_type(),
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "retained descriptor must be a BLOB of at most 64 KiB",
+        )),
+    ))
+}
+
 pub(crate) fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(row.get::<_, i64>(index)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -111,19 +151,28 @@ fn next_manifest(previous: &str, offset: u64, length: usize, hash: &str) -> Stri
 }
 
 fn state(db: &Connection, id: &str) -> Result<EvidenceState> {
-    Ok(db.query_row(
-        "SELECT length,committed,manifest,complete FROM migration_evidence WHERE id=?1",
+    ensure!(id.len() == 64, "evidence identity size limit");
+    let (length, committed, manifest, complete): (u64, u64, Option<String>, bool) = db.query_row(
+        "SELECT length,committed,
+         CASE WHEN typeof(manifest)='text' AND length(CAST(manifest AS BLOB))=64 THEN manifest END,
+         complete FROM migration_evidence WHERE id=?1",
         [id],
         |row| {
-            Ok(EvidenceState {
-                id: id.into(),
-                length: unsigned(row, 0)?,
-                committed: unsigned(row, 1)?,
-                manifest: row.get(2)?,
-                complete: row.get(3)?,
-            })
+            Ok((
+                unsigned(row, 0)?,
+                unsigned(row, 1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
         },
-    )?)
+    )?;
+    Ok(EvidenceState {
+        id: id.into(),
+        length,
+        committed,
+        manifest: manifest.context("evidence manifest type/size limit")?,
+        complete,
+    })
 }
 
 /// Compression and hashing happen before admission to the catalog writer.
@@ -133,6 +182,10 @@ pub(crate) struct PreparedChunk {
     compressed: Vec<u8>,
 }
 impl PreparedChunk {
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    pub(crate) fn probe_capacity(&self) -> usize {
+        self.hash.capacity() + self.compressed.capacity()
+    }
     pub(crate) fn new(bytes: &[u8]) -> Result<Self> {
         ensure!(
             !bytes.is_empty() && bytes.len() <= CHUNK_BYTES,
@@ -170,15 +223,12 @@ pub(crate) fn begin_owned(
         "INSERT OR IGNORE INTO migration_evidence(id,descriptor,length,manifest,complete,authority) VALUES(?1,?2,?3,?1,?4,?5)",
         params![id, descriptor, i64::try_from(length)?, length == 0, authority.name()],
     )?;
-    let existing: (Vec<u8>, u64) = db.query_row(
+    let matches: bool = db.query_row(
         "SELECT descriptor,length FROM migration_evidence WHERE id=?1",
         [&id],
-        |r| Ok((r.get(0)?, unsigned(r, 1)?)),
+        |r| Ok(retained_descriptor(r, 0)? == descriptor && unsigned(r, 1)? == length),
     )?;
-    ensure!(
-        existing == (descriptor.to_vec(), length),
-        "evidence identity collision"
-    );
+    ensure!(matches, "evidence identity collision");
     require_authority(db, &id, authority)?;
     state(db, &id)
 }
@@ -252,12 +302,17 @@ pub(crate) fn read(db: &Connection, id: &str, offset: u64) -> Result<Vec<u8>> {
     if offset == status.length {
         return Ok(Vec::new());
     }
-    let (hash, length, compressed): (String, u64, Vec<u8>) = db.query_row(
-        "SELECT b.hash,b.length,b.compressed FROM migration_evidence_chunks c
+    let (hash, length, compressed): (Option<String>, u64, Option<Vec<u8>>) = db.query_row(
+        "SELECT CASE WHEN typeof(b.hash)='text' AND length(CAST(b.hash AS BLOB))=64 THEN b.hash END,
+         b.length, CASE WHEN typeof(b.compressed)='blob' AND length(b.compressed)<=?3
+          AND typeof(b.length)='integer' AND b.length BETWEEN 1 AND ?4 THEN b.compressed END
+         FROM migration_evidence_chunks c
          JOIN migration_evidence_blobs b ON b.hash=c.hash WHERE c.evidence=?1 AND c.offset=?2",
-        params![id, i64::try_from(offset)?],
+        params![id, i64::try_from(offset)?, i64::try_from(CHUNK_BYTES + 4096)?, i64::try_from(CHUNK_BYTES)?],
         |r| Ok((r.get(0)?, unsigned(r, 1)?, r.get(2)?)),
     )?;
+    let hash = hash.context("evidence chunk digest type/size limit")?;
+    let compressed = compressed.context("compressed evidence type/size limit")?;
     ensure!(
         length > 0 && length <= (status.length - offset).min(CHUNK_BYTES as u64),
         "evidence chunk length differs"
@@ -318,7 +373,7 @@ impl Catalog {
             .query_row(
                 "SELECT descriptor FROM migration_evidence WHERE id=?1",
                 [id],
-                |r| r.get(0),
+                |r| Ok(retained_descriptor(r, 0)?.to_vec()),
             )
             .optional()?
             .context("unknown migration evidence")
@@ -333,6 +388,132 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_descriptors_admit_blob_size_before_copy_or_comparison() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        let descriptor = vec![0xff; DESCRIPTOR_BYTES];
+        let before = catalog.begin_migration_evidence(&descriptor, 1)?;
+        assert_eq!(
+            catalog.migration_evidence_descriptor(&before.id)?,
+            descriptor
+        );
+        assert_eq!(catalog.begin_migration_evidence(&descriptor, 1)?, before);
+        for expression in ["zeroblob(65537)", "zeroblob(1048576)", "'text'", "64"] {
+            catalog.db.execute_batch("SAVEPOINT malformed_descriptor")?;
+            catalog.db.execute(
+                &format!("UPDATE migration_evidence SET descriptor={expression} WHERE id=?1"),
+                [&before.id],
+            )?;
+            for error in [
+                begin(&catalog.db, &descriptor, 1).unwrap_err(),
+                catalog
+                    .migration_evidence_descriptor(&before.id)
+                    .unwrap_err(),
+            ] {
+                assert!(format!("{error:#}").contains("BLOB of at most 64 KiB"));
+            }
+            catalog
+                .db
+                .execute_batch("ROLLBACK TO malformed_descriptor; RELEASE malformed_descriptor")?;
+            assert_eq!(
+                catalog.migration_evidence_descriptor(&before.id)?,
+                descriptor
+            );
+        }
+        let empty = catalog.begin_migration_evidence(b"", 0)?;
+        assert!(catalog.migration_evidence_descriptor(&empty.id)?.is_empty());
+        assert!(
+            catalog
+                .migration_evidence_descriptor(&"x".repeat(64))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown migration evidence")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_identity_checks_bytes_storage_and_utf8_without_normalizing() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        for value in ["g".repeat(64), "é".repeat(32)] {
+            let actual = db.query_row("SELECT ?", [&value], |r| retained_identity(r, 0))?;
+            assert_eq!(actual, value);
+        }
+        for expression in [
+            "NULL",
+            "64",
+            "zeroblob(64)",
+            "hex(zeroblob(32)) || 'x'",
+            "replace(hex(zeroblob(33)), '0', 'é')",
+            "CAST(x'ff' || zeroblob(63) AS TEXT)",
+            "'short'",
+        ] {
+            let error = db
+                .query_row(&format!("SELECT {expression}"), [], |r| {
+                    retained_identity(r, 0)
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("64 bytes of UTF-8 TEXT"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn opening_evidence_columns_admit_bytes_and_storage_before_materialization() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        install(&db)?;
+        let id = begin(&db, b"bounded opening", 3)?.id;
+        append(&db, &id, 0, &PreparedChunk::new(b"yes")?)?;
+        for (sql, expected) in [
+            (
+                "UPDATE migration_evidence SET manifest=replace(hex(zeroblob(33)),'0','é')",
+                "manifest type/size",
+            ),
+            (
+                "UPDATE migration_evidence SET manifest=zeroblob(64)",
+                "manifest type/size",
+            ),
+            (
+                "UPDATE migration_evidence_blobs SET hash=replace(hex(zeroblob(33)),'0','é'); UPDATE migration_evidence_chunks SET hash=(SELECT hash FROM migration_evidence_blobs)",
+                "digest type/size",
+            ),
+            (
+                "UPDATE migration_evidence_blobs SET compressed=replace(hex(zeroblob(300000)),'0','é')",
+                "compressed evidence type/size",
+            ),
+            (
+                "UPDATE migration_evidence_blobs SET compressed='bad'",
+                "compressed evidence type/size",
+            ),
+        ] {
+            db.execute_batch("SAVEPOINT corrupt; PRAGMA defer_foreign_keys=ON")?;
+            db.execute_batch(sql)?;
+            let error = read(&db, &id, 0).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{sql}: {error:#}");
+            db.execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            assert_eq!(
+                db.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
+                1
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })?,
+                0
+            );
+            assert_eq!(read(&db, &id, 0)?, b"yes");
+        }
+        assert!(
+            state(&db, &"é".repeat(64))
+                .unwrap_err()
+                .to_string()
+                .contains("identity size")
+        );
+        Ok(())
+    }
 
     #[test]
     fn admission_domains_cannot_cross_public_append_authority() -> Result<()> {

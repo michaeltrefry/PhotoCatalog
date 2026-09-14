@@ -6,6 +6,7 @@ use super::{
     organization::{Evidence, SourceRecord},
     retention,
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_metadata::{self, Prepared, Source},
@@ -371,7 +372,7 @@ fn historical_content(
 }
 fn roster_admission(
     db: &Connection,
-    source: Option<&MigrationSource>,
+    source: Option<&dyn MigrationRead>,
     request: &Projection,
     binding: &str,
     supplement: &str,
@@ -497,7 +498,7 @@ struct PacketGuard {
     complete: bool,
 }
 fn packet_guard(db: &Connection, sequence: i64) -> Result<PacketGuard> {
-    Ok(db.query_row("SELECT input,revision,collection,source_rowid,digest,raw_length,complete FROM migration_retained_records WHERE sequence=?",[sequence],|r|Ok(PacketGuard{sequence,input:r.get(0)?,revision:r.get(1)?,collection:r.get(2)?,rowid:r.get(3)?,digest:r.get(4)?,length:evidence::size(r,5)?,complete:r.get(6)?}))?)
+    Ok(db.query_row("SELECT input,revision,collection,source_rowid,digest,raw_length,complete FROM migration_retained_records WHERE sequence=?",[sequence],|r|Ok(PacketGuard{sequence,input:evidence::retained_identity(r,0)?,revision:evidence::retained_identity(r,1)?,collection:r.get(2)?,rowid:r.get(3)?,digest:evidence::retained_identity(r,4)?,length:evidence::size(r,5)?,complete:r.get(6)?}))?)
 }
 fn packet_guards(
     db: &Connection,
@@ -1052,6 +1053,26 @@ impl Catalog {
         source: Option<&MigrationSource>,
         request: &Projection,
     ) -> Result<ProjectionResult> {
+        self.project_migration_file_metadata_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_file_metadata_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
+        request: &Projection,
+    ) -> Result<ProjectionResult> {
+        let admit = |bytes| match source {
+            Some(source) => source.admit_file_metadata(bytes),
+            None => Ok(()),
+        };
+        let requested =
+            crate::lightroom_migration_worker::memory::requested::Requested::new(&admit);
+        let selected = crate::lightroom_migration_worker::memory::core::file_metadata_selected(
+            request.packet_records.len(),
+        )?;
+        let _selected_scope = requested.scope(selected)?;
         request.file.source.identity()?;
         ensure!(
             request.file.source.table == "AgLibraryFile",
@@ -1142,7 +1163,8 @@ impl Catalog {
         let prepared=inspection.as_ref().map(|inspection| {
             let location=origin_path(&historical.path,request.origin)?;
             let source=Source{kind:request.origin.kind().into(),locator:format!("lightroom:{}:{}:{}",request.file.source.identity()?,request.origin.name(),supplement_semantic).into_bytes(),display:format!("Lightroom retained {}",request.origin.name()),ambiguous,provenance:serde_json::json!({"adapter":ADAPTER,"file":request.file.source,"origin":request.origin,"source_path":location,"historical_observation":historical.observation,"association":request.association,"supplement_proof_blake3":supplemental.as_ref().map(|s|&s.0)})};
-            Ok::<_,anyhow::Error>((Prepared::new(inspection,&source)?,source))
+            let prepared = Prepared::new_admitted(inspection, &source, &requested)?;
+            Ok::<_,anyhow::Error>((prepared, source))
         }).transpose()?;
         let mut result = ProjectionResult {
             input_digest: digest,
@@ -1195,7 +1217,8 @@ impl Catalog {
             return Ok(old);
         }
         if let Some((prepared, source)) = prepared {
-            let change = catalog_metadata::retain_prepared(&tx, &asset, &source, &prepared, true)?;
+            let change =
+                catalog_metadata::retain_prepared(&tx, &asset, &source, &prepared.value, true)?;
             result.observation = Some(change.observation_id);
         }
         tx.execute(
@@ -1762,6 +1785,47 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn retained_identity_guards_apply_when_packet_descriptors_exceed_budget() -> Result<()> {
+        let t = Test::new(Origin::Embedded, Status::Complete, false, false)?;
+        let sequence = t.request.packet_records[0];
+        let original = packet_guard(&t.catalog.db, sequence)?;
+        // The descriptor-heavy path deliberately skips selected_record decoding.
+        t.catalog.db.execute(
+            "UPDATE migration_retained_records SET raw_length=?, compressed=x'00' WHERE sequence=?",
+            params![META as i64, sequence],
+        )?;
+        let (_, fits) = packet_guards(&t.catalog.db, &t.request, &original.input)?;
+        assert!(!fits);
+        for column in ["input", "revision", "digest"] {
+            for expression in [
+                "hex(zeroblob(524288))",
+                "replace(hex(zeroblob(33)), '0', 'é')",
+                "zeroblob(64)",
+                "CAST(x'ff' || zeroblob(63) AS TEXT)",
+                "'short'",
+            ] {
+                t.catalog
+                    .db
+                    .execute_batch("SAVEPOINT corrupt; PRAGMA defer_foreign_keys=ON")?;
+                t.catalog.db.execute(
+                    &format!("UPDATE migration_retained_records SET {column}={expression} WHERE sequence=?"),
+                    [sequence],
+                )?;
+                let error = packet_guards(&t.catalog.db, &t.request, &original.input).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                // Transaction rechecks use the same direct guard reader.
+                let error = packet_guard(&t.catalog.db, sequence).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                t.catalog
+                    .db
+                    .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            }
+        }
+        assert!(packet_guard(&t.catalog.db, sequence).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn interpretation_limits_keep_complete_custody_without_reading_oversized_bytes() -> Result<()> {
         let t = Test::new(Origin::Embedded, Status::Complete, false, false)?;
         let mut proof = Evidence::with_record_limit(2052)?;
@@ -2119,4 +2183,17 @@ mod tests {
         );
         Ok(())
     }
+}
+
+/// Target layout coefficient for the bounded packet roster's actual element.
+pub(crate) fn packet_guard_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<PacketGuard>()
+}
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[test]
+fn capacity_fixed_packet_guard_layout() {
+    let baseline = crate::capacity_probes::begin();
+    crate::capacity_probes::fixed_layout::<PacketGuard>("PacketGuard");
+    crate::capacity_probes::report("fixed-packet-guard", baseline);
 }

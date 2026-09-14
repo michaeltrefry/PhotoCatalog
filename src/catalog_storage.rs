@@ -2241,13 +2241,13 @@ fn read_evidence_with(
     })
 }
 #[cfg(unix)]
-fn object_key(file: &File) -> Result<(u64, u64)> {
+pub(crate) fn object_key(file: &File) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = file.metadata()?;
     Ok((m.dev(), m.ino()))
 }
 #[cfg(windows)]
-fn object_key(file: &File) -> Result<(u64, u64)> {
+pub(crate) fn object_key(file: &File) -> Result<(u64, u64)> {
     use std::os::windows::io::AsRawHandle;
     object_key_handle(file.as_raw_handle())
 }

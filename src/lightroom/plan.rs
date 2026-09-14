@@ -64,15 +64,17 @@ pub(super) fn validate_paging_indexes(db: &Connection) -> Result<()> {
             .split_whitespace()
             .nth(2)
             .context("invalid paging index definition")?;
-        let actual: Option<String> = db
+        let actual: Option<bool> = db
             .query_row(
-                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
                 [name],
-                |r| r.get(0),
+                |r| {
+                    Ok(matches!(r.get_ref(0)?, ValueRef::Text(sql) if sql == definition.as_bytes()))
+                },
             )
             .optional()?;
         ensure!(
-            actual.as_deref() == Some(definition),
+            actual == Some(true),
             "missing or incompatible inspection paging index: {name}"
         );
     }

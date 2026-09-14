@@ -8,6 +8,7 @@ use super::{
     metadata::{self, CurrentDevelop, ResultRecord},
     walk::{LinkResolution, Walk},
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{Catalog, catalog_writer::Priority, lightroom::migration_source::MigrationSource};
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -223,6 +224,13 @@ impl Catalog {
         source: &MigrationSource,
         request: &Request,
     ) -> Result<Progress> {
+        self.begin_current_develop_repair_reader(source, request)
+    }
+    pub(crate) fn begin_current_develop_repair_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        request: &Request,
+    ) -> Result<Progress> {
         self.require_jobs_released()?;
         ensure!(
             hash(&request.run)
@@ -340,6 +348,13 @@ impl Catalog {
         source: &MigrationSource,
         id: &str,
     ) -> Result<Step> {
+        self.step_current_develop_repair_reader(source, id)
+    }
+    pub(crate) fn step_current_develop_repair_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        id: &str,
+    ) -> Result<Step> {
         self.require_jobs_released()?;
         let (binding, before) = read(&self.db, id)?;
         super::keyword_repair::require_owner(&self.db, &before.run, None)?;
@@ -388,7 +403,7 @@ impl Catalog {
     }
     fn archive_current_report(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         before: &Progress,
     ) -> Result<Step> {
@@ -451,7 +466,7 @@ impl Catalog {
     }
     fn repair_current_item(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         before: &Progress,
     ) -> Result<Step> {

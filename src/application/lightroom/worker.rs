@@ -406,6 +406,42 @@ impl Owner {
                     .summary(),
                 maximum,
             ),
+            Query::SelectionSources {
+                review_token,
+                revision,
+                after,
+                limit,
+            } => {
+                let review = self.review.as_ref().context("no live selection review")?;
+                encode(
+                    &review.preparation_sources(
+                        &review_token,
+                        &revision,
+                        after.0,
+                        count(limit, 256)?,
+                        control.cancel.clone(),
+                    )?,
+                    maximum,
+                )
+            }
+            Query::SelectionPreparation {
+                review_token,
+                document,
+                offset,
+                limit,
+            } => {
+                let review = self.review.as_ref().context("no live selection review")?;
+                encode(
+                    &review.preparation_chunk(
+                        &review_token,
+                        document,
+                        offset.0,
+                        count(limit, 64 * 1024)?,
+                        control.cancel.clone(),
+                    )?,
+                    maximum,
+                )
+            }
             Query::SelectionPage {
                 review_token,
                 collection,

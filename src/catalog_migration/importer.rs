@@ -8,6 +8,7 @@ use super::{
     retention,
     walk::{LinkResolution, Walk},
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_writer::Priority,
@@ -217,13 +218,23 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
 fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     crate::lightroom::bounded_json(v, LIMIT)
 }
+// Both fields must fit before either is returned to Rust. BLOB affinity does
+// not prohibit stored TEXT, so length admission counts bytes explicitly.
+const READ_DOCUMENTS_SQL: &str = "SELECT
+    CASE WHEN length(CAST(progress AS BLOB))<=?2 AND length(CAST(policy AS BLOB))<=?2 THEN progress END,
+    CASE WHEN length(CAST(progress AS BLOB))<=?2 AND length(CAST(policy AS BLOB))<=?2 THEN policy END
+    FROM migration_runs WHERE id=?1";
 pub(crate) fn read(db: &Connection, id: &str) -> Result<(Progress, Policy)> {
     ensure!(id.len() == 64, "migration run identity bounds");
-    let (p, q): (Vec<u8>, Vec<u8>) = db.query_row(
-        "SELECT progress,policy FROM migration_runs WHERE id=?",
-        [id],
+    let (p, q): (Option<Vec<u8>>, Option<Vec<u8>>) = db.query_row(
+        READ_DOCUMENTS_SQL,
+        params![id, i64::try_from(LIMIT)?],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let (p, q) = (
+        p.context("migration state bounds before allocation")?,
+        q.context("migration state bounds before allocation")?,
+    );
     ensure!(
         p.len() <= LIMIT && q.len() <= LIMIT,
         "migration state bounds"
@@ -273,7 +284,7 @@ pub(crate) fn advance(
     tx.commit()?;
     Ok(())
 }
-fn admit_supplements(catalog: &Catalog, source: &MigrationSource, policy: &Policy) -> Result<()> {
+fn admit_supplements(catalog: &Catalog, source: &dyn MigrationRead, policy: &Policy) -> Result<()> {
     let pins = &source.seal().supplements;
     ensure!(
         pins.len() == policy.supplements.len(),
@@ -315,7 +326,7 @@ fn admit_supplements(catalog: &Catalog, source: &MigrationSource, policy: &Polic
 }
 fn supplement_step(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     policy: &Policy,
 ) -> Result<Step> {
@@ -381,6 +392,14 @@ impl Catalog {
     pub fn begin_selected_import(
         &mut self,
         source: &MigrationSource,
+        approval: &[u8],
+        policy: &Policy,
+    ) -> Result<Progress> {
+        self.begin_selected_import_reader(source, approval, policy)
+    }
+    pub(crate) fn begin_selected_import_reader(
+        &mut self,
+        source: &dyn MigrationRead,
         approval: &[u8],
         policy: &Policy,
     ) -> Result<Progress> {
@@ -464,7 +483,7 @@ impl Catalog {
         let id = blake3::hash(&encode(&(ADAPTER, source.binding_blake3(), policy))?)
             .to_hex()
             .to_string();
-        let retained = self.begin_migration_retention(source, approval)?;
+        let retained = self.begin_migration_retention_reader(source, approval)?;
         let progress = Progress {
             id: id.clone(),
             input: retained.input,
@@ -500,6 +519,13 @@ impl Catalog {
     /// One bounded custody/index operation or one native source row. No original
     /// file is opened. Callers may cancel between steps without losing receipts.
     pub fn step_selected_import(&mut self, source: &MigrationSource, id: &str) -> Result<Step> {
+        self.step_selected_import_reader(source, id)
+    }
+    pub(crate) fn step_selected_import_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        id: &str,
+    ) -> Result<Step> {
         self.require_jobs_released()?;
         let (before, policy) = read(&self.db, id)?;
         super::current_repair::require_not_pending(&self.db, id)?;
@@ -512,7 +538,7 @@ impl Catalog {
         let mut outcome = None;
         match before.stage {
             Stage::Custody => {
-                if self.step_migration_retention(source)?.complete {
+                if self.step_migration_retention_reader(source)?.complete {
                     after.stage = Stage::SupplementCustody;
                 }
             }
@@ -646,7 +672,7 @@ pub(crate) fn retained(reason: impl Into<String>) -> RowResult {
 }
 fn original(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<RowResult> {
@@ -752,7 +778,7 @@ fn zero(cell: &Cell) -> bool {
 }
 fn image(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     stage: Stage,
@@ -762,7 +788,7 @@ fn image(
     let raw = catalog.migration_lookup_record(origin.retained_record)?;
     let schema = catalog.migration_lookup_record(table)?;
     if field_length(&raw, "cells_json")? > LIMIT || field_length(&schema, "columns_json")? > LIMIT {
-        let result=catalog.project_migration_image(Some(source),&images::Projection{origin:origin.clone(),retained_table:table,import_source:policy.import_source.clone(),decision:images::Decision::Retain{reason:"Image interpretation exceeds bounded cells/columns limits; complete original row retained".into()}})?;
+        let result=catalog.project_migration_image_reader(Some(source),&images::Projection{origin:origin.clone(),retained_table:table,import_source:policy.import_source.clone(),decision:images::Decision::Retain{reason:"Image interpretation exceeds bounded cells/columns limits; complete original row retained".into()}})?;
         return Ok(RowResult::Applied(Outcome::Image(result.outcome)));
     }
     let fields = walk.columns(origin)?;
@@ -856,7 +882,7 @@ fn image(
             label,
         }
     };
-    let result = catalog.project_migration_image(
+    let result = catalog.project_migration_image_reader(
         Some(source),
         &images::Projection {
             origin: origin.clone(),
@@ -886,7 +912,7 @@ fn has_mapped_image(db: &Connection, owner: &str, source: &SourceKey) -> Result<
 
 fn metadata(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     stage: Stage,
@@ -919,7 +945,7 @@ fn metadata(
         };
         let request = catalog.prepare_migration_current_develop(request)?;
         Ok(RowResult::Applied(metadata_outcome(
-            catalog.project_migration_current_develop(Some(source), &request)?,
+            catalog.project_migration_current_develop_reader(Some(source), &request)?,
         )))
     } else {
         let image = match walk.link(origin, "image", "Adobe_images")? {
@@ -959,13 +985,13 @@ fn metadata(
             import_source: policy.import_source.clone(),
         };
         Ok(RowResult::Applied(metadata_outcome(
-            catalog.project_migration_catalog_xmp(Some(source), &request)?,
+            catalog.project_migration_catalog_xmp_reader(Some(source), &request)?,
         )))
     }
 }
 fn file_metadata(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     stage: Stage,
@@ -1023,7 +1049,7 @@ fn file_metadata(
         },
         supplement: None,
     };
-    let historical = catalog.project_migration_file_metadata(Some(source), &request)?;
+    let historical = catalog.project_migration_file_metadata_reader(Some(source), &request)?;
     let supplemental = policy.supplements.iter().find(|p| {
         p.capture_revision == origin.source.capture_revision
             && p.source_id == source_id
@@ -1032,7 +1058,7 @@ fn file_metadata(
     let result = if let Some(supplement) = supplemental {
         let mut request = request;
         request.supplement = Some(supplement.evidence.clone());
-        catalog.project_migration_file_metadata(Some(source), &request)?
+        catalog.project_migration_file_metadata_reader(Some(source), &request)?
     } else {
         historical
     };
@@ -1066,7 +1092,7 @@ fn field_length(
 }
 fn prepared_origin(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     revision: &str,
     sequence: i64,
 ) -> Result<(Option<SourceRecord>, Option<String>)> {
@@ -1211,6 +1237,59 @@ mod mapping_query_tests {
                 .get::<_, bool>(0))?
         );
         assert!(legacy.get_status(StatementStatus::VmStep) > 20_000);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod document_admission_tests {
+    use super::*;
+    use rusqlite::types::Type;
+    #[test]
+    fn oversized_progress_or_policy_never_crosses_the_sql_row_boundary() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        retention::install(&db)?;
+        install(&db)?;
+        let id = "a".repeat(64);
+        db.execute(
+            "INSERT INTO migration_retention(id,seal,approval) VALUES(?1,?2,?2)",
+            params![id, b"{}".as_slice()],
+        )?;
+        db.execute(
+            "INSERT INTO migration_runs VALUES(?1,?1,?2,?2)",
+            params![id, b"{}".as_slice()],
+        )?;
+        for field in ["progress", "policy"] {
+            db.execute(
+                "UPDATE migration_runs SET progress=?1,policy=?1",
+                [b"{}".as_slice()],
+            )?;
+            db.execute(
+                &format!("UPDATE migration_runs SET {field}=zeroblob(?1)"),
+                [i64::try_from(LIMIT + 1)?],
+            )?;
+            let mut statement = db.prepare(READ_DOCUMENTS_SQL)?;
+            let mut rows = statement.query(params![id, i64::try_from(LIMIT)?])?;
+            let row = rows.next()?.context("fixture row")?;
+            assert_eq!(row.get_ref(0)?.data_type(), Type::Null);
+            assert_eq!(row.get_ref(1)?.data_type(), Type::Null);
+            assert!(format!("{:#}", read(&db, &id).unwrap_err()).contains("before allocation"));
+        }
+        // A TEXT value with fewer characters than bytes cannot evade admission.
+        let multibyte = "é".repeat(LIMIT / 2 + 1);
+        db.execute(
+            "UPDATE migration_runs SET progress=?1,policy=?2",
+            params![multibyte, b"{}".as_slice()],
+        )?;
+        assert!(format!("{:#}", read(&db, &id).unwrap_err()).contains("before allocation"));
+        assert_eq!(
+            db.query_row(
+                "SELECT length(CAST(progress AS BLOB)) FROM migration_runs",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            i64::try_from(LIMIT + 2)?
+        );
         Ok(())
     }
 }

@@ -9,7 +9,8 @@ Latest local checkpoint (supersedes older pending notes below):
 Active next wave: C preview metadata aggregate assembly (Sol/high, cross-module
 ownership arithmetic), managed SqlReader selected-XMP denial/retry fixture
 (Sol/high, same subsystem context), and a private actual-native corruption/cache
-fixture (Terra/medium, localized test work). Native execution is serialized under
+fixture (Sol/medium, after Terra/medium returned planning without implementation).
+Native execution is serialized under
 root grants; proof-only and private fixture work can proceed together. Existing
 verified checkpoints are retained rather than re-audited. These are model choices
 for this wave, not a permanent mapping. Live read-back confirms sc-22847 In
@@ -38,8 +39,15 @@ Progress, sc-22848 To Do, and the remaining epic stories Done.
   is clean. Final evidence is `sc-22847-lightroom-migration-bridge-xksnotzh/core-xmp-freeze-20260914T113402Z`;
   artifact manifest SHA256 `4c63d5d5741cadcc01290d95758da52146d08debbc0a75aec97aab1f1cc416d8`.
   The initial two compile errors and recovered JPEG transcript/count correction
-  remain recorded. This does not establish actual managed SqlReader integration,
-  large canonical/shared-extension stress cases, or native SDK memory bounds.
+  remain recorded. Successor `f27917066b7415d355da8374f2886d250cbb4206`
+  proves selected metadata through the actual managed SqlReader/Source child:
+  required 3,447,432,641 versus available 3,447,432,640 rejects before five table
+  families mutate; same-pool retry preserves raw XMP, semantic hash and rows.
+  One focused test passed with direct exit 0 and independent review PASS (0.95).
+  Operation ownership retires to caller-only 17 then zero; LM is a joined-thread
+  substitute. Receipt is `managed-selected-freeze-20260914T114754Z` under the same
+  private evidence root. Full LM process integration, pre-projection coordinator
+  ownership, large canonical/shared-extension stress and native SDK bounds remain open.
   Earlier whole-app Clippy failed on
   182 unchanged baseline diagnostics, so vendor success is not an app Clippy claim.
 - FS8 v31 passed eight SQL/edit/image rollback tests and whole-app strict Clippy.
@@ -60,7 +68,23 @@ Progress, sc-22848 To Do, and the remaining epic stories Done.
   previews at 2 MiB took 995.719 ms in this synthetic batch; this is not S13's
   200-preview p95 benchmark. The local checkpoint is committed at
   `b2ecda61fae387848d3cfae30c9ebe393cdd92d3`, with all 68 committed file hashes
-  verified against source-v32. No remote publication or full FS8 completion claim.
+  verified against source-v32. Merged into desktop at `dd58654`; application source
+  exactly matches the checkpoint. The LM checkpoint integration preserves managed
+  job guards and both SQLite fixes.
+  Independent Sol/high review found two stale LM catalog-constructor references;
+  both now use the session authority and SQL wrapper. A schema-index check also
+  conflicted with the restricted SQLite function whitelist; it now compares
+  borrowed text without adding authorization. Exact repairs pass source review.
+  Combined validation passes 26 focused tests: supervisor 5, exclusive-open 2,
+  database identity 4, prepared edits 4, directory discovery 1, index validation 1,
+  bridge 8 and metadata rollback 1. The six bridge failures before the index fix
+  are preserved. Evidence is `sc-22847-desktop-lm-integration-q8yn11ac`, with
+  passing receipts `gate-1789387799261340000` (first five commands) and
+  `gate-1789388111029829000` (all three commands); all direct processes were waited.
+  A shared-target stale XMP Rust
+  artifact caused the first compile failure; only wrapper freshness was
+  invalidated, with source hashes unchanged, before retrying.
+  No remote publication or full FS8 completion claim.
 - Execution uses the reloaded shortcut-epic model policy: Luna/low for mechanical
   evidence verification, Terra/medium for localized review and fixture repair,
   Sol/high for cross-layer XMP implementation. Each received an explicit model and

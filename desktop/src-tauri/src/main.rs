@@ -10,12 +10,21 @@ fn main() {
     // The installed executable is also the isolated worker. Never initialize a
     // webview, dialogs or catalog owner in a worker process.
     match std::env::args_os().nth(1).as_deref() {
+        Some(arg) if arg == "--lightroom-source-reader-sql" || arg == "--lightroom-source-reader-raw" => {
+            let raw = arg == "--lightroom-source-reader-raw";
+            if let Err(error) = photocatalog::lightroom_migration_worker::managed_source_reader_main(raw) {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Some(arg) if arg == "--catalog-filesystem-worker" => {
             std::process::exit(if photocatalog::filesystem_worker::worker_main().is_ok() { 0 } else { 1 });
         }
         Some(arg) if arg == "--catalog-desktop-worker" => {
             if let Err(error) = application::desktop::worker_main() {
                 eprintln!("{error:#}");
+                std::process::exit(1);
             }
             return;
         }

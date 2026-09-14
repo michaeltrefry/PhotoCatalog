@@ -6,8 +6,12 @@ use anyhow::{Result, ensure};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, ThreadId},
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,16 +19,59 @@ pub(crate) enum Priority {
     Foreground,
     Background,
 }
+
+/// Worker-only admission. A selected migration child must obtain a parent
+/// writer grant at the same boundary as an ordinary in-process writer permit.
+/// The lease is released only after its caller's transaction has been dropped.
+pub(crate) trait ExternalAdmission: Send + Sync {
+    fn acquire(&self) -> Result<Box<dyn ExternalLease>>;
+}
+pub(crate) trait ExternalLease {
+    /// A failed release must poison/cancel the worker. The parent retains its
+    /// permit until a matching release or verified child reap.
+    fn release(&mut self);
+}
+
 #[derive(Default)]
 struct State {
     owner: Option<ThreadId>,
     next: [u64; 2],
     serving: [u64; 2],
+    // Inclusive ranges, not one allocation for each canceled ticket. Repeated
+    // canceled requests behind one live waiter occupy only one range.
+    retired: [BTreeMap<u64, u64>; 2],
+}
+impl State {
+    fn advance_retired(&mut self, class: usize) {
+        while let Some(end) = self.retired[class].remove(&self.serving[class]) {
+            self.serving[class] = end + 1; // ticket allocation excludes u64::MAX
+        }
+    }
+    fn retire(&mut self, class: usize, ticket: u64) {
+        let mut start = ticket;
+        let mut end = ticket;
+        if let Some((&a, &b)) = self.retired[class].range(..=ticket).next_back() {
+            if b >= ticket {
+                return;
+            }
+            if b + 1 == ticket {
+                start = a;
+                self.retired[class].remove(&a);
+            }
+        }
+        if let Some(&next_end) = self.retired[class].get(&(ticket + 1)) {
+            end = next_end;
+            self.retired[class].remove(&(ticket + 1));
+        }
+        self.retired[class].insert(start, end);
+        self.advance_retired(class);
+    }
 }
 #[derive(Default)]
 pub(crate) struct Writers {
     state: Mutex<State>,
     changed: Condvar,
+    external: Option<Arc<dyn ExternalAdmission>>,
 }
 
 pub(crate) fn for_catalog(canonical_root: &Path) -> Arc<Writers> {
@@ -42,60 +89,160 @@ pub(crate) fn for_catalog(canonical_root: &Path) -> Arc<Writers> {
     value
 }
 
+/// Owns an allocated, not-yet-admitted ticket. Declared before the mutex guard
+/// so cancellation/error always unlocks State before retiring the ticket.
+struct WaitingTicket {
+    writers: Arc<Writers>,
+    ticket: Option<(usize, u64)>,
+}
+impl Drop for WaitingTicket {
+    fn drop(&mut self) {
+        if let Some((class, ticket)) = self.ticket {
+            self.writers
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retire(class, ticket);
+            self.writers.changed.notify_all();
+        }
+    }
+}
 impl Writers {
+    pub(crate) fn with_external(admission: Arc<dyn ExternalAdmission>) -> Arc<Self> {
+        Arc::new(Self {
+            external: Some(admission),
+            ..Self::default()
+        })
+    }
+    /// Notification is nonblocking and needs no writer mutex. The bounded wait
+    /// below also covers a notify-before-wait race.
+    pub(crate) fn wake_waiters(&self) {
+        self.changed.notify_all();
+    }
+
     #[cfg(test)]
     pub(crate) fn wait_until_queued(&self, foreground: u64, background: u64) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut state = self.state.lock().unwrap();
         while state.next[0] - state.serving[0] != foreground
             || state.next[1] - state.serving[1] != background
         {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = deadline.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "writer did not reach admission");
             state = self.changed.wait_timeout(state, left).unwrap().0;
         }
     }
     pub(crate) fn enter(self: &Arc<Self>, priority: Priority) -> Result<Permit> {
+        self.enter_checked(priority, None, None)
+    }
+    pub(crate) fn enter_cancellable(
+        self: &Arc<Self>,
+        priority: Priority,
+        cancel: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> Result<Permit> {
+        self.enter_checked(priority, Some(cancel), deadline)
+    }
+    fn enter_checked(
+        self: &Arc<Self>,
+        priority: Priority,
+        cancel: Option<&AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<Permit> {
+        let mut waiting = WaitingTicket {
+            writers: self.clone(),
+            ticket: None,
+        };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let owner = thread::current().id();
         ensure!(
             state.owner != Some(owner),
             "recursive catalog writer admission; release the current transaction before calling another catalog writer"
         );
+        ensure!(
+            !cancel.is_some_and(|c| c.load(Ordering::Acquire)),
+            "catalog writer admission canceled"
+        );
+        ensure!(
+            !deadline.is_some_and(|d| Instant::now() >= d),
+            "catalog writer admission deadline"
+        );
         let class = usize::from(priority == Priority::Background);
         let ticket = state.next[class];
         state.next[class] = ticket
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("catalog writer ticket exhausted"))?;
+        waiting.ticket = Some((class, ticket));
         self.changed.notify_all();
-        while state.owner.is_some()
-            || state.serving[class] != ticket
-            || (class == 1 && state.next[0] != state.serving[0])
-        {
-            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        loop {
+            ensure!(
+                !cancel.is_some_and(|c| c.load(Ordering::Acquire)),
+                "catalog writer admission canceled"
+            );
+            ensure!(
+                !deadline.is_some_and(|d| Instant::now() >= d),
+                "catalog writer admission deadline"
+            );
+            state.advance_retired(0);
+            state.advance_retired(1);
+            if state.owner.is_none()
+                && state.serving[class] == ticket
+                && (class == 0 || state.next[0] == state.serving[0])
+            {
+                break;
+            }
+            state = if cancel.is_some() || deadline.is_some() {
+                let timeout = deadline
+                    .map(|d| d.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::from_millis(50))
+                    .min(Duration::from_millis(50));
+                self.changed
+                    .wait_timeout(state, timeout)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+            } else {
+                self.changed.wait(state).unwrap_or_else(|e| e.into_inner())
+            };
         }
         state.serving[class] += 1;
         state.owner = Some(owner);
-        Ok(Permit {
+        waiting.ticket = None;
+        drop(state);
+        let mut permit = Permit {
             writers: self.clone(),
+            external: None,
             _not_send: std::marker::PhantomData,
-        })
+        };
+        if let Some(external) = &self.external {
+            permit.external = Some(external.acquire()?);
+        }
+        Ok(permit)
     }
 }
 
-/// Declared before the transaction so rollback drops before this permit on error.
+/// Declare before the transaction: rollback precedes release even on error.
 /// Owned rather than borrowing Catalog, leaving its connection freely mutable.
 pub(crate) struct Permit {
     writers: Arc<Writers>,
+    external: Option<Box<dyn ExternalLease>>,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut state = self.writers.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.owner = None;
+        if let Some(mut lease) = self.external.take() {
+            lease.release();
+        }
+        self.writers
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .owner = None;
         self.writers.changed.notify_all();
     }
 }
+
+#[cfg(test)]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {
