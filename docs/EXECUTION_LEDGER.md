@@ -6,6 +6,14 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+LM3 T200212 (32 files, manifest5d20174e) passes full test-target and Tauri checks,
+logs52011090/68191804, cargo36889/38062 waited0, source unchanged. Independent
+semantic re-review is active before the 15-test gate. FS9 reviewa9a43cbf found
+PhotoPublication dropped before Finish/Abort; successor e486bce0 restores lifetime
+and adds a lock-retention test. Its full compile passes (cargo45154 waited0,
+loga7c7d4b6); independent review precedes the seven-test gate. Both lanes remain
+local synthetic work, no runtime acceptance yet.
+
 FS9 original-verification source ce64eab9 (14 files, manifest298523b6) passed
 full test-target compile: `sc-22847-original-lease-preflight2-p5po7f2t`,
 cargo15069 waited0, source unchanged, log3a1a5195. Independent review is active.
