@@ -29,14 +29,31 @@ limits, and retained failed-drain ownership. Implementation order v4 is:
 3. Common seven-operation executor and worker/Source roles.
 4. G/C authority bridge and application integration.
 
-Only batch1 is currently implemented, source frozen in
-`sc-22847-lm-worker-batch1-20260914T160953Z` (diff512b86df, six source files).
-Independent source review is pending. Its eight-test native gate owns the next
-serialized CPU2 lane conditional on PASS; source must remain frozen. Sol/high
-implements and independently reviews using separate agents, reusing context
-because new-agent thread capacity was exhausted. No further batch admitted yet.
+LM transport batch1 `02a3c69` is integrated as `d8f5a6e`; all six reviewed
+and tested blobs match. Eight focused tests passed (0failed,901filtered), direct
+cargo exit0/PID15100 waited; final review PASS0.99 `71af2b07`. Evidence in
+`sc-22847-lm-worker-batch1-20260914T160953Z/native-second` preserves the complete
+receipt. The first wrapper failed on reserved zsh variable `status`; its test
+output/fresh compilation is supporting evidence only. The identical corrected
+rerun supplies direct exit proof. Integrated package formatting also passes.
+Batch2 owner/API sketch is root-approved; source implementation is active.
+It retains partial post-spawn owners and typed DrainPending, distinguishes
+confirmed join panic from unknown child wait, and checks release acknowledgements.
+Blocking Drop drain is the final ownership guard; normal controls stay pollable.
+Exact shared-pool reservation/result paging and multipart consumption belong
+to this batch. No executor/G-C caller is claimed yet. CPU2 is currently idle.
+Sol/high implements and independently reviews using separate agents, reusing
+context because new-agent thread capacity was exhausted.
 Earlier actual Source evidence used an LM thread substitute; that limitation
 remains until production worker integration and its tests pass.
+
+Parallel FS9 source component `sc-22847-export-facts` starts from checkpoint
+`443f716` (Shortcut23422). Stateless F facts and one stable destination snapshot
+preserve C SQL transactions, alias decisions and current recheck points; no
+cross-request alias session is justified by existing semantics. All existing
+alias callsites remain in scope; capture/link publication and original reads
+remain separately open. No native grant while LM transport holds CPU2.
+
 
 ## Retained verified component history
 
