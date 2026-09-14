@@ -6,6 +6,23 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+LM final source passes the complete27-test group c237d0e9, nine transport-focused
+cases, and seven standalone CLI tests9501f378. All source/log hashes and checked
+process retirement verified. Evidence auditd1e94143 passed27+9 and awaits its
+CLI addendum before local component commit. Publication source7f20828b passes
+nineteen exact tests (1 each,961filtered) in recovery-runtime19-z5zd366c; all
+source/logs and20reportedPIDs including F51366 verified absent. Separate evidence
+audit is active; observed capacity docs refresh follows. Both components remain
+uncommitted pending evidence closeout; fullS12, LMbatch4 and N/Gexport remainopen.
+
+LM startupFIFO plus checked receiver verdict passes compile5d381c99 and
+independent closure79149970 (0.99). Nine-case runtime active in
+sc-22847-lm3-fifo-proof-runtime9-gdx12zry, outer64705. Publication ENOENT is a
+real Recovery Begin defect: strict seal reader requires the intentionally absent
+payload. Stronger author is factoring metadata-only restore admission while
+preserving strict publish verification, locked restore identity and journal
+checks. Sol explicit-overwrite/diagnostic fixture corrections are preserved.
+
 Publication runtime17: thirteen exact passes, four failures (real-F interrupted
 capture ENOENT; three catalog fixtures lack explicit overwrite). Four old plan
 filters selected zero and were corrected to ownership_tests, then all four
