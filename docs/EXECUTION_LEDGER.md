@@ -6,6 +6,14 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+FS9 original-verification source ce64eab9 (14 files, manifest298523b6) passed
+full test-target compile: `sc-22847-original-lease-preflight2-p5po7f2t`,
+cargo15069 waited0, source unchanged, log3a1a5195. Independent review is active.
+First compiler negative d720b6d6 is preserved; its two ownership/conversion errors
+were repaired together. The focused actual-F test uses a real subprocess of the
+libtest executable with a test-only cancellation barrier, not the production CLI;
+its unused production-binary prerequisite is being corrected before runtime.
+
 LM batch3 T192424 (28 files, manifest e1ca27fa) passed the full test-target
 compile preflight in `sc-22847-lm3-preflight3-xyyrpsrk`: cargo67371 waited exit0,
 source unchanged, logd272c6ce. Independent review4d1effbd requires seven repairs:
