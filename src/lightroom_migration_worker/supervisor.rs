@@ -101,6 +101,7 @@ impl<A: Admission> State<A> {
             | ChildFrame::NeedWrite { guard, .. }
             | ChildFrame::ReleaseWrite { guard, .. }
             | ChildFrame::Progress { guard, .. }
+            | ChildFrame::BeginResult { guard, .. }
             | ChildFrame::Result { guard, .. }
             | ChildFrame::Finished { guard, .. }
             | ChildFrame::Failed { guard, .. } => guard,
@@ -235,6 +236,9 @@ impl<A: Admission> State<A> {
                     .as_mut()
                     .context("progress while writer admission pending")?
                     .progress(&phase, completed.0, total.map(|n| n.0))?;
+            }
+            ChildFrame::BeginResult { .. } => {
+                anyhow::bail!("streamed result unsupported by legacy supervisor")
             }
             ChildFrame::Result { offset, text, .. } => {
                 ensure!(

@@ -17,6 +17,17 @@ use std::{
     time::{Duration, Instant},
 };
 pub const FRAME_BYTES: usize = 128 * 1024;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRole {
+    Operation,
+    Seal,
+    Approval,
+    Policy,
+    RepairRequest,
+    SupplementRequests,
+    ExecutionAuthorization,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Guard {
@@ -64,6 +75,23 @@ pub enum ParentFrame {
         guard: Guard,
         blake3: String,
     },
+    BeginPart {
+        guard: Guard,
+        role: InputRole,
+        blake3: String,
+        bytes: U64,
+    },
+    Part {
+        guard: Guard,
+        role: InputRole,
+        offset: U64,
+        text: String,
+    },
+    FinishPart {
+        guard: Guard,
+        role: InputRole,
+        blake3: String,
+    },
     Grant {
         guard: Guard,
         sequence: U64,
@@ -73,6 +101,11 @@ pub enum ParentFrame {
         guard: Guard,
         sequence: U64,
         bytes: U64,
+    },
+    ResultGrant {
+        guard: Guard,
+        bytes: U64,
+        blake3: String,
     },
     Cancel {
         guard: Guard,
@@ -117,6 +150,11 @@ pub enum ChildFrame {
         phase: String,
         completed: U64,
         total: Option<U64>,
+    },
+    BeginResult {
+        guard: Guard,
+        bytes: U64,
+        blake3: String,
     },
     Result {
         guard: Guard,
@@ -188,6 +226,11 @@ struct MemoryWaiting {
     bytes: usize,
     granted: bool,
 }
+struct ResultWaiting {
+    bytes: usize,
+    blake3: String,
+    granted: bool,
+}
 struct Waiting {
     sequence: u64,
     write: WriteKind,
@@ -198,8 +241,10 @@ pub(crate) struct Controls {
     audit: Audit,
     waiting: Mutex<Option<Waiting>>,
     memory_waiting: Mutex<Option<MemoryWaiting>>,
+    result_waiting: Mutex<Option<ResultWaiting>>,
     memory_sequence: AtomicU64,
     memory_changed: Condvar,
+    result_changed: Condvar,
     sources: Mutex<Option<Arc<dyn SourceListener>>>,
     changed: Condvar,
     sequence: AtomicU64,
@@ -213,8 +258,10 @@ impl Controls {
             audit,
             waiting: Mutex::new(None),
             memory_waiting: Mutex::new(None),
+            result_waiting: Mutex::new(None),
             memory_sequence: AtomicU64::new(0),
             memory_changed: Condvar::new(),
+            result_changed: Condvar::new(),
             sources: Mutex::new(None),
             changed: Condvar::new(),
             sequence: AtomicU64::new(0),
@@ -277,6 +324,29 @@ impl Controls {
                 self.memory_changed.notify_all();
                 Ok(())
             }
+            ParentFrame::ResultGrant {
+                guard,
+                bytes,
+                blake3,
+            } => {
+                ensure!(guard == self.guard, "stale helper result grant");
+                self.check()?;
+                super::input::digest(&blake3)?;
+                let mut slot = self
+                    .result_waiting
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("helper result grant state poisoned"))?;
+                let pending = slot.as_mut().context("unsolicited helper result grant")?;
+                ensure!(
+                    pending.bytes == usize::try_from(bytes.0)?
+                        && pending.blake3 == blake3
+                        && !pending.granted,
+                    "stale or repeated helper result grant"
+                );
+                pending.granted = true;
+                self.result_changed.notify_all();
+                Ok(())
+            }
             ParentFrame::Grant {
                 guard,
                 sequence,
@@ -304,6 +374,7 @@ impl Controls {
             self.revoke_sources();
             self.changed.notify_all();
             self.memory_changed.notify_all();
+            self.result_changed.notify_all();
         }
         checked
     }
@@ -312,17 +383,72 @@ impl Controls {
         self.revoke_sources();
         self.changed.notify_all();
         self.memory_changed.notify_all();
+        self.result_changed.notify_all();
     }
     pub(crate) fn poison(&self) {
         self.audit.poison();
         self.revoke_sources();
         self.changed.notify_all();
         self.memory_changed.notify_all();
+        self.result_changed.notify_all();
     }
     fn check(&self) -> Result<()> {
         self.audit.check()?;
         ensure!(Instant::now() < self.until, "helper execution deadline");
         Ok(())
+    }
+
+    pub(crate) fn request_result(
+        &self,
+        measured: &result::Measured,
+        maximum: usize,
+        output: &dyn Publish,
+    ) -> Result<result::Grant> {
+        self.check()?;
+        ensure!(
+            measured.bytes <= maximum,
+            "migration result accepted-type byte bound"
+        );
+        let bytes = U64(measured.bytes.try_into()?);
+        {
+            let mut slot = self
+                .result_waiting
+                .lock()
+                .map_err(|_| anyhow::anyhow!("helper result grant state poisoned"))?;
+            ensure!(slot.is_none(), "nested helper result request");
+            *slot = Some(ResultWaiting {
+                bytes: measured.bytes,
+                blake3: measured.blake3.clone(),
+                granted: false,
+            });
+        }
+        let requested = (|| {
+            output.publish(&ChildFrame::BeginResult {
+                guard: self.guard.clone(),
+                bytes,
+                blake3: measured.blake3.clone(),
+            })?;
+            let mut slot = self
+                .result_waiting
+                .lock()
+                .map_err(|_| anyhow::anyhow!("helper result grant state poisoned"))?;
+            loop {
+                self.check()?;
+                if slot.as_ref().is_some_and(|value| value.granted) {
+                    slot.take();
+                    return Ok(result::Grant::new(measured.clone()));
+                }
+                slot = self
+                    .result_changed
+                    .wait_timeout(slot, Duration::from_millis(50))
+                    .map_err(|_| anyhow::anyhow!("helper result grant state poisoned"))?
+                    .0;
+            }
+        })();
+        if requested.is_err() {
+            self.poison();
+        }
+        requested
     }
 }
 /// Forward every prospective child allocation to the parent's shared pool.
@@ -506,5 +632,6 @@ impl ExternalLease for Lease {
         }
     }
 }
+pub(crate) mod result;
 #[cfg(test)]
 mod tests;

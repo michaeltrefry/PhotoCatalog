@@ -217,6 +217,36 @@ fn input_guard_result_digest_and_terminal_order_are_enforced() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn lm_transport_batch1_legacy_supervisor_rejects_streamed_result_without_accepting_bytes()
+-> Result<()> {
+    let mut state = state(
+        Arc::new(Writers::default()),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let stop = Arc::new(Stop::default());
+    admitted(&mut state, &stop)?;
+    let error = state
+        .accept_wait(
+            ChildFrame::BeginResult {
+                guard: guard(),
+                bytes: U64(9 * 1024 * 1024),
+                blake3: "b".repeat(64),
+            },
+            &stop,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported by legacy supervisor")
+    );
+    assert!(state.result.is_empty());
+    assert!(state.terminal.is_none());
+    Ok(())
+}
+
 mod process_tests;
 
 #[test]
