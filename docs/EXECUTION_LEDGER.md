@@ -177,7 +177,33 @@ the existing bounded error formatter; independent two-file review
 passes without changing classification, admission or cleanup. Strict Clippy and
 formatting pass with six verified artifacts and two waited commands; receipt
 `cae42fb666a90a295a97ccd63fe12c9c14d46ba2ba84ff65bf2bace3bc463f33`.
-A fresh CLI/configured retry is active. No actual preview success is awarded yet.
+Configured v21 failed with `missing field value` in the filesystem reply.
+The isolated skipped-tuple Chunk round-trip reproduced this failure; a named
+skipped field preserves the adjacent-tag value object. V22 applies that repair
+and passes 28 focused tests plus strict Clippy and formatting (receipt
+`61e7c02a130d072538a7d77157667886c9459828222081b0accb0e706900f613`).
+Its actual CLI run completes Render N, Decode N, encoded delivery and checked
+retirement in the first session, then fails reopening the small-budget session
+before N. The complete configured test remains failed (receipt
+`c0e8a7a8a60b85b07f5ea1088d84b012f54904ee9b99842de5e7ae2fd1275e60`).
+V23 adds bounded typed diagnostics without changing limits. One focused test,
+strict Clippy and formatting pass; the first runner's incorrect discovery prefix
+is preserved separately. The actual retry identifies a selected 91,998-byte cache
+object with zero encoded allowance (receipt
+`4d0493e145e5b711dd7e3d3f57e46023ff16b4f2e437571ef492af0a4e47f3b6`).
+Root verified seven artifact hashes, both direct waits and no observed survivors.
+Source tracing identifies a duplicate hydration lookup of a read-owned queued
+ticket. Predicate and managed retry routing are being corrected; the 2 MiB
+working limit and 8 MiB encoded allowance are unchanged.
+
+Six abnormal catalog-worker loss fixtures and the staggered two-native-worker
+fixture now pass independent source review, with actual runtime pending.
+The staggered fixture submits B only after A has received its encode grant and
+is held alive. It exposes the dispatch loop's busy-task early return; the reviewed
+repair lets managed jobs reach the existing admission scheduler while preserving
+publication fences. Managed prepared-cache candidate selection leaves full
+source/receipt/content verification to N; rejected candidates still decode the
+original. These fixtures do not yet establish full FS8 acceptance.
 
 The codec correction now has local runtime evidence: typed native/JPEG/WebP
 resource and unknown failures are retained, explicit invalid cache data is
@@ -198,6 +224,20 @@ length-sized clones from original spare capacity and shared Arc backing. Final
 checked aggregate accounting remains open. Private WebP/AVIF route fixtures have
 source review; root abnormal-C/live-N/F-retention fixture is under review. Neither
 has runtime evidence yet. No installed-app or full FS8 acceptance follows.
+
+Lightroom Source admission v52 is committed locally as
+`f9ac9cc44d8ae922f84364d9adfdf9e38bed34e1`. Root verified 137 committed
+source blobs and 32 qualification artifacts. Fifteen in-process tests and five
+actual Source-process tests pass, with two formatting checks and all 22 commands
+directly waited. Qualification receipt
+`e404f6560e1b6dd56baeed7475756df6026a195f5538664cf195142c36dea25e`
+and independent review
+`e89c1f14fe084c3a443a22babfd0e092ac776e57f17ef9316c51a73102cdc295`
+pass. This includes three retained-query boundary/rollback tests and explicit
+funding for simultaneously retained source partition trees. Recorded allowances
+are phase high-water bounds, not measured live allocation or RSS. The fixture
+still substitutes a joined thread for LM; actual LM/core/protocol/production-pool
+integration remains required. Twenty libtest warnings are not a Clippy result.
 
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
