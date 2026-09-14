@@ -13,6 +13,12 @@ struct BudgetState {
     limit: u64,
     used: u64,
 }
+pub(crate) fn budget_state_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Mutex<BudgetState>>(),
+        std::mem::align_of::<Mutex<BudgetState>>(),
+    )
+}
 pub struct ByteReservation {
     budget: ByteBudget,
     bytes: u64,

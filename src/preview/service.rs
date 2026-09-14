@@ -4,6 +4,7 @@
 pub(crate) mod encoded_delivery;
 #[path = "managed_reads.rs"]
 mod managed_reads;
+pub(crate) use managed_reads::metadata_root_layout as managed_read_metadata_root_layout;
 #[path = "read_queue.rs"]
 mod read_queue;
 use super::*;

@@ -117,6 +117,13 @@ impl Default for Limits {
     }
 }
 impl Config {
+    /// Requested Rust backing for the managed catalog process's bounded preview
+    /// metadata graph. Pixel, encoded-image, codec/native, SQLite and runtime
+    /// storage have their own admissions and are deliberately not included.
+    pub fn requested_preview_metadata_bytes(&self) -> Result<u64> {
+        desktop::preview_metadata_capacity::requested_bytes(self)
+    }
+
     fn validate(&self) -> Result<()> {
         let l = &self.limits;
         ensure!(
@@ -143,6 +150,10 @@ impl Config {
             self.worker_executable.is_absolute() && self.worker_executable.is_file(),
             "native worker executable unavailable"
         );
+        // This is an arithmetic/layout admission only. Existing small working
+        // budgets remain valid because metadata is not silently subtracted from
+        // the native working allowance.
+        self.requested_preview_metadata_bytes()?;
         Ok(())
     }
 }

@@ -42,6 +42,16 @@ pub(crate) struct Job {
     canceling: bool,
     admission_failure: Option<String>,
 }
+pub(crate) fn metadata_owner_layouts() -> [(usize, usize); 3] {
+    [
+        (std::mem::size_of::<Job>(), std::mem::align_of::<Job>()),
+        (
+            std::mem::size_of::<Mutex<Option<Job>>>(),
+            std::mem::align_of::<Mutex<Option<Job>>>(),
+        ),
+        (std::mem::size_of::<Stage>(), std::mem::align_of::<Stage>()),
+    ]
+}
 impl Job {
     pub fn admit(
         calls: Arc<crate::preview::stage_io::Calls>,

@@ -11,6 +11,7 @@ mod memory;
 mod scheduler;
 mod store;
 pub use identity::renderer_identity;
+pub(crate) use memory::budget_state_layout;
 pub use memory::{
     ByteBudget, ByteReservation, DecodedBudgetExceeded, DecodedCache, EncodedBudgetExceeded,
     RetainedPixels,
@@ -32,9 +33,11 @@ pub use worker::{
     EditWork, ProducedPreview, RenderWork, RenderedPreviewBatch, WorkerFailure, WorkerProcess,
     recover_worker_staging, worker_main,
 };
+pub(crate) use worker::{managed_process::metadata_owner_layouts, receipt_metadata_layouts};
 
 mod service;
 pub(crate) use service::encoded_delivery;
+pub(crate) use service::managed_read_metadata_root_layout;
 pub use service::{
     CacheReadMetrics, EncodedPreview, HydrationRequest, JobState, JobView, NativeLaunchPause,
     NativeLaunchPermit, PreviewPolicy, PreviewService, PreviewView, ReadCompletion, ReadOutcome,

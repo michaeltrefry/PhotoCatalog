@@ -1,12 +1,13 @@
 //! Retained C transport tasks; no catalog SQL enters these closures.
 use super::managed_process::Job;
 use super::*;
+use crate::preview::transport_task::RetainedError;
 use crate::preview::{stage_io::Calls, transport_task::Task};
 use std::sync::{Arc, Mutex};
 
 enum Outcome {
-    Work(Result<Box<RenderedPreviewBatch>>),
-    Drain(Result<()>),
+    Work(std::result::Result<Box<RenderedPreviewBatch>, RetainedError>),
+    Drain(std::result::Result<(), RetainedError>),
 }
 pub(crate) struct Render {
     owner: Arc<Mutex<Option<Job>>>,
@@ -17,8 +18,8 @@ pub(crate) struct Render {
     limits: crate::preview::ServiceLimits,
     cost: u64,
     complete: bool,
-    failure: Option<anyhow::Error>,
-    result: Option<Result<Box<RenderedPreviewBatch>>>,
+    failure: Option<RetainedError>,
+    result: Option<std::result::Result<Box<RenderedPreviewBatch>, RetainedError>>,
     #[cfg(test)]
     cleanup_spawn_failures: usize,
 }
@@ -76,7 +77,9 @@ impl Render {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                 })();
-                Ok(Outcome::Work(result.map(Box::new)))
+                Ok(Outcome::Work(
+                    result.map(Box::new).map_err(RetainedError::new),
+                ))
             },
         )?);
         Ok(())
@@ -89,11 +92,12 @@ impl Render {
         }
         match self.poll_task(canceled) {
             Ok(Some(batch)) => self.result = Some(Ok(batch)),
-            Err(error) if self.complete => self.result = Some(Err(error)),
+            Err(error) if self.complete => self.result = Some(Err(RetainedError::new(error))),
             Err(error) => {
                 // Thread admission or another pre-drain error is retryable
                 // ownership, not a terminal publication result.
-                self.failure.get_or_insert(error);
+                self.failure
+                    .get_or_insert_with(|| RetainedError::new(error));
             }
             Ok(None) => {}
         }
@@ -102,7 +106,11 @@ impl Render {
         self.progress(canceled);
         self.result
             .take()
-            .map(|result| result.map(|batch| *batch))
+            .map(|result| {
+                result
+                    .map(|batch| *batch)
+                    .map_err(RetainedError::into_error)
+            })
             .transpose()
     }
     fn poll_task(&mut self, canceled: &AtomicBool) -> Result<Option<Box<RenderedPreviewBatch>>> {
@@ -119,7 +127,8 @@ impl Render {
             Ok(Some(result)) => result,
             Err(error) => {
                 self.task = None;
-                self.failure.get_or_insert(error);
+                self.failure
+                    .get_or_insert_with(|| RetainedError::new(error));
                 self.start_cleanup()?;
                 return Ok(None);
             }
@@ -137,7 +146,11 @@ impl Render {
             }
             Outcome::Drain(Ok(())) => {
                 self.complete = true;
-                Err(self.failure.take().context("render failure absent")?)
+                Err(self
+                    .failure
+                    .take()
+                    .context("render failure absent")?
+                    .into_error())
             }
             Outcome::Drain(Err(error)) => {
                 self.failure.get_or_insert(error);
@@ -177,7 +190,7 @@ impl Render {
                     }
                     Ok(())
                 })();
-                Ok(Outcome::Drain(result))
+                Ok(Outcome::Drain(result.map_err(RetainedError::new)))
             },
         )?);
         Ok(())
