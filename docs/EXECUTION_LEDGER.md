@@ -290,6 +290,66 @@ passes. This qualifies the reviewed transport/query delta only; actual core
 admission, custody cursor/row guards, XMP interpretation ownership and production
 LM integration remain open. No push or new Actions run was made.
 
+Preview v28 composed the reviewed SQL guards and actual prepared/cache fixture,
+with 67 source pins verified. Its discovery compile stopped before tests on two
+test-only `usize` SQL parameters; root verified five artifacts and the direct
+waited exit 101, with no observed survivors. Receipt
+`b72e9c708663cc4cc3b3f46cb693a83bf40961b0413d8676cc002286699394f6`
+is retained. SQL v3 changes only those two fixture parameters to checked `i64`
+conversions; its six-file manifest is
+`f2539d217ee7d1632cadac4edef73af593f39a4e0a1dc8694fba3dba59407c47`.
+Production guards remain unchanged; the successor runtime gate is pending.
+
+Lightroom v54 adds core/retention pre-copy admission, but its finite independent
+review found one omitted nested owner: retained-stage lookup parses a saved
+InputSeal while page/cursor/staged owners remain live. Review
+`caefec298f22fde683556c95d25172b6fc375369f6c64f8d8abcbe64c3c9fa69`
+keeps v54 unqualified without running its native gate. Its repair must preserve
+the saved seal's generic decoding surface rather than imposing Source roster
+limits on an API that did not validate those limits previously.
+
+The root XMP prerequisite is isolated on `codex/sc-22847-xmp-bounded` at base
+`b4909e1`. It checks exact lossy UTF-8 length while borrowing the native C string
+before the existing compact 16 MiB limit can allocate a Rust output String.
+Canonical serialization and native SDK allocations are separate open terms.
+All 715 vendor files reproduce byte-for-byte from the pinned upstream archive,
+including previously omitted JPEG wrapper patches. Eight-file source v2
+`995542b0c24df6ebea660b24af1bed2c26ab03800f78a3fe7ef1c03711c3bdd8`
+and three standalone helper tests pass independent review
+`7b4f7bf4c5beb4ded7d4a5f132b95e2ae930ab903b32056ec19ce7bd382f6ae6`.
+The tests verify zero output allocations on refusal, one on exact retry and
+65,025 byte-pair conversions. Their three commands were directly waited with
+exit zero, receipt `9a97fdf8ba107c80246268d88649b3a8667527ea6601164ecc497d50476065e0`.
+This standalone probe used Rust 1.97.1. Repository-pinned Rust 1.98 SDK tests
+subsequently passed all thirteen cases (one new boundary/error/retry regression,
+four empty-scalar and eight model-preservation regressions); two formatting
+checks passed. The exact eight-file checkpoint is committed locally as
+`ff8a0119df602cb9d8d2b5c513e4e18912584212`, all eight committed blobs verified,
+receipt `188cd0d6b65c3271bf047347ea903eb2b3f535c9a01b7f45c8c2ae78c5685140`.
+Independent finite qualification
+`8ce7abe78fc79322b3bbf239aa1c6fdd62049c22522e645f43a96a1ede0d232b`
+preserves strict Clippy's failure: 182 primary diagnostics in thirty files that
+are byte-identical to the pre-change LM base, with no XMP changed-file location.
+No warnings were suppressed and no full Clippy pass is claimed. SDK receipt
+`fcb1c25542e93981e3788c556c7cf8a776c10ec462b47326d16425028b102a09`
+and style-only successor
+`f389748c1d3e5fd11e351db821efc58de4293944b5c8b03f3fa5c8f5e7f57e08`
+record all five direct waits, including Clippy exit 101.
+
+Lightroom v55 repairs the saved seal overlap without narrowing saved-state
+grammar. Its sixteen functional checks and three formatting commands pass;
+root verified 31 raw artifact hashes and all nineteen direct waits. Receipts
+`6c3389f9de57b6ce2c4a1d19a96109e248f96a77719eaa8c8057998fab714e07`,
+`f4352fb258da2ca3ed2bf63bfe16d8719a01eb7fde5a74a11cc596346374d0fd`,
+`e9071498b73fc2c953628a8528e30015cec81932e95c9e4c33f2d599050da0d5`
+preserve the finite phases. An actual Source feeds the retention test; a thread
+substitutes for LM, so this is not actual LM-process qualification. One byte
+below the required admission rejects before INSERT; retry retains one record,
+then releases the operation and caller charges to zero. The runner's malformed
+declared marker regex was not automatically enforced; a separate corrected raw
+marker readback is preserved for final review. No RAID/original access, app
+replacement, push or new Actions run occurred in this continuation.
+
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
 an epoch/token-bound relay; reaping LM alone cannot prove its Source children
