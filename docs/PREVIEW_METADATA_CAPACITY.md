@@ -98,8 +98,31 @@ destination paths before a 64 KiB durable-plan rejection. A separate C phase
 envelope charges the two simultaneously reachable 256 KiB SQL rows, their
 parsed native paths, the destination projection's path/string allocations, and
 the later source/canonical/destination exclusion backings. No destination bytes
-survive beyond the bounded snapshot revision. Original acquisition and
-publication capture/link filesystem operations remain outside this component.
+survive beyond the bounded snapshot revision. Publication capture/link
+filesystem operations remain outside this component.
+
+Managed original verification adds a stateless F planning inspection and one
+stateful held-file lease for acceptance/publication. The serial export actor is
+the sole caller, so F enforces one active lease without adding configurable
+parallelism. C records the exact root capability, requested native path,
+transfer ID, step and allowance before Begin dispatch. It retains that custody
+through every existing SQL intent/capture/link recheck and clears it only after
+a validated Finish or Abort reply. An uncertain Begin is retried with the same
+identity before cleanup; repeated Begin, Finish and Abort are idempotent for
+that transfer, while foreign provenance cannot close an active handle. Session
+Close reconciles custody before SQL/root release, and destructors do not perform
+blocking cleanup or discard an uncertain owner.
+
+The report names the C custody `Arc<Mutex<Option<_>>>` allocation, its active
+root/path/transfer/revision backing, the simultaneous C caller request, and F's
+active-plus-terminal/new-Begin overlap. F's retained `VerifiedFile` includes the
+held handle, native path and 64-byte revision digest. Original bytes are hashed
+through a fixed 64 KiB stack buffer and are never transferred or heap-retained;
+thread stacks remain outside this requested-backing calculation. The already
+installed publication recovery branch still acquires no original lease. F's
+long-lived admitted-original-root vector and all independently allocated native
+path vectors are a separate retained term derived from the 4 MiB startup frame;
+the formula includes outer-vector growth and per-path minimum allocation.
 
 Managed ICC acquisition uses one serial export-profile transfer. F retains the
 opened stable `Source`, the exact catalog root capability, requested path,
@@ -201,14 +224,14 @@ canonical path plus its two optional retained stage IDs. Every active render or
 read Job separately owns its spawn root/stage, possible status IDs and Stage ID.
 The proxy binding IDs and completed digest are also named contributions.
 
-The final frozen macOS arm64 Rust 1.98.0 focused execution reported these
-checked application-requested backing assemblies:
+The original-lease macOS arm64 Rust 1.98.0 focused execution reported these
+checked application-requested backing assemblies (eight focused tests passed):
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 71,264,322 | 5,954,269,130 | 5,364,516,472 | 6,025,533,452 |
-| Default | 785,359,688 | 5,954,278,706 | 5,364,516,472 | 6,739,638,394 |
-| Maximum | 1,066,041,177,824 | 10,471,433,606 | 5,364,516,472 | 1,076,512,611,430 |
+| Minimum | 318,728,794 | 5,955,843,190 | 5,364,516,472 | 6,274,571,984 |
+| Default | 1,032,824,160 | 5,955,852,766 | 5,364,516,472 | 6,988,676,926 |
+| Maximum | 1,066,288,642,296 | 10,473,007,666 | 5,364,516,472 | 1,076,761,649,962 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime

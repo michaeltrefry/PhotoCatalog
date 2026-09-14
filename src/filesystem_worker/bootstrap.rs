@@ -5,9 +5,10 @@ use crate::{
         BootstrapMode, CatalogBootstrap, ConfirmSqlAdmission, ExportAliasFactKind,
         ExportAliasFactReply, ExportAliasFactRequest, ExportAliasFactValue,
         ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportObjectKey,
-        ExportProfileAction, ExportProfileReply, ExportProfileRequest, ExportProfileValue, LeaseId,
-        PinnedDatabase, PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory,
-        RootCapability, validate_path,
+        ExportOriginalAction, ExportOriginalReply, ExportOriginalRequest, ExportOriginalValue,
+        ExportProfileAction, ExportProfileReply, ExportProfileRequest, ExportProfileValue,
+        InspectExportOriginal, InspectedExportOriginal, LeaseId, PinnedDatabase, PrepareCatalog,
+        PrepareExportDirectory, PreparedExportDirectory, RootCapability, validate_path,
     },
     catalog_storage::{open_regular, physical_object_id},
     storage_volume::NativePath,
@@ -23,6 +24,8 @@ use std::{
 #[cfg(test)]
 pub(super) const EXPORT_DESTINATION_SNAPSHOT_BARRIER: &str =
     "PHOTOCATALOG_F_EXPORT_DESTINATION_SNAPSHOT_BARRIER";
+#[cfg(test)]
+pub(super) const EXPORT_ORIGINAL_BARRIER: &str = "PHOTOCATALOG_F_EXPORT_ORIGINAL_BARRIER";
 
 #[cfg(test)]
 fn export_destination_snapshot_test_barrier(
@@ -49,6 +52,35 @@ fn export_destination_snapshot_test_barrier(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "test snapshot cancellation was not released",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn export_original_test_barrier(bytes: u64, cancel: &AtomicBool) -> std::io::Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let Some(marker) = std::env::var_os(EXPORT_ORIGINAL_BARRIER) else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(marker);
+    if !barrier.join("armed").exists() {
+        return Ok(());
+    }
+    let entered = barrier.join("entered");
+    if !entered.exists() {
+        fs::write(&entered, b"original-read-started")?;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !cancel.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "test original cancellation was not released",
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -88,6 +120,8 @@ struct RootRecord {
     stages: super::preview_stage::Owner,
     export_profile: Option<ExportProfileTransfer>,
     export_profile_terminal: Option<ExportProfileTerminal>,
+    export_original: Option<ExportOriginalTransfer>,
+    export_original_terminal: Option<ExportOriginalTerminal>,
 }
 struct ExportProfileTransfer {
     requested: NativePath,
@@ -108,12 +142,38 @@ enum ExportProfileTerminalValue {
     Finished { bytes: u64 },
     Aborted,
 }
+struct ExportOriginalTransfer {
+    requested: NativePath,
+    transfer: LeaseId,
+    next_step: u64,
+    allowance: u64,
+    verified: crate::metadata_export::VerifiedFile,
+}
+struct ExportOriginalTerminal {
+    requested: NativePath,
+    transfer: LeaseId,
+    step: u64,
+    allowance: u64,
+    value: ExportOriginalTerminalValue,
+}
+enum ExportOriginalTerminalValue {
+    Finished,
+    Aborted,
+}
 pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
     (
         std::mem::size_of::<Option<ExportProfileTransfer>>()
             + std::mem::size_of::<Option<ExportProfileTerminal>>(),
         std::mem::align_of::<Option<ExportProfileTransfer>>()
             .max(std::mem::align_of::<Option<ExportProfileTerminal>>()),
+    )
+}
+pub(crate) fn export_original_transfer_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Option<ExportOriginalTransfer>>()
+            + std::mem::size_of::<Option<ExportOriginalTerminal>>(),
+        std::mem::align_of::<Option<ExportOriginalTransfer>>()
+            .max(std::mem::align_of::<Option<ExportOriginalTerminal>>()),
     )
 }
 struct ManifestLock(File);
@@ -323,6 +383,8 @@ impl BootstrapOwner {
             stages: super::preview_stage::Owner::default(),
             export_profile: None,
             export_profile_terminal: None,
+            export_original: None,
+            export_original_terminal: None,
         };
         record.verify_root_binding()?;
         self.record = Some(record);
@@ -401,6 +463,10 @@ impl BootstrapOwner {
             ensure!(
                 record.export_profile.is_none(),
                 "export profile transfer has not drained"
+            );
+            ensure!(
+                record.export_original.is_none(),
+                "export original lease has not drained"
             );
             record.objects.drain();
             record.store.release()?;
@@ -687,6 +753,315 @@ impl BootstrapOwner {
             };
             reply.validate_for(request)?;
             Ok(reply)
+        })
+    }
+    fn export_original_path(&self, requested: &NativePath) -> Result<PathBuf> {
+        let path = requested.to_path()?;
+        let parent = path
+            .parent()
+            .context("original parent required")?
+            .canonicalize()?;
+        let normalized = parent.join(path.file_name().context("original filename required")?);
+        let mut admitted = false;
+        for root in &self.original_roots {
+            if let Ok(root) = root.to_path()?.canonicalize()
+                && normalized.starts_with(root)
+            {
+                admitted = true;
+                break;
+            }
+        }
+        ensure!(
+            admitted,
+            "export original is outside admitted original roots"
+        );
+        Ok(normalized)
+    }
+    pub fn inspect_export_original(
+        &self,
+        request: &InspectExportOriginal,
+        cancel: &AtomicBool,
+    ) -> Result<InspectedExportOriginal> {
+        request.validate()?;
+        original_cancel(cancel)?;
+        self.with_root(&request.root, |_| {
+            // Authenticate and revalidate the retained catalog root before
+            // resolving or opening any caller-supplied original path.
+            let path = self.export_original_path(&request.requested)?;
+            let mut canceled_while_reading = false;
+            let revision = crate::metadata_export::inspect_file_revision_with_checkpoint(
+                &path,
+                request.allowance.0,
+                &mut |_bytes| {
+                    #[cfg(test)]
+                    export_original_test_barrier(_bytes, cancel)?;
+                    if cancel.load(Ordering::Acquire) {
+                        canceled_while_reading = true;
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "export original inspection canceled",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            if canceled_while_reading {
+                return Err(anyhow::Error::new(super::wire::Failure::new(
+                    super::wire::FailureKind::Canceled,
+                    "export original inspection canceled",
+                )));
+            }
+            let revision = revision.map_err(export_original_error)?;
+            original_cancel(cancel)?;
+            let reply = InspectedExportOriginal {
+                root: request.root.clone(),
+                requested: request.requested.clone(),
+                allowance: request.allowance,
+                revision,
+            };
+            reply.validate_for(request)?;
+            Ok(reply)
+        })
+    }
+    pub fn export_original_call(
+        &mut self,
+        request: &ExportOriginalRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportOriginalReply> {
+        request.validate()?;
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "export original lease requires confirmed SQL admission"
+        );
+        {
+            let record = self
+                .record
+                .as_ref()
+                .context("export original catalog root is not retained")?;
+            ensure!(
+                request.root == record.bootstrap.root_capability(),
+                "export original session mismatch"
+            );
+            record.verify_root_binding()?;
+            if matches!(request.action, ExportOriginalAction::Begin) {
+                if let Some(active) = &record.export_original {
+                    ensure!(
+                        active.requested == request.requested
+                            && active.transfer == request.transfer
+                            && active.allowance == request.allowance.0,
+                        "export original lease already active"
+                    );
+                    return Ok(ExportOriginalReply {
+                        root: request.root.clone(),
+                        requested: request.requested.clone(),
+                        transfer: request.transfer.clone(),
+                        step: request.step,
+                        value: ExportOriginalValue::Begun {
+                            revision: active.verified.revision().clone(),
+                        },
+                    });
+                }
+            }
+        }
+        let candidate = if matches!(request.action, ExportOriginalAction::Begin) {
+            let path = self.export_original_path(&request.requested)?;
+            original_cancel(cancel)?;
+            let mut canceled_while_reading = false;
+            let verified = crate::metadata_export::VerifiedFile::read_with_checkpoint(
+                &path,
+                request.allowance.0,
+                &mut |_bytes| {
+                    #[cfg(test)]
+                    export_original_test_barrier(_bytes, cancel)?;
+                    if cancel.load(Ordering::Acquire) {
+                        canceled_while_reading = true;
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "export original verification canceled",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            if canceled_while_reading {
+                return Err(anyhow::Error::new(super::wire::Failure::new(
+                    super::wire::FailureKind::Canceled,
+                    "export original verification canceled",
+                )));
+            }
+            let verified = verified.map_err(export_original_error)?;
+            original_cancel(cancel)?;
+            Some(verified)
+        } else {
+            None
+        };
+        let record = self
+            .record
+            .as_mut()
+            .context("export original catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "export original session mismatch"
+        );
+        record.verify_root_binding()?;
+        let result = (|| -> Result<ExportOriginalValue> {
+            match request.action {
+                ExportOriginalAction::Begin => {
+                    ensure!(
+                        record.export_original.is_none(),
+                        "export original lease already active"
+                    );
+                    let verified = candidate.expect("begin candidate verified");
+                    let revision = verified.revision().clone();
+                    record.export_original_terminal = None;
+                    record.export_original = Some(ExportOriginalTransfer {
+                        requested: request.requested.clone(),
+                        transfer: request.transfer.clone(),
+                        next_step: 1,
+                        allowance: request.allowance.0,
+                        verified,
+                    });
+                    Ok(ExportOriginalValue::Begun { revision })
+                }
+                action => {
+                    if record.export_original.is_none() {
+                        if record.export_original_terminal.is_none()
+                            && matches!(action, ExportOriginalAction::Abort)
+                        {
+                            ensure!(
+                                request.step.0 == 1,
+                                "unknown export original abort step mismatch"
+                            );
+                            record.export_original_terminal = Some(ExportOriginalTerminal {
+                                requested: request.requested.clone(),
+                                transfer: request.transfer.clone(),
+                                step: request.step.0,
+                                allowance: request.allowance.0,
+                                value: ExportOriginalTerminalValue::Aborted,
+                            });
+                            return Ok(ExportOriginalValue::Aborted);
+                        }
+                        let terminal = record
+                            .export_original_terminal
+                            .as_mut()
+                            .context("export original lease is not retained")?;
+                        ensure!(
+                            terminal.requested == request.requested
+                                && terminal.transfer == request.transfer
+                                && terminal.allowance == request.allowance.0,
+                            "export original terminal provenance mismatch"
+                        );
+                        return match (&mut terminal.value, action) {
+                            (
+                                ExportOriginalTerminalValue::Finished,
+                                ExportOriginalAction::Finish,
+                            ) => {
+                                ensure!(
+                                    terminal.step == request.step.0,
+                                    "export original terminal step mismatch"
+                                );
+                                Ok(ExportOriginalValue::Finished)
+                            }
+                            (
+                                ExportOriginalTerminalValue::Finished,
+                                ExportOriginalAction::Abort,
+                            ) => {
+                                ensure!(
+                                    terminal.step.checked_add(1) == Some(request.step.0),
+                                    "export original terminal abort step mismatch"
+                                );
+                                terminal.step = request.step.0;
+                                terminal.value = ExportOriginalTerminalValue::Aborted;
+                                Ok(ExportOriginalValue::Aborted)
+                            }
+                            (ExportOriginalTerminalValue::Aborted, ExportOriginalAction::Abort) => {
+                                ensure!(
+                                    terminal.step == request.step.0,
+                                    "export original terminal step mismatch"
+                                );
+                                Ok(ExportOriginalValue::Aborted)
+                            }
+                            _ => anyhow::bail!("export original terminal action mismatch"),
+                        };
+                    }
+                    let transfer = record
+                        .export_original
+                        .as_mut()
+                        .context("export original lease is not retained")?;
+                    ensure!(
+                        transfer.requested == request.requested
+                            && transfer.transfer == request.transfer
+                            && transfer.allowance == request.allowance.0,
+                        "export original lease provenance mismatch"
+                    );
+                    if !matches!(action, ExportOriginalAction::Abort) {
+                        ensure!(
+                            transfer.next_step == request.step.0,
+                            "export original step mismatch"
+                        );
+                        transfer.next_step = transfer
+                            .next_step
+                            .checked_add(1)
+                            .context("export original step exhausted")?;
+                    }
+                    match action {
+                        ExportOriginalAction::Recheck => {
+                            original_cancel(cancel)?;
+                            transfer.verified.recheck()?;
+                            original_cancel(cancel)?;
+                            Ok(ExportOriginalValue::Rechecked)
+                        }
+                        ExportOriginalAction::Finish => {
+                            let transfer =
+                                record.export_original.take().expect("retained original");
+                            record.export_original_terminal = Some(ExportOriginalTerminal {
+                                requested: transfer.requested,
+                                transfer: transfer.transfer,
+                                step: request.step.0,
+                                allowance: transfer.allowance,
+                                value: ExportOriginalTerminalValue::Finished,
+                            });
+                            Ok(ExportOriginalValue::Finished)
+                        }
+                        ExportOriginalAction::Abort => {
+                            ensure!(
+                                request.step.0 == transfer.next_step
+                                    || transfer.next_step.checked_add(1) == Some(request.step.0),
+                                "export original abort step mismatch"
+                            );
+                            let transfer =
+                                record.export_original.take().expect("retained original");
+                            record.export_original_terminal = Some(ExportOriginalTerminal {
+                                requested: transfer.requested,
+                                transfer: transfer.transfer,
+                                step: request.step.0,
+                                allowance: transfer.allowance,
+                                value: ExportOriginalTerminalValue::Aborted,
+                            });
+                            Ok(ExportOriginalValue::Aborted)
+                        }
+                        ExportOriginalAction::Begin => unreachable!(),
+                    }
+                }
+            }
+        })();
+        if let Err(error) = record.verify_root_binding() {
+            return Err(anyhow::Error::new(super::wire::Failure::new(
+                super::wire::FailureKind::Unknown,
+                error,
+            )));
+        }
+        let value = result?;
+        Ok(ExportOriginalReply {
+            root: request.root.clone(),
+            requested: request.requested.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            value,
         })
     }
     pub fn export_profile_call(
@@ -982,6 +1357,28 @@ fn profile_cancel(cancel: &AtomicBool) -> Result<()> {
         )));
     }
     Ok(())
+}
+fn original_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(anyhow::Error::new(super::wire::Failure::new(
+            super::wire::FailureKind::Canceled,
+            "export original verification canceled",
+        )));
+    }
+    Ok(())
+}
+fn export_original_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<crate::metadata_export::FileByteLimit>()
+        .is_some()
+    {
+        anyhow::Error::new(super::wire::Failure::new(
+            super::wire::FailureKind::ResourceLimit,
+            "export original exceeds its byte allowance",
+        ))
+    } else {
+        error
+    }
 }
 fn open_database(path: &Path, may_create: bool, must_create: bool) -> Result<(File, bool)> {
     if must_create {

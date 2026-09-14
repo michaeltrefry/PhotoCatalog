@@ -880,6 +880,30 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
         c.vec(1, 39)?,
     ])?;
+    let inspect_original_request = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Operation>().size,
+        Layout::of::<crate::catalog_session::InspectExportOriginal>().size,
+        c.mul(3, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+    ])?;
+    let inspect_original_reply = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Response>().size,
+        c.mul(3, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+        c.vec(1, 64)?,
+    ])?;
+    let original_lease_request = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Operation>().size,
+        Layout::of::<crate::catalog_session::ExportOriginalRequest>().size,
+        c.mul(4, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+    ])?;
+    let original_lease_reply = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Response>().size,
+        c.mul(4, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+        c.vec(1, 64)?,
+    ])?;
     let export_typed_graph = [
         c.add(&[
             export_directory_request,
@@ -892,6 +916,14 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.add(&[
             export_alias_request,
             export_alias_request.max(export_alias_reply),
+        ])?,
+        c.add(&[
+            inspect_original_request,
+            inspect_original_request.max(inspect_original_reply),
+        ])?,
+        c.add(&[
+            original_lease_request,
+            original_lease_request.max(original_lease_reply),
         ])?,
     ]
     .into_iter()
@@ -974,6 +1006,68 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         Phase::Active,
         1,
         alias_projection_and_candidate.max(exact_source_exclusion),
+    )?;
+    // The export actor is serial: one planning inspection or one held-original
+    // operation is active. C records custody before Begin dispatch. F retains
+    // one VerifiedFile through every existing SQL/publication recheck, plus one
+    // terminal record while constructing the next candidate after a lost ack.
+    let (custody_size, custody_align) = crate::catalog_session::export_original_custody_layout();
+    a.push(
+        "retained.export_original_c_custody_arc_root",
+        Phase::Retained,
+        1,
+        c.arc(Layout {
+            size: u64::try_from(custody_size)?,
+            align: u64::try_from(custody_align)?,
+        })?,
+    )?;
+    a.push(
+        "active.export_original_c_custody_and_lease_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(5, LEASE_ID_BYTES)?,
+            c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+            c.vec(1, 64)?,
+        ])?,
+    )?;
+    a.push(
+        "active.export_original_c_caller_request_backing",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(4, LEASE_ID_BYTES)?,
+            c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+        ])?,
+    )?;
+    let (original_transfer_size, _) = crate::filesystem_worker::export_original_transfer_layout();
+    a.push(
+        "active.export_original_f_active_terminal_overlap",
+        Phase::Active,
+        1,
+        c.add(&[
+            u64::try_from(original_transfer_size)?,
+            c.mul(2, LEASE_ID_BYTES)?,
+            c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
+            c.vec(1, 64)?,
+        ])?,
+    )?;
+    a.push(
+        "active.export_original_f_begin_path_backings",
+        Phase::Active,
+        1,
+        c.mul(5, c.vec(2, PATH_UNITS as u64)?)?,
+    )?;
+    let original_root_nodes = c.add(&[super::wire::CONFIG_BYTES as u64, 1])? / 2;
+    a.push(
+        "retained.export_original_f_admitted_root_backings",
+        Phase::Retained,
+        1,
+        c.add(&[
+            c.vec_growth(Layout::of::<NativePath>().size, original_root_nodes)?,
+            c.mul(c.mul(3, original_root_nodes)?, Layout::of::<u16>().size)?,
+            c.mul(c.mul(8, original_root_nodes)?, Layout::of::<u16>().size)?,
+        ])?,
     )?;
     // The serial export worker owns at most one profile transfer. Its cache and
     // the in-progress assembly share the existing 32 MiB quota: before token
@@ -1357,6 +1451,37 @@ mod tests {
                 Checked.mul(5, Checked.vec(2, PATH_UNITS as u64)?)?,
                 Checked.mul(3, Checked.vec(1, Checked.add(&[PATH_UNITS as u64, 4])?)?,)?,
                 Checked.vec(1, 39)?,
+            ])?
+        );
+        let original_custody = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "active.export_original_c_custody_and_lease_backings")
+            .unwrap();
+        assert_eq!(original_custody.phase, Phase::Active);
+        assert_eq!(original_custody.count, 1);
+        assert_eq!(
+            original_custody.each,
+            Checked.add(&[
+                Checked.mul(5, LEASE_ID_BYTES)?,
+                Checked.mul(2, Checked.vec(2, PATH_UNITS as u64)?)?,
+                Checked.vec(1, 64)?,
+            ])?
+        );
+        let original_f = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "active.export_original_f_active_terminal_overlap")
+            .unwrap();
+        assert_eq!(original_f.phase, Phase::Active);
+        assert_eq!(original_f.count, 1);
+        assert_eq!(
+            original_f.each,
+            Checked.add(&[
+                u64::try_from(crate::filesystem_worker::export_original_transfer_layout().0)?,
+                Checked.mul(2, LEASE_ID_BYTES)?,
+                Checked.mul(3, Checked.vec(2, PATH_UNITS as u64)?)?,
+                Checked.vec(1, 64)?,
             ])?
         );
         let profile_cache = default_report

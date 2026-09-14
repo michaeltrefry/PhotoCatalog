@@ -30,6 +30,14 @@ struct Facts {
     fail_profile_begin_reply: AtomicBool,
     fail_profile_finish_reply: AtomicBool,
     fail_profile_abort: AtomicBool,
+    export_original_revision: Mutex<Option<crate::metadata_export::FileRevision>>,
+    export_original_requests: Arc<Mutex<Vec<ExportOriginalRequest>>>,
+    inspect_original_requests: Arc<Mutex<Vec<InspectExportOriginal>>>,
+    fail_original_begin_reply: AtomicBool,
+    fail_original_finish_reply: Arc<AtomicBool>,
+    fail_original_abort: Arc<AtomicBool>,
+    original_cleanup_probe: Arc<Mutex<Option<crate::metadata_export::SealedPhotoExport>>>,
+    original_cleanup_probe_results: Arc<Mutex<Vec<(ExportOriginalAction, bool)>>>,
 }
 impl Facts {
     fn create(base: &Path) -> Result<(Arc<Self>, PrepareCatalog)> {
@@ -113,6 +121,14 @@ impl Facts {
                 fail_profile_begin_reply: AtomicBool::new(false),
                 fail_profile_finish_reply: AtomicBool::new(false),
                 fail_profile_abort: AtomicBool::new(false),
+                export_original_revision: Mutex::new(None),
+                export_original_requests: Arc::new(Mutex::new(Vec::new())),
+                inspect_original_requests: Arc::new(Mutex::new(Vec::new())),
+                fail_original_begin_reply: AtomicBool::new(false),
+                fail_original_finish_reply: Arc::new(AtomicBool::new(false)),
+                fail_original_abort: Arc::new(AtomicBool::new(false)),
+                original_cleanup_probe: Arc::new(Mutex::new(None)),
+                original_cleanup_probe_results: Arc::new(Mutex::new(Vec::new())),
             }),
             request,
         ))
@@ -126,6 +142,111 @@ impl Drop for Facts {
     }
 }
 impl CatalogFilesystem for Facts {
+    fn inspect_export_original(
+        &self,
+        request: &InspectExportOriginal,
+        cancel: &AtomicBool,
+    ) -> Result<InspectedExportOriginal> {
+        request.validate()?;
+        self.inspect_original_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if cancel.load(Ordering::Acquire) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Canceled,
+                "synthetic original inspection cancellation",
+            )
+            .into());
+        }
+        Ok(InspectedExportOriginal {
+            root: request.root.clone(),
+            requested: request.requested.clone(),
+            allowance: request.allowance,
+            revision: match self.export_original_revision.lock().unwrap().clone() {
+                Some(value) => value,
+                None => crate::metadata_export::inspect_file_revision(
+                    &request.requested.to_path()?,
+                    request.allowance.0,
+                )?,
+            },
+        })
+    }
+    fn export_original_call(
+        &self,
+        request: &ExportOriginalRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportOriginalReply> {
+        request.validate()?;
+        self.export_original_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if cancel.load(Ordering::Acquire) && !request.cleanup() {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Canceled,
+                "synthetic original cancellation",
+            )
+            .into());
+        }
+        if request.cleanup()
+            && let Some(seal) = self.original_cleanup_probe.lock().unwrap().as_ref()
+        {
+            self.original_cleanup_probe_results.lock().unwrap().push((
+                request.action,
+                crate::metadata_export::PhotoPublication::prepare(seal).is_err(),
+            ));
+        }
+        if request.cleanup() && self.fail_original_abort.load(Ordering::Acquire) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                "synthetic lost original abort",
+            )
+            .into());
+        }
+        let value = match request.action {
+            ExportOriginalAction::Begin => {
+                if self.fail_original_begin_reply.swap(false, Ordering::AcqRel) {
+                    return Err(crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        "synthetic lost original begin reply",
+                    )
+                    .into());
+                }
+                ExportOriginalValue::Begun {
+                    revision: match self.export_original_revision.lock().unwrap().clone() {
+                        Some(value) => value,
+                        None => crate::metadata_export::inspect_file_revision(
+                            &request.requested.to_path()?,
+                            request.allowance.0,
+                        )?,
+                    },
+                }
+            }
+            ExportOriginalAction::Recheck => ExportOriginalValue::Rechecked,
+            ExportOriginalAction::Finish => {
+                if self
+                    .fail_original_finish_reply
+                    .swap(false, Ordering::AcqRel)
+                {
+                    return Err(crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        "synthetic lost original finish reply",
+                    )
+                    .into());
+                }
+                ExportOriginalValue::Finished
+            }
+            ExportOriginalAction::Abort => ExportOriginalValue::Aborted,
+        };
+        Ok(ExportOriginalReply {
+            root: request.root.clone(),
+            requested: request.requested.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            value,
+        })
+    }
     fn export_destination_snapshot(
         &self,
         request: &ExportDestinationSnapshotRequest,
@@ -488,6 +609,7 @@ fn managed_authority_is_exact_arc_while_legacy_exports_keep_physical_compatibili
             pool: pool.clone(),
         },
         searches: Mutex::new(Vec::new()),
+        original: Arc::new(Mutex::new(None)),
     });
     assert!(CatalogSessionAuthority::export_matches(
         &authority, &authority
@@ -692,6 +814,7 @@ fn prepared_variant_edit_uses_inherited_managed_arc_and_rejects_fresh_arc() -> R
             pool: pool.clone(),
         },
         searches: Mutex::new(Vec::new()),
+        original: Arc::new(Mutex::new(None)),
     });
     assert!(
         catalog
@@ -774,6 +897,7 @@ pub(crate) fn export_managed_session(
 pub(crate) type ExportFactRequests = (
     Arc<Mutex<Vec<ExportDestinationSnapshotRequest>>>,
     Arc<Mutex<Vec<ExportAliasFactRequest>>>,
+    Arc<Mutex<Vec<InspectExportOriginal>>>,
 );
 pub(crate) fn export_facts_managed_session(
     base: &Path,
@@ -783,6 +907,7 @@ pub(crate) fn export_facts_managed_session(
     let calls = (
         facts.export_snapshot_requests.clone(),
         facts.export_alias_requests.clone(),
+        facts.inspect_original_requests.clone(),
     );
     let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
     Ok((session, calls))
@@ -813,6 +938,132 @@ pub(crate) fn export_profile_managed_session(
     let requests = facts.export_profile_requests.clone();
     let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
     Ok((session, requests))
+}
+
+pub(crate) struct ExportOriginalTestControl {
+    pub(crate) inspections: Arc<Mutex<Vec<InspectExportOriginal>>>,
+    pub(crate) calls: Arc<Mutex<Vec<ExportOriginalRequest>>>,
+    pub(crate) cleanup_probe: Arc<Mutex<Option<crate::metadata_export::SealedPhotoExport>>>,
+    pub(crate) cleanup_probe_results: Arc<Mutex<Vec<(ExportOriginalAction, bool)>>>,
+    pub(crate) fail_finish_reply: Arc<AtomicBool>,
+    pub(crate) fail_abort: Arc<AtomicBool>,
+}
+
+pub(crate) fn export_original_managed_session(
+    base: &Path,
+) -> Result<(ManagedSession, ExportOriginalTestControl)> {
+    let (facts, request) = Facts::create(base)?;
+    facts.empty_restore_status.store(true, Ordering::Release);
+    let control = ExportOriginalTestControl {
+        inspections: facts.inspect_original_requests.clone(),
+        calls: facts.export_original_requests.clone(),
+        cleanup_probe: facts.original_cleanup_probe.clone(),
+        cleanup_probe_results: facts.original_cleanup_probe_results.clone(),
+        fail_finish_reply: facts.fail_original_finish_reply.clone(),
+        fail_abort: facts.fail_original_abort.clone(),
+    };
+    let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
+    Ok((session, control))
+}
+
+#[test]
+fn managed_original_custody_survives_lost_replies_and_close_reconciles_exact_transfer() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let (facts, request) = Facts::create(temp.path())?;
+    let revision = crate::metadata_export::FileRevision {
+        bytes: 7,
+        digest: "ab".repeat(32),
+        modified_ns: 11,
+        identity: (12, 13),
+    };
+    *facts.export_original_revision.lock().unwrap() = Some(revision.clone());
+    facts.empty_restore_status.store(true, Ordering::Release);
+    let mut session =
+        ManagedSession::admit(facts.clone(), &request, &AtomicBool::new(false)).unwrap();
+    let requested = NativePath::from_path(&temp.path().join("not-visible-to-c.raw"));
+    assert_eq!(
+        session
+            .authority
+            .inspect_export_original(&requested, 8, &AtomicBool::new(false),)?,
+        Some(revision.clone())
+    );
+    let mut lease = session
+        .authority
+        .begin_export_original(&requested, 8, &revision, &AtomicBool::new(false))?
+        .unwrap();
+    lease.recheck(&AtomicBool::new(false))?;
+    lease.complete(Ok(()), &AtomicBool::new(false))?;
+
+    facts
+        .fail_original_begin_reply
+        .store(true, Ordering::Release);
+    facts.fail_original_abort.store(true, Ordering::Release);
+    assert!(
+        session
+            .authority
+            .begin_export_original(&requested, 8, &revision, &AtomicBool::new(false),)
+            .is_err()
+    );
+    facts
+        .fail_original_begin_reply
+        .store(false, Ordering::Release);
+    facts.fail_original_abort.store(false, Ordering::Release);
+    session
+        .authority
+        .inspect_export_original(&requested, 8, &AtomicBool::new(false))?;
+
+    let lease = session
+        .authority
+        .begin_export_original(&requested, 8, &revision, &AtomicBool::new(false))?
+        .unwrap();
+    let dropped_transfer = lease.transfer.clone();
+    drop(lease);
+    session
+        .authority
+        .inspect_export_original(&requested, 8, &AtomicBool::new(false))?;
+    assert!(
+        facts
+            .export_original_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(
+                |request| matches!(request.action, ExportOriginalAction::Abort)
+                    && request.transfer == dropped_transfer
+            )
+    );
+
+    let lease = session
+        .authority
+        .begin_export_original(&requested, 8, &revision, &AtomicBool::new(false))?
+        .unwrap();
+    facts
+        .fail_original_finish_reply
+        .store(true, Ordering::Release);
+    facts.fail_original_abort.store(true, Ordering::Release);
+    assert!(lease.complete(Ok(()), &AtomicBool::new(false)).is_err());
+    assert!(session.close().is_err());
+    facts
+        .fail_original_finish_reply
+        .store(false, Ordering::Release);
+    facts.fail_original_abort.store(false, Ordering::Release);
+    session.close()?;
+
+    let requests = facts.export_original_requests.lock().unwrap();
+    assert!(matches!(requests[0].action, ExportOriginalAction::Begin));
+    assert!(matches!(requests[1].action, ExportOriginalAction::Recheck));
+    assert!(matches!(requests[2].action, ExportOriginalAction::Finish));
+    assert!(requests.windows(2).any(|pair| {
+        matches!(pair[0].action, ExportOriginalAction::Begin)
+            && matches!(pair[1].action, ExportOriginalAction::Abort)
+            && pair[0].transfer == pair[1].transfer
+            && pair[1].step == U64(1)
+    }));
+    assert!(requests.iter().any(|request| {
+        matches!(request.action, ExportOriginalAction::Abort) && request.step == U64(2)
+    }));
+    Ok(())
 }
 
 #[test]

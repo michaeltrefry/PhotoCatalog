@@ -4,8 +4,9 @@ use crate::{
     catalog_backup::RestoreStatus,
     catalog_session::{
         CatalogBootstrap, ConfirmSqlAdmission, ExportAliasFactReply, ExportAliasFactRequest,
-        ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportProfileReply,
-        ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportOriginalReply,
+        ExportOriginalRequest, ExportProfileReply, ExportProfileRequest, InspectExportOriginal,
+        InspectedExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
         PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, validate_path,
     },
     storage_volume::NativePath,
@@ -92,6 +93,9 @@ pub fn build_identity() -> String {
             include_str!("../lib.rs"),
             include_str!("../catalog_storage.rs"),
             include_str!("../metadata_export.rs"),
+            include_str!("../metadata_export/photo_phases.rs"),
+            include_str!("../catalog_exports.rs"),
+            include_str!("../catalog_exports/control.rs"),
             include_str!("../storage_volume.rs"),
             include_str!("../../Cargo.lock")
         )
@@ -119,6 +123,8 @@ pub enum Operation {
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     ExportAliasFact(Box<ExportAliasFactRequest>),
+    InspectExportOriginal(Box<InspectExportOriginal>),
+    ExportOriginal(Box<ExportOriginalRequest>),
     ExportProfile(Box<ExportProfileRequest>),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
@@ -153,6 +159,7 @@ impl Operation {
     pub(crate) fn is_cleanup(&self) -> bool {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
+            || matches!(self, Self::ExportOriginal(r) if r.cleanup())
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
             || matches!(self, Self::PreviewStage(r) if r.cleanup())
@@ -166,6 +173,8 @@ impl Operation {
             Self::PrepareExportDirectory(value) => value.validate()?,
             Self::ExportDestinationSnapshot(value) => value.validate()?,
             Self::ExportAliasFact(value) => value.validate()?,
+            Self::InspectExportOriginal(value) => value.validate()?,
+            Self::ExportOriginal(value) => value.validate()?,
             Self::ExportProfile(value) => value.validate()?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
@@ -271,6 +280,8 @@ pub enum Response {
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     ExportAliasFact(ExportAliasFactReply),
+    InspectedExportOriginal(InspectedExportOriginal),
+    ExportOriginal(ExportOriginalReply),
     ExportProfile(ExportProfileReply),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),

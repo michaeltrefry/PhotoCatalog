@@ -6,8 +6,9 @@ use crate::{
     catalog_session::{
         CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportAliasFactReply,
         ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
-        ExportProfileReply, ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
+        ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
+        InspectExportOriginal, InspectedExportOriginal, LeaseId, PrepareCatalog,
+        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
 };
@@ -1039,6 +1040,35 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected export profile response"),
         }
     }
+    fn inspect_export_original(
+        &self,
+        request: &InspectExportOriginal,
+        cancel: &AtomicBool,
+    ) -> Result<InspectedExportOriginal> {
+        match self.execute(
+            Operation::InspectExportOriginal(Box::new(request.clone())),
+            cancel,
+        )? {
+            Response::InspectedExportOriginal(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected export original inspection response"),
+        }
+    }
+    fn export_original_call(
+        &self,
+        request: &ExportOriginalRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportOriginalReply> {
+        match self.execute(Operation::ExportOriginal(Box::new(request.clone())), cancel)? {
+            Response::ExportOriginal(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected export original response"),
+        }
+    }
 
     fn prepare_catalog(
         &self,
@@ -1518,7 +1548,7 @@ mod tests {
         }
     }
     fn spawn_fixture(role: &str, directory: &Path, faults: Faults) -> Result<NoDependents> {
-        spawn_fixture_with_snapshot_barrier(role, directory, None, faults)
+        spawn_fixture_config(role, directory, vec![], None, None, faults)
     }
     fn spawn_fixture_with_snapshot_barrier(
         role: &str,
@@ -1526,7 +1556,33 @@ mod tests {
         snapshot_barrier: Option<&Path>,
         faults: Faults,
     ) -> Result<NoDependents> {
-        let startup = Startup::new(vec![])?;
+        spawn_fixture_config(role, directory, vec![], snapshot_barrier, None, faults)
+    }
+    fn spawn_fixture_with_originals(
+        role: &str,
+        directory: &Path,
+        original_roots: Vec<NativePath>,
+        original_barrier: Option<&Path>,
+        faults: Faults,
+    ) -> Result<NoDependents> {
+        spawn_fixture_config(
+            role,
+            directory,
+            original_roots,
+            None,
+            original_barrier,
+            faults,
+        )
+    }
+    fn spawn_fixture_config(
+        role: &str,
+        directory: &Path,
+        original_roots: Vec<NativePath>,
+        snapshot_barrier: Option<&Path>,
+        original_barrier: Option<&Path>,
+        faults: Faults,
+    ) -> Result<NoDependents> {
+        let startup = Startup::new(original_roots)?;
         let hello = encode(&startup, CONFIG_BYTES)?;
         let mut command = Command::new(std::env::current_exe()?);
         command
@@ -1545,6 +1601,12 @@ mod tests {
         if let Some(marker) = snapshot_barrier {
             command.env(
                 crate::filesystem_worker::bootstrap::EXPORT_DESTINATION_SNAPSHOT_BARRIER,
+                marker,
+            );
+        }
+        if let Some(marker) = original_barrier {
+            command.env(
+                crate::filesystem_worker::bootstrap::EXPORT_ORIGINAL_BARRIER,
                 marker,
             );
         }
@@ -2019,6 +2081,126 @@ mod tests {
             error.downcast_ref::<Failure>().unwrap().kind,
             FailureKind::Rejected
         );
+        child.0.release_root(&root)?;
+        child.0.try_shutdown()?;
+        assert_retired(&child.0);
+        Ok(())
+    }
+
+    #[test]
+    fn actual_f_export_original_lease_is_bound_cancelable_and_reaped() -> Result<()> {
+        use crate::catalog_session::{
+            ExportOriginalAction, ExportOriginalRequest, ExportOriginalValue,
+            InspectExportOriginal, SQL_ROLES, SqlRole, SqlRoleObservation,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let originals = temp.path().join("originals");
+        let barrier = temp.path().join("original-barrier");
+        fs::create_dir(&originals)?;
+        fs::create_dir(&barrier)?;
+        let child = spawn_fixture_with_originals(
+            "filesystem",
+            temp.path(),
+            vec![NativePath::from_path(&originals.canonicalize()?)],
+            Some(&barrier),
+            Faults::default(),
+        )?;
+        let catalog = PrepareCatalog {
+            operation: U64(19),
+            session: LeaseId::new(),
+            mode: crate::catalog_session::BootstrapMode::DesktopCreate,
+            root: NativePath::from_path(&temp.path().join("catalog")),
+            manifest_root: NativePath::from_path(&temp.path().join("manifest")),
+            import_source: None,
+        };
+        let bootstrap = child.0.prepare_catalog(&catalog, &AtomicBool::new(false))?;
+        let confirmation = ConfirmSqlAdmission {
+            operation: bootstrap.operation,
+            root: bootstrap.root_capability(),
+            roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                role,
+                physical: if role == SqlRole::Manifest {
+                    bootstrap.manifest.physical
+                } else {
+                    bootstrap.catalog.physical
+                },
+            }),
+        };
+        child
+            .0
+            .confirm_sql_admission(&confirmation, &AtomicBool::new(false))?;
+        let root = bootstrap.root_capability();
+        let original = originals.join("asset.raw");
+        let bytes = vec![0x35; 128 * 1024];
+        fs::write(&original, &bytes)?;
+        let requested = NativePath::from_path(&original);
+        let inspect = InspectExportOriginal {
+            root: root.clone(),
+            requested: requested.clone(),
+            allowance: U64(bytes.len() as u64),
+        };
+        let revision = child
+            .0
+            .inspect_export_original(&inspect, &AtomicBool::new(false))?
+            .revision;
+        assert_eq!(revision.digest, blake3::hash(&bytes).to_hex().to_string());
+        let transfer = LeaseId::new();
+        let request = |step, action| ExportOriginalRequest {
+            root: root.clone(),
+            requested: requested.clone(),
+            transfer: transfer.clone(),
+            step: U64(step),
+            allowance: U64(bytes.len() as u64),
+            action,
+        };
+        let begin = request(0, ExportOriginalAction::Begin);
+        let reply = child
+            .0
+            .export_original_call(&begin, &AtomicBool::new(false))?;
+        assert!(
+            matches!(reply.value, ExportOriginalValue::Begun { revision: value } if value == revision)
+        );
+        let recheck = request(1, ExportOriginalAction::Recheck);
+        child
+            .0
+            .export_original_call(&recheck, &AtomicBool::new(false))?
+            .validate(&recheck)?;
+        let finish = request(2, ExportOriginalAction::Finish);
+        child
+            .0
+            .export_original_call(&finish, &AtomicBool::new(false))?
+            .validate(&finish)?;
+
+        fs::write(barrier.join("armed"), b"cancel next original read")?;
+        let entered = barrier.join("entered");
+        let canceled_transfer = LeaseId::new();
+        let canceled_request = ExportOriginalRequest {
+            transfer: canceled_transfer,
+            ..request(0, ExportOriginalAction::Begin)
+        };
+        let cancel = AtomicBool::new(false);
+        let error = std::thread::scope(|scope| -> Result<anyhow::Error> {
+            let call = scope.spawn(|| child.0.export_original_call(&canceled_request, &cancel));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !entered.exists() {
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "F did not reach the original hash checkpoint"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cancel.store(true, Ordering::Release);
+            Ok(call
+                .join()
+                .expect("original cancellation caller")
+                .unwrap_err())
+        })?;
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Canceled
+        );
+        assert_eq!(fs::read(&original)?, bytes);
         child.0.release_root(&root)?;
         child.0.try_shutdown()?;
         assert_retired(&child.0);

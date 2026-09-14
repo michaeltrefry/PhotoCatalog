@@ -7,8 +7,10 @@ use crate::{
     catalog_session::{
         CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportAliasFactReply,
         ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
-        ExportProfileReply, ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, store,
+        ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
+        InspectExportOriginal, InspectedExportOriginal, LeaseId, PrepareCatalog,
+        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
+        store,
     },
     filesystem_worker::{
         client::Client,
@@ -62,6 +64,8 @@ pub(super) enum Call {
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     ExportAliasFact(Box<ExportAliasFactRequest>),
+    InspectExportOriginal(Box<InspectExportOriginal>),
+    ExportOriginal(Box<ExportOriginalRequest>),
     ExportProfile(Box<ExportProfileRequest>),
 }
 impl Call {
@@ -71,6 +75,7 @@ impl Call {
             || matches!(self, Self::PreviewIo(request) if request.cleanup())
             || matches!(self, Self::PreviewStage(request) if request.cleanup())
             || matches!(self, Self::ExportProfile(request) if request.cleanup())
+            || matches!(self, Self::ExportOriginal(request) if request.cleanup())
     }
     fn cancellable(&self) -> bool {
         matches!(
@@ -81,10 +86,12 @@ impl Call {
                 | Self::PrepareExportDirectory(_)
                 | Self::ExportDestinationSnapshot(_)
                 | Self::ExportAliasFact(_)
+                | Self::InspectExportOriginal(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
             || matches!(self, Self::ExportProfile(request) if !request.cleanup())
+            || matches!(self, Self::ExportOriginal(request) if !request.cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -122,6 +129,8 @@ impl Call {
             Self::PrepareExportDirectory(request) => request.validate(),
             Self::ExportDestinationSnapshot(request) => request.validate(),
             Self::ExportAliasFact(request) => request.validate(),
+            Self::InspectExportOriginal(request) => request.validate(),
+            Self::ExportOriginal(request) => request.validate(),
             Self::ExportProfile(request) => request.validate(),
             _ => Ok(()),
         }
@@ -136,6 +145,8 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<PrepareExportDirectory>(),
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
         std::mem::size_of::<ExportAliasFactRequest>(),
+        std::mem::size_of::<InspectExportOriginal>(),
+        std::mem::size_of::<ExportOriginalRequest>(),
         std::mem::size_of::<ExportProfileRequest>(),
     ]
     .into_iter()
@@ -160,6 +171,8 @@ pub(super) enum Value {
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     ExportAliasFact(ExportAliasFactReply),
+    InspectedExportOriginal(InspectedExportOriginal),
+    ExportOriginal(ExportOriginalReply),
     ExportProfile(ExportProfileReply),
     Unit,
 }
@@ -1075,6 +1088,12 @@ impl Parent {
                 Call::ExportAliasFact(request) => {
                     Value::ExportAliasFact(self.client.export_alias_fact(request, cancel)?)
                 }
+                Call::InspectExportOriginal(request) => Value::InspectedExportOriginal(
+                    self.client.inspect_export_original(request, cancel)?,
+                ),
+                Call::ExportOriginal(request) => {
+                    Value::ExportOriginal(self.client.export_original_call(request, cancel)?)
+                }
                 Call::ExportProfile(request) => {
                     Value::ExportProfile(self.client.export_profile_call(request, cancel)?)
                 }
@@ -1706,6 +1725,35 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("wrong export profile reply"),
         }
     }
+    fn inspect_export_original(
+        &self,
+        request: &InspectExportOriginal,
+        cancel: &AtomicBool,
+    ) -> Result<InspectedExportOriginal> {
+        match self.call(
+            Call::InspectExportOriginal(Box::new(request.clone())),
+            cancel,
+        )? {
+            Value::InspectedExportOriginal(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("wrong export original inspection reply"),
+        }
+    }
+    fn export_original_call(
+        &self,
+        request: &ExportOriginalRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportOriginalReply> {
+        match self.call(Call::ExportOriginal(Box::new(request.clone())), cancel)? {
+            Value::ExportOriginal(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("wrong export original reply"),
+        }
+    }
 }
 fn unit(v: Value) -> Result<()> {
     ensure!(matches!(v, Value::Unit), "wrong unit reply");
@@ -1745,6 +1793,10 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::ExportAliasFact(request), Value::ExportAliasFact(value)) => {
             value.validate_for(request)?
         }
+        (Call::InspectExportOriginal(request), Value::InspectedExportOriginal(value)) => {
+            value.validate_for(request)?
+        }
+        (Call::ExportOriginal(request), Value::ExportOriginal(value)) => value.validate(request)?,
         (Call::ExportProfile(request), Value::ExportProfile(value)) => value.validate(request)?,
         (Call::Resume { restore_id, .. }, Value::Restore(Some(v))) => ensure!(
             &v.receipt.restore_id == restore_id && !v.jobs_held,

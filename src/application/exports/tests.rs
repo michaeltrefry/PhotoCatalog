@@ -235,7 +235,7 @@ fn managed_append_routes_destination_snapshot_and_alias_facts_through_authority(
     let temp = tempfile::tempdir()?;
     let original = temp.path().join("managed-original.png");
     std::fs::write(&original, b"managed original custody bytes")?;
-    let (mut session, (snapshots, aliases)) = export_facts_managed_session(temp.path())?;
+    let (mut session, (snapshots, aliases, originals)) = export_facts_managed_session(temp.path())?;
     let destination = temp.path().join("managed-export.png");
     let protected_destination = NativePath::from_path(
         &destination
@@ -279,6 +279,11 @@ fn managed_append_routes_destination_snapshot_and_alias_facts_through_authority(
         NativePath::from_path(&destination)
     );
     drop(snapshots);
+    let originals = originals.lock().unwrap();
+    assert_eq!(originals.len(), 1);
+    assert_eq!(originals[0].requested, NativePath::from_path(&original));
+    assert_eq!(originals[0].allowance, U64(1024));
+    drop(originals);
     let aliases = aliases.lock().unwrap();
     assert!(
         aliases

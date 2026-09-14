@@ -29,6 +29,9 @@ struct FilesystemHandler {
 pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
     bootstrap::export_profile_transfer_layout()
 }
+pub(crate) fn export_original_transfer_layout() -> (usize, usize) {
+    bootstrap::export_original_transfer_layout()
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;
@@ -76,6 +79,16 @@ impl FilesystemHandler {
                 .export_alias_fact(&request, cancel)
                 .map_err(export_directory_failure)
                 .map(Response::ExportAliasFact),
+            Operation::InspectExportOriginal(request) => self
+                .owner
+                .inspect_export_original(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::InspectedExportOriginal),
+            Operation::ExportOriginal(request) => self
+                .owner
+                .export_original_call(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::ExportOriginal),
             Operation::ExportProfile(request) => self
                 .owner
                 .export_profile_call(&request, cancel)

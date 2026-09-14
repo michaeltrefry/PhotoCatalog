@@ -11,6 +11,19 @@ pub const PATH_UNITS: usize = 32_768;
 pub const ENVELOPE_BYTES: usize = 1024 * 1024;
 pub const EXPORT_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 
+fn validate_export_revision(
+    revision: &crate::metadata_export::FileRevision,
+    allowance: u64,
+) -> Result<()> {
+    ensure!(
+        revision.bytes <= allowance
+            && revision.digest.len() == 64
+            && revision.digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid export original revision"
+    );
+    Ok(())
+}
+
 /// The same native observation shape applies to a database or a directory.
 /// Windows deliberately preserves the existing volume serial / 64-bit index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +437,132 @@ impl ExportDestinationSnapshotReply {
         crate::metadata_export::validate_destination_snapshot_wire(&self.snapshot)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectExportOriginal {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub allowance: U64,
+}
+impl InspectExportOriginal {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        validate_path(&self.requested)?;
+        ensure!(self.allowance.0 > 0, "zero export original allowance");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectedExportOriginal {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub allowance: U64,
+    pub revision: crate::metadata_export::FileRevision,
+}
+impl InspectedExportOriginal {
+    pub fn validate_for(&self, request: &InspectExportOriginal) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            self.root == request.root
+                && self.requested == request.requested
+                && self.allowance == request.allowance,
+            "inspected export original belongs to another request"
+        );
+        validate_export_revision(&self.revision, request.allowance.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportOriginalAction {
+    Begin,
+    Recheck,
+    Finish,
+    Abort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportOriginalRequest {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub transfer: LeaseId,
+    pub step: U64,
+    pub allowance: U64,
+    pub action: ExportOriginalAction,
+}
+impl ExportOriginalRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        validate_path(&self.requested)?;
+        ensure!(self.allowance.0 > 0, "zero export original allowance");
+        ensure!(
+            matches!(self.action, ExportOriginalAction::Begin) == (self.step.0 == 0),
+            "export original begin/step mismatch"
+        );
+        Ok(())
+    }
+    pub fn cleanup(&self) -> bool {
+        matches!(
+            self.action,
+            ExportOriginalAction::Finish | ExportOriginalAction::Abort
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExportOriginalValue {
+    Begun {
+        revision: crate::metadata_export::FileRevision,
+    },
+    Rechecked,
+    Finished,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportOriginalReply {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub transfer: LeaseId,
+    pub step: U64,
+    pub value: ExportOriginalValue,
+}
+impl ExportOriginalReply {
+    pub fn validate(&self, request: &ExportOriginalRequest) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            self.root == request.root
+                && self.requested == request.requested
+                && self.transfer == request.transfer
+                && self.step == request.step,
+            "export original reply provenance mismatch"
+        );
+        match (&request.action, &self.value) {
+            (ExportOriginalAction::Begin, ExportOriginalValue::Begun { revision }) => {
+                validate_export_revision(revision, request.allowance.0)
+            }
+            (ExportOriginalAction::Recheck, ExportOriginalValue::Rechecked)
+            | (ExportOriginalAction::Finish, ExportOriginalValue::Finished)
+            | (ExportOriginalAction::Abort, ExportOriginalValue::Aborted) => Ok(()),
+            _ => anyhow::bail!("unexpected export original reply"),
+        }
+    }
+}
 impl PreparedExportDirectory {
     pub fn validate_for(&self, request: &PrepareExportDirectory) -> Result<()> {
         request.validate()?;
@@ -651,6 +790,20 @@ pub trait CatalogFilesystem: Send + Sync {
     ) -> Result<ExportProfileReply> {
         anyhow::bail!("filesystem owner does not support export profile reads")
     }
+    fn inspect_export_original(
+        &self,
+        _request: &InspectExportOriginal,
+        _cancel: &AtomicBool,
+    ) -> Result<InspectedExportOriginal> {
+        anyhow::bail!("filesystem owner does not support export original inspection")
+    }
+    fn export_original_call(
+        &self,
+        _request: &ExportOriginalRequest,
+        _cancel: &AtomicBool,
+    ) -> Result<ExportOriginalReply> {
+        anyhow::bail!("filesystem owner does not support export original leases")
+    }
     /// A lost reply is recovered by the original operation identity inside the
     /// client. Never repeat Prepare/creation. An error/cancel can still leave an
     /// outstanding token, which the caller explicitly abandons before SQL opens.
@@ -721,12 +874,170 @@ enum AuthorityMode {
         pool: Arc<RolePool>,
     },
 }
+#[derive(Clone, Copy)]
+enum OriginalCustodyState {
+    BeginPending,
+    Active { next_step: u64 },
+    AbortPending { step: u64 },
+}
+struct OriginalCustody {
+    filesystem: Arc<dyn CatalogFilesystem>,
+    root: RootCapability,
+    requested: NativePath,
+    transfer: LeaseId,
+    allowance: u64,
+    state: OriginalCustodyState,
+}
+pub(crate) struct ManagedOriginalLease {
+    custody: Arc<Mutex<Option<OriginalCustody>>>,
+    transfer: LeaseId,
+    revision: crate::metadata_export::FileRevision,
+    complete: bool,
+}
+impl ManagedOriginalLease {
+    pub(crate) fn revision(&self) -> &crate::metadata_export::FileRevision {
+        &self.revision
+    }
+    fn request(
+        custody: &OriginalCustody,
+        step: u64,
+        action: ExportOriginalAction,
+    ) -> ExportOriginalRequest {
+        ExportOriginalRequest {
+            root: custody.root.clone(),
+            requested: custody.requested.clone(),
+            transfer: custody.transfer.clone(),
+            step: U64(step),
+            allowance: U64(custody.allowance),
+            action,
+        }
+    }
+    pub(crate) fn recheck(&mut self, cancel: &AtomicBool) -> Result<()> {
+        let mut slot = self.custody.lock().unwrap_or_else(|e| e.into_inner());
+        let custody = slot
+            .as_mut()
+            .context("export original custody is not retained")?;
+        ensure!(
+            custody.transfer == self.transfer,
+            "export original custody changed"
+        );
+        let OriginalCustodyState::Active { next_step } = custody.state else {
+            anyhow::bail!("export original cleanup must reconcile before recheck")
+        };
+        let request = Self::request(custody, next_step, ExportOriginalAction::Recheck);
+        custody.state = OriginalCustodyState::AbortPending {
+            step: next_step
+                .checked_add(1)
+                .context("export original cleanup step exhausted")?,
+        };
+        let reply = custody.filesystem.export_original_call(&request, cancel)?;
+        reply.validate(&request)?;
+        ensure!(matches!(reply.value, ExportOriginalValue::Rechecked));
+        custody.state = OriginalCustodyState::Active {
+            next_step: next_step
+                .checked_add(1)
+                .context("export original step exhausted")?,
+        };
+        Ok(())
+    }
+    fn abort(&mut self, cancel: &AtomicBool) -> Result<()> {
+        let mut slot = self.custody.lock().unwrap_or_else(|e| e.into_inner());
+        let custody = slot
+            .as_mut()
+            .context("export original custody is not retained")?;
+        ensure!(
+            custody.transfer == self.transfer,
+            "export original custody changed"
+        );
+        let step = match custody.state {
+            OriginalCustodyState::BeginPending => 1,
+            OriginalCustodyState::Active { next_step } => next_step,
+            OriginalCustodyState::AbortPending { step } => step,
+        };
+        custody.state = OriginalCustodyState::AbortPending { step };
+        let request = Self::request(custody, step, ExportOriginalAction::Abort);
+        let reply = custody.filesystem.export_original_call(&request, cancel)?;
+        reply.validate(&request)?;
+        ensure!(matches!(reply.value, ExportOriginalValue::Aborted));
+        *slot = None;
+        self.complete = true;
+        Ok(())
+    }
+    fn finish(&mut self, cancel: &AtomicBool) -> Result<()> {
+        let mut slot = self.custody.lock().unwrap_or_else(|e| e.into_inner());
+        let custody = slot
+            .as_mut()
+            .context("export original custody is not retained")?;
+        ensure!(
+            custody.transfer == self.transfer,
+            "export original custody changed"
+        );
+        let OriginalCustodyState::Active { next_step } = custody.state else {
+            anyhow::bail!("export original cleanup must reconcile before finish")
+        };
+        let abort_step = next_step
+            .checked_add(1)
+            .context("export original cleanup step exhausted")?;
+        let request = Self::request(custody, next_step, ExportOriginalAction::Finish);
+        custody.state = OriginalCustodyState::AbortPending { step: abort_step };
+        let reply = custody.filesystem.export_original_call(&request, cancel)?;
+        reply.validate(&request)?;
+        ensure!(matches!(reply.value, ExportOriginalValue::Finished));
+        *slot = None;
+        self.complete = true;
+        Ok(())
+    }
+    pub(crate) fn complete<T>(mut self, result: Result<T>, cancel: &AtomicBool) -> Result<T> {
+        match result {
+            Ok(value) => {
+                if let Err(error) = self.finish(cancel) {
+                    let _ = self.abort(cancel);
+                    Err(error)
+                } else {
+                    Ok(value)
+                }
+            }
+            Err(error) => {
+                let _ = self.abort(cancel);
+                Err(error)
+            }
+        }
+    }
+}
+impl Drop for ManagedOriginalLease {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let mut slot = self.custody.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(custody) = slot.as_mut() else {
+            return;
+        };
+        if custody.transfer != self.transfer {
+            return;
+        }
+        custody.state = OriginalCustodyState::AbortPending {
+            step: match custody.state {
+                OriginalCustodyState::BeginPending => 1,
+                OriginalCustodyState::Active { next_step } => next_step,
+                OriginalCustodyState::AbortPending { step } => step,
+            },
+        };
+    }
+}
+pub(crate) fn export_original_custody_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Mutex<Option<OriginalCustody>>>(),
+        std::mem::align_of::<Mutex<Option<OriginalCustody>>>(),
+    )
+}
 /// The Arc instance, not its serialized epoch/physical tuple, grants a prepared
 /// edit or native permit authority within the original catalog lifetime.
 pub(crate) struct CatalogSessionAuthority {
     physical: PhysicalObjectId,
     mode: AuthorityMode,
     searches: Mutex<Vec<Arc<dyn SessionTask>>>,
+    original: Arc<Mutex<Option<OriginalCustody>>>,
 }
 impl CatalogSessionAuthority {
     pub(crate) fn legacy(file: Arc<File>) -> Result<Arc<Self>> {
@@ -734,6 +1045,7 @@ impl CatalogSessionAuthority {
             physical: crate::catalog_storage::physical_object_id(&file)?,
             mode: AuthorityMode::Legacy(file),
             searches: Mutex::new(Vec::new()),
+            original: Arc::new(Mutex::new(None)),
         }))
     }
     pub(crate) fn legacy_file(&self) -> Result<&Arc<File>> {
@@ -768,6 +1080,168 @@ impl CatalogSessionAuthority {
                 Ok(Some(prepared.directory))
             }
         }
+    }
+    pub(crate) fn inspect_export_original(
+        &self,
+        requested: &NativePath,
+        allowance: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::metadata_export::FileRevision>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        self.reconcile_export_original(cancel)?;
+        let request = InspectExportOriginal {
+            root: root.clone(),
+            requested: requested.clone(),
+            allowance: U64(allowance),
+        };
+        request.validate()?;
+        let reply = filesystem.inspect_export_original(&request, cancel)?;
+        reply.validate_for(&request)?;
+        Ok(Some(reply.revision))
+    }
+    pub(crate) fn begin_export_original(
+        &self,
+        requested: &NativePath,
+        allowance: u64,
+        expected: &crate::metadata_export::FileRevision,
+        cancel: &AtomicBool,
+    ) -> Result<Option<ManagedOriginalLease>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        self.reconcile_export_original(cancel)?;
+        let transfer = LeaseId::new();
+        let request = ExportOriginalRequest {
+            root: root.clone(),
+            requested: requested.clone(),
+            transfer: transfer.clone(),
+            step: U64(0),
+            allowance: U64(allowance),
+            action: ExportOriginalAction::Begin,
+        };
+        request.validate()?;
+        {
+            let mut slot = self.original.lock().unwrap_or_else(|e| e.into_inner());
+            ensure!(
+                slot.is_none(),
+                "export original custody is already retained"
+            );
+            *slot = Some(OriginalCustody {
+                filesystem: filesystem.clone(),
+                root: root.clone(),
+                requested: requested.clone(),
+                transfer: transfer.clone(),
+                allowance,
+                state: OriginalCustodyState::BeginPending,
+            });
+        }
+        let reply = filesystem.export_original_call(&request, cancel);
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                let uncertain = error
+                    .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+                    .is_none_or(|failure| {
+                        failure.kind == crate::filesystem_worker::wire::FailureKind::Unknown
+                    });
+                if uncertain {
+                    let _ = self.reconcile_export_original(cancel);
+                } else {
+                    *self.original.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                return Err(error);
+            }
+        };
+        let validated = reply.validate(&request).and_then(|_| {
+            let ExportOriginalValue::Begun { revision } = &reply.value else {
+                unreachable!()
+            };
+            ensure!(
+                revision == expected,
+                "original changed since export planning"
+            );
+            Ok(revision.clone())
+        });
+        let revision = match validated {
+            Ok(revision) => revision,
+            Err(error) => {
+                if let Some(custody) = self
+                    .original
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+                {
+                    custody.state = OriginalCustodyState::AbortPending { step: 1 };
+                }
+                let _ = self.reconcile_export_original(cancel);
+                return Err(error);
+            }
+        };
+        self.original
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .expect("begin custody retained")
+            .state = OriginalCustodyState::Active { next_step: 1 };
+        Ok(Some(ManagedOriginalLease {
+            custody: self.original.clone(),
+            transfer,
+            revision,
+            complete: false,
+        }))
+    }
+    pub(crate) fn reconcile_export_original(&self, cancel: &AtomicBool) -> Result<()> {
+        let mut slot = self.original.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(custody) = slot.as_mut() else {
+            return Ok(());
+        };
+        if matches!(custody.state, OriginalCustodyState::BeginPending) {
+            let request = ManagedOriginalLease::request(custody, 0, ExportOriginalAction::Begin);
+            // This exact-id replay is cleanup/reconciliation. The initiating
+            // operation's canceled flag cannot suppress the proof needed to
+            // learn whether F retained the handle.
+            let recovery_cancel = AtomicBool::new(false);
+            let reply = match custody
+                .filesystem
+                .export_original_call(&request, &recovery_cancel)
+            {
+                Ok(reply) => reply,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+                        .is_some_and(|failure| {
+                            failure.kind != crate::filesystem_worker::wire::FailureKind::Unknown
+                        }) =>
+                {
+                    *slot = None;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            reply.validate(&request)?;
+            ensure!(matches!(reply.value, ExportOriginalValue::Begun { .. }));
+            custody.state = OriginalCustodyState::Active { next_step: 1 };
+        }
+        let step = match custody.state {
+            OriginalCustodyState::BeginPending => unreachable!(),
+            OriginalCustodyState::Active { next_step } => next_step,
+            OriginalCustodyState::AbortPending { step } => step,
+        };
+        custody.state = OriginalCustodyState::AbortPending { step };
+        let request = ManagedOriginalLease::request(custody, step, ExportOriginalAction::Abort);
+        let reply = custody.filesystem.export_original_call(&request, cancel)?;
+        reply.validate(&request)?;
+        ensure!(matches!(reply.value, ExportOriginalValue::Aborted));
+        *slot = None;
+        Ok(())
     }
     pub(crate) fn read_export_profile(
         &self,
@@ -1354,6 +1828,7 @@ impl ManagedSession {
                 pool: pool.clone(),
             },
             searches: Mutex::new(Vec::new()),
+            original: Arc::new(Mutex::new(None)),
         });
         let db = pool.lease(0).expect("new confirmed actor role available");
         let catalog = Catalog {
@@ -1375,6 +1850,8 @@ impl ManagedSession {
     }
     pub(crate) fn close(&mut self) -> Result<()> {
         self.close_attempted = true;
+        self.authority
+            .reconcile_export_original(&AtomicBool::new(false))?;
         self.authority.pool().unwrap().begin_close();
         self.authority.cancel_searches();
         self.authority.drain_searches()?;
@@ -1399,8 +1876,9 @@ impl Drop for ManagedSession {
 mod tests;
 #[cfg(test)]
 pub(crate) use tests::{
-    export_facts_managed_session, export_managed_session, export_profile_managed_session,
-    retained_admission, unused_filesystem,
+    ExportOriginalTestControl, export_facts_managed_session, export_managed_session,
+    export_original_managed_session, export_profile_managed_session, retained_admission,
+    unused_filesystem,
 };
 
 #[cfg(test)]

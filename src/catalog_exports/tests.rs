@@ -160,6 +160,158 @@ fn frozen_job_survives_restart_and_only_accepted_seal_publishes() -> Result<()> 
     assert_eq!(std::fs::read(original)?, b"source bytes unchanged");
     Ok(())
 }
+
+#[test]
+fn managed_original_lease_spans_every_accept_and_publish_recheck_and_skips_installed_recovery()
+-> Result<()> {
+    use crate::catalog_session::{ExportOriginalAction, export_original_managed_session};
+    let temp = tempfile::tempdir()?;
+    let original = temp.path().join("managed-original.png");
+    let original_bytes = b"managed source bytes unchanged";
+    std::fs::write(&original, original_bytes)?;
+    let (mut managed, original_control) = export_original_managed_session(temp.path())?;
+    let inspections = &original_control.inspections;
+    let calls = &original_control.calls;
+    let destination = temp.path().join("managed-export.png");
+    {
+        let catalog = managed.catalog.as_mut().unwrap();
+        let fingerprint = blake3::hash(original_bytes).to_hex().to_string();
+        catalog.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,'original','ready',?2,'fixture','{\"format\":\"PNG\",\"width\":1000,\"height\":1000,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",params![crate::location_bytes(&original),fingerprint])?;
+        catalog.record_storage_path("a", &NativePath::from_path(&original))?;
+        let (job, work) = queued(catalog, destination.clone())?;
+        let sealed = seal(temp.path(), &work)?;
+        catalog.accept_photo_export_seal(&work, &sealed)?;
+        let after_accept = calls.lock().unwrap().len();
+        assert_eq!(after_accept, 3);
+        assert_eq!(
+            calls.lock().unwrap()[..after_accept]
+                .iter()
+                .filter(|request| matches!(request.action, ExportOriginalAction::Recheck))
+                .count(),
+            1
+        );
+        catalog.publish_photo_export_item(&job.id, 1)?;
+        let after_publish = calls.lock().unwrap().len();
+        assert_eq!(after_publish - after_accept, 5);
+        assert!(matches!(
+            calls.lock().unwrap()[after_accept].action,
+            ExportOriginalAction::Begin
+        ));
+        assert!(matches!(
+            calls.lock().unwrap()[after_publish - 1].action,
+            ExportOriginalAction::Finish
+        ));
+        assert_eq!(
+            calls.lock().unwrap()[after_accept..after_publish]
+                .iter()
+                .filter(|request| matches!(request.action, ExportOriginalAction::Recheck))
+                .count(),
+            3
+        );
+        // The already-installed recovery/finalization path needs no source lease.
+        catalog.publish_photo_export_item(&job.id, 1)?;
+        assert_eq!(calls.lock().unwrap().len(), after_publish);
+    }
+    assert_eq!(inspections.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read(&destination)?,
+        b"completed encoded derivative"
+    );
+    assert_eq!(std::fs::read(&original)?, original_bytes);
+    managed.close()?;
+    Ok(())
+}
+
+#[test]
+fn managed_accept_retains_publication_lock_through_uncertain_original_cleanup() -> Result<()> {
+    use crate::catalog_session::{ExportOriginalAction, export_original_managed_session};
+    use std::sync::atomic::Ordering;
+
+    let temp = tempfile::tempdir()?;
+    let original = temp.path().join("managed-original.png");
+    std::fs::write(&original, b"managed source bytes unchanged")?;
+    let (mut managed, original_control) = export_original_managed_session(temp.path())?;
+    let destination = temp.path().join("managed-export.png");
+    let sealed = {
+        let catalog = managed.catalog.as_mut().unwrap();
+        let fingerprint = blake3::hash(b"managed source bytes unchanged")
+            .to_hex()
+            .to_string();
+        catalog.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,'original','ready',?2,'fixture','{\"format\":\"PNG\",\"width\":1000,\"height\":1000,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",params![crate::location_bytes(&original),fingerprint])?;
+        catalog.record_storage_path("a", &NativePath::from_path(&original))?;
+        let (_, work) = queued(catalog, destination)?;
+        let sealed = seal(temp.path(), &work)?;
+        *original_control.cleanup_probe.lock().unwrap() = Some(sealed.clone());
+        original_control
+            .fail_finish_reply
+            .store(true, Ordering::Release);
+        original_control.fail_abort.store(true, Ordering::Release);
+        assert!(catalog.accept_photo_export_seal(&work, &sealed).is_err());
+        sealed
+    };
+    assert_eq!(
+        *original_control.cleanup_probe_results.lock().unwrap(),
+        vec![
+            (ExportOriginalAction::Finish, true),
+            (ExportOriginalAction::Abort, true),
+        ]
+    );
+    // Function retirement drops the publication owner even though exact F
+    // original custody remains registered for a later checked reconciliation.
+    let publication = crate::metadata_export::PhotoPublication::prepare(&sealed)?;
+    drop(publication);
+    original_control.fail_abort.store(false, Ordering::Release);
+    managed.close()?;
+    Ok(())
+}
+
+#[test]
+fn managed_accept_aborts_original_after_publication_preparation_failure() -> Result<()> {
+    use crate::catalog_session::{ExportOriginalAction, export_original_managed_session};
+    use std::sync::atomic::Ordering;
+
+    let temp = tempfile::tempdir()?;
+    let original = temp.path().join("managed-original.png");
+    std::fs::write(&original, b"managed source bytes unchanged")?;
+    let (mut managed, original_control) = export_original_managed_session(temp.path())?;
+    let destination = temp.path().join("managed-export.png");
+    {
+        let catalog = managed.catalog.as_mut().unwrap();
+        let fingerprint = blake3::hash(b"managed source bytes unchanged")
+            .to_hex()
+            .to_string();
+        catalog.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('a',?1,'original','ready',?2,'fixture','{\"format\":\"PNG\",\"width\":1000,\"height\":1000,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')",params![crate::location_bytes(&original),fingerprint])?;
+        catalog.record_storage_path("a", &NativePath::from_path(&original))?;
+        let (_, work) = queued(catalog, destination)?;
+        let sealed = seal(temp.path(), &work)?;
+        std::fs::write(
+            sealed.recovery_directory().join("payload"),
+            b"changed after sealing",
+        )?;
+        original_control.fail_abort.store(true, Ordering::Release);
+        let error = catalog
+            .accept_photo_export_seal(&work, &sealed)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("sealed payload changed"),
+            "publication preparation error was replaced: {error:#}"
+        );
+    }
+    let calls = original_control.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(matches!(calls[0].action, ExportOriginalAction::Begin));
+    assert!(matches!(calls[1].action, ExportOriginalAction::Abort));
+    assert_eq!(calls[0].transfer, calls[1].transfer);
+    assert_eq!(calls[1].step.0, 1);
+    drop(calls);
+    assert!(
+        managed.close().is_err(),
+        "uncertain same-call Abort must retain custody"
+    );
+    original_control.fail_abort.store(false, Ordering::Release);
+    managed.close()?;
+    Ok(())
+}
 #[test]
 fn cancel_blocks_orphan_and_accepted_seal_without_publishing() -> Result<()> {
     for accepted in [false, true] {

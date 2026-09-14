@@ -2,8 +2,9 @@ use super::*;
 use crate::{
     application::U64,
     catalog_session::{
-        BootstrapMode, ConfirmSqlAdmission, EXPORT_PROFILE_BYTES, ExportProfileAction,
-        ExportProfileRequest, ExportProfileValue, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        BootstrapMode, ConfirmSqlAdmission, EXPORT_PROFILE_BYTES, ExportOriginalAction,
+        ExportOriginalRequest, ExportOriginalValue, ExportProfileAction, ExportProfileRequest,
+        ExportProfileValue, InspectExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
         RootCapability, SQL_ROLES, SqlRole, SqlRoleObservation,
     },
 };
@@ -51,6 +52,24 @@ fn profile_request(
         transfer: transfer.clone(),
         step: U64(step),
         allowance: U64(EXPORT_PROFILE_BYTES as u64),
+        action,
+    }
+}
+
+fn original_request(
+    root: &RootCapability,
+    path: &Path,
+    transfer: &LeaseId,
+    step: u64,
+    allowance: u64,
+    action: ExportOriginalAction,
+) -> ExportOriginalRequest {
+    ExportOriginalRequest {
+        root: root.clone(),
+        requested: NativePath::from_path(path),
+        transfer: transfer.clone(),
+        step: U64(step),
+        allowance: U64(allowance),
         action,
     }
 }
@@ -552,5 +571,224 @@ fn export_profile_transfer_is_stable_bounded_bound_and_explicitly_retired() -> R
     }
     owner.release(&root)?;
     owner.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn export_original_inspection_and_lease_are_bounded_bound_rechecked_and_recoverable() -> Result<()>
+{
+    let temp = TempDir::new()?;
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals)?;
+    let catalog_request = request(&temp);
+    let mut owner = BootstrapOwner::new(
+        LeaseId::new(),
+        vec![NativePath::from_path(&originals.canonicalize()?)],
+    );
+    let bootstrap = owner.prepare(&catalog_request, &AtomicBool::new(false), |_| Ok(()))?;
+    owner.confirm(&confirmation(&bootstrap), &AtomicBool::new(false))?;
+    let root = bootstrap.root_capability();
+    let path = originals.join("asset.raw");
+    fs::write(&path, b"original-bytes")?;
+    let allowance = fs::metadata(&path)?.len();
+    let inspect = InspectExportOriginal {
+        root: root.clone(),
+        requested: NativePath::from_path(&path),
+        allowance: U64(allowance),
+    };
+    let inspected = owner.inspect_export_original(&inspect, &AtomicBool::new(false))?;
+    inspected.validate_for(&inspect)?;
+    assert_eq!(inspected.revision.bytes, allowance);
+    let mut too_small = inspect.clone();
+    too_small.allowance = U64(allowance - 1);
+    let error = owner
+        .inspect_export_original(&too_small, &AtomicBool::new(false))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Failure>().unwrap().kind,
+        FailureKind::ResourceLimit
+    );
+    let outside = temp.path().join("outside.raw");
+    fs::write(&outside, b"outside")?;
+    let mut outside_request = inspect.clone();
+    outside_request.requested = NativePath::from_path(&outside);
+    assert!(
+        owner
+            .inspect_export_original(&outside_request, &AtomicBool::new(false))
+            .is_err()
+    );
+    let mut directory_request = inspect.clone();
+    directory_request.requested = NativePath::from_path(&originals);
+    assert!(
+        owner
+            .inspect_export_original(&directory_request, &AtomicBool::new(false))
+            .is_err()
+    );
+    #[cfg(unix)]
+    {
+        let link = originals.join("asset-link.raw");
+        std::os::unix::fs::symlink(&path, &link)?;
+        let mut link_request = inspect.clone();
+        link_request.requested = NativePath::from_path(&link);
+        assert!(
+            owner
+                .inspect_export_original(&link_request, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+
+    let transfer = LeaseId::new();
+    let begin = original_request(
+        &root,
+        &path,
+        &transfer,
+        0,
+        allowance,
+        ExportOriginalAction::Begin,
+    );
+    let begun = owner.export_original_call(&begin, &AtomicBool::new(false))?;
+    begun.validate(&begin)?;
+    assert!(
+        matches!(begun.value, ExportOriginalValue::Begun { revision } if revision == inspected.revision)
+    );
+    // Repeating the same Begin reconciles a lost response without another lease.
+    owner
+        .export_original_call(&begin, &AtomicBool::new(false))?
+        .validate(&begin)?;
+    let foreign_abort = original_request(
+        &root,
+        &path,
+        &LeaseId::new(),
+        1,
+        allowance,
+        ExportOriginalAction::Abort,
+    );
+    assert!(
+        owner
+            .export_original_call(&foreign_abort, &AtomicBool::new(true))
+            .is_err()
+    );
+    assert!(owner.release(&root).is_err());
+    let recheck = original_request(
+        &root,
+        &path,
+        &transfer,
+        1,
+        allowance,
+        ExportOriginalAction::Recheck,
+    );
+    owner
+        .export_original_call(&recheck, &AtomicBool::new(false))?
+        .validate(&recheck)?;
+    let retained = originals.join("retained.raw");
+    fs::rename(&path, &retained)?;
+    fs::write(&path, b"replacement!!!")?;
+    let changed = original_request(
+        &root,
+        &path,
+        &transfer,
+        2,
+        allowance,
+        ExportOriginalAction::Recheck,
+    );
+    assert!(
+        owner
+            .export_original_call(&changed, &AtomicBool::new(false))
+            .is_err()
+    );
+    let abort = original_request(
+        &root,
+        &path,
+        &transfer,
+        3,
+        allowance,
+        ExportOriginalAction::Abort,
+    );
+    owner.export_original_call(&abort, &AtomicBool::new(true))?;
+    owner.export_original_call(&abort, &AtomicBool::new(true))?;
+    fs::remove_file(&path)?;
+    fs::rename(&retained, &path)?;
+
+    let finished_transfer = LeaseId::new();
+    let begin = original_request(
+        &root,
+        &path,
+        &finished_transfer,
+        0,
+        allowance,
+        ExportOriginalAction::Begin,
+    );
+    owner.export_original_call(&begin, &AtomicBool::new(false))?;
+    let finish = original_request(
+        &root,
+        &path,
+        &finished_transfer,
+        1,
+        allowance,
+        ExportOriginalAction::Finish,
+    );
+    owner.export_original_call(&finish, &AtomicBool::new(false))?;
+    owner.export_original_call(&finish, &AtomicBool::new(false))?;
+    let foreign_finish = original_request(
+        &root,
+        &path,
+        &LeaseId::new(),
+        1,
+        allowance,
+        ExportOriginalAction::Finish,
+    );
+    assert!(
+        owner
+            .export_original_call(&foreign_finish, &AtomicBool::new(false))
+            .is_err()
+    );
+    let foreign_terminal_abort = original_request(
+        &root,
+        &path,
+        &LeaseId::new(),
+        2,
+        allowance,
+        ExportOriginalAction::Abort,
+    );
+    assert!(
+        owner
+            .export_original_call(&foreign_terminal_abort, &AtomicBool::new(true))
+            .is_err()
+    );
+    let finish_abort = original_request(
+        &root,
+        &path,
+        &finished_transfer,
+        2,
+        allowance,
+        ExportOriginalAction::Abort,
+    );
+    owner.export_original_call(&finish_abort, &AtomicBool::new(true))?;
+    owner.export_original_call(&finish_abort, &AtomicBool::new(true))?;
+
+    // If Begin never reached F, retrying the exact Begin establishes a
+    // recoverable identity; its cleanup cannot act on a foreign transfer.
+    let uncertain = LeaseId::new();
+    let begin = original_request(
+        &root,
+        &path,
+        &uncertain,
+        0,
+        allowance,
+        ExportOriginalAction::Begin,
+    );
+    owner.export_original_call(&begin, &AtomicBool::new(false))?;
+    let abort = original_request(
+        &root,
+        &path,
+        &uncertain,
+        1,
+        allowance,
+        ExportOriginalAction::Abort,
+    );
+    owner.export_original_call(&abort, &AtomicBool::new(true))?;
+    owner.release(&root)?;
+    owner.shutdown()?;
+    assert_eq!(fs::read(&path)?, b"original-bytes");
     Ok(())
 }

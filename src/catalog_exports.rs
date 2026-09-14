@@ -276,19 +276,58 @@ fn require_current_renderer(plan: &PhotoExportPlan) -> Result<()> {
     Ok(())
 }
 fn verify_original(
+    session: &crate::catalog_session::CatalogSessionAuthority,
     plan: &PhotoExportPlan,
-    checkpoint: &mut dyn FnMut(u64) -> std::io::Result<()>,
-) -> Result<metadata_export::VerifiedFile> {
+    control: &mut ExportControl<'_>,
+    hook: &mut dyn FnMut(PhotoExportBoundary) -> Result<()>,
+) -> Result<VerifiedOriginal> {
+    let managed = session.pool().is_some();
+    if managed {
+        hook(PhotoExportBoundary::Hashing)?;
+    }
+    if let Some(lease) = session.begin_export_original(
+        &plan.original,
+        plan.max_original_bytes,
+        &plan.original_revision,
+        control.cancellation(),
+    )? {
+        let result = control.hash(lease.revision().bytes);
+        return match result {
+            Ok(()) => Ok(VerifiedOriginal::Managed(lease)),
+            Err(error) => lease.complete(Err(error.into()), control.cancellation()),
+        };
+    }
     let verified = metadata_export::VerifiedFile::read_with_checkpoint(
         &plan.original.to_path()?,
         plan.max_original_bytes,
-        checkpoint,
+        &mut |bytes| {
+            hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)?;
+            control.hash(bytes)
+        },
     )?;
     ensure!(
         verified.revision() == &plan.original_revision,
         "original changed since export planning"
     );
-    Ok(verified)
+    Ok(VerifiedOriginal::Legacy(verified))
+}
+enum VerifiedOriginal {
+    Legacy(metadata_export::VerifiedFile),
+    Managed(crate::catalog_session::ManagedOriginalLease),
+}
+impl VerifiedOriginal {
+    fn recheck(&mut self, cancel: &std::sync::atomic::AtomicBool) -> Result<()> {
+        match self {
+            Self::Legacy(value) => value.recheck(),
+            Self::Managed(value) => value.recheck(cancel),
+        }
+    }
+    fn complete<T>(self, result: Result<T>, cancel: &std::sync::atomic::AtomicBool) -> Result<T> {
+        match self {
+            Self::Legacy(_) => result,
+            Self::Managed(value) => value.complete(result, cancel),
+        }
+    }
 }
 fn protect_destination_controlled(
     db: &Connection,
@@ -755,11 +794,20 @@ impl Catalog {
         );
         let original = self.preview_original_path(&target.key.asset_id)?;
         let path = original.to_path()?;
-        let original_revision = metadata_export::inspect_file_revision_with_checkpoint(
-            &path,
+        let original_revision = if let Some(revision) = self.session.inspect_export_original(
+            &original,
             max_original_bytes,
-            &mut |bytes| control.hash(bytes),
-        )?;
+            control.cancellation(),
+        )? {
+            control.hash(revision.bytes)?;
+            revision
+        } else {
+            metadata_export::inspect_file_revision_with_checkpoint(
+                &path,
+                max_original_bytes,
+                &mut |bytes| control.hash(bytes),
+            )?
+        };
         ensure!(
             identity.source.fingerprint.as_deref() == Some(&original_revision.digest),
             "original fingerprint changed"
@@ -1055,28 +1103,35 @@ impl Catalog {
                 && seal.max_payload_bytes == work.plan.max_payload_bytes,
             "seal does not match export authority"
         );
-        let original = verify_original(&work.plan, &mut |bytes| {
-            hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)?;
-            control.hash(bytes)
-        })?;
-        // Verify the seal under its operation lease too; acceptance never trusts
-        // a serialized caller's claim about payload bytes.
-        let _publication =
-            metadata_export::PhotoPublication::prepare_with_checkpoint(seal, &mut |bytes| {
+        let mut original = verify_original(&self.session, &work.plan, control, &mut hook)?;
+        // Retain the publication operation lock and its verified file owners
+        // until the managed original handle has a checked terminal outcome.
+        // This matches the legacy lifetime: another publication must not enter
+        // while Finish/Abort is still uncertain.
+        let publication =
+            match metadata_export::PhotoPublication::prepare_with_checkpoint(seal, &mut |bytes| {
                 hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)?;
                 control.hash(bytes)
-            })?;
-        hook(PhotoExportBoundary::OriginalVerified)?;
-        control.check(ExportCheckpoint::OriginalVerified)?;
-        let filesystem = self.session.clone();
-        self.with_edit_transaction(&work.plan.identity,Priority::Foreground,|tx|{
-            control.check(ExportCheckpoint::BeforeMutation)?;
-            metadata_current(tx,&work.plan)?;ensure!(job(tx,&work.job)?.state=="queued","export canceled");
-            original.recheck().context("original changed while waiting for export authority")?;_publication.recheck_payload()?;
-            protect_destination_controlled(tx,&filesystem,&work.plan.destination.destination,&work.plan.original.to_path()?,work.plan.alias_limits,control)?;
-            control.check(ExportCheckpoint::BeforeMutation)?;
-            ensure!(tx.execute("UPDATE photo_export_items SET state='sealed',seal=?1 WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![serde_json::to_string(seal)?,work.job,work.sequence,work.attempt,work.authority])?==1,"export attempt changed or canceled");Ok(())
-        })?.context("edit/source changed before accepting export")
+            }) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    return original.complete(Err(error), control.cancellation());
+                }
+            };
+        let result = (|| {
+            hook(PhotoExportBoundary::OriginalVerified)?;
+            control.check(ExportCheckpoint::OriginalVerified)?;
+            let filesystem = self.session.clone();
+            self.with_edit_transaction(&work.plan.identity,Priority::Foreground,|tx|{
+                control.check(ExportCheckpoint::BeforeMutation)?;
+                metadata_current(tx,&work.plan)?;ensure!(job(tx,&work.job)?.state=="queued","export canceled");
+                original.recheck(control.cancellation()).context("original changed while waiting for export authority")?;publication.recheck_payload()?;
+                protect_destination_controlled(tx,&filesystem,&work.plan.destination.destination,&work.plan.original.to_path()?,work.plan.alias_limits,control)?;
+                control.check(ExportCheckpoint::BeforeMutation)?;
+                ensure!(tx.execute("UPDATE photo_export_items SET state='sealed',seal=?1 WHERE job=?2 AND sequence=?3 AND state='rendering' AND attempt=?4 AND authority=?5",params![serde_json::to_string(seal)?,work.job,work.sequence,work.attempt,work.authority])?==1,"export attempt changed or canceled");Ok(())
+            })?.context("edit/source changed before accepting export")
+        })();
+        original.complete(result, control.cancellation())
     }
     pub fn publish_photo_export_item(&mut self, id: &str, sequence: i64) -> Result<ExportReceipt> {
         Ok(self.publish_photo_export_item_with_metrics(id, sequence)?.0)
@@ -1169,117 +1224,121 @@ impl Catalog {
             // but must not strand finalization of an already installed object.
             require_current_renderer(&plan)?;
             let start = std::time::Instant::now();
-            let original = verify_original(&plan, &mut |bytes| {
-                hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)?;
-                control.hash(bytes)
-            })?;
+            let mut original = verify_original(&self.session, &plan, control, &mut hook)?;
             metrics.original_hash_ms = start.elapsed().as_secs_f64() * 1000.;
-            hook(PhotoExportBoundary::OriginalVerified)?;
-            control.check(ExportCheckpoint::OriginalVerified)?;
-            let start = std::time::Instant::now();
-            let filesystem = self.session.clone();
-            self.with_edit_transaction(&plan.identity,Priority::Foreground,|tx|{
+            let original_result = (|| -> Result<Option<ExportReceipt>> {
+                hook(PhotoExportBoundary::OriginalVerified)?;
+                control.check(ExportCheckpoint::OriginalVerified)?;
+                let start = std::time::Instant::now();
+                let filesystem = self.session.clone();
+                self.with_edit_transaction(&plan.identity,Priority::Foreground,|tx|{
                 control.check(ExportCheckpoint::BeforeMutation)?;
-                metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");original.recheck().context("original changed while waiting for export authority")?;
+                metadata_current(tx,&plan)?;ensure!(job(tx,id)?.state=="queued","export canceled");original.recheck(control.cancellation()).context("original changed while waiting for export authority")?;
                 protect_destination_controlled(tx,&filesystem,&plan.destination.destination,&plan.original.to_path()?,plan.alias_limits,control)?;
                 control.check(ExportCheckpoint::BeforeMutation)?;
                 ensure!(tx.execute("UPDATE photo_export_items SET publication=?1 WHERE job=?2 AND sequence=?3 AND authority=?4 AND state='sealed' AND (publication IS NULL OR publication=?1)",params![intent,id,sequence,authority])?==1,"export publication intent changed");Ok(())
             })?.context("edit/source changed before publication intent")?;
-            metrics
-                .authority_intervals_ms
-                .push(start.elapsed().as_secs_f64() * 1000.);
-            hook(PhotoExportBoundary::IntentCommitted)?;
-            control.check(ExportCheckpoint::IntentCommitted)?;
-            let start = std::time::Instant::now();
-            let filesystem = self.session.clone();
-            let capture = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
-                control.check(ExportCheckpoint::BeforeMutation)?;
-                publication_current(tx, id, sequence, &authority, &intent, &plan)?;
-                original
-                    .recheck()
-                    .context("original changed while waiting for export authority")?;
-                protect_destination_controlled(
-                    tx,
-                    &filesystem,
-                    &plan.destination.destination,
-                    &plan.original.to_path()?,
-                    plan.alias_limits,
-                    control,
-                )?;
-                control.check(ExportCheckpoint::BeforeMutation)?;
-                session.capture()
-            });
-            metrics
-                .authority_intervals_ms
-                .push(start.elapsed().as_secs_f64() * 1000.);
-            let capture = match capture {
-                Ok(Some(())) => Ok(()),
-                Ok(None) => Err(anyhow::anyhow!("edit/source changed before capture")),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = capture {
-                control.check(ExportCheckpoint::BeforeMutation)?;
-                let receipt = session.failure_receipt_with_checkpoint(
-                    format!("capture retained: {error:#}"),
-                    &mut |bytes| control.hash(bytes),
-                );
-                control.check(ExportCheckpoint::BeforeMutation)?;
-                self.record_photo_publication_failure(id, sequence, &authority, &intent, &receipt)?;
-                metrics.publication = session.timings().clone();
-                metrics.total_ms = started.elapsed().as_secs_f64() * 1000.;
-                return Ok((receipt, metrics));
-            }
-            hook(PhotoExportBoundary::Captured)?;
-            control.check(ExportCheckpoint::Captured)?;
-            session.verify_capture_with_checkpoint(&mut |bytes| {
-                hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)?;
-                control.hash(bytes)
-            })?;
-            hook(PhotoExportBoundary::CaptureVerified)?;
-            control.check(ExportCheckpoint::CaptureVerified)?;
-            let start = std::time::Instant::now();
-            let filesystem = self.session.clone();
-            let link = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
-                control.check(ExportCheckpoint::BeforeMutation)?;
-                publication_current(tx, id, sequence, &authority, &intent, &plan)?;
-                original
-                    .recheck()
-                    .context("original changed while waiting for export authority")?;
-                protect_destination_controlled(
-                    tx,
-                    &filesystem,
-                    &plan.destination.destination,
-                    &plan.original.to_path()?,
-                    plan.alias_limits,
-                    control,
-                )?;
-                control.check(ExportCheckpoint::BeforeMutation)?;
-                session.link()?;
-                control.linked();
-                Ok(())
-            });
-            metrics
-                .authority_intervals_ms
-                .push(start.elapsed().as_secs_f64() * 1000.);
-            match link {
-                Ok(Some(())) => {}
-                Ok(None) => anyhow::bail!("edit/source changed before publication link"),
-                Err(error) => {
+                metrics
+                    .authority_intervals_ms
+                    .push(start.elapsed().as_secs_f64() * 1000.);
+                hook(PhotoExportBoundary::IntentCommitted)?;
+                control.check(ExportCheckpoint::IntentCommitted)?;
+                let start = std::time::Instant::now();
+                let filesystem = self.session.clone();
+                let capture =
+                    self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
+                        control.check(ExportCheckpoint::BeforeMutation)?;
+                        publication_current(tx, id, sequence, &authority, &intent, &plan)?;
+                        original
+                            .recheck(control.cancellation())
+                            .context("original changed while waiting for export authority")?;
+                        protect_destination_controlled(
+                            tx,
+                            &filesystem,
+                            &plan.destination.destination,
+                            &plan.original.to_path()?,
+                            plan.alias_limits,
+                            control,
+                        )?;
+                        control.check(ExportCheckpoint::BeforeMutation)?;
+                        session.capture()
+                    });
+                metrics
+                    .authority_intervals_ms
+                    .push(start.elapsed().as_secs_f64() * 1000.);
+                let capture = match capture {
+                    Ok(Some(())) => Ok(()),
+                    Ok(None) => Err(anyhow::anyhow!("edit/source changed before capture")),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = capture {
                     control.check(ExportCheckpoint::BeforeMutation)?;
                     let receipt = session.failure_receipt_with_checkpoint(
-                        format!("publication retained: {error:#}"),
+                        format!("capture retained: {error:#}"),
                         &mut |bytes| control.hash(bytes),
                     );
                     control.check(ExportCheckpoint::BeforeMutation)?;
                     self.record_photo_publication_failure(
                         id, sequence, &authority, &intent, &receipt,
                     )?;
-                    metrics.publication = session.timings().clone();
-                    metrics.total_ms = started.elapsed().as_secs_f64() * 1000.;
-                    return Ok((receipt, metrics));
+                    return Ok(Some(receipt));
                 }
+                hook(PhotoExportBoundary::Captured)?;
+                control.check(ExportCheckpoint::Captured)?;
+                session.verify_capture_with_checkpoint(&mut |bytes| {
+                    hook(PhotoExportBoundary::Hashing).map_err(std::io::Error::other)?;
+                    control.hash(bytes)
+                })?;
+                hook(PhotoExportBoundary::CaptureVerified)?;
+                control.check(ExportCheckpoint::CaptureVerified)?;
+                let start = std::time::Instant::now();
+                let filesystem = self.session.clone();
+                let link = self.with_edit_transaction(&plan.identity, Priority::Foreground, |tx| {
+                    control.check(ExportCheckpoint::BeforeMutation)?;
+                    publication_current(tx, id, sequence, &authority, &intent, &plan)?;
+                    original
+                        .recheck(control.cancellation())
+                        .context("original changed while waiting for export authority")?;
+                    protect_destination_controlled(
+                        tx,
+                        &filesystem,
+                        &plan.destination.destination,
+                        &plan.original.to_path()?,
+                        plan.alias_limits,
+                        control,
+                    )?;
+                    control.check(ExportCheckpoint::BeforeMutation)?;
+                    session.link()?;
+                    control.linked();
+                    Ok(())
+                });
+                metrics
+                    .authority_intervals_ms
+                    .push(start.elapsed().as_secs_f64() * 1000.);
+                match link {
+                    Ok(Some(())) => {}
+                    Ok(None) => anyhow::bail!("edit/source changed before publication link"),
+                    Err(error) => {
+                        control.check(ExportCheckpoint::BeforeMutation)?;
+                        let receipt = session.failure_receipt_with_checkpoint(
+                            format!("publication retained: {error:#}"),
+                            &mut |bytes| control.hash(bytes),
+                        );
+                        control.check(ExportCheckpoint::BeforeMutation)?;
+                        self.record_photo_publication_failure(
+                            id, sequence, &authority, &intent, &receipt,
+                        )?;
+                        return Ok(Some(receipt));
+                    }
+                }
+                hook(PhotoExportBoundary::Linked)?;
+                Ok(None)
+            })();
+            if let Some(receipt) = original.complete(original_result, control.cancellation())? {
+                metrics.publication = session.timings().clone();
+                metrics.total_ms = started.elapsed().as_secs_f64() * 1000.;
+                return Ok((receipt, metrics));
             }
-            hook(PhotoExportBoundary::Linked)?;
         }
         control.check(ExportCheckpoint::Finalizing)?;
         let receipt = session.verify_installed_with_checkpoint(&mut |bytes| {
