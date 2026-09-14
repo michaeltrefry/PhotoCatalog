@@ -6,14 +6,23 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
-LM final source passes the complete27-test group c237d0e9, nine transport-focused
-cases, and seven standalone CLI tests9501f378. All source/log hashes and checked
-process retirement verified. Evidence auditd1e94143 passed27+9 and awaits its
-CLI addendum before local component commit. Publication source7f20828b passes
-nineteen exact tests (1 each,961filtered) in recovery-runtime19-z5zd366c; all
-source/logs and20reportedPIDs including F51366 verified absent. Separate evidence
-audit is active; observed capacity docs refresh follows. Both components remain
-uncommitted pending evidence closeout; fullS12, LMbatch4 and N/Gexport remainopen.
+LM batch3 is locally committed as 848d2a4 and integrated as a345bb2;
+independent final acceptance ef42a760 closes its 27 + 9 + 7 component gates.
+Stateful F publication is locally committed as 01a7f51 and integrated as
+1243dd8; independent evidence 7cf0e881 verifies its 19 exact selected passes.
+The requested-capacity table is refreshed; all 13 tested Rust hashes remain
+unchanged. The combined 56-file manifest matches both source commits.
+
+Integrated HEAD 1243dd8c23138727a5e8deba73fb2783e8df77bc passes formatting,
+full test-target compilation, fresh CLI build, actual managed startup refusal/
+retry, cold/warm preview delivery, Tauri check, 27 LM executor tests and seven
+CLI compatibility tests. Evidence: private sc-22847-lm-publication-integration-
+bio0am7u; receipt cb7aa884, CLI edcc84fd. Root verified 390 source hashes,
+all 12 reported process IDs absent, and no remaining managed workers. Separate
+composition review 4448f225 passes; final integrated receipt audit is pending.
+LM batch4 G/C admission and public application bridge, N/G export executor,
+full S12 installed workflows and S13 readiness remain open. No push, CI,
+installation replacement, canonical migration or RAID access occurred.
 
 LM startupFIFO plus checked receiver verdict passes compile5d381c99 and
 independent closure79149970 (0.99). Nine-case runtime active in
