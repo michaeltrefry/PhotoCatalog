@@ -99,10 +99,23 @@ corrects this and adds a regression. Its gate failed before tests because the
 new fixture omitted the Duration import. Receipt
 `5fdd0ca6c09baac1155a1c6e15042f77831a9534dc0ea0b2c33b11bbd76cf71f`
 has five verified evidence hashes, Cargo14767 waited101 and no observed survivors.
-The import-only correction is being prepared. Ready-ticket encoded delivery still
+The import-only v10 correction passed all 32 focused tests (two ignored), strict
+all-target Clippy and package formatting. Root verified 16 evidence artifacts and
+all 11 waited commands, with no observed survivors; receipt
+`6a6cc8f6b16564e8952d8872dcf51320639e94cc8e071eba6aa09a83fd7b5c47`.
+This includes the two normal-tick recovery tests and retained-result regression.
+Ready-ticket encoded delivery still
 needs off-actor storage I/O, and stage metadata needs actual capacity admission
 before filesystem effects. These remain within full FS8 acceptance; configured
 C/G/F/N delivery, final accounting and bounded measurements are not yet qualified.
+The stage capacity repair is applied on the isolated FS8 branch: fixed 16-slot
+storage is charged by actual capacity, sealed digest and cleanup path growth are
+reserved, prepared paths are admitted before filesystem changes, and exhausted
+metadata allowance cannot block authorized cleanup. Three new regression tests
+and the two-file source passed independent review
+`9b5ff283fa43ae6d10e662f60b2501a55748362c3b7e95f7485d457207c2f0f2`;
+runtime remains pending. Source files are retained privately in
+`sc-22847-stage-capacity-czfw9qcf` for exact comparison.
 
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
