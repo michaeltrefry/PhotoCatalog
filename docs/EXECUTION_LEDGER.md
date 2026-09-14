@@ -6,9 +6,30 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
-Current component integration is `786be8c` (FS9 facts `8f03d7d3`, fifteen exact
-reviewed/tested blobs matched; integrated formatting passes), including LM
-transport `d8f5a6e`. The next combined build waits for LM supervisor batch2.
+Current combined-tested source is `d3b5c24`, including FS9 facts `786be8c`,
+LM transport `d8f5a6e`, and LM supervisor batch2 `b9e8177a` cherry-picked with
+eleven exact frozen blob matches. T180722 passed four focused tests (each1,
+0failed,924filtered); receipt7207567a and independent evidence review0730ac17
+PASS0.99. Earlier sixteen-test evidence remains retained. Typed Broker cause
+survives cleanup faults and a preexisting secondary cause; external cancellation
+with a live nonfailed Broker stays Canceled. Compiler and PID-publication
+fixture negatives T175237/T180033 remain preserved with narrow successor reviews.
+
+Combined gate `sc-22847-facts-lm2-integration-dymsh3u7` passed package formatting,
+fresh CLI build, actual managed startup and cold/warm render (each1), and Tauri
+release check. Session94548 completed/reaped0, source_changed=[]. Logs: CLI
+021eed03, startup29dd7945, rendera502ec36, Tauridda8d981; independent integrated
+evidence audit is pending. This remains synthetic local integration, not release
+or complete S12 acceptance. Shortcut23433 read back.
+
+Process audit found old orphaned synthetic pairs34004/34005 and50122/50123 from
+failed preview-io gates. Their runner sampling missed each second worker pair.
+Fresh identity/fixture checks preceded exact-PID SIGTERM; all four now absent,
+fixtures preserved. Evidence `sc-22847-old-fixture-cleanup-1565nxmz`; Shortcut23434
+read back. Current test still skips finish on early errors; isolated test-only
+custody repair is authorized from d3b5c24, preserving production fail-closed
+behavior. LM batch3 shared executor/roles is the independent next source lane;
+neither lane has native authorization yet. G/C application bridge remains batch4.
 
 Last combined-tested source `197e06e` integrates ICC `35f5a70e`; all
 14 files match. Nine focused tests passed, including actual F PID76821 reaped.
