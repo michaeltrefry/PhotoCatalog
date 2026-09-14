@@ -10,7 +10,44 @@ Repository, bundle and persistent format identifiers remain compatible.
 Shortcut epic E1 and S12 were updated; comment23342 records the decision.
 
 S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
-PR16 checkpoint `e841bdb8a452c747bbf4e1eaf429c52f82c402b6` passed all four
+PR16 head `33d4a84f3e992e7d423ddf046e21b3450946e735` passed all four
+CI34794176560 jobs. All three provider archives, installers, native payloads,
+notices and installed-worker evidence passed read-only audit. Root reverified
+all56 evidence hashes in `sc-22847-ci-34794176560-p04ycpod/receipt.json`, SHA256
+`97280aaadc9624be2f46728ccf85c348167e9142383ba659f2a28f96617f62d7`.
+The published head includes the configured catalog/filesystem relay fixtures;
+FS6 custody is now independently qualified and integrated locally at `9acecca`.
+No whole desktop or GUI acceptance is claimed.
+
+FS6 author `7174222b85844bccbc54f49d75b6f8bf97773455` is integrated as
+`9aceccadf5627007f7f68a165fc5289fe3a4dcee`. Root verified all21 committed
+blobs against reviewed source and all62 qualification artifacts. Independent
+final review `sc-22847-fs6-ipc-review-j6xayps7/review-final-v7.json`, SHA256
+`45476fc752a814c8fbdaf2af86b9986b9a8d5b178d8830a989af7acc7da33040`, passes
+all six original findings. Qualified coverage is F32/relay25/C4, six configured
+process fixtures and two compatibility cases; the changed queued fixture also
+checks successful worker retirement and relay join explicitly. Strict all-target
+Clippy and formatting pass. Integrated Mac Tauri release/locked check passed in
+10.44 seconds with all21 source pins intact; session66336/PID36192 is terminal
+and reaped. Receipt `sc-22847-fs6-integration-leosphhb/receipt.json` records log
+SHA256 `4b6ec628b0a8070c2ad2218ca40d4c6969f6fc91333bc95c3e99f8a365faec49`.
+The filesystem helper retains preview tier/relocation locks through the final SQL
+drain; retries retain exact operation identity, stale operations cannot repeat
+effects, and bounded status remains independent of blocked work. The managed
+route is still unselected. FS7/FS8, actual native-descendant integration and full
+S12 acceptance remain required; these tests did not touch originals or XMP.
+
+LM Part C v30 is frozen for independent source review (114 pins), including the
+runtime-unqualified v29 lint batch. Complete bounded seal/authority/descriptor
+opening and shared core-private retained-record projection are implemented in
+its isolated worktree. Nine new fixtures and carried affected tests await the
+combined gate; aggregate memory qualification and production migration wiring
+remain unfinished. Source receipt `foundation-source-v30.json`, SHA256
+`edffd90ccd0bdf27a9d20e7c8456b8a6929e923f67e84e402516abf23268dd47`, under
+`sc-22847-lightroom-migration-bridge-xksnotzh`. This is not part of the published
+FS6 batch and no runtime parity is claimed yet.
+
+Earlier PR16 checkpoint `e841bdb8a452c747bbf4e1eaf429c52f82c402b6` passed all four
 CI34783536524 jobs (macOS, Linux, Windows, contracts). All three provider ZIP
 digests and included installers, executables, native closure and notices passed
 artifact audit. Root verified all 40 evidence hashes. Receipt
@@ -98,9 +135,51 @@ well. The ordinary desktop gate passes 21 tests with eight explicitly ignored
 external/helper entrypoints and no configured executable; strict all-target Clippy
 and formatting also pass (session68966 terminal/reaped). Independent four-file
 source review passes with exact hashes. This fixture correction is checked
-separately from unchanged actual-process test bodies. The relay and CI wiring
-remain local pending publication; production
-selection still requires the remaining custody work.
+separately from unchanged actual-process test bodies. The relay and CI wiring are
+published at `33d4a84f3e992e7d423ddf046e21b3450946e735`; fresh CI34794176560 is
+running. Draft PR16 head/body and Shortcut comment23350 were read back exactly.
+Production selection still requires the remaining custody work.
+
+FS6 frozen v1 (20 files) requires a finite repair batch before native testing.
+Root review identified stale operation replay after the latest receipt changes,
+and ResourceLimit being downgraded on exact replay. Independent IPC review found
+missing helper source-identity inputs, Stop canceling pending cleanup, unchecked
+StoreStatus failures/query identities, and a status query that could wait after
+the control transport stopped. The private store operation becomes a monotonic
+U64 with a retained high-water fence, exact latest replay, cancellation gaps and
+checked exhaustion. No persistent schema changes. Root review SHA256
+`c70001ed915c21b1e5ae763a1b55bfb07c1f1aa05716872aa750f09df152b187`;
+IPC review `d9c61fb211a9b13380ee7057a12c7bfd5606589afc68d55d79139f307c27bd45`.
+
+LM Source Part B v28 passed independent review (107 pins, 11-file delta) and
+the initial native gate: nine Manifest grammar/admission tests, four method
+preflight tests and package formatting. Session71706 and all three commands were
+reaped; source remained unchanged. Root verified all eight evidence hashes and
+the actual thirteen-test result. Receipt
+`sc-22847-lightroom-migration-bridge-xksnotzh/source-v28-runtime-receipt.json`,
+SHA256 `375b0f74bca65280f7cf9db903d801bbd9ff5e7396517c05aa1174d151088f95`.
+Larger private reader/lifecycle tests are next; Part C and aggregate memory are
+still required. Shortcut comment23351 and In Progress state were read back exactly.
+
+Part B is now a clean source checkpoint at
+`a7682ba82e7fb09a9f29cbcfd31b412cb5428484`; root verified all107 committed blobs.
+The larger gate also passed, totaling26 functional functions (9 actual-process,
+17 in-process) plus one inert helper. Corrected runtime receipt SHA256
+`f5573fffa02bbdcc9e29f58021a8ea72fae159a40b94409e4fa7d548e236c5bc` and independent
+audit `6319685683f2568076061a3a57f1e01a997ee3267ec0ff71fdb015cac6fa33cf` distinguish
+the nine actual-process functions from pure framing tests and the inert entrypoint.
+Root verified21 larger-gate evidence hashes and the14 selected function results;
+the initial13 remain the separately verified gate above. The full16MiB shortest
+Issue fixture retained1,525,033 entries in109,802,376 exact vector bytes; foreign
+path evidence retained8,387,806 native units. These measurements do not establish
+aggregate allocation or RSS. Concrete Clippy repairs and the remaining production
+integration/Part C are still required. Comment23352 was read back exactly.
+
+At published33d4, CI34794176560 finished with all four jobs successful. All three
+provider archives, payloads, installers and notices passed read-only verification.
+macOS has18 closure files/25 notices and a receipt-only observer; Linux has4/17
+and Windows4/71 with their observers included and rehashed. The frozen audit is
+under `sc-22847-ci-34794176560-p04ycpod`; root reverified all56 evidence hashes.
 
 Earlier successful checkpoints remain preserved: CI34779651605 at `ab921727`
 qualifies reader/preview drain before transport and the exclusive-create guard;
