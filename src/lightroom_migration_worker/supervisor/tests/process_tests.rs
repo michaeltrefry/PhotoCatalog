@@ -67,6 +67,14 @@ fn owned_executor_fixture() -> Result<()> {
             }
         }
     });
+    let memory = MemoryBudget::from_parent(Arc::new(
+        crate::lightroom_migration_worker::protocol::MemoryGrants {
+            controls: controls.clone(),
+            output: output.clone(),
+        },
+    ));
+    let mut phase = memory.reservation();
+    phase.grow(12345)?;
     let verified = lease.clone();
     let writers = Writers::with_external(Arc::new(Grants {
         controls,
@@ -200,6 +208,7 @@ fn lost_release_keeps_parent_permit_until_actual_executor_reap() -> Result<()> {
         stop,
         Instant::now() + Duration::from_secs(20),
         parent,
+        MemoryBudget::new(2 * 1024 * 1024 * 1024)?,
     );
     assert!(result.is_err());
     assert_eq!(*released.lock().unwrap(), [(1, false), (2, true)]);
@@ -241,6 +250,7 @@ fn cancel_while_parent_writer_held_reaps_without_waiting_for_that_writer() -> Re
             worker_stop,
             Instant::now() + Duration::from_secs(20),
             parent,
+            MemoryBudget::new(2 * 1024 * 1024 * 1024)?,
         )
     });
     // Always cancel and join the owned helper before reporting a readiness
@@ -305,6 +315,7 @@ fn failed_or_panicked_actor_acknowledgement_retires_hold_after_actual_reap() -> 
                 Arc::new(Stop::default()),
                 Instant::now() + Duration::from_secs(20),
                 parent,
+                MemoryBudget::new(2 * 1024 * 1024 * 1024)?,
             )
         }));
         if panic {
@@ -332,5 +343,59 @@ fn failed_or_panicked_actor_acknowledgement_retires_hold_after_actual_reap() -> 
         }
         let _permit = catalog.writers.enter(Priority::Foreground)?;
     }
+    Ok(())
+}
+
+#[test]
+fn parent_pool_refuses_before_spawn_and_charges_saved_result_after_reap() -> Result<()> {
+    let (_temp, _catalog, parent, _needs) = setup()?;
+    let request = serde_json::to_string(&parent.root)?;
+    let tiny = MemoryBudget::new(1)?;
+    let result = execute_owned(
+        |_| panic!("resource refusal must precede spawn"),
+        guard(),
+        &request,
+        Arc::new(Stop::default()),
+        Instant::now() + Duration::from_secs(5),
+        parent,
+        tiny.clone(),
+    );
+    assert!(result.is_err());
+    assert_eq!(tiny.used(), 0);
+
+    let (_temp, _catalog, parent, _needs) = setup()?;
+    let request = serde_json::to_string(&parent.root)?;
+    let budget = MemoryBudget::new(2 * 1024 * 1024 * 1024)?;
+    let mut pid = None;
+    let result = execute_owned(
+        |stop| {
+            let child = Process::spawn_test_command(command("normal")?, stop)?;
+            pid = Some(child.pid());
+            Ok(child)
+        },
+        guard(),
+        &request,
+        Arc::new(Stop::default()),
+        Instant::now() + Duration::from_secs(20),
+        parent,
+        budget.clone(),
+    )?;
+    assert_eq!(result.text(), "{\"committed\":true}");
+    assert_eq!(budget.used(), RESULT_BYTES);
+    #[cfg(unix)]
+    {
+        assert_eq!(unsafe { libc::kill(pid.unwrap() as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    drop(result);
+    assert_eq!(budget.used(), 0);
+    println!(
+        "PARENT_MEMORY child_pid={} reaped=true saved_result_charge={} final_charge=0",
+        pid.unwrap(),
+        RESULT_BYTES
+    );
     Ok(())
 }

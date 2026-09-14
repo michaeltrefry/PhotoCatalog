@@ -108,6 +108,15 @@ fn mapping_path(mapping: &ArtifactMapping) -> Result<PathBuf> {
     mapping_path_parts(&mapping.root, &mapping.relative)
 }
 fn mapping_path_parts(root: &NativePath, relative: &NativePath) -> Result<PathBuf> {
+    let (root_path, relative_path) = mapping_native_paths(root, relative)?;
+    reject_links(&root_path)?;
+    ensure!(
+        fs::symlink_metadata(&root_path)?.is_dir(),
+        "artifact sealed root is not a directory"
+    );
+    Ok(root_path.join(relative_path))
+}
+fn mapping_native_paths(root: &NativePath, relative: &NativePath) -> Result<(PathBuf, PathBuf)> {
     for native in [root, relative] {
         let units = match native {
             NativePath::UnixBytes(v) => v.len(),
@@ -141,12 +150,67 @@ fn mapping_path_parts(root: &NativePath, relative: &NativePath) -> Result<PathBu
             "artifact relative path component"
         ),
     }
-    reject_links(&root_path)?;
-    ensure!(
-        fs::symlink_metadata(&root_path)?.is_dir(),
-        "artifact sealed root is not a directory"
-    );
-    Ok(root_path.join(relative_path))
+    Ok((root_path, relative_path))
+}
+
+/// Only the owned raw Source epoch uses this allocation path. The public/CLI
+/// mapping route keeps its existing behavior. Grants occur before Source locks.
+fn admitted_mapping_path(
+    mapping: &ArtifactMapping,
+    admit: &mut dyn FnMut(usize) -> Result<()>,
+) -> Result<PathBuf> {
+    fn add(a: usize, b: usize) -> Result<usize> {
+        a.checked_add(b)
+            .context("artifact path allocation overflow")
+    }
+    fn mul(a: usize, b: usize) -> Result<usize> {
+        a.checked_mul(b)
+            .context("artifact path allocation overflow")
+    }
+    for native in [&mapping.root, &mapping.relative] {
+        let units = match native {
+            NativePath::UnixBytes(v) => v.len(),
+            NativePath::WindowsWide(v) => v.len(),
+        };
+        ensure!((1..=32768).contains(&units), "artifact mapping path length");
+        #[cfg(unix)]
+        let bytes = units;
+        #[cfg(windows)]
+        let bytes = add(mul(units, 3)?, mul(units, 6)?.max(8))?;
+        admit(bytes)?;
+    }
+    let (root, relative) = mapping_native_paths(&mapping.root, &mapping.relative)?;
+    #[cfg(windows)]
+    Source::check_prepared_directory(&root, admit)?;
+    #[cfg(unix)]
+    {
+        // Original-prefix PathBuf growth and transient CString used by std FS.
+        admit(add(mul(root.as_os_str().len(), 4)?, 9)?)?;
+        reject_links(&root)?;
+        ensure!(
+            fs::symlink_metadata(&root)?.is_dir(),
+            "artifact sealed root is not a directory"
+        );
+    }
+    let capacity = add(add(root.as_os_str().len(), relative.as_os_str().len())?, 1)?;
+    admit(capacity)?;
+    let mut original = std::ffi::OsString::with_capacity(capacity);
+    original.push(&root);
+    // Native component validation above has excluded absolute/non-normal relative
+    // paths. Raw append avoids PathBuf::push's verbatim Vec/rebuild allocations.
+    #[cfg(unix)]
+    let separator = "/";
+    #[cfg(windows)]
+    let separator = "\\";
+    if !original.as_encoded_bytes().ends_with(separator.as_bytes()) {
+        original.push(separator);
+    }
+    original.push(&relative);
+    #[cfg(unix)]
+    // Source.path clone + prefix growth/realloc + std CString scratch. Retained
+    // until reader reap, reused during serial revision checks.
+    admit(add(mul(original.len(), 5)?, 9)?)?;
+    Ok(original.into())
 }
 
 fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDescriptor> {
@@ -280,6 +344,24 @@ impl ArtifactReader {
         stop: &dyn Fn() -> bool,
         protected: &[crate::lightroom_migration_worker::identity::FileKey],
     ) -> Result<Self> {
+        Self::open_descriptor_impl(descriptor, limits, stop, protected, None)
+    }
+    pub(crate) fn open_owned_descriptor(
+        descriptor: ArtifactDescriptor,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_descriptor_impl(descriptor, limits, stop, protected, Some(admit))
+    }
+    fn open_descriptor_impl(
+        descriptor: ArtifactDescriptor,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+        mut admit: Option<&mut dyn FnMut(usize) -> Result<()>>,
+    ) -> Result<Self> {
         limits.validate()?;
         ensure!(!stop(), "artifact custody stopped");
         ensure!(protected.len() <= 4096, "artifact protected identity bound");
@@ -314,17 +396,48 @@ impl ArtifactReader {
             descriptor.artifact.revision.bytes <= limits.maximum_bytes,
             "artifact exceeds declared maximum bytes"
         );
-        let path = mapping_path(&request.mapping)?;
+        let path = if let Some(admit) = admit.as_mut() {
+            admitted_mapping_path(&request.mapping, *admit)?
+        } else {
+            mapping_path(&request.mapping)?
+        };
         #[cfg(windows)]
-        let lease = {
+        let legacy_lease = if admit.is_none() {
             use std::os::windows::fs::OpenOptionsExt;
             reject_links(&path)?;
-            fs::OpenOptions::new()
-                .read(true)
-                .share_mode(1)
-                .open(&path)?
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(&path)?,
+            )
+        } else {
+            None
         };
+        #[cfg(windows)]
+        let mut source = if let Some(admit) = admit.as_mut() {
+            Source::open_prepared(
+                &path,
+                limits.maximum_bytes,
+                *admit,
+                crate::lightroom::source::closed_path::file_path,
+            )?
+        } else {
+            Source::open(&path, limits.maximum_bytes)?
+        };
+        #[cfg(not(windows))]
         let mut source = Source::open(&path, limits.maximum_bytes)?;
+        #[cfg(windows)]
+        let lease = match legacy_lease {
+            Some(lease) => lease,
+            None => {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(source.prepared_path())?
+            }
+        };
         ensure!(
             source.before == request.mapping.copy_identity,
             "artifact sealed copy identity differs"
@@ -1103,6 +1216,45 @@ mod tests {
                 .open_migration_artifact(request, RawFixture::limits(), &|| false)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn owned_mapping_grants_precede_paths_and_keep_legacy_native_spelling() -> Result<()> {
+        let (fixture, _catalog) = RawFixture::new(10)?;
+        let mapping = &fixture.requests[0].mapping;
+        let expected = mapping_path(mapping)?;
+        let mut attempts = 0;
+        let denied = admitted_mapping_path(mapping, &mut |_| {
+            attempts += 1;
+            anyhow::bail!("synthetic no allocation allowance")
+        });
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("synthetic no allocation allowance")
+        );
+        assert_eq!(attempts, 1);
+        let mut total = 0usize;
+        let actual = admitted_mapping_path(mapping, &mut |bytes| {
+            total = total.checked_add(bytes).unwrap();
+            Ok(())
+        })?;
+        assert_eq!(actual, expected);
+        assert!(total > actual.as_os_str().len());
+        let mut foreign = mapping.clone();
+        #[cfg(unix)]
+        {
+            foreign.relative = NativePath::WindowsWide(vec![0xd800]);
+        }
+        #[cfg(windows)]
+        {
+            foreign.relative = NativePath::UnixBytes(vec![255]);
+        }
+        assert!(admitted_mapping_path(&foreign, &mut |_| Ok(())).is_err());
+        assert!(mapping_path(&foreign).is_err());
+        println!("RAW_PATH admitted={total} original_native_spelling=true foreign_rejected=true");
         Ok(())
     }
 

@@ -1,10 +1,47 @@
 //! Checked requested-Rust-storage admission shared by one migration operation.
 //! A configured allowance is a resource decision, never a data-format ceiling.
+pub(crate) mod layout;
+
 use anyhow::{Context, Result, ensure};
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone)]
-pub(crate) struct MemoryBudget(Arc<Mutex<State>>);
+pub(crate) struct MemoryBudget(Arc<Backend>);
+enum Backend {
+    Local(Mutex<State>),
+    Parent(Arc<dyn AllocationGrant>),
+}
+/// The parent retains every successful grant until the complete helper process
+/// and its consumers have drained. Dropping a child reservation never releases
+/// a possibly still-live cross-process allocation.
+pub(crate) trait AllocationGrant: Send + Sync {
+    fn reserve(&self, bytes: usize) -> Result<()>;
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub limit: usize,
+    pub used: usize,
+    pub available: usize,
+}
+#[derive(Debug)]
+pub(crate) struct ResourceLimit {
+    pub required: usize,
+    pub available: usize,
+}
+impl fmt::Display for ResourceLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "migration allocation allowance exhausted; requested {} additional bytes, {} available",
+            self.required, self.available
+        )
+    }
+}
+impl std::error::Error for ResourceLimit {}
+
 struct State {
     limit: usize,
     used: usize,
@@ -19,7 +56,28 @@ impl MemoryBudget {
             limit != 0,
             "migration allocation allowance must be positive"
         );
-        Ok(Self(Arc::new(Mutex::new(State { limit, used: 0 }))))
+        Ok(Self(Arc::new(Backend::Local(Mutex::new(State {
+            limit,
+            used: 0,
+        })))))
+    }
+    pub(crate) fn from_parent(grant: Arc<dyn AllocationGrant>) -> Self {
+        Self(Arc::new(Backend::Parent(grant)))
+    }
+    /// Parent snapshots are current shared-pool state. A child must never report
+    /// a local counter as the parent pool's current available allowance.
+    pub(crate) fn snapshot(&self) -> Result<Snapshot> {
+        let Backend::Local(state) = &*self.0 else {
+            anyhow::bail!("allocation availability belongs to the parent coordinator")
+        };
+        let state = state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("migration allocation allowance poisoned"))?;
+        Ok(Snapshot {
+            limit: state.limit,
+            used: state.used,
+            available: state.limit - state.used,
+        })
     }
     pub(crate) fn reservation(&self) -> Reservation {
         Reservation {
@@ -29,7 +87,7 @@ impl MemoryBudget {
     }
     #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
-        self.0.lock().unwrap().used
+        self.snapshot().unwrap().used
     }
 }
 impl Reservation {
@@ -38,28 +96,38 @@ impl Reservation {
             .held
             .checked_add(bytes)
             .context("migration allocation charge overflow")?;
-        let mut state = self
-            .budget
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("migration allocation allowance poisoned"))?;
-        let used = state
-            .used
-            .checked_add(bytes)
-            .context("migration allocation total overflow")?;
-        ensure!(
-            used <= state.limit,
-            "migration allocation allowance exhausted; requested {bytes} additional bytes, {} available",
-            state.limit - state.used
-        );
-        state.used = used;
+        match &*self.budget.0 {
+            Backend::Local(state) => {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("migration allocation allowance poisoned"))?;
+                let used = state
+                    .used
+                    .checked_add(bytes)
+                    .context("migration allocation total overflow")?;
+                if used > state.limit {
+                    return Err(ResourceLimit {
+                        required: bytes,
+                        available: state.limit - state.used,
+                    }
+                    .into());
+                }
+                state.used = used;
+            }
+            // No local pool mutex is held through this IPC callback. Its exact
+            // grant sequence is serialized by the protocol's owned waiting slot.
+            Backend::Parent(grant) => grant.reserve(bytes)?,
+        }
         self.held = held;
         Ok(())
     }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Backend::Local(state) = &*self.budget.0 else {
+            return;
+        };
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         // This owner alone retires its monotonic contribution. No allocation,
         // filesystem access, callback or process wait occurs under this lock.
         state.used -= self.held;

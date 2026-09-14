@@ -1,6 +1,7 @@
 //! Bounded byte-only helper protocol. No control message carries an OS handle.
 use super::identity::{Audit, FileKey};
 pub use super::lease::DestinationPin;
+pub use super::source_reader::relay::{Command as SourceCommand, Event as SourceEvent};
 use crate::{
     application::U64,
     catalog_writer::{ExternalAdmission, ExternalLease},
@@ -45,6 +46,10 @@ pub enum WriteKind {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ParentFrame {
+    Source {
+        guard: Guard,
+        event: SourceEvent,
+    },
     Begin {
         guard: Guard,
         request_blake3: String,
@@ -64,6 +69,11 @@ pub enum ParentFrame {
         sequence: U64,
         write: WriteKind,
     },
+    MemoryGrant {
+        guard: Guard,
+        sequence: U64,
+        bytes: U64,
+    },
     Cancel {
         guard: Guard,
     },
@@ -71,6 +81,15 @@ pub enum ParentFrame {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ChildFrame {
+    Source {
+        guard: Guard,
+        command: SourceCommand,
+    },
+    NeedMemory {
+        guard: Guard,
+        sequence: U64,
+        bytes: U64,
+    },
     Admitted {
         guard: Guard,
         request_blake3: String,
@@ -160,6 +179,15 @@ impl<T: Write + Send> Publish for Mutex<T> {
         )
     }
 }
+pub(crate) trait SourceListener: Send + Sync {
+    fn accept(&self, event: SourceEvent) -> Result<()>;
+    fn revoke(&self);
+}
+struct MemoryWaiting {
+    sequence: u64,
+    bytes: usize,
+    granted: bool,
+}
 struct Waiting {
     sequence: u64,
     write: WriteKind,
@@ -169,6 +197,10 @@ pub(crate) struct Controls {
     guard: Guard,
     audit: Audit,
     waiting: Mutex<Option<Waiting>>,
+    memory_waiting: Mutex<Option<MemoryWaiting>>,
+    memory_sequence: AtomicU64,
+    memory_changed: Condvar,
+    sources: Mutex<Option<Arc<dyn SourceListener>>>,
     changed: Condvar,
     sequence: AtomicU64,
     until: Instant,
@@ -180,17 +212,69 @@ impl Controls {
             guard,
             audit,
             waiting: Mutex::new(None),
+            memory_waiting: Mutex::new(None),
+            memory_sequence: AtomicU64::new(0),
+            memory_changed: Condvar::new(),
+            sources: Mutex::new(None),
             changed: Condvar::new(),
             sequence: AtomicU64::new(0),
             until,
         }))
     }
+    pub(crate) fn install_sources(&self, listener: Arc<dyn SourceListener>) -> Result<()> {
+        let mut sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(sources.is_none(), "Source listener already installed");
+        *sources = Some(listener);
+        Ok(())
+    }
+    fn revoke_sources(&self) {
+        let source = self
+            .sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(source) = source {
+            source.revoke();
+        }
+    }
     /// The only control-listener operations. Neither can touch SQL or a lock.
     pub(crate) fn accept(&self, frame: ParentFrame) -> Result<()> {
         let checked = (|| match frame {
+            ParentFrame::Source { guard, event } => {
+                ensure!(guard == self.guard, "stale Source relay control");
+                let sources = self
+                    .sources
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .context("Source relay listener not installed")?;
+                sources.accept(event)
+            }
             ParentFrame::Cancel { guard } => {
                 ensure!(guard == self.guard, "stale helper cancellation");
                 self.cancel();
+                Ok(())
+            }
+            ParentFrame::MemoryGrant {
+                guard,
+                sequence,
+                bytes,
+            } => {
+                ensure!(guard == self.guard, "stale helper memory grant");
+                self.check()?;
+                let mut slot = self
+                    .memory_waiting
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?;
+                let pending = slot.as_mut().context("unsolicited helper memory grant")?;
+                ensure!(
+                    pending.sequence == sequence.0
+                        && pending.bytes == usize::try_from(bytes.0)?
+                        && !pending.granted,
+                    "stale or repeated helper memory grant"
+                );
+                pending.granted = true;
+                self.memory_changed.notify_all();
                 Ok(())
             }
             ParentFrame::Grant {
@@ -217,17 +301,23 @@ impl Controls {
         })();
         if checked.is_err() {
             self.audit.poison();
+            self.revoke_sources();
             self.changed.notify_all();
+            self.memory_changed.notify_all();
         }
         checked
     }
     pub(crate) fn cancel(&self) {
         self.audit.cancel();
+        self.revoke_sources();
         self.changed.notify_all();
+        self.memory_changed.notify_all();
     }
     pub(crate) fn poison(&self) {
         self.audit.poison();
+        self.revoke_sources();
         self.changed.notify_all();
+        self.memory_changed.notify_all();
     }
     fn check(&self) -> Result<()> {
         self.audit.check()?;
@@ -235,6 +325,70 @@ impl Controls {
         Ok(())
     }
 }
+/// Forward every prospective child allocation to the parent's shared pool.
+/// There is deliberately no release frame: an uncertain child lifetime cannot
+/// free a parent charge. The supervisor keeps grants through verified drain.
+pub(crate) struct MemoryGrants {
+    pub controls: Arc<Controls>,
+    pub output: Arc<dyn Publish>,
+}
+impl super::memory::AllocationGrant for MemoryGrants {
+    fn reserve(&self, bytes: usize) -> Result<()> {
+        self.controls.check()?;
+        let sequence = self
+            .controls
+            .memory_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .map_err(|_| anyhow::anyhow!("helper memory sequence exhausted"))?
+            + 1;
+        {
+            let mut slot = self
+                .controls
+                .memory_waiting
+                .lock()
+                .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?;
+            ensure!(slot.is_none(), "nested helper memory request");
+            *slot = Some(MemoryWaiting {
+                sequence,
+                bytes,
+                granted: false,
+            });
+        }
+        let result = (|| {
+            self.output.publish(&ChildFrame::NeedMemory {
+                guard: self.controls.guard.clone(),
+                sequence: U64(sequence),
+                bytes: U64(bytes.try_into()?),
+            })?;
+            let mut slot = self
+                .controls
+                .memory_waiting
+                .lock()
+                .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?;
+            loop {
+                self.controls.check()?;
+                if slot
+                    .as_ref()
+                    .is_some_and(|v| v.sequence == sequence && v.granted)
+                {
+                    slot.take();
+                    return Ok(());
+                }
+                slot = self
+                    .controls
+                    .memory_changed
+                    .wait_timeout(slot, Duration::from_millis(50))
+                    .map_err(|_| anyhow::anyhow!("helper memory grant state poisoned"))?
+                    .0;
+            }
+        })();
+        if result.is_err() {
+            self.controls.poison();
+        }
+        result
+    }
+}
+
 /// Created only after source/target admission. Catalog grants additionally bind
 /// the same helper's held lock; bootstrap grants carry no lock authority.
 pub(crate) struct Grants {

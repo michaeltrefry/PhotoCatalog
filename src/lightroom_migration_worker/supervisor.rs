@@ -3,12 +3,14 @@
 use super::{
     identity::FileKey,
     input::{INPUT_BYTES, TEXT_CHUNK, digest},
+    memory::{MemoryBudget, Reservation},
     process::{Output, Process, Stop},
     protocol::{ChildFrame, DestinationPin, Guard, ParentFrame, WriteKind},
+    source_reader::relay::broker::Broker,
 };
 use crate::{
     application::U64,
-    catalog_writer::{Permit, Priority, Writers},
+    catalog_writer::{Priority, Writers},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -17,6 +19,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+mod pending;
 
 const RESULT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -27,7 +31,7 @@ const RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// supervisor records the attempt before calling writer: release is delivered
 /// once after exact ReleaseWrite or helper reap even when writer errors/panics
 /// after posting an actor hold. Release must safely retire an unacknowledged hold.
-pub(crate) trait Admission {
+pub(crate) trait Admission: Send + 'static {
     fn lock(&mut self, target: &str, destination: &DestinationPin, lock: &FileKey) -> Result<()>;
     fn writer(
         &mut self,
@@ -44,29 +48,35 @@ pub(crate) trait Admission {
 struct Held {
     sequence: u64,
     kind: WriteKind,
-    permit: Permit,
+    permit: pending::Lease,
 }
 struct State<A: Admission> {
-    admission: A,
+    admission: Option<A>,
+    pending: Option<pending::Pending<A>>,
     guard: Guard,
     input_digest: String,
     admitted: bool,
     lock: Option<(String, FileKey)>,
     next_write: u64,
+    next_memory: u64,
+    memory: Reservation,
     held: Option<Held>,
     attempted: Option<(u64, WriteKind)>,
     result: String,
     terminal: Option<Result<()>>,
 }
 impl<A: Admission> State<A> {
-    fn new(admission: A, guard: Guard, input_digest: String) -> Self {
+    fn new(admission: A, guard: Guard, input_digest: String, memory: Reservation) -> Self {
         Self {
-            admission,
+            admission: Some(admission),
+            pending: None,
             guard,
             input_digest,
             admitted: false,
             lock: None,
             next_write: 1,
+            next_memory: 1,
+            memory,
             held: None,
             attempted: None,
             result: String::with_capacity(RESULT_BYTES),
@@ -76,7 +86,7 @@ impl<A: Admission> State<A> {
     fn accept(
         &mut self,
         frame: ChildFrame,
-        stop: &Stop,
+        stop: &Arc<Stop>,
         until: Instant,
     ) -> Result<Option<ParentFrame>> {
         ensure!(
@@ -84,7 +94,9 @@ impl<A: Admission> State<A> {
             "helper frame after terminal result"
         );
         let guard = match &frame {
-            ChildFrame::Admitted { guard, .. }
+            ChildFrame::Source { guard, .. }
+            | ChildFrame::NeedMemory { guard, .. }
+            | ChildFrame::Admitted { guard, .. }
             | ChildFrame::LockAcquired { guard, .. }
             | ChildFrame::NeedWrite { guard, .. }
             | ChildFrame::ReleaseWrite { guard, .. }
@@ -94,6 +106,28 @@ impl<A: Admission> State<A> {
             | ChildFrame::Failed { guard, .. } => guard,
         };
         ensure!(guard == &self.guard, "stale migration helper frame");
+        // Pre-parse allocation permission conveys no source/target authority.
+        // It can precede Admitted so decoding does not allocate before its grant.
+        if let ChildFrame::NeedMemory {
+            sequence, bytes, ..
+        } = frame
+        {
+            ensure!(
+                sequence.0 == self.next_memory,
+                "stale or repeated helper memory request"
+            );
+            let next = self
+                .next_memory
+                .checked_add(1)
+                .context("migration memory sequence exhausted")?;
+            self.memory.grow(usize::try_from(bytes.0)?)?;
+            self.next_memory = next;
+            return Ok(Some(ParentFrame::MemoryGrant {
+                guard: self.guard.clone(),
+                sequence,
+                bytes,
+            }));
+        }
         if let ChildFrame::Admitted { request_blake3, .. } = frame {
             ensure!(
                 !self.admitted && request_blake3 == self.input_digest,
@@ -104,6 +138,10 @@ impl<A: Admission> State<A> {
         }
         ensure!(self.admitted, "helper acted before exact input admission");
         match frame {
+            ChildFrame::Source { .. } => {
+                anyhow::bail!("Source command bypassed supervisor demultiplexer")
+            }
+            ChildFrame::NeedMemory { .. } => unreachable!(),
             ChildFrame::LockAcquired {
                 lock,
                 destination,
@@ -115,7 +153,10 @@ impl<A: Admission> State<A> {
                     "helper lock order/replay differs"
                 );
                 digest(&target_token)?;
-                self.admission.lock(&target_token, &destination, &lock)?;
+                self.admission
+                    .as_mut()
+                    .context("destination lock while writer admission pending")?
+                    .lock(&target_token, &destination, &lock)?;
                 self.lock = Some((target_token, lock));
             }
             ChildFrame::NeedWrite {
@@ -128,7 +169,8 @@ impl<A: Admission> State<A> {
                 ensure!(
                     sequence.0 == self.next_write
                         && self.held.is_none()
-                        && self.attempted.is_none(),
+                        && self.attempted.is_none()
+                        && self.pending.is_none(),
                     "nested or stale migration writer request"
                 );
                 digest(&target_token)?;
@@ -147,35 +189,26 @@ impl<A: Admission> State<A> {
                 // The callback can post an actor hold before its acknowledgement
                 // fails. Own that attempted hold before entering caller code.
                 self.attempted = Some((sequence.0, write));
-                let writers = self.admission.writer(
+                let admission = self
+                    .admission
+                    .take()
+                    .context("migration admission already pending")?;
+                match pending::Pending::start(
+                    admission,
                     sequence.0,
                     write,
-                    &target_token,
-                    lock.as_ref(),
-                    stop,
+                    target_token,
+                    lock,
+                    stop.clone(),
                     until,
-                )?;
-                let permit = writers.enter_cancellable(
-                    Priority::Background,
-                    stop.admission(),
-                    Some(until),
-                )?;
-                // Retain before enqueueing Grant. Lost/blocked output is an
-                // uncertain grant, resolved only by exact release or actual reap.
-                self.held = Some(Held {
-                    sequence: sequence.0,
-                    kind: write,
-                    permit,
-                });
-                self.next_write = self
-                    .next_write
-                    .checked_add(1)
-                    .context("migration grant sequence exhausted")?;
-                return Ok(Some(ParentFrame::Grant {
-                    guard: self.guard.clone(),
-                    sequence,
-                    write,
-                }));
+                ) {
+                    Ok(pending) => self.pending = Some(pending),
+                    Err(error) => {
+                        self.attempted.take();
+                        return Err(error);
+                    }
+                }
+                return Ok(None);
             }
             ChildFrame::ReleaseWrite {
                 sequence, write, ..
@@ -186,7 +219,7 @@ impl<A: Admission> State<A> {
                         .is_some_and(|h| h.sequence == sequence.0 && h.kind == write),
                     "unsolicited or stale migration writer release"
                 );
-                self.release();
+                self.release()?;
             }
             ChildFrame::Progress {
                 phase,
@@ -199,6 +232,8 @@ impl<A: Admission> State<A> {
                     "migration phase bounds"
                 );
                 self.admission
+                    .as_mut()
+                    .context("progress while writer admission pending")?
                     .progress(&phase, completed.0, total.map(|n| n.0))?;
             }
             ChildFrame::Result { offset, text, .. } => {
@@ -234,18 +269,61 @@ impl<A: Admission> State<A> {
         }
         Ok(None)
     }
-    fn release(&mut self) {
-        if let Some(Held { permit, .. }) = self.held.take() {
-            drop(permit);
+    fn poll_admission(&mut self) -> Result<Option<ParentFrame>> {
+        let Some(waiter) = self.pending.as_mut() else {
+            return Ok(None);
+        };
+        if !waiter.finished() {
+            return Ok(None);
         }
+        let sequence = waiter.sequence;
+        let kind = waiter.kind;
+        let (admission, outcome) = waiter.take_ready();
+        self.admission = Some(admission);
+        let waiter = self.pending.take().expect("owned ready admission");
+        match outcome {
+            pending::Outcome::Finished(result) => result?,
+            pending::Outcome::Panicked(panic) => std::panic::resume_unwind(panic),
+        };
+        let permit = waiter.into_lease();
+        self.held = Some(Held {
+            sequence,
+            kind,
+            permit,
+        });
+        self.next_write = self
+            .next_write
+            .checked_add(1)
+            .context("migration grant sequence exhausted")?;
+        Ok(Some(ParentFrame::Grant {
+            guard: self.guard.clone(),
+            sequence: U64(sequence),
+            write: kind,
+        }))
+    }
+    fn release(&mut self) -> Result<()> {
+        if let Some(mut waiter) = self.pending.take() {
+            waiter.stop.cancel();
+            let (admission, outcome) = waiter.join();
+            self.admission = Some(admission);
+            drop(outcome);
+        }
+        let retired = if let Some(Held { mut permit, .. }) = self.held.take() {
+            permit.retire()
+        } else {
+            Ok(())
+        };
         if let Some((sequence, kind)) = self.attempted.take() {
-            self.admission.release(sequence, kind);
+            if let Some(admission) = self.admission.as_mut() {
+                admission.release(sequence, kind);
+            }
         }
+        retired
     }
 }
 impl<A: Admission> Drop for State<A> {
     fn drop(&mut self) {
-        self.release();
+        let _ = self.release();
     }
 }
 
@@ -253,16 +331,28 @@ impl<A: Admission> Drop for State<A> {
 /// State's parent permit release, including unwinding and malformed output.
 struct Owned<A: Admission> {
     process: Process,
+    broker: Option<Broker>,
     state: State<A>,
 }
 impl<A: Admission> Drop for Owned<A> {
     fn drop(&mut self) {
         // Queue-bypass cancellation is attempted even if admission failed or
         // the caller unwinds. A blocked/full pipe cannot delay kill/reap.
-        let _ = self.process.try_send(ParentFrame::Cancel {
+        let _ = self.process.try_send_control(ParentFrame::Cancel {
             guard: self.state.guard.clone(),
         });
-        self.process.terminate();
+        if let Some(waiter) = &self.state.pending {
+            waiter.stop.cancel();
+        }
+        self.process.revoke();
+        if let Some(broker) = &self.broker {
+            broker.revoke_after_lm();
+            broker.wait_revoked();
+        }
+        let _ = self.process.drain_checked();
+        if let Some(broker) = &mut self.broker {
+            let _ = broker.finish();
+        }
     }
 }
 fn send(process: &Process, mut frame: ParentFrame, stop: &Stop, until: Instant) -> Result<()> {
@@ -277,7 +367,24 @@ fn send(process: &Process, mut frame: ParentFrame, stop: &Stop, until: Instant) 
     }
 }
 
-/// Owns only bounded UTF-8 authority/result memory plus bounded pipe frames.
+/// Exact result bytes stay charged while cached by the coordinator. The private
+/// wrapper provides borrowed access; moving out a naked String would lose that
+/// lifetime, so no such conversion is exposed.
+pub(crate) struct SavedResult {
+    text: String,
+    memory: Reservation,
+}
+impl SavedResult {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// G owns the executor and both Source roles through the broker. A managed
+/// executor receives tokens rather than spawning descendants. The complete
+/// application coordinator still supplies approved action/phase admission.
+///
+/// Owns bounded UTF-8 authority/result memory plus bounded pipe frames.
 /// Large saved evidence is returned by the paged/chunk query layer; this limit
 /// never truncates results or changes a caller's reviewed migration scope.
 pub(crate) fn execute<A: Admission>(
@@ -287,16 +394,20 @@ pub(crate) fn execute<A: Admission>(
     stop: Arc<Stop>,
     until: Instant,
     admission: A,
-) -> Result<String> {
-    execute_owned(
+    budget: MemoryBudget,
+) -> Result<SavedResult> {
+    execute_with_broker(
         |stop| Process::spawn(executable, stop),
+        Some(executable.to_path_buf()),
         guard,
         request,
         stop,
         until,
         admission,
+        budget,
     )
 }
+#[cfg(test)]
 fn execute_owned<A: Admission>(
     spawn: impl FnOnce(Arc<Stop>) -> Result<Process>,
     guard: Guard,
@@ -304,7 +415,20 @@ fn execute_owned<A: Admission>(
     stop: Arc<Stop>,
     until: Instant,
     admission: A,
-) -> Result<String> {
+    budget: MemoryBudget,
+) -> Result<SavedResult> {
+    execute_with_broker(spawn, None, guard, request, stop, until, admission, budget)
+}
+fn execute_with_broker<A: Admission>(
+    spawn: impl FnOnce(Arc<Stop>) -> Result<Process>,
+    source_executable: Option<std::path::PathBuf>,
+    guard: Guard,
+    request: &str,
+    stop: Arc<Stop>,
+    until: Instant,
+    admission: A,
+    budget: MemoryBudget,
+) -> Result<SavedResult> {
     guard.validate()?;
     ensure!(
         request.len() <= INPUT_BYTES,
@@ -314,10 +438,22 @@ fn execute_owned<A: Admission>(
         !stop.requested() && Instant::now() < until,
         "migration admission canceled/deadline"
     );
+    // Result storage is allocated below and stays owned across lost replies.
+    // Full typed/core phase admission is added by the coordinator separately.
+    let mut memory = budget.reservation();
+    memory.grow(INPUT_BYTES)?;
+    let mut result_memory = budget.reservation();
+    result_memory.grow(RESULT_BYTES)?;
     let input_digest = blake3::hash(request.as_bytes()).to_hex().to_string();
+    // Start the broker before LM; if LM launch fails, no Source command could
+    // have arrived and the broker's owned Drop still joins its thread.
+    let broker = source_executable
+        .map(|path| Broker::start(path, guard.clone(), stop.clone()))
+        .transpose()?;
     let mut owner = Owned {
         process: spawn(stop.clone())?,
-        state: State::new(admission, guard.clone(), input_digest.clone()),
+        broker,
+        state: State::new(admission, guard.clone(), input_digest.clone(), memory),
     };
     send(
         &owner.process,
@@ -357,23 +493,73 @@ fn execute_owned<A: Admission>(
         until,
     )?;
     let mut ended = false;
+    let mut command = None;
+    let mut data = None;
+    let mut control = None;
     loop {
+        // Reserved failure delivery bypasses both actor admission and the normal
+        // data queue. If the executor cannot receive it, revocation kills it;
+        // successful commits preceding observed loss retain their exact receipt.
+        if let Some(broker) = &owner.broker {
+            if let Some(event) = broker.try_urgent() {
+                let frame = ParentFrame::Source {
+                    guard: owner.state.guard.clone(),
+                    event,
+                };
+                if let Some(unsent) = owner.process.try_send_control(frame)? {
+                    control = Some(unsent);
+                }
+            }
+        }
         ensure!(
             !stop.requested(),
-            "migration operation canceled; helper drained before return"
+            "migration operation canceled; all helpers drained before return"
         );
         ensure!(
             Instant::now() < until,
-            "migration operation deadline; helper drained before return"
+            "migration operation deadline; all helpers drained before return"
         );
-        if !ended {
+        if let Some(frame) = control.take() {
+            control = owner.process.try_send_control(frame)?;
+        }
+        if control.is_none() {
+            control = owner.state.poll_admission()?;
+        }
+        if let Some(broker) = &owner.broker {
+            if let Some(next) = command.take() {
+                command = broker.try_send(next)?;
+            }
+            if data.is_none() {
+                data = broker.try_receive()?.map(|event| ParentFrame::Source {
+                    guard: owner.state.guard.clone(),
+                    event,
+                });
+            }
+        }
+        if let Some(frame) = data.take() {
+            data = owner.process.try_send(frame)?;
+        }
+        if !ended && command.is_none() && control.is_none() {
             match owner.process.try_receive()? {
                 Output::Pending => {}
+                Output::Frame(ChildFrame::Source {
+                    guard,
+                    command: next,
+                }) => {
+                    ensure!(
+                        guard == owner.state.guard
+                            && owner.state.admitted
+                            && owner.state.terminal.is_none(),
+                        "Source relay command admission/guard differs"
+                    );
+                    command = owner
+                        .broker
+                        .as_ref()
+                        .context("test executor has no configured Source broker")?
+                        .try_send(next)?;
+                }
                 Output::Frame(frame) => {
-                    if let Some(grant) = owner.state.accept(frame, &stop, until)? {
-                        send(&owner.process, grant, &stop, until)?;
-                    }
-                    continue;
+                    control = owner.state.accept(frame, &stop, until)?;
                 }
                 Output::End => ended = true,
             }
@@ -385,19 +571,29 @@ fn execute_owned<A: Admission>(
                 .terminal
                 .take()
                 .context("migration helper ended without a terminal result")??;
-            // Drop/join transport threads before returning the cached result.
-            owner.process.terminate();
-            return Ok(std::mem::take(&mut owner.state.result));
+            ensure!(
+                command.is_none() && data.is_none() && control.is_none(),
+                "migration helper ended with pending relay/control output"
+            );
+            if let Some(broker) = &owner.broker {
+                broker.ensure_idle()?;
+            }
+            // Signal every actual child before waiting for any one owner's pipes.
+            owner.process.revoke();
+            if let Some(broker) = &owner.broker {
+                broker.revoke_after_lm();
+                broker.wait_revoked();
+            }
+            owner.process.drain_checked()?;
+            if let Some(broker) = &mut owner.broker {
+                broker.finish()?;
+            }
+            return Ok(SavedResult {
+                text: std::mem::take(&mut owner.state.result),
+                memory: result_memory,
+            });
         }
-        ensure!(
-            !stop.requested(),
-            "migration operation canceled; helper drained before return"
-        );
-        ensure!(
-            Instant::now() < until,
-            "migration operation deadline; helper drained before return"
-        );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(2));
     }
 }
 

@@ -41,7 +41,7 @@ fn escape(bytes: &[u8], admit: Admit<'_>) -> Result<String> {
 }
 
 #[cfg(unix)]
-pub(super) fn prepare(path: &Path, admit: Admit<'_>) -> Result<String> {
+pub(crate) fn prepare(path: &Path, admit: Admit<'_>) -> Result<String> {
     use std::{os::unix::ffi::OsStrExt, path::Component};
     ensure!(path.is_absolute(), "sealed database path must be absolute");
     let original = path.as_os_str().as_bytes();
@@ -289,10 +289,10 @@ mod windows {
     }
 }
 #[cfg(windows)]
-pub(super) use windows::{file_path, prepare};
+pub(crate) use windows::{file_path, prepare};
 
 #[cfg(windows)]
-pub(super) struct Companions(Vec<std::path::PathBuf>);
+pub(crate) struct Companions(Vec<std::path::PathBuf>);
 #[cfg(windows)]
 impl Companions {
     pub(crate) fn prepare(path: &Path, admit: Admit<'_>) -> Result<Self> {
@@ -319,7 +319,7 @@ impl Companions {
             Ok(_) => anyhow::bail!("sealed inspection source has a SQLite companion"),
         }
     }
-    pub(super) fn verify(&self) -> Result<()> {
+    pub(crate) fn verify(&self) -> Result<()> {
         for path in &self.0 {
             Self::absent(path)?;
         }

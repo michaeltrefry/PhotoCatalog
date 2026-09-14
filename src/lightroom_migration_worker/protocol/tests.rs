@@ -139,3 +139,62 @@ fn cancellation_releases_waiting_helper_without_a_grant() -> Result<()> {
     assert!(rx.try_recv().is_err());
     Ok(())
 }
+
+#[test]
+fn memory_grant_exact_echo_cancel_and_parent_owned_retirement() -> Result<()> {
+    use crate::lightroom_migration_worker::memory::MemoryBudget;
+    for cancel in [false, true] {
+        let audit = Audit::new(Arc::new(AtomicBool::new(false)), vec![])?;
+        let controls = Controls::new(
+            guard(),
+            audit.clone(),
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        let (tx, rx) = mpsc::channel();
+        let budget = MemoryBudget::from_parent(Arc::new(MemoryGrants {
+            controls: controls.clone(),
+            output: Arc::new(Output(tx)),
+        }));
+        assert!(budget.snapshot().is_err());
+        let worker = std::thread::spawn(move || -> Result<()> {
+            let mut reservation = budget.reservation();
+            reservation.grow(123)?;
+            drop(reservation);
+            Ok(())
+        });
+        let frame: ChildFrame =
+            read_frame(&mut Cursor::new(rx.recv_timeout(Duration::from_secs(2))?))?;
+        let ChildFrame::NeedMemory {
+            sequence, bytes, ..
+        } = frame
+        else {
+            anyhow::bail!("memory request required");
+        };
+        assert_eq!(bytes.0, 123);
+        if cancel {
+            controls.accept(ParentFrame::Cancel { guard: guard() })?;
+            assert!(worker.join().unwrap().is_err());
+        } else {
+            controls.accept(ParentFrame::MemoryGrant {
+                guard: guard(),
+                sequence,
+                bytes,
+            })?;
+            worker.join().unwrap()?;
+            // No implicit release when a child-side reservation drops. Parent
+            // retirement is bound to its verified process/consumer ownership.
+            assert!(rx.try_recv().is_err());
+            assert!(
+                controls
+                    .accept(ParentFrame::MemoryGrant {
+                        guard: guard(),
+                        sequence,
+                        bytes
+                    })
+                    .is_err()
+            );
+            assert!(audit.is_poisoned());
+        }
+    }
+    Ok(())
+}

@@ -1,4 +1,4 @@
-use super::{CommitHealth, RawReader};
+use super::{CommitHealth, RawReader, relay::client::Client};
 use crate::{
     Catalog,
     catalog_migration::{
@@ -8,15 +8,12 @@ use crate::{
     lightroom_migration_worker::{identity::FileKey, memory::MemoryBudget, protocol::Guard},
 };
 use anyhow::{Context, Result, ensure};
-use std::{
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 /// The selected-import Worker still owns only one active raw member. Each new
 /// member receives a new full-hash admission and cannot reuse a failed epoch.
 pub(crate) struct RemoteArtifacts {
-    pub executable: PathBuf,
+    pub relay: Arc<Client>,
     pub guard: Guard,
     pub protected: Vec<FileKey>,
     pub cancel: Arc<AtomicBool>,
@@ -44,7 +41,7 @@ impl ArtifactFactory for RemoteArtifacts {
             .checked_add(1)
             .context("artifact epoch exhausted")?;
         let mut reader = RawReader::open(
-            &self.executable,
+            self.relay.clone(),
             self.guard.clone(),
             reader_epoch,
             descriptor,

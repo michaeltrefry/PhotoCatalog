@@ -82,7 +82,14 @@ impl Controls {
 
 /// Input and output are pre-established anonymous pipes. Production dispatch
 /// calls this before creating any GUI, Catalog, logger or other source owner.
-pub(super) fn serve(input: impl IoRead + Send + 'static, mut output: impl Write) -> Result<()> {
+pub(super) fn serve(input: impl IoRead + Send + 'static, output: impl Write) -> Result<()> {
+    serve_mode(input, output, None)
+}
+pub(super) fn serve_mode(
+    input: impl IoRead + Send + 'static,
+    mut output: impl Write,
+    expected: Option<super::relay::Kind>,
+) -> Result<()> {
     let controls = Arc::new(Controls {
         state: Mutex::new(Incoming {
             pending: None,
@@ -145,7 +152,7 @@ pub(super) fn serve(input: impl IoRead + Send + 'static, mut output: impl Write)
                 state.ended = true;
                 listener.changed.notify_all();
             })?;
-    let result = run(&controls, &mut output);
+    let result = run(&controls, &mut output, expected);
     if let Err(error) = &result {
         // Opening can fail before Ready (missing source, invalid authority,
         // identity or bounds). Preserve that reason as a bounded protocol reply;
@@ -195,11 +202,12 @@ impl Roster {
                 descriptor,
                 limits,
                 protected,
-            } => Ok(Self::Artifact(ArtifactReader::open_descriptor(
+            } => Ok(Self::Artifact(ArtifactReader::open_owned_descriptor(
                 descriptor,
                 limits.try_into()?,
                 &|| cancel.load(Ordering::Acquire),
                 &protected,
+                admit,
             )?)),
         }
     }
@@ -222,7 +230,11 @@ impl Roster {
         }
     }
 }
-fn run(controls: &Controls, output: &mut impl Write) -> Result<()> {
+fn run(
+    controls: &Controls,
+    output: &mut impl Write,
+    expected: Option<super::relay::Kind>,
+) -> Result<()> {
     let Request::Begin {
         epoch,
         bytes,
@@ -263,6 +275,16 @@ fn run(controls: &Controls, output: &mut impl Write) -> Result<()> {
     );
     let authority =
         super::authority_json::decode(&encoded, &|| controls.cancel.load(Ordering::Acquire))?;
+    if let Some(expected) = expected {
+        ensure!(
+            matches!(
+                (&authority, expected),
+                (Authority::Sql { .. }, super::relay::Kind::Sql)
+                    | (Authority::Artifact { .. }, super::relay::Kind::Raw)
+            ),
+            "managed Source role/authority mismatch"
+        );
+    }
     #[cfg(all(test, feature = "internal-capacity-probes"))]
     crate::capacity_probes::observe(crate::capacity_probes::OPEN_DECODED, encoded.capacity());
     drop(encoded);
@@ -436,7 +458,7 @@ fn reply_prefix(arguments: std::fmt::Arguments<'_>) -> String {
     let _ = std::fmt::write(&mut output, arguments);
     output.text
 }
-fn reply_error_text(error: &anyhow::Error) -> String {
+pub(super) fn reply_error_text(error: &anyhow::Error) -> String {
     reply_prefix(format_args!("{error:#}"))
 }
 

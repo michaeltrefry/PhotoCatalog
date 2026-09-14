@@ -1,6 +1,10 @@
 //! Operation-scoped remote source ownership. All filesystem work stays in the
 //! child; this owner retains its process until the caller's SQL/permit stack has
 //! drained. It is never stored on or joined by the foreground actor.
+mod transport;
+use super::relay::{Kind, client::Client};
+use transport::Transport;
+
 use super::{
     transport::*,
     wire::{Budget, Expected, Query, Value},
@@ -25,7 +29,6 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{
     cell::RefCell,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -80,7 +83,7 @@ struct SourceAdmission {
 }
 
 struct Session {
-    process: Process<Reply>,
+    process: Transport,
     epoch: Epoch,
     binding: String,
     health: Health,
@@ -96,7 +99,7 @@ struct Session {
 }
 impl Session {
     fn open(
-        executable: &Path,
+        relay: Arc<Client>,
         epoch: Epoch,
         authority: Authority,
         cancel: Arc<AtomicBool>,
@@ -105,6 +108,14 @@ impl Session {
         memory: MemoryBudget,
     ) -> Result<Self> {
         epoch.validate()?;
+        ensure!(
+            (1..=3_600_000).contains(&open_ms) && (1..=120_000).contains(&read_ms),
+            "source process deadline bounds"
+        );
+        let kind = match &authority {
+            Authority::Sql { .. } => Kind::Sql,
+            Authority::Artifact { .. } => Kind::Raw,
+        };
         let budget = Budget::from_authority(&authority)?;
         let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
         #[cfg(all(test, feature = "internal-capacity-probes"))]
@@ -112,10 +123,11 @@ impl Session {
 
         let binding = authority.binding()?;
         let process_stop = Arc::new(Stop::default());
-        let process = Process::spawn_role(
-            executable,
-            "--lightroom-source-reader",
+        let process = relay.open(
+            kind,
+            epoch.clone(),
             process_stop.clone(),
+            Instant::now() + Duration::from_millis(open_ms),
         )?;
         Self::admit(
             process,
@@ -133,7 +145,7 @@ impl Session {
         )
     }
     fn admit(
-        process: Process<Reply>,
+        process: impl Into<Transport>,
         process_stop: Arc<Stop>,
         admission: SourceAdmission,
     ) -> Result<Self> {
@@ -153,7 +165,7 @@ impl Session {
         );
         let until = Instant::now() + Duration::from_millis(open_ms);
         let mut session = Self {
-            process,
+            process: process.into(),
             epoch,
             chain: binding.clone(),
             binding,
@@ -408,7 +420,7 @@ impl Session {
             ensure!(Instant::now() < until, "source process exit deadline");
             thread::sleep(Duration::from_millis(5));
         }
-        self.process.terminate();
+        self.process.terminate()?;
         self.retired = true;
         Ok(())
     }
@@ -418,7 +430,7 @@ impl Drop for Session {
         // Scope construction requires this owner outside all consumer SQL and
         // permits. Every error/unwind retains it until that stack has retired.
         let _ = self.retire();
-        self.process.terminate();
+        let _ = self.process.terminate();
     }
 }
 
@@ -430,7 +442,7 @@ pub(crate) struct SqlReader {
 }
 impl SqlReader {
     pub(crate) fn open(
-        executable: &Path,
+        relay: Arc<Client>,
         guard: Guard,
         reader: String,
         seal: InputSeal,
@@ -440,7 +452,7 @@ impl SqlReader {
         memory: MemoryBudget,
     ) -> Result<Self> {
         let session = Session::open(
-            executable,
+            relay,
             Epoch { guard, reader },
             Authority::Sql {
                 seal: seal.clone(),
@@ -580,7 +592,7 @@ pub(crate) struct RawReader {
 }
 impl RawReader {
     pub(crate) fn open(
-        executable: &Path,
+        relay: Arc<Client>,
         guard: Guard,
         reader: String,
         descriptor: ArtifactDescriptor,
@@ -591,7 +603,7 @@ impl RawReader {
     ) -> Result<Self> {
         let encoded = crate::lightroom::bounded_json(&descriptor, 64 * 1024)?;
         let session = Session::open(
-            executable,
+            relay,
             Epoch { guard, reader },
             Authority::Artifact {
                 descriptor: descriptor.clone(),

@@ -9,6 +9,8 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+pub(crate) mod closed_path;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision {
     pub object: String,
@@ -74,6 +76,45 @@ struct PreparedPaths {
 }
 #[cfg(windows)]
 impl PreparedPaths {
+    fn admit(
+        path: &Path,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        prepare: fn(&Path, &mut dyn FnMut(usize) -> Result<()>) -> Result<PathBuf>,
+    ) -> Result<Self> {
+        let count = path.components().count();
+        let current_bytes = path
+            .as_os_str()
+            .len()
+            .checked_add(count)
+            .context("source prefix capacity overflow")?;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<PathBuf>())
+            .and_then(|n| n.checked_add(current_bytes))
+            .and_then(|n| n.checked_add(path.as_os_str().len()))
+            .context("source prefix roster allocation overflow")?;
+        admit(bytes)?;
+        let mut checks = Vec::with_capacity(count);
+        let mut current = std::ffi::OsString::with_capacity(current_bytes);
+        for component in path.components() {
+            // PathBuf::push rebuilds verbatim paths through a temporary component
+            // Vec. Append the borrowed native spelling into our precharged
+            // OsString instead; never collapse an original parent component.
+            if matches!(component, Component::Prefix(_) | Component::RootDir) {
+                current.push(component.as_os_str());
+                continue;
+            }
+            if !current.is_empty() && !current.as_encoded_bytes().ends_with(b"\\") {
+                current.push("\\");
+            }
+            current.push(component.as_os_str());
+            debug_assert!(current.len() <= current_bytes);
+            let prepared = prepare(Path::new(&current), admit)?;
+            PreparedPaths::check(&prepared)?;
+            checks.push(prepared);
+        }
+        let target = prepare(path, admit)?;
+        Ok(Self { checks, target })
+    }
     fn check(path: &Path) -> Result<()> {
         use std::os::windows::fs::MetadataExt;
         let meta = fs::symlink_metadata(path)?;
@@ -178,44 +219,26 @@ impl Source {
         prepare: fn(&Path, &mut dyn FnMut(usize) -> Result<()>) -> Result<PathBuf>,
     ) -> Result<Self> {
         crate::lightroom_migration_worker::identity::before_source_open()?;
-        let count = path.components().count();
-        let current_bytes = path
-            .as_os_str()
-            .len()
-            .checked_add(count)
-            .context("source prefix capacity overflow")?;
-        let bytes = count
-            .checked_mul(std::mem::size_of::<PathBuf>())
-            .and_then(|n| n.checked_add(current_bytes))
-            .and_then(|n| n.checked_add(path.as_os_str().len()))
-            .context("source prefix roster allocation overflow")?;
-        admit(bytes)?;
-        let mut checks = Vec::with_capacity(count);
-        let mut current = std::ffi::OsString::with_capacity(current_bytes);
-        for component in path.components() {
-            // PathBuf::push rebuilds verbatim paths through a temporary component
-            // Vec. Append the borrowed native spelling into our precharged
-            // OsString instead; never collapse an original parent component.
-            if matches!(component, Component::Prefix(_) | Component::RootDir) {
-                current.push(component.as_os_str());
-                continue;
-            }
-            if !current.is_empty() && !current.as_encoded_bytes().ends_with(b"\\") {
-                current.push("\\");
-            }
-            current.push(component.as_os_str());
-            debug_assert!(current.len() <= current_bytes);
-            let prepared = prepare(Path::new(&current), admit)?;
-            PreparedPaths::check(&prepared)?;
-            checks.push(prepared);
-        }
-        let target = prepare(path, admit)?;
+        let prepared = PreparedPaths::admit(path, admit, prepare)?;
+        let target = &prepared.target;
         let metadata = fs::symlink_metadata(&target)?;
         ensure!(metadata.is_file(), "source is not a regular file");
         let file = Self::open_file(&target)?;
         let mut value = Self::from_opened(path, maximum, true, metadata, file)?;
-        value.prepared = Some(PreparedPaths { checks, target });
+        value.prepared = Some(prepared);
         Ok(value)
+    }
+    #[cfg(windows)]
+    pub(crate) fn check_prepared_directory(
+        path: &Path,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        let prepared = PreparedPaths::admit(path, admit, closed_path::file_path)?;
+        ensure!(
+            fs::symlink_metadata(&prepared.target)?.is_dir(),
+            "artifact sealed root is not a directory"
+        );
+        Ok(())
     }
     #[cfg(windows)]
     pub(crate) fn prepared_path(&self) -> &Path {

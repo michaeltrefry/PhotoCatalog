@@ -16,8 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "reader_uri.rs"]
-mod reader_uri;
+use crate::lightroom::source::closed_path as reader_uri;
 #[path = "supplement_json.rs"]
 mod supplement_json;
 

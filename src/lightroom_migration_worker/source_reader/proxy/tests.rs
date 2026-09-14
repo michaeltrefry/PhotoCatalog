@@ -3,7 +3,7 @@ use crate::{
     lightroom::{migration_source::tests::Fixture, source::Source},
     storage_volume::NativePath,
 };
-use std::{fs, process::Command};
+use std::{fs, path::Path, process::Command};
 const FIXTURE: &str = "PHOTOCATALOG_CLOSED_SOURCE_FIXTURE";
 const HELPER: &str =
     "lightroom_migration_worker::source_reader::proxy::tests::owned_source_fixture";
@@ -560,5 +560,81 @@ fn actual_source_opening_allowance_denial_and_retirement_release_charge() -> Res
     assert_eq!(budget.used(), 0);
     assert!(can_write(&fixture.path));
     println!("SOURCE_ALLOWANCE child_pid={pid} charged={charged} reaped=true retired_charge=0");
+    Ok(())
+}
+
+#[test]
+fn raw_opening_shares_sql_allowance_and_retires_only_after_reap() -> Result<()> {
+    let fixture = Fixture::new();
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let bytes = vec![23; 8193];
+    let descriptor = raw_descriptor(&root, &bytes)?;
+    let raw = || Authority::Artifact {
+        descriptor: descriptor.clone(),
+        limits: ArtifactLimits {
+            maximum_bytes: 100_000,
+            open_deadline_ms: 10_000,
+            chunk_deadline_ms: 5000,
+            chunk_bytes: 16_384,
+        }
+        .into(),
+        protected: vec![],
+    };
+    let tiny = MemoryBudget::new(1)?;
+    assert!(
+        session_with_memory(
+            raw(),
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            tiny.clone()
+        )
+        .is_err()
+    );
+    assert_eq!(tiny.used(), 0);
+    assert!(can_write(&root.join("capture.bin")));
+
+    let budget = MemoryBudget::new(8 * 1024 * 1024)?;
+    let mut sql = session_with_memory(
+        Authority::Sql {
+            seal: fixture.seal.clone(),
+            limits: ReadLimits::default().into(),
+            protected: vec![],
+        },
+        Arc::new(AtomicBool::new(false)),
+        10_000,
+        budget.clone(),
+    )?;
+    let sql_charge = budget.used();
+    let mut raw = session_with_memory(
+        raw(),
+        Arc::new(AtomicBool::new(false)),
+        10_000,
+        budget.clone(),
+    )?;
+    let combined = budget.used();
+    assert!(combined > sql_charge && sql_charge > 0);
+    let sql_pid = sql.process.pid();
+    let raw_pid = raw.process.pid();
+    assert!(!can_write(&fixture.path));
+    assert!(!can_write(&root.join("capture.bin")));
+    let Value::Chunk(chunk) = raw.query(Read::ArtifactChunk { offset: U64(0) })? else {
+        anyhow::bail!("raw chunk");
+    };
+    assert_eq!(chunk, bytes);
+    raw.retire()?;
+    assert_eq!(budget.used(), combined);
+    drop(raw);
+    assert_eq!(budget.used(), sql_charge);
+    assert!(can_write(&root.join("capture.bin")));
+    assert!(!can_write(&fixture.path));
+    sql.retire()?;
+    assert_eq!(budget.used(), sql_charge);
+    drop(sql);
+    assert_eq!(budget.used(), 0);
+    assert!(can_write(&fixture.path));
+    println!(
+        "RAW_ALLOWANCE sql_pid={sql_pid} raw_pid={raw_pid} sql_charge={sql_charge} combined={combined} both_reaped=true final_charge=0"
+    );
     Ok(())
 }
