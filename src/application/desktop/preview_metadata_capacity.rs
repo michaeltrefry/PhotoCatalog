@@ -10,7 +10,7 @@ use crate::{
     application::{Config, U64},
     catalog_edits::EditRenderIdentity,
     catalog_metadata::RenderIdentity,
-    catalog_session::{PATH_UNITS, native},
+    catalog_session::{EXPORT_PROFILE_BYTES, PATH_UNITS, native},
     preview::{
         ByteReservation, CacheReadMetrics, Consumer, JobState, PreviewKey, PreviewService,
         PreviewView, Priority, ReadCompletion, RenderRecord, RenderWork, RetainedPixels,
@@ -33,6 +33,11 @@ const RELAY_BYTES: u64 = 1024 * 1024;
 const CHUNK_BYTES: u64 = 16 * 1024;
 const PACKET_ARC_ALLOCATIONS: u64 = 30;
 const LEASE_ID_BYTES: u64 = 36;
+// `Source::revision` formats a Unix u64:u64 object and i64:i64 change pair,
+// or a Windows u64:u128 object and i64 change value. These are the portable
+// maximum decimal characters, including separators.
+const SOURCE_REVISION_OBJECT_BYTES: u64 = 20 + 1 + 39;
+const SOURCE_REVISION_CHANGED_BYTES: u64 = 20 + 1 + 20;
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -870,6 +875,112 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
         ])?,
     )?;
+    // The serial export worker owns at most one profile transfer. Its cache and
+    // the in-progress assembly share the existing 32 MiB quota: before token
+    // publication, the assembly occupies the unused cache allowance. Eight
+    // Vec backings cover either eight cached entries or seven plus assembly.
+    let profile_total = c.mul(2, EXPORT_PROFILE_BYTES as u64)?;
+    let profile_vectors = c.add(&[c.mul(2, profile_total)?, c.mul(8, 8)?])?;
+    let (profile_entry_size, profile_entry_align) =
+        crate::application::exports::profile_cache_entry_layout();
+    a.push(
+        "retained.export_profile_cache_and_assembly_backings",
+        Phase::Retained,
+        1,
+        c.add(&[
+            c.table(
+                Layout {
+                    size: u64::try_from(profile_entry_size)?,
+                    align: u64::try_from(profile_entry_align)?,
+                },
+                8,
+            )?,
+            c.mul(
+                8,
+                c.add(&[
+                    c.mul(2, LEASE_ID_BYTES)?,
+                    c.mul(3, PATH_UNITS as u64)?,
+                    64,
+                    c.arc(Layout::of::<Vec<u8>>())?,
+                ])?,
+            )?,
+            profile_vectors,
+        ])?,
+    )?;
+    let profile_result_backing = c.add(&[LEASE_ID_BYTES, c.mul(3, PATH_UNITS as u64)?, 64])?;
+    a.push(
+        "retained.export_profile_status_result_backing",
+        Phase::Retained,
+        1,
+        profile_result_backing,
+    )?;
+    a.push(
+        "active.export_profile_status_query_clone_backing",
+        Phase::Active,
+        1,
+        profile_result_backing,
+    )?;
+    // `output_profile` temporarily owns the request clone and returned ICC
+    // clone while the quota-backed assembly remains live.
+    a.push(
+        "active.export_profile_lcms_clone_backings",
+        Phase::Active,
+        2,
+        c.vec(1, EXPORT_PROFILE_BYTES as u64)?,
+    )?;
+    let profile_request = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Operation>().size,
+        Layout::of::<crate::catalog_session::ExportProfileRequest>().size,
+        c.mul(4, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+    ])?;
+    let profile_reply = c.add(&[
+        Layout::of::<crate::filesystem_worker::wire::Response>().size,
+        c.mul(4, LEASE_ID_BYTES)?,
+        c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+        64,
+        c.vec(1, CHUNK_BYTES)?,
+    ])?;
+    a.push(
+        "active.export_profile_f_typed_graphs",
+        Phase::Active,
+        1,
+        c.add(&[profile_request, profile_request.max(profile_reply)])?,
+    )?;
+    let (transfer_size, _) = crate::filesystem_worker::export_profile_transfer_layout();
+    a.push(
+        "active.export_profile_f_retained_transfer",
+        Phase::Active,
+        1,
+        c.add(&[
+            u64::try_from(transfer_size)?,
+            c.mul(2, LEASE_ID_BYTES)?,
+            c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+            c.vec(1, SOURCE_REVISION_OBJECT_BYTES)?,
+            c.vec(1, SOURCE_REVISION_CHANGED_BYTES)?,
+        ])?,
+    )?;
+    a.push(
+        "active.export_profile_f_begin_path_backings",
+        Phase::Active,
+        1,
+        c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
+    )?;
+    a.push(
+        "active.export_profile_c_caller_request_backing",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(4, LEASE_ID_BYTES)?,
+            c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+        ])?,
+    )?;
+    a.push(
+        "active.export_profile_worker_requested_path_backing",
+        Phase::Active,
+        1,
+        c.vec(2, PATH_UNITS as u64)?,
+    )?;
     for (name, count) in [
         ("relay.parent_fault_backing", 1),
         ("relay.child_fault_backing", 1),
@@ -1110,6 +1221,58 @@ mod tests {
                 Checked.mul(3, LEASE_ID_BYTES)?,
                 Checked.mul(2, Checked.vec(2, PATH_UNITS as u64)?)?,
             ])?
+        );
+        let profile_cache = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.export_profile_cache_and_assembly_backings")
+            .unwrap();
+        assert_eq!(profile_cache.phase, Phase::Retained);
+        assert_eq!(profile_cache.count, 1);
+        let profile_clones = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "active.export_profile_lcms_clone_backings")
+            .unwrap();
+        assert_eq!(profile_clones.phase, Phase::Active);
+        assert_eq!(profile_clones.count, 2);
+        assert_eq!(
+            profile_clones.each,
+            Checked.vec(1, EXPORT_PROFILE_BYTES as u64)?
+        );
+        let profile_transfer = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "active.export_profile_f_retained_transfer")
+            .unwrap();
+        assert_eq!(profile_transfer.phase, Phase::Active);
+        assert_eq!(profile_transfer.count, 1);
+        assert_eq!(
+            profile_transfer.each,
+            Checked.add(&[
+                u64::try_from(crate::filesystem_worker::export_profile_transfer_layout().0)?,
+                Checked.mul(2, LEASE_ID_BYTES)?,
+                Checked.mul(2, Checked.vec(2, PATH_UNITS as u64)?)?,
+                Checked.vec(1, SOURCE_REVISION_OBJECT_BYTES)?,
+                Checked.vec(1, SOURCE_REVISION_CHANGED_BYTES)?,
+            ])?
+        );
+        let profile_status = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.export_profile_status_result_backing")
+            .unwrap();
+        let profile_status_clone = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "active.export_profile_status_query_clone_backing")
+            .unwrap();
+        assert_eq!(profile_status.phase, Phase::Retained);
+        assert_eq!(profile_status_clone.phase, Phase::Active);
+        assert_eq!(profile_status.each, profile_status_clone.each);
+        assert_eq!(
+            profile_status.each,
+            Checked.add(&[LEASE_ID_BYTES, Checked.mul(3, PATH_UNITS as u64)?, 64,])?
         );
         default.preview_limits.working_bytes = 1;
         assert_eq!(report(&default)?.requested, default_report.requested);

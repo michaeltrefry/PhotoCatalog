@@ -21,6 +21,12 @@ struct Facts {
     fatal_drop_sentry: bool,
     export_directory: NativePath,
     export_requests: Arc<Mutex<Vec<PrepareExportDirectory>>>,
+    export_profile: Mutex<Vec<u8>>,
+    export_profile_requests: Arc<Mutex<Vec<ExportProfileRequest>>>,
+    cancel_profile_after_begin: AtomicBool,
+    fail_profile_begin_reply: AtomicBool,
+    fail_profile_finish_reply: AtomicBool,
+    fail_profile_abort: AtomicBool,
 }
 impl Facts {
     fn create(base: &Path) -> Result<(Arc<Self>, PrepareCatalog)> {
@@ -95,6 +101,12 @@ impl Facts {
                 fatal_drop_sentry: false,
                 export_directory: NativePath::from_path(&export_directory),
                 export_requests: Arc::new(Mutex::new(Vec::new())),
+                export_profile: Mutex::new(Vec::new()),
+                export_profile_requests: Arc::new(Mutex::new(Vec::new())),
+                cancel_profile_after_begin: AtomicBool::new(false),
+                fail_profile_begin_reply: AtomicBool::new(false),
+                fail_profile_finish_reply: AtomicBool::new(false),
+                fail_profile_abort: AtomicBool::new(false),
             }),
             request,
         ))
@@ -108,6 +120,82 @@ impl Drop for Facts {
     }
 }
 impl CatalogFilesystem for Facts {
+    fn export_profile_call(
+        &self,
+        request: &ExportProfileRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportProfileReply> {
+        request.validate()?;
+        self.export_profile_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if cancel.load(Ordering::Acquire) && !request.cleanup() {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Canceled,
+                "synthetic export profile cancellation",
+            )
+            .into());
+        }
+        if request.cleanup() && self.fail_profile_abort.load(Ordering::Acquire) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                "synthetic lost export profile abort",
+            )
+            .into());
+        }
+        let profile = self.export_profile.lock().unwrap();
+        let value = match &request.action {
+            ExportProfileAction::Begin => {
+                if self.cancel_profile_after_begin.load(Ordering::Acquire) {
+                    cancel.store(true, Ordering::Release);
+                }
+                if self.fail_profile_begin_reply.load(Ordering::Acquire) {
+                    return Err(crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        "synthetic lost export profile begin reply",
+                    )
+                    .into());
+                }
+                ExportProfileValue::Begun {
+                    bytes: U64(profile.len() as u64),
+                }
+            }
+            ExportProfileAction::Read { offset } => {
+                let start = usize::try_from(offset.0)?;
+                let end = profile
+                    .len()
+                    .min(start + crate::catalog_session::preview_io::CHUNK_BYTES);
+                ensure!(start < end, "synthetic profile offset");
+                let bytes = profile[start..end].to_vec();
+                ExportProfileValue::Chunk {
+                    offset: *offset,
+                    checksum: blake3::hash(&bytes).to_hex().to_string(),
+                    bytes,
+                }
+            }
+            ExportProfileAction::Finish => {
+                if self.fail_profile_finish_reply.load(Ordering::Acquire) {
+                    return Err(crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        "synthetic lost export profile finish reply",
+                    )
+                    .into());
+                }
+                ExportProfileValue::Finished {
+                    bytes: U64(profile.len() as u64),
+                }
+            }
+            ExportProfileAction::Abort => ExportProfileValue::Aborted,
+        };
+        Ok(ExportProfileReply {
+            root: request.root.clone(),
+            requested: request.requested.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            value,
+        })
+    }
     fn prepare_export_directory(
         &self,
         request: &PrepareExportDirectory,
@@ -621,6 +709,33 @@ pub(crate) fn export_managed_session(
     let directory = NativePath::from_path(&export_directory.canonicalize()?);
     let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
     Ok((session, requests, directory))
+}
+
+pub(crate) fn export_profile_managed_session(
+    base: &Path,
+    profile: Vec<u8>,
+    cancel_after_begin: bool,
+    fail_begin_reply: bool,
+    fail_finish_reply: bool,
+    fail_abort: bool,
+) -> Result<(ManagedSession, Arc<Mutex<Vec<ExportProfileRequest>>>)> {
+    let (facts, request) = Facts::create(base)?;
+    *facts.export_profile.lock().unwrap() = profile;
+    facts
+        .cancel_profile_after_begin
+        .store(cancel_after_begin, Ordering::Release);
+    facts
+        .fail_profile_begin_reply
+        .store(fail_begin_reply, Ordering::Release);
+    facts
+        .fail_profile_finish_reply
+        .store(fail_finish_reply, Ordering::Release);
+    facts
+        .fail_profile_abort
+        .store(fail_abort, Ordering::Release);
+    let requests = facts.export_profile_requests.clone();
+    let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
+    Ok((session, requests))
 }
 
 #[test]

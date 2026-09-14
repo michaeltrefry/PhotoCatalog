@@ -2,7 +2,8 @@
 use crate::{
     catalog_backup::{self, RestoreStatus},
     catalog_session::{
-        BootstrapMode, CatalogBootstrap, ConfirmSqlAdmission, LeaseId, PinnedDatabase,
+        BootstrapMode, CatalogBootstrap, ConfirmSqlAdmission, ExportProfileAction,
+        ExportProfileReply, ExportProfileRequest, ExportProfileValue, LeaseId, PinnedDatabase,
         PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
         validate_path,
     },
@@ -12,6 +13,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::{self, File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -46,6 +48,35 @@ struct RootRecord {
     store: super::store::StoreOwner,
     objects: super::preview_io::ObjectOwner,
     stages: super::preview_stage::Owner,
+    export_profile: Option<ExportProfileTransfer>,
+    export_profile_terminal: Option<ExportProfileTerminal>,
+}
+struct ExportProfileTransfer {
+    requested: NativePath,
+    transfer: LeaseId,
+    next_step: u64,
+    allowance: u64,
+    offset: u64,
+    source: crate::lightroom::source::Source,
+}
+struct ExportProfileTerminal {
+    requested: NativePath,
+    transfer: LeaseId,
+    step: u64,
+    allowance: u64,
+    value: ExportProfileTerminalValue,
+}
+enum ExportProfileTerminalValue {
+    Finished { bytes: u64 },
+    Aborted,
+}
+pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Option<ExportProfileTransfer>>()
+            + std::mem::size_of::<Option<ExportProfileTerminal>>(),
+        std::mem::align_of::<Option<ExportProfileTransfer>>()
+            .max(std::mem::align_of::<Option<ExportProfileTerminal>>()),
+    )
 }
 struct ManifestLock(File);
 impl ManifestLock {
@@ -252,6 +283,8 @@ impl BootstrapOwner {
             store: super::store::StoreOwner::default(),
             objects: super::preview_io::ObjectOwner::default(),
             stages: super::preview_stage::Owner::default(),
+            export_profile: None,
+            export_profile_terminal: None,
         };
         record.verify_root_binding()?;
         self.record = Some(record);
@@ -326,6 +359,10 @@ impl BootstrapOwner {
             ensure!(
                 record.stages.empty(),
                 "worker stages/native/output owners have not drained"
+            );
+            ensure!(
+                record.export_profile.is_none(),
+                "export profile transfer has not drained"
             );
             record.objects.drain();
             record.store.release()?;
@@ -489,6 +526,216 @@ impl BootstrapOwner {
             })
         })
     }
+    pub fn export_profile_call(
+        &mut self,
+        request: &ExportProfileRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportProfileReply> {
+        request.validate()?;
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "export profile read requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("export profile catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "export profile session mismatch"
+        );
+        record.verify_root_binding()?;
+        let result = (|| -> Result<ExportProfileValue> {
+            let value = match &request.action {
+                ExportProfileAction::Begin => {
+                    profile_cancel(cancel)?;
+                    ensure!(
+                        record.export_profile.is_none(),
+                        "export profile transfer already active"
+                    );
+                    let path = request.requested.to_path()?;
+                    let parent = path
+                        .parent()
+                        .context("profile parent required")?
+                        .canonicalize()?;
+                    let normalized =
+                        parent.join(path.file_name().context("profile filename required")?);
+                    let source = crate::lightroom::source::Source::open(&normalized, u64::MAX)?;
+                    if source.before.bytes > request.allowance.0 {
+                        return Err(anyhow::Error::new(super::wire::Failure::new(
+                            super::wire::FailureKind::ResourceLimit,
+                            "ICC source exceeds the available profile byte allowance",
+                        )));
+                    }
+                    let bytes = source.before.bytes;
+                    record.export_profile_terminal = None;
+                    record.export_profile = Some(ExportProfileTransfer {
+                        requested: request.requested.clone(),
+                        transfer: request.transfer.clone(),
+                        next_step: 1,
+                        allowance: request.allowance.0,
+                        offset: 0,
+                        source,
+                    });
+                    ExportProfileValue::Begun {
+                        bytes: crate::application::U64(bytes),
+                    }
+                }
+                action => {
+                    if record.export_profile.is_none() {
+                        let terminal = record
+                            .export_profile_terminal
+                            .as_mut()
+                            .context("export profile transfer is not retained")?;
+                        ensure!(
+                            terminal.requested == request.requested
+                                && terminal.transfer == request.transfer
+                                && terminal.allowance == request.allowance.0,
+                            "export profile terminal provenance mismatch"
+                        );
+                        return match (&mut terminal.value, action) {
+                            (
+                                ExportProfileTerminalValue::Finished { bytes },
+                                ExportProfileAction::Finish,
+                            ) => {
+                                ensure!(
+                                    terminal.step == request.step.0,
+                                    "export profile terminal step mismatch"
+                                );
+                                Ok(ExportProfileValue::Finished {
+                                    bytes: crate::application::U64(*bytes),
+                                })
+                            }
+                            (
+                                ExportProfileTerminalValue::Finished { .. },
+                                ExportProfileAction::Abort,
+                            ) => {
+                                ensure!(
+                                    terminal.step.checked_add(1) == Some(request.step.0),
+                                    "export profile terminal abort step mismatch"
+                                );
+                                terminal.step = request.step.0;
+                                terminal.value = ExportProfileTerminalValue::Aborted;
+                                Ok(ExportProfileValue::Aborted)
+                            }
+                            (ExportProfileTerminalValue::Aborted, ExportProfileAction::Abort) => {
+                                ensure!(
+                                    terminal.step == request.step.0,
+                                    "export profile terminal step mismatch"
+                                );
+                                Ok(ExportProfileValue::Aborted)
+                            }
+                            _ => anyhow::bail!("export profile terminal action mismatch"),
+                        };
+                    }
+                    let transfer = record
+                        .export_profile
+                        .as_mut()
+                        .context("export profile transfer is not retained")?;
+                    ensure!(
+                        transfer.requested == request.requested
+                            && transfer.transfer == request.transfer
+                            && transfer.allowance == request.allowance.0,
+                        "export profile transfer provenance mismatch"
+                    );
+                    if !matches!(action, ExportProfileAction::Abort) {
+                        ensure!(
+                            transfer.next_step == request.step.0,
+                            "export profile step mismatch"
+                        );
+                        transfer.next_step = transfer
+                            .next_step
+                            .checked_add(1)
+                            .context("export profile step exhausted")?;
+                    }
+                    match action {
+                        ExportProfileAction::Read { offset } => {
+                            profile_cancel(cancel)?;
+                            ensure!(
+                                offset.0 == transfer.offset
+                                    && transfer.offset < transfer.source.before.bytes,
+                                "export profile read offset mismatch"
+                            );
+                            let remaining = transfer.source.before.bytes - transfer.offset;
+                            let length = usize::try_from(
+                                remaining
+                                    .min(crate::catalog_session::preview_io::CHUNK_BYTES as u64),
+                            )?;
+                            let mut bytes = vec![0; length];
+                            transfer.source.file.read_exact(&mut bytes)?;
+                            profile_cancel(cancel)?;
+                            let value = ExportProfileValue::Chunk {
+                                offset: *offset,
+                                checksum: blake3::hash(&bytes).to_hex().to_string(),
+                                bytes,
+                            };
+                            transfer.offset += length as u64;
+                            value
+                        }
+                        ExportProfileAction::Finish => {
+                            profile_cancel(cancel)?;
+                            ensure!(
+                                transfer.offset == transfer.source.before.bytes,
+                                "export profile finished before all bytes were read"
+                            );
+                            let mut extra = [0];
+                            ensure!(
+                                transfer.source.file.read(&mut extra)? == 0,
+                                "ICC changed size"
+                            );
+                            transfer.source.verify()?;
+                            profile_cancel(cancel)?;
+                            let bytes = transfer.source.before.bytes;
+                            let transfer = record.export_profile.take().expect("retained transfer");
+                            record.export_profile_terminal = Some(ExportProfileTerminal {
+                                requested: transfer.requested,
+                                transfer: transfer.transfer,
+                                step: request.step.0,
+                                allowance: transfer.allowance,
+                                value: ExportProfileTerminalValue::Finished { bytes },
+                            });
+                            ExportProfileValue::Finished {
+                                bytes: crate::application::U64(bytes),
+                            }
+                        }
+                        ExportProfileAction::Abort => {
+                            // Cancellation can be observed before the preceding
+                            // request reaches F or after F advances its step.
+                            // The serial caller's cleanup is therefore either
+                            // the retained next step or exactly one beyond it.
+                            ensure!(
+                                request.step.0 == transfer.next_step
+                                    || transfer.next_step.checked_add(1) == Some(request.step.0),
+                                "export profile abort step mismatch"
+                            );
+                            let transfer = record.export_profile.take().expect("retained transfer");
+                            record.export_profile_terminal = Some(ExportProfileTerminal {
+                                requested: transfer.requested,
+                                transfer: transfer.transfer,
+                                step: request.step.0,
+                                allowance: transfer.allowance,
+                                value: ExportProfileTerminalValue::Aborted,
+                            });
+                            ExportProfileValue::Aborted
+                        }
+                        ExportProfileAction::Begin => unreachable!(),
+                    }
+                }
+            };
+            Ok(value)
+        })();
+        record.verify_root_binding()?;
+        let value = result?;
+        Ok(ExportProfileReply {
+            root: request.root.clone(),
+            requested: request.requested.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            value,
+        })
+    }
     fn with_root<T>(
         &self,
         root: &RootCapability,
@@ -551,6 +798,15 @@ fn export_cancel(cancel: &AtomicBool) -> Result<()> {
         return Err(anyhow::Error::new(super::wire::Failure::new(
             super::wire::FailureKind::Canceled,
             "export directory preparation canceled",
+        )));
+    }
+    Ok(())
+}
+fn profile_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(anyhow::Error::new(super::wire::Failure::new(
+            super::wire::FailureKind::Canceled,
+            "export profile read canceled",
         )));
     }
     Ok(())

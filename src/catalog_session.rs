@@ -3,12 +3,13 @@
 //! Scalar observations are evidence supplied by the filesystem owner. They do
 //! not themselves construct a catalog authority or authorize a SQL statement.
 use crate::{application::U64, catalog_backup::RestoreStatus, storage_volume::NativePath};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 use std::sync::atomic::AtomicBool;
 
 pub const PATH_UNITS: usize = 32_768;
 pub const ENVELOPE_BYTES: usize = 1024 * 1024;
+pub const EXPORT_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The same native observation shape applies to a database or a directory.
 /// Windows deliberately preserves the existing volume serial / 64-bit index.
@@ -281,6 +282,147 @@ impl PreparedExportDirectory {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "action",
+    content = "arguments",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExportProfileAction {
+    Begin,
+    Read { offset: U64 },
+    Finish,
+    Abort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportProfileRequest {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub transfer: LeaseId,
+    pub step: U64,
+    pub allowance: U64,
+    pub action: ExportProfileAction,
+}
+impl ExportProfileRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        validate_path(&self.requested)?;
+        ensure!(
+            (1..=EXPORT_PROFILE_BYTES as u64).contains(&self.allowance.0),
+            "export profile allowance"
+        );
+        ensure!(
+            matches!(&self.action, ExportProfileAction::Begin) == (self.step.0 == 0),
+            "export profile begin/step mismatch"
+        );
+        if let ExportProfileAction::Read { offset } = &self.action {
+            ensure!(offset.0 < self.allowance.0, "export profile offset limit");
+        }
+        Ok(())
+    }
+    pub fn cleanup(&self) -> bool {
+        matches!(self.action, ExportProfileAction::Abort)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ExportProfileValue {
+    Begun {
+        bytes: U64,
+    },
+    Chunk {
+        offset: U64,
+        checksum: String,
+        #[serde(skip)]
+        bytes: Vec<u8>,
+    },
+    Finished {
+        bytes: U64,
+    },
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportProfileReply {
+    pub root: RootCapability,
+    pub requested: NativePath,
+    pub transfer: LeaseId,
+    pub step: U64,
+    pub value: ExportProfileValue,
+}
+impl ExportProfileReply {
+    pub fn binary(&self) -> Option<&[u8]> {
+        match &self.value {
+            ExportProfileValue::Chunk { bytes, .. } => Some(bytes),
+            _ => None,
+        }
+    }
+    pub fn set_binary(&mut self, value: &[u8]) -> Result<()> {
+        match &mut self.value {
+            ExportProfileValue::Chunk { bytes, .. } => {
+                ensure!(
+                    !value.is_empty() && value.len() <= preview_io::CHUNK_BYTES,
+                    "export profile chunk admission"
+                );
+                *bytes = value.to_vec();
+            }
+            _ => ensure!(value.is_empty(), "unexpected export profile binary reply"),
+        }
+        Ok(())
+    }
+    pub fn validate(&self, request: &ExportProfileRequest) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            self.root == request.root
+                && self.requested == request.requested
+                && self.transfer == request.transfer
+                && self.step == request.step,
+            "export profile reply provenance mismatch"
+        );
+        match (&request.action, &self.value) {
+            (ExportProfileAction::Begin, ExportProfileValue::Begun { bytes }) => {
+                ensure!(bytes.0 <= request.allowance.0, "export profile byte limit");
+                Ok(())
+            }
+            (
+                ExportProfileAction::Read { offset: expected },
+                ExportProfileValue::Chunk {
+                    offset,
+                    checksum,
+                    bytes,
+                },
+            ) => {
+                ensure!(
+                    offset == expected
+                        && !bytes.is_empty()
+                        && bytes.len() <= preview_io::CHUNK_BYTES
+                        && blake3::hash(bytes).to_hex().as_str() == checksum,
+                    "export profile chunk mismatch"
+                );
+                Ok(())
+            }
+            (ExportProfileAction::Finish, ExportProfileValue::Finished { bytes }) => {
+                ensure!(bytes.0 <= request.allowance.0, "export profile byte limit");
+                Ok(())
+            }
+            (ExportProfileAction::Abort, ExportProfileValue::Aborted) => Ok(()),
+            _ => anyhow::bail!("unexpected export profile reply"),
+        }
+    }
+}
+
 pub mod native;
 pub mod preview_io;
 pub mod preview_stage;
@@ -333,6 +475,13 @@ pub trait CatalogFilesystem: Send + Sync {
         _cancel: &AtomicBool,
     ) -> Result<PreparedExportDirectory> {
         anyhow::bail!("filesystem owner does not support export directory preparation")
+    }
+    fn export_profile_call(
+        &self,
+        _request: &ExportProfileRequest,
+        _cancel: &AtomicBool,
+    ) -> Result<ExportProfileReply> {
+        anyhow::bail!("filesystem owner does not support export profile reads")
     }
     /// A lost reply is recovered by the original operation identity inside the
     /// client. Never repeat Prepare/creation. An error/cancel can still leave an
@@ -451,6 +600,100 @@ impl CatalogSessionAuthority {
                 Ok(Some(prepared.directory))
             }
         }
+    }
+    pub(crate) fn read_export_profile(
+        &self,
+        requested: &NativePath,
+        allowance: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<u8>>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let transfer = LeaseId::new();
+        let mut step = 0u64;
+        let result = (|| {
+            let request = ExportProfileRequest {
+                root: root.clone(),
+                requested: requested.clone(),
+                transfer: transfer.clone(),
+                step: U64(step),
+                allowance: U64(allowance),
+                action: ExportProfileAction::Begin,
+            };
+            let reply = filesystem.export_profile_call(&request, cancel)?;
+            reply.validate(&request)?;
+            let ExportProfileValue::Begun { bytes: total } = reply.value else {
+                unreachable!()
+            };
+            let length = usize::try_from(total.0)?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(length)?;
+            let mut offset = 0usize;
+            while offset < length {
+                step = step
+                    .checked_add(1)
+                    .context("export profile step exhausted")?;
+                let request = ExportProfileRequest {
+                    root: root.clone(),
+                    requested: requested.clone(),
+                    transfer: transfer.clone(),
+                    step: U64(step),
+                    allowance: U64(allowance),
+                    action: ExportProfileAction::Read {
+                        offset: U64(offset as u64),
+                    },
+                };
+                let reply = filesystem.export_profile_call(&request, cancel)?;
+                reply.validate(&request)?;
+                let ExportProfileValue::Chunk { bytes: chunk, .. } = reply.value else {
+                    unreachable!()
+                };
+                ensure!(
+                    chunk.len() <= length - offset,
+                    "export profile exceeds declared length"
+                );
+                offset += chunk.len();
+                bytes.extend_from_slice(&chunk);
+            }
+            step = step
+                .checked_add(1)
+                .context("export profile step exhausted")?;
+            let request = ExportProfileRequest {
+                root: root.clone(),
+                requested: requested.clone(),
+                transfer: transfer.clone(),
+                step: U64(step),
+                allowance: U64(allowance),
+                action: ExportProfileAction::Finish,
+            };
+            let reply = filesystem.export_profile_call(&request, cancel)?;
+            reply.validate(&request)?;
+            let ExportProfileValue::Finished { bytes: finished } = reply.value else {
+                unreachable!()
+            };
+            ensure!(finished == total, "export profile finish length changed");
+            Ok(bytes)
+        })();
+        if result.is_err() {
+            if let Some(abort_step) = step.checked_add(1) {
+                let request = ExportProfileRequest {
+                    root: root.clone(),
+                    requested: requested.clone(),
+                    transfer,
+                    step: U64(abort_step),
+                    allowance: U64(allowance),
+                    action: ExportProfileAction::Abort,
+                };
+                if let Ok(reply) = filesystem.export_profile_call(&request, cancel) {
+                    let _ = reply.validate(&request);
+                }
+            }
+        }
+        result.map(Some)
     }
     pub(crate) fn require_jobs_released(&self, legacy_root: &Path) -> Result<()> {
         if matches!(&self.mode, AuthorityMode::Legacy(_)) {
@@ -943,7 +1186,9 @@ impl Drop for ManagedSession {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::{export_managed_session, retained_admission, unused_filesystem};
+pub(crate) use tests::{
+    export_managed_session, export_profile_managed_session, retained_admission, unused_filesystem,
+};
 
 #[cfg(test)]
 pub(crate) mod overlap_tests;

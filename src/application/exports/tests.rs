@@ -229,7 +229,7 @@ fn bounded_job_pages_and_exact_frozen_plan_chunks() -> anyhow::Result<()> {
 }
 #[test]
 fn profile_tokens_are_rgb_validated_bounded_and_native_links_rejected() -> anyhow::Result<()> {
-    let temp = tempfile::tempdir()?;
+    let (temp, catalog) = fixture()?;
     let p = temp.path().join("output.icc");
     let bytes = lcms2::Profile::new_srgb().icc()?;
     std::fs::write(&p, &bytes)?;
@@ -238,7 +238,8 @@ fn profile_tokens_are_rgb_validated_bounded_and_native_links_rejected() -> anyho
         cache: Default::default(),
         config: config(),
     };
-    let ResultValue::Profile(info) = worker::profile(&ctx, &NativePath::from_path(&p))? else {
+    let ResultValue::Profile(info) = worker::profile(&ctx, &catalog, &NativePath::from_path(&p))?
+    else {
         panic!()
     };
     assert_eq!(info.bytes, U64(bytes.len() as u64));
@@ -272,13 +273,141 @@ fn profile_tokens_are_rgb_validated_bounded_and_native_links_rejected() -> anyho
         .is_err()
     );
     std::fs::write(&p, b"not an ICC")?;
-    assert!(worker::profile(&ctx, &NativePath::from_path(&p)).is_err());
+    assert!(worker::profile(&ctx, &catalog, &NativePath::from_path(&p)).is_err());
     #[cfg(unix)]
     {
         let link = temp.path().join("alias.icc");
         std::os::unix::fs::symlink(&p, &link)?;
-        assert!(worker::profile(&ctx, &NativePath::from_path(&link)).is_err());
+        assert!(worker::profile(&ctx, &catalog, &NativePath::from_path(&link)).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn managed_profile_uses_authority_bytes_and_never_admits_partial_or_invalid_content()
+-> anyhow::Result<()> {
+    use crate::catalog_session::{ExportProfileAction, export_profile_managed_session};
+
+    let temp = tempfile::tempdir()?;
+    let bytes = lcms2::Profile::new_srgb().icc()?;
+    let requested = NativePath::from_path(&temp.path().join("caller-profile-does-not-exist.icc"));
+    let (mut session, requests) =
+        export_profile_managed_session(temp.path(), bytes.clone(), false, false, false, false)?;
+    let ctx = worker::Context {
+        control: Default::default(),
+        cache: Default::default(),
+        config: config(),
+    };
+    let catalog = session.catalog.as_ref().unwrap();
+    let ResultValue::Profile(info) = worker::profile(&ctx, catalog, &requested)? else {
+        panic!("profile result")
+    };
+    assert_eq!(info.name, "caller-profile-does-not-exist.icc");
+    assert_eq!(info.bytes, U64(bytes.len() as u64));
+    assert_eq!(info.blake3, blake3::hash(&bytes).to_hex().as_str());
+    assert!(!info.linear);
+    assert_eq!(
+        ctx.cache.lock().unwrap().profiles[&info.token]
+            .bytes
+            .as_slice(),
+        bytes.as_slice()
+    );
+    let calls = requests.lock().unwrap();
+    assert!(matches!(
+        calls.first().unwrap().action,
+        ExportProfileAction::Begin
+    ));
+    assert!(matches!(
+        calls.last().unwrap().action,
+        ExportProfileAction::Finish
+    ));
+    assert!(calls.iter().all(|r| r.requested == requested));
+    drop(calls);
+    session.close()?;
+
+    let invalid = tempfile::tempdir()?;
+    let (mut session, _) = export_profile_managed_session(
+        invalid.path(),
+        b"not an ICC".to_vec(),
+        false,
+        false,
+        false,
+        false,
+    )?;
+    let ctx = worker::Context {
+        control: Default::default(),
+        cache: Default::default(),
+        config: config(),
+    };
+    assert!(worker::profile(&ctx, session.catalog.as_ref().unwrap(), &requested).is_err());
+    assert!(ctx.cache.lock().unwrap().profiles.is_empty());
+    session.close()?;
+
+    let canceled = tempfile::tempdir()?;
+    let (mut session, requests) = export_profile_managed_session(
+        canceled.path(),
+        vec![7; 32 * 1024],
+        true,
+        false,
+        false,
+        true,
+    )?;
+    let ctx = worker::Context {
+        control: Default::default(),
+        cache: Default::default(),
+        config: config(),
+    };
+    assert!(worker::profile(&ctx, session.catalog.as_ref().unwrap(), &requested).is_err());
+    assert!(ctx.cache.lock().unwrap().profiles.is_empty());
+    assert!(matches!(
+        requests.lock().unwrap().last().unwrap().action,
+        ExportProfileAction::Abort
+    ));
+    session.close()?;
+
+    let lost = tempfile::tempdir()?;
+    let (mut session, requests) =
+        export_profile_managed_session(lost.path(), vec![9; 32 * 1024], false, true, false, true)?;
+    let ctx = worker::Context {
+        control: Default::default(),
+        cache: Default::default(),
+        config: config(),
+    };
+    assert!(worker::profile(&ctx, session.catalog.as_ref().unwrap(), &requested).is_err());
+    assert!(ctx.cache.lock().unwrap().profiles.is_empty());
+    let requests = requests.lock().unwrap();
+    assert!(matches!(
+        requests.first().unwrap().action,
+        ExportProfileAction::Begin
+    ));
+    assert!(matches!(
+        requests.last().unwrap().action,
+        ExportProfileAction::Abort
+    ));
+    drop(requests);
+    session.close()?;
+
+    let lost_finish = tempfile::tempdir()?;
+    let (mut session, requests) =
+        export_profile_managed_session(lost_finish.path(), bytes, false, false, true, true)?;
+    let ctx = worker::Context {
+        control: Default::default(),
+        cache: Default::default(),
+        config: config(),
+    };
+    assert!(worker::profile(&ctx, session.catalog.as_ref().unwrap(), &requested).is_err());
+    assert!(ctx.cache.lock().unwrap().profiles.is_empty());
+    let requests = requests.lock().unwrap();
+    assert!(matches!(
+        requests[requests.len() - 2].action,
+        ExportProfileAction::Finish
+    ));
+    assert!(matches!(
+        requests.last().unwrap().action,
+        ExportProfileAction::Abort
+    ));
+    drop(requests);
+    session.close()?;
     Ok(())
 }
 #[test]

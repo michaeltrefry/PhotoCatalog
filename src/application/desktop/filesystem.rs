@@ -5,9 +5,9 @@ use crate::{
     application::U64,
     catalog_backup::RestoreStatus,
     catalog_session::{
-        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, LeaseId, PrepareCatalog,
-        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
-        store,
+        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportProfileReply,
+        ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, store,
     },
     filesystem_worker::{
         client::Client,
@@ -59,6 +59,7 @@ pub(super) enum Call {
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
+    ExportProfile(Box<ExportProfileRequest>),
 }
 impl Call {
     fn cleanup(&self) -> bool {
@@ -66,6 +67,7 @@ impl Call {
             || matches!(self, Self::PreviewStore(request) if request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if request.cleanup())
             || matches!(self, Self::PreviewStage(request) if request.cleanup())
+            || matches!(self, Self::ExportProfile(request) if request.cleanup())
     }
     fn cancellable(&self) -> bool {
         matches!(
@@ -77,6 +79,7 @@ impl Call {
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
+            || matches!(self, Self::ExportProfile(request) if !request.cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -112,6 +115,7 @@ impl Call {
             }
             Self::ReadPreviewConfiguration(path) => store::path(path),
             Self::PrepareExportDirectory(request) => request.validate(),
+            Self::ExportProfile(request) => request.validate(),
             _ => Ok(()),
         }
     }
@@ -123,6 +127,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
+        std::mem::size_of::<ExportProfileRequest>(),
     ]
     .into_iter()
     .max()
@@ -144,6 +149,7 @@ pub(super) enum Value {
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
     ExportDirectory(PreparedExportDirectory),
+    ExportProfile(ExportProfileReply),
     Unit,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -461,6 +467,10 @@ fn encode_packet(packet: &Packet, cap: usize) -> Result<Vec<u8>> {
             outcome: Ok(Value::PreviewIo(r)),
             ..
         } => r.binary(),
+        Body::Reply {
+            outcome: Ok(Value::ExportProfile(r)),
+            ..
+        } => r.binary(),
         _ => return encode(packet, cap),
     };
     crate::catalog_session::preview_io::pack(packet, binary, cap)
@@ -493,6 +503,10 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
         } => r.set_binary(binary.to_vec())?,
         Body::Reply {
             outcome: Ok(Value::PreviewIo(r)),
+            ..
+        } => r.set_binary(binary)?,
+        Body::Reply {
+            outcome: Ok(Value::ExportProfile(r)),
             ..
         } => r.set_binary(binary)?,
         _ => ensure!(binary.is_empty(), "unexpected relay binary trailer"),
@@ -1043,6 +1057,9 @@ impl Parent {
                 }
                 Call::PrepareExportDirectory(request) => {
                     Value::ExportDirectory(self.client.prepare_export_directory(request, cancel)?)
+                }
+                Call::ExportProfile(request) => {
+                    Value::ExportProfile(self.client.export_profile_call(request, cancel)?)
                 }
             })
         })();
@@ -1630,6 +1647,19 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("wrong export directory reply"),
         }
     }
+    fn export_profile_call(
+        &self,
+        request: &ExportProfileRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportProfileReply> {
+        match self.call(Call::ExportProfile(Box::new(request.clone())), cancel)? {
+            Value::ExportProfile(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("wrong export profile reply"),
+        }
+    }
 }
 fn unit(v: Value) -> Result<()> {
     ensure!(matches!(v, Value::Unit), "wrong unit reply");
@@ -1663,6 +1693,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::PrepareExportDirectory(request), Value::ExportDirectory(value)) => {
             value.validate_for(request)?
         }
+        (Call::ExportProfile(request), Value::ExportProfile(value)) => value.validate(request)?,
         (Call::Resume { restore_id, .. }, Value::Restore(Some(v))) => ensure!(
             &v.receipt.restore_id == restore_id && !v.jobs_held,
             "relay restored-job receipt mismatch"

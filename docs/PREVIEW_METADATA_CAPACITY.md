@@ -77,6 +77,33 @@ native-path backings while its deep-cloned relay `Call` is in flight; that Call
 graph remains separately charged. Directory contents and exported image bytes
 are outside this read-only preparation phase.
 
+Managed ICC acquisition uses one serial export-profile transfer. F retains the
+opened stable `Source`, the exact catalog root capability, requested path,
+transfer identity, next step and offset until an acknowledged finish or abort.
+The 16 KiB profile chunks use the existing raw binary trailer on both relay
+hops; neither hop admits the 16 MiB profile as one encoded message. The F typed
+graphs, retained transfer root/path backing and C caller request backing are
+named active terms. Cancellation alone does not release the F handle, and an
+uncertain abort keeps root release from succeeding.
+After verified finish closes the read-only `Source`, F retains bounded terminal
+path, transfer, step, allowance and byte metadata. Matching finish recovery or
+abort cleanup is idempotent; a foreign transfer cannot close an active source
+or adopt terminal evidence. The retained-transfer term also includes the
+bounded decimal `Source.before` object and change-revision string backings.
+
+The existing eight-token cache and its 32 MiB total byte quota are a retained
+term. An in-progress C assembly occupies only the unused portion of that same
+quota, so eight vector backings cover eight cached profiles or seven cached
+profiles plus one assembly. The term also includes the cache table, both token
+strings, requested filename, digest, and each cached `Arc<Vec<u8>>` allocation
+root. During lcms validation, `output_profile` temporarily owns two additional
+copies of the new profile, each independently bounded by 16 MiB; those are a
+separate active term. Native lcms allocations remain opaque native storage.
+F performs no ICC interpretation, and no partial assembly becomes a token.
+The published `ProfileAdmission` remains in export control status beside the
+cache, and a status query can hold one deep clone. Their token, original-name
+and digest string backings are separate named retained and active terms.
+
 Tagged serde parsing uses the pinned `serde::__private229::de::Content` and
 `(Content,Content)` layouts. For raw length `R`, `N=floor((R+1)/2)`,
 `U=N*(max(2S,P)+8*max(S,P))`, and `G=S+U+R`. A parser charge is
@@ -150,15 +177,18 @@ canonical path plus its two optional retained stage IDs. Every active render or
 read Job separately owns its spawn root/stage, possible status IDs and Stage ID.
 The proxy binding IDs and completed digest are also named contributions.
 
-Executed on macOS arm64 with Rust 1.98.0, the checked formula produces these
-requested backing bounds in bytes. They are conservative capacity calculations,
-not observed allocations or RSS measurements.
+The final frozen macOS arm64 Rust 1.98.0 focused execution reported these
+checked application-requested backing assemblies:
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 3,261,374 | 5,868,572,026 | 5,364,516,472 | 5,871,833,400 |
-| Default | 717,356,740 | 5,868,581,602 | 5,364,516,472 | 6,585,938,342 |
-| Maximum | 1,065,973,174,876 | 10,385,736,502 | 5,364,516,472 | 1,076,358,911,378 |
+| Minimum | 71,264,322 | 5,938,306,300 | 5,364,516,472 | 6,009,570,622 |
+| Default | 785,359,688 | 5,938,315,876 | 5,364,516,472 | 6,723,675,564 |
+| Maximum | 1,066,041,177,824 | 10,455,470,776 | 5,364,516,472 | 1,076,496,648,600 |
+
+These are conservative requested-allocation calculations. Reporting them does
+not reserve the aggregate, measure observed allocation, or bound native/runtime
+storage or RSS.
 
 The integrated gate passed three formula tests and 21 affected transport, codec,
 cache and real-process tests. The bounded error representation preserves typed

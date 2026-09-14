@@ -3,8 +3,9 @@ use crate::{
     application::U64,
     catalog_backup::RestoreStatus,
     catalog_session::{
-        CatalogBootstrap, ConfirmSqlAdmission, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, validate_path,
+        CatalogBootstrap, ConfirmSqlAdmission, ExportProfileReply, ExportProfileRequest, LeaseId,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
+        SqlAdmissionConfirmed, validate_path,
     },
     storage_volume::NativePath,
 };
@@ -115,6 +116,7 @@ pub enum Operation {
     PreviewStage(crate::catalog_session::preview_stage::Request),
     ReadPreviewConfiguration(NativePath),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
+    ExportProfile(Box<ExportProfileRequest>),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
     AbandonPrepare {
@@ -147,6 +149,7 @@ pub enum Operation {
 impl Operation {
     pub(crate) fn is_cleanup(&self) -> bool {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
+            || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
             || matches!(self, Self::PreviewStage(r) if r.cleanup())
@@ -158,6 +161,7 @@ impl Operation {
             Self::PreviewStage(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
             Self::PrepareExportDirectory(value) => value.validate()?,
+            Self::ExportProfile(value) => value.validate()?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
                 validate_root(&value.root)?;
@@ -260,6 +264,7 @@ pub enum Response {
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     PreviewConfiguration(Vec<u8>),
     ExportDirectory(PreparedExportDirectory),
+    ExportProfile(ExportProfileReply),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
     RestoreStatus(Option<RestoreStatus>),
@@ -648,6 +653,7 @@ pub(crate) fn encode_outcome(value: &Outcome) -> Result<Vec<u8>> {
     let binary = match value {
         Ok(Response::PreviewIo(r)) => r.binary(),
         Ok(Response::PreviewStage(r)) => (!r.binary().is_empty()).then(|| r.binary()),
+        Ok(Response::ExportProfile(r)) => r.binary(),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -658,6 +664,7 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
     match &mut value {
         Ok(Response::PreviewIo(r)) => r.set_binary(binary)?,
         Ok(Response::PreviewStage(r)) => r.set_binary(binary.to_vec())?,
+        Ok(Response::ExportProfile(r)) => r.set_binary(binary)?,
         _ => ensure!(binary.is_empty(), "unexpected outcome binary trailer"),
     }
     Ok(value)
@@ -666,6 +673,70 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn export_profile_outcome_uses_exact_bounded_binary_trailer() -> Result<()> {
+        use crate::catalog_session::{
+            EXPORT_PROFILE_BYTES, ExportProfileAction, ExportProfileReply, ExportProfileRequest,
+            ExportProfileValue, PhysicalObjectId, RootCapability,
+        };
+        #[cfg(unix)]
+        let physical = |index| PhysicalObjectId::Unix {
+            device: crate::application::U64(1),
+            inode: crate::application::U64(index),
+        };
+        #[cfg(windows)]
+        let physical = |index| PhysicalObjectId::Windows {
+            volume_serial: crate::application::U64(1),
+            file_index: crate::application::U64(index),
+        };
+        let request = ExportProfileRequest {
+            root: RootCapability {
+                epoch: LeaseId::new(),
+                token: LeaseId::new(),
+                session: LeaseId::new(),
+                canonical_root: NativePath::from_path(&std::env::temp_dir()),
+                root_physical: physical(2),
+                catalog_physical: physical(3),
+            },
+            requested: NativePath::from_path(&std::env::temp_dir().join("profile.icc")),
+            transfer: LeaseId::new(),
+            step: crate::application::U64(1),
+            allowance: crate::application::U64(EXPORT_PROFILE_BYTES as u64),
+            action: ExportProfileAction::Read {
+                offset: crate::application::U64(0),
+            },
+        };
+        let bytes = vec![0x3c; CHUNK_BYTES];
+        let reply = ExportProfileReply {
+            root: request.root.clone(),
+            requested: request.requested.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            value: ExportProfileValue::Chunk {
+                offset: crate::application::U64(0),
+                checksum: blake3::hash(&bytes).to_hex().to_string(),
+                bytes: bytes.clone(),
+            },
+        };
+        let encoded = encode_outcome(&Ok(Response::ExportProfile(reply)))?;
+        assert!(encoded.len() < bytes.len() + 2048);
+        let Ok(Response::ExportProfile(decoded)) = decode_outcome(&encoded)? else {
+            panic!("profile outcome")
+        };
+        decoded.validate(&request)?;
+        assert_eq!(decoded.binary(), Some(bytes.as_slice()));
+        let mut foreign = decoded.clone();
+        foreign.transfer = LeaseId::new();
+        assert!(foreign.validate(&request).is_err());
+        let mut corrupt = decoded.clone();
+        if let ExportProfileValue::Chunk { checksum, .. } = &mut corrupt.value {
+            *checksum = "0".repeat(64);
+        }
+        assert!(corrupt.validate(&request).is_err());
+        let mut oversized = decoded;
+        assert!(oversized.set_binary(&vec![0; CHUNK_BYTES + 1]).is_err());
+        Ok(())
+    }
     #[test]
     fn stage_packed_outcomes_preserve_skipped_chunk_content_and_metadata() -> Result<()> {
         use crate::catalog_session::preview_stage::{Reply, Value};

@@ -20,7 +20,7 @@ mod read;
 mod worker;
 pub use dto::*;
 type Result<T> = std::result::Result<T, BridgeError>;
-const PROFILE_BYTES: usize = 16 * 1024 * 1024;
+const PROFILE_BYTES: usize = crate::catalog_session::EXPORT_PROFILE_BYTES;
 const PATH_BYTES: usize = 32 * 1024;
 fn identity(s: &str) -> Result<()> {
     if s.is_empty() || s.len() > 256 {
@@ -66,6 +66,10 @@ fn path(value: &NativePath) -> Result<std::path::PathBuf> {
 struct ProfileEntry {
     info: ProfileAdmission,
     bytes: Arc<Vec<u8>>,
+}
+pub(crate) fn profile_cache_entry_layout() -> (usize, usize) {
+    type Entry = (String, ProfileEntry);
+    (std::mem::size_of::<Entry>(), std::mem::align_of::<Entry>())
 }
 #[derive(Default)]
 struct Cache {

@@ -503,7 +503,11 @@ impl Drop for Authority<'_> {
 fn ae(e: BridgeError) -> anyhow::Error {
     anyhow::anyhow!("{}", e.message)
 }
-pub(super) fn profile(ctx: &Context, p: &NativePath) -> anyhow::Result<ResultValue> {
+pub(super) fn profile(
+    ctx: &Context,
+    catalog: &Catalog,
+    p: &NativePath,
+) -> anyhow::Result<ResultValue> {
     let path = path(p).map_err(ae)?;
     {
         let c = ctx.cache.lock().unwrap();
@@ -512,39 +516,74 @@ pub(super) fn profile(ctx: &Context, p: &NativePath) -> anyhow::Result<ResultVal
             "ICC token count exceeded; release unused profile"
         );
     }
-    let parent = path
-        .parent()
-        .context("profile parent required")?
-        .canonicalize()?;
-    let normalized = parent.join(path.file_name().context("profile filename required")?);
-    let mut source = crate::lightroom::source::Source::open(&normalized, PROFILE_BYTES as u64)?;
-    {
-        let c = ctx.cache.lock().unwrap();
-        let retained: u64 = c.profiles.values().map(|p| p.info.bytes.0).sum();
+    path.parent().context("profile parent required")?;
+    let filename = path.file_name().context("profile filename required")?;
+    let cancel = ctx.cancel();
+    let (bytes, retained) = if catalog.session.pool().is_some() {
+        let retained = ctx
+            .cache
+            .lock()
+            .unwrap()
+            .profiles
+            .values()
+            .map(|p| p.info.bytes.0)
+            .sum::<u64>();
+        let allowance = (2 * PROFILE_BYTES as u64)
+            .checked_sub(retained)
+            .context("ICC byte quota exceeded; release unused profile")?
+            .min(PROFILE_BYTES as u64);
+        ensure!(
+            allowance > 0,
+            "ICC byte quota exceeded; release unused profile"
+        );
+        let bytes = catalog
+            .session
+            .read_export_profile(p, allowance, &cancel.0)?
+            .context("managed export profile route unavailable")?;
+        (bytes, retained)
+    } else {
+        let parent = path
+            .parent()
+            .context("profile parent required")?
+            .canonicalize()?;
+        let normalized = parent.join(filename);
+        let mut source = crate::lightroom::source::Source::open(&normalized, PROFILE_BYTES as u64)?;
+        let retained = ctx
+            .cache
+            .lock()
+            .unwrap()
+            .profiles
+            .values()
+            .map(|p| p.info.bytes.0)
+            .sum::<u64>();
         ensure!(
             retained + source.before.bytes <= 2 * PROFILE_BYTES as u64,
             "ICC byte quota exceeded; release unused profile"
         );
-    }
-    let mut bytes = vec![0; usize::try_from(source.before.bytes)?];
-    let cancel = ctx.cancel();
-    for chunk in bytes.chunks_mut(64 * 1024) {
-        ensure!(
-            !cancel.is_canceled() && !ctx.stopped(),
-            "ICC admission canceled"
-        );
-        source.file.read_exact(chunk)?;
-    }
-    let mut extra = [0];
-    ensure!(source.file.read(&mut extra)? == 0, "ICC changed size");
-    source.verify()?;
+        let mut bytes = vec![0; usize::try_from(source.before.bytes)?];
+        for chunk in bytes.chunks_mut(64 * 1024) {
+            ensure!(
+                !cancel.is_canceled() && !ctx.stopped(),
+                "ICC admission canceled"
+            );
+            source.file.read_exact(chunk)?;
+        }
+        let mut extra = [0];
+        ensure!(source.file.read(&mut extra)? == 0, "ICC changed size");
+        source.verify()?;
+        (bytes, retained)
+    };
+    ensure!(
+        retained + bytes.len() as u64 <= 2 * PROFILE_BYTES as u64,
+        "ICC byte quota exceeded; release unused profile"
+    );
     ensure!(!cancel.is_canceled(), "ICC admission canceled");
     let (_, _, linear) = crate::image_export::output_profile(&OutputProfile::Icc {
         bytes: bytes.clone(),
     })?;
     let info = ProfileAdmission {
         token: uuid::Uuid::new_v4().to_string(),
-        name: path.file_name().unwrap().to_string_lossy().into_owned(),
+        name: filename.to_string_lossy().into_owned(),
         bytes: U64(bytes.len() as u64),
         blake3: blake3::hash(&bytes).to_hex().to_string(),
         linear,
@@ -893,7 +932,7 @@ fn execute(
             result?;
             Ok(ResultValue::Job(read::job(catalog, &job).map_err(ae)?))
         }
-        Request::Profile { path } => profile(ctx, &path),
+        Request::Profile { path } => profile(ctx, catalog, &path),
         Request::Destinations {
             directory,
             targets,

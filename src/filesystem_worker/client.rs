@@ -4,8 +4,9 @@ use crate::{
     application::U64,
     catalog_backup::RestoreStatus,
     catalog_session::{
-        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, LeaseId, PrepareCatalog,
-        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
+        CatalogBootstrap, CatalogFilesystem, ConfirmSqlAdmission, ExportProfileReply,
+        ExportProfileRequest, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
 };
@@ -992,6 +993,19 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected export directory response"),
         }
     }
+    fn export_profile_call(
+        &self,
+        request: &ExportProfileRequest,
+        cancel: &AtomicBool,
+    ) -> Result<ExportProfileReply> {
+        match self.execute(Operation::ExportProfile(Box::new(request.clone())), cancel)? {
+            Response::ExportProfile(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected export profile response"),
+        }
+    }
 
     fn prepare_catalog(
         &self,
@@ -1587,6 +1601,153 @@ mod tests {
         child
             .0
             .abandon_prepare(bootstrap.operation, &bootstrap.session)?;
+        child.0.try_shutdown()?;
+        assert_retired(&child.0);
+        Ok(())
+    }
+
+    #[test]
+    fn actual_f_export_profile_round_trip_cancels_cleans_up_and_reaps() -> Result<()> {
+        use crate::catalog_session::{
+            EXPORT_PROFILE_BYTES, ExportProfileAction, ExportProfileRequest, ExportProfileValue,
+            SQL_ROLES, SqlRole, SqlRoleObservation,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let child = spawn_fixture("filesystem", temp.path(), Faults::default())?;
+        let catalog = PrepareCatalog {
+            operation: U64(18),
+            session: LeaseId::new(),
+            mode: crate::catalog_session::BootstrapMode::DesktopCreate,
+            root: NativePath::from_path(&temp.path().join("catalog")),
+            manifest_root: NativePath::from_path(&temp.path().join("manifest")),
+            import_source: None,
+        };
+        let bootstrap = child.0.prepare_catalog(&catalog, &AtomicBool::new(false))?;
+        let confirmation = ConfirmSqlAdmission {
+            operation: bootstrap.operation,
+            root: bootstrap.root_capability(),
+            roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                role,
+                physical: if role == SqlRole::Manifest {
+                    bootstrap.manifest.physical
+                } else {
+                    bootstrap.catalog.physical
+                },
+            }),
+        };
+        child
+            .0
+            .confirm_sql_admission(&confirmation, &AtomicBool::new(false))?;
+        let profile = temp.path().join("selected.icc");
+        let expected = vec![0x5a; crate::catalog_session::preview_io::CHUNK_BYTES + 11];
+        fs::write(&profile, &expected)?;
+        let root = bootstrap.root_capability();
+        let requested = NativePath::from_path(&profile);
+        let transfer = LeaseId::new();
+        let request = |step, action| ExportProfileRequest {
+            root: root.clone(),
+            requested: requested.clone(),
+            transfer: transfer.clone(),
+            step: U64(step),
+            allowance: U64(EXPORT_PROFILE_BYTES as u64),
+            action,
+        };
+        let begin = request(0, ExportProfileAction::Begin);
+        let reply = child
+            .0
+            .export_profile_call(&begin, &AtomicBool::new(false))?;
+        assert!(
+            matches!(reply.value, ExportProfileValue::Begun { bytes } if bytes == U64(expected.len() as u64))
+        );
+        let mut bytes = Vec::new();
+        let mut step = 1u64;
+        while bytes.len() < expected.len() {
+            let read = request(
+                step,
+                ExportProfileAction::Read {
+                    offset: U64(bytes.len() as u64),
+                },
+            );
+            let reply = child
+                .0
+                .export_profile_call(&read, &AtomicBool::new(false))?;
+            reply.validate(&read)?;
+            let ExportProfileValue::Chunk { bytes: chunk, .. } = reply.value else {
+                panic!("profile chunk")
+            };
+            bytes.extend_from_slice(&chunk);
+            step += 1;
+        }
+        let finish = request(step, ExportProfileAction::Finish);
+        child
+            .0
+            .export_profile_call(&finish, &AtomicBool::new(false))?
+            .validate(&finish)?;
+        assert_eq!(bytes, expected);
+        assert_eq!(fs::read(&profile)?, expected);
+
+        let canceled_transfer = LeaseId::new();
+        let canceled = |step, action| ExportProfileRequest {
+            root: root.clone(),
+            requested: requested.clone(),
+            transfer: canceled_transfer.clone(),
+            step: U64(step),
+            allowance: U64(EXPORT_PROFILE_BYTES as u64),
+            action,
+        };
+        child.0.export_profile_call(
+            &canceled(0, ExportProfileAction::Begin),
+            &AtomicBool::new(false),
+        )?;
+        let error = child
+            .0
+            .export_profile_call(
+                &canceled(1, ExportProfileAction::Read { offset: U64(0) }),
+                &AtomicBool::new(true),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Canceled
+        );
+        child.0.export_profile_call(
+            &canceled(2, ExportProfileAction::Abort),
+            &AtomicBool::new(true),
+        )?;
+
+        let oversized = temp.path().join("oversized.icc");
+        fs::File::create(&oversized)?.set_len(EXPORT_PROFILE_BYTES as u64 + 1)?;
+        let oversized_request = ExportProfileRequest {
+            root: root.clone(),
+            requested: NativePath::from_path(&oversized),
+            transfer: LeaseId::new(),
+            step: U64(0),
+            allowance: U64(EXPORT_PROFILE_BYTES as u64),
+            action: ExportProfileAction::Begin,
+        };
+        let error = child
+            .0
+            .export_profile_call(&oversized_request, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::ResourceLimit
+        );
+        let missing_request = ExportProfileRequest {
+            requested: NativePath::from_path(&temp.path().join("missing.icc")),
+            transfer: LeaseId::new(),
+            ..oversized_request
+        };
+        let error = child
+            .0
+            .export_profile_call(&missing_request, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            FailureKind::Rejected
+        );
+        child.0.release_root(&root)?;
         child.0.try_shutdown()?;
         assert_retired(&child.0);
         Ok(())

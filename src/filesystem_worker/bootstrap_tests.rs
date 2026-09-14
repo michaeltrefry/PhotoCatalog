@@ -2,11 +2,12 @@ use super::*;
 use crate::{
     application::U64,
     catalog_session::{
-        BootstrapMode, ConfirmSqlAdmission, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        SQL_ROLES, SqlRole, SqlRoleObservation,
+        BootstrapMode, ConfirmSqlAdmission, EXPORT_PROFILE_BYTES, ExportProfileAction,
+        ExportProfileRequest, ExportProfileValue, LeaseId, PrepareCatalog, PrepareExportDirectory,
+        RootCapability, SQL_ROLES, SqlRole, SqlRoleObservation,
     },
 };
-use std::sync::atomic::AtomicBool;
+use std::{io::Write, sync::atomic::AtomicBool};
 use tempfile::TempDir;
 
 fn request(temp: &TempDir) -> PrepareCatalog {
@@ -34,6 +35,23 @@ fn confirmation(value: &crate::catalog_session::CatalogBootstrap) -> ConfirmSqlA
                 value.catalog.physical
             },
         }),
+    }
+}
+
+fn profile_request(
+    root: &RootCapability,
+    path: &Path,
+    transfer: &LeaseId,
+    step: u64,
+    action: ExportProfileAction,
+) -> ExportProfileRequest {
+    ExportProfileRequest {
+        root: root.clone(),
+        requested: NativePath::from_path(path),
+        transfer: transfer.clone(),
+        step: U64(step),
+        allowance: U64(EXPORT_PROFILE_BYTES as u64),
+        action,
     }
 }
 
@@ -273,6 +291,266 @@ fn export_directory_preparation_is_read_only_bound_and_cancellable() -> Result<(
     );
     assert_eq!(fs::read(output.join("sentinel"))?, b"unchanged");
     owner.abandon(bootstrap.operation, &bootstrap.session)?;
+    owner.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn export_profile_transfer_is_stable_bounded_bound_and_explicitly_retired() -> Result<()> {
+    let temp = TempDir::new()?;
+    let catalog_request = request(&temp);
+    let mut owner = owner();
+    let bootstrap = owner.prepare(&catalog_request, &AtomicBool::new(false), |_| Ok(()))?;
+    owner.confirm(&confirmation(&bootstrap), &AtomicBool::new(false))?;
+    let root = bootstrap.root_capability();
+    let profile = temp.path().join("selected.icc");
+    let original = vec![0xa5; crate::catalog_session::preview_io::CHUNK_BYTES + 17];
+    fs::write(&profile, &original)?;
+
+    let transfer = LeaseId::new();
+    let begin = profile_request(&root, &profile, &transfer, 0, ExportProfileAction::Begin);
+    let reply = owner.export_profile_call(&begin, &AtomicBool::new(false))?;
+    reply.validate(&begin)?;
+    assert!(
+        matches!(reply.value, ExportProfileValue::Begun { bytes } if bytes == U64(original.len() as u64))
+    );
+    assert!(owner.release(&root).is_err());
+
+    let mut foreign = profile_request(
+        &root,
+        &profile,
+        &transfer,
+        1,
+        ExportProfileAction::Read { offset: U64(0) },
+    );
+    foreign.root.session = LeaseId::new();
+    assert!(
+        owner
+            .export_profile_call(&foreign, &AtomicBool::new(false))
+            .is_err()
+    );
+    let first = profile_request(
+        &root,
+        &profile,
+        &transfer,
+        1,
+        ExportProfileAction::Read { offset: U64(0) },
+    );
+    let first_reply = owner.export_profile_call(&first, &AtomicBool::new(false))?;
+    first_reply.validate(&first)?;
+    let ExportProfileValue::Chunk { bytes, .. } = first_reply.value else {
+        panic!("profile chunk")
+    };
+    assert_eq!(bytes, original[..bytes.len()]);
+    let second = profile_request(
+        &root,
+        &profile,
+        &transfer,
+        2,
+        ExportProfileAction::Read {
+            offset: U64(bytes.len() as u64),
+        },
+    );
+    let second_reply = owner.export_profile_call(&second, &AtomicBool::new(false))?;
+    second_reply.validate(&second)?;
+    let finish = profile_request(&root, &profile, &transfer, 3, ExportProfileAction::Finish);
+    let finish_reply = owner.export_profile_call(&finish, &AtomicBool::new(false))?;
+    finish_reply.validate(&finish)?;
+    assert_eq!(fs::read(&profile)?, original);
+    owner
+        .export_profile_call(&finish, &AtomicBool::new(false))?
+        .validate(&finish)?;
+    let foreign_finish = profile_request(
+        &root,
+        &profile,
+        &LeaseId::new(),
+        3,
+        ExportProfileAction::Finish,
+    );
+    assert!(
+        owner
+            .export_profile_call(&foreign_finish, &AtomicBool::new(false))
+            .is_err()
+    );
+    let foreign_terminal_abort = profile_request(
+        &root,
+        &profile,
+        &LeaseId::new(),
+        4,
+        ExportProfileAction::Abort,
+    );
+    assert!(
+        owner
+            .export_profile_call(&foreign_terminal_abort, &AtomicBool::new(false))
+            .is_err()
+    );
+    let finish_abort = profile_request(&root, &profile, &transfer, 4, ExportProfileAction::Abort);
+    owner.export_profile_call(&finish_abort, &AtomicBool::new(false))?;
+    owner.export_profile_call(&finish_abort, &AtomicBool::new(false))?;
+
+    let canceled_transfer = LeaseId::new();
+    let begin = profile_request(
+        &root,
+        &profile,
+        &canceled_transfer,
+        0,
+        ExportProfileAction::Begin,
+    );
+    owner.export_profile_call(&begin, &AtomicBool::new(false))?;
+    let canceled = profile_request(
+        &root,
+        &profile,
+        &canceled_transfer,
+        1,
+        ExportProfileAction::Read { offset: U64(0) },
+    );
+    let error = owner
+        .export_profile_call(&canceled, &AtomicBool::new(true))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Failure>().unwrap().kind,
+        FailureKind::Canceled
+    );
+    assert!(owner.release(&root).is_err());
+    let foreign_abort = profile_request(
+        &root,
+        &profile,
+        &LeaseId::new(),
+        99,
+        ExportProfileAction::Abort,
+    );
+    assert!(
+        owner
+            .export_profile_call(&foreign_abort, &AtomicBool::new(true))
+            .is_err()
+    );
+    assert!(owner.release(&root).is_err());
+    let abort = profile_request(
+        &root,
+        &profile,
+        &canceled_transfer,
+        2,
+        ExportProfileAction::Abort,
+    );
+    owner.export_profile_call(&abort, &AtomicBool::new(true))?;
+    owner.export_profile_call(&abort, &AtomicBool::new(true))?;
+    assert!(
+        owner
+            .export_profile_call(&foreign_abort, &AtomicBool::new(true))
+            .is_err()
+    );
+
+    let offset_transfer = LeaseId::new();
+    let begin = profile_request(
+        &root,
+        &profile,
+        &offset_transfer,
+        0,
+        ExportProfileAction::Begin,
+    );
+    owner.export_profile_call(&begin, &AtomicBool::new(false))?;
+    let wrong_offset = profile_request(
+        &root,
+        &profile,
+        &offset_transfer,
+        1,
+        ExportProfileAction::Read { offset: U64(1) },
+    );
+    assert!(
+        owner
+            .export_profile_call(&wrong_offset, &AtomicBool::new(false))
+            .is_err()
+    );
+    let abort = profile_request(
+        &root,
+        &profile,
+        &offset_transfer,
+        2,
+        ExportProfileAction::Abort,
+    );
+    owner.export_profile_call(&abort, &AtomicBool::new(false))?;
+
+    let growing_transfer = LeaseId::new();
+    let begin = profile_request(
+        &root,
+        &profile,
+        &growing_transfer,
+        0,
+        ExportProfileAction::Begin,
+    );
+    owner.export_profile_call(&begin, &AtomicBool::new(false))?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&profile)?
+        .write_all(b"changed")?;
+    let mut offset = 0usize;
+    let mut step = 1u64;
+    while offset < original.len() {
+        let read = profile_request(
+            &root,
+            &profile,
+            &growing_transfer,
+            step,
+            ExportProfileAction::Read {
+                offset: U64(offset as u64),
+            },
+        );
+        let reply = owner.export_profile_call(&read, &AtomicBool::new(false))?;
+        let ExportProfileValue::Chunk { bytes, .. } = reply.value else {
+            panic!("profile chunk")
+        };
+        offset += bytes.len();
+        step += 1;
+    }
+    let finish = profile_request(
+        &root,
+        &profile,
+        &growing_transfer,
+        step,
+        ExportProfileAction::Finish,
+    );
+    assert!(
+        owner
+            .export_profile_call(&finish, &AtomicBool::new(false))
+            .is_err()
+    );
+    let abort = profile_request(
+        &root,
+        &profile,
+        &growing_transfer,
+        step + 1,
+        ExportProfileAction::Abort,
+    );
+    owner.export_profile_call(&abort, &AtomicBool::new(false))?;
+
+    let oversized = temp.path().join("oversized.icc");
+    fs::File::create(&oversized)?.set_len(EXPORT_PROFILE_BYTES as u64 + 1)?;
+    let begin = profile_request(
+        &root,
+        &oversized,
+        &LeaseId::new(),
+        0,
+        ExportProfileAction::Begin,
+    );
+    let error = owner
+        .export_profile_call(&begin, &AtomicBool::new(false))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Failure>().unwrap().kind,
+        FailureKind::ResourceLimit
+    );
+    #[cfg(unix)]
+    {
+        let link = temp.path().join("alias.icc");
+        std::os::unix::fs::symlink(&profile, &link)?;
+        let begin = profile_request(&root, &link, &LeaseId::new(), 0, ExportProfileAction::Begin);
+        assert!(
+            owner
+                .export_profile_call(&begin, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+    owner.release(&root)?;
     owner.shutdown()?;
     Ok(())
 }

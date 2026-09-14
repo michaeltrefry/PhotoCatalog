@@ -137,6 +137,78 @@ fn export_directory_reply_requires_exact_root_and_requested_path() -> Result<()>
     assert!(validate_reply(&call, &Value::ExportDirectory(foreign), &binding).is_err());
     Ok(())
 }
+
+#[test]
+fn export_profile_chunk_uses_bounded_binary_and_exact_provenance() -> Result<()> {
+    use crate::catalog_session::{
+        EXPORT_PROFILE_BYTES, ExportProfileAction, ExportProfileReply, ExportProfileRequest,
+        ExportProfileValue,
+    };
+
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let catalog = request();
+    let root = bootstrap(&catalog, &binding).root_capability();
+    let request = ExportProfileRequest {
+        root: root.clone(),
+        requested: NativePath::from_path(&std::env::temp_dir().join("selected.icc")),
+        transfer: LeaseId::new(),
+        step: U64(1),
+        allowance: U64(EXPORT_PROFILE_BYTES as u64),
+        action: ExportProfileAction::Read { offset: U64(7) },
+    };
+    let bytes = vec![0xa5; crate::catalog_session::preview_io::CHUNK_BYTES];
+    let reply = ExportProfileReply {
+        root,
+        requested: request.requested.clone(),
+        transfer: request.transfer.clone(),
+        step: request.step,
+        value: ExportProfileValue::Chunk {
+            offset: U64(7),
+            checksum: blake3::hash(&bytes).to_hex().to_string(),
+            bytes: bytes.clone(),
+        },
+    };
+    reply.validate(&request)?;
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Reply {
+            id: U64(21),
+            outcome: Ok(Value::ExportProfile(reply.clone())),
+        },
+    };
+    let encoded = encode_packet(&packet, BYTES)?;
+    assert!(encoded.len() < bytes.len() + 2048);
+    let Body::Reply {
+        outcome: Ok(Value::ExportProfile(decoded)),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        panic!("profile reply")
+    };
+    decoded.validate(&request)?;
+    assert_eq!(decoded.binary(), Some(bytes.as_slice()));
+
+    let mut foreign = reply;
+    foreign.requested = NativePath::from_path(&std::env::temp_dir().join("other.icc"));
+    assert!(foreign.validate(&request).is_err());
+    let mut corrupt = decoded;
+    if let ExportProfileValue::Chunk { checksum, .. } = &mut corrupt.value {
+        *checksum = "0".repeat(64);
+    }
+    assert!(corrupt.validate(&request).is_err());
+    assert!(
+        corrupt
+            .set_binary(&vec![
+                0;
+                crate::catalog_session::preview_io::CHUNK_BYTES + 1
+            ])
+            .is_err()
+    );
+    Ok(())
+}
 #[test]
 fn wrong_reply_is_not_acknowledged_and_cancel_does_not_erase_publication() -> Result<()> {
     let binding = Binding {

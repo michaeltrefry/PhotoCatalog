@@ -26,6 +26,9 @@ use wire::{
 struct FilesystemHandler {
     owner: BootstrapOwner,
 }
+pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
+    bootstrap::export_profile_transfer_layout()
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;
@@ -63,6 +66,11 @@ impl FilesystemHandler {
                 .prepare_export_directory(&request, cancel)
                 .map_err(export_directory_failure)
                 .map(Response::ExportDirectory),
+            Operation::ExportProfile(request) => self
+                .owner
+                .export_profile_call(&request, cancel)
+                .map_err(export_profile_failure)
+                .map(Response::ExportProfile),
             Operation::PrepareCatalog(request) => self
                 .owner
                 .prepare(&request, cancel, |progress| {
@@ -144,8 +152,14 @@ impl Handler for FilesystemHandler {
     fn execute(&mut self, operation: Operation, context: &OperationContext) -> Outcome {
         // A filesystem failure can follow a successful creation or publication.
         // Preserve uncertainty and the separate admission record for reconciliation.
-        self.execute_inner(operation, context)
-            .map_err(filesystem_failure)
+        let export_profile = matches!(&operation, Operation::ExportProfile(_));
+        self.execute_inner(operation, context).map_err(|error| {
+            if export_profile {
+                filesystem_failure(export_profile_failure(error))
+            } else {
+                filesystem_failure(error)
+            }
+        })
     }
     fn shutdown(&mut self) -> std::result::Result<(), Failure> {
         self.owner
@@ -169,6 +183,13 @@ fn filesystem_failure(error: anyhow::Error) -> Failure {
     failure
 }
 fn export_directory_failure(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<Failure>().is_some() {
+        error
+    } else {
+        Failure::new(FailureKind::Rejected, error).into()
+    }
+}
+fn export_profile_failure(error: anyhow::Error) -> anyhow::Error {
     if error.downcast_ref::<Failure>().is_some() {
         error
     } else {
