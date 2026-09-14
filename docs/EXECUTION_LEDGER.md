@@ -6,6 +6,17 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 Latest local checkpoint (supersedes older pending notes below):
 
+LM3 stronger-model candidate T203411 (41 files, manifestc4b97d4f) passes full
+Rust test-target and Tauri compile checks, logs1dca6e22/a1b9196f, source unchanged.
+Different independent reviewcdcf4d07 requires four repairs: Run shared parser/SQL
+admission, continuous preflight/upgrade database identity, exact rejection test
+text, and platform gating of Unix-only fixtures. One bounded V1-V4 repair is
+active; runtime20 is prepared but unexecuted. FS9 publication implementation is
+active in isolated sc-22847-export-publication fromf03c6fe, covering the complete
+stateful preparation/capture/link/restore/verification/cleanup lease. Its design
+preserves exact active-step replay, terminal custody, SQL ownership, and joint
+original/publication accounting. No native jobs are active at this checkpoint.
+
 FS9 original verification is locally committed `dcdfd5d` and integrated `5c210c8`;
 all 14 reviewed blobs match, including observed capacity documentation. Eight
 exact tests passed (each1,953filtered), F61529 checked/reaped and absent;
