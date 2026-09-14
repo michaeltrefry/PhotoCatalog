@@ -1975,12 +1975,14 @@ mod managed_discovery_tests {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let original = directory.join("photo.cr2");
         let sidecar = directory.join("photo.cr2.xmp");
-        let mut paths = vec![original.clone(), sidecar.clone()];
+        let paths = vec![original.clone(), sidecar.clone()];
         #[cfg(unix)]
-        {
+        let paths = {
             use std::os::unix::ffi::OsStringExt;
+            let mut paths = paths;
             paths.push(directory.join(std::ffi::OsString::from_vec(b"native\xff.xmp".to_vec())));
-        }
+            paths
+        };
         index_directory_facts(
             &discovery.db,
             &directory,

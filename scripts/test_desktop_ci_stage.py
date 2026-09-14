@@ -12,6 +12,46 @@ import package_desktop as p
 
 
 class StageTests(unittest.TestCase):
+    def test_stale_bundles_cannot_enter_fresh_installer_qualification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            release = Path(tmp)/'release'; release.mkdir()
+            executable = release/'photocatalog-desktop'
+            executable.write_bytes(b'current compiled executable')
+            for directory, pattern, old_name, new_name in [
+                ('macos', '*.app', 'PhotoCatalog.app', 'LensWorks.app'),
+                ('deb', '*.deb', 'photocatalog_0.1_amd64.deb', 'lensworks_0.1_amd64.deb'),
+                ('nsis', '*-setup.exe', 'PhotoCatalog_0.1-setup.exe', 'LensWorks_0.1-setup.exe'),
+            ]:
+                with self.subTest(directory=directory):
+                    folder = release/'bundle'/directory; folder.mkdir(parents=True)
+                    for name in (old_name, new_name):
+                        if directory == 'macos': (folder/name).mkdir()
+                        else: (folder/name).write_bytes(b'stale cached installer')
+                    with self.assertRaisesRegex(p.PackageError, 'expected one'):
+                        package.one(folder, pattern)
+                    package.clear_cached_bundles(release)
+                    self.assertFalse((release/'bundle').exists())
+                    self.assertEqual(executable.read_bytes(), b'current compiled executable')
+                    folder.mkdir(parents=True)
+                    if directory == 'macos': (folder/new_name).mkdir()
+                    else: (folder/new_name).write_bytes(b'new installer')
+                    self.assertEqual(package.one(folder, pattern), folder/new_name)
+                    package.clear_cached_bundles(release)
+            package.clear_cached_bundles(release)  # Cold cache is already clean.
+
+    def test_cached_bundle_link_cannot_delete_another_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); release = root/'release'; release.mkdir()
+            outside = root/'installed'; outside.mkdir()
+            sentinel = outside/'keep'; sentinel.write_bytes(b'existing application')
+            try:
+                (release/'bundle').symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f'directory symlinks unavailable: {error}')
+            with self.assertRaisesRegex(p.PackageError, 'must not be a link'):
+                package.clear_cached_bundles(release)
+            self.assertEqual(sentinel.read_bytes(), b'existing application')
+
     def test_pinned_tauri_patch_is_exact_and_handles_chunk_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); exe = root/'app'; marker = b'__TAURI_BUNDLE_TYPE_VAR_UNK'

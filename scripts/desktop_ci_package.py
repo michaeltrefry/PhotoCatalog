@@ -29,6 +29,17 @@ def one(folder, pattern):
     return files[0]
 
 
+def clear_cached_bundles(release):
+    # The hosted Rust cache may include bundles from an earlier product name or
+    # version. Only freshly bundled output may enter installer qualification.
+    # Keep compiled executables/dependencies; this script owns disposable CI output.
+    folder = release/'bundle'
+    p.require(not folder.is_symlink(), 'cached bundle output must not be a link')
+    if folder.exists():
+        p.require(folder.is_dir(), 'cached bundle output must be a directory')
+        shutil.rmtree(folder)
+
+
 def bundle_config(platform, stage, notices):
     native = stage/'native'
     if platform == 'linux':
@@ -62,6 +73,7 @@ def qualify(args):
     # Preserve install tree and failed output for CI artifacts; never modify an
     # existing application. The hosted runner owns final workspace disposal.
     p.require(not installed.is_relative_to(root), 'install proof must be outside checkout')
+    clear_cached_bundles(release)
     if args.platform == 'macos':
         bundle(desktop, 'app')
         app = one(release/'bundle/macos', '*.app')

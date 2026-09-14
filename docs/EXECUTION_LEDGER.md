@@ -22,6 +22,19 @@ GUI acceptance and absence of undiscovered descendants are not claimed.
 This run includes additive catalog transport and the exclusive-create guard.
 Shortcut comment23340 and In Progress state were read back exactly.
 
+The LensWorks/helper batch is published at `383944d`. Fresh CI34790332966
+finished with contracts passing and three platform failures. Windows stopped at
+a test-only Unix mutation warning; macOS/Linux passed the Rust suite and built
+LensWorks, then rejected ambiguous cached PhotoCatalog/LensWorks bundle outputs.
+Both failures are repaired together: only the Unix fixture binding is mutable,
+and disposable CI clears generated bundle output before bundling while preserving
+compiled executables/dependencies. The focused discovery test, strict all-target
+Clippy and formatting pass; thirteen staging/packaging tests pass on the pinned
+Python runtime, including stale app/DEB/NSIS outputs and link refusal. The initial
+default-Python import failure is preserved separately. These are local repair
+results; fresh hosted qualification remains required. Comment23345 records the
+preceding integrated gate and the XMP zero-test correction; it was read back.
+
 Earlier successful checkpoints remain preserved: CI34779651605 at `ab921727`
 qualifies reader/preview drain before transport and the exclusive-create guard;
 CI34776023414 at `3bd92de` qualifies its preceding identity/close corrections.
@@ -110,13 +123,26 @@ preserved. Numerical aggregate memory admission is still unqualified.
 
 The finite Source opening guards are qualified in clean author commit `6aa0967`;
 all 102 committed source pins were verified. Ten focused functions pass. The
-maximal accepted sequence fixture retains 16,777,207 input bytes and 1,290,413
+large accepted sequence fixture retains 16,777,207 input bytes and 1,290,413
 Issues with a 150,994,944-byte Vec capacity, producing 52,908,799 encoded bytes.
 This disproves the prior 128 MiB typed allowance; no replacement aggregate
 allowance is claimed. Failed compile, fixture and source-manifest attempts remain
 preserved. Borrowed supplement selection is the next finite memory slice; other
 preallocation and the numerical aggregate remain required. Comment23341 records
 the qualified checkpoint.
+
+Supplement projection Part A is clean checkpoint `b037b85`, with all 104 source
+pins verified. Five functions pass, including original-parser parity, reserved
+RawValue forms, cancellation and an actual reader fixture preserving source
+bytes. The 8,388,604-byte synthetic baseline has 299,588 ignored members and nine
+final projected nodes; this is not peak-allocation or RSS evidence. Source review
+and the two test-only corrections are preserved. Runtime receipt SHA256
+`052f802560ee2ec4f26aa19378a82d8458feefed6bff6e57dc4d9284434c6396`.
+Whole-branch strict Clippy still fails in eighteen files unchanged from its
+pre-Part-A baseline; no suppression or full migration acceptance is claimed.
+Part B must account for every accepted representation, including shorter Some
+values and serde map/sequence differences. The earlier large fixture is one exact
+measurement, not a global maximum or replacement aggregate memory allowance.
 
 The filesystem bootstrap/restore helper is qualified at author `e413c0a`, locally
 integrated as `c10d546` plus `b21b13b`. Eighteen worker functions, one configured
