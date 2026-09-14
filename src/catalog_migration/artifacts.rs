@@ -32,6 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod descriptor_json;
 mod preparation;
 pub use preparation::{MappingPreparation, prepare_mapping};
 
@@ -153,7 +154,7 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         request.retained_capture_record > 0 && i64::try_from(request.member_index).is_ok(),
         "artifact member selector bounds"
     );
-    let record = retention::selected_record(db, request.retained_capture_record)?;
+    let record = retention::selected_capture(db, request.retained_capture_record)?;
     ensure!(
         record.collection == Collection::Captures,
         "artifact authority must be a retained Captures record"
@@ -176,7 +177,11 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
     let (input, seal): (Option<String>, Option<Vec<u8>>) = db.query_row("SELECT CASE WHEN typeof(i.id)='text' AND length(CAST(i.id AS BLOB))=64 THEN i.id END,CASE WHEN typeof(i.seal)='blob' AND length(i.seal)<=?2 THEN i.seal END FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1", params![request.retained_capture_record,crate::lightroom::MANIFEST_BYTES as i64], |r| Ok((r.get(0)?,r.get(1)?)))?;
     let input = input.context("retained input identity storage type/64-byte admission")?;
     let seal = seal.context("retained seal storage type/byte admission limit")?;
-    let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
+    let seal = crate::lightroom::migration_source::seal_json::decode(
+        &seal,
+        crate::lightroom::MANIFEST_BYTES,
+        &|| false,
+    )?;
     let selected = seal
         .selected
         .iter()

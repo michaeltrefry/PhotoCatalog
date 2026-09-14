@@ -60,7 +60,7 @@ pub(super) enum Query {
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(super) enum Value {
     Verified,
-    Manifest(Manifest),
+    Manifest(Box<Manifest>),
     StableSource(StableSource),
     OriginPacketRoster(Vec<crate::application::I64>),
     Page(Page),
@@ -73,7 +73,7 @@ impl Query {
     pub(super) fn read(self, source: &dyn MigrationRead) -> Result<Value> {
         Ok(match self {
             Self::CaptureManifest { revision } => {
-                Value::Manifest(source.capture_manifest(&revision)?)
+                Value::Manifest(Box::new(source.capture_manifest(&revision)?))
             }
             Self::StableSource {
                 revision,
@@ -163,12 +163,12 @@ impl Value {
         }
         let body = envelope.value.context("source result body required")?.get();
         Ok(match expected {
-            Kind::Manifest => Self::Manifest(
+            Kind::Manifest => Self::Manifest(Box::new(
                 crate::lightroom::migration_source::manifest_json::decode_reply(
                     body.as_bytes(),
                     &|| false,
                 )?,
-            ),
+            )),
             Kind::StableSource => Self::StableSource(serde_json::from_str(body)?),
             Kind::OriginPacketRoster => Self::OriginPacketRoster(serde_json::from_str(body)?),
             Kind::Page => Self::Page(serde_json::from_str(body)?),

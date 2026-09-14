@@ -46,13 +46,15 @@ pub(super) fn session_with_deadline(
     Session::admit(
         process,
         stop,
-        epoch(),
-        binding,
-        encoded,
-        cancel,
-        15_000,
-        read_ms,
-        budget,
+        SourceAdmission {
+            epoch: epoch(),
+            binding,
+            encoded,
+            cancel,
+            open_ms: 15_000,
+            read_ms,
+            budget,
+        },
     )
 }
 pub(super) fn sql(fixture: &Fixture, cancel: Arc<AtomicBool>) -> Result<SqlReader> {
@@ -285,7 +287,7 @@ fn observed_reader_death_rolls_back_before_commit_but_durable_commit_wins() -> R
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("catalog");
         drop(Catalog::open(&root)?);
-        let replacement = Catalog::open(&temp.path().join("replacement"))?;
+        let replacement = Catalog::open(temp.path().join("replacement"))?;
         let root = root.canonicalize()?;
         fs::write(root.join(".lightroom-import.lock"), [])?;
         let remote = sql(&fixture, Arc::new(AtomicBool::new(false)))?;

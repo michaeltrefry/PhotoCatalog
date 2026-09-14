@@ -91,7 +91,7 @@ fn maximal_issue_manifest(
     assert_eq!(value.issues.capacity(), count);
     assert!(issue_capacity_bytes <= (72 * (MANIFEST_BYTES + 4)).div_ceil(11));
     let encoded = exact_json(
-        &Value::Manifest(value),
+        &Value::Manifest(Box::new(value)),
         RESULT_BYTES,
         &AtomicBool::new(false),
     )?;
@@ -119,7 +119,7 @@ fn maximal_stable_source_table_and_canonical_key_preserve_expanded_result() -> R
     let inline = PAGE_BYTES / 4;
     let table = "\0".repeat(inline);
     let overhead = serde_json::to_vec(&vec![crate::lightroom::plan::Cell::Blob(vec![])])?.len();
-    let elements = (inline - overhead + 1) / 2;
+    let elements = (inline - overhead).div_ceil(2);
     let key = serde_json::to_vec(&vec![crate::lightroom::plan::Cell::Blob(vec![0; elements])])?;
     assert!(key.len() <= inline && inline - key.len() < 2);
     fixture.edit(|db| {
@@ -243,7 +243,7 @@ fn maximal_units_first_manifest_preserves_foreign_evidence_and_rejects_tamper() 
         "],\"encoding\":\"WindowsWide\"}}{}",
         &template[at + needle.len()..]
     );
-    let count = (MANIFEST_BYTES - prefix.len() - suffix.len() + 1) / 2;
+    let count = (MANIFEST_BYTES - prefix.len() - suffix.len()).div_ceil(2);
     let mut raw = Vec::with_capacity(MANIFEST_BYTES);
     raw.extend_from_slice(prefix.as_bytes());
     for index in 0..count {
@@ -330,7 +330,7 @@ fn borrowed_outer_value_checks_method_before_payload_and_preserves_tag_order() -
         (Kind::Verified, Value::Verified),
         (
             Kind::Manifest,
-            Value::Manifest(source.capture_manifest(revision)?),
+            Value::Manifest(Box::new(source.capture_manifest(revision)?)),
         ),
         (
             Kind::StableSource,

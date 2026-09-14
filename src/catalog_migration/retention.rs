@@ -418,6 +418,9 @@ fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 fn decode(bytes: &[u8], length: usize, digest: &str) -> Result<EvidenceRecord> {
+    Ok(serde_json::from_slice(&decode_raw(bytes, length, digest)?)?)
+}
+fn decode_raw(bytes: &[u8], length: usize, digest: &str) -> Result<Vec<u8>> {
     ensure!(
         length <= RECORD_LIMIT && bytes.len() <= RECORD_LIMIT + 32768,
         "retained record size limit"
@@ -433,13 +436,34 @@ fn decode(bytes: &[u8], length: usize, digest: &str) -> Result<EvidenceRecord> {
             && blake3::hash(&raw).to_hex().as_str() == digest,
         "retained record integrity mismatch"
     );
-    Ok(serde_json::from_slice(&raw)?)
+    Ok(raw)
 }
 
 /// Resolve completed destination evidence to its retained authorized selection.
 pub(crate) fn selected_record(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
-    let (input, seal, compressed, length, digest):
-        (Option<String>, Option<Vec<u8>>, Option<Vec<u8>>, usize, Option<String>) = db.query_row(
+    selected_record_with(db, sequence, |raw, _| Ok(serde_json::from_slice(raw)?))
+}
+/// Artifact-only bounded projection; other callers retain the generic API.
+pub(crate) fn selected_capture(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
+    selected_record_with(db, sequence, |raw, input| {
+        crate::lightroom::migration_source::record_json::capture(raw, input, RECORD_LIMIT, &|| {
+            false
+        })
+    })
+}
+fn selected_record_with(
+    db: &Connection,
+    sequence: i64,
+    project: impl FnOnce(&[u8], &str) -> Result<EvidenceRecord>,
+) -> Result<EvidenceRecord> {
+    struct RetainedColumns {
+        input: Option<String>,
+        seal: Option<Vec<u8>>,
+        compressed: Option<Vec<u8>>,
+        length: usize,
+        digest: Option<String>,
+    }
+    let RetainedColumns { input, seal, compressed, length, digest } = db.query_row(
         "SELECT CASE WHEN typeof(i.id)='text' AND length(CAST(i.id AS BLOB))=64 THEN i.id END,
          CASE WHEN typeof(i.seal)='blob' AND length(i.seal)<=?2 THEN i.seal END,
          CASE WHEN typeof(r.compressed)='blob' AND length(r.compressed)<=?3
@@ -448,18 +472,20 @@ pub(crate) fn selected_record(db: &Connection, sequence: i64) -> Result<Evidence
          CASE WHEN typeof(r.digest)='text' AND length(CAST(r.digest AS BLOB))=64 THEN r.digest END
          FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1 AND r.complete=1",
         params![sequence, i64::try_from(RECORD_LIMIT)?, i64::try_from(RECORD_LIMIT + 32768)?],
-        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,evidence::size(r,3)?,r.get(4)?)),
+        |r|Ok(RetainedColumns {input:r.get(0)?,seal:r.get(1)?,compressed:r.get(2)?,length:evidence::size(r,3)?,digest:r.get(4)?}),
     )?;
     let input = input.context("retained input identity type/size limit")?;
     let seal = seal.context("retained seal type/size limit")?;
     let compressed = compressed.context("retained record type/size limit")?;
     let digest = digest.context("retained digest type/size limit")?;
-    let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
+    let seal =
+        crate::lightroom::migration_source::seal_json::decode(&seal, RECORD_LIMIT, &|| false)?;
     ensure!(
         seal.binding_blake3()? == input,
         "retained seal binding differs"
     );
-    let record = decode(&compressed, length, &digest)?;
+    let raw = decode_raw(&compressed, length, &digest)?;
+    let record = project(&raw, &input)?;
     ensure!(
         seal.selected.iter().any(|s| s.revision == record.revision)
             && !seal.excluded_revisions.contains(&record.revision),

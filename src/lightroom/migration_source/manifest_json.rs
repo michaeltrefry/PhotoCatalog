@@ -105,6 +105,17 @@ impl<'de: 'a, 'a> Deserialize<'de> for Path<'a> {
 }
 impl Path<'_> {
     fn encoding(&self) -> Result<Encoding> {
+        self.encoding_mode(false)
+    }
+    fn encoding_mode(&self, buffered: bool) -> Result<Encoding> {
+        if buffered && self.sequence {
+            return Ok(
+                match super::buffered_json::path_identifier(self.encoding)? {
+                    0 => Encoding::UnixBytes,
+                    _ => Encoding::WindowsWide,
+                },
+            );
+        }
         if self.sequence {
             // Public adjacent-tag sequences use an identifier, not deserialize_enum.
             let tag: Cow<'_, str> = serde_json::from_str(self.encoding.get())?;
@@ -114,7 +125,7 @@ impl Path<'_> {
                 _ => anyhow::bail!("unknown native path encoding"),
             })
         } else {
-            Ok(serde_json::from_str(self.encoding.get())?)
+            Ok(super::buffered_json::unit_enum(self.encoding, buffered)?)
         }
     }
     fn inspect(&self, footprint: &mut Footprint, stop: &dyn Fn() -> bool) -> Result<()> {
@@ -169,6 +180,32 @@ impl Path<'_> {
             }
         })
     }
+}
+/// A borrowed path with exact final unit capacity; no public NativePath change.
+pub(crate) fn path(
+    raw: &RawValue,
+    maximum_units: usize,
+    stop: &dyn Fn() -> bool,
+) -> Result<NativePath> {
+    path_mode(raw, maximum_units, stop, false)
+}
+pub(crate) fn path_mode(
+    raw: &RawValue,
+    maximum_units: usize,
+    stop: &dyn Fn() -> bool,
+    buffered: bool,
+) -> Result<NativePath> {
+    let p: Path<'_> = serde_json::from_str(raw.get())?;
+    Ok(match p.encoding_mode(buffered)? {
+        Encoding::UnixBytes => {
+            let n = units_bounded::<u8>(p.units, stop, None, maximum_units)?.0;
+            NativePath::UnixBytes(units(p.units, stop, Some(n))?.1)
+        }
+        Encoding::WindowsWide => {
+            let n = units_bounded::<u16>(p.units, stop, None, maximum_units)?.0;
+            NativePath::WindowsWide(units(p.units, stop, Some(n))?.1)
+        }
+    })
 }
 #[derive(Deserialize)]
 struct RequestJson<'a> {

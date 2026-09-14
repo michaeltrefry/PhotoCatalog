@@ -1,6 +1,7 @@
 //! Closed-roster source process. The destination executor consumes typed, bounded
 //! immutable values; it never receives a source File or SQLite connection.
 mod artifact_factory;
+mod authority_json;
 mod commit;
 mod owner;
 mod proxy;

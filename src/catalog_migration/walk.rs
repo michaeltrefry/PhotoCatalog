@@ -8,10 +8,12 @@ use super::{
     retention,
 };
 use crate::lightroom::migration_source::MigrationRead;
+#[cfg(test)]
+use crate::lightroom::migration_source::MigrationSource;
 use crate::{
     Catalog,
     lightroom::{
-        migration_source::{Collection, EvidenceRecord, MigrationSource, Resolution},
+        migration_source::{Collection, EvidenceRecord, Resolution},
         plan::Cell,
     },
 };

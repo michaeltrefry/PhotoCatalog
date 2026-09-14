@@ -5,8 +5,11 @@
 //! seal and the exclusion of other writers for the entire adapter lifetime.
 
 mod access;
+pub(crate) mod buffered_json;
 pub(crate) mod manifest_json;
 mod reader;
+pub(crate) mod record_json;
+pub(crate) mod seal_json;
 pub(crate) use access::MigrationRead;
 pub(crate) use reader::IMAGE_LINK_LIMITATIONS;
 pub use reader::MigrationSource;

@@ -49,6 +49,16 @@ impl Health {
             || self.poisoned.load(Ordering::Acquire)
     }
 }
+struct SourceAdmission {
+    epoch: Epoch,
+    binding: String,
+    encoded: Vec<u8>,
+    cancel: Arc<AtomicBool>,
+    open_ms: u64,
+    read_ms: u64,
+    budget: Budget,
+}
+
 struct Session {
     process: Process<Reply>,
     epoch: Epoch,
@@ -84,6 +94,23 @@ impl Session {
         Self::admit(
             process,
             process_stop,
+            SourceAdmission {
+                epoch,
+                binding,
+                encoded,
+                cancel,
+                open_ms,
+                read_ms,
+                budget,
+            },
+        )
+    }
+    fn admit(
+        process: Process<Reply>,
+        process_stop: Arc<Stop>,
+        admission: SourceAdmission,
+    ) -> Result<Self> {
+        let SourceAdmission {
             epoch,
             binding,
             encoded,
@@ -91,19 +118,7 @@ impl Session {
             open_ms,
             read_ms,
             budget,
-        )
-    }
-    fn admit(
-        process: Process<Reply>,
-        process_stop: Arc<Stop>,
-        epoch: Epoch,
-        binding: String,
-        encoded: Vec<u8>,
-        cancel: Arc<AtomicBool>,
-        open_ms: u64,
-        read_ms: u64,
-        budget: Budget,
-    ) -> Result<Self> {
+        } = admission;
         ensure!(
             (1..=3_600_000).contains(&open_ms) && (1..=120_000).contains(&read_ms),
             "source process deadline bounds"
@@ -402,7 +417,7 @@ impl MigrationRead for SqlReader {
         match self.query(Query::CaptureManifest {
             revision: revision.into(),
         })? {
-            Value::Manifest(v) => Ok(v),
+            Value::Manifest(v) => Ok(*v),
             _ => anyhow::bail!("source manifest reply kind"),
         }
     }

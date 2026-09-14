@@ -230,7 +230,8 @@ fn run(controls: &Controls, output: &mut impl Write) -> Result<()> {
         encoded.len() == length && crate::lightroom::digest(&encoded) == blake3,
         "source authority digest/length"
     );
-    let authority: Authority = serde_json::from_slice(&encoded)?;
+    let authority =
+        super::authority_json::decode(&encoded, &|| controls.cancel.load(Ordering::Acquire))?;
     drop(encoded);
     let binding = authority.binding()?;
     let mut roster = Roster::open(authority, controls.cancel.clone())?;

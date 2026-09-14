@@ -195,9 +195,25 @@ fn all_nine_kinds_apply_expected_query_and_full_scalar_bounds() -> Result<()> {
         logical_revision: None,
         revision_id: None,
     };
+    #[derive(serde::Serialize)]
+    struct PriorManifestEnvelope<'a> {
+        kind: &'static str,
+        value: &'a crate::lightroom::capture::Manifest,
+    }
+    let prior_manifest_bytes = serde_json::to_vec(&PriorManifestEnvelope {
+        kind: "Manifest",
+        value: &manifest,
+    })?;
+    let manifest_value = Value::Manifest(Box::new(manifest));
+    assert_eq!(serde_json::to_vec(&manifest_value)?, prior_manifest_bytes);
+    println!(
+        "manifest Value fixed boxed allocation={} bytes; Value inline size={} bytes",
+        std::mem::size_of::<crate::lightroom::capture::Manifest>(),
+        std::mem::size_of::<Value>(),
+    );
     let cases = vec![
         (
-            Value::Manifest(manifest),
+            manifest_value,
             Read::Sql(Query::CaptureManifest {
                 revision: rev.clone(),
             }),

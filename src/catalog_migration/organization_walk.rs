@@ -9,12 +9,11 @@ use super::{
     walk::{LinkResolution, Walk},
 };
 use crate::lightroom::migration_source::MigrationRead;
+#[cfg(test)]
+use crate::lightroom::migration_source::MigrationSource;
 use crate::{
     Catalog,
-    lightroom::{
-        migration_source::{Field, MigrationSource},
-        plan::Cell,
-    },
+    lightroom::{migration_source::Field, plan::Cell},
     organization::{Flag, KeywordKind},
 };
 use anyhow::{Result, ensure};
