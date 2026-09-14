@@ -263,6 +263,33 @@ rollback/replay. Runtime remains pending. Private source manifest
 `b9543f9f11d4629d5feb9a4d418f2ab09d184daced517646705c38ebf7d09f1a`
 is under `sc-22847-organization-query-w9vqymoo` in private results.
 
+Preview v26 closes the read-ownership/backpressure regression with five focused
+tests and nineteen configured/compatibility positives, strict Clippy and
+formatting. Root verified the thirty artifact hashes and twenty direct waits;
+initial receipt `6826f88b33c331a44d2eb83db355fea6213b97413d50692af4b22956a7888b0f`,
+configured receipt `9966238a3648e82c4fcc566ee55b7ca4e62b4d8ec41c0826efdeecd070385a81`.
+Independent runtime review
+`09d95775dd24a393b10792fd7cae2ff89ce0c23855c7f2f99669df2a84b717c2`
+verifies 60 source pins and the exact CLI. The real small 2 MiB reopening case,
+JPEG/WebP/AVIF, held transfer, six catalog-loss phases, two staggered live native
+workers and ten invalid header grants now pass. Actual N/C/F retirement is
+checked; no full FS8/S13 or installed-app acceptance follows. Prepared reuse plus
+two validated fallbacks and a fresh four-image cache batch have source-reviewed
+fixtures awaiting execution. Final SQL construction guards and aggregate
+accounting remain in progress.
+
+Lightroom v53 is committed locally as
+`b4909e1c5cd14acc5eaf5d0d607802303d479f72`; root verified all 140 committed
+blobs. Seven tests pass: transport refusal before spawn, both organization query
+regressions and four actual executor ownership cases. Formatting and all eight
+direct waits pass, with twelve verified raw artifact hashes; receipt
+`09bdc87253a3b516098bb753ca43963a8075119c1d49ee64f4d41f81bc499f88`.
+Independent checkpoint review
+`879050767caf6f13e725ea14bc0b4f66d67a1e6d1913cac3a0c9feb3e1c53a8f`
+passes. This qualifies the reviewed transport/query delta only; actual core
+admission, custody cursor/row guards, XMP interpretation ownership and production
+LM integration remain open. No push or new Actions run was made.
+
 Complete Source/core aggregate admission and migration wiring remain active.
 Managed migration requires G to own both actual SQL/raw Source processes through
 an epoch/token-bound relay; reaping LM alone cannot prove its Source children
