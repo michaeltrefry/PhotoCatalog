@@ -87,6 +87,18 @@ fn epoch(reader: &str) -> Epoch {
     }
 }
 type Fixture = (Broker, Arc<Stop>, Arc<Mutex<Vec<u32>>>);
+struct RevokeFixture {
+    broker: Broker,
+    stop: Arc<Stop>,
+    pids: Arc<Mutex<Vec<u32>>>,
+    checked: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
+}
+
+#[derive(Clone, Copy)]
+enum RevokeFailure {
+    Before,
+    After,
+}
 
 fn broker() -> Result<Fixture> {
     broker_with_budget(MemoryBudget::new(1024 * 1024)?)
@@ -112,6 +124,43 @@ fn broker_with_budget(budget: MemoryBudget) -> Result<Fixture> {
         },
     )?;
     Ok((broker, stop, pids))
+}
+fn broker_with_revoke_failure(
+    budget: MemoryBudget,
+    failure: RevokeFailure,
+) -> Result<RevokeFixture> {
+    let stop = Arc::new(Stop::default());
+    let pids = Arc::new(Mutex::new(Vec::with_capacity(1)));
+    let seen = pids.clone();
+    let checked = Arc::new(Mutex::new(None));
+    let observed = checked.clone();
+    let broker = Broker::start_with(
+        guard(),
+        stop.clone(),
+        budget,
+        move |_, stop, before_wait| {
+            let mut command = OsCommand::new(std::env::current_exe()?);
+            command
+                .args(["--exact", HELPER, "--nocapture"])
+                .env(ENV, "1");
+            crate::lightroom_migration_worker::process::source_environment(&mut command);
+            let mut process =
+                Process::spawn_test_command_with_cleanup(command, stop, Some(before_wait))?;
+            match failure {
+                RevokeFailure::Before => process.inject_revoke_failure_before_boundary(),
+                RevokeFailure::After => process.inject_revoke_failure_after_boundary(),
+            }
+            *observed.lock().unwrap() = Some(process.checked_drain_probe());
+            seen.lock().unwrap().push(process.pid());
+            Ok(process)
+        },
+    )?;
+    Ok(RevokeFixture {
+        broker,
+        stop,
+        pids,
+        checked,
+    })
 }
 fn send(broker: &Broker, mut command: Command) -> Result<()> {
     let until = Instant::now() + Duration::from_secs(5);
@@ -588,6 +637,109 @@ fn source_charge_needs_quiescence_and_reuses_only_exact_retired_epoch() -> Resul
     println!(
         "SOURCE_SCOPE_RETIRED after_wait=60 after_quiesced=30 after_broker_thread=60 after_owner=10 final=0"
     );
+    Ok(())
+}
+
+#[test]
+fn explicit_drain_ignores_only_transport_failure_after_revoke_boundary() -> Result<()> {
+    let budget = MemoryBudget::new(100)?;
+    let RevokeFixture {
+        mut broker,
+        stop,
+        pids,
+        checked,
+    } = broker_with_revoke_failure(budget.clone(), RevokeFailure::After)?;
+    let token = start(&broker, 1, Kind::Sql, "sql")?;
+    send(
+        &broker,
+        Command::Reserve {
+            token: token.clone(),
+            sequence: U64(1),
+            bytes: U64(40),
+        },
+    )?;
+    assert!(matches!(event(&broker)?, Event::Reserved { .. }));
+    send(
+        &broker,
+        Command::Drain {
+            token: token.clone(),
+        },
+    )?;
+    assert!(matches!(event(&broker)?, Event::Drained { token: actual } if actual == token));
+    assert!(
+        checked
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|probe| probe.load(std::sync::atomic::Ordering::Acquire)),
+        "Drained preceded checked child reap and I/O joins"
+    );
+    assert!(!stop.requested());
+    assert_eq!(
+        budget.used(),
+        40,
+        "checked Source drain alone released the epoch charge"
+    );
+    send(
+        &broker,
+        Command::Quiesced {
+            token: token.clone(),
+        },
+    )?;
+    assert!(matches!(event(&broker)?, Event::Quiesced { token: actual } if actual == token));
+    assert_eq!(budget.used(), 0);
+    broker.revoke_after_lm();
+    broker.finish()?;
+    absent(&pids);
+    Ok(())
+}
+
+#[test]
+fn transport_failure_before_revoke_boundary_remains_fatal() -> Result<()> {
+    let budget = MemoryBudget::new(100)?;
+    let RevokeFixture {
+        mut broker,
+        stop,
+        pids,
+        ..
+    } = broker_with_revoke_failure(budget.clone(), RevokeFailure::Before)?;
+    let token = start(&broker, 1, Kind::Sql, "sql")?;
+    send(
+        &broker,
+        Command::Reserve {
+            token: token.clone(),
+            sequence: U64(1),
+            bytes: U64(40),
+        },
+    )?;
+    assert!(matches!(event(&broker)?, Event::Reserved { .. }));
+    send(
+        &broker,
+        Command::Drain {
+            token: token.clone(),
+        },
+    )?;
+    let until = Instant::now() + Duration::from_secs(5);
+    while !stop.requested() {
+        ensure!(
+            Instant::now() < until,
+            "pre-revoke transport failure did not revoke"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(matches!(
+        broker.try_urgent(),
+        Some(Event::Failed { token: actual, detail })
+            if actual == token && detail.contains("Source transport failed")
+    ));
+    assert_eq!(budget.used(), 40);
+    broker.revoke_after_lm();
+    broker.wait_revoked();
+    assert!(broker.finish().is_err());
+    absent(&pids);
+    assert_eq!(budget.used(), 40);
+    drop(broker);
+    assert_eq!(budget.used(), 0);
     Ok(())
 }
 

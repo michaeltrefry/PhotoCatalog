@@ -59,6 +59,18 @@ pub(crate) struct Process<T = ChildFrame> {
     injected_wait_failures: usize,
     #[cfg(test)]
     startup_order_gate: Arc<Mutex<Option<Arc<StartupOrderGate>>>>,
+    #[cfg(test)]
+    injected_revoke_failure: InjectedRevokeFailure,
+    #[cfg(test)]
+    checked_drain: Arc<AtomicBool>,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+enum InjectedRevokeFailure {
+    #[default]
+    None,
+    Before,
+    After,
 }
 /// Forces the writer's control-poll/data-receive window without changing its
 /// production queue order or holding another encoded frame. All waits are
@@ -331,6 +343,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
             injected_wait_failures: 0,
             #[cfg(test)]
             startup_order_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            injected_revoke_failure: InjectedRevokeFailure::None,
+            #[cfg(test)]
+            checked_drain: Arc::new(AtomicBool::new(false)),
         };
         let configured = (|| -> Result<()> {
             let mut stdin = owner.child.stdin.take().context("migration input pipe")?;
@@ -461,6 +477,18 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         self.injected_wait_failures = count;
     }
     #[cfg(test)]
+    pub(crate) fn inject_revoke_failure_before_boundary(&mut self) {
+        self.injected_revoke_failure = InjectedRevokeFailure::Before;
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_revoke_failure_after_boundary(&mut self) {
+        self.injected_revoke_failure = InjectedRevokeFailure::After;
+    }
+    #[cfg(test)]
+    pub(crate) fn checked_drain_probe(&self) -> Arc<AtomicBool> {
+        self.checked_drain.clone()
+    }
+    #[cfg(test)]
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -553,6 +581,14 @@ impl<T> Process<T> {
     /// and both Sources before waiting for any one child; a failed first kill
     /// must not postpone revoking the other owners.
     pub(crate) fn revoke(&mut self) {
+        #[cfg(test)]
+        if matches!(self.injected_revoke_failure, InjectedRevokeFailure::Before) {
+            self.transport.failed.store(true, Ordering::Release);
+        }
+        #[cfg(test)]
+        if matches!(self.injected_revoke_failure, InjectedRevokeFailure::After) {
+            self.transport.failed.store(true, Ordering::Release);
+        }
         self.input.take();
         self.control.take();
         self.output.take();
@@ -602,6 +638,8 @@ impl<T> Process<T> {
         if let Some(reader) = self.reader.take() {
             self.io_panicked |= reader.join().is_err();
         }
+        #[cfg(test)]
+        self.checked_drain.store(true, Ordering::Release);
         Ok(Some(DrainReport {
             status: self.reaped.expect("confirmed process reap"),
             io_panicked: self.io_panicked,
