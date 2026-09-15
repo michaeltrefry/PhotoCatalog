@@ -175,6 +175,12 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((attempt, digest)) = receipt {
+            ensure!(
+                crate::catalog_metadata_write::existing(&tx, attempt, digest)?.is_none(),
+                "metadata attempt already committed"
+            );
+        }
         crate::catalog_images::require_image_metadata_identity(&tx, &identity)?;
         tx.execute(
             "INSERT OR IGNORE INTO metadata_blobs VALUES(?1,?2,?3)",

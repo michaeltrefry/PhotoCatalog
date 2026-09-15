@@ -16,6 +16,8 @@ struct Transfer {
     request: Request,
     mode: Mode,
     bytes: Vec<u8>,
+    evidence: Option<(fs::File, std::path::PathBuf)>,
+    hasher: blake3::Hasher,
     expected: u64,
     digest: String,
     offset: u64,
@@ -60,11 +62,20 @@ impl Owner {
                 );
                 let capacity = usize::try_from(bytes.0)?;
                 let mut payload = Vec::new();
-                payload.try_reserve_exact(capacity)?;
+                let evidence = if let Mode::Evidence { destination } = mode {
+                    Some(crate::metadata_export::create_evidence_new(
+                        &destination.to_path()?,
+                    )?)
+                } else {
+                    payload.try_reserve_exact(capacity)?;
+                    None
+                };
                 self.transfer = Some(Transfer {
                     request: request.clone(),
                     mode: mode.clone(),
                     bytes: payload,
+                    evidence,
+                    hasher: blake3::Hasher::new(),
                     expected: bytes.0,
                     digest: blake3.clone(),
                     offset: 0,
@@ -85,7 +96,13 @@ impl Owner {
                     transfer.offset.saturating_add(bytes.len() as u64) <= transfer.expected,
                     "metadata file upload extent"
                 );
-                transfer.bytes.extend_from_slice(bytes);
+                if let Some((file, _)) = &mut transfer.evidence {
+                    use std::io::Write;
+                    file.write_all(bytes)?;
+                } else {
+                    transfer.bytes.extend_from_slice(bytes);
+                }
+                transfer.hasher.update(bytes);
                 transfer.offset += bytes.len() as u64;
                 Value::Appended {
                     offset: U64(transfer.offset),
@@ -102,7 +119,7 @@ impl Owner {
                     "metadata file upload incomplete"
                 );
                 ensure!(
-                    blake3::hash(&transfer.bytes).to_hex().as_str() == transfer.digest,
+                    transfer.hasher.finalize().to_hex().as_str() == transfer.digest,
                     "metadata file upload digest"
                 );
                 check(cancel)?;
@@ -144,10 +161,10 @@ impl Owner {
                         Value::Receipt(crate::metadata_export::restore_planned_export(&plan)?)
                     }
                     Mode::Evidence { destination } => {
-                        crate::metadata_export::write_evidence_new(
-                            &destination.to_path()?,
-                            &transfer.bytes,
-                        )?;
+                        let (file, path) = transfer
+                            .evidence
+                            .context("metadata evidence file is not active")?;
+                        crate::metadata_export::finish_evidence_new(&file, &path)?;
                         Value::Evidence(EvidenceReceipt {
                             destination,
                             bytes: U64(transfer.expected),
@@ -535,6 +552,59 @@ mod tests {
             crate::metadata_export::ExportState::Restored
         );
         assert_eq!(fs::read(destination)?, b"original sidecar");
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_stream_writes_chunks_without_accumulating_document() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let canonical = temp.path().canonicalize()?;
+        let root = root(&canonical);
+        let destination = canonical.join("evidence.json");
+        let payload = vec![b'x'; crate::catalog_session::metadata_files::CHUNK_BYTES + 37];
+        let digest = blake3::hash(&payload).to_hex().to_string();
+        let transfer = crate::catalog_session::LeaseId::new();
+        let mut owner = Owner::default();
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            1,
+            Action::Begin {
+                mode: Mode::Evidence {
+                    destination: NativePath::from_path(&destination),
+                },
+                bytes: U64(payload.len() as u64),
+                blake3: digest,
+            },
+        )?;
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            2,
+            Action::Append {
+                offset: U64(0),
+                bytes: payload[..crate::catalog_session::metadata_files::CHUNK_BYTES].to_vec(),
+            },
+        )?;
+        assert!(owner.transfer.as_ref().unwrap().bytes.is_empty());
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            3,
+            Action::Append {
+                offset: U64(crate::catalog_session::metadata_files::CHUNK_BYTES as u64),
+                bytes: payload[crate::catalog_session::metadata_files::CHUNK_BYTES..].to_vec(),
+            },
+        )?;
+        let Value::Evidence(receipt) = call(&mut owner, &root, &transfer, 4, Action::Finish)?
+        else {
+            unreachable!()
+        };
+        assert_eq!(receipt.bytes.0, payload.len() as u64);
+        assert_eq!(fs::read(destination)?, payload);
         Ok(())
     }
 }

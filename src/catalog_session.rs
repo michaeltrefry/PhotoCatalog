@@ -1192,10 +1192,76 @@ pub(crate) use roles::{RolePool, SqlConnection};
 use rusqlite::{Connection, OpenFlags};
 use std::{
     fs::File,
+    io::{self, Write},
     mem::ManuallyDrop,
     path::Path,
     sync::{Arc, Mutex, atomic::Ordering},
 };
+
+struct MetadataEvidenceWriter<'a> {
+    filesystem: &'a dyn CatalogFilesystem,
+    root: &'a RootCapability,
+    transfer: &'a LeaseId,
+    operation: &'a mut u64,
+    offset: u64,
+    buffer: Vec<u8>,
+    cancel: &'a AtomicBool,
+}
+impl MetadataEvidenceWriter<'_> {
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        *self.operation = self
+            .operation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("metadata evidence operation exhausted"))?;
+        let bytes = std::mem::take(&mut self.buffer);
+        let length = bytes.len() as u64;
+        let request = metadata_files::Request {
+            root: self.root.clone(),
+            transfer: self.transfer.clone(),
+            operation: U64(*self.operation),
+            action: metadata_files::Action::Append {
+                offset: U64(self.offset),
+                bytes,
+            },
+        };
+        let reply = self
+            .filesystem
+            .metadata_files_call(&request, self.cancel)
+            .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        reply
+            .validate(&request)
+            .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        self.offset = self.offset.saturating_add(length);
+        if !matches!(
+            reply.value,
+            metadata_files::Value::Appended { offset: U64(value) } if value == self.offset
+        ) {
+            return Err(io::Error::other("metadata evidence upload acknowledgement"));
+        }
+        Ok(())
+    }
+}
+impl Write for MetadataEvidenceWriter<'_> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let original = bytes.len();
+        while !bytes.is_empty() {
+            let room = metadata_files::CHUNK_BYTES - self.buffer.len();
+            let take = room.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buffer.len() == metadata_files::CHUNK_BYTES {
+                self.flush_chunk()?;
+            }
+        }
+        Ok(original)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_chunk()
+    }
+}
 
 pub(crate) trait SessionTask: Send + Sync {
     fn request_cancel(&self);
@@ -2333,6 +2399,95 @@ impl CatalogSessionAuthority {
             None => Ok(None),
             _ => anyhow::bail!("unexpected metadata evidence result"),
         }
+    }
+    pub(crate) fn write_metadata_evidence_stream(
+        &self,
+        destination: &NativePath,
+        total: u64,
+        digest: &str,
+        cancel: &AtomicBool,
+        emit: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<Option<metadata_files::EvidenceReceipt>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            total <= metadata_files::EVIDENCE_BYTES,
+            "metadata evidence byte limit"
+        );
+        crate::catalog_metadata_write::validate_digest(digest)?;
+        let transfer = LeaseId::new();
+        let mut operation = 1u64;
+        let result = (|| {
+            let request = metadata_files::Request {
+                root: root.clone(),
+                transfer: transfer.clone(),
+                operation: U64(operation),
+                action: metadata_files::Action::Begin {
+                    mode: metadata_files::Mode::Evidence {
+                        destination: destination.clone(),
+                    },
+                    bytes: U64(total),
+                    blake3: digest.to_owned(),
+                },
+            };
+            let reply = filesystem.metadata_files_call(&request, cancel)?;
+            reply.validate(&request)?;
+            ensure!(matches!(reply.value, metadata_files::Value::Begun));
+            let mut writer = MetadataEvidenceWriter {
+                filesystem: filesystem.as_ref(),
+                root,
+                transfer: &transfer,
+                operation: &mut operation,
+                offset: 0,
+                buffer: Vec::with_capacity(metadata_files::CHUNK_BYTES),
+                cancel,
+            };
+            emit(&mut writer)?;
+            writer.flush_chunk()?;
+            ensure!(
+                writer.offset == total,
+                "metadata evidence emitted byte count"
+            );
+            drop(writer);
+            operation = operation
+                .checked_add(1)
+                .context("metadata evidence operation exhausted")?;
+            let request = metadata_files::Request {
+                root: root.clone(),
+                transfer: transfer.clone(),
+                operation: U64(operation),
+                action: metadata_files::Action::Finish,
+            };
+            let reply = filesystem.metadata_files_call(&request, cancel)?;
+            reply.validate(&request)?;
+            let metadata_files::Value::Evidence(receipt) = reply.value else {
+                anyhow::bail!("unexpected metadata evidence result")
+            };
+            ensure!(
+                receipt.bytes.0 == total && receipt.blake3 == digest,
+                "metadata evidence receipt seal"
+            );
+            Ok(receipt)
+        })();
+        if result.is_err()
+            && let Some(release) = operation.checked_add(1)
+        {
+            let request = metadata_files::Request {
+                root: root.clone(),
+                transfer,
+                operation: U64(release),
+                action: metadata_files::Action::Release,
+            };
+            let cleanup_cancel = AtomicBool::new(false);
+            if let Ok(reply) = filesystem.metadata_files_call(&request, &cleanup_cancel) {
+                let _ = reply.validate(&request);
+            }
+        }
+        result.map(Some)
     }
     pub(crate) fn discover_metadata_files(
         &self,

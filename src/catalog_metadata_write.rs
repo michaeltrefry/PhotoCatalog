@@ -3,6 +3,7 @@ use crate::{Catalog, catalog_images::ImageMetadataIdentity};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE metadata_write_receipts (
@@ -321,7 +322,7 @@ impl Catalog {
     }
 
     pub(crate) fn export_metadata_evidence(
-        &self,
+        &mut self,
         identity: &ImageMetadataIdentity,
         observation: i64,
         destination: &crate::storage_volume::NativePath,
@@ -334,29 +335,129 @@ impl Catalog {
             (1..=256 * 1024 * 1024).contains(&byte_limit) && (1..=1024).contains(&packet_limit),
             "metadata evidence limits"
         );
-        let packets = self.metadata_packets(&identity.image_id, observation)?;
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::catalog_images::require_image_metadata_identity(&tx, identity)?;
+        let owned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata_image_observations WHERE image_id=?1 AND observation_id=?2)",
+            params![identity.image_id, observation],
+            |row| row.get(0),
+        )?;
+        ensure!(owned, "observation is not owned by selected image");
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM metadata_packets WHERE observation_id=?1",
+            [observation],
+            |row| row.get(0),
+        )?;
         ensure!(
-            packets.len() <= packet_limit,
+            count >= 0 && usize::try_from(count)? <= packet_limit,
             "metadata evidence packet limit"
         );
-        let bytes = serde_json::to_vec(&packets)?;
-        ensure!(
-            u64::try_from(bytes.len())? <= byte_limit,
-            "metadata evidence byte limit"
-        );
-        match self
-            .session
-            .write_metadata_evidence(destination, &bytes, cancel)?
-        {
-            Some(receipt) => Ok(receipt),
+        let mut seal = EvidenceSeal::new(byte_limit);
+        emit_evidence_document(&tx, observation, cancel, &mut seal)?;
+        let total = seal.bytes;
+        let digest = seal.hasher.finalize().to_hex().to_string();
+        let managed = self.session.write_metadata_evidence_stream(
+            destination,
+            total,
+            &digest,
+            cancel,
+            |writer| emit_evidence_document(&tx, observation, cancel, writer),
+        )?;
+        let receipt = match managed {
+            Some(receipt) => receipt,
             None => {
-                crate::metadata_export::write_evidence_new(&destination.to_path()?, &bytes)?;
-                Ok(crate::catalog_session::metadata_files::EvidenceReceipt {
+                crate::metadata_export::write_evidence_new_stream(
+                    &destination.to_path()?,
+                    |writer| emit_evidence_document(&tx, observation, cancel, writer),
+                )?;
+                crate::catalog_session::metadata_files::EvidenceReceipt {
                     destination: destination.clone(),
-                    bytes: crate::application::U64(u64::try_from(bytes.len())?),
-                    blake3: blake3::hash(&bytes).to_hex().to_string(),
-                })
+                    bytes: crate::application::U64(total),
+                    blake3: digest,
+                }
             }
+        };
+        tx.commit()?;
+        Ok(receipt)
+    }
+}
+
+struct EvidenceSeal {
+    hasher: blake3::Hasher,
+    bytes: u64,
+    limit: u64,
+}
+impl EvidenceSeal {
+    fn new(limit: u64) -> Self {
+        Self {
+            hasher: blake3::Hasher::new(),
+            bytes: 0,
+            limit,
         }
     }
+}
+impl Write for EvidenceSeal {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("metadata evidence byte count overflow"))?;
+        if next > self.limit {
+            return Err(io::Error::other("metadata evidence byte limit"));
+        }
+        self.hasher.update(bytes);
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn emit_evidence_document(
+    db: &Connection,
+    observation: i64,
+    cancel: &std::sync::atomic::AtomicBool,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writer.write_all(b"[")?;
+    let mut statement = db.prepare(
+        "SELECT ordinal,CASE WHEN length(CAST(blob_hash AS BLOB))=64 THEN blob_hash END,CASE WHEN length(CAST(descriptor AS BLOB))<=16384 THEN descriptor END FROM metadata_packets WHERE observation_id=?1 ORDER BY ordinal",
+    )?;
+    let mut rows = statement.query([observation])?;
+    let mut first = true;
+    while let Some(row) = rows.next()? {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "metadata evidence export canceled"
+        );
+        let ordinal: i64 = row.get(0)?;
+        ensure!(ordinal >= 0, "metadata packet ordinal");
+        let digest: String = row
+            .get::<_, Option<String>>(1)?
+            .context("metadata packet digest byte limit")?;
+        validate_digest(&digest)?;
+        let descriptor: String = row
+            .get::<_, Option<String>>(2)?
+            .context("metadata packet descriptor byte limit")?;
+        let _: serde_json::Value = serde_json::from_str(&descriptor)?;
+        let bytes = crate::catalog_metadata::read_blob(db, &digest)?;
+        if !first {
+            writer.write_all(b",")?;
+        }
+        first = false;
+        write!(
+            writer,
+            "{{\"ordinal\":{ordinal},\"descriptor\":{descriptor},\"bytes\":"
+        )?;
+        serde_json::to_writer(&mut *writer, &bytes)?;
+        write!(writer, ",\"blake3\":\"{digest}\"}}")?;
+    }
+    writer.write_all(b"]")?;
+    Ok(())
 }

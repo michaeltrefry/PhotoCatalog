@@ -469,6 +469,22 @@ pub(crate) fn plan_export_controlled(
 }
 
 pub(crate) fn write_evidence_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_evidence_new_stream(path, |file| {
+        file.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+pub(crate) fn write_evidence_new_stream(
+    path: &Path,
+    emit: impl FnOnce(&mut dyn Write) -> Result<()>,
+) -> Result<()> {
+    let (mut file, destination) = create_evidence_new(path)?;
+    emit(&mut file)?;
+    finish_evidence_new(&file, &destination)
+}
+
+pub(crate) fn create_evidence_new(path: &Path) -> Result<(File, PathBuf)> {
     ensure!(path.is_absolute(), "evidence destination must be absolute");
     let parent = path
         .parent()
@@ -479,8 +495,16 @@ pub(crate) fn write_evidence_new(path: &Path, bytes: &[u8]) -> Result<()> {
             .context("evidence destination has no filename")?,
     );
     ensure!(destination == path, "evidence destination parent changed");
-    write_new(&destination, bytes)?;
-    sync_directory(&parent)
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&destination)?;
+    Ok((file, destination))
+}
+
+pub(crate) fn finish_evidence_new(file: &File, destination: &Path) -> Result<()> {
+    file.sync_all()?;
+    sync_directory(destination.parent().context("evidence parent")?)
 }
 
 pub fn apply_export(plan: &ExportPlan, payload: &[u8]) -> Result<ExportReceipt> {

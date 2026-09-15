@@ -7,6 +7,8 @@ use crate::{
 };
 use anyhow::{Context, Result as AnyResult, ensure};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
 type Result<T> = std::result::Result<T, BridgeError>;
 const CHUNK: usize = 16 * 1024;
@@ -341,6 +343,7 @@ struct InputState {
     dto: Input,
     bytes: Vec<u8>,
 }
+#[derive(Clone)]
 struct Reader {
     reference: Reference,
     bytes: Vec<u8>,
@@ -356,7 +359,7 @@ struct DiscoveryState {
     transfer: crate::catalog_session::LeaseId,
     next_operation: u64,
 }
-pub struct Coordinator {
+struct WorkerState {
     epoch: u64,
     input: Option<InputState>,
     review: Option<ReviewState>,
@@ -364,7 +367,7 @@ pub struct Coordinator {
     operation: Option<Operation>,
     discovery: Option<DiscoveryState>,
 }
-impl Default for Coordinator {
+impl Default for WorkerState {
     fn default() -> Self {
         Self {
             epoch: 1,
@@ -376,7 +379,7 @@ impl Default for Coordinator {
         }
     }
 }
-impl Coordinator {
+impl WorkerState {
     pub fn close(&mut self, catalog: &Catalog) -> AnyResult<()> {
         if let Some(discovery) = self.discovery.take() {
             catalog
@@ -845,6 +848,8 @@ impl Coordinator {
                     .filter(|value| value.dto.token == review && value.dto.digest == review_digest)
                     .ok_or_else(|| error(ErrorCode::StaleSession, "metadata review changed"))?
                     .prepared;
+                self.input = None;
+                self.reader = None;
                 let change = catalog
                     .commit_prepared_metadata_edit_with_receipt(prepared, attempt, digest)
                     .map_err(native)?;
@@ -1213,6 +1218,686 @@ impl Coordinator {
     }
 }
 
+#[derive(Default)]
+struct SharedState {
+    epoch: u64,
+    operation: Option<Operation>,
+    input: Option<Input>,
+    review: Option<Review>,
+    reader: Option<Reader>,
+    fields: Vec<ReviewField>,
+    cancel: Option<Cancellation>,
+    write_hold: bool,
+    closing: bool,
+}
+
+enum WorkerTask {
+    Run {
+        operation: Operation,
+        action: Action,
+        bounds: Limits,
+        cancel: Cancellation,
+        write_ready: mpsc::Receiver<()>,
+    },
+    RecoveryEntries {
+        token: String,
+        after: Option<String>,
+        limit: u16,
+        bounds: Limits,
+        cancel: Cancellation,
+        reply: mpsc::SyncSender<Result<Response>>,
+    },
+    Shutdown,
+}
+
+struct Worker {
+    sender: mpsc::Sender<WorkerTask>,
+    join: thread::JoinHandle<()>,
+    session: Arc<crate::catalog_session::CatalogSessionAuthority>,
+}
+
+pub struct Coordinator {
+    shared: Arc<Mutex<SharedState>>,
+    worker: Option<Worker>,
+    write_ready: Option<mpsc::SyncSender<()>>,
+    pause: Option<crate::preview::NativeLaunchPause>,
+}
+
+impl Default for Coordinator {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(SharedState {
+                epoch: 1,
+                ..SharedState::default()
+            })),
+            worker: None,
+            write_ready: None,
+            pause: None,
+        }
+    }
+}
+
+impl Coordinator {
+    pub fn write_hold(&self) -> bool {
+        self.shared.lock().unwrap().write_hold
+    }
+
+    pub fn needs_write(&self) -> bool {
+        self.shared.lock().unwrap().write_hold && self.write_ready.is_some()
+    }
+
+    pub fn request_cancel(&self) {
+        if let Some(cancel) = &self.shared.lock().unwrap().cancel {
+            cancel.cancel();
+        }
+    }
+
+    pub fn start_write(&mut self, service: &mut crate::preview::PreviewService) -> Result<()> {
+        if self.pause.is_none() {
+            self.pause = Some(service.pause_native_launches().map_err(native)?);
+        }
+        if let Some(ready) = self.write_ready.take() {
+            ready
+                .send(())
+                .map_err(|_| error(ErrorCode::Native, "metadata write handshake was lost"))?;
+        }
+        Ok(())
+    }
+
+    pub fn release_completed(&mut self) -> Result<()> {
+        if !self.shared.lock().unwrap().write_hold {
+            self.pause = None;
+            self.write_ready = None;
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.join.is_finished())
+        {
+            let worker = self.worker.take().unwrap();
+            let healthy = worker.join.join().is_ok();
+            worker
+                .session
+                .joined(crate::catalog_session::SqlRole::Relink, healthy)
+                .map_err(native)?;
+            if !healthy {
+                return Err(error(ErrorCode::Native, "metadata worker panicked"));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_worker(&mut self, catalog: &Catalog) -> Result<()> {
+        if self.worker.is_some() {
+            return Ok(());
+        }
+        let handle = catalog.relink_worker_handle().map_err(native)?;
+        let session = catalog.session.clone();
+        let shared = Arc::clone(&self.shared);
+        let (sender, receiver) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("catalog-metadata-write".into())
+            .spawn(move || {
+                let mut catalog = match handle.open() {
+                    Ok(catalog) => catalog,
+                    Err(failure) => {
+                        let mut shared = shared.lock().unwrap();
+                        if let Some(operation) = shared.operation.as_mut() {
+                            operation.phase = "failed".into();
+                            operation.stage = "draining".into();
+                            operation.error = Some(format!(
+                                "metadata worker could not open the selected catalog: {failure:#}"
+                            ));
+                        }
+                        shared.write_hold = false;
+                        shared.cancel = None;
+                        return;
+                    }
+                };
+                let mut state = WorkerState::default();
+                while let Ok(task) = receiver.recv() {
+                    match task {
+                        WorkerTask::Run {
+                            mut operation,
+                            action,
+                            bounds,
+                            cancel,
+                            write_ready,
+                        } => {
+                            let result = if action_write_hold(&action) {
+                                loop {
+                                    if cancel.is_canceled() {
+                                        break Err(error(
+                                            ErrorCode::Canceled,
+                                            "metadata operation canceled before writer admission",
+                                        ));
+                                    }
+                                    match write_ready
+                                        .recv_timeout(std::time::Duration::from_millis(50))
+                                    {
+                                        Ok(()) => {
+                                            break state.run(
+                                                &mut catalog,
+                                                &operation.attempt,
+                                                &operation.request_digest,
+                                                action,
+                                                &bounds,
+                                                &cancel,
+                                            );
+                                        }
+                                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                            break Err(error(
+                                                ErrorCode::Closed,
+                                                "metadata writer admission was withdrawn",
+                                            ));
+                                        }
+                                    }
+                                }
+                            } else {
+                                state.run(
+                                    &mut catalog,
+                                    &operation.attempt,
+                                    &operation.request_digest,
+                                    action,
+                                    &bounds,
+                                    &cancel,
+                                )
+                            };
+                            match result {
+                                Ok(value) => {
+                                    operation.phase = "complete".into();
+                                    operation.progress = U64(1);
+                                    operation.result = Some(value);
+                                }
+                                Err(failure) => {
+                                    operation.phase = if cancel.is_canceled() {
+                                        "canceled"
+                                    } else {
+                                        "failed"
+                                    }
+                                    .into();
+                                    operation.error = Some(failure.message);
+                                }
+                            }
+                            operation.stage = "draining".into();
+                            let mut shared = shared.lock().unwrap();
+                            shared.operation = Some(operation);
+                            shared.input = state.input.as_ref().map(|value| value.dto.clone());
+                            shared.review = state.review.as_ref().map(|value| value.dto.clone());
+                            shared.reader = state.reader.clone();
+                            shared.fields = state
+                                .review
+                                .as_ref()
+                                .map(|value| value.fields.clone())
+                                .unwrap_or_default();
+                            shared.write_hold = false;
+                            shared.cancel = None;
+                            let idle = state.input.is_none()
+                                && state.review.is_none()
+                                && state.reader.is_none()
+                                && state.discovery.is_none();
+                            drop(shared);
+                            if idle {
+                                break;
+                            }
+                        }
+                        WorkerTask::RecoveryEntries {
+                            token,
+                            after,
+                            limit,
+                            bounds,
+                            cancel,
+                            reply,
+                        } => {
+                            let result = state
+                                .recovery_entries(&catalog, token, after, limit, &bounds, &cancel);
+                            let _ = reply.send(result);
+                        }
+                        WorkerTask::Shutdown => break,
+                    }
+                }
+                let _ = state.close(&catalog);
+            })
+            .map_err(|value| native(value.into()))?;
+        self.worker = Some(Worker {
+            sender,
+            join,
+            session,
+        });
+        Ok(())
+    }
+
+    pub fn close(&mut self, _catalog: &Catalog) -> AnyResult<()> {
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.closing = true;
+            if let Some(cancel) = &shared.cancel {
+                cancel.cancel();
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.sender.send(WorkerTask::Shutdown);
+            let healthy = worker.join.join().is_ok();
+            worker
+                .session
+                .joined(crate::catalog_session::SqlRole::Relink, healthy)?;
+            ensure!(healthy, "metadata worker panicked during Close");
+        }
+        let mut shared = self.shared.lock().unwrap();
+        shared.epoch = shared.epoch.saturating_add(1);
+        shared.input = None;
+        shared.review = None;
+        shared.reader = None;
+        shared.fields.clear();
+        shared.cancel = None;
+        shared.write_hold = false;
+        self.write_ready = None;
+        self.pause = None;
+        Ok(())
+    }
+
+    pub fn execute(
+        &mut self,
+        catalog_name: &str,
+        catalog: &mut Catalog,
+        request: Request,
+        bounds: &Limits,
+        _command_cancel: &Cancellation,
+    ) -> Result<Response> {
+        match request {
+            Request::Options => Ok(Response::Options(options(bounds))),
+            Request::Status { operation } => {
+                if let Some(operation) = &operation {
+                    valid_uuid(operation)?;
+                }
+                let shared = self.shared.lock().unwrap();
+                if operation.as_ref().is_some_and(|expected| {
+                    shared.operation.as_ref().map(|value| &value.id) != Some(expected)
+                }) {
+                    return Err(error(ErrorCode::StaleSession, "metadata operation changed"));
+                }
+                Ok(Response::Status(Status {
+                    catalog: catalog_name.into(),
+                    epoch: U64(shared.epoch),
+                    operation: shared.operation.clone(),
+                    write_hold: shared.write_hold,
+                    closing: shared.closing,
+                    input: shared.input.clone(),
+                    review: shared.review.clone(),
+                }))
+            }
+            Request::Cancel { operation, epoch } => {
+                valid_uuid(&operation)?;
+                let mut shared = self.shared.lock().unwrap();
+                if epoch.0 != shared.epoch
+                    || shared.operation.as_ref().map(|value| &value.id) != Some(&operation)
+                {
+                    return Err(error(ErrorCode::StaleSession, "metadata operation changed"));
+                }
+                if let Some(cancel) = &shared.cancel {
+                    cancel.cancel();
+                    if let Some(operation) = shared.operation.as_mut() {
+                        operation.cancel_requested = true;
+                    }
+                }
+                Ok(Response::Status(Status {
+                    catalog: catalog_name.into(),
+                    epoch: U64(shared.epoch),
+                    operation: shared.operation.clone(),
+                    write_hold: shared.write_hold,
+                    closing: shared.closing,
+                    input: shared.input.clone(),
+                    review: shared.review.clone(),
+                }))
+            }
+            Request::Start { attempt, action } => {
+                self.release_completed()?;
+                crate::catalog_metadata_write::validate_attempt(&attempt).map_err(native)?;
+                let digest = canonical_request_digest(catalog, &self.shared, &action)?;
+                if let Some(receipt) = catalog.metadata_write_receipt(&attempt).map_err(native)? {
+                    if receipt.request_digest != digest {
+                        return Err(error(
+                            ErrorCode::InvalidRequest,
+                            "attempt already belongs to a different request",
+                        ));
+                    }
+                    let epoch = self.shared.lock().unwrap().epoch;
+                    let operation =
+                        terminal(&attempt, &digest, &kind(&action), epoch, receipt.result);
+                    let id = operation.id.clone();
+                    self.shared.lock().unwrap().operation = Some(operation);
+                    return Ok(Response::Admitted(Admitted {
+                        operation: id,
+                        attempt,
+                        request_digest: digest,
+                        epoch: U64(epoch),
+                    }));
+                }
+                {
+                    let shared = self.shared.lock().unwrap();
+                    if shared.closing {
+                        return Err(error(ErrorCode::Closed, "metadata worker is closing"));
+                    }
+                    if shared.operation.as_ref().is_some_and(|value| {
+                        !matches!(value.phase.as_str(), "complete" | "failed" | "canceled")
+                    }) {
+                        return Err(error(
+                            ErrorCode::Busy,
+                            "metadata operation is still running or draining",
+                        ));
+                    }
+                }
+                self.ensure_worker(catalog)?;
+                let epoch = self.shared.lock().unwrap().epoch;
+                let id = uuid::Uuid::new_v4().to_string();
+                let write_hold = action_write_hold(&action);
+                let operation = Operation {
+                    id: id.clone(),
+                    attempt: attempt.clone(),
+                    request_digest: digest.clone(),
+                    epoch: U64(epoch),
+                    kind: kind(&action),
+                    phase: "running".into(),
+                    stage: if write_hold {
+                        "waiting_writer"
+                    } else {
+                        "preparing"
+                    }
+                    .into(),
+                    cancel_requested: false,
+                    progress: U64(0),
+                    result: None,
+                    error: None,
+                };
+                let cancel = Cancellation::default();
+                let (write_ready, wait_for_write) = mpsc::sync_channel(1);
+                {
+                    let mut shared = self.shared.lock().unwrap();
+                    shared.operation = Some(operation.clone());
+                    shared.cancel = Some(cancel.clone());
+                    shared.write_hold = write_hold;
+                }
+                self.write_ready = write_hold.then_some(write_ready);
+                self.worker
+                    .as_ref()
+                    .unwrap()
+                    .sender
+                    .send(WorkerTask::Run {
+                        operation,
+                        action,
+                        bounds: bounds.clone(),
+                        cancel,
+                        write_ready: wait_for_write,
+                    })
+                    .map_err(|_| {
+                        error(
+                            ErrorCode::Native,
+                            "metadata worker stopped before admission was delivered",
+                        )
+                    })?;
+                Ok(Response::Admitted(Admitted {
+                    operation: id,
+                    attempt,
+                    request_digest: digest,
+                    epoch: U64(epoch),
+                }))
+            }
+            Request::InputStatus { token, generation } => {
+                let shared = self.shared.lock().unwrap();
+                let input = shared
+                    .input
+                    .as_ref()
+                    .filter(|value| value.token == token && value.generation == generation)
+                    .ok_or_else(|| error(ErrorCode::StaleSession, "metadata input changed"))?;
+                Ok(Response::Input(input.clone()))
+            }
+            Request::Receipt { attempt } => Ok(Response::Receipt(
+                catalog.metadata_write_receipt(&attempt).map_err(native)?,
+            )),
+            Request::Review { token, digest } => {
+                let shared = self.shared.lock().unwrap();
+                let review = shared
+                    .review
+                    .as_ref()
+                    .filter(|value| value.token == token && value.digest == digest)
+                    .ok_or_else(|| error(ErrorCode::StaleSession, "metadata review changed"))?;
+                Ok(Response::Review(review.clone()))
+            }
+            Request::ReviewFields {
+                token,
+                digest,
+                after,
+                limit,
+            } => {
+                let shared = self.shared.lock().unwrap();
+                shared
+                    .review
+                    .as_ref()
+                    .filter(|value| value.token == token && value.digest == digest)
+                    .ok_or_else(|| error(ErrorCode::StaleSession, "metadata review changed"))?;
+                if limit == 0 || limit > bounds.page_rows {
+                    return Err(error(
+                        ErrorCode::ResourceLimit,
+                        "metadata review page limit",
+                    ));
+                }
+                let start = after
+                    .as_deref()
+                    .map(str::parse::<usize>)
+                    .transpose()
+                    .map_err(|_| error(ErrorCode::InvalidRequest, "invalid review cursor"))?
+                    .unwrap_or(0);
+                let end = start
+                    .saturating_add(limit as usize)
+                    .min(shared.fields.len());
+                Ok(Response::ReviewFields(Page {
+                    rows: shared.fields[start..end].to_vec(),
+                    next: (end < shared.fields.len()).then(|| end.to_string()),
+                    scanned: U64((end - start) as u64),
+                }))
+            }
+            Request::Chunk {
+                reference,
+                offset,
+                length,
+            } => {
+                if length == 0 || length as usize > CHUNK {
+                    return Err(error(ErrorCode::ResourceLimit, "metadata chunk limit"));
+                }
+                let shared = self.shared.lock().unwrap();
+                let reader = shared
+                    .reader
+                    .as_ref()
+                    .filter(|value| {
+                        value.reference.token == reference.token
+                            && value.reference.blake3 == reference.blake3
+                            && value.reference.bytes == reference.bytes
+                    })
+                    .ok_or_else(|| {
+                        error(ErrorCode::StaleSession, "metadata byte reference changed")
+                    })?;
+                let start = usize::try_from(offset.0).map_err(|value| native(value.into()))?;
+                if start > reader.bytes.len() {
+                    return Err(error(ErrorCode::InvalidRequest, "metadata chunk offset"));
+                }
+                let end = start
+                    .saturating_add(length as usize)
+                    .min(reader.bytes.len());
+                Ok(Response::Chunk(Bytes {
+                    bytes: reader.bytes[start..end].to_vec(),
+                    offset,
+                    total: U64(reader.bytes.len() as u64),
+                    next: (end < reader.bytes.len()).then(|| U64(end as u64)),
+                    blake3: reader.reference.blake3.clone(),
+                    verified: true,
+                }))
+            }
+            Request::Plans {
+                owner,
+                after,
+                limit,
+            } => WorkerState::default().plans(catalog, owner.as_ref(), after, limit, bounds),
+            Request::Plan { operation } => Ok(Response::Plan(
+                plan_json(catalog, &operation).map_err(native)?,
+            )),
+            Request::RecoveryEntries {
+                token,
+                after,
+                limit,
+            } => {
+                let worker = self.worker.as_ref().ok_or_else(|| {
+                    error(ErrorCode::StaleSession, "metadata discovery worker changed")
+                })?;
+                let cancel = Cancellation::default();
+                let (reply, receive) = mpsc::sync_channel(1);
+                worker
+                    .sender
+                    .send(WorkerTask::RecoveryEntries {
+                        token,
+                        after,
+                        limit,
+                        bounds: bounds.clone(),
+                        cancel,
+                        reply,
+                    })
+                    .map_err(|_| error(ErrorCode::Native, "metadata worker stopped"))?;
+                receive
+                    .recv()
+                    .map_err(|_| error(ErrorCode::Native, "metadata worker response was lost"))?
+            }
+        }
+    }
+}
+
+pub(super) fn action_write_hold(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Commit { .. }
+            | Action::Resolve { .. }
+            | Action::SidecarPlan { .. }
+            | Action::SidecarApply { .. }
+            | Action::SidecarRecover { .. }
+            | Action::SidecarRestore { .. }
+            | Action::EvidenceExport { .. }
+    )
+}
+
+fn canonical_request_digest(
+    catalog: &Catalog,
+    shared: &Arc<Mutex<SharedState>>,
+    action: &Action,
+) -> Result<String> {
+    let authority = match action {
+        Action::Commit {
+            review,
+            review_digest,
+        } => {
+            let shared = shared.lock().unwrap();
+            let value = shared
+                .review
+                .as_ref()
+                .filter(|value| value.token == *review && value.digest == *review_digest)
+                .ok_or_else(|| error(ErrorCode::StaleSession, "metadata review changed"))?;
+            serde_json::to_vec(&(
+                "edit",
+                &value.identity,
+                value.base_model,
+                &value.input_blake3,
+                review_digest,
+            ))
+        }
+        Action::Resolve {
+            identity,
+            field,
+            model,
+        } => serde_json::to_vec(&("resolve", identity, field, model)),
+        Action::SidecarPlan {
+            identity,
+            base_model,
+            destination,
+            limits,
+        } => serde_json::to_vec(&("sidecar_plan", identity, base_model, destination, limits)),
+        Action::SidecarApply {
+            operation,
+            authority_blake3,
+            overwrite_ack,
+            limits,
+        } => {
+            let exact = catalog
+                .metadata_export_plan(operation)
+                .map_err(native)?
+                .ok_or_else(|| error(ErrorCode::InvalidRequest, "metadata plan not found"))?
+                .5;
+            if &exact != authority_blake3 {
+                return Err(error(
+                    ErrorCode::StaleSession,
+                    "metadata plan authority changed",
+                ));
+            }
+            serde_json::to_vec(&("sidecar_apply", operation, exact, overwrite_ack, limits))
+        }
+        Action::SidecarRecover {
+            operation,
+            authority_blake3,
+            recovery_directory,
+            may_publish_ack,
+            limits,
+        } => {
+            let exact = catalog
+                .metadata_export_plan(operation)
+                .map_err(native)?
+                .ok_or_else(|| error(ErrorCode::InvalidRequest, "metadata plan not found"))?
+                .5;
+            if &exact != authority_blake3 {
+                return Err(error(
+                    ErrorCode::StaleSession,
+                    "metadata plan authority changed",
+                ));
+            }
+            serde_json::to_vec(&(
+                "sidecar_recover",
+                operation,
+                exact,
+                recovery_directory,
+                may_publish_ack,
+                limits,
+            ))
+        }
+        Action::SidecarRestore {
+            operation,
+            authority_blake3,
+            recovery_directory,
+            limits,
+        } => {
+            let exact = catalog
+                .metadata_export_plan(operation)
+                .map_err(native)?
+                .ok_or_else(|| error(ErrorCode::InvalidRequest, "metadata plan not found"))?
+                .5;
+            if &exact != authority_blake3 {
+                return Err(error(
+                    ErrorCode::StaleSession,
+                    "metadata plan authority changed",
+                ));
+            }
+            serde_json::to_vec(&(
+                "sidecar_restore",
+                operation,
+                exact,
+                recovery_directory,
+                limits,
+            ))
+        }
+        _ => serde_json::to_vec(action),
+    }
+    .map_err(|value| native(value.into()))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"photocatalog-metadata-write-v1\0");
+    hasher.update(&authority);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn options(bounds: &Limits) -> Options {
     Options {
         defaults: WriteLimits::default(),
@@ -1325,4 +2010,79 @@ fn sidecar_json(
     rowid: i64,
 ) -> serde_json::Value {
     serde_json::json!({"row":I64(rowid),"operation":plan.operation,"version":U64(plan.version as u64),"owner":owner,"revision":I64(revision),"base_model":I64(base_model),"destination":NativePath::from_path(&plan.destination),"expected":plan.expected,"payload_bytes":U64(plan.payload_bytes),"payload_digest":plan.payload_digest,"authority_blake3":authority,"current":true,"receipt":receipt})
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn write_admission_is_cancelable_before_actor_handshake() -> AnyResult<()> {
+        let temp = tempfile::tempdir()?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        let mut coordinator = Coordinator::default();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let response = coordinator.execute(
+            "catalog",
+            &mut catalog,
+            Request::Start {
+                attempt,
+                action: Action::Resolve {
+                    identity: ImageIdentity {
+                        image_id: "missing".into(),
+                        key: VariantKey::master("missing"),
+                        metadata_revision: I64(0),
+                        pixel_generation: I64(0),
+                        shared_source_epoch: I64(0),
+                        physical_generation: I64(0),
+                    },
+                    field: "rating".into(),
+                    model: I64(1),
+                },
+            },
+            &Limits::default(),
+            &Cancellation::default(),
+        )?;
+        let Response::Admitted(admitted) = response else {
+            unreachable!()
+        };
+        let canceled = coordinator.execute(
+            "catalog",
+            &mut catalog,
+            Request::Cancel {
+                operation: admitted.operation.clone(),
+                epoch: admitted.epoch,
+            },
+            &Limits::default(),
+            &Cancellation::default(),
+        )?;
+        let Response::Status(status) = canceled else {
+            unreachable!()
+        };
+        assert!(status.operation.unwrap().cancel_requested);
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let Response::Status(status) = coordinator.execute(
+                "catalog",
+                &mut catalog,
+                Request::Status {
+                    operation: Some(admitted.operation.clone()),
+                },
+                &Limits::default(),
+                &Cancellation::default(),
+            )?
+            else {
+                unreachable!()
+            };
+            if status
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.phase == "canceled")
+            {
+                coordinator.close(&catalog)?;
+                return Ok(());
+            }
+        }
+        anyhow::bail!("metadata cancellation did not settle")
+    }
 }

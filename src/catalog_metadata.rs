@@ -1143,7 +1143,7 @@ pub(crate) fn rebuild(db: &Connection, asset: &str) -> Result<()> {
     }
     Ok(())
 }
-fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
     // Admit both sizes in the same SQLite read before rusqlite allocates the
     // compressed bytes. This matches the inspection bridge's retained-blob bound.
     let (length, data): (i64, Option<Vec<u8>>) = db.query_row(
@@ -1491,6 +1491,10 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            crate::catalog_metadata_write::existing(&tx, attempt, request_digest)?.is_none(),
+            "metadata attempt already committed"
+        );
         crate::catalog_images::require_image_metadata_identity(&tx, identity)?;
         let asset = identity.image_id.as_str();
         ensure!(
@@ -2539,6 +2543,12 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((attempt, digest, _)) = durable {
+            ensure!(
+                crate::catalog_metadata_write::existing(&tx, attempt, digest)?.is_none(),
+                "metadata attempt already committed"
+            );
+        }
         let stored = crate::catalog_metadata_write::export_plan_row(&tx, operation)?;
         let asset = stored.asset_id;
         let expected = stored.revision;
@@ -2638,6 +2648,12 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((attempt, digest)) = durable {
+            ensure!(
+                crate::catalog_metadata_write::existing(&tx, attempt, digest)?.is_none(),
+                "metadata attempt already committed"
+            );
+        }
         let stored = crate::catalog_metadata_write::export_plan_row(&tx, operation)?;
         let asset = stored.asset_id;
         let expected = stored.revision;

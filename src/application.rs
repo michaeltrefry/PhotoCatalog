@@ -1562,6 +1562,7 @@ impl Actor {
         let o = self.current(catalog)?;
         let held = o.jobs_held
             || o.relink.busy()
+            || o.metadata_write.write_hold()
             || copy_active
             || backup_active
             || o.import.as_ref().is_some_and(|i| !i.terminal())
@@ -1963,6 +1964,17 @@ impl Actor {
                 "export write hold: cached reads and cancellation remain available",
             ));
         }
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.metadata_write.write_hold())
+            && !during_relink_hold(&r)
+        {
+            return Err(error(
+                ErrorCode::Busy,
+                "metadata write hold: cached reads and cancellation remain available",
+            ));
+        }
         if self.shared.exports.lock().unwrap().busy()
             && (matches!(
                 &r,
@@ -2013,7 +2025,7 @@ impl Actor {
                     *request,
                     &limits,
                     &control,
-                    o.jobs_held || o.relink.write_hold(),
+                    o.jobs_held || o.relink.write_hold() || o.metadata_write.write_hold(),
                 )?)))
             }
             Request::Relink { catalog, request } => {
@@ -2441,7 +2453,9 @@ impl Actor {
                 } else {
                     core!(o.service.cached_variant(&o.catalog, &key, tier, false))
                 };
-                if (o.relink.write_hold() || o.exports.write_hold(&shared.exports))
+                if (o.relink.write_hold()
+                    || o.exports.write_hold(&shared.exports)
+                    || o.metadata_write.write_hold())
                     && cached.is_none()
                     && read.is_none()
                 {
@@ -2681,7 +2695,7 @@ impl Actor {
             &self.shared.exports,
             prior_foreground,
             native_demand,
-            o.jobs_held || o.relink.write_hold(),
+            o.jobs_held || o.relink.write_hold() || o.metadata_write.write_hold(),
         ) {
             self.shared.queue.lock().unwrap().status.message = Some(e.message);
             self.shared.exports.lock().unwrap().request_cancel();
@@ -2689,6 +2703,30 @@ impl Actor {
         if o.exports.write_hold(&self.shared.exports) {
             self.shared.queue.lock().unwrap().status.active_previews =
                 o.service.scheduler_usage().active as u32;
+            return;
+        }
+        if let Err(error) = o.metadata_write.release_completed() {
+            self.shared.queue.lock().unwrap().status.message = Some(error.message);
+            return;
+        }
+        if o.metadata_write.write_hold() {
+            cancel_relink_consumers(o);
+            let readers_drained = o.hydration.drain_canceled();
+            if let Err(error) = o.service.tick(&mut o.catalog) {
+                self.shared.queue.lock().unwrap().status.message =
+                    Some(format!("draining previews for metadata write: {error:#}"));
+                o.metadata_write.request_cancel();
+                return;
+            }
+            o.service.tick_read(&o.catalog);
+            if readers_drained
+                && o.service.native_work_drained()
+                && o.metadata_write.needs_write()
+                && let Err(error) = o.metadata_write.start_write(&mut o.service)
+            {
+                self.shared.queue.lock().unwrap().status.message = Some(error.message);
+                o.metadata_write.request_cancel();
+            }
             return;
         }
         let relink_foreground = self
@@ -2740,7 +2778,7 @@ impl Actor {
             &mut o.catalog,
             &self.shared.copy,
             copy_foreground,
-            o.jobs_held || o.relink.write_hold(),
+            o.jobs_held || o.relink.write_hold() || o.metadata_write.write_hold(),
             #[cfg(test)]
             self.config.import_checkpoint.clone(),
         ) {
@@ -2849,7 +2887,10 @@ impl Actor {
                         t.dto.message = Some(message);
                     }
                     preview::ReadOutcome::Missing => {
-                        if o.relink.write_hold() || o.exports.write_hold(&self.shared.exports) {
+                        if o.relink.write_hold()
+                            || o.exports.write_hold(&self.shared.exports)
+                            || o.metadata_write.write_hold()
+                        {
                             t.dto.state = PreviewState::Unavailable;
                             t.dto.message = Some(
                                 "catalog write hold; request original rendering after completion"
