@@ -1059,6 +1059,7 @@ fn compact_discard_claim_crash_recovery_resolves_every_durable_phase() -> Result
         "claim-created",
         "claim-scratch",
         "before-claim",
+        "after-claim-move",
         "after-claim",
         "claim-verified",
         "after-request",
@@ -1101,6 +1102,50 @@ fn compact_discard_claim_crash_recovery_resolves_every_durable_phase() -> Result
         );
         assert!(fs::read_dir(&root)?.all(|entry| !claim::is_claim(&entry.unwrap().path())));
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn held_directory_rename_uses_delete_capable_handles_and_refuses_replacement() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let parent = discard_directory(&root)?;
+    let source = root.join("source");
+    fs::create_dir(&source)?;
+    let source_handle = discard_directory(&source)?;
+    let source_identity = lease_identity(&source_handle)?;
+
+    rename_directory_held(&source_handle, &parent, std::ffi::OsStr::new("moved"))?;
+    assert!(!source.try_exists()?);
+    assert_eq!(
+        lease_identity(&discard_directory(&root.join("moved"))?)?,
+        source_identity
+    );
+
+    let collision_source = root.join("collision-source");
+    let collision_target = root.join("collision-target");
+    fs::create_dir(&collision_source)?;
+    fs::create_dir(&collision_target)?;
+    let collision_source_handle = discard_directory(&collision_source)?;
+    let collision_source_identity = lease_identity(&collision_source_handle)?;
+    let collision_target_identity = lease_identity(&discard_directory(&collision_target)?)?;
+    assert!(
+        rename_directory_held(
+            &collision_source_handle,
+            &parent,
+            std::ffi::OsStr::new("collision-target")
+        )
+        .is_err()
+    );
+    assert_eq!(
+        lease_identity(&discard_directory(&collision_source)?)?,
+        collision_source_identity
+    );
+    assert_eq!(
+        lease_identity(&discard_directory(&collision_target)?)?,
+        collision_target_identity
+    );
     Ok(())
 }
 

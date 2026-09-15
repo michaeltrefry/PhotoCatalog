@@ -352,6 +352,12 @@ impl CompactDiscard {
         if !self.record.moved {
             let target = self.wrapper.join("transport");
             if !target.try_exists()? {
+                #[cfg(windows)]
+                reopen_claimed_files(
+                    self.inner.as_mut().context("unclaimed cleanup custody")?,
+                    &retired.staging,
+                    &self.record.files,
+                )?;
                 self.inner
                     .as_mut()
                     .context("unclaimed cleanup custody")?
@@ -377,11 +383,37 @@ impl CompactDiscard {
                         std::io::Error::last_os_error()
                     );
                 }
-                #[cfg(not(unix))]
-                fs::rename(&retired.staging, &target)?;
+                #[cfg(windows)]
+                {
+                    // Windows can reject a directory move while these retained
+                    // child handles are live. The durable record already binds
+                    // every child identity, so close them, move the exact held
+                    // directory into the exact held wrapper, and immediately
+                    // reopen and revalidate the same objects before deletion.
+                    let inner = self.inner.as_mut().unwrap();
+                    for index in [0, 1] {
+                        if let Some(file) = &inner.files[index] {
+                            FileExt::unlock(file)?;
+                        }
+                    }
+                    inner.files = std::array::from_fn(|_| None);
+                    rename_directory_held(
+                        &inner.directory,
+                        self.wrapper_file.as_ref().unwrap(),
+                        std::ffi::OsStr::new("transport"),
+                    )?;
+                }
                 // Record selection before fallible barriers/checks. Even if the
                 // move selected a replacement, retries never select source again.
                 self.record.moved = true;
+                #[cfg(test)]
+                compact_discard_checkpoint("after-claim-move", &retired.staging)?;
+                #[cfg(windows)]
+                reopen_claimed_files(
+                    self.inner.as_mut().context("claimed cleanup custody")?,
+                    &target,
+                    &self.record.files,
+                )?;
                 #[cfg(test)]
                 compact_discard_checkpoint("after-claim", &retired.staging)?;
                 self.record.save(&self.wrapper)?;
@@ -392,6 +424,12 @@ impl CompactDiscard {
             }
         }
         let claimed = self.record.candidate(self.wrapper.join("transport"));
+        #[cfg(windows)]
+        reopen_claimed_files(
+            self.inner.as_mut().context("claimed cleanup custody")?,
+            &claimed.staging,
+            &self.record.files,
+        )?;
         let inner = self.inner.as_mut().context("claimed cleanup custody")?;
         inner.parent = self.wrapper_file.as_ref().unwrap().try_clone()?;
         if !inner.directory_removed {
@@ -414,6 +452,43 @@ impl CompactDiscard {
         self.parent.sync_all()?;
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn reopen_claimed_files(
+    inner: &mut ClaimedCleanup,
+    path: &Path,
+    identities: &[Option<Key>; 8],
+) -> Result<()> {
+    ensure!(
+        lease_identity(&crate::filesystem_worker::open_directory(path)?)?
+            == lease_identity(&inner.directory)?,
+        "claimed export directory identity changed during move"
+    );
+    if inner
+        .files
+        .iter()
+        .zip(identities)
+        .all(|(file, identity)| file.is_some() == identity.is_some())
+    {
+        return Ok(());
+    }
+    let mut files: [Option<File>; 8] = std::array::from_fn(|_| None);
+    for (index, name) in TRANSPORT_FILES.iter().enumerate() {
+        if let Some(identity) = identities[index] {
+            let file = discard_file(&path.join(name))?;
+            ensure!(
+                lease_identity(&file)? == identity,
+                "claimed export artifact identity changed during move"
+            );
+            if index < 2 {
+                file.try_lock_exclusive().context("claimed lease busy")?;
+            }
+            files[index] = Some(file);
+        }
+    }
+    inner.files = files;
+    Ok(())
 }
 fn remove_control(wrapper: &Path) -> Result<()> {
     let (_, target) = inspect(wrapper)?;

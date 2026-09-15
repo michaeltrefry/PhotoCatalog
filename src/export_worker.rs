@@ -830,7 +830,8 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         fs::remove_dir(path)?;
         return Ok(Inspection::Cleaned);
     }
-    let parent = match acquire_parent_lease(path)? {
+    #[allow(unused_mut)]
+    let mut parent = match acquire_parent_lease(path)? {
         ParentLeaseInspection::Absent => None,
         ParentLeaseInspection::Acquired(parent) => Some(parent),
         ParentLeaseInspection::Busy => {
@@ -839,6 +840,10 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
             ));
         }
     };
+    #[cfg(windows)]
+    let directory = discard_directory(path)?;
+    #[cfg(windows)]
+    let directory_parent = discard_directory(path.parent().context("export transport parent")?)?;
     let lock = open_lease(path)?;
     if let Err(error) = lock.try_lock_exclusive() {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
@@ -881,8 +886,26 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
             .parent()
             .context("export transport parent")?
             .join(format!("{RETIRED_PREFIX}{}", uuid::Uuid::new_v4()));
-        // A delayed Windows child may hold its current directory open. Failure
-        // leaves the tombstoned original plus request intact for a later pass.
+        // The active marker is durable and both worker leases have proved idle.
+        // Windows can reject a pathname rename while descendant lock handles
+        // remain open. Release those locks and rename the already
+        // admitted directory handle into the already admitted parent instead,
+        // so a path substitution cannot redirect the fence to another object.
+        #[cfg(windows)]
+        {
+            drop(parent.take());
+            rename_directory_held(
+                &directory,
+                &directory_parent,
+                claimed.file_name().context("retired export name")?,
+            )?;
+            ensure!(
+                lease_identity(&crate::filesystem_worker::open_directory(&claimed)?)?
+                    == lease_identity(&directory)?,
+                "retired export directory identity changed during fence"
+            );
+        }
+        #[cfg(not(windows))]
         fs::rename(path, &claimed)?;
         claimed
     };
@@ -1188,6 +1211,55 @@ fn discard_file(path: &Path) -> Result<File> {
     #[cfg(not(windows))]
     metadata_export::open_regular(path)
 }
+
+#[cfg(windows)]
+fn rename_directory_held(source: &File, parent: &File, name: &std::ffi::OsStr) -> Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    #[repr(C)]
+    struct RenameInfo {
+        replace_if_exists: u32,
+        root_directory: *mut std::ffi::c_void,
+        file_name_length: u32,
+        file_name: [u16; 128],
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            class: i32,
+            info: *const std::ffi::c_void,
+            bytes: u32,
+        ) -> i32;
+    }
+    let encoded: Vec<u16> = name.encode_wide().collect();
+    ensure!(
+        !encoded.is_empty() && encoded.len() <= 128 && !encoded.contains(&0),
+        "invalid retired export name"
+    );
+    let mut info = RenameInfo {
+        replace_if_exists: 0,
+        root_directory: parent.as_raw_handle(),
+        file_name_length: u32::try_from(encoded.len() * std::mem::size_of::<u16>())?,
+        file_name: [0; 128],
+    };
+    info.file_name[..encoded.len()].copy_from_slice(&encoded);
+    let bytes = std::mem::offset_of!(RenameInfo, file_name)
+        .checked_add(encoded.len() * std::mem::size_of::<u16>())
+        .context("retired export rename buffer")?;
+    ensure!(
+        unsafe {
+            SetFileInformationByHandle(
+                source.as_raw_handle(),
+                3, // FileRenameInfo: fail rather than replace an existing target.
+                (&info as *const RenameInfo).cast(),
+                u32::try_from(bytes)?,
+            )
+        } != 0,
+        "handle-bound export directory rename failed: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
 impl ClaimedCleanup {
     pub(crate) fn begin(retired: &CompactRetiredExportTransport) -> Result<Self> {
         ensure!(retired_name(&retired.staging), "transport was not fenced");
@@ -1344,16 +1416,12 @@ impl ClaimedCleanup {
                 }
                 #[cfg(windows)]
                 {
-                    // Delete through a separately closed handle to the exact
-                    // retained object; the lease/proof handle stays in custody.
-                    let target = discard_file(&retired.staging.join(TRANSPORT_FILES[index]))?;
-                    ensure!(
-                        lease_identity(&target)?
-                            == lease_identity(self.files[index].as_ref().expect("retained file"))?,
-                        "retired deletion identity changed"
-                    );
-                    crate::filesystem_worker::delete_export_held(&target)?;
-                    drop(target);
+                    // Delete through the already admitted object handle. Closing
+                    // it after the durable intent releases Windows locks and
+                    // makes removal visible before the directory is retired.
+                    let target = self.files[index].as_ref().expect("retained file");
+                    crate::filesystem_worker::delete_export_held(target)?;
+                    drop(self.files[index].take());
                 }
                 self.removed[index] = true;
                 #[cfg(test)]

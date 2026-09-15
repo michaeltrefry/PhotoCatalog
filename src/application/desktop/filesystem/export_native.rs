@@ -304,11 +304,7 @@ mod tests {
         let mut f = fixture()?;
         // Largest legal root path, exact persisted plan, independent blob
         // declarations and maximum binary chunk retain their full envelopes.
-        f.root.canonical_root =
-            crate::storage_volume::NativePath::from_path(&std::path::PathBuf::from(format!(
-                "/{}",
-                "x".repeat(crate::catalog_session::PATH_UNITS - 1)
-            )));
+        f.root.canonical_root = crate::catalog_session::maximum_absolute_native_path_for_test();
         f.executor = crate::catalog_session::export_executor::executor_id(&f.root, 1)?;
         f.begin.executor = f.executor.clone();
         f.begin.root = f.root.clone();
