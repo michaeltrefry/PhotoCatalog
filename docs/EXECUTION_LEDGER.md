@@ -20,9 +20,24 @@ CLI compatibility tests. Evidence: private sc-22847-lm-publication-integration-
 bio0am7u; receipt cb7aa884, CLI edcc84fd. Root verified 390 source hashes,
 all 12 reported process IDs absent, and no remaining managed workers. Separate
 composition review 4448f225 and integrated evidence audit 99f5d32a pass.
-Next: isolated LM batch4 implementation on codex/sc-22847-lm-desktop, with
-independent read-only inventory of the remaining N/G export path.
-LM batch4 G/C admission and public application bridge, N/G export executor,
+Export render-only precursor is locally committed as f850edc and integrated as
+fa4f585dc450d897ae3aa3b288e2552a4b831af1. N now emits bounded rendering facts;
+the local parent validates output identity and seals only after checked child
+exit. Existing orphan equality, persisted protocol compatibility, Stop and
+service behavior remain covered. All 389 integrated source hashes equal the
+final tested source. Fourteen worker tests passed in private
+sc-22847-export-fixture-runtime-_jyzox0q; seven service tests passed after a
+fixture-only canonical-path correction in sc-22847-export-service-path-fix-
+4ls1a2tm (receipt 8da015dc). Fresh CLI 63fe2a28 and independent final audit
+3c3bd3dc are retained. Earlier failed gates remain negative evidence.
+
+Next: export-only F stage implementation on codex/sc-22847-export-stage;
+managed G native custody and C service wiring follow that dependency. LM batch4
+C relay ancestry repair compiled and independently passed, but the same review
+found a whole-message frame cap that narrows accepted native paths and drops
+reply pins. Bounded multipart request/reply repair is active on
+codex/sc-22847-lm-desktop; review 309de124 records the exact open finding.
+LM batch4 G integration/public application bridge, managed N/G export executor,
 full S12 installed workflows and S13 readiness remain open. No push, CI,
 installation replacement, canonical migration or RAID access occurred.
 
