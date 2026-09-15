@@ -969,6 +969,19 @@ impl Client {
 }
 
 impl CatalogFilesystem for Client {
+    fn metadata_files_call(
+        &self,
+        request: &crate::catalog_session::metadata_files::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::metadata_files::Reply> {
+        match self.execute(Operation::MetadataFiles(Box::new(request.clone())), cancel)? {
+            Response::MetadataFiles(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected metadata file reply"),
+        }
+    }
     fn export_executor_call(
         &self,
         request: &crate::catalog_session::export_executor::Request,

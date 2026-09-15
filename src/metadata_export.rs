@@ -369,7 +369,7 @@ pub enum ExportState {
     Recoverable,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "wire::Receipt", into = "wire::Receipt")]
 pub struct ExportReceipt {
     pub state: ExportState,
@@ -377,6 +377,25 @@ pub struct ExportReceipt {
     pub recovery_directory: PathBuf,
     pub captured_original: Option<PathBuf>,
     pub detail: String,
+}
+
+pub(crate) fn validate_plan_wire(plan: &ExportPlan) -> Result<()> {
+    validate_plan(plan)
+}
+
+pub(crate) fn validate_export_receipt_basic(receipt: &ExportReceipt) -> Result<()> {
+    ensure!(
+        receipt.detail.len() <= 64 * 1024,
+        "metadata export receipt detail limit"
+    );
+    ensure!(
+        receipt.destination.is_absolute() && receipt.recovery_directory.is_absolute(),
+        "metadata export receipt path"
+    );
+    if let Some(path) = &receipt.captured_original {
+        ensure!(path.is_absolute(), "metadata captured original path");
+    }
+    Ok(())
 }
 
 /// Fault/race seam used by deterministic tests; hooks never change the protocol.
@@ -406,6 +425,62 @@ pub fn plan_export(destination: &Path, payload: &[u8]) -> Result<ExportPlan> {
     };
     admit_paths(&plan)?;
     Ok(plan)
+}
+
+pub(crate) fn plan_export_controlled(
+    destination: &Path,
+    payload: &[u8],
+    max_existing_bytes: u64,
+    checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> Result<ExportPlan> {
+    ensure!(
+        payload.len() <= crate::xmp::MAX_PACKET_BYTES,
+        "XMP payload byte limit"
+    );
+    checkpoint(0)?;
+    let destination = normalize_destination(destination)?;
+    let expected = match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "destination is not an ordinary file (symlinks refused)"
+            );
+            Some(stream_revision(
+                &destination,
+                max_existing_bytes,
+                checkpoint,
+                None,
+            )?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    checkpoint(expected.as_ref().map_or(0, |v| v.bytes))?;
+    let plan = ExportPlan {
+        version: 3,
+        operation: uuid::Uuid::new_v4().to_string(),
+        destination,
+        expected,
+        payload_digest: blake3::hash(payload).to_hex().to_string(),
+        payload_bytes: payload.len() as u64,
+    };
+    validate_plan(&plan)?;
+    Ok(plan)
+}
+
+pub(crate) fn write_evidence_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure!(path.is_absolute(), "evidence destination must be absolute");
+    let parent = path
+        .parent()
+        .context("evidence destination has no parent")?
+        .canonicalize()?;
+    let destination = parent.join(
+        path.file_name()
+            .context("evidence destination has no filename")?,
+    );
+    ensure!(destination == path, "evidence destination parent changed");
+    write_new(&destination, bytes)?;
+    sync_directory(&parent)
 }
 
 pub fn apply_export(plan: &ExportPlan, payload: &[u8]) -> Result<ExportReceipt> {

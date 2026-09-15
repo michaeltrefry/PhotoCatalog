@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 pub const PATH_UNITS: usize = 32_768;
 pub const ENVELOPE_BYTES: usize = 1024 * 1024;
 pub const EXPORT_PROFILE_BYTES: usize = 16 * 1024 * 1024;
+pub mod metadata_files;
 
 fn validate_export_revision(
     revision: &crate::metadata_export::FileRevision,
@@ -1042,6 +1043,13 @@ pub trait CatalogFilesystem: Send + Sync {
         _cancel: &AtomicBool,
     ) -> Result<export_stage::Reply> {
         anyhow::bail!("filesystem owner does not support export stage custody")
+    }
+    fn metadata_files_call(
+        &self,
+        _request: &metadata_files::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<metadata_files::Reply> {
+        anyhow::bail!("filesystem owner does not support metadata file custody")
     }
     fn export_executor_call(
         &self,
@@ -2156,6 +2164,225 @@ impl CatalogSessionAuthority {
             }
         }
         result.map(Some)
+    }
+    fn metadata_file_transfer(
+        &self,
+        mode: metadata_files::Mode,
+        payload: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<Option<metadata_files::Value>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let transfer = LeaseId::new();
+        let mut operation = 1u64;
+        let result = (|| {
+            let request = metadata_files::Request {
+                root: root.clone(),
+                transfer: transfer.clone(),
+                operation: U64(operation),
+                action: metadata_files::Action::Begin {
+                    mode,
+                    bytes: U64(u64::try_from(payload.len())?),
+                    blake3: blake3::hash(payload).to_hex().to_string(),
+                },
+            };
+            let reply = filesystem.metadata_files_call(&request, cancel)?;
+            reply.validate(&request)?;
+            ensure!(matches!(reply.value, metadata_files::Value::Begun));
+            let mut offset = 0usize;
+            while offset < payload.len() {
+                operation = operation
+                    .checked_add(1)
+                    .context("metadata file operation exhausted")?;
+                let end = (offset + metadata_files::CHUNK_BYTES).min(payload.len());
+                let request = metadata_files::Request {
+                    root: root.clone(),
+                    transfer: transfer.clone(),
+                    operation: U64(operation),
+                    action: metadata_files::Action::Append {
+                        offset: U64(u64::try_from(offset)?),
+                        bytes: payload[offset..end].to_vec(),
+                    },
+                };
+                let reply = filesystem.metadata_files_call(&request, cancel)?;
+                reply.validate(&request)?;
+                ensure!(
+                    matches!(reply.value, metadata_files::Value::Appended { offset: U64(value) } if value == end as u64),
+                    "metadata file upload acknowledgement"
+                );
+                offset = end;
+            }
+            operation = operation
+                .checked_add(1)
+                .context("metadata file operation exhausted")?;
+            let request = metadata_files::Request {
+                root: root.clone(),
+                transfer: transfer.clone(),
+                operation: U64(operation),
+                action: metadata_files::Action::Finish,
+            };
+            let reply = filesystem.metadata_files_call(&request, cancel)?;
+            reply.validate(&request)?;
+            Ok(reply.value)
+        })();
+        if result.is_err()
+            && let Some(release) = operation.checked_add(1)
+        {
+            let request = metadata_files::Request {
+                root: root.clone(),
+                transfer,
+                operation: U64(release),
+                action: metadata_files::Action::Release,
+            };
+            let cleanup_cancel = AtomicBool::new(false);
+            if let Ok(reply) = filesystem.metadata_files_call(&request, &cleanup_cancel) {
+                let _ = reply.validate(&request);
+            }
+        }
+        result.map(Some)
+    }
+    pub(crate) fn plan_metadata_file(
+        &self,
+        destination: &NativePath,
+        payload: &[u8],
+        max_existing_bytes: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::metadata_export::ExportPlan>> {
+        let value = self.metadata_file_transfer(
+            metadata_files::Mode::Plan {
+                destination: destination.clone(),
+                max_existing_bytes: U64(max_existing_bytes),
+            },
+            payload,
+            cancel,
+        )?;
+        match value {
+            Some(metadata_files::Value::Plan(plan)) => Ok(Some(plan)),
+            None => Ok(None),
+            _ => anyhow::bail!("unexpected metadata planning result"),
+        }
+    }
+    pub(crate) fn apply_metadata_file(
+        &self,
+        plan: &crate::metadata_export::ExportPlan,
+        payload: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::metadata_export::ExportReceipt>> {
+        let value = self.metadata_file_transfer(
+            metadata_files::Mode::Apply { plan: plan.clone() },
+            payload,
+            cancel,
+        )?;
+        match value {
+            Some(metadata_files::Value::Receipt(receipt)) => Ok(Some(receipt)),
+            None => Ok(None),
+            _ => anyhow::bail!("unexpected metadata publication result"),
+        }
+    }
+    pub(crate) fn recover_metadata_file(
+        &self,
+        plan: &crate::metadata_export::ExportPlan,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::metadata_export::ExportReceipt>> {
+        let value = self.metadata_file_transfer(
+            metadata_files::Mode::Recover { plan: plan.clone() },
+            &[],
+            cancel,
+        )?;
+        match value {
+            Some(metadata_files::Value::Receipt(receipt)) => Ok(Some(receipt)),
+            None => Ok(None),
+            _ => anyhow::bail!("unexpected metadata recovery result"),
+        }
+    }
+    pub(crate) fn restore_metadata_file(
+        &self,
+        plan: &crate::metadata_export::ExportPlan,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::metadata_export::ExportReceipt>> {
+        let value = self.metadata_file_transfer(
+            metadata_files::Mode::Restore { plan: plan.clone() },
+            &[],
+            cancel,
+        )?;
+        match value {
+            Some(metadata_files::Value::Receipt(receipt)) => Ok(Some(receipt)),
+            None => Ok(None),
+            _ => anyhow::bail!("unexpected metadata restore result"),
+        }
+    }
+    pub(crate) fn write_metadata_evidence(
+        &self,
+        destination: &NativePath,
+        bytes: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<Option<metadata_files::EvidenceReceipt>> {
+        let value = self.metadata_file_transfer(
+            metadata_files::Mode::Evidence {
+                destination: destination.clone(),
+            },
+            bytes,
+            cancel,
+        )?;
+        match value {
+            Some(metadata_files::Value::Evidence(receipt)) => Ok(Some(receipt)),
+            None => Ok(None),
+            _ => anyhow::bail!("unexpected metadata evidence result"),
+        }
+    }
+    pub(crate) fn discover_metadata_files(
+        &self,
+        transfer: &LeaseId,
+        operation: u64,
+        directory: &NativePath,
+        after: Option<NativePath>,
+        scan_rows: u64,
+        page_rows: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Option<metadata_files::Value>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let request = metadata_files::Request {
+            root: root.clone(),
+            transfer: transfer.clone(),
+            operation: U64(operation),
+            action: metadata_files::Action::Discover {
+                directory: directory.clone(),
+                after,
+                scan_rows: U64(scan_rows),
+                page_rows: U64(page_rows),
+            },
+        };
+        let reply = filesystem.metadata_files_call(&request, cancel)?;
+        reply.validate(&request)?;
+        Ok(Some(reply.value))
+    }
+    pub(crate) fn release_metadata_files(&self, transfer: &LeaseId, operation: u64) -> Result<()> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(());
+        };
+        let request = metadata_files::Request {
+            root: root.clone(),
+            transfer: transfer.clone(),
+            operation: U64(operation),
+            action: metadata_files::Action::Release,
+        };
+        let cancel = AtomicBool::new(false);
+        let reply = filesystem.metadata_files_call(&request, &cancel)?;
+        reply.validate(&request)?;
+        ensure!(matches!(reply.value, metadata_files::Value::Released));
+        Ok(())
     }
     pub(crate) fn export_destination_snapshot(
         &self,

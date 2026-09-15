@@ -193,6 +193,7 @@ struct RootRecord {
     stages: super::preview_stage::Owner,
     export_executor: super::export_executor::Owner,
     export_stage: super::export_stage::Owner,
+    metadata_files: super::metadata_files::Owner,
     export_profile: Option<ExportProfileTransfer>,
     export_profile_terminal: Option<ExportProfileTerminal>,
     export_original: Option<ExportOriginalTransfer>,
@@ -507,6 +508,7 @@ impl BootstrapOwner {
             stages: super::preview_stage::Owner::default(),
             export_executor: super::export_executor::Owner::default(),
             export_stage: super::export_stage::Owner::default(),
+            metadata_files: super::metadata_files::Owner::default(),
             export_profile: None,
             export_profile_terminal: None,
             export_original: None,
@@ -608,6 +610,10 @@ impl BootstrapOwner {
                 record.export_publication.is_none(),
                 "export publication lease has not drained"
             );
+            ensure!(
+                record.metadata_files.empty(),
+                "metadata file transfer has not drained"
+            );
             record.objects.drain();
             record.store.release()?;
             record.manifest_lock.release()?;
@@ -698,6 +704,31 @@ impl BootstrapOwner {
             )?));
         }
         let result = record.export_stage.call(manifest, request, cancel);
+        record.verify_root_binding()?;
+        result
+    }
+
+    pub fn metadata_files_call(
+        &mut self,
+        request: &crate::catalog_session::metadata_files::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::metadata_files::Reply> {
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "metadata files require confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("metadata files catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "metadata file session mismatch"
+        );
+        record.verify_root_binding()?;
+        let result = record.metadata_files.call(request, cancel);
         record.verify_root_binding()?;
         result
     }

@@ -88,6 +88,8 @@ pub fn build_identity() -> String {
             include_str!("../catalog_session/preview_stage.rs"),
             include_str!("export_stage.rs"),
             include_str!("../catalog_session/export_stage.rs"),
+            include_str!("metadata_files.rs"),
+            include_str!("../catalog_session/metadata_files.rs"),
             include_str!("export_executor.rs"),
             include_str!("../catalog_session/export_executor.rs"),
             include_str!("../export_worker.rs"),
@@ -146,6 +148,7 @@ pub enum Operation {
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
     ExportPublication(Box<ExportPublicationRequest>),
+    MetadataFiles(Box<crate::catalog_session::metadata_files::Request>),
     ExportProfile(Box<ExportProfileRequest>),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
@@ -194,6 +197,7 @@ impl Operation {
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
             || matches!(self, Self::ExportPublication(r) if r.cleanup())
+            || matches!(self, Self::MetadataFiles(r) if r.cleanup())
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
             || matches!(self, Self::PreviewStage(r) if r.cleanup())
@@ -217,6 +221,7 @@ impl Operation {
             Self::InspectExportOriginal(value) => value.validate()?,
             Self::ExportOriginal(value) => value.validate()?,
             Self::ExportPublication(value) => value.validate()?,
+            Self::MetadataFiles(value) => value.validate()?,
             Self::ExportProfile(value) => value.validate()?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
@@ -632,6 +637,7 @@ pub enum Response {
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
     ExportPublication(ExportPublicationReply),
+    MetadataFiles(crate::catalog_session::metadata_files::Reply),
     ExportProfile(ExportProfileReply),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
@@ -1003,6 +1009,7 @@ pub(crate) fn encode_operation(value: &Operation) -> Result<Vec<u8>> {
         Operation::PreviewIo(r) => r.binary(),
         Operation::PreviewStage(r) => (!r.binary().is_empty()).then(|| r.binary()),
         Operation::ExportStage(r) => (!r.binary().is_empty()).then(|| r.binary()),
+        Operation::MetadataFiles(r) => (!r.binary().is_empty()).then(|| r.binary()),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -1014,6 +1021,7 @@ pub(crate) fn decode_operation(bytes: &[u8]) -> Result<Operation> {
         Operation::PreviewIo(r) => r.set_binary(binary)?,
         Operation::PreviewStage(r) => r.set_binary(binary.to_vec())?,
         Operation::ExportStage(r) => r.set_binary(binary.to_vec())?,
+        Operation::MetadataFiles(r) => r.set_binary(binary.to_vec())?,
         _ => ensure!(binary.is_empty(), "unexpected operation binary trailer"),
     }
     value.validate()?;

@@ -11,6 +11,7 @@ pub mod lightroom;
 pub mod lightroom_bridge;
 pub mod lightroom_migration;
 pub mod metadata;
+pub mod metadata_write;
 pub mod organization;
 mod preview_delivery;
 pub mod preview_settings;
@@ -304,6 +305,15 @@ impl Envelope {
                 metadata::Request::Resolve { .. } => 1,
                 _ => 2,
             },
+            Work::Command(Request::MetadataWrite { request, .. }, _) => {
+                if request.control() {
+                    0
+                } else if request.read_only() {
+                    2
+                } else {
+                    1
+                }
+            }
             Work::Command(Request::Relink { request, .. }, _) => {
                 if request.read_only() {
                     2
@@ -1036,6 +1046,7 @@ struct Open {
     managed: Option<crate::catalog_session::ManagedSession>,
     closing: bool,
     exports: exports::Coordinator,
+    metadata_write: metadata_write::Coordinator,
     token: String,
     catalog: Catalog,
     service: PreviewService,
@@ -1173,6 +1184,7 @@ fn during_relink_hold(request: &Request) -> bool {
         Request::Metadata { request, .. } => {
             !matches!(request.as_ref(), metadata::Request::Resolve { .. })
         }
+        Request::MetadataWrite { request, .. } => request.read_only() || request.control(),
         Request::Relink { request, .. } => request.read_only(),
         Request::Organization { request, .. } => matches!(
             request.as_ref(),
@@ -1313,7 +1325,8 @@ impl Actor {
                                     | Request::Images { .. }
                                     | Request::Search { .. }
                                     | Request::Organization { .. }
-                            ) || matches!(&r, Request::Metadata { request, .. } if matches!(request.as_ref(), metadata::Request::Resolve { .. }));
+                            ) || matches!(&r, Request::Metadata { request, .. } if matches!(request.as_ref(), metadata::Request::Resolve { .. }))
+                                || matches!(&r, Request::MetadataWrite { request, .. } if !request.read_only());
                             let reply_limit = if matches!(&r, Request::Lightroom { .. }) {
                                 self.config
                                     .limits
@@ -1435,6 +1448,7 @@ impl Actor {
             if !open.managed.as_ref().is_some_and(|m| m.sql_returned) {
                 open.deliveries.signal_shutdown(&mut open.service);
                 open.exports.signal_shutdown(&self.shared.exports);
+                open.metadata_write.close(&open.catalog).map_err(native)?;
                 open.service.signal_shutdown();
                 self.shared.relink.lock().unwrap().request_cancel();
                 open.hydration.request_cancel();
@@ -1685,6 +1699,7 @@ impl Actor {
                 managed: None,
                 closing: false,
                 exports: exports::Coordinator::default(),
+                metadata_write: metadata_write::Coordinator::default(),
                 token: uuid::Uuid::new_v4().to_string(),
                 catalog,
                 service,
@@ -1829,6 +1844,7 @@ impl Actor {
                     managed: Some(managed),
                     closing: false,
                     exports: exports::Coordinator::default(),
+                    metadata_write: metadata_write::Coordinator::default(),
                     token: uuid::Uuid::new_v4().to_string(),
                     catalog,
                     service,
@@ -2067,6 +2083,19 @@ impl Actor {
                     &limits,
                     cancel,
                 )?)))
+            }
+            Request::MetadataWrite { catalog, request } => {
+                let limits = limits.clone();
+                let open = self.current(&catalog)?;
+                Ok(Response::MetadataWrite(Box::new(
+                    open.metadata_write.execute(
+                        &catalog,
+                        &mut open.catalog,
+                        *request,
+                        &limits,
+                        cancel,
+                    )?,
+                )))
             }
             Request::Organization { catalog, request } => Ok(Response::Organization(Box::new(
                 organization::execute(&mut self.current(&catalog)?.catalog, *request, &limits)?,

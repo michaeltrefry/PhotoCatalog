@@ -811,6 +811,7 @@ fn local_route(request: &Request) -> bool {
         | Request::ReleaseViewport { .. }
         | Request::PreviewSettings { .. }
         | Request::Metadata { .. }
+        | Request::MetadataWrite { .. }
         | Request::Organization { .. } => false,
     }
 }
@@ -828,6 +829,7 @@ fn control_route(r: &Request) -> bool {
     ) || matches!(r, Request::Export {request,..} if matches!(request.as_ref(),super::exports::Request::Status{..}|super::exports::Request::Cancel{..}|super::exports::Request::Yield{..}))
         || matches!(r, Request::Relink {request,..} if matches!(request.as_ref(),super::relink::Request::Status{..}|super::relink::Request::Cancel{..}))
         || matches!(r, Request::EditCopy {request,..} if matches!(request.as_ref(),super::copy::Request::Status{..}|super::copy::Request::Cancel{..}))
+        || matches!(r, Request::MetadataWrite {request,..} if request.control())
 }
 
 /// Hidden installed/CLI worker mode. No webview initialization occurs here.

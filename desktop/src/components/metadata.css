@@ -17,3 +17,7 @@ dialog:has(.metadata-panel) .dialog-body { min-height: 0; }
 .metadata-byte-viewer { border: 1px solid var(--border, #444); padding: 14px; }
 .metadata-byte-viewer header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .metadata-byte-viewer pre { white-space: pre; overflow-wrap: normal; max-height: 340px; }
+.metadata-write { border-top: 1px solid var(--border, #444); padding-top: 12px; }
+.metadata-write .metadata-review { margin: 14px 0; padding: 14px; border: 1px solid var(--border, #444); border-radius: 8px; }
+.metadata-write ol { max-height: 220px; overflow: auto; }
+.metadata-write li button { margin-left: 8px; }

@@ -8,6 +8,7 @@ mod export_executor;
 mod export_stage;
 mod lightroom_artifacts;
 mod lightroom_sealed;
+mod metadata_files;
 mod preview_io;
 mod preview_stage;
 pub mod process;
@@ -138,6 +139,11 @@ impl FilesystemHandler {
                 .export_publication_call(&request, cancel)
                 .map_err(export_directory_failure)
                 .map(Response::ExportPublication),
+            Operation::MetadataFiles(request) => self
+                .owner
+                .metadata_files_call(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::MetadataFiles),
             Operation::ExportProfile(request) => self
                 .owner
                 .export_profile_call(&request, cancel)

@@ -5,6 +5,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Recipe } from './recipe';
 import type { OrganizationRequest, OrganizationResponse } from './organization';
 import type { MetadataRequest, MetadataResponse } from './metadata';
+import type { Request as MetadataWriteRequest, Response as MetadataWriteResponse } from './metadataWrite';
 import type { RelinkRequest, RelinkResponse } from './relink';
 import type { CopyRequest, CopyResponse } from './editCopy';
 import type { Request as LightroomMigrationRequest, Response as LightroomMigrationResponse } from './lightroomMigration';
@@ -35,6 +36,7 @@ export type Request =
   | { command: 'edit_copy'; args: AtCatalog & { request: CopyRequest } }
   | { command: 'relink'; args: AtCatalog & { request: RelinkRequest } }
   | { command: 'metadata'; args: AtCatalog & { request: MetadataRequest } }
+  | { command: 'metadata_write'; args: AtCatalog & { request: MetadataWriteRequest } }
   | { command: 'organization'; args: AtCatalog & { request: OrganizationRequest } }
   | { command: 'preview_settings'; args: AtCatalog & { request: PreviewSettingsRequest } }
   | { command: 'status' | 'backup_status' }
@@ -69,6 +71,7 @@ export interface Data {
   edit_copy: CopyResponse;
   relink: RelinkResponse;
   metadata: MetadataResponse;
+  metadata_write: MetadataWriteResponse;
   organization: OrganizationResponse;
   backup: BackupStatus | null;
   restore: { receipt: RestoreReceipt; jobs_held: boolean } | null;
@@ -115,7 +118,7 @@ export async function chooseFolder(createCatalog = false): Promise<{ path: Nativ
 
 export async function chooseSource(): Promise<{ path: NativePath; display: string } | null> { return chooseLocation('originals'); }
 
-export async function chooseLocation(purpose: 'preview_destination' | 'original_root' | 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
+export async function chooseLocation(purpose: 'preview_destination' | 'original_root' | 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'metadata_sidecar' | 'metadata_evidence' | 'metadata_recovery' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
 
 export async function previewBlob(catalog: string, ticket: string): Promise<Blob> {
   const handoff = crypto.randomUUID();

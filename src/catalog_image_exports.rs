@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use flate2::{Compression, write::ZlibEncoder};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, sync::atomic::AtomicBool};
 
 pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch(
@@ -32,18 +32,21 @@ pub(crate) fn current(
     asset: &str,
     revision: i64,
 ) -> Result<bool> {
-    let encoded: Option<String> = db
+    let encoded: Option<Option<String>> = db
         .query_row(
-            "SELECT image_identity FROM metadata_image_export_authorities WHERE operation=?1",
+            "SELECT CASE WHEN length(CAST(image_identity AS BLOB))<=32768 THEN image_identity END FROM metadata_image_export_authorities WHERE operation=?1",
             [operation],
             |r| r.get(0),
         )
         .optional()?;
-    let Some(encoded) = encoded else {
-        let current:i64=db.query_row("SELECT COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0))?;
-        return Ok(current == revision);
+    let encoded = match encoded {
+        Some(Some(encoded)) => encoded,
+        Some(None) => anyhow::bail!("image export identity size limit"),
+        None => {
+            let current:i64=db.query_row("SELECT COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0))?;
+            return Ok(current == revision);
+        }
     };
-    ensure!(encoded.len() <= 32768, "image export identity size limit");
     let expected: ImageMetadataIdentity = serde_json::from_str(&encoded)?;
     expected.key.validate()?;
     ensure!(
@@ -57,6 +60,31 @@ pub(crate) fn current(
     Ok(actual.is_some_and(|(identity, ready)| ready && identity == expected))
 }
 
+pub(crate) fn owner(
+    db: &Connection,
+    operation: &str,
+    asset: &str,
+    revision: i64,
+) -> Result<crate::catalog_metadata_write::Owner> {
+    let encoded: Option<Option<String>> = db
+        .query_row(
+            "SELECT CASE WHEN length(CAST(image_identity AS BLOB))<=32768 THEN image_identity END FROM metadata_image_export_authorities WHERE operation=?1",
+            [operation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match encoded {
+        Some(Some(encoded)) => Ok(crate::catalog_metadata_write::Owner::Image {
+            identity: serde_json::from_str(&encoded)?,
+        }),
+        Some(None) => anyhow::bail!("image export identity size limit"),
+        None => Ok(crate::catalog_metadata_write::Owner::LegacyAsset {
+            asset_id: asset.to_owned(),
+            revision,
+        }),
+    }
+}
+
 impl Catalog {
     /// Freeze this image's selected XMP model and resolved fields. Older master
     /// plans remain readable and are never reserialized or assigned new authority.
@@ -67,6 +95,59 @@ impl Catalog {
         base_model: i64,
         destination: &Path,
     ) -> Result<ImageMetadataExportPlan> {
+        self.plan_image_metadata_export_with_cancel(
+            key,
+            expected_revision,
+            base_model,
+            destination,
+            &AtomicBool::new(false),
+        )
+    }
+    pub(crate) fn plan_image_metadata_export_with_cancel(
+        &mut self,
+        key: &VariantKey,
+        expected_revision: i64,
+        base_model: i64,
+        destination: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<ImageMetadataExportPlan> {
+        self.plan_image_metadata_export_controlled(
+            key,
+            expected_revision,
+            base_model,
+            destination,
+            cancel,
+            None,
+        )
+    }
+    pub(crate) fn plan_image_metadata_export_with_receipt(
+        &mut self,
+        key: &VariantKey,
+        expected_revision: i64,
+        base_model: i64,
+        destination: &Path,
+        cancel: &AtomicBool,
+        attempt: &str,
+        request_digest: &str,
+    ) -> Result<ImageMetadataExportPlan> {
+        self.plan_image_metadata_export_controlled(
+            key,
+            expected_revision,
+            base_model,
+            destination,
+            cancel,
+            Some((attempt, request_digest)),
+        )
+    }
+    fn plan_image_metadata_export_controlled(
+        &mut self,
+        key: &VariantKey,
+        expected_revision: i64,
+        base_model: i64,
+        destination: &Path,
+        cancel: &AtomicBool,
+        receipt: Option<(&str, &str)>,
+    ) -> Result<ImageMetadataExportPlan> {
         let identity = self.image_metadata_identity(key)?;
         ensure!(
             identity.metadata_revision == expected_revision,
@@ -74,7 +155,16 @@ impl Catalog {
         );
         let (payload, projected) =
             self.resolved_export_xmp(&identity.image_id, expected_revision, base_model)?;
-        let plan = crate::metadata_export::plan_export(destination, &payload)?;
+        let native = crate::storage_volume::NativePath::from_path(destination);
+        let plan = match self.session.plan_metadata_file(
+            &native,
+            &payload,
+            crate::catalog_session::metadata_files::EVIDENCE_BYTES,
+            cancel,
+        )? {
+            Some(plan) => plan,
+            None => crate::metadata_export::plan_export(destination, &payload)?,
+        };
         let hash = blake3::hash(&payload).to_hex().to_string();
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&payload)?;
@@ -105,6 +195,18 @@ impl Catalog {
             "INSERT INTO metadata_image_export_authorities VALUES(?1,?2)",
             params![plan.operation, encoded],
         )?;
+        if let Some((attempt, digest)) = receipt {
+            crate::catalog_metadata_write::insert(
+                &tx,
+                attempt,
+                digest,
+                "sidecar_plan",
+                &crate::catalog_metadata_write::Owner::Image {
+                    identity: identity.clone(),
+                },
+                &serde_json::json!({"operation": plan.operation}),
+            )?;
+        }
         tx.commit()?;
         Ok(ImageMetadataExportPlan {
             image_identity: identity,

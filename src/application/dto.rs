@@ -109,6 +109,10 @@ pub enum Request {
         catalog: String,
         request: Box<super::metadata::Request>,
     },
+    MetadataWrite {
+        catalog: String,
+        request: Box<super::metadata_write::Request>,
+    },
     Organization {
         catalog: String,
         request: Box<super::organization::Request>,
@@ -339,6 +343,7 @@ pub enum Response {
     Lightroom(Box<super::lightroom_bridge::Response>),
     Export(Box<super::exports::Response>),
     Metadata(Box<super::metadata::Response>),
+    MetadataWrite(Box<super::metadata_write::Response>),
     Relink(Box<super::relink::Response>),
     EditCopy(Box<super::copy::Response>),
     Organization(Box<super::organization::Response>),
