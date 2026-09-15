@@ -381,6 +381,7 @@ pub(crate) mod export_stage_test_support {
             self.0.empty()
         }
     }
+    #[cfg(unix)]
     pub fn maximum_receipt(work: &crate::catalog_exports::ExportWork, path: &Path) -> Result<()> {
         super::export_stage::test_maximum_receipt(work, path)
     }

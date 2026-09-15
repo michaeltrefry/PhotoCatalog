@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(unix)]
+use crate::lightroom_migration_worker::source_reader::relay::{
+    Command as SourceCommand, Event as SourceEvent, Kind as SourceKind,
+};
 use crate::{
     Catalog,
     lightroom_migration_worker::{
@@ -6,9 +10,6 @@ use crate::{
         input,
         lease::{DestinationLease, DestinationReview},
         protocol::{Controls, Grants, Publish, read_frame, write_frame},
-        source_reader::relay::{
-            Command as SourceCommand, Event as SourceEvent, Kind as SourceKind,
-        },
     },
     storage_volume::NativePath,
 };
@@ -1261,6 +1262,7 @@ fn lm_supervisor_batch4_first_failure_during_unknown_wait_uses_retained_failure_
     drop(budget);
     let mut process =
         Process::spawn_test_command(command("hang_before_input")?, Arc::new(Stop::default()))?;
+    #[cfg(unix)]
     let pid = process.pid();
     process.inject_wait_failures(1);
     let state = State::new_streaming(

@@ -145,6 +145,7 @@ fn remote_sql_full_method_parity_and_cancel_retain_lock_through_consumer_drain()
     let before = fs::read(&fixture.path)?;
     let cancel = Arc::new(AtomicBool::new(false));
     let remote = sql(&fixture, cancel.clone())?;
+    #[cfg(unix)]
     let pid = remote.session.borrow().process.pid();
     assert!(!can_write(&fixture.path));
     let local = fixture.open();

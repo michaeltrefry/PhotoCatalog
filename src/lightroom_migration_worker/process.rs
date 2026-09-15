@@ -545,7 +545,7 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     }
 }
 impl<T> Process<T> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn inject_io_panic_report(&mut self) {
         self.io_panicked = true;
     }

@@ -1,8 +1,9 @@
 use super::*;
+use crate::{application::Request, storage_volume::NativePath};
+#[cfg(unix)]
 use crate::{
-    application::{Config, Limits, Reply, Request, Response},
+    application::{Config, Limits, Reply, Response},
     lightroom_migration_worker::input,
-    storage_volume::NativePath,
 };
 
 fn header(

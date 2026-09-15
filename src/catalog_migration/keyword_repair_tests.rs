@@ -167,12 +167,14 @@ fn request(c: &Catalog, s: &MigrationSource, run: &str, current: &str) -> Result
     })
 }
 
+#[cfg(unix)]
 pub(crate) struct ManagedFixture {
     pub(crate) fixture: ImportFixture,
     pub(crate) request: Request,
     pub(crate) approval: String,
 }
 
+#[cfg(unix)]
 pub(crate) fn managed_fixture() -> Result<ManagedFixture> {
     let fixture = fixture()?;
     let (catalog, source, run, current) = completed(&fixture)?;

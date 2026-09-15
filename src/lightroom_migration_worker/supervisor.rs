@@ -1139,7 +1139,7 @@ impl<A: Admission> Operation<A> {
 /// New managed callers retain this operation in G and drive `retry_drain`
 /// until it reaches a checked terminal. Worker dispatch and the multipart
 /// document roster are connected by the next executor batch.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[expect(
     clippy::too_many_arguments,
     reason = "the test entrypoint exposes each independently varied supervisor authority"

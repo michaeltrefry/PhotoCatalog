@@ -326,7 +326,10 @@ impl CompactDiscard {
         if !self.created {
             #[cfg(test)]
             compact_discard_checkpoint("before-claim-create", &retired.staging)?;
+            #[cfg(unix)]
             let mut builder = fs::DirBuilder::new();
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;

@@ -75,11 +75,13 @@ struct PreparedPaths {
     target: PathBuf,
 }
 #[cfg(windows)]
+type PreparePath = for<'a> fn(&'a Path, &'a mut dyn FnMut(usize) -> Result<()>) -> Result<PathBuf>;
+#[cfg(windows)]
 impl PreparedPaths {
     fn admit(
         path: &Path,
         admit: &mut dyn FnMut(usize) -> Result<()>,
-        prepare: fn(&Path, &mut dyn FnMut(usize) -> Result<()>) -> Result<PathBuf>,
+        prepare: PreparePath,
     ) -> Result<Self> {
         let count = path.components().count();
         let current_bytes = path
@@ -216,14 +218,14 @@ impl Source {
         path: &Path,
         maximum: u64,
         admit: &mut dyn FnMut(usize) -> Result<()>,
-        prepare: fn(&Path, &mut dyn FnMut(usize) -> Result<()>) -> Result<PathBuf>,
+        prepare: PreparePath,
     ) -> Result<Self> {
         crate::lightroom_migration_worker::identity::before_source_open()?;
         let prepared = PreparedPaths::admit(path, admit, prepare)?;
         let target = &prepared.target;
-        let metadata = fs::symlink_metadata(&target)?;
+        let metadata = fs::symlink_metadata(target)?;
         ensure!(metadata.is_file(), "source is not a regular file");
-        let file = Self::open_file(&target)?;
+        let file = Self::open_file(target)?;
         let mut value = Self::from_opened(path, maximum, true, metadata, file)?;
         value.prepared = Some(prepared);
         Ok(value)

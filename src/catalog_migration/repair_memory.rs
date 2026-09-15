@@ -159,9 +159,9 @@ type AdobeCallback = Box<dyn Fn(bool, usize, usize) -> Result<()>>;
 thread_local! {
     static ADOBE_OBSERVER: RefCell<Option<AdobeCallback>> = const { RefCell::new(None) };
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct AdobeObserver;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for AdobeObserver {
     fn drop(&mut self) {
         ADOBE_OBSERVER.with(|observer| {
@@ -169,7 +169,7 @@ impl Drop for AdobeObserver {
         });
     }
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn install_adobe_observer(callback: AdobeCallback) -> Result<AdobeObserver> {
     ADOBE_OBSERVER.with(|observer| {
         ensure!(

@@ -72,6 +72,7 @@ impl ImportFixture {
     fn with_wrapper(oversized: bool, wrapped: bool) -> Result<Self> {
         Self::with_settings(oversized, wrapped, None)
     }
+    #[cfg(unix)]
     pub(crate) fn with_adobe_expansion() -> Result<(Self, usize)> {
         let children = (0..256).map(|n| format!("p{n}=1,")).collect::<String>();
         let payload = format!(
@@ -243,6 +244,7 @@ impl ImportFixture {
             chunk_bytes: 512,
         }
     }
+    #[cfg(unix)]
     pub(crate) fn raw(&self) -> &[Vec<u8>] {
         &self.raw
     }

@@ -941,7 +941,7 @@ pub(super) fn test_captured_begin_failure() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn test_maximum_receipt(
     work: &crate::catalog_exports::ExportWork,
     path: &Path,

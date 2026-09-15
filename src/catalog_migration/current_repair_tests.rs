@@ -95,12 +95,14 @@ fn request(catalog: &Catalog, run: &str) -> Result<current_repair::Request> {
     })
 }
 
+#[cfg(unix)]
 pub(crate) struct ManagedFixture {
     pub(crate) fixture: ImportFixture,
     pub(crate) request: current_repair::Request,
     pub(crate) approval: String,
 }
 
+#[cfg(unix)]
 pub(crate) fn managed_fixture() -> Result<ManagedFixture> {
     let fixture = ImportFixture::with_wrapper(false, true)?;
     let (catalog, source, complete) = old_complete(&fixture)?;

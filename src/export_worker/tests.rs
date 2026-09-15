@@ -1153,7 +1153,10 @@ fn compact_discard_unknown_or_extra_claim_controls_block_all_fencing() -> Result
             }
             "extra-empty-intent" => {
                 let extra = root.join(format!(".f-{}", uuid::Uuid::new_v4()));
+                #[cfg(unix)]
                 let mut builder = fs::DirBuilder::new();
+                #[cfg(not(unix))]
+                let builder = fs::DirBuilder::new();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;

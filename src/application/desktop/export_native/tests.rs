@@ -1667,6 +1667,7 @@ fn real_f_cached_failed_seal_allows_release() -> Result<()> {
     subprocess_case("failed_seal")
 }
 
+#[cfg(unix)]
 fn held_begin_retire_case() -> Result<()> {
     let f = fixture()?;
     let pool = ByteBudget::new(f.worker)?;
@@ -1831,6 +1832,7 @@ fn process_case(mode: &str) -> Result<()> {
     assert_eq!(pool.reserve_exact(f.worker)?.bytes(), f.worker);
     Ok(())
 }
+#[cfg(unix)]
 fn real_arm_close_case() -> Result<()> {
     let f = fixture()?;
     let pool = ByteBudget::new(f.worker)?;
@@ -1863,6 +1865,7 @@ fn real_arm_close_case() -> Result<()> {
     );
     Ok(())
 }
+#[cfg(unix)]
 fn real_partial_begin_case() -> Result<()> {
     let f = fixture()?;
     let pool = ByteBudget::new(f.worker)?;
@@ -1894,6 +1897,7 @@ fn real_partial_begin_case() -> Result<()> {
     assert_eq!(calls[1].operation, U64(2));
     Ok(())
 }
+#[cfg(unix)]
 fn real_failed_seal_case() -> Result<()> {
     let f = fixture()?;
     let pool = ByteBudget::new(f.worker)?;
@@ -2003,6 +2007,7 @@ fn maximum_enriched_receipt_and_pending_release_retain_full_graph_until_exact_re
 {
     subprocess_case("max_terminal")
 }
+#[cfg(unix)]
 fn real_maximum_terminal_case() -> Result<()> {
     let f = fixture()?;
     let pool = ByteBudget::new(f.worker)?;
@@ -2110,6 +2115,7 @@ fn exhausted_cleanup_sequence_retains_custody_without_dispatch() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn fixture_checked_drain(slot: &Slot, terminal: export_stage::NativeTerminal) -> Result<()> {
     // These in-process F-only fixtures deliberately never create an OS child.
     *slot.terminal.lock().unwrap() = Some(terminal.clone());
@@ -2143,6 +2149,7 @@ fn writer_thread_creation_failure_closes_pipe_before_drain_and_pool_reuse() -> R
     subprocess_case("writer_spawn")
 }
 
+#[cfg(unix)]
 fn fixture_ready_path(slot: &Slot) -> Result<PathBuf> {
     let stage = slot.stage_state.lock().unwrap();
     match &stage
@@ -2158,6 +2165,7 @@ fn fixture_ready_path(slot: &Slot) -> Result<PathBuf> {
         _ => anyhow::bail!("fixture expected Ready path"),
     }
 }
+#[cfg(unix)]
 fn real_failed_arm_case() -> Result<()> {
     let f = fixture()?;
     let pool = ByteBudget::new(f.worker)?;
@@ -2219,6 +2227,7 @@ fn real_failed_arm_case() -> Result<()> {
     assert_eq!(pool.used(), 0);
     Ok(())
 }
+#[cfg(unix)]
 fn real_failed_drain_before_case() -> Result<()> {
     use fs2::FileExt;
     let f = fixture()?;
