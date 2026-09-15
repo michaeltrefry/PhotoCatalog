@@ -46,7 +46,7 @@ pub struct PhotoRenderTimings {
     pub sync_ms: f64,
     pub total_ms: f64,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedPhoto {
     pub staging: PathBuf,
     pub encoding: EncodingReport,

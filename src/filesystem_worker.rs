@@ -3,6 +3,7 @@
 //! on the remaining managed filesystem and SQL routes.
 mod bootstrap;
 pub mod client;
+mod export_stage;
 mod preview_io;
 mod preview_stage;
 pub mod process;
@@ -35,6 +36,9 @@ pub(crate) fn export_original_transfer_layout() -> (usize, usize) {
 pub(crate) fn export_publication_transfer_layout() -> (usize, usize) {
     bootstrap::export_publication_transfer_layout()
 }
+pub(crate) fn export_stage_owner_layout() -> (usize, usize) {
+    export_stage::owner_layout()
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;
@@ -50,6 +54,10 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::ExportStage(request) => self
+                .owner
+                .export_stage_call(&request, cancel)
+                .map(Response::ExportStage),
             Operation::PreviewStage(request) => self
                 .owner
                 .stage_call(&request, cancel)

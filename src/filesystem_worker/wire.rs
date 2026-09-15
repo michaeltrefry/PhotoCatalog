@@ -81,6 +81,11 @@ pub fn build_identity() -> String {
             include_str!("preview_io.rs"),
             include_str!("preview_stage.rs"),
             include_str!("../catalog_session/preview_stage.rs"),
+            include_str!("export_stage.rs"),
+            include_str!("../catalog_session/export_stage.rs"),
+            include_str!("../export_worker.rs"),
+            include_str!("../export_worker/wire.rs"),
+            include_str!("../photo_render.rs"),
             include_str!("../catalog_session/native.rs"),
             include_str!("../preview/stage_io.rs"),
             include_str!("../preview/prepared_cache.rs"),
@@ -120,6 +125,7 @@ pub enum Operation {
     PreviewStore(crate::catalog_session::store::Request),
     PreviewIo(crate::catalog_session::preview_io::Request),
     PreviewStage(crate::catalog_session::preview_stage::Request),
+    ExportStage(crate::catalog_session::export_stage::Request),
     ReadPreviewConfiguration(NativePath),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
@@ -167,12 +173,14 @@ impl Operation {
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
             || matches!(self, Self::PreviewStage(r) if r.cleanup())
+            || matches!(self, Self::ExportStage(r) if r.cleanup())
     }
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::PreviewStore(value) => value.validate()?,
             Self::PreviewIo(value) => value.validate()?,
             Self::PreviewStage(value) => value.validate()?,
+            Self::ExportStage(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
             Self::PrepareExportDirectory(value) => value.validate()?,
             Self::ExportDestinationSnapshot(value) => value.validate()?,
@@ -282,6 +290,7 @@ pub enum Response {
     PreviewStore(crate::catalog_session::store::Reply),
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
+    ExportStage(crate::catalog_session::export_stage::Reply),
     PreviewConfiguration(Vec<u8>),
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
@@ -660,6 +669,7 @@ pub(crate) fn encode_operation(value: &Operation) -> Result<Vec<u8>> {
     let binary = match value {
         Operation::PreviewIo(r) => r.binary(),
         Operation::PreviewStage(r) => (!r.binary().is_empty()).then(|| r.binary()),
+        Operation::ExportStage(r) => (!r.binary().is_empty()).then(|| r.binary()),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -670,6 +680,7 @@ pub(crate) fn decode_operation(bytes: &[u8]) -> Result<Operation> {
     match &mut value {
         Operation::PreviewIo(r) => r.set_binary(binary)?,
         Operation::PreviewStage(r) => r.set_binary(binary.to_vec())?,
+        Operation::ExportStage(r) => r.set_binary(binary.to_vec())?,
         _ => ensure!(binary.is_empty(), "unexpected operation binary trailer"),
     }
     value.validate()?;

@@ -273,11 +273,38 @@ owners, one authority and sixteen recovery slots, complete destination pins,
 bounded parsers and queue backing to the same process reservation. Frame size
 bounds each fragment; configured message allowances bound complete headers.
 
-The migration relay macOS arm64 Rust 1.98.0 execution reported these checked
-application-requested backing assemblies. All 28 relay tests, one existing
-ordinary-admission test and three capacity tests passed. Requested is Retained
-+ max(Active, Startup). Evidence is retained in private
-`sc-22847-lm4-final-test-fix-pafzm7h6`.
+The export-only filesystem stage adds two named terms to this same reservation.
+`retained.export_stage_f_owner_and_stage_backings` contains the actual F owner
+layout, retained directory/lock cleanup custody, root and stage identities, the
+bounded 256 KiB native request, and the exact 128 KiB raw plan plus its parsed
+Recipe/path/string graph. Its three replay slots separately retain the terminal
+seal completion and ordinary user/supervisor replies. The successful completion
+owns decoded native facts (including the metadata-note String vector), the seal
+snapshot, paths and provenance; bounded failure graphs are also included.
+ICC and selected-XMP contents each retain an independent 16 MiB file allowance.
+They upload in 16 KiB chunks and verify through a 16 KiB scratch vector: F never
+allocates an entire blob for verification.
+
+`active.export_stage_full_envelopes_and_transient_backings` contains three full
+current relay-maximum envelopes (`RELAY_BYTES`, presently 1 MiB), simultaneous
+work/root/binding/path graphs, native request verification bytes, exact-plan and
+receipt serde parse overlap, and four completion graphs for facts, pre-effect
+admission and wrapper/cache/reply clone overlap. It separately charges the upload
+trailer and streamed hash scratch. Variable typed graphs use the existing checked
+serde Content layout bound rather than assuming serialized bytes equal heap
+backing. No new user-visible plan, path, output, or metadata-note cap is imposed.
+The 64 KiB native receipt limit is independent of the enriched F/C reply; both
+actual full reply envelopes are admitted before any durable seal creation.
+
+These terms are summed by `requested_preview_metadata_bytes` and reserved from
+the existing shared metadata `ByteBudget`. The focused stage admission test uses
+that same `ProcessReservation`, proves one-byte-short refusal and retained-owner
+charging, then retries the same pool after release. This is requested Rust
+backing only. Native worker/codec working storage, OS handles and mappings,
+allocator overhead, and observed RSS require their own admission and evidence.
+The historical table below is the accepted migration-relay checkpoint before
+export staging integration. A successor integrated capacity run is required
+before quoting current totals. Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|

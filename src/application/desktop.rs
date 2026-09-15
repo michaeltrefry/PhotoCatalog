@@ -16,6 +16,9 @@ use std::{
 };
 #[allow(dead_code)] // Additive, unselected until the FS6 managed actor dependency is admitted.
 mod filesystem;
+pub(crate) use filesystem::admit_export_stage_reply;
+#[cfg(test)]
+pub(crate) use filesystem::roundtrip_export_stage;
 #[cfg(test)]
 mod filesystem_tests;
 pub(crate) mod lightroom_migration;

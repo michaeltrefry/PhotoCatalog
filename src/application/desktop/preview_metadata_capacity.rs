@@ -1281,6 +1281,92 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             c.mul(2, c.vec(1, 64)?)?,
         ])?,
     )?;
+    // One export-only F stage is serial with the existing export actor. ICC and
+    // XMP contents are streamed directly to files, so retained backing includes
+    // only their handles/digests; each 16 KiB chunk remains in the same relay
+    // pool already reserved for managed metadata. The raw worker request and
+    // parsed immutable plan coexist for the stage lifetime. These are requested
+    // Rust backing bytes; native codec allocations and measured RSS are separate.
+    let export_stage_path = c.vec(2, PATH_UNITS as u64)?;
+    let export_stage_binding = c.add(&[
+        c.vec(1, 128)?,
+        c.vec(1, 128)?,
+        c.vec(1, 64)?,
+        c.vec(1, 256)?,
+    ])?;
+    // The immutable plan retains exact raw JSON plus a parsed Recipe/paths
+    // graph. The serde Content layout bound covers variable vectors/strings;
+    // counting only a handful of paths misses legal large recipes.
+    let export_stage_work = c.add(&[
+        Layout::of::<crate::catalog_exports::ExportWork>().size,
+        crate::catalog_session::export_stage::PLAN_BYTES as u64,
+        c.content(crate::catalog_session::export_stage::PLAN_BYTES as u64)?
+            .1,
+        export_stage_binding,
+    ])?;
+    let receipt_bytes = crate::catalog_session::export_stage::RECEIPT_BYTES as u64;
+    // Successful cached terminal owns all decoded native facts (including the
+    // notes String vector), added seal/snapshot, and native path/provenance.
+    let export_stage_completion = c.add(&[
+        Layout::of::<crate::catalog_session::export_stage::Completion>().size,
+        c.content(receipt_bytes)?.1,
+        publication_authority_backing,
+        c.mul(3, export_stage_path)?,
+        export_stage_binding,
+        c.mul(4, LEASE_ID_BYTES)?,
+    ])?;
+    let export_stage_cached_small = c.add(&[
+        export_stage_binding,
+        c.mul(4, LEASE_ID_BYTES)?,
+        export_stage_path,
+        c.vec(1, crate::filesystem_worker::wire::ERROR_BYTES as u64)?,
+    ])?;
+    let (export_stage_size, export_stage_align) =
+        crate::filesystem_worker::export_stage_owner_layout();
+    a.push(
+        "retained.export_stage_f_owner_and_stage_backings",
+        Phase::Retained,
+        1,
+        c.add(&[
+            c.layout_upper(&[Layout {
+                size: u64::try_from(export_stage_size)?,
+                align: u64::try_from(export_stage_align)?,
+            }])?
+            .size,
+            c.mul(6, LEASE_ID_BYTES)?,
+            c.mul(3, export_stage_path)?, // stage, RootCapability, partial cleanup
+            crate::catalog_session::export_stage::REQUEST_BYTES as u64,
+            export_stage_work,
+            c.mul(2, c.vec(1, 64)?)?,
+            c.vec_growth(Layout::of::<std::fs::File>().size, 2)?,
+            // Independent terminal-seal, user and supervisor replay slots.
+            export_stage_completion,
+            c.mul(3, export_stage_cached_small)?,
+        ])?,
+    )?;
+    a.push(
+        "active.export_stage_full_envelopes_and_transient_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(3, RELAY_BYTES)?,
+            // Stage construction, exact-plan serde and native request v2 clone.
+            c.mul(3, export_stage_work)?,
+            c.parse(
+                crate::catalog_session::export_stage::PLAN_BYTES as u64,
+                2,
+                export_stage_work,
+            )?,
+            c.mul(3, export_stage_binding)?,
+            c.mul(4, export_stage_path)?,
+            crate::catalog_session::export_stage::REQUEST_BYTES as u64,
+            c.parse(receipt_bytes, 2, export_stage_completion)?,
+            // Facts + pre-effect completion + full F and C wrapper clones,
+            // then result/cache/reply clone overlap. These lifetimes are serial.
+            c.mul(4, export_stage_completion)?,
+            c.mul(2, CHUNK_BYTES)?, // upload trailer and streamed hash scratch
+        ])?,
+    )?;
     // The serial export worker owns at most one profile transfer. Its cache and
     // the in-progress assembly share the existing 32 MiB quota: before token
     // publication, the assembly occupies the unused cache allowance. Eight
@@ -1712,6 +1798,24 @@ mod tests {
             assert_eq!(entry.count, 1);
             assert!(entry.each > 0);
         }
+        let export_stage_retained = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.export_stage_f_owner_and_stage_backings")
+            .unwrap();
+        assert_eq!(export_stage_retained.phase, Phase::Retained);
+        assert_eq!(export_stage_retained.count, 1);
+        assert!(
+            export_stage_retained.each > crate::catalog_session::export_stage::REQUEST_BYTES as u64
+        );
+        let export_stage_active = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "active.export_stage_full_envelopes_and_transient_backings")
+            .unwrap();
+        assert_eq!(export_stage_active.phase, Phase::Active);
+        assert_eq!(export_stage_active.count, 1);
+        assert!(export_stage_active.each >= 3 * RELAY_BYTES);
         let profile_cache = default_report
             .contributions
             .iter()
@@ -1827,6 +1931,59 @@ mod tests {
             mutate(&mut changed.preview_limits);
             assert_eq!(report(&changed)?.requested, expected);
         }
+        Ok(())
+    }
+    #[test]
+    fn export_stage_backings_are_admitted_by_the_existing_shared_reservation() -> Result<()> {
+        let config = config();
+        let report = report(&config)?;
+        let retained = report
+            .contributions
+            .iter()
+            .find(|c| c.name == "retained.export_stage_f_owner_and_stage_backings")
+            .unwrap()
+            .each;
+        let active = report
+            .contributions
+            .iter()
+            .find(|c| c.name == "active.export_stage_full_envelopes_and_transient_backings")
+            .unwrap()
+            .each;
+        let receipt_graph = Checked
+            .content(crate::catalog_session::export_stage::RECEIPT_BYTES as u64)?
+            .1;
+        assert!(
+            retained > receipt_graph + crate::catalog_session::export_stage::REQUEST_BYTES as u64
+        );
+        assert!(active >= 4 * receipt_graph + 3 * RELAY_BYTES + 2 * CHUNK_BYTES);
+        assert!(report.retained >= retained && report.active >= active);
+        // This is the existing process admission object, not a stage pool.
+        let pool = crate::preview::ByteBudget::new(report.requested)?;
+        let occupied = pool.try_reserve(1).unwrap();
+        assert!(
+            super::super::preview_metadata_admission::ProcessReservation::reserve(&config, &pool)
+                .is_err()
+        );
+        assert_eq!(pool.used(), 1);
+        drop(occupied);
+        let owner =
+            super::super::preview_metadata_admission::ProcessReservation::reserve(&config, &pool)?;
+        assert_eq!(pool.used(), report.requested);
+        let retained_owner = owner.clone();
+        owner.arm();
+        owner.retire();
+        drop(owner);
+        assert_eq!(pool.used(), report.requested);
+        drop(retained_owner);
+        assert_eq!(pool.used(), 0);
+        let retry =
+            super::super::preview_metadata_admission::ProcessReservation::reserve(&config, &pool)?;
+        drop(retry);
+        assert_eq!(pool.used(), 0);
+        println!(
+            "export_stage retained={retained} active={active}; shared total={}",
+            report.requested
+        );
         Ok(())
     }
 }

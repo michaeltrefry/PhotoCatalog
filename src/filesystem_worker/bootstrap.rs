@@ -191,6 +191,7 @@ struct RootRecord {
     store: super::store::StoreOwner,
     objects: super::preview_io::ObjectOwner,
     stages: super::preview_stage::Owner,
+    export_stage: super::export_stage::Owner,
     export_profile: Option<ExportProfileTransfer>,
     export_profile_terminal: Option<ExportProfileTerminal>,
     export_original: Option<ExportOriginalTransfer>,
@@ -487,6 +488,7 @@ impl BootstrapOwner {
             store: super::store::StoreOwner::default(),
             objects: super::preview_io::ObjectOwner::default(),
             stages: super::preview_stage::Owner::default(),
+            export_stage: super::export_stage::Owner::default(),
             export_profile: None,
             export_profile_terminal: None,
             export_original: None,
@@ -569,6 +571,10 @@ impl BootstrapOwner {
                 "worker stages/native/output owners have not drained"
             );
             ensure!(
+                record.export_stage.empty(),
+                "export stage/native/seal owner has not drained"
+            );
+            ensure!(
                 record.export_profile.is_none(),
                 "export profile transfer has not drained"
             );
@@ -631,6 +637,37 @@ impl BootstrapOwner {
             "stage manifest directory changed"
         );
         let result = record.stages.call(manifest, request, cancel);
+        record.verify_root_binding()?;
+        result
+    }
+    pub fn export_stage_call(
+        &mut self,
+        request: &crate::catalog_session::export_stage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_stage::Reply> {
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|progress| progress.state == PreparationState::Confirmed),
+            "export stage custody requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("export stage catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "export stage session mismatch"
+        );
+        record.verify_root_binding()?;
+        let database = record.bootstrap.manifest.path.to_path()?;
+        let manifest = database.parent().context("manifest parent")?;
+        ensure!(
+            physical_object_id(&record.manifest_directory)?
+                == physical_object_id(&open_directory(manifest)?)?,
+            "export stage manifest directory changed"
+        );
+        let result = record.export_stage.call(manifest, request, cancel);
         record.verify_root_binding()?;
         result
     }

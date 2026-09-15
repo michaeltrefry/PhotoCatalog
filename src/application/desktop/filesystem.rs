@@ -60,6 +60,7 @@ pub(super) enum Call {
     PreviewStore(Box<store::Request>),
     PreviewIo(Box<crate::catalog_session::preview_io::Request>),
     PreviewStage(Box<crate::catalog_session::preview_stage::Request>),
+    ExportStage(Box<crate::catalog_session::export_stage::Request>),
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
@@ -77,6 +78,7 @@ impl Call {
             || matches!(self, Self::PreviewStore(request) if request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if request.cleanup())
             || matches!(self, Self::PreviewStage(request) if request.cleanup())
+            || matches!(self, Self::ExportStage(request) if request.cleanup())
             || matches!(self, Self::ExportProfile(request) if request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if request.cleanup())
             || matches!(self, Self::ExportPublication(request) if request.cleanup())
@@ -95,6 +97,7 @@ impl Call {
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
+            || matches!(self, Self::ExportStage(request) if !request.cleanup())
             || matches!(self, Self::ExportProfile(request) if !request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if !request.cleanup())
             || matches!(self, Self::ExportPublication(request) if !request.cleanup())
@@ -131,6 +134,13 @@ impl Call {
                 );
                 request.validate()
             }
+            Self::ExportStage(request) => {
+                ensure!(
+                    !request.supervisor && !request.privileged(),
+                    "C cannot assert export native custody transitions"
+                );
+                request.validate()
+            }
             Self::ReadPreviewConfiguration(path) => store::path(path),
             Self::PrepareExportDirectory(request) => request.validate(),
             Self::ExportDestinationSnapshot(request) => request.validate(),
@@ -150,6 +160,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<store::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
+        std::mem::size_of::<crate::catalog_session::export_stage::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
         std::mem::size_of::<MigrationIdentityRequest>(),
@@ -176,6 +187,7 @@ pub(super) enum Value {
     PreviewStore(store::Reply),
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
+    ExportStage(crate::catalog_session::export_stage::Reply),
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
     ExportDirectory(PreparedExportDirectory),
@@ -488,6 +500,10 @@ impl Output {
 fn encode_packet(packet: &Packet, cap: usize) -> Result<Vec<u8>> {
     let binary = match &packet.body {
         Body::Call {
+            call: Call::ExportStage(r),
+            ..
+        } => (!r.binary().is_empty()).then(|| r.binary()),
+        Body::Call {
             call: Call::PreviewStage(r),
             ..
         } => (!r.binary().is_empty()).then(|| r.binary()),
@@ -525,6 +541,10 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
     let (mut packet, binary): (Packet, _) =
         crate::catalog_session::preview_io::unpack(bytes, BYTES)?;
     match &mut packet.body {
+        Body::Call {
+            call: Call::ExportStage(r),
+            ..
+        } => r.set_binary(binary.to_vec())?,
         Body::Call {
             call: Call::PreviewStage(r),
             ..
@@ -1082,6 +1102,9 @@ impl Parent {
                 Call::PreviewStage(request) => {
                     Value::PreviewStage(self.client.preview_stage_call(request, cancel)?)
                 }
+                Call::ExportStage(request) => {
+                    Value::ExportStage(self.client.export_stage_call(request, cancel)?)
+                }
                 Call::PreviewIo(request) => {
                     Value::PreviewIo(self.client.preview_io_call(request, cancel)?)
                 }
@@ -1528,6 +1551,25 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("unexpected stage relay reply"),
         }
     }
+    fn export_stage_call(
+        &self,
+        request: &crate::catalog_session::export_stage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_stage::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch
+                && !request.supervisor
+                && !request.privileged(),
+            "export stage relay authority"
+        );
+        match self.call(Call::ExportStage(Box::new(request.clone())), cancel)? {
+            Value::ExportStage(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected export stage relay reply"),
+        }
+    }
     fn preview_io_call(
         &self,
         request: &crate::catalog_session::preview_io::Request,
@@ -1821,6 +1863,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::RestoreStatus(_), Value::Restore(_)) => {}
         (Call::PreviewIo(request), Value::PreviewIo(reply)) => reply.validate(request)?,
         (Call::PreviewStage(request), Value::PreviewStage(reply)) => reply.validate(request)?,
+        (Call::ExportStage(request), Value::ExportStage(reply)) => reply.validate(request)?,
         (Call::PreviewStore(request), Value::PreviewStore(reply)) => {
             store::validate_reply(request, reply)?
         }
@@ -1902,3 +1945,49 @@ mod store_tests;
 
 #[cfg(test)]
 mod preview_tests;
+
+/// Admit the complete enriched export completion through the C relay envelope.
+/// IDs use maximal scalar width; UUIDs have fixed wire width.
+pub(crate) fn admit_export_stage_reply(
+    reply: &crate::catalog_session::export_stage::Reply,
+) -> Result<()> {
+    let packet = Packet {
+        binding: Binding {
+            nonce: LeaseId::new(),
+            epoch: reply.epoch.clone(),
+        },
+        body: Body::Reply {
+            id: U64(u64::MAX),
+            outcome: Ok(Value::ExportStage(reply.clone())),
+        },
+    };
+    encode_packet(&packet, BYTES)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn roundtrip_export_stage(
+    request: &crate::catalog_session::export_stage::Request,
+) -> Result<crate::catalog_session::export_stage::Request> {
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: request.root.epoch.clone(),
+    };
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Call {
+            id: U64(u64::MAX),
+            call: Call::ExportStage(Box::new(request.clone())),
+        },
+    };
+    let encoded = encode_packet(&packet, BYTES)?;
+    let Body::Call {
+        call: Call::ExportStage(decoded),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        anyhow::bail!("export C packet round trip");
+    };
+    Call::ExportStage(decoded.clone()).validate()?;
+    Ok(*decoded)
+}

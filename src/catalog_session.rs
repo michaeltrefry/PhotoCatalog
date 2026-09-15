@@ -998,6 +998,7 @@ impl ExportProfileReply {
     }
 }
 
+pub mod export_stage;
 pub mod native;
 pub mod preview_io;
 pub mod preview_stage;
@@ -1016,6 +1017,13 @@ pub trait CatalogFilesystem: Send + Sync {
         _cancel: &AtomicBool,
     ) -> Result<preview_stage::Reply> {
         anyhow::bail!("filesystem owner does not support stage custody")
+    }
+    fn export_stage_call(
+        &self,
+        _request: &export_stage::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<export_stage::Reply> {
+        anyhow::bail!("filesystem owner does not support export stage custody")
     }
     fn preview_io_call(
         &self,
@@ -1715,6 +1723,40 @@ impl CatalogSessionAuthority {
             AuthorityMode::Managed { pool, .. } => Some(pool),
             _ => None,
         }
+    }
+    /// Selects the managed F export-stage backend without changing standalone
+    /// export behavior. C can issue only non-privileged stage actions; the later
+    /// G owner must use its distinct supervisor integration for Arm/Drained.
+    pub(crate) fn export_stage_call(
+        &self,
+        stage: LeaseId,
+        operation: U64,
+        binding: export_stage::Binding,
+        action: export_stage::Action,
+        cancel: &AtomicBool,
+    ) -> Result<Option<export_stage::Reply>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let request = export_stage::Request {
+            root: root.clone(),
+            stage,
+            operation,
+            supervisor: false,
+            binding,
+            action,
+        };
+        ensure!(
+            !request.privileged(),
+            "catalog authority cannot assert export native custody"
+        );
+        request.validate()?;
+        let reply = filesystem.export_stage_call(&request, cancel)?;
+        reply.validate(&request)?;
+        Ok(Some(reply))
     }
     pub(crate) fn prepare_export_directory(
         &self,

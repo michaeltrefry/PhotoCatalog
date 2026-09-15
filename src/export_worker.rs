@@ -19,15 +19,15 @@ use std::{
 };
 #[path = "export_worker/wire.rs"]
 mod wire;
-const REQUEST_LIMIT: u64 = 256 * 1024;
-const RECEIPT_LIMIT: u64 = 64 * 1024;
-const BLOB_LIMIT: u64 = 16 * 1024 * 1024;
+pub(crate) const REQUEST_LIMIT: u64 = 256 * 1024;
+pub(crate) const RECEIPT_LIMIT: u64 = 64 * 1024;
+pub(crate) const BLOB_LIMIT: u64 = 16 * 1024 * 1024;
 struct Request {
     version: u32,
     work: ExportWork,
     limits: PhotoRenderLimits,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "wire::Completion")]
 pub struct CompletedExport {
     pub authority: String,
@@ -53,7 +53,7 @@ pub struct ExportRenderingFacts {
     pub peak_resident_bytes: Option<u64>,
     pub peak_method: String,
 }
-fn admit_output_path(work: &ExportWork, path: &Path) -> Result<()> {
+pub(crate) fn admit_output_path(work: &ExportWork, path: &Path) -> Result<()> {
     // Reserve half the established receipt limit for fixed encoder reports,
     // notes and timing fields; path arrays and the snapshot share the remainder.
     let paths = serde_json::to_vec(&crate::storage_volume::NativePath::from_path(path))?.len()
@@ -65,13 +65,10 @@ fn admit_output_path(work: &ExportWork, path: &Path) -> Result<()> {
     Ok(())
 }
 fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= limit,
-        "worker artifact size/type"
-    );
+    let mut file = metadata_export::open_regular(path)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.len() <= limit, "worker artifact size/type");
     let mut bytes = vec![0; usize::try_from(metadata.len())?];
-    let mut file = File::open(path)?;
     file.read_exact(&mut bytes)?;
     let mut extra = [0];
     ensure!(
@@ -127,6 +124,70 @@ fn validate_persisted(request: &Request) -> Result<()> {
         "export decode allowance exceeds plan"
     );
     Ok(())
+}
+
+/// Produces the exact request consumed by the render-only native worker. The
+/// managed filesystem owner calls this before creating any stage effects.
+pub(crate) fn prepare_managed_request(
+    work: &ExportWork,
+    limits: PhotoRenderLimits,
+    staging: &Path,
+) -> Result<Vec<u8>> {
+    let request = Request {
+        version: 2,
+        work: work.clone(),
+        limits,
+    };
+    validate(&request)?;
+    admit_output_path(work, &staging.join("output"))?;
+    let bytes = serde_json::to_vec(&request)?;
+    ensure!(
+        bytes.len() as u64 <= REQUEST_LIMIT,
+        "export worker request limit"
+    );
+    Ok(bytes)
+}
+
+/// Reads only render facts and performs the same strict post-exit sealing and
+/// durable readback as the standalone parent. Callers must first prove that the
+/// exact native operation has drained.
+pub(crate) fn complete_managed_rendering(
+    work: &ExportWork,
+    staging: &Path,
+    canceled: &AtomicBool,
+    admit: impl FnOnce(CompletedExport) -> Result<()>,
+) -> Result<CompletedExport> {
+    let facts = match wire::decode_completion(&read(&staging.join("result.json"), RECEIPT_LIMIT)?)?
+    {
+        wire::DecodedCompletion::Rendering(facts) => facts,
+        wire::DecodedCompletion::Legacy(_) => {
+            bail!("managed export requires render-only native facts")
+        }
+    };
+    validate_rendering(work, staging, &facts)?;
+    // The 64 KiB allowance belongs to N's receipt. Admit the enriched result
+    // through the actual F/C envelopes before creating any durable seal. Only
+    // payload filesystem identity/mtime and elapsed seal timing can change;
+    // maximal-width scalar representatives bound their serialized backing.
+    let mut payload = facts.output_revision.clone();
+    payload.modified_ns = u128::MAX;
+    payload.identity = (u64::MAX, u64::MAX);
+    admit(CompletedExport {
+        authority: facts.authority.clone(),
+        attempt: facts.attempt.clone(),
+        sealed: SealedPhotoExport {
+            version: work.plan.destination.version,
+            snapshot: work.plan.destination.clone(),
+            authority_digest: work.authority.clone(),
+            max_payload_bytes: work.plan.max_payload_bytes,
+            payload,
+        },
+        rendered: facts.rendered.clone(),
+        seal_ms: -1.2345678901234567e-123,
+        peak_resident_bytes: facts.peak_resident_bytes,
+        peak_method: facts.peak_method.clone(),
+    })?;
+    complete_rendering(work, facts, canceled)
 }
 /// Application supplies the executable, work authority and explicit limits. It
 /// owns the global native reservation until poll/stop has reaped this child.
