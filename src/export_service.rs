@@ -1,5 +1,6 @@
 //! Incremental export actor: one admitted process, bounded catalog pages, and
 //! preview launch suspension held until the export process has been reaped.
+mod managed;
 use crate::{
     Catalog,
     catalog_exports::{ExportCheckpoint, ExportControl, ExportPublicationMetrics, ExportWork},
@@ -15,6 +16,41 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
+
+/// Internal coordinator outcome: the exact managed transition remains owned.
+/// This marker is never serialized as a new public ExportEvent.
+#[derive(Debug)]
+pub(crate) struct PendingExport;
+impl std::fmt::Display for PendingExport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("managed export transition requires exact retry")
+    }
+}
+impl std::error::Error for PendingExport {}
+
+pub(crate) fn pending_export(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PendingExport>().is_some()
+}
+
+#[cfg(test)]
+pub(crate) use managed::tests::{
+    enqueue as managed_test_enqueue, limits as managed_test_limits,
+    previews as managed_test_previews, set_blobs as managed_test_set_blobs,
+};
+
+pub(crate) fn managed_export_state_layouts() -> [(usize, usize); 5] {
+    let [service, active, phase, disposition] = managed::state_layouts();
+    [
+        (
+            std::mem::size_of::<ExportService>(),
+            std::mem::align_of::<ExportService>(),
+        ),
+        service,
+        active,
+        phase,
+        disposition,
+    ]
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,7 +139,7 @@ fn unix_ms() -> Result<u128> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis())
 }
-struct Active {
+struct LocalActive {
     process: ExportWorkerProcess,
     _reservation: ByteReservation,
     started: std::time::Instant,
@@ -117,14 +153,14 @@ impl Drop for AcquiredExecutorLock {
         let _ = FileExt::unlock(&self.0);
     }
 }
-pub struct ExportService {
+struct LocalExportService {
     catalog: PathBuf,
     catalog_pin: std::sync::Arc<crate::catalog_session::CatalogSessionAuthority>,
     executable: PathBuf,
     staging: PathBuf,
     limits: ExportServiceLimits,
     budget: ByteBudget,
-    active: Option<Active>,
+    active: Option<LocalActive>,
     pause: Option<NativeLaunchPause>,
     permit: Option<NativeLaunchPermit>,
     _lock: Option<AcquiredExecutorLock>,
@@ -142,7 +178,7 @@ fn detail(error: impl std::fmt::Display) -> String {
     }
     value
 }
-impl ExportService {
+impl LocalExportService {
     /// The application owns its preview service for the same catalog. CLI callers
     /// also open the configured preview store, whose process lock prevents a second
     /// application from running that service concurrently.
@@ -577,7 +613,7 @@ impl ExportService {
             match spawn {
                 Ok(process) => {
                     let pid = process.pid();
-                    self.active = Some(Active {
+                    self.active = Some(LocalActive {
                         process,
                         _reservation: reservation,
                         started: worker_started,
@@ -638,8 +674,11 @@ impl ExportService {
             cleanup_warning,
         })
     }
+    fn close(&mut self) -> Result<()> {
+        self.drain_native()
+    }
 }
-impl Drop for ExportService {
+impl Drop for LocalExportService {
     fn drop(&mut self) {
         if let Some(active) = self.active.as_mut()
             && active.process.stop().is_err()
@@ -657,6 +696,180 @@ impl Drop for ExportService {
         self.active.take();
         self.pause.take();
         self.permit.take();
+    }
+}
+
+enum Backend {
+    Local(Box<LocalExportService>),
+    Managed(Box<managed::ExportService>),
+}
+
+/// Stable public export facade. Standalone catalogs retain the original local
+/// implementation; managed catalogs use only the root-private session adapter.
+pub struct ExportService {
+    backend: Backend,
+}
+
+impl ExportService {
+    pub fn open(catalog: &Catalog, executable: &Path, limits: ExportServiceLimits) -> Result<Self> {
+        catalog.require_jobs_released()?;
+        limits.validate()?;
+        ensure!(
+            executable.is_absolute(),
+            "absolute export executable required"
+        );
+        let backend = match catalog.session.export_backend() {
+            crate::catalog_session::ExportBackendKind::Local => Backend::Local(Box::new(
+                LocalExportService::open(catalog, executable, limits)?,
+            )),
+            crate::catalog_session::ExportBackendKind::Managed => {
+                Backend::Managed(Box::new(managed::ExportService::open(catalog, limits)?))
+            }
+        };
+        Ok(Self { backend })
+    }
+
+    pub fn recover(
+        &mut self,
+        catalog: &mut Catalog,
+        max_directories: usize,
+    ) -> Result<ExportRecovery> {
+        match &mut self.backend {
+            Backend::Local(value) => value.recover(catalog, max_directories),
+            Backend::Managed(value) => value.recover(catalog, max_directories),
+        }
+    }
+
+    pub fn recover_cancellable(
+        &mut self,
+        catalog: &mut Catalog,
+        max_directories: usize,
+        control: &mut ExportControl<'_>,
+    ) -> Result<ExportRecovery> {
+        match &mut self.backend {
+            Backend::Local(value) => value.recover_cancellable(catalog, max_directories, control),
+            Backend::Managed(value) => value.recover_cancellable(catalog, max_directories, control),
+        }
+    }
+
+    pub fn take_completion_metrics(&mut self) -> Option<ExportCompletionMetrics> {
+        match &mut self.backend {
+            Backend::Local(value) => value.take_completion_metrics(),
+            Backend::Managed(value) => value.take_completion_metrics(),
+        }
+    }
+
+    pub fn reserved_bytes(&self) -> u64 {
+        match &self.backend {
+            Backend::Local(value) => value.reserved_bytes(),
+            Backend::Managed(value) => value.reserved_bytes(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        match &self.backend {
+            Backend::Local(value) => value.is_active(),
+            Backend::Managed(value) => value.is_active(),
+        }
+    }
+
+    pub fn admit_native(&mut self, catalog: &Catalog, permit: NativeLaunchPermit) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(value) => value.admit_native(catalog, permit),
+            Backend::Managed(value) => value.admit_native(catalog, permit),
+        }
+    }
+
+    pub fn tick(
+        &mut self,
+        catalog: &mut Catalog,
+        previews: &mut PreviewService,
+        job: &str,
+        canceled: &AtomicBool,
+    ) -> Result<ExportEvent> {
+        match &mut self.backend {
+            Backend::Local(value) => value.tick(catalog, previews, job, canceled),
+            Backend::Managed(value) => value.tick(catalog, previews, job, canceled),
+        }
+    }
+
+    pub fn tick_detached(
+        &mut self,
+        catalog: &mut Catalog,
+        job: &str,
+        control: &mut ExportControl<'_>,
+    ) -> Result<ExportEvent> {
+        match &mut self.backend {
+            Backend::Local(value) => value.tick_detached(catalog, job, control),
+            Backend::Managed(value) => value.tick_detached(catalog, job, control),
+        }
+    }
+
+    pub fn drain_native(&mut self) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(value) => value.drain_native(),
+            Backend::Managed(value) => value.drain_native(),
+        }
+    }
+
+    pub fn yield_to_previews(&mut self, catalog: &mut Catalog) -> Result<ExportEvent> {
+        match &mut self.backend {
+            Backend::Local(value) => value.yield_to_previews(catalog),
+            Backend::Managed(value) => value.yield_to_previews(catalog),
+        }
+    }
+
+    pub(crate) fn yield_to_previews_cancellable(
+        &mut self,
+        catalog: &mut Catalog,
+        control: &mut ExportControl<'_>,
+    ) -> Result<ExportEvent> {
+        match &mut self.backend {
+            Backend::Local(value) => value.yield_to_previews(catalog),
+            Backend::Managed(value) => value.yield_to_previews_cancellable(catalog, control),
+        }
+    }
+
+    pub(crate) fn close(&mut self) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(value) => value.close(),
+            Backend::Managed(value) => value.close(),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn local_lock(&self) -> Option<&File> {
+        match &self.backend {
+            Backend::Local(value) => value._lock.as_ref().map(|lock| &lock.0),
+            Backend::Managed(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_boundary_tests {
+    #[test]
+    fn managed_adapter_has_no_os_filesystem_or_private_budget_owner() {
+        let source = include_str!("export_service/managed.rs");
+        for forbidden in [
+            "ExportWorkerProcess",
+            "std::process",
+            "ChildStdin",
+            "Command::",
+            "Stdio::",
+            "std::fs",
+            "OpenOptions",
+            "File::",
+            "ByteBudget",
+            "ByteReservation",
+            "canonicalize(",
+            "photo-export-workers",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "managed C adapter contains forbidden owner/API {forbidden}"
+            );
+        }
     }
 }
 
@@ -696,7 +909,7 @@ mod lock_tests {
         let executable = std::env::current_exe()?;
         let service = ExportService::open(&catalog, &executable, limits())?;
         // A fork can retain this same open-file description until exec.
-        let inherited = service._lock.as_ref().unwrap().0.try_clone()?;
+        let inherited = service.local_lock().unwrap().try_clone()?;
         assert!(ExportService::open(&catalog, &executable, limits()).is_err());
         assert!(ExportService::open(&catalog, &executable, limits()).is_err());
         drop(service);
@@ -718,7 +931,7 @@ mod lock_tests {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let service = ExportService::open(&catalog, &executable, limits())?;
-                    inherited = Some(service._lock.as_ref().unwrap().0.try_clone()?);
+                    inherited = Some(service.local_lock().unwrap().try_clone()?);
                     if unwind {
                         panic!("controlled executor unwind");
                     }

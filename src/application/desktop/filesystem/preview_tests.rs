@@ -1,4 +1,4 @@
-//! Configured C/G/F/N preview routes. No export/import command is dispatched.
+//! Configured C/G/F/N preview and export routes on owned temporary catalogs.
 use super::super::DesktopBridge;
 use super::{Call, Parent};
 use crate::application::{
@@ -54,10 +54,25 @@ struct Running {
     client: Arc<Client>,
     observed: Arc<Mutex<Vec<Observation>>>,
     metadata: crate::preview::ByteBudget,
+    native: crate::preview::ByteBudget,
     temporary: Arc<tempfile::TempDir>,
     token: Option<String>,
     cleanup: CleanupState,
 }
+struct ExportFixtureOptions<'a> {
+    temporary: Arc<tempfile::TempDir>,
+    executable: &'a Path,
+    root: &'a Path,
+    originals: &'a Path,
+    small: bool,
+    codec: crate::preview::Codec,
+    workers: usize,
+    export_executable: &'a Path,
+    worker_bytes: u64,
+}
+type ManagedExportMetadataJob = (String, PathBuf, &'static str, Vec<u8>);
+type ExportObserverRecord = (String, [u8; 32]);
+
 fn command(bridge: &DesktopBridge, request: Request) -> Result<Response> {
     let result = bridge
         .submit(request)
@@ -105,6 +120,30 @@ impl Running {
         codec: crate::preview::Codec,
         workers: usize,
     ) -> Result<(Self, String)> {
+        Self::start_export_options(ExportFixtureOptions {
+            temporary,
+            executable,
+            root,
+            originals,
+            small,
+            codec,
+            workers,
+            export_executable: executable,
+            worker_bytes: 64 * 1024 * 1024,
+        })
+    }
+    fn start_export_options(options: ExportFixtureOptions<'_>) -> Result<(Self, String)> {
+        let ExportFixtureOptions {
+            temporary,
+            executable,
+            root,
+            originals,
+            small,
+            codec,
+            workers,
+            export_executable,
+            worker_bytes,
+        } = options;
         ensure!((1..=2).contains(&workers), "fixture worker count");
         let client = Arc::new(Client::spawn(
             executable,
@@ -120,9 +159,9 @@ impl Running {
             working_bytes: if small {
                 2 * 1024 * 1024
             } else {
-                128 * 1024 * 1024 * workers as u64
+                2 * worker_bytes * workers as u64
             },
-            per_worker_bytes: if small { 64 * 1024 } else { 64 * 1024 * 1024 },
+            per_worker_bytes: if small { 64 * 1024 } else { worker_bytes },
             cache_header_scratch_bytes: 4096,
             cache_codec_scratch_bytes: 64 * 1024,
             encoded_staging_bytes: 8 * 1024 * 1024 * workers as u64,
@@ -145,6 +184,7 @@ impl Running {
         };
         let native = crate::preview::ByteBudget::new(limits.working_bytes)?;
         parent.configure_native(executable.to_owned(), limits, &native)?;
+        parent.configure_export_native(export_executable.to_owned(), workers, &native)?;
         let observed: Arc<Mutex<Vec<Observation>>> = Default::default();
         let weak = Arc::downgrade(&parent);
         let observations = observed.clone();
@@ -210,6 +250,7 @@ impl Running {
             client,
             observed,
             metadata,
+            native,
             temporary,
             token: None,
             cleanup: CleanupState::Active,
@@ -1293,6 +1334,641 @@ fn actual_managed_metadata_is_held_through_close_until_checked_wait() -> Result<
     drop(retry);
     eprintln!(
         "metadata charge={charge}; held through catalog close, blocked OS wait and surviving parent; same-pool retry and C/F retirement passed"
+    );
+    Ok(())
+}
+
+fn managed_export_metadata_jobs(
+    temporary: &Path,
+    root: &Path,
+    key: &VariantKey,
+) -> Result<Vec<ManagedExportMetadataJob>> {
+    use crate::catalog_session::export_stage as s;
+    let mut catalog = crate::Catalog::open(root)?;
+    let metadata_revision = catalog.image_metadata_identity(key)?.metadata_revision;
+    let mut max_icc = lcms2::Profile::new_srgb().icc()?;
+    max_icc.resize(s::BLOB_BYTES as usize, 0);
+    max_icc[..4].copy_from_slice(&(s::BLOB_BYTES as u32).to_be_bytes());
+    // A valid profile with unused trailing storage, admitted by LittleCMS.
+    lcms2::Profile::new_icc(&max_icc)?;
+    let packet = String::from_utf8(crate::xmp::empty_packet()?)?;
+    let split = packet.rfind("<?xpacket end").unwrap_or(packet.len());
+    let mut max_xmp = packet.as_bytes()[..split].to_vec();
+    max_xmp.resize(s::BLOB_BYTES as usize - (packet.len() - split), b' ');
+    max_xmp.extend_from_slice(&packet.as_bytes()[split..]);
+    crate::xmp::parse(&max_xmp)
+        .with_context(|| format!("both-max selected XMP parse: input bytes {}", max_xmp.len()))?;
+    let fields = |icc: Option<&[u8]>, linear: bool| crate::xmp::DerivativeFields {
+        width: 256,
+        height: 256,
+        channels: 4,
+        bits_per_sample: 8,
+        mime_type: "image/png".into(),
+        profile_name: if let Some(icc) = icc {
+            format!("ICC BLAKE3 {}", blake3::hash(icc).to_hex())
+        } else if linear {
+            "linear sRGB".into()
+        } else {
+            "sRGB IEC61966-2.1".into()
+        },
+        is_srgb: icc.is_none() && !linear,
+    };
+    // RDF literals survive derivative policy; packet padding does not.
+    // Size the retained literal against the exact PNG/sRGB technical fields.
+    const PAYLOAD_NS: &str = "urn:lensworks:managed-export-fixture";
+    let packet_with_literal = |literal: &str| {
+        format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:fixture=\"{PAYLOAD_NS}\"><fixture:payload>{literal}</fixture:payload></rdf:Description></rdf:RDF></x:xmpmeta>"
+    ).into_bytes()
+    };
+    // The SDK's compact form writes this simple property as an attribute:
+    // each quote becomes &quot;. Its canonical element form keeps one byte.
+    // This gives the bounded per-property assembly 80 KiB of headroom before
+    // compact output reaches 16 MiB, without changing the retained RDF value.
+    let quoted_prefix = "\"".repeat(16 * 1024);
+    let seed = packet_with_literal(&format!("{quoted_prefix}A"));
+    let seed_derivative = crate::xmp::rendered_derivative(&seed, &fields(None, false))
+        .with_context(|| {
+            format!(
+                "maximum derivative seed: source bytes {}, quote bytes {}",
+                seed.len(),
+                quoted_prefix.len()
+            )
+        })?;
+    let ascii_bytes = (s::BLOB_BYTES as usize)
+        .checked_sub(seed_derivative.len())
+        .context("maximum derivative fixture overhead exceeds blob limit")?
+        + 1;
+    let literal = format!("{quoted_prefix}{}", "A".repeat(ascii_bytes));
+    let max_output_xmp = packet_with_literal(&literal);
+    ensure!(
+        max_output_xmp.len() <= s::BLOB_BYTES as usize,
+        "maximum derivative source is {} bytes; input limit {}",
+        max_output_xmp.len(),
+        s::BLOB_BYTES
+    );
+    let source_model = crate::xmp::parse(&max_output_xmp)
+        .with_context(|| format!("maximum derivative source parse: input bytes {}, literal bytes {}, seed output bytes {}", max_output_xmp.len(), literal.len(), seed_derivative.len()))?;
+    let canonical_source_bytes = crate::xmp::canonical(&source_model)
+        .with_context(|| {
+            format!(
+                "maximum derivative source canonicalization: input bytes {}",
+                max_output_xmp.len()
+            )
+        })?
+        .len();
+    eprintln!(
+        "maximum XMP fixture: source bytes {}, canonical source bytes {}, quote bytes {}, literal bytes {}, seed output bytes {}, expected compact derivative bytes {}",
+        max_output_xmp.len(),
+        canonical_source_bytes,
+        quoted_prefix.len(),
+        literal.len(),
+        seed_derivative.len(),
+        s::BLOB_BYTES
+    );
+    let maximum_derivative =
+        crate::xmp::rendered_derivative(&max_output_xmp, &fields(None, false))
+            .with_context(|| format!("maximum derivative including bounded fragment assembly: source bytes {}, canonical source bytes {}, literal bytes {}, quote bytes {}, expected compact output bytes {}", max_output_xmp.len(), canonical_source_bytes, literal.len(), quoted_prefix.len(), s::BLOB_BYTES))?;
+    ensure!(
+        maximum_derivative.len() == s::BLOB_BYTES as usize,
+        "maximum derivative sizing: actual {} expected {}",
+        maximum_derivative.len(),
+        s::BLOB_BYTES
+    );
+    let derivative_xml = std::str::from_utf8(&maximum_derivative)?;
+    let derivative_doc = roxmltree::Document::parse(derivative_xml)?;
+    let retained = derivative_doc
+        .descendants()
+        .find_map(|node| node.attribute((PAYLOAD_NS, "payload")))
+        .or_else(|| {
+            derivative_doc
+                .descendants()
+                .find(|node| node.has_tag_name((PAYLOAD_NS, "payload")))
+                .and_then(|node| node.text())
+        })
+        .context("maximum derivative lost unknown RDF literal")?;
+    ensure!(
+        retained.as_bytes() == literal.as_bytes(),
+        "retained RDF literal: actual bytes {} hash {}; expected bytes {} hash {}",
+        retained.len(),
+        blake3::hash(retained.as_bytes()),
+        literal.len(),
+        blake3::hash(literal.as_bytes())
+    );
+    let small_icc = lcms2::Profile::new_srgb().icc()?;
+    let small_xmp = crate::xmp::empty_packet()?;
+    let mut jobs = Vec::new();
+    for (name, icc, xmp, linear) in [
+        (
+            "replay",
+            Some(small_icc.as_slice()),
+            Some(small_xmp.as_slice()),
+            false,
+        ),
+        ("srgb", None, None, false),
+        ("linear", None, None, true),
+        ("max-icc", Some(max_icc.as_slice()), None, false),
+        ("max-xmp", None, Some(max_output_xmp.as_slice()), false),
+        (
+            "both-max",
+            Some(max_icc.as_slice()),
+            Some(max_xmp.as_slice()),
+            false,
+        ),
+    ] {
+        let destination = temporary.join(format!("paired-{name}.png"));
+        let job = catalog.begin_photo_export()?;
+        catalog.append_photo_export(
+            &job.id,
+            0,
+            &crate::catalog_exports::ExportTarget {
+                key: key.clone(),
+                expected_revision: 0,
+                destination: destination.clone(),
+                overwrite: false,
+                metadata: if xmp.is_some() {
+                    crate::catalog_exports::MetadataSelection::Resolved {
+                        expected_revision: metadata_revision,
+                        base_model: None,
+                    }
+                } else {
+                    crate::catalog_exports::MetadataSelection::Omit
+                },
+            },
+            &crate::image_export::OutputSpec {
+                size: crate::image_export::OutputSize::Original,
+                format: crate::image_export::OutputFormat::Png {
+                    depth: crate::image_export::IntegerDepth::Eight,
+                },
+                profile: crate::image_export::OutputProfile::Srgb,
+                alpha: crate::image_export::AlphaPolicy::Preserve,
+            },
+            4 * 1024 * 1024,
+            64 * 1024 * 1024,
+        )?;
+        // Preserve exact transport inputs; rendering subsequently applies
+        // the specified derivative metadata policy.
+        crate::export_service::managed_test_set_blobs(&mut catalog, &job.id, icc, xmp, linear)?;
+        catalog.seal_photo_export_job(&job.id, 1)?;
+        let selected = xmp.unwrap_or(&small_xmp);
+        let expected_xmp = crate::xmp::rendered_derivative(selected, &fields(icc, linear))
+            .with_context(|| {
+                format!(
+                    "{name}: expected PNG derivative from {} selected XMP bytes",
+                    selected.len()
+                )
+            })?;
+        // These packets have no safe EXIF source fields. The existing
+        // aggregate metadata limit therefore admits a full 16 MiB XMP.
+        crate::image_export::ResolvedExportMetadata {
+            xmp: Some(String::from_utf8(expected_xmp.clone())?),
+            exif: crate::image_export::SafeExif::default(),
+        }
+        .validate(s::BLOB_BYTES)
+        .with_context(|| {
+            format!(
+                "{name}: derived metadata admission: XMP bytes {}, safe EXIF bytes 0, cap {}",
+                expected_xmp.len(),
+                s::BLOB_BYTES
+            )
+        })?;
+        jobs.push((job.id, destination, name, expected_xmp));
+    }
+    Ok(jobs)
+}
+
+#[test]
+fn managed_export_max_metadata_fixture_matches_derivative_limits() -> Result<()> {
+    let (temporary, root, _originals, key, _digest) = fixture()?;
+    // Exercise the same codec-valid packets, derivative sizing, metadata-cap
+    // admission and catalog plans that the actual paired fixture consumes.
+    managed_export_metadata_jobs(temporary.path(), &root, &key)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual paired C/G/F/N export fixture"]
+fn actual_managed_export_replays_stage_and_native_acknowledgements_and_reuses_preview_pool()
+-> Result<()> {
+    use crate::application::exports as x;
+    use crate::catalog_session::{export_executor as e, export_native as n, export_stage as s};
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, key, original_digest) = fixture()?;
+    let jobs = managed_export_metadata_jobs(temporary.path(), &root, &key)?;
+    let (running, token) = Running::start_export_options(ExportFixtureOptions {
+        temporary: temporary.clone(),
+        executable: &executable,
+        root: &root,
+        originals: &originals,
+        small: false,
+        codec: crate::preview::Codec::Jpeg,
+        workers: 1,
+        export_executable: &executable,
+        worker_bytes: 512 * 1024 * 1024,
+    })?;
+    let preview = running.ready(&token, &key, 1)?;
+    let preview_bytes = running.bytes(&token, &preview.ticket)?;
+    ensure!(
+        !preview_bytes.bytes().is_empty(),
+        "real paired preview bytes"
+    );
+    drop(preview_bytes);
+    let observed: Arc<Mutex<Vec<ExportObserverRecord>>> = Default::default();
+    let dropped: Arc<Mutex<std::collections::BTreeSet<String>>> = Default::default();
+    let records = observed.clone();
+    let losses = dropped.clone();
+    let native_ids: Arc<Mutex<Vec<u64>>> = Default::default();
+    let identities = native_ids.clone();
+    let native_pool = running.native.clone();
+    let shared_pool_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probes = shared_pool_probes.clone();
+    let prior = running.parent.observer.lock().unwrap().clone();
+    *running.parent.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
+        if let Some(prior) = &prior {
+            prior(call, after)?;
+        }
+        if !after {
+            return Ok(());
+        }
+        if let Call::ExportNative(request) = call
+            && matches!(request.action, n::Action::Register { .. })
+        {
+            identities.lock().unwrap().push(request.operation.0);
+            let (limit, used) = native_pool.snapshot();
+            ensure!(
+                used > 0 && native_pool.try_reserve(limit).is_none(),
+                "registered export must occupy the actual shared pool"
+            );
+            probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let action = match call {
+            Call::ExportNative(request) => match request.action {
+                n::Action::Register { .. } => Some(("register", request.digest()?)),
+                n::Action::Spawn => Some(("spawn", request.digest()?)),
+                n::Action::Start => Some(("start", request.digest()?)),
+                _ => None,
+            },
+            Call::ExportStage(request) => {
+                let label = match request.action {
+                    s::Action::Begin { .. } => "begin",
+                    s::Action::UploadIcc { .. } => "icc",
+                    s::Action::UploadXmp { .. } => "xmp",
+                    s::Action::Ready { .. } => "ready",
+                    s::Action::ResultAndSeal => "seal",
+                    s::Action::Release => "release",
+                    _ => "other",
+                };
+                Some((label, request.digest()?))
+            }
+            Call::ExportExecutor(request) if matches!(request.action, e::Action::Release) => {
+                Some((
+                    "close",
+                    *blake3::hash(&serde_json::to_vec(request)?).as_bytes(),
+                ))
+            }
+            _ => None,
+        };
+        if let Some((label, digest)) = action {
+            records.lock().unwrap().push((label.to_owned(), digest));
+            if losses.lock().unwrap().insert(label.to_owned()) {
+                return Err(crate::filesystem_worker::wire::Failure::new(
+                    crate::filesystem_worker::wire::FailureKind::Unknown,
+                    format!("injected lost paired {label} acknowledgement"),
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }));
+    let export = |request: x::Request| -> Result<x::Response> {
+        match command(
+            &running.bridge,
+            Request::Export {
+                catalog: token.clone(),
+                request: Box::new(request),
+            },
+        )? {
+            Response::Export(value) => Ok(*value),
+            _ => anyhow::bail!("wrong paired export response"),
+        }
+    };
+    let x::Response::Options(options) = export(x::Request::Options)? else {
+        anyhow::bail!("missing export options")
+    };
+    let mut limits = options.execution;
+    limits.render.decode.max_allocation_bytes = U64(32 * 1024 * 1024);
+    limits.render.render.max_allocation_bytes = U64(32 * 1024 * 1024);
+    limits.render.encode.render.max_allocation_bytes = U64(32 * 1024 * 1024);
+    let wait = |id: String| -> Result<x::Operation> {
+        let deadline = Instant::now() + Duration::from_secs(240);
+        loop {
+            let x::Response::Operation(Some(operation)) = export(x::Request::Status {
+                operation: Some(id.clone()),
+            })?
+            else {
+                anyhow::bail!("missing paired export operation")
+            };
+            if ["complete", "failed", "canceled", "paused"].contains(&operation.phase.as_str()) {
+                return Ok(operation);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "paired export deadline: {operation:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let x::Response::Operation(Some(recover)) = export(x::Request::Recover {
+        directories: U64(32),
+        limits: Some(limits.clone()),
+    })?
+    else {
+        anyhow::bail!("missing recovery operation")
+    };
+    let recovered = wait(recover.id)?;
+    ensure!(
+        recovered.phase == "complete",
+        "paired recovery: {recovered:?}"
+    );
+    for (job, destination, name, expected_xmp) in &jobs {
+        let x::Response::Operation(Some(run)) = export(x::Request::Run {
+            job: job.clone(),
+            limits: Some(limits.clone()),
+            max_items: U64(1),
+            max_seconds: U64(240),
+        })?
+        else {
+            anyhow::bail!("missing Run operation")
+        };
+        let completed = wait(run.id)?;
+        ensure!(
+            completed.phase == "complete" && completed.processed == U64(1),
+            "paired {name}: {completed:?}"
+        );
+        ensure!(
+            image::open(destination)?.width() == 256,
+            "{name}: actual encoded export must decode"
+        );
+        let decoder = png::Decoder::new_with_limits(
+            std::io::BufReader::new(std::fs::File::open(destination)?),
+            png::Limits {
+                bytes: 128 * 1024 * 1024,
+            },
+        );
+        let reader = decoder.read_info()?;
+        if matches!(*name, "max-icc" | "both-max") {
+            ensure!(
+                reader
+                    .info()
+                    .icc_profile
+                    .as_ref()
+                    .is_some_and(|icc| icc.len() == s::BLOB_BYTES as usize),
+                "{name}: full ICC retained in PNG"
+            );
+        }
+        if matches!(*name, "max-xmp" | "both-max") {
+            let xmp = reader
+                .info()
+                .utf8_text
+                .iter()
+                .find(|text| text.keyword == "XML:com.adobe.xmp")
+                .context("PNG XMP missing")?
+                .get_text()?;
+            ensure!(
+                xmp.as_bytes() == expected_xmp.as_slice(),
+                "{name}: PNG derivative XMP actual bytes {} hash {}; expected bytes {} hash {}",
+                xmp.len(),
+                blake3::hash(xmp.as_bytes()),
+                expected_xmp.len(),
+                blake3::hash(expected_xmp)
+            );
+            if *name == "max-xmp" {
+                ensure!(
+                    xmp.len() == s::BLOB_BYTES as usize,
+                    "{name}: encoded maximum derivative actual {} expected {}",
+                    xmp.len(),
+                    s::BLOB_BYTES
+                );
+            }
+            crate::xmp::parse(xmp.as_bytes())?;
+        }
+        drop(reader);
+        ensure!(
+            running.native.used() == 0,
+            "{name}: Retire releases shared pool"
+        );
+        let full = running
+            .native
+            .try_reserve(running.native.snapshot().0)
+            .context("full shared pool unavailable after checked Retire")?;
+        drop(full);
+    }
+    ensure!(
+        shared_pool_probes.load(std::sync::atomic::Ordering::Relaxed) >= jobs.len(),
+        "every actual Register charged shared pool"
+    );
+    ensure!(
+        blake3::hash(&std::fs::read(originals.join("original.png"))?)
+            .to_hex()
+            .as_str()
+            == original_digest,
+        "original changed"
+    );
+    ensure!(
+        running.native.used() == 0,
+        "export retirement must release shared native pool"
+    );
+    let following = running.ready(&token, &key, 2)?;
+    ensure!(
+        matches!(following.state, PreviewState::Ready),
+        "preview reuses pool after export"
+    );
+    let mut ids = native_ids.lock().unwrap().clone();
+    ensure!(
+        ids.windows(2).all(|pair| pair[0] <= pair[1]),
+        "native identity regressed across jobs"
+    );
+    ids.dedup();
+    ensure!(
+        ids.len() == jobs.len() && ids.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "one contiguous native identity per successful export"
+    );
+    running.finish(token)?;
+    let rows = observed.lock().unwrap();
+    for label in [
+        "register", "begin", "icc", "xmp", "ready", "spawn", "start", "seal", "release", "close",
+    ] {
+        let calls: Vec<_> = rows
+            .iter()
+            .filter(|(name, _)| name == label)
+            .map(|(_, digest)| digest)
+            .collect();
+        let mut counts = std::collections::HashMap::new();
+        for digest in calls {
+            *counts.entry(*digest).or_insert(0usize) += 1;
+        }
+        ensure!(
+            counts.values().filter(|n| **n == 2).count() == 1 && counts.values().all(|n| *n <= 2),
+            "{label}: one lost acknowledgement must yield one exact duplicate, with all other operations occurring once"
+        );
+    }
+    ensure!(
+        dropped.lock().unwrap().len() == 10,
+        "all ten acknowledgement faults exercised"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires configured built CLI; actual paired C/G/F failed native launch"]
+fn actual_managed_export_failed_launch_drains_releases_and_restores_preview_capacity() -> Result<()>
+{
+    use crate::application::exports as x;
+    use crate::catalog_session::export_native as n;
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    let (temporary, root, originals, key, _) = fixture()?;
+    let destination = temporary.path().join("failed-launch.png");
+    let job = {
+        let mut catalog = crate::Catalog::open(&root)?;
+        let job = catalog.begin_photo_export()?;
+        catalog.append_photo_export(
+            &job.id,
+            0,
+            &crate::catalog_exports::ExportTarget {
+                key: key.clone(),
+                expected_revision: 0,
+                destination: destination.clone(),
+                overwrite: false,
+                metadata: crate::catalog_exports::MetadataSelection::Omit,
+            },
+            &crate::image_export::OutputSpec {
+                size: crate::image_export::OutputSize::Original,
+                format: crate::image_export::OutputFormat::Png {
+                    depth: crate::image_export::IntegerDepth::Eight,
+                },
+                profile: crate::image_export::OutputProfile::Srgb,
+                alpha: crate::image_export::AlphaPolicy::Preserve,
+            },
+            4 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )?;
+        catalog.seal_photo_export_job(&job.id, 1)?;
+        job.id
+    };
+    let export_executable = temporary.path().join("absent-export-native");
+    let (running, token) = Running::start_export_options(ExportFixtureOptions {
+        temporary: temporary.clone(),
+        executable: &executable,
+        root: &root,
+        originals: &originals,
+        small: false,
+        codec: crate::preview::Codec::Jpeg,
+        workers: 1,
+        export_executable: &export_executable,
+        worker_bytes: 64 * 1024 * 1024,
+    })?;
+    running.ready(&token, &key, 1)?;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let prior = running.parent.observer.lock().unwrap().clone();
+    *running.parent.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
+        if let Some(prior) = &prior {
+            prior(call, after)?;
+        }
+        if after && let Call::ExportNative(request) = call {
+            observed.lock().unwrap().push(request.action.clone());
+        }
+        Ok(())
+    }));
+    let export = |request| -> Result<x::Response> {
+        match command(
+            &running.bridge,
+            Request::Export {
+                catalog: token.clone(),
+                request: Box::new(request),
+            },
+        )? {
+            Response::Export(value) => Ok(*value),
+            _ => anyhow::bail!("wrong export response"),
+        }
+    };
+    let wait = |id: String| -> Result<x::Operation> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let x::Response::Operation(Some(operation)) = export(x::Request::Status {
+                operation: Some(id.clone()),
+            })?
+            else {
+                anyhow::bail!("missing operation")
+            };
+            if ["complete", "failed", "canceled", "paused"].contains(&operation.phase.as_str()) {
+                return Ok(operation);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "failed-launch operation deadline"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let x::Response::Options(options) = export(x::Request::Options)? else {
+        anyhow::bail!("options missing")
+    };
+    let mut limits = options.execution;
+    limits.render.decode.max_allocation_bytes = U64(32 * 1024 * 1024);
+    limits.render.render.max_allocation_bytes = U64(32 * 1024 * 1024);
+    limits.render.encode.render.max_allocation_bytes = U64(32 * 1024 * 1024);
+    let x::Response::Operation(Some(recover)) = export(x::Request::Recover {
+        directories: U64(32),
+        limits: Some(limits.clone()),
+    })?
+    else {
+        anyhow::bail!("recovery missing")
+    };
+    ensure!(wait(recover.id)?.phase == "complete", "recovery failed");
+    let x::Response::Operation(Some(run)) = export(x::Request::Run {
+        job: job.clone(),
+        limits: Some(limits),
+        max_items: U64(1),
+        max_seconds: U64(60),
+    })?
+    else {
+        anyhow::bail!("run missing")
+    };
+    let operation = wait(run.id)?;
+    ensure!(
+        operation.processed == U64(1),
+        "failed launch did not settle: {operation:?}"
+    );
+    ensure!(
+        !destination.exists() && running.native.used() == 0,
+        "failed launch must not publish or retain shared reservation"
+    );
+    let requests = calls.lock().unwrap();
+    ensure!(
+        requests
+            .iter()
+            .filter(|r| matches!(r, n::Action::Spawn))
+            .count()
+            == 1,
+        "one attempted native launch"
+    );
+    ensure!(
+        !requests.iter().any(|r| matches!(r, n::Action::Start)),
+        "failed launch must not Start"
+    );
+    drop(requests);
+    running.ready(&token, &key, 2)?;
+    running.finish(token)?;
+    let catalog = crate::Catalog::open(&root)?;
+    ensure!(
+        catalog.photo_export_items(&job, 0, 2)?[0].state == "failed",
+        "failed launch SQL settlement"
     );
     Ok(())
 }

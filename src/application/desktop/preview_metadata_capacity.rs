@@ -1579,6 +1579,18 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.arc(export_owner)?,
     )?;
     a.push(
+        "retained.export_native_g_previous_retire_receipt",
+        Phase::Retained,
+        1,
+        // Inline tuple storage is in Owner. Account separately for the full
+        // root/path/binding/status heap graph retained after slot destruction.
+        c.add(&[
+            c.mul(2, RELAY_BYTES)?,
+            export_stage_binding,
+            crate::catalog_session::export_native::ERROR_BYTES as u64,
+        ])?,
+    )?;
+    a.push(
         "fixed.export_native_g_slot_arc_backings",
         Phase::Active,
         w,
@@ -1621,6 +1633,96 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             crate::catalog_session::export_stage::RECEIPT_BYTES as u64,
             c.mul(2, crate::catalog_session::export_stage::BLOB_BYTES)?,
             crate::catalog_session::export_stage::CHUNK_BYTES as u64,
+        ])?,
+    )?;
+    let [
+        export_c_registry,
+        export_c_state,
+        export_c_executor_state,
+        export_c_executor,
+        export_c_attempt,
+    ] = crate::catalog_session::managed_export_registry_layouts();
+    let [
+        export_c_facade,
+        export_c_service,
+        export_c_active,
+        export_c_phase,
+        export_c_disposition,
+    ] = crate::export_service::managed_export_state_layouts();
+    a.push(
+        "retained.export_managed_c_registry_and_exact_replay_graphs",
+        Phase::Retained,
+        1,
+        c.add(&[
+            u64::try_from(export_c_registry.0)?,
+            u64::try_from(export_c_state.0)?,
+            u64::try_from(export_c_executor_state.0)?,
+            u64::try_from(export_c_executor.0)?,
+            u64::try_from(export_c_attempt.0)?,
+            // Active/pending executor requests and pending Close each retain a
+            // complete RootCapability/executor graph. This also covers the
+            // constructor's relay clone while the session registry is pinned.
+            c.mul(4, RELAY_BYTES)?,
+            c.mul(12, LEASE_ID_BYTES)?,
+            c.mul(4, c.vec(2, PATH_UNITS as u64)?)?,
+        ])?,
+    )?;
+    a.push(
+        "retained.export_managed_c_service_attempt_work_and_phase_graphs",
+        Phase::Retained,
+        1,
+        c.add(&[
+            // The stable facade retains the Backend discriminator and Box
+            // pointer inline in the application export owner.
+            u64::try_from(export_c_facade.0)?,
+            // Backend::Managed box-owns this complete allocation. The Box
+            // pointee is a separate retained heap owner charged exactly once.
+            u64::try_from(export_c_service.0)?,
+            u64::try_from(export_c_active.0)?,
+            u64::try_from(export_c_phase.0)?,
+            u64::try_from(export_c_disposition.0)?,
+            // Active owns exact work in Begin plus the pending stage clone;
+            // the registry/handle roots and bindings remain live across ticks.
+            c.mul(2, export_stage_work)?,
+            c.mul(3, export_stage_binding)?,
+            c.mul(8, LEASE_ID_BYTES)?,
+            c.mul(2, c.vec(2, PATH_UNITS as u64)?)?,
+            c.vec(1, 8192)?,
+        ])?,
+    )?;
+    a.push(
+        "retained.export_managed_c_full_icc_and_xmp_blob_backings",
+        Phase::Retained,
+        1,
+        // photo_export_inputs materializes both independently bounded SQL
+        // blobs and C retains them between 16 KiB upload ticks. They therefore
+        // consume two full 16 MiB Vec capacities, rather than a streaming term.
+        c.mul(2, c.vec_growth(1, EXPORT_PROFILE_BYTES as u64)?)?,
+    )?;
+    a.push(
+        "active.export_managed_c_chunk_pending_request_and_relay_clones",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(4, CHUNK_BYTES)?,
+            c.mul(
+                3,
+                crate::catalog_session::export_stage::REQUEST_BYTES as u64,
+            )?,
+            c.mul(3, RELAY_BYTES)?,
+            c.mul(2, export_stage_binding)?,
+        ])?,
+    )?;
+    a.push(
+        "retained.export_managed_c_completion_receipt_and_metrics",
+        Phase::Retained,
+        1,
+        c.add(&[
+            export_stage_completion,
+            Layout::of::<crate::export_service::ExportCompletionMetrics>().size,
+            c.content(receipt_bytes)?.1,
+            c.mul(5, c.vec(1, 8192)?)?,
+            c.mul(8, c.vec(1, 256)?)?,
         ])?,
     )?;
     let export_executor_owner = crate::filesystem_worker::export_executor_owner_layout();
@@ -2112,6 +2214,34 @@ mod tests {
             minimum_report.requested
         );
         assert!(minimum_report.requested < report(&config())?.requested);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_export_c_capacity_terms_cover_retained_and_transient_graphs() -> Result<()> {
+        let report = report(&config())?;
+        for name in [
+            "retained.export_managed_c_registry_and_exact_replay_graphs",
+            "retained.export_managed_c_service_attempt_work_and_phase_graphs",
+            "retained.export_managed_c_full_icc_and_xmp_blob_backings",
+            "active.export_managed_c_chunk_pending_request_and_relay_clones",
+            "retained.export_managed_c_completion_receipt_and_metrics",
+        ] {
+            assert!(
+                report.contributions.iter().any(|entry| entry.name == name),
+                "missing managed export C capacity term {name}"
+            );
+        }
+        let blobs = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.export_managed_c_full_icc_and_xmp_blob_backings")
+            .unwrap();
+        assert_eq!(blobs.phase, Phase::Retained);
+        assert_eq!(
+            blobs.each,
+            Checked.mul(2, Checked.vec_growth(1, EXPORT_PROFILE_BYTES as u64)?)?
+        );
         Ok(())
     }
 

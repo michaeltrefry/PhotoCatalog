@@ -679,6 +679,7 @@ pub(super) struct Owner {
     budget: ByteBudget,
     selected: Mutex<Option<RootCapability>>,
     early_stop: Mutex<Vec<Key>>,
+    previous_retire: Mutex<Option<(RootCapability, Status)>>,
 }
 impl Owner {
     pub fn new(
@@ -705,6 +706,7 @@ impl Owner {
             budget: budget.clone(),
             selected: Mutex::new(None),
             early_stop: Mutex::new(Vec::new()),
+            previous_retire: Mutex::new(None),
         })
     }
     pub fn bind(&self, root: &RootCapability) -> Result<()> {
@@ -723,6 +725,10 @@ impl Owner {
             "previous export native root remains retained"
         );
         *selected = Some(root.clone());
+        self.previous_retire
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         *self.high_water.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         *self.executor.lock().unwrap_or_else(|p| p.into_inner()) = ExecutorState::default();
         self.root_closing.store(false, Ordering::Release);
@@ -780,6 +786,17 @@ impl Owner {
         Ok(())
     }
     pub fn query(&self, query: &Query) -> Result<Status> {
+        query.key.validate()?;
+        if query.action == QueryAction::Retire
+            && let Some((root, status)) = self
+                .previous_retire
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            && query.key == Key::new(root, status.operation, &status.stage)
+        {
+            return Ok(status.clone());
+        }
         let slot = self.compact(&query.key)?;
         match query.action {
             QueryAction::Status => Ok(slot.status()),
@@ -1126,7 +1143,44 @@ impl Owner {
     pub fn call(&self, request: &Request) -> Result<Status> {
         request.validate()?;
         if matches!(request.action, Action::Register { .. }) {
-            return self.register(request);
+            return self.register(request).map_err(|error| {
+                let _admission = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+                // Only the owner can attest that this exact registration was
+                // refused without publishing a slot. Relay/envelope errors do
+                // not receive this negative-custody receipt.
+                if self
+                    .slot(&request.root, request.operation, &request.stage)
+                    .is_err()
+                {
+                    let mut value = failure(error, false);
+                    if value.kind != FailureKind::Unknown
+                        && let Ok(digest) = request.digest()
+                    {
+                        value.object_receipt =
+                            Some(crate::catalog_session::preview_io::FailureReceipt {
+                                operation: request.operation,
+                                step: U64(0),
+                                request_digest: digest,
+                            });
+                    }
+                    value.into()
+                } else {
+                    error
+                }
+            });
+        }
+        if matches!(request.action, Action::Retire)
+            && let Some((root, status)) = self
+                .previous_retire
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            && root == &request.root
+            && status.operation == request.operation
+            && status.stage == request.stage
+        {
+            status.validate(request)?;
+            return Ok(status.clone());
         }
         let slot = self.slot(&request.root, request.operation, &request.stage)?;
         ensure!(
@@ -1608,8 +1662,14 @@ impl Owner {
     fn retire_slot(&self, slot: &Arc<Slot>) -> Result<Status> {
         let _lifecycle = slot.try_lifecycle()?;
         let mut stage = slot.stage_state.lock().unwrap_or_else(|p| p.into_inner());
+        // A racing retry may already hold an Arc to the retired slot. The
+        // lifecycle guard proves its first retirement has completely finished.
+        if stage.retired {
+            drop(stage);
+            return Ok(slot.status());
+        }
         ensure!(
-            !stage.retired && stage.pending.is_none() && stage.supervisor_pending.is_none(),
+            stage.pending.is_none() && stage.supervisor_pending.is_none(),
             "export stage transition remains owned"
         );
         ensure!(
@@ -1657,18 +1717,24 @@ impl Owner {
         stage.retired = true;
         drop(stage);
         let status = slot.status();
+        // The receipt attests to completed custody retirement. Keep the slot
+        // discoverable (and lifecycle-locked) until its actual reservation has
+        // been released; racing callers can only retry while that is pending.
+        let reservation = slot
+            .reservation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .context("export native reservation already retired")?;
+        drop(reservation);
+        *self
+            .previous_retire
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((slot.root.clone(), status.clone()));
         self.slots
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|candidate| !Arc::ptr_eq(candidate, slot));
-        ensure!(
-            slot.reservation
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-                .is_some(),
-            "export native reservation already retired"
-        );
         Ok(status)
     }
     pub fn retire_root(&self, root: &RootCapability) -> Result<()> {
@@ -1768,6 +1834,10 @@ impl Owner {
             "released export native root mismatch"
         );
         *selected = None;
+        self.previous_retire
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         Ok(())
     }
     pub fn finish_after_catalog(&self) -> Result<()> {

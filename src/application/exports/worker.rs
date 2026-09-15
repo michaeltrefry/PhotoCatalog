@@ -773,6 +773,7 @@ fn service<'a>(
             replace,
             "execution limits changed; explicitly recover with these limits first"
         );
+        slot.as_mut().unwrap().1.close()?;
         slot.take();
     }
     if slot.is_none() {
@@ -817,6 +818,10 @@ pub(super) fn run(handle: RelinkWorkerHandle, rx: mpsc::Receiver<Task>, ctx: Con
         }
         match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(task) => {
+                let run_job = match &task.request {
+                    Request::Run { job, .. } => Some(job.clone()),
+                    _ => None,
+                };
                 let mut result = execute(
                     &ctx,
                     &mut catalog,
@@ -837,8 +842,27 @@ pub(super) fn run(handle: RelinkWorkerHandle, rx: mpsc::Receiver<Task>, ctx: Con
                         }
                         service.drain_native()
                     } else {
-                        ctx.authority(true)
-                            .and_then(|_hold| service.yield_to_previews(&mut catalog).map(|_| ()))
+                        ctx.authority(true).and_then(|_hold| {
+                            let cancel = ctx.cancel();
+                            if cancel.is_canceled()
+                                && let Some(job) = run_job.as_ref()
+                            {
+                                service.tick_detached(
+                                    &mut catalog,
+                                    job,
+                                    &mut core::ExportControl::new(&cancel.0),
+                                )?;
+                                ensure!(!service.is_active(), crate::export_service::PendingExport);
+                                Ok(())
+                            } else {
+                                service
+                                    .yield_to_previews_cancellable(
+                                        &mut catalog,
+                                        &mut core::ExportControl::new(&cancel.0),
+                                    )
+                                    .map(|_| ())
+                            }
+                        })
                     };
                     match cleanup {
                         Ok(()) => break,
@@ -893,8 +917,23 @@ pub(super) fn run(handle: RelinkWorkerHandle, rx: mpsc::Receiver<Task>, ctx: Con
             Err(_) => break,
         }
     }
-    if let Some((_, service)) = &mut owner {
-        let _ = service.yield_to_previews(&mut catalog);
+    while let Some((_, service)) = &mut owner {
+        let cleanup = service.drain_native().and_then(|()| service.close());
+        match cleanup {
+            Ok(()) => break,
+            Err(error) => {
+                ctx.update("draining", None);
+                if let Some(status) = &mut ctx.control.lock().unwrap().status {
+                    status.error = Some(
+                        format!("export shutdown drain: {error:#}")
+                            .chars()
+                            .take(2048)
+                            .collect(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
     {
         let id = ctx.control.lock().unwrap().cancel_job_on_shutdown.clone();
@@ -1053,6 +1092,7 @@ fn execute(
             let service = service(owner, catalog, ctx, &limits, false)?;
             let started = Instant::now();
             let mut processed = 0;
+            let mut permit_unavailable = false;
             loop {
                 if ctx.stopped() {
                     break;
@@ -1061,33 +1101,31 @@ fn execute(
                     let c = ctx.control.lock().unwrap();
                     (c.yield_requested, c.foreground_yield)
                 };
-                if cancel.is_canceled() || yielded || foreground {
-                    let _hold = ctx.authority(true)?;
-                    ctx.update("yielding", None);
-                    service.yield_to_previews(catalog)?;
-                    if cancel.is_canceled() {
-                        if read::job(catalog, &job).map_err(ae)?.state != "complete" {
-                            catalog.cancel_photo_export_job(&job)?;
-                        }
-                        break;
-                    }
-                    if yielded {
-                        break;
-                    }
-                    {
-                        let mut c = ctx.control.lock().unwrap();
-                        c.foreground_yield = false;
-                    }
-                }
-                if processed >= max_items.0 || started.elapsed().as_secs() >= max_seconds.0 {
-                    let _hold = ctx.authority(true)?;
-                    service.yield_to_previews(catalog)?;
-                    break;
-                }
+                let exhausted =
+                    processed >= max_items.0 || started.elapsed().as_secs() >= max_seconds.0;
+                let yielding = yielded || foreground || exhausted || permit_unavailable;
                 let event = {
                     let _hold = ctx.authority(true)?;
-                    service.tick_detached(catalog, &job, &mut control)?
+                    // Cancellation keeps its real token through seal acceptance
+                    // and publication. Both cleanup paths must finish their exact
+                    // admitted operation before this Run can return SQL custody.
+                    let result = if yielding && !cancel.is_canceled() {
+                        ctx.update("yielding", None);
+                        service.yield_to_previews_cancellable(catalog, &mut control)
+                    } else {
+                        service.tick_detached(catalog, &job, &mut control)
+                    };
+                    match result {
+                        Ok(event) => event,
+                        Err(error) if crate::export_service::pending_export(&error) => {
+                            drop(_hold);
+                            thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 };
+                let idle = matches!(event, ExportEvent::Idle);
                 match event {
                     ExportEvent::WaitingForPreviews => match ctx.permit() {
                         Ok(permit) => service.admit_native(catalog, permit)?,
@@ -1095,14 +1133,10 @@ fn execute(
                             if ctx.stopped() {
                                 return Err(e);
                             }
-                            let _hold = ctx.authority(true)?;
-                            service.yield_to_previews(catalog)?;
-                            if cancel.is_canceled()
-                                && read::job(catalog, &job).map_err(ae)?.state != "complete"
-                            {
-                                catalog.cancel_photo_export_job(&job)?;
-                            }
-                            break;
+                            // Retry through the same loop so a pending yield or
+                            // cancellation cannot escape into outer cleanup.
+                            permit_unavailable = true;
+                            continue;
                         }
                     },
                     ExportEvent::Started { sequence, pid } => {
@@ -1133,13 +1167,385 @@ fn execute(
                             s.job = Some(current);
                         }
                     }
-                    ExportEvent::Idle => break,
+                    ExportEvent::Idle => {}
                     ExportEvent::Yielded { .. } => {}
+                }
+                if !service.is_active() {
+                    if cancel.is_canceled() {
+                        let _hold = ctx.authority(true)?;
+                        if read::job(catalog, &job).map_err(ae)?.state != "complete" {
+                            catalog.cancel_photo_export_job(&job)?;
+                        }
+                        break;
+                    }
+                    if yielded || exhausted || permit_unavailable {
+                        break;
+                    }
+                    if foreground {
+                        ctx.control.lock().unwrap().foreground_yield = false;
+                    } else if idle {
+                        break;
+                    }
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             Ok(ResultValue::Job(read::job(catalog, &job).map_err(ae)?))
         }
         _ => anyhow::bail!("unsupported long export request"),
+    }
+}
+
+#[cfg(test)]
+mod managed_c_coordinator_tests {
+    use super::*;
+    use crate::catalog_session::{export_native as n, export_stage as s};
+    use std::sync::atomic::AtomicBool;
+    struct Grants {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Grants {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn managed_export_c_retries_unknown_replies_inside_actual_coordinator_run() -> anyhow::Result<()>
+    {
+        for fault in [
+            "register", "begin", "icc", "xmp", "ready", "spawn", "start", "status", "seal",
+            "release", "retire",
+        ] {
+            run_case(fault)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn managed_export_c_coordinator_cancels_running_lost_seal_and_retired_before_acceptance()
+    -> anyhow::Result<()> {
+        for fault in [
+            "cancel-running",
+            "cancel-seal",
+            "cancel-retire",
+            "cancel-during-yield",
+        ] {
+            run_case(fault)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn managed_export_c_coordinator_finishes_incremental_explicit_and_foreground_yield()
+    -> anyhow::Result<()> {
+        for fault in ["yield-running", "yield-seal", "foreground-seal"] {
+            run_case(fault)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn managed_export_c_replacement_waits_for_exact_close_before_successor_acquire()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (mut session, facts) =
+            crate::catalog_session::managed_export_runtime_session(temp.path())?;
+        facts.real_executor();
+        let catalog = session.catalog.as_mut().unwrap();
+        let ctx = Context {
+            control: Default::default(),
+            cache: Default::default(),
+            config: Config {
+                worker_executable: std::env::current_exe()?,
+                cache_root: None,
+                original_roots: vec![],
+                preview_policy: Default::default(),
+                preview_limits: Default::default(),
+                limits: Default::default(),
+                import_checkpoint: None,
+            },
+        };
+        let first = options(&ctx.config).execution;
+        let mut second = first.clone();
+        second.render.encode.row_buffer_bytes.0 -= 1;
+        let mut slot = None;
+        service(&mut slot, catalog, &ctx, &first, true)?.recover(catalog, 32)?;
+        facts.lose_executor("close");
+        assert!(service(&mut slot, catalog, &ctx, &second, true).is_err());
+        assert_eq!(slot.as_ref().unwrap().0, serde_json::to_string(&first)?);
+        let before = facts.executor_requests();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|r| matches!(
+                    r.action,
+                    crate::catalog_session::export_executor::Action::Acquire
+                ))
+                .count(),
+            1
+        );
+        service(&mut slot, catalog, &ctx, &second, true)?.recover(catalog, 32)?;
+        let after = facts.executor_requests();
+        let closes: Vec<_> = after
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.action,
+                    crate::catalog_session::export_executor::Action::Release
+                )
+            })
+            .collect();
+        assert_eq!(closes.len(), 2);
+        assert_eq!(closes[0], closes[1]);
+        let acquires: Vec<_> = after
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.action,
+                    crate::catalog_session::export_executor::Action::Acquire
+                )
+            })
+            .collect();
+        assert_eq!(acquires.len(), 2);
+        assert_ne!(acquires[0].executor, acquires[1].executor);
+        slot.as_mut().unwrap().1.close()?;
+        drop(slot);
+        session.close()?;
+        Ok(())
+    }
+
+    fn run_case(fault: &'static str) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (mut session, facts) =
+            crate::catalog_session::managed_export_runtime_session(temp.path())?;
+        facts.drain_native_on_status(true);
+        match fault {
+            "register" | "spawn" | "start" | "retire" => facts.lose_native(fault),
+            "status" => facts.lose_status(),
+            "cancel-seal" | "yield-seal" | "foreground-seal" | "cancel-during-yield" => {
+                facts.lose_stage_action("seal")
+            }
+            "cancel-running" | "cancel-retire" | "yield-running" => {}
+            _ => facts.lose_stage_action(fault),
+        }
+        let catalog = session.catalog.as_mut().unwrap();
+        let job = crate::export_service::managed_test_enqueue(catalog, temp.path(), fault)?;
+        crate::export_service::managed_test_set_blobs(
+            catalog,
+            &job,
+            Some(&vec![1; 16_385]),
+            Some(&vec![2; 16_385]),
+            false,
+        )?;
+        let mut previews = crate::export_service::managed_test_previews(temp.path())?;
+        let pause = previews.pause_native_launches()?;
+        let permit = previews.native_launch_permit(catalog, pause)?;
+        let mut config = Config {
+            worker_executable: std::env::current_exe()?,
+            cache_root: None,
+            original_roots: vec![],
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        };
+        config.preview_limits.working_bytes = 2 * 1024 * 1024;
+        config.preview_limits.per_worker_bytes = 2 * 1024 * 1024;
+        config.preview_limits.decode_limits.max_allocation_bytes = 1024 * 1024;
+        let mut ctx = Context {
+            control: Default::default(),
+            cache: Default::default(),
+            config,
+        };
+        let injected = Arc::new(AtomicBool::new(false));
+        let triggered = injected.clone();
+        let observed = facts.clone();
+        let shared = ctx.control.clone();
+        ctx.config.import_checkpoint = Some(Arc::new(move |checkpoint, cancel| {
+            if fault == "cancel-during-yield" {
+                // Request yield after the lost Seal reply, then cancel inside
+                // acceptance hashing after yield was selected and Retire finished.
+                if checkpoint == "export_hold"
+                    && observed
+                        .stage_requests()
+                        .iter()
+                        .any(|r| matches!(r.action, s::Action::ResultAndSeal))
+                {
+                    shared.lock().unwrap().yield_requested = true;
+                }
+                if checkpoint == "export_hashing"
+                    && observed
+                        .native_requests()
+                        .iter()
+                        .any(|r| matches!(r.action, n::Action::Retire))
+                {
+                    triggered.store(true, std::sync::atomic::Ordering::Release);
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+                return;
+            }
+            let at_boundary = if fault.ends_with("-running") {
+                checkpoint.starts_with("export_native_started:")
+            } else if checkpoint == "export_hold" && fault.ends_with("-seal") {
+                observed
+                    .stage_requests()
+                    .iter()
+                    .any(|r| matches!(r.action, s::Action::ResultAndSeal))
+            } else if checkpoint == "export_hold" && fault == "cancel-retire" {
+                observed
+                    .native_requests()
+                    .iter()
+                    .any(|r| matches!(r.action, n::Action::Retire))
+            } else {
+                false
+            };
+            if at_boundary && !triggered.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                if fault.starts_with("cancel-") {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                } else if fault.starts_with("yield-") {
+                    shared.lock().unwrap().yield_requested = true;
+                } else if fault.starts_with("foreground-") {
+                    shared.lock().unwrap().foreground_yield = true;
+                }
+            }
+        }));
+        ctx.control.lock().unwrap().permit = Some(permit);
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let control = ctx.control.clone();
+        let grant_thread = std::thread::spawn(move || {
+            while !signal.load(std::sync::atomic::Ordering::Acquire) {
+                let mut c = control.lock().unwrap();
+                if c.hold_since.is_some() {
+                    c.hold_granted = true;
+                }
+                drop(c);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let grants = Grants {
+            stop,
+            thread: Some(grant_thread),
+        };
+        let render = RenderLimits {
+            max_pixels: U64(1024),
+            max_allocation_bytes: U64(1024 * 1024),
+            max_live_bytes: U64(1024 * 1024),
+        };
+        let execution_limits = ExecutionLimits {
+            worker_bytes: U64(2 * 1024 * 1024),
+            working_bytes: U64(2 * 1024 * 1024),
+            render: PhotoLimits {
+                decode: DecodeLimits {
+                    max_encoded_bytes: U64(1024 * 1024),
+                    max_intermediate_pixels: U64(1024),
+                    max_allocation_bytes: U64(1024 * 1024),
+                },
+                render: render.clone(),
+                encode: EncodeLimits {
+                    render,
+                    max_metadata_bytes: U64(1024 * 1024),
+                    row_buffer_bytes: U64(64 * 1024),
+                },
+                max_encoded_extent: U64(1024 * 1024),
+            },
+        };
+        execution(&execution_limits, &ctx.config)?;
+        let mut owner = None;
+        execute(
+            &ctx,
+            catalog,
+            &mut owner,
+            Request::Recover {
+                directories: U64(32),
+                limits: Some(execution_limits.clone()),
+            },
+            None,
+        )?;
+        let result = execute(
+            &ctx,
+            catalog,
+            &mut owner,
+            Request::Run {
+                job: job.clone(),
+                limits: Some(execution_limits),
+                max_items: U64(1),
+                max_seconds: U64(20),
+            },
+            None,
+        )?;
+        let ResultValue::Job(completed) = result else {
+            anyhow::bail!("unexpected Run result")
+        };
+        let interrupted = fault.starts_with("cancel-") || fault == "yield-running";
+        let expected = if fault.starts_with("cancel-") {
+            "canceled"
+        } else if fault == "yield-running" {
+            "queued"
+        } else {
+            "complete"
+        };
+        assert_eq!(completed.state, expected, "fault={fault}");
+        if fault.contains('-') {
+            assert!(
+                injected.load(std::sync::atomic::Ordering::Acquire),
+                "boundary not reached: {fault}"
+            );
+        }
+        if fault.starts_with("foreground-") {
+            assert!(!ctx.control.lock().unwrap().foreground_yield);
+        }
+        let stages = facts.stage_requests();
+        let natives = facts.native_requests();
+        let mut identities = std::collections::HashSet::new();
+        for request in &natives {
+            identities.insert((request.operation.0, request.stage.as_str().to_owned()));
+        }
+        assert_eq!(
+            identities.len(),
+            1,
+            "fault={fault}: no second SQL/native attempt"
+        );
+        let seals: std::collections::HashSet<_> = stages
+            .iter()
+            .filter(|r| matches!(r.action, s::Action::ResultAndSeal))
+            .map(s::Request::digest)
+            .collect::<anyhow::Result<_>>()?;
+        assert_eq!(seals.len(), usize::from(!fault.ends_with("-running")));
+        let begins: std::collections::HashSet<_> = stages
+            .iter()
+            .filter(|r| matches!(r.action, s::Action::Begin { .. }))
+            .map(s::Request::digest)
+            .collect::<anyhow::Result<_>>()?;
+        assert_eq!(begins.len(), 1);
+        assert!(
+            natives
+                .iter()
+                .any(|r| matches!(r.action, n::Action::Retire))
+        );
+        assert!(catalog.rendering_photo_export_attempts(200)?.is_empty());
+        let published = temp.path().join(format!("{fault}-published.png"));
+        if interrupted {
+            assert!(!published.exists(), "publication after {fault}");
+            let items = catalog.photo_export_items(&job, 0, 10)?;
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                items[0].state,
+                if fault == "yield-running" {
+                    "pending"
+                } else {
+                    "failed"
+                }
+            );
+        } else {
+            assert_eq!(std::fs::read(published)?, b"x");
+        }
+        assert_eq!(owner.as_ref().unwrap().1.reserved_bytes(), 0);
+        owner.as_mut().unwrap().1.close()?;
+        drop((owner, grants, previews));
+        session.close()?;
+        Ok(())
     }
 }

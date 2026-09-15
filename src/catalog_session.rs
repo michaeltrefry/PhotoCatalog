@@ -999,6 +999,11 @@ impl ExportProfileReply {
 }
 
 pub mod export_executor;
+mod export_managed;
+pub(crate) use export_managed::{ExportBackendKind, ManagedExportAttempt, ManagedExportExecutor};
+pub(crate) fn managed_export_registry_layouts() -> [(usize, usize); 5] {
+    export_managed::registry_layouts()
+}
 pub mod export_native;
 pub mod export_stage;
 pub mod native;
@@ -1713,6 +1718,7 @@ pub(crate) struct CatalogSessionAuthority {
     searches: Mutex<Vec<Arc<dyn SessionTask>>>,
     original: Arc<Mutex<Option<OriginalCustody>>>,
     publication: Arc<Mutex<Option<PublicationCustody>>>,
+    managed_export: export_managed::Registry,
 }
 impl CatalogSessionAuthority {
     pub(crate) fn legacy(file: Arc<File>) -> Result<Arc<Self>> {
@@ -1722,6 +1728,7 @@ impl CatalogSessionAuthority {
             searches: Mutex::new(Vec::new()),
             original: Arc::new(Mutex::new(None)),
             publication: Arc::new(Mutex::new(None)),
+            managed_export: export_managed::Registry::default(),
         }))
     }
     pub(crate) fn legacy_file(&self) -> Result<&Arc<File>> {
@@ -2762,6 +2769,7 @@ impl ManagedSession {
             searches: Mutex::new(Vec::new()),
             original: Arc::new(Mutex::new(None)),
             publication: Arc::new(Mutex::new(None)),
+            managed_export: export_managed::Registry::default(),
         });
         let db = pool.lease(0).expect("new confirmed actor role available");
         let catalog = Catalog {
@@ -2810,8 +2818,8 @@ impl Drop for ManagedSession {
 mod tests;
 #[cfg(test)]
 pub(crate) use tests::{
-    ExportOriginalTestControl, export_facts_managed_session, export_managed_session,
-    export_original_managed_session, export_profile_managed_session, retained_admission,
+    export_facts_managed_session, export_managed_session, export_original_managed_session,
+    export_profile_managed_session, managed_export_runtime_session, retained_admission,
     unused_filesystem,
 };
 

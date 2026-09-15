@@ -74,6 +74,7 @@ pub fn build_identity() -> String {
             include_str!("../catalog_session.rs"),
             include_str!("../catalog_session/store.rs"),
             include_str!("../catalog_session/preview_io.rs"),
+            include_str!("../catalog_session/export_managed.rs"),
             include_str!("../preview/store.rs"),
             include_str!("../filesystem_worker.rs"),
             include_str!("bootstrap.rs"),

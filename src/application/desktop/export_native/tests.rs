@@ -1191,19 +1191,48 @@ fn shared_pool_refuses_atomically_and_reuses_only_after_explicit_retirement() ->
     let competitor = pool.reserve_exact(1)?;
     let stages = FakeStages::new(f._temp.path().to_owned());
     let owner = owner(&f, stages.clone(), &pool)?;
-    let error = owner.call(&register(&f)).unwrap_err();
-    let limit = error
-        .downcast_ref::<crate::preview::ByteLimit>()
-        .context("typed shared-pool refusal")?;
-    assert_eq!((limit.required, limit.available), (f.worker, f.worker - 1));
+    let request = register(&f);
+    let high_water = *owner.high_water.lock().unwrap();
+    let error = owner.call(&request).unwrap_err();
+    let failure = error
+        .downcast_ref::<Failure>()
+        .context("typed shared-pool refusal with negative custody receipt")?;
+    failure.validate()?;
+    assert_eq!(failure.kind, FailureKind::ResourceLimit);
+    assert_eq!(
+        failure.message,
+        crate::preview::ByteLimit {
+            required: f.worker,
+            available: f.worker - 1,
+        }
+        .to_string()
+    );
+    let receipt = failure.object_receipt.context("negative custody receipt")?;
+    assert_eq!(receipt.operation, request.operation);
+    assert_eq!(receipt.step, U64(0));
+    assert_eq!(receipt.request_digest, request.digest()?);
+    assert_eq!(pool.used(), 1, "refusal must retain only the competitor");
+    assert_eq!(*owner.high_water.lock().unwrap(), high_water);
+    assert!(
+        owner
+            .slot(&request.root, request.operation, &request.stage)
+            .is_err()
+    );
     drop(competitor);
-    owner.call(&register(&f))?;
+    owner.call(&request)?;
+    assert_eq!(pool.used(), f.worker);
     owner.stage_call(&f.begin, &AtomicBool::new(false))?;
     owner.stage_call(
         &ordinary(&f, 2, export_stage::Action::Abort),
         &AtomicBool::new(false),
     )?;
+    assert_eq!(pool.used(), f.worker, "Abort alone cannot release custody");
+    assert!(
+        pool.try_reserve(1).is_none(),
+        "capacity cannot be reused before Retire"
+    );
     owner.call(&lifecycle(&f, Action::Retire))?;
+    assert_eq!(pool.used(), 0);
     let reused = pool.reserve_exact(f.worker)?;
     assert_eq!(reused.bytes(), f.worker);
     assert_eq!(
@@ -2958,5 +2987,126 @@ fn combined_root_close_finishes_each_interrupted_discard_phase() -> Result<()> {
         FileExt::unlock(&lock)?;
     }
     crate::export_worker::set_compact_discard_hook(|_, _| Ok(()));
+    Ok(())
+}
+
+#[test]
+fn managed_c_retire_ack_replays_exact_identity_without_second_budget_release() -> Result<()> {
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = owner(&f, stages, &pool)?;
+    owner.call(&register(&f))?;
+    assert_eq!(pool.used(), f.worker);
+    let mut retire = register(&f);
+    retire.action = Action::Retire;
+    let first = owner.call(&retire)?;
+    assert_eq!(pool.used(), 0);
+    let replay = owner.call(&retire)?;
+    assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&replay)?);
+    let query = Query {
+        key: Key::new(&f.root, retire.operation, &f.stage),
+        action: QueryAction::Retire,
+    };
+    assert_eq!(
+        serde_json::to_vec(&first)?,
+        serde_json::to_vec(&owner.query(&query)?)?
+    );
+    let mut foreign = retire.clone();
+    foreign.binding.job.push_str("-foreign");
+    assert!(owner.call(&foreign).is_err());
+    foreign = retire.clone();
+    foreign.root.token = LeaseId::new();
+    assert!(owner.call(&foreign).is_err());
+    foreign = retire.clone();
+    foreign.stage = LeaseId::new();
+    assert!(owner.call(&foreign).is_err());
+    let reservation = pool.try_reserve(f.worker).unwrap();
+    owner.call(&retire)?;
+    assert_eq!(pool.used(), f.worker);
+    drop(reservation);
+    owner.executor_call(
+        &executor_request(&f, f.executor.clone(), 2, export_executor::Action::Release),
+        &AtomicBool::new(false),
+    )?;
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn managed_c_retire_waits_for_reservation_and_retires_captured_arc_without_deadlock() -> Result<()>
+{
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = owner(&f, stages, &pool)?;
+    owner.call(&register(&f))?;
+    let captured = owner.slot(&f.root, U64(9), &f.stage)?;
+    let reservation = captured.reservation.lock().unwrap();
+    let thread_owner = owner.clone();
+    let mut request = register(&f);
+    request.action = Action::Retire;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let first = thread::spawn(move || {
+        let _ = tx.send(thread_owner.call(&request));
+    });
+    wait_until(|| captured.stage_state.lock().unwrap().retired)?;
+    assert_eq!(pool.used(), f.worker);
+    assert!(owner.previous_retire.lock().unwrap().is_none());
+    let query = Query {
+        key: Key::new(&f.root, U64(9), &f.stage),
+        action: QueryAction::Retire,
+    };
+    assert!(
+        owner.query(&query).is_err(),
+        "no successful Retire before budget release"
+    );
+    drop(reservation);
+    rx.recv_timeout(Duration::from_secs(5))??;
+    first.join().unwrap();
+    assert_eq!(pool.used(), 0);
+    // Close captures slot Arcs before cleanup. Exercise those same cleanup and
+    // retirement calls after the ordinary caller has independently retired it.
+    owner.cleanup_slot(&captured)?;
+    let thread_owner = owner.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let retry = thread::spawn(move || {
+        let _ = tx.send(thread_owner.retire_slot(&captured));
+    });
+    rx.recv_timeout(Duration::from_secs(5))??;
+    retry.join().unwrap();
+    assert_eq!(pool.used(), 0);
+    owner.executor_call(
+        &executor_request(&f, f.executor.clone(), 2, export_executor::Action::Release),
+        &AtomicBool::new(false),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn managed_c_register_refusal_has_exact_negative_custody_receipt() -> Result<()> {
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker.checked_sub(1).context("fixture pool allowance")?)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = owner(&f, stages, &pool)?;
+    let request = register(&f);
+    let error = owner.call(&request).unwrap_err();
+    let failure = error
+        .downcast_ref::<Failure>()
+        .context("bound negative registration failure")?;
+    assert_ne!(failure.kind, FailureKind::Unknown);
+    let receipt = failure.object_receipt.as_ref().unwrap();
+    assert_eq!(receipt.operation, request.operation);
+    assert_eq!(receipt.request_digest, request.digest()?);
+    assert!(
+        owner
+            .slot(&request.root, request.operation, &request.stage)
+            .is_err()
+    );
+    assert_eq!(pool.used(), 0);
+    owner.executor_call(
+        &executor_request(&f, f.executor.clone(), 2, export_executor::Action::Release),
+        &AtomicBool::new(false),
+    )?;
     Ok(())
 }

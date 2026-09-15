@@ -1200,6 +1200,59 @@ impl Catalog {
         }
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM photo_export_items i JOIN photo_export_jobs j ON j.id=i.job WHERE i.job=?1 AND i.sequence=?2 AND i.attempt=?3 AND i.authority=?4 AND i.state='rendering' AND j.state='queued')",params![work.job,work.sequence,work.attempt,work.authority],|r|r.get(0))?)
     }
+    /// Revalidate a claimed attempt immediately before managed staging/native
+    /// admission. This is an observation only; seal acceptance repeats its full
+    /// transactional authority checks.
+    pub(crate) fn admit_photo_export_render_cancellable(
+        &self,
+        work: &ExportWork,
+        control: &mut ExportControl<'_>,
+    ) -> Result<()> {
+        control.begin()?;
+        self.require_jobs_released()?;
+        checked_plan(work.plan.raw(), &work.authority)?;
+        require_current_renderer(&work.plan)?;
+        ensure!(
+            self.photo_export_work_current(work)?,
+            "export work changed before native admission"
+        );
+        let original = work.plan.original.to_path()?;
+        if let Some(revision) = self.session.inspect_export_original(
+            &work.plan.original,
+            work.plan.max_original_bytes,
+            control.cancellation(),
+        )? {
+            control.hash(revision.bytes)?;
+            ensure!(
+                revision == work.plan.original_revision,
+                "original changed since export planning"
+            );
+        } else {
+            let verified = metadata_export::VerifiedFile::read_with_checkpoint(
+                &original,
+                work.plan.max_original_bytes,
+                &mut |bytes| control.hash(bytes).map_err(std::io::Error::other),
+            )?;
+            ensure!(
+                verified.revision() == &work.plan.original_revision,
+                "original changed since export planning"
+            );
+        }
+        // Alias-index evidence requires its own authoritative read snapshot.
+        // Current-work helpers above own their snapshots; seal acceptance later
+        // repeats full transactional authority validation.
+        let tx = self.db.unchecked_transaction()?;
+        protect_destination_controlled(
+            &tx,
+            &self.session,
+            &work.plan.destination.destination,
+            &original,
+            work.plan.alias_limits,
+            control,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Fence a stopped attempt. The executor must reap its worker before launching
     /// another; a late result with the old token can never be accepted afterward.
     pub fn requeue_photo_export_attempt(&mut self, work: &ExportWork) -> Result<()> {

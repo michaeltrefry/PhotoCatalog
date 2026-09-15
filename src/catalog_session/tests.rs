@@ -1,9 +1,10 @@
 use super::*;
+use crate::catalog_exports::ExportWork;
 use anyhow::Context;
 use std::{
     fs::{self, OpenOptions},
     path::PathBuf,
-    sync::atomic::AtomicUsize,
+    sync::{Barrier, atomic::AtomicUsize},
 };
 
 /// Synthetic facts provider only. Real F process/path custody is independently
@@ -46,6 +47,30 @@ struct Facts {
     fail_publication_begin_reply: AtomicBool,
     fail_publication_step_reply: AtomicBool,
     fail_publication_abort: Arc<AtomicBool>,
+    export_executor_requests: Arc<Mutex<Vec<export_executor::Request>>>,
+    real_export_executor:
+        Mutex<Option<crate::filesystem_worker::export_executor_test_support::Owner>>,
+    lose_export_executor_action: Mutex<Option<String>>,
+    cancel_after_discard: Mutex<Option<Arc<AtomicBool>>>,
+    export_executor_enter: Mutex<Option<Arc<Barrier>>>,
+    export_executor_release: Mutex<Option<Arc<Barrier>>>,
+    bad_export_executor_digest: AtomicBool,
+    wrong_export_executor_value: AtomicBool,
+    export_native_status: Mutex<Option<export_native::Status>>,
+    export_native_requests: Arc<Mutex<Vec<export_native::Request>>>,
+    foreign_export_native_status_binding: AtomicBool,
+    export_stage_requests: Arc<Mutex<Vec<export_stage::Request>>>,
+    export_stage_completed: Mutex<Option<([u8; 32], export_stage::Reply)>>,
+    lose_export_stage_reply: AtomicBool,
+    reject_export_stage_reply: AtomicBool,
+    export_stage_work: Mutex<Option<ExportWork>>,
+    drain_export_native_on_status: AtomicBool,
+    lose_export_native_action: Mutex<Option<String>>,
+    lose_export_stage_action: Mutex<Option<String>>,
+    reject_export_register: AtomicBool,
+    fail_export_spawn: AtomicBool,
+    lose_export_status: AtomicBool,
+    reject_export_release: AtomicBool,
 }
 
 enum TestPublicationState {
@@ -179,6 +204,29 @@ impl Facts {
                 fail_publication_begin_reply: AtomicBool::new(false),
                 fail_publication_step_reply: AtomicBool::new(false),
                 fail_publication_abort: Arc::new(AtomicBool::new(false)),
+                export_executor_requests: Arc::new(Mutex::new(Vec::new())),
+                real_export_executor: Mutex::new(None),
+                lose_export_executor_action: Mutex::new(None),
+                cancel_after_discard: Mutex::new(None),
+                export_executor_enter: Mutex::new(None),
+                export_executor_release: Mutex::new(None),
+                bad_export_executor_digest: AtomicBool::new(false),
+                wrong_export_executor_value: AtomicBool::new(false),
+                export_native_status: Mutex::new(None),
+                export_native_requests: Arc::new(Mutex::new(Vec::new())),
+                foreign_export_native_status_binding: AtomicBool::new(false),
+                export_stage_requests: Arc::new(Mutex::new(Vec::new())),
+                export_stage_completed: Mutex::new(None),
+                lose_export_stage_reply: AtomicBool::new(false),
+                reject_export_stage_reply: AtomicBool::new(false),
+                export_stage_work: Mutex::new(None),
+                drain_export_native_on_status: AtomicBool::new(false),
+                lose_export_native_action: Mutex::new(None),
+                lose_export_stage_action: Mutex::new(None),
+                reject_export_register: AtomicBool::new(false),
+                fail_export_spawn: AtomicBool::new(false),
+                lose_export_status: AtomicBool::new(false),
+                reject_export_release: AtomicBool::new(false),
             }),
             request,
         ))
@@ -192,6 +240,255 @@ impl Drop for Facts {
     }
 }
 impl CatalogFilesystem for Facts {
+    fn export_native(&self) -> Option<&dyn export_native::CatalogExportNative> {
+        Some(self)
+    }
+
+    fn export_executor_call(
+        &self,
+        request: &export_executor::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<export_executor::Reply> {
+        request.validate()?;
+        self.export_executor_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if matches!(request.action, export_executor::Action::Acquire) {
+            let enter = self.export_executor_enter.lock().unwrap().clone();
+            let release = self.export_executor_release.lock().unwrap().clone();
+            if let (Some(enter), Some(release)) = (enter, release) {
+                enter.wait();
+                release.wait();
+            }
+        }
+        if let Some(owner) = self.real_export_executor.lock().unwrap().as_mut() {
+            let catalog = self.bootstrap.canonical_root.to_path()?;
+            let manifest = self.bootstrap.manifest.path.to_path()?;
+            let reply = owner.call(&catalog, manifest.parent().unwrap(), request, _cancel, true)?;
+            let label = match request.action {
+                export_executor::Action::Acquire => "acquire",
+                export_executor::Action::Recover { .. } => "recover",
+                export_executor::Action::Discard { .. } => "discard",
+                export_executor::Action::Release => "close",
+            };
+            if label == "discard"
+                && let Some(cancel) = self.cancel_after_discard.lock().unwrap().take()
+            {
+                cancel.store(true, Ordering::Release);
+            }
+            let mut lost = self.lose_export_executor_action.lock().unwrap();
+            if lost.as_deref() == Some(label) {
+                lost.take();
+                anyhow::bail!("injected lost real executor {label} acknowledgement");
+            }
+            return Ok(reply);
+        }
+        let mut value = match &request.action {
+            export_executor::Action::Acquire => export_executor::Value::Acquired,
+            export_executor::Action::Recover { .. } => export_executor::Value::Recovery {
+                scanned: U64(0),
+                cleaned: U64(0),
+                retained: U64(0),
+                retained_example: None,
+                candidate: None,
+            },
+            export_executor::Action::Discard { .. } => {
+                export_executor::Value::Discarded { candidate: None }
+            }
+            export_executor::Action::Release => export_executor::Value::Released,
+        };
+        if self
+            .wrong_export_executor_value
+            .swap(false, Ordering::AcqRel)
+        {
+            value = export_executor::Value::Released;
+        }
+        Ok(export_executor::Reply {
+            root: request.root.clone(),
+            executor: request.executor.clone(),
+            operation: request.operation,
+            request_digest: if self
+                .bad_export_executor_digest
+                .swap(false, Ordering::AcqRel)
+            {
+                "0".repeat(64)
+            } else {
+                request.digest()?
+            },
+            value,
+        })
+    }
+
+    fn export_stage_call(
+        &self,
+        request: &export_stage::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<export_stage::Reply> {
+        request.validate()?;
+        self.export_stage_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        let digest = request.digest()?;
+        if let Some((completed_digest, reply)) =
+            self.export_stage_completed.lock().unwrap().as_ref()
+            && completed_digest == &digest
+        {
+            return Ok(reply.clone());
+        }
+        let value = match &request.action {
+            export_stage::Action::Begin { work, limits } => {
+                // Use F's real pre-effect persisted-request validator. A fake
+                // acknowledgement must not bypass the stored plan allowances.
+                crate::export_worker::prepare_managed_request(
+                    work,
+                    *limits,
+                    &request
+                        .root
+                        .canonical_root
+                        .to_path()?
+                        .join("synthetic-export-stage"),
+                )?;
+                *self.export_stage_work.lock().unwrap() = Some((**work).clone());
+                export_stage::Value::Begun
+            }
+            export_stage::Action::UploadIcc { .. }
+            | export_stage::Action::UploadXmp { .. }
+            | export_stage::Action::Abort
+            | export_stage::Action::Release => export_stage::Value::Unit,
+            export_stage::Action::Ready { .. } => export_stage::Value::Ready {
+                path: request.root.canonical_root.clone(),
+            },
+            export_stage::Action::ResultAndSeal => {
+                let path = request
+                    .root
+                    .canonical_root
+                    .to_path()?
+                    .join("synthetic-export-stage");
+                fs::create_dir_all(&path)?;
+                let completed_file = path.join("completed.bin");
+                fs::write(&completed_file, b"x")?;
+                let work = self
+                    .export_stage_work
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("synthetic export stage work missing")?;
+                let sealed = crate::metadata_export::seal_photo_export(
+                    &work.plan.destination,
+                    &completed_file,
+                    work.plan.max_payload_bytes,
+                    &work.authority,
+                    |_| Ok(()),
+                )?;
+                export_stage::Value::Completed {
+                    path: NativePath::from_path(&path),
+                    completion: export_stage::Completion {
+                        authority: request.binding.authority.clone(),
+                        attempt: request.binding.attempt.clone(),
+                        sealed: sealed.clone(),
+                        rendered: export_stage::Rendered {
+                            staging: NativePath::from_path(&path.join("output")),
+                            encoding: crate::image_export::EncodingReport {
+                                output: crate::image_export::OutputDescriptor {
+                                    width: 1,
+                                    height: 1,
+                                    channels: 4,
+                                    bits_per_sample: 8,
+                                    floating_point: false,
+                                    orientation: 1,
+                                    icc_blake3: "c".repeat(64),
+                                    integer_clips_to_unit_range: true,
+                                    alpha: crate::image_export::AlphaPolicy::Preserve,
+                                },
+                                encoded_extent: sealed.payload.bytes,
+                                source_fingerprint: "d".repeat(64),
+                                recipe_digest: "e".repeat(64),
+                                metadata_blake3: "f".repeat(64),
+                                compression: "fixture".into(),
+                            },
+                            renderer_identity: request.binding.renderer.clone(),
+                            metadata_notes: Vec::new(),
+                            timings: crate::photo_render::PhotoRenderTimings {
+                                source_verification_before_ms: 0.,
+                                staging_setup_ms: 0.,
+                                decode_ms: 0.,
+                                recipe_ms: 0.,
+                                metadata_ms: 0.,
+                                encode_ms: 0.,
+                                source_verification_after_ms: 0.,
+                                sync_ms: 0.,
+                                total_ms: 0.,
+                            },
+                        },
+                        seal_ms: 0.,
+                        peak_resident_bytes: Some(1),
+                        peak_method: "fixture".into(),
+                    },
+                }
+            }
+            export_stage::Action::Arm { .. } | export_stage::Action::NativeDrained { .. } => {
+                anyhow::bail!("synthetic C stage fixture rejects supervisor operation")
+            }
+        };
+        let reply = export_stage::Reply {
+            epoch: request.root.epoch.clone(),
+            session: request.root.session.clone(),
+            stage: request.stage.clone(),
+            operation: request.operation,
+            binding: request.binding.clone(),
+            value,
+        };
+        reply.validate(request)?;
+        if matches!(request.action, export_stage::Action::ResultAndSeal) {
+            *self.export_stage_completed.lock().unwrap() = Some((digest, reply.clone()));
+        }
+        if let Some(status) = self.export_native_status.lock().unwrap().as_mut() {
+            status.stage_high_water = request.operation;
+            status.pending_stage_operation = None;
+        }
+        if self.reject_export_stage_reply.swap(false, Ordering::AcqRel) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Rejected,
+                "synthetic terminal export stage failure",
+            )
+            .into());
+        }
+        if matches!(request.action, export_stage::Action::Release)
+            && self.reject_export_release.swap(false, Ordering::AcqRel)
+        {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Rejected,
+                "synthetic terminal Release failure",
+            )
+            .into());
+        }
+        let stage_action = match request.action {
+            export_stage::Action::Begin { .. } => "begin",
+            export_stage::Action::UploadIcc { .. } => "icc",
+            export_stage::Action::UploadXmp { .. } => "xmp",
+            export_stage::Action::Ready { .. } => "ready",
+            export_stage::Action::ResultAndSeal => "seal",
+            export_stage::Action::Release => "release",
+            export_stage::Action::Abort => "abort",
+            _ => "supervisor",
+        };
+        let lose_action =
+            self.lose_export_stage_action.lock().unwrap().as_deref() == Some(stage_action);
+        if lose_action {
+            self.lose_export_stage_action.lock().unwrap().take();
+        }
+        if lose_action || self.lose_export_stage_reply.swap(false, Ordering::AcqRel) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                "synthetic lost export stage acknowledgement",
+            )
+            .into());
+        }
+        Ok(reply)
+    }
+
     fn inspect_export_original(
         &self,
         request: &InspectExportOriginal,
@@ -770,6 +1067,142 @@ impl CatalogFilesystem for Facts {
     }
 }
 
+impl export_native::CatalogExportNative for Facts {
+    fn call(
+        &self,
+        request: &export_native::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<export_native::Status> {
+        request.validate()?;
+        self.export_native_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if matches!(request.action, export_native::Action::Register { .. })
+            && self.reject_export_register.load(Ordering::Acquire)
+        {
+            let mut failure = crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Rejected,
+                "export configured working allowance exceeds shared native pool",
+            );
+            failure.object_receipt = Some(preview_io::FailureReceipt {
+                operation: request.operation,
+                step: U64(0),
+                request_digest: request.digest()?,
+            });
+            return Err(failure.into());
+        }
+        let previous = self.export_native_status.lock().unwrap().clone();
+        let action_name = match request.action {
+            export_native::Action::Register { .. } => "register",
+            export_native::Action::Spawn => "spawn",
+            export_native::Action::Start => "start",
+            export_native::Action::Stop => "stop",
+            export_native::Action::RetryDrain => "retry_drain",
+            export_native::Action::Retire => "retire",
+        };
+        let phase = match request.action {
+            export_native::Action::Register { .. } => export_native::Phase::Registered,
+            export_native::Action::Spawn if self.fail_export_spawn.load(Ordering::Acquire) => {
+                export_native::Phase::WaitFailed
+            }
+            export_native::Action::Spawn => export_native::Phase::Spawned,
+            export_native::Action::Start => export_native::Phase::Running,
+            export_native::Action::Stop => export_native::Phase::StopRequested,
+            export_native::Action::RetryDrain => export_native::Phase::Drained,
+            export_native::Action::Retire => export_native::Phase::Released,
+        };
+        let status = export_native::Status {
+            epoch: request.root.epoch.clone(),
+            session: request.root.session.clone(),
+            operation: request.operation,
+            stage: request.stage.clone(),
+            binding: request.binding.clone(),
+            pid: if matches!(
+                phase,
+                export_native::Phase::Spawned | export_native::Phase::Running
+            ) {
+                Some(42)
+            } else {
+                previous.as_ref().and_then(|status| status.pid)
+            },
+            phase,
+            started: matches!(
+                phase,
+                export_native::Phase::Running
+                    | export_native::Phase::StopRequested
+                    | export_native::Phase::Drained
+                    | export_native::Phase::Released
+            ),
+            exit_code: (phase == export_native::Phase::Drained).then_some(0),
+            success: (phase == export_native::Phase::Drained)
+                .then_some(!self.fail_export_spawn.load(Ordering::Acquire)),
+            stage_high_water: previous
+                .as_ref()
+                .map_or(U64(0), |status| status.stage_high_water),
+            pending_stage_operation: previous.and_then(|status| status.pending_stage_operation),
+            pending_dispatch: export_native::DispatchState::None,
+            error: self
+                .fail_export_spawn
+                .load(Ordering::Acquire)
+                .then(|| "export native launch failed before Child return".into()),
+        };
+        *self.export_native_status.lock().unwrap() = Some(status.clone());
+        if self.lose_export_native_action.lock().unwrap().as_deref() == Some(action_name) {
+            self.lose_export_native_action.lock().unwrap().take();
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                format!("synthetic lost {action_name} acknowledgement"),
+            )
+            .into());
+        }
+        Ok(status)
+    }
+
+    fn status(&self, key: &export_native::Key) -> Result<export_native::Status> {
+        key.validate()?;
+        let mut slot = self.export_native_status.lock().unwrap();
+        if self.drain_export_native_on_status.load(Ordering::Acquire)
+            && slot.as_ref().is_some_and(|status| {
+                matches!(
+                    status.phase,
+                    export_native::Phase::Running | export_native::Phase::StopRequested
+                )
+            })
+        {
+            let status = slot.as_mut().unwrap();
+            status.phase = export_native::Phase::Drained;
+            status.exit_code = Some(0);
+            status.success = Some(true);
+        }
+        let mut status = slot
+            .clone()
+            .context("synthetic export native status missing")?;
+        drop(slot);
+        ensure!(
+            status.epoch == key.epoch
+                && status.session == key.session
+                && status.operation == key.operation
+                && status.stage == key.stage,
+            "synthetic export native key mismatch"
+        );
+        if self.lose_export_status.swap(false, Ordering::AcqRel) {
+            return Err(crate::filesystem_worker::wire::Failure::new(
+                crate::filesystem_worker::wire::FailureKind::Unknown,
+                "lost native Status acknowledgement",
+            )
+            .into());
+        }
+        if self
+            .foreign_export_native_status_binding
+            .swap(false, Ordering::AcqRel)
+        {
+            status.binding.job.push_str("-foreign");
+        }
+        Ok(status)
+    }
+}
+
 #[test]
 fn managed_export_directory_uses_exact_session_capability_and_preserves_cancellation() -> Result<()>
 {
@@ -922,6 +1355,7 @@ fn managed_authority_is_exact_arc_while_legacy_exports_keep_physical_compatibili
         searches: Mutex::new(Vec::new()),
         original: Arc::new(Mutex::new(None)),
         publication: Arc::new(Mutex::new(None)),
+        managed_export: export_managed::Registry::default(),
     });
     assert!(CatalogSessionAuthority::export_matches(
         &authority, &authority
@@ -942,6 +1376,257 @@ fn managed_authority_is_exact_arc_while_legacy_exports_keep_physical_compatibili
         &authority,
         &first.session
     )?);
+    Ok(())
+}
+
+#[test]
+fn managed_export_open_releases_claim_after_bad_ack_and_replays_exact_acquire() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (facts, request) = Facts::create(temp.path())?;
+    let mut session =
+        ManagedSession::admit(facts.clone(), &request, &AtomicBool::new(false)).unwrap();
+    facts
+        .bad_export_executor_digest
+        .store(true, Ordering::Release);
+    assert!(
+        session
+            .authority
+            .open_managed_export(&AtomicBool::new(false))
+            .is_err()
+    );
+    facts
+        .wrong_export_executor_value
+        .store(true, Ordering::Release);
+    assert!(
+        session
+            .authority
+            .open_managed_export(&AtomicBool::new(false))
+            .is_err()
+    );
+    let mut executor = session
+        .authority
+        .open_managed_export(&AtomicBool::new(false))?
+        .unwrap();
+    let requests = facts.export_executor_requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[1], requests[2]);
+    drop(requests);
+    executor.close()?;
+    session.close()?;
+    Ok(())
+}
+
+#[test]
+fn managed_export_open_claim_serializes_the_entire_acquire_relay() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (facts, request) = Facts::create(temp.path())?;
+    let mut session =
+        ManagedSession::admit(facts.clone(), &request, &AtomicBool::new(false)).unwrap();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    *facts.export_executor_enter.lock().unwrap() = Some(entered.clone());
+    *facts.export_executor_release.lock().unwrap() = Some(release.clone());
+    let authority = session.authority.clone();
+    let opened = std::thread::spawn(move || authority.open_managed_export(&AtomicBool::new(false)));
+    entered.wait();
+    assert!(
+        session
+            .authority
+            .open_managed_export(&AtomicBool::new(false))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("already open")
+    );
+    release.wait();
+    let mut executor = opened.join().unwrap()?.unwrap();
+    assert_eq!(facts.export_executor_requests.lock().unwrap().len(), 1);
+    executor.close()?;
+    session.close()?;
+    Ok(())
+}
+
+#[test]
+fn managed_export_open_finishes_drop_with_lost_recover_before_successor_acquire() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (facts, request) = Facts::create(temp.path())?;
+    let mut session =
+        ManagedSession::admit(facts.clone(), &request, &AtomicBool::new(false)).unwrap();
+    let mut executor = session
+        .authority
+        .open_managed_export(&AtomicBool::new(false))?
+        .unwrap();
+    facts
+        .bad_export_executor_digest
+        .store(true, Ordering::Release);
+    assert!(executor.recover(8, &AtomicBool::new(false)).is_err());
+    facts
+        .bad_export_executor_digest
+        .store(true, Ordering::Release);
+    assert!(executor.close().is_err());
+    executor.release_claim_after_failed_drop();
+    drop(executor);
+
+    let mut successor = session
+        .authority
+        .open_managed_export(&AtomicBool::new(false))?
+        .unwrap();
+    let requests = facts.export_executor_requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(matches!(
+        requests[0].action,
+        export_executor::Action::Acquire
+    ));
+    assert_eq!(requests[1], requests[2]);
+    assert_eq!(requests[2], requests[3]);
+    assert!(matches!(
+        requests[3].action,
+        export_executor::Action::Recover { .. }
+    ));
+    assert!(matches!(
+        requests[4].action,
+        export_executor::Action::Release
+    ));
+    assert!(matches!(
+        requests[5].action,
+        export_executor::Action::Acquire
+    ));
+    assert_ne!(requests[0].executor, requests[5].executor);
+    drop(requests);
+    successor.close()?;
+    session.close()?;
+    Ok(())
+}
+
+#[test]
+fn managed_export_status_and_stage_replay_require_exact_bound_evidence() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let original = temp.path().join("managed-status-original.png");
+    fs::write(&original, b"managed status original")?;
+    let (facts, request) = Facts::create(temp.path())?;
+    facts.empty_restore_status.store(true, Ordering::Release);
+    let mut session =
+        ManagedSession::admit(facts.clone(), &request, &AtomicBool::new(false)).unwrap();
+    let catalog = session.catalog.as_mut().unwrap();
+    let fingerprint = blake3::hash(b"managed status original")
+        .to_hex()
+        .to_string();
+    catalog.db.execute("INSERT INTO assets(id,location,path_display,state,fingerprint,preview_hash,metadata) VALUES('managed-status',?1,?2,'ready',?3,'fixture','{\"format\":\"PNG\",\"width\":32,\"height\":24,\"orientation\":1,\"camera_make\":null,\"camera_model\":null,\"captured_at\":null,\"preview_source\":\"fixture\"}')", rusqlite::params![crate::location_bytes(&original), original.to_string_lossy(), fingerprint])?;
+    catalog.record_storage_path("managed-status", &NativePath::from_path(&original))?;
+    let job = catalog.begin_photo_export()?;
+    catalog.append_photo_export(
+        &job.id,
+        0,
+        &crate::catalog_exports::ExportTarget {
+            key: crate::catalog_edits::VariantKey::master("managed-status"),
+            expected_revision: 0,
+            destination: temp.path().join("managed-status-output.png"),
+            overwrite: false,
+            metadata: crate::catalog_exports::MetadataSelection::Omit,
+        },
+        &crate::image_export::OutputSpec {
+            size: crate::image_export::OutputSize::Original,
+            format: crate::image_export::OutputFormat::Png {
+                depth: crate::image_export::IntegerDepth::Eight,
+            },
+            profile: crate::image_export::OutputProfile::Srgb,
+            alpha: crate::image_export::AlphaPolicy::Preserve,
+        },
+        1024,
+        1024,
+    )?;
+    catalog.seal_photo_export_job(&job.id, 1)?;
+    let work = catalog.claim_photo_export(&job.id)?.unwrap();
+    let render = crate::edit::RenderLimits {
+        max_pixels: 1024,
+        max_allocation_bytes: 1024 * 1024,
+        max_live_bytes: 1024 * 1024,
+    };
+    let limits = crate::export_service::ExportServiceLimits {
+        worker_bytes: 2 * 1024 * 1024,
+        working_bytes: 2 * 1024 * 1024,
+        render: crate::photo_render::PhotoRenderLimits {
+            decode: crate::media::DecodeLimits {
+                max_encoded_bytes: 1024 * 1024,
+                max_intermediate_pixels: 1024,
+                max_allocation_bytes: 1024 * 1024,
+            },
+            render,
+            encode: crate::image_export::EncodeLimits {
+                render,
+                ..Default::default()
+            },
+            max_encoded_extent: 1024 * 1024,
+        },
+    };
+    let mut executor = session
+        .authority
+        .open_managed_export(&AtomicBool::new(false))?
+        .unwrap();
+    let mut attempt = executor.prepare_attempt(work, limits)?;
+    facts.reject_export_register.store(true, Ordering::Release);
+    let error = attempt.register(&AtomicBool::new(false)).unwrap_err();
+    assert!(attempt.registration_rejected(&error));
+    let mut foreign = error
+        .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+        .unwrap()
+        .clone();
+    foreign.object_receipt.as_mut().unwrap().request_digest[0] ^= 1;
+    assert!(!attempt.registration_rejected(&foreign.clone().into()));
+    foreign.object_receipt = None;
+    assert!(!attempt.registration_rejected(&foreign.into()));
+    facts.reject_export_register.store(false, Ordering::Release);
+    attempt.register(&AtomicBool::new(false))?;
+    facts
+        .foreign_export_native_status_binding
+        .store(true, Ordering::Release);
+    assert!(attempt.status().is_err());
+    facts.lose_export_stage_reply.store(true, Ordering::Release);
+    assert!(attempt.begin(&AtomicBool::new(false)).is_err());
+    assert!(attempt.pending_stage());
+    attempt.begin(&AtomicBool::new(false))?;
+    assert!(!attempt.pending_stage());
+    let stage_requests = facts.export_stage_requests.lock().unwrap();
+    assert_eq!(stage_requests[0].digest()?, stage_requests[1].digest()?);
+    drop(stage_requests);
+
+    facts.lose_export_stage_reply.store(true, Ordering::Release);
+    assert!(
+        attempt
+            .stage(export_stage::Action::ResultAndSeal, &AtomicBool::new(false),)
+            .is_err()
+    );
+    assert!(attempt.pending_stage());
+    let reply = attempt.stage(export_stage::Action::ResultAndSeal, &AtomicBool::new(false))?;
+    assert!(matches!(reply.value, export_stage::Value::Completed { .. }));
+    assert!(!attempt.pending_stage());
+    let stage_requests = facts.export_stage_requests.lock().unwrap();
+    let last = stage_requests.len() - 1;
+    assert_eq!(
+        stage_requests[last - 1].digest()?,
+        stage_requests[last].digest()?
+    );
+    drop(stage_requests);
+
+    facts
+        .reject_export_stage_reply
+        .store(true, Ordering::Release);
+    assert!(
+        attempt
+            .stage(
+                export_stage::Action::UploadIcc {
+                    offset: U64(0),
+                    bytes: vec![1],
+                },
+                &AtomicBool::new(false),
+            )
+            .is_err()
+    );
+    assert!(!attempt.pending_stage());
+    assert!(attempt.take_terminal_stage_failure().is_some());
+    executor.close()?;
+    session.close()?;
     Ok(())
 }
 
@@ -1128,6 +1813,7 @@ fn prepared_variant_edit_uses_inherited_managed_arc_and_rejects_fresh_arc() -> R
         searches: Mutex::new(Vec::new()),
         original: Arc::new(Mutex::new(None)),
         publication: Arc::new(Mutex::new(None)),
+        managed_export: export_managed::Registry::default(),
     });
     assert!(
         catalog
@@ -1224,6 +1910,101 @@ pub(crate) fn export_facts_managed_session(
     );
     let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
     Ok((session, calls))
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagedExportTestControl {
+    facts: Arc<Facts>,
+}
+impl ManagedExportTestControl {
+    pub(crate) fn real_executor(&self) {
+        *self.facts.real_export_executor.lock().unwrap() = Some(Default::default());
+    }
+    pub(crate) fn lose_executor(&self, action: &str) {
+        *self.facts.lose_export_executor_action.lock().unwrap() = Some(action.into());
+    }
+    pub(crate) fn cancel_discard(&self, cancel: Arc<AtomicBool>) {
+        *self.facts.cancel_after_discard.lock().unwrap() = Some(cancel);
+    }
+    pub(crate) fn lose_stage_action(&self, action: &str) {
+        *self.facts.lose_export_stage_action.lock().unwrap() = Some(action.into());
+    }
+    pub(crate) fn reject_register(&self) {
+        self.facts
+            .reject_export_register
+            .store(true, Ordering::Release);
+    }
+    pub(crate) fn fail_spawn(&self) {
+        self.facts.fail_export_spawn.store(true, Ordering::Release);
+    }
+    pub(crate) fn native_failure(&self, phase: export_native::Phase) {
+        self.facts.fail_export_spawn.store(true, Ordering::Release);
+        let mut slot = self.facts.export_native_status.lock().unwrap();
+        let status = slot.as_mut().expect("running fixture native slot");
+        status.phase = phase;
+        status.success = None;
+        status.error = Some(format!("injected native {phase:?}"));
+    }
+    pub(crate) fn lose_status(&self) {
+        self.facts.lose_export_status.store(true, Ordering::Release);
+    }
+    pub(crate) fn reject_release(&self) {
+        self.facts
+            .reject_export_release
+            .store(true, Ordering::Release);
+    }
+    pub(crate) fn stage_requests(&self) -> Vec<export_stage::Request> {
+        self.facts.export_stage_requests.lock().unwrap().clone()
+    }
+    pub(crate) fn native_requests(&self) -> Vec<export_native::Request> {
+        self.facts.export_native_requests.lock().unwrap().clone()
+    }
+    pub(crate) fn executor_requests(&self) -> Vec<export_executor::Request> {
+        self.facts.export_executor_requests.lock().unwrap().clone()
+    }
+    pub(crate) fn drain_native_on_status(&self, value: bool) {
+        self.facts
+            .drain_export_native_on_status
+            .store(value, Ordering::Release);
+    }
+    pub(crate) fn lose_native(&self, action: &str) {
+        *self.facts.lose_export_native_action.lock().unwrap() = Some(action.into());
+    }
+    pub(crate) fn lose_stage(&self) {
+        self.facts
+            .lose_export_stage_reply
+            .store(true, Ordering::Release);
+    }
+    pub(crate) fn native_request_bytes(&self) -> Result<Vec<Vec<u8>>> {
+        self.facts
+            .export_native_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| crate::filesystem_worker::wire::encode(request, ENVELOPE_BYTES))
+            .collect()
+    }
+    pub(crate) fn stage_request_digests(&self) -> Result<Vec<[u8; 32]>> {
+        self.facts
+            .export_stage_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(export_stage::Request::digest)
+            .collect()
+    }
+}
+
+pub(crate) fn managed_export_runtime_session(
+    base: &Path,
+) -> Result<(ManagedSession, ManagedExportTestControl)> {
+    let (facts, request) = Facts::create(base)?;
+    facts.empty_restore_status.store(true, Ordering::Release);
+    let control = ManagedExportTestControl {
+        facts: facts.clone(),
+    };
+    let session = ManagedSession::admit(facts, &request, &AtomicBool::new(false)).unwrap();
+    Ok((session, control))
 }
 
 pub(crate) fn export_profile_managed_session(

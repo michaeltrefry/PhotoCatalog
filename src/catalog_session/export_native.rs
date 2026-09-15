@@ -38,6 +38,10 @@ pub struct Request {
     pub action: Action,
 }
 impl Request {
+    pub fn digest(&self) -> Result<[u8; 32]> {
+        self.validate()?;
+        Ok(*blake3::hash(&serde_json::to_vec(self)?).as_bytes())
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(self.operation.0 > 0, "zero export native operation");
         super::validate_path(&self.root.canonical_root)?;

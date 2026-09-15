@@ -1485,6 +1485,7 @@ fn paired_preview_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
             | Request::PreviewStatus { .. }
             | Request::CancelPreview { .. }
             | Request::ReleaseViewport { .. }
+            | Request::Export { .. }
     ))
 }
 fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<ChildPending>> {
@@ -1756,7 +1757,7 @@ fn child_input(
 mod tests {
     use super::*;
     #[test]
-    fn paired_preview_route_admits_preview_lifecycle_and_rejects_unconverted_calls() {
+    fn paired_preview_route_admits_preview_and_export_lifecycle() {
         let path = crate::storage_volume::NativePath::from_path(std::path::Path::new("/fixture"));
         let catalog = "catalog".to_owned();
         for request in [
@@ -1788,29 +1789,184 @@ mod tests {
                 viewport: "view".into(),
                 generation: crate::application::U64(1),
             },
+            Request::Export {
+                catalog: catalog.clone(),
+                request: Box::new(crate::application::exports::Request::Options),
+            },
         ] {
             assert!(
                 paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
                     .unwrap()
             );
         }
-        for request in [
-            Request::ImportCancel {
-                catalog: catalog.clone(),
-                import: "import".into(),
-            },
-            Request::Export {
-                catalog,
-                request: Box::new(crate::application::exports::Request::Options),
-            },
-        ] {
-            assert!(
-                !paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
-                    .unwrap()
-            );
-        }
+        let request = Request::ImportCancel {
+            catalog: catalog.clone(),
+            import: "import".into(),
+        };
+        assert!(
+            !paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap()).unwrap()
+        );
         assert!(paired_preview_route(Kind::Bytes, b"{}").unwrap());
         assert!(!paired_preview_route(Kind::Hello, b"{}").unwrap());
+    }
+
+    #[test]
+    fn paired_route_admits_every_nested_export_request() {
+        use crate::{
+            application::exports as export,
+            image_export::{AlphaPolicy, IntegerDepth, OutputFormat, OutputSize},
+        };
+        let path = crate::storage_volume::NativePath::from_path(std::path::Path::new("/fixture"));
+        let target = export::Target {
+            key: crate::catalog_edits::VariantKey::master("asset"),
+            expected_revision: crate::application::I64(0),
+            destination: path.clone(),
+            overwrite: false,
+            metadata: export::Metadata::Omit,
+        };
+        let output = export::Output {
+            size: OutputSize::Original,
+            format: OutputFormat::Png {
+                depth: IntegerDepth::Eight,
+            },
+            profile: export::Profile::Srgb,
+            alpha: AlphaPolicy::Preserve,
+        };
+        let budgets = export::Budgets {
+            max_original_bytes: crate::application::U64(1),
+            max_payload_bytes: crate::application::U64(1),
+            alias_limits: export::AliasLimits {
+                directories: crate::application::U64(1),
+                candidates: crate::application::U64(1),
+            },
+        };
+        let render = export::RenderLimits {
+            max_pixels: crate::application::U64(1),
+            max_allocation_bytes: crate::application::U64(1),
+            max_live_bytes: crate::application::U64(1),
+        };
+        let execution = export::ExecutionLimits {
+            worker_bytes: crate::application::U64(1),
+            working_bytes: crate::application::U64(1),
+            render: export::PhotoLimits {
+                decode: export::DecodeLimits {
+                    max_encoded_bytes: crate::application::U64(1),
+                    max_intermediate_pixels: crate::application::U64(1),
+                    max_allocation_bytes: crate::application::U64(1),
+                },
+                render: render.clone(),
+                encode: export::EncodeLimits {
+                    render,
+                    max_metadata_bytes: crate::application::U64(1),
+                    row_buffer_bytes: crate::application::U64(1),
+                },
+                max_encoded_extent: crate::application::U64(1),
+            },
+        };
+        let requests = vec![
+            export::Request::Options,
+            export::Request::Profile { path: path.clone() },
+            export::Request::ProfileRelease {
+                token: "token".into(),
+            },
+            export::Request::Begin,
+            export::Request::Paths {
+                limit: crate::application::U64(1),
+            },
+            export::Request::Destinations {
+                directory: path,
+                targets: vec![export::TargetKey {
+                    key: crate::catalog_edits::VariantKey::master("asset"),
+                    expected_revision: crate::application::I64(0),
+                }],
+                format: output.format,
+                naming: export::Naming {
+                    prefix: "prefix".into(),
+                    suffix: "suffix".into(),
+                    variant_suffix: true,
+                    sequence_start: Some(crate::application::U64(1)),
+                },
+            },
+            export::Request::DestinationRows {
+                token: "token".into(),
+                after: crate::application::U64(0),
+                limit: crate::application::U64(1),
+            },
+            export::Request::ResultRelease {
+                token: "token".into(),
+            },
+            export::Request::Append {
+                job: "job".into(),
+                expected_total: crate::application::I64(0),
+                target,
+                output,
+                budgets: Some(budgets),
+            },
+            export::Request::Seal {
+                job: "job".into(),
+                expected_total: crate::application::I64(1),
+            },
+            export::Request::Job { job: "job".into() },
+            export::Request::Jobs {
+                after: crate::application::I64(0),
+                limit: crate::application::U64(1),
+            },
+            export::Request::Items {
+                job: "job".into(),
+                after: crate::application::I64(0),
+                limit: crate::application::U64(1),
+            },
+            export::Request::Plan {
+                job: "job".into(),
+                sequence: crate::application::I64(0),
+            },
+            export::Request::PlanChunk {
+                job: "job".into(),
+                sequence: crate::application::I64(0),
+                authority: "a".repeat(64),
+                offset: crate::application::U64(0),
+                bytes: crate::application::U64(1),
+            },
+            export::Request::Run {
+                job: "job".into(),
+                limits: Some(execution.clone()),
+                max_items: crate::application::U64(1),
+                max_seconds: crate::application::U64(1),
+            },
+            export::Request::Status { operation: None },
+            export::Request::Cancel {
+                job: Some("job".into()),
+                operation: Some("operation".into()),
+            },
+            export::Request::Yield {
+                job: "job".into(),
+                operation: "operation".into(),
+            },
+            export::Request::Recover {
+                directories: crate::application::U64(1),
+                limits: Some(execution),
+            },
+            export::Request::RetrySeal {
+                job: "job".into(),
+                sequence: crate::application::I64(0),
+                authority: "a".repeat(64),
+            },
+            export::Request::Restore {
+                job: "job".into(),
+                sequence: crate::application::I64(0),
+                authority: "a".repeat(64),
+            },
+        ];
+        assert_eq!(requests.len(), 22);
+        for request in requests {
+            let outer = Request::Export {
+                catalog: "catalog".into(),
+                request: Box::new(request),
+            };
+            assert!(
+                paired_preview_route(Kind::Command, &serde_json::to_vec(&outer).unwrap()).unwrap()
+            );
+        }
     }
     fn child_state() -> ChildShared {
         Arc::new(Mutex::new(ChildState {
