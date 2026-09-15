@@ -66,9 +66,28 @@ evidence audit `db04e2db`. All 394 source hashes and 21 authored entries match;
 seven command processes and eight logged fixture processes retired. The capacity
 table now records this combined source, explicitly requested backing, not RSS.
 
-Next: full LM G coordinator/public application facade on
-`codex/sc-22847-lm-facade`, preserving all seven operations, raw document limits,
-shared budget, cancellation and checked descendant retirement. Managed G export
+Full LM G coordinator/public facade is frozen on `codex/sc-22847-lm-facade`:
+13 files compile in the full test-target gate (`e2987421`, root receipt
+`fb34219c`) after one test-only enum assertion correction. No runtime acceptance
+is claimed. Independent source review `950067e3` found three blocking defects:
+early target cancellation can drain a never-submitted target forever; writer
+pre-submission cancellation or waiter spawn failure leaves an unrecoverable
+release; Begin builds owned bookkeeping before its pool reservation. The full
+bounded repair and deterministic regressions are active in that worktree.
+Evidence: private `sc-22847-lm4-facade-independent-review-zyjf7_ul/REVIEW.md`.
+
+A separate managed-C process trace (`df08341a`) establishes that the closed
+paired allowlist has no C-owned OS children. The facade's proposed abrupt-C
+retirement path therefore requires verified paired Ready identity, checked C
+reap and transport completion, joined G migration state, and existing G-native/F
+drain. Legacy/unverified/unknown-G states retain the old conservative policy;
+unknown catalog outcome must remain distinct from safe retirement. This path
+is implemented and source-reviewed but still awaits runtime proof.
+
+Next: finish the three facade repairs, refreeze, compile, independently review,
+then run the planned exact behaviors and regressions with a fresh immutable CLI.
+Preserve all seven operations, raw document limits, shared budget, cancellation
+and checked descendant retirement. Managed G export
 custody and C service wiring follow serially because desktop wiring overlaps.
 Full S12 installed workflows and S13 readiness remain open. No push, CI,
 installation replacement, canonical migration or RAID access occurred.
