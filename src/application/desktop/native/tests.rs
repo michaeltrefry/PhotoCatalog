@@ -174,8 +174,10 @@ fn root_switch_cannot_pass_registered_or_registering_native_owner() -> Result<()
 
 #[test]
 fn same_pool_refuses_spawn_retains_unknown_and_reuses_only_after_retirement() -> Result<()> {
-    let mut limits = crate::preview::ServiceLimits::default();
-    limits.workers = 1;
+    let mut limits = crate::preview::ServiceLimits {
+        workers: 1,
+        ..Default::default()
+    };
     let work = render();
     let cost = render_cost(
         &work,
@@ -238,8 +240,10 @@ fn same_pool_refuses_spawn_retains_unknown_and_reuses_only_after_retirement() ->
 
 #[test]
 fn dropping_drained_unretired_owner_keeps_the_exact_pool_charge() -> Result<()> {
-    let mut limits = crate::preview::ServiceLimits::default();
-    limits.workers = 1;
+    let mut limits = crate::preview::ServiceLimits {
+        workers: 1,
+        ..Default::default()
+    };
     let work = render();
     let cost = render_cost(
         &work,
@@ -366,11 +370,13 @@ fn encode_growth_refusal_preserves_grant_and_send_state_for_exact_retry() -> Res
         }
     }
 
-    let mut limits = crate::preview::ServiceLimits::default();
-    limits.workers = 1;
-    limits.working_bytes = 100;
-    limits.cache_header_scratch_bytes = 10;
-    limits.cache_codec_scratch_bytes = 10;
+    let limits = crate::preview::ServiceLimits {
+        workers: 1,
+        working_bytes: 100,
+        cache_header_scratch_bytes: 10,
+        cache_codec_scratch_bytes: 10,
+        ..Default::default()
+    };
     let budget = ByteBudget::new(limits.working_bytes)?;
     let root = root();
     let stage = LeaseId::new();

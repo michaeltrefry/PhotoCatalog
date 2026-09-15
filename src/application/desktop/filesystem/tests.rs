@@ -887,13 +887,15 @@ fn actual_idle_f_death_is_monitored_but_normal_retirement_is_not_failure() -> Re
     Ok(())
 }
 
-fn export_relay_fixture() -> Result<(
+type ExportRelayFixture = (
     EmptyOwner,
     Arc<Proxy>,
     super::super::export_native::tests::Fixture,
     crate::preview::ByteBudget,
     Arc<super::super::export_native::tests::FakeStages>,
-)> {
+);
+
+fn export_relay_fixture() -> Result<ExportRelayFixture> {
     let parent = real_empty_owner()?;
     let mut f = super::super::export_native::tests::fixture()?;
     f.root.epoch = parent.0.binding.epoch.clone();

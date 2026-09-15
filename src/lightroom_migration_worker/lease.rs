@@ -279,7 +279,7 @@ impl DestinationLease {
                         self.review.database.file.try_clone()?,
                     ))?,
                 },
-                lease: self,
+                _lease: self,
             })
         })();
         if result.is_err() {
@@ -294,7 +294,7 @@ impl DestinationLease {
 /// internal moves through DerefMut do not transfer the physical lock owner.
 pub(crate) struct LockedCatalog<'a> {
     catalog: Catalog,
-    lease: &'a DestinationLease,
+    _lease: &'a DestinationLease,
 }
 impl std::ops::Deref for LockedCatalog<'_> {
     type Target = Catalog;
@@ -308,9 +308,10 @@ impl std::ops::DerefMut for LockedCatalog<'_> {
     }
 }
 impl LockedCatalog<'_> {
+    #[cfg(test)]
     pub(crate) fn verify(&self) -> Result<()> {
-        self.lease.verify()?;
-        catalog_storage::verify_database_object(&self.catalog.db, &self.lease.review.database.file)
+        self._lease.verify()?;
+        catalog_storage::verify_database_object(&self.catalog.db, &self._lease.review.database.file)
     }
 }
 #[cfg(test)]

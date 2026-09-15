@@ -42,6 +42,7 @@ struct Model {
 /// compare ASCII case-insensitively; duplicate normalized alternatives are errors.
 /// Sequence order,
 /// duplicates, literal whitespace, unknown qualifiers, and subjects are retained.
+#[cfg(test)]
 pub fn assert_equivalent(source_xml: &str, serialized_xml: &str) -> Result<()> {
     let admit = |_| Ok(());
     let requested = Requested::new(&admit);

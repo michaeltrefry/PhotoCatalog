@@ -5,6 +5,7 @@ use crate::{
 };
 use std::{fs, path::Path, process::Command};
 const FIXTURE: &str = "PHOTOCATALOG_CLOSED_SOURCE_FIXTURE";
+const FIXTURE_ROLE: &str = "PHOTOCATALOG_CLOSED_SOURCE_FIXTURE_ROLE";
 const HELPER: &str =
     "lightroom_migration_worker::source_reader::proxy::tests::owned_source_fixture";
 
@@ -15,7 +16,12 @@ fn owned_source_fixture() -> Result<()> {
     }
     #[cfg(feature = "internal-capacity-probes")]
     let capacity_baseline = crate::capacity_probes::begin();
-    super::super::owner::serve(std::io::stdin(), std::io::stderr())?;
+    let raw = match std::env::var(FIXTURE_ROLE)?.as_str() {
+        "sql" => false,
+        "raw" => true,
+        _ => anyhow::bail!("owned source fixture role"),
+    };
+    super::super::test_source_reader_main(raw, std::io::stderr())?;
     #[cfg(feature = "internal-capacity-probes")]
     crate::capacity_probes::report("owned-source-helper", capacity_baseline);
     std::process::exit(0);
@@ -61,7 +67,14 @@ fn session_with_memory(
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["--exact", HELPER, "--nocapture"])
-        .env(FIXTURE, "1");
+        .env(FIXTURE, "1")
+        .env(
+            FIXTURE_ROLE,
+            match kind {
+                Kind::Sql => "sql",
+                Kind::Raw => "raw",
+            },
+        );
     crate::lightroom_migration_worker::process::source_environment(&mut command);
     let process = Process::spawn_test_command(command, stop.clone())?;
     let budget = super::super::wire::Budget::from_authority(&authority)?;

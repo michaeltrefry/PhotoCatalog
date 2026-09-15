@@ -363,7 +363,9 @@ fn lm_desktop_relay_wire_is_private_bounded_and_strict() -> anyhow::Result<()> {
     let mut value = serde_json::to_value(&request)?;
     value["unreviewed"] = serde_json::json!(true);
     assert!(serde_json::from_value::<Request>(value).is_err());
-    let too_large = request_with_phase("x".repeat(129));
+    let maximum = request_with_phase("x".repeat(256));
+    assert!(maximum.validate().is_ok());
+    let too_large = request_with_phase("x".repeat(257));
     assert!(too_large.validate().is_err());
     assert_ne!(super::super::wire::build_identity(), "");
     Ok(())

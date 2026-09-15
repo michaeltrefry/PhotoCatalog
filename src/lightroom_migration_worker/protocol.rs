@@ -458,12 +458,15 @@ impl Controls {
 /// Forward every prospective child allocation to the parent's shared pool.
 /// There is deliberately no release frame: an uncertain child lifetime cannot
 /// free a parent charge. The supervisor keeps grants through verified drain.
+type Startup = dyn FnMut() -> Result<ParentFrame> + Send;
+
 pub(crate) struct MemoryGrants {
     controls: Arc<Controls>,
     output: Arc<dyn Publish>,
-    startup: Mutex<Option<Box<dyn FnMut() -> Result<ParentFrame> + Send>>>,
+    startup: Mutex<Option<Box<Startup>>>,
 }
 impl MemoryGrants {
+    #[cfg(test)]
     pub(crate) fn new(controls: Arc<Controls>, output: Arc<dyn Publish>) -> Self {
         Self {
             controls,

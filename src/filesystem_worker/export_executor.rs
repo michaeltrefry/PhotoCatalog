@@ -51,19 +51,11 @@ struct Active {
     inventory: VecDeque<CompactRetiredExportTransport>,
     discard: Option<(CompactDiscard, Reply)>,
 }
+#[derive(Default)]
 pub(super) struct Owner {
     lifecycle_high_water: u64,
     active: Option<Active>,
     previous_close: Option<Cached>,
-}
-impl Default for Owner {
-    fn default() -> Self {
-        Self {
-            lifecycle_high_water: 0,
-            active: None,
-            previous_close: None,
-        }
-    }
 }
 pub(crate) fn owner_layout() -> (usize, usize) {
     (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>())

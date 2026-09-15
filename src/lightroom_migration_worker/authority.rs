@@ -103,15 +103,22 @@ pub struct ApprovedDocuments {
 /// The worker keeps this value inside their scope, so exact raw bytes remain
 /// live without a second aggregate `Documents` copy.
 pub(crate) struct ApprovedAdmitted<'a> {
-    seal_json: &'a str,
+    _seal_json: &'a str,
     approval_json: &'a str,
-    policy_json: &'a str,
-    execution_authorization_json: Option<&'a str>,
+    _policy_json: &'a str,
+    _execution_authorization_json: Option<&'a str>,
     seal: InputSeal,
     policy: Policy,
-    destination: NativePath,
-    policy_blake3: String,
-    token: String,
+    _destination: NativePath,
+    _policy_blake3: String,
+    _token: String,
+}
+
+#[derive(Clone, Copy)]
+struct DocumentLimits {
+    per_cli_document: usize,
+    authorization_document: usize,
+    aggregate: Option<usize>,
 }
 
 struct Parsed {
@@ -128,24 +135,22 @@ fn parse_parts(
     execution_authorization_json: Option<&str>,
     destination: &NativePath,
     expected_approval_blake3: &str,
-    per_cli_document: usize,
-    authorization_document: usize,
-    aggregate: Option<usize>,
+    limits: DocumentLimits,
 ) -> Result<Parsed> {
     local_destination(destination)?;
     for raw in [seal_json, approval_json, policy_json] {
         ensure!(
-            !raw.is_empty() && raw.len() <= per_cli_document,
+            !raw.is_empty() && raw.len() <= limits.per_cli_document,
             "migration document byte limit"
         );
     }
     if let Some(raw) = execution_authorization_json {
         ensure!(
-            !raw.is_empty() && raw.len() <= authorization_document,
+            !raw.is_empty() && raw.len() <= limits.authorization_document,
             "migration document byte limit"
         );
     }
-    if let Some(maximum) = aggregate {
+    if let Some(maximum) = limits.aggregate {
         let total = [seal_json, approval_json, policy_json]
             .into_iter()
             .chain(execution_authorization_json)
@@ -284,9 +289,11 @@ impl ApprovedDocuments {
             documents.execution_authorization_json.as_deref(),
             &destination,
             expected_approval_blake3,
-            DOCUMENT_BYTES,
-            DOCUMENT_BYTES,
-            Some(BUNDLE_BYTES),
+            DocumentLimits {
+                per_cli_document: DOCUMENT_BYTES,
+                authorization_document: DOCUMENT_BYTES,
+                aggregate: Some(BUNDLE_BYTES),
+            },
         )?;
         Ok(Self {
             documents,
@@ -342,20 +349,23 @@ impl<'a> ApprovedAdmitted<'a> {
             execution_authorization_json,
             &destination,
             expected_approval_blake3,
-            crate::lightroom_migration_worker::input::CLI_DOCUMENT_BYTES,
-            crate::lightroom_migration_worker::input::EXECUTION_AUTHORIZATION_BYTES,
-            None,
+            DocumentLimits {
+                per_cli_document: crate::lightroom_migration_worker::input::CLI_DOCUMENT_BYTES,
+                authorization_document:
+                    crate::lightroom_migration_worker::input::EXECUTION_AUTHORIZATION_BYTES,
+                aggregate: None,
+            },
         )?;
         Ok(Self {
-            seal_json,
+            _seal_json: seal_json,
             approval_json,
-            policy_json,
-            execution_authorization_json,
+            _policy_json: policy_json,
+            _execution_authorization_json: execution_authorization_json,
             seal: parsed.seal,
             policy: parsed.policy,
-            destination,
-            policy_blake3: parsed.policy_blake3,
-            token: parsed.token,
+            _destination: destination,
+            _policy_blake3: parsed.policy_blake3,
+            _token: parsed.token,
         })
     }
     pub(crate) fn seal(&self) -> &InputSeal {
@@ -364,24 +374,24 @@ impl<'a> ApprovedAdmitted<'a> {
     pub(crate) fn policy(&self) -> &Policy {
         &self.policy
     }
-    pub(crate) fn destination(&self) -> &NativePath {
-        &self.destination
-    }
+    #[cfg(test)]
     pub(crate) fn policy_blake3(&self) -> &str {
-        &self.policy_blake3
+        &self._policy_blake3
     }
+    #[cfg(test)]
     pub(crate) fn token(&self) -> &str {
-        &self.token
+        &self._token
     }
     pub(crate) fn approval_bytes(&self) -> &[u8] {
         self.approval_json.as_bytes()
     }
+    #[cfg(test)]
     pub(crate) fn exact_documents(&self) -> (&str, &str, &str, Option<&str>) {
         (
-            self.seal_json,
+            self._seal_json,
             self.approval_json,
-            self.policy_json,
-            self.execution_authorization_json,
+            self._policy_json,
+            self._execution_authorization_json,
         )
     }
 }

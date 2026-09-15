@@ -1655,13 +1655,15 @@ pub(crate) fn install_adobe_observer(
     ))
 }
 
+type AdobeCheckpoint = Arc<Mutex<Option<(Vec<u8>, i64)>>>;
+
 struct AdobePressure {
     parent: Parent,
     budget: MemoryBudget,
     compete: bool,
     held: Arc<Mutex<Option<super::super::super::memory::Reservation>>>,
     observed: Arc<Mutex<Option<(usize, usize)>>>,
-    checkpoint: Arc<Mutex<Option<(Vec<u8>, i64)>>>,
+    checkpoint: AdobeCheckpoint,
 }
 impl Admission for AdobePressure {
     fn lock(&mut self, target: &str, destination: &DestinationPin, lock: &FileKey) -> Result<()> {

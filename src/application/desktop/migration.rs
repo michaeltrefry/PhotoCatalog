@@ -1,11 +1,12 @@
 //! G owns the upload, executor, Source broker and checked terminal publication.
-use super::{Shared, lightroom_migration as relay};
+use super::Shared;
+use super::lightroom_migration as relay;
 use crate::{
     application::{self, BridgeError, ErrorCode, U64, lightroom_migration as api},
     catalog_writer::{ExternalAdmission, ExternalLease, Writers},
     lightroom_migration_worker::{
         identity::FileKey,
-        input::{self, TEXT_CHUNK},
+        input::TEXT_CHUNK,
         lease::DestinationPin,
         memory::{MemoryBudget, Reservation, SharedAllocationGrant},
         process::Stop,
@@ -152,6 +153,10 @@ struct Entry {
     // Retained API bookkeeping is distinct from operation and result custody.
     _bookkeeping: Arc<ByteReservation>,
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the upload owner remains inline so its charged reservation outlives every uploaded document"
+)]
 enum EntryState {
     Upload(Upload),
     Active {
@@ -268,7 +273,7 @@ impl Coordinator {
             2 * size_of::<Waiting>(),
             size_of::<WriteAttempt>(),
             2 * size_of::<Mutex<Acquisition>>(),
-            8 * size_of::<usize>(),
+            size_of::<[usize; 8]>(),
             size_of::<api::Snapshot>(),
             2 * size_of::<Guard>(),
             2 * (36 + 64),
@@ -355,10 +360,10 @@ impl Coordinator {
         if let Some(entry) = &mut *slot {
             Self::reap(entry).map_err(bridge)?;
             if !matches!(entry.state, EntryState::Terminal { .. }) {
-                if matches!(request, application::Request::Close { .. }) {
-                    if let EntryState::Active { job, .. } = &entry.state {
-                        job.cancel();
-                    }
+                if matches!(request, application::Request::Close { .. })
+                    && let EntryState::Active { job, .. } = &entry.state
+                {
+                    job.cancel();
                 }
                 return Err(application::error(
                     ErrorCode::Busy,

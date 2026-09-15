@@ -853,11 +853,13 @@ mod tests {
         reconcile(&db);
         let destination = folder.join("export.jpg");
         fs::write(&destination, b"old export").unwrap();
+        let error = guard(&db, &destination, AliasLimits::default()).unwrap_err();
+        assert_eq!(error.to_string(), "cannot validate original directory");
         assert!(
-            guard(&db, &destination, AliasLimits::default())
-                .unwrap_err()
-                .to_string()
-                .contains("foreign original directory")
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::InvalidInput),
+            "foreign path must fail native conversion: {error:#}"
         );
         assert_eq!(fs::read(destination).unwrap(), b"old export");
     }

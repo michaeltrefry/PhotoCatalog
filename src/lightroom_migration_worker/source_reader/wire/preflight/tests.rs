@@ -136,8 +136,10 @@ fn all_ten_collection_pages_keep_complete_named_fields_and_exact_capacities() ->
             unreachable!()
         };
         let canonical = size(body, crate::lightroom::PAGE_BYTES)?;
-        let mut limits = ReadLimits::default();
-        limits.page_bytes = canonical;
+        let mut limits = ReadLimits {
+            page_bytes: canonical,
+            ..Default::default()
+        };
         assert!(decode(&page, &read, Budget::Sql(limits)).is_ok());
         limits.page_bytes = canonical - 1;
         assert!(decode(&page, &read, Budget::Sql(limits)).is_err());

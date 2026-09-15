@@ -97,8 +97,8 @@ struct Slot {
     binding: export_stage::Binding,
     registration_digest: [u8; 32],
     begin_digest: [u8; 32],
-    worker_bytes: u64,
-    working_bytes: u64,
+    _worker_bytes: u64,
+    _working_bytes: u64,
     reservation: Mutex<Option<ByteReservation>>,
     stage_state: Mutex<StageState>,
     lifecycle: Mutex<()>,
@@ -455,19 +455,17 @@ impl Slot {
             .unwrap_or_else(|p| p.into_inner())
             .supervisor_pending
             .clone();
-        if let Some(request) = pending {
-            if let Err(error) = self.dispatch_supervisor(&supervisor, &request) {
-                if self
-                    .stage_state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .supervisor_pending
-                    .is_some()
-                {
-                    return Err(error);
-                }
-                // A bound failure leaves cleanup custody, not missing transport.
-            }
+        if let Some(request) = pending
+            && let Err(error) = self.dispatch_supervisor(&supervisor, &request)
+            && self
+                .stage_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .supervisor_pending
+                .is_some()
+        {
+            return Err(error);
+            // A bound failure leaves cleanup custody, not missing transport.
         }
         Ok(())
     }
@@ -517,10 +515,11 @@ impl Slot {
         Ok(())
     }
     fn start_reaper(self: &Arc<Self>) -> Result<()> {
-        if {
+        let stage_drained = {
             let stage = self.stage_state.lock().unwrap_or_else(|p| p.into_inner());
             stage.released || stage.drain == DrainState::Acknowledged
-        } {
+        };
+        if stage_drained {
             return Ok(());
         }
         let mut retained = self.reaper.lock().unwrap_or_else(|p| p.into_inner());
@@ -1060,8 +1059,8 @@ impl Owner {
             binding: request.binding.clone(),
             registration_digest: digest,
             begin_digest,
-            worker_bytes: worker_bytes.0,
-            working_bytes: working_bytes.0,
+            _worker_bytes: worker_bytes.0,
+            _working_bytes: working_bytes.0,
             reservation: Mutex::new(Some(reservation)),
             stage_state: Mutex::new(StageState {
                 high_water: 0,
@@ -1361,11 +1360,7 @@ impl Owner {
                 && last.operation == request.operation.0
             {
                 ensure!(last.digest == digest, "altered export stage replay");
-                return last
-                    .outcome
-                    .as_ref()
-                    .cloned()
-                    .map_err(|f| failure_error(&f));
+                return last.outcome.as_ref().cloned().map_err(failure_error);
             }
             if let Some(pending) = stage.pending.as_mut() {
                 ensure!(
@@ -1541,18 +1536,17 @@ impl Owner {
                 }
             };
             if let Some(request) = pending {
-                if let Err(error) = self.stage_call(&request, &AtomicBool::new(false)) {
-                    if slot
+                if let Err(error) = self.stage_call(&request, &AtomicBool::new(false))
+                    && slot
                         .stage_state
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .pending
                         .is_some()
-                    {
-                        return Err(error);
-                    }
-                    // A bound failed operation is terminal; continue its cleanup.
+                {
+                    return Err(error);
                 }
+                // A bound failed operation is terminal; continue its cleanup.
                 continue;
             }
             break;

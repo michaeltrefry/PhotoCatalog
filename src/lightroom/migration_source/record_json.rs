@@ -196,7 +196,7 @@ pub(crate) fn cell(raw: &RawValue, inline: usize) -> Result<Cell> {
             );
             let mut out = Vec::new();
             out.try_reserve_exact(value.len() / 2)?;
-            for pair in value.as_bytes().chunks_exact(2) {
+            for pair in value.as_bytes().as_chunks::<2>().0 {
                 out.push(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?);
             }
             if matches!(tag, CellTag::Text) {

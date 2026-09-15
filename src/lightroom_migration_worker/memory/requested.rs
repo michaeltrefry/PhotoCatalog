@@ -143,7 +143,6 @@ mod tests {
         assert_eq!(pool.used(), 11);
         drop(scope);
         assert_eq!(pool.used(), 11);
-        drop(requested);
         drop(operation);
         assert_eq!(pool.used(), 0);
         Ok(())

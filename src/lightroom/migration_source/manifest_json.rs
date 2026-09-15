@@ -181,14 +181,6 @@ impl Path<'_> {
         })
     }
 }
-/// A borrowed path with exact final unit capacity; no public NativePath change.
-pub(crate) fn path(
-    raw: &RawValue,
-    maximum_units: usize,
-    stop: &dyn Fn() -> bool,
-) -> Result<NativePath> {
-    path_mode(raw, maximum_units, stop, false)
-}
 pub(crate) fn path_mode(
     raw: &RawValue,
     maximum_units: usize,

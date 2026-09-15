@@ -82,10 +82,12 @@ fn epoch(reader: &str) -> Epoch {
         reader: reader.into(),
     }
 }
-fn broker() -> Result<(Broker, Arc<Stop>, Arc<Mutex<Vec<u32>>>)> {
+type Fixture = (Broker, Arc<Stop>, Arc<Mutex<Vec<u32>>>);
+
+fn broker() -> Result<Fixture> {
     broker_with_budget(MemoryBudget::new(1024 * 1024)?)
 }
-fn broker_with_budget(budget: MemoryBudget) -> Result<(Broker, Arc<Stop>, Arc<Mutex<Vec<u32>>>)> {
+fn broker_with_budget(budget: MemoryBudget) -> Result<Fixture> {
     let stop = Arc::new(Stop::default());
     let pids = Arc::new(Mutex::new(Vec::with_capacity(2)));
     let seen = pids.clone();

@@ -547,7 +547,7 @@ impl<A: Admission> State<A> {
                     bytes: streamed.bytes,
                     blake3: streamed.blake3,
                 },
-                memory: self
+                _memory: self
                     .streamed_memory
                     .take()
                     .context("streamed result reservation absent")?,
@@ -555,7 +555,7 @@ impl<A: Admission> State<A> {
         }
         Ok(SavedResult {
             body: SavedBody::Legacy(std::mem::take(&mut self.result)),
-            memory: legacy_memory.context("legacy result reservation absent")?,
+            _memory: legacy_memory.context("legacy result reservation absent")?,
         })
     }
 }
@@ -613,12 +613,12 @@ impl<A: Admission> Owned<A> {
                 None
             };
             self.lm_drained = true;
-            if let Some(report) = report {
-                if report.io_panicked {
-                    self.drain_fault.get_or_insert_with(|| {
-                        anyhow::anyhow!("migration I/O thread panicked during owned drain")
-                    });
-                }
+            if let Some(report) = report
+                && report.io_panicked
+            {
+                self.drain_fault.get_or_insert_with(|| {
+                    anyhow::anyhow!("migration I/O thread panicked during owned drain")
+                });
             }
         }
         if !self.broker_drained {
@@ -793,9 +793,10 @@ enum SavedBody {
 }
 pub(crate) struct SavedResult {
     body: SavedBody,
-    memory: Reservation,
+    _memory: Reservation,
 }
 impl SavedResult {
+    #[cfg(test)]
     pub(crate) fn text(&self) -> &str {
         match &self.body {
             SavedBody::Legacy(text) => text,
@@ -942,6 +943,7 @@ pub(crate) enum Drained {
     Failed(Failure),
 }
 impl Drained {
+    #[cfg(test)]
     fn into_result(self) -> Result<SavedResult> {
         match self {
             Self::Complete(result) => Ok(result),
@@ -1043,6 +1045,10 @@ impl<A: Admission> DrainPending<A> {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the running process and reservation owners must remain one inline drainable operation"
+)]
 pub(crate) enum Operation<A: Admission> {
     Running(Running<A>),
     Drained(Drained),
@@ -1108,17 +1114,15 @@ impl<A: Admission> Operation<A> {
             return None;
         }
         if let Self::DrainPending(pending) = self {
-            if let Some(drained) = pending.retry_drain() {
-                *self = Self::Drained(drained);
-            } else {
-                return None;
-            }
+            let drained = pending.retry_drain()?;
+            *self = Self::Drained(drained);
         }
         match self {
             Self::Drained(drained) => Some(drained),
             Self::Running(_) | Self::DrainPending(_) => unreachable!(),
         }
     }
+    #[cfg(test)]
     fn drain_blocking(mut self) -> Drained {
         loop {
             if self.retry_drain().is_some() {
@@ -1132,40 +1136,18 @@ impl<A: Admission> Operation<A> {
     }
 }
 
-/// G owns the executor and both Source roles through the broker. A managed
-/// executor receives tokens rather than spawning descendants. The complete
-/// application coordinator still supplies approved action/phase admission.
-///
-/// Owns bounded UTF-8 authority/result memory plus bounded pipe frames.
-/// Large saved evidence is returned by the paged/chunk query layer; this limit
-/// never truncates results or changes a caller's reviewed migration scope.
-pub(crate) fn execute<A: Admission>(
-    executable: &Path,
-    guard: Guard,
-    request: &str,
-    stop: Arc<Stop>,
-    until: Instant,
-    admission: A,
-    budget: MemoryBudget,
-) -> Result<SavedResult> {
-    execute_operation_with_broker(
-        |stop| Process::spawn_owned(executable, stop),
-        Some(executable),
-        guard,
-        request,
-        stop,
-        until,
-        admission,
-        budget,
-        &[],
-        None,
-    )
-    .drain_blocking()
-    .into_result()
-}
 /// New managed callers retain this operation in G and drive `retry_drain`
 /// until it reaches a checked terminal. Worker dispatch and the multipart
 /// document roster are connected by the next executor batch.
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test entrypoint exposes each independently varied supervisor authority"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "spawn failure closures retain partial process custody until checked drain"
+)]
 pub(crate) fn execute_operation<A: Admission>(
     executable: &Path,
     guard: Guard,
@@ -1191,6 +1173,10 @@ pub(crate) fn execute_operation<A: Admission>(
     )
 }
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "the adapter preserves the process-owning spawn failure contract"
+)]
 fn execute_owned<A: Admission>(
     spawn: impl FnOnce(Arc<Stop>) -> Result<Process>,
     guard: Guard,
@@ -1221,6 +1207,10 @@ fn execute_owned<A: Admission>(
     .into_result()
 }
 #[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test entrypoint exposes each independently varied supervisor authority"
+)]
 fn execute_owned_operation<A: Admission>(
     spawn: impl FnOnce(Arc<Stop>) -> std::result::Result<Process, SpawnFailure>,
     guard: Guard,
@@ -1246,7 +1236,14 @@ fn execute_owned_operation<A: Admission>(
 }
 /// Managed G callers separate retained operation grants from exact cached result
 /// ownership. Both budgets must wrap the same configured desktop ByteBudget.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct checked authority, budget, or protocol bound"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "spawn failure closures retain partial process custody until checked drain"
+)]
 pub(crate) fn execute_operation_with_result_budget<A: Admission>(
     executable: &Path,
     guard: Guard,
@@ -1274,6 +1271,11 @@ pub(crate) fn execute_operation_with_result_budget<A: Admission>(
     )
 }
 
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test adapter keeps distinct supervisor authorities independently injectable"
+)]
 fn execute_operation_with_broker<A: Admission>(
     spawn: impl FnOnce(Arc<Stop>) -> std::result::Result<Process, SpawnFailure>,
     source_executable: Option<&Path>,
@@ -1301,7 +1303,12 @@ fn execute_operation_with_broker<A: Admission>(
         streamed_result_maximum,
     )
 }
-#[allow(clippy::too_many_arguments)]
+type Setup<A> = (State<A>, Option<Reservation>, String, Option<Broker>);
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct checked authority, budget, or protocol bound"
+)]
 fn execute_operation_with_broker_and_result_budget<A: Admission>(
     spawn: impl FnOnce(Arc<Stop>) -> std::result::Result<Process, SpawnFailure>,
     source_executable: Option<&Path>,
@@ -1315,7 +1322,7 @@ fn execute_operation_with_broker_and_result_budget<A: Admission>(
     documents: &[InputPart<'_>],
     streamed_result_maximum: Option<usize>,
 ) -> Operation<A> {
-    let setup = (|| -> Result<(State<A>, Option<Reservation>, String, Option<Broker>)> {
+    let setup = (|| -> Result<Setup<A>> {
         guard.validate()?;
         ensure!(
             request.len() <= INPUT_BYTES,
@@ -1541,20 +1548,20 @@ impl<A: Admission> Running<A> {
         // Reserved failure delivery bypasses both actor admission and the normal
         // data queue. If the executor cannot receive it, revocation kills it;
         // successful commits preceding observed loss retain their exact receipt.
-        if let Some(broker) = &owner.broker {
-            if let Some(event) = broker.try_urgent() {
-                let frame = ParentFrame::Source {
-                    guard: owner.state.guard.clone(),
-                    event,
-                };
-                if let Some(unsent) = owner
-                    .process
-                    .as_ref()
-                    .context("migration process absent")?
-                    .try_send_control(frame)?
-                {
-                    *control = Some(unsent);
-                }
+        if let Some(broker) = &owner.broker
+            && let Some(event) = broker.try_urgent()
+        {
+            let frame = ParentFrame::Source {
+                guard: owner.state.guard.clone(),
+                event,
+            };
+            if let Some(unsent) = owner
+                .process
+                .as_ref()
+                .context("migration process absent")?
+                .try_send_control(frame)?
+            {
+                *control = Some(unsent);
             }
         }
         ensure!(

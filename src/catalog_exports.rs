@@ -330,6 +330,10 @@ impl VerifiedOriginal {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the publication owner remains inline through effectful completion and rollback"
+)]
 enum PublicationSession {
     Legacy(metadata_export::PhotoPublication),
     Managed(crate::catalog_session::ManagedPublicationLease),
@@ -1630,6 +1634,10 @@ impl Catalog {
         })();
         session.complete(result)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transaction rechecks each publication identity and authority component independently"
+    )]
     fn finalize_photo_publication(
         &mut self,
         id: &str,

@@ -201,6 +201,10 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline replies preserve the explicitly bounded relay root without an unaccounted heap owner"
+)]
 pub(super) enum Value {
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
@@ -356,6 +360,10 @@ pub(super) enum Control {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline packet bodies are part of the relay root accounted before encoding"
+)]
 pub(super) enum Body {
     Call {
         id: U64,

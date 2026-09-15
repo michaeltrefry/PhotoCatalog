@@ -58,6 +58,7 @@ fn native(raw: &RawValue, stop: &dyn Fn() -> bool, buffered: bool) -> Result<Nat
 /// A canonical descriptor was already limited to 64 KiB before source opens.
 /// Admit each repeated path before allocation; typed scalar strings are at most
 /// input_limit transiently and their retained sum must fit that existing limit.
+#[cfg(test)]
 pub(crate) fn decode(
     bytes: &[u8],
     input_limit: usize,

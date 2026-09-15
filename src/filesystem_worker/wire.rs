@@ -293,6 +293,10 @@ impl AdmissionSnapshot {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline response variants preserve the bounded protocol root without an extra heap owner"
+)]
 pub enum Response {
     ExportExecutor(crate::catalog_session::export_executor::Reply),
     PreviewStore(crate::catalog_session::store::Reply),

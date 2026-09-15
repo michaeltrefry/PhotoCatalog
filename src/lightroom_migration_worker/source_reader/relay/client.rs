@@ -248,7 +248,7 @@ impl Client {
         self.revoke();
         (self.abort)();
     }
-    pub(crate) fn open(
+    pub(in crate::lightroom_migration_worker::source_reader) fn open(
         self: &Arc<Self>,
         kind: Kind,
         epoch: Epoch,
@@ -520,7 +520,10 @@ impl Remote {
     pub(crate) fn admit_producer(&self, bytes: usize) -> Result<()> {
         self.client.admit_producer(self.slot.kind, bytes)
     }
-    pub(crate) fn try_send(&self, request: Request) -> Result<Option<Request>> {
+    pub(in crate::lightroom_migration_worker::source_reader) fn try_send(
+        &self,
+        request: Request,
+    ) -> Result<Option<Request>> {
         self.client.check()?;
         ensure!(
             request.epoch() == &self.slot.epoch,
@@ -577,7 +580,9 @@ impl Remote {
         self.client.publish(command)?;
         Ok(Some(request))
     }
-    pub(crate) fn try_receive(&self) -> Result<Output<Reply>> {
+    pub(in crate::lightroom_migration_worker::source_reader) fn try_receive(
+        &self,
+    ) -> Result<Output<Reply>> {
         self.client.check()?;
         let (token, reply, closed) = {
             let mut state = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());

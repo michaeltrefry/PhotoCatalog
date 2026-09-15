@@ -1743,113 +1743,6 @@ impl CatalogSessionAuthority {
             _ => None,
         }
     }
-    /// Selects the managed F export-stage backend without changing standalone
-    /// export behavior. C can issue only non-privileged stage actions; the later
-    /// G owner must use its distinct supervisor integration for Arm/Drained.
-    pub(crate) fn export_stage_call(
-        &self,
-        executor: LeaseId,
-        stage: LeaseId,
-        operation: U64,
-        binding: export_stage::Binding,
-        action: export_stage::Action,
-        cancel: &AtomicBool,
-    ) -> Result<Option<export_stage::Reply>> {
-        let AuthorityMode::Managed {
-            filesystem, root, ..
-        } = &self.mode
-        else {
-            return Ok(None);
-        };
-        let request = export_stage::Request {
-            root: root.clone(),
-            executor,
-            stage,
-            operation,
-            supervisor: false,
-            binding,
-            action,
-        };
-        ensure!(
-            !request.privileged(),
-            "catalog authority cannot assert export native custody"
-        );
-        request.validate()?;
-        let reply = filesystem.export_stage_call(&request, cancel)?;
-        reply.validate(&request)?;
-        Ok(Some(reply))
-    }
-    pub(crate) fn export_executor_call(
-        &self,
-        executor: LeaseId,
-        operation: U64,
-        action: export_executor::Action,
-        cancel: &AtomicBool,
-    ) -> Result<Option<export_executor::Reply>> {
-        let AuthorityMode::Managed {
-            filesystem, root, ..
-        } = &self.mode
-        else {
-            return Ok(None);
-        };
-        let request = export_executor::Request {
-            root: root.clone(),
-            executor,
-            operation,
-            action,
-        };
-        request.validate()?;
-        let reply = filesystem.export_executor_call(&request, cancel)?;
-        reply.validate(&request)?;
-        Ok(Some(reply))
-    }
-    pub(crate) fn export_native_call(
-        &self,
-        operation: U64,
-        stage: LeaseId,
-        binding: export_stage::Binding,
-        action: export_native::Action,
-        cancel: &AtomicBool,
-    ) -> Result<Option<export_native::Status>> {
-        let AuthorityMode::Managed {
-            filesystem, root, ..
-        } = &self.mode
-        else {
-            return Ok(None);
-        };
-        let request = export_native::Request {
-            root: root.clone(),
-            operation,
-            stage,
-            binding,
-            action,
-        };
-        request.validate()?;
-        let owner = filesystem
-            .export_native()
-            .context("managed export native owner is unavailable")?;
-        let status = owner.call(&request, cancel)?;
-        status.validate(&request)?;
-        Ok(Some(status))
-    }
-    pub(crate) fn export_native_status(
-        &self,
-        operation: U64,
-        stage: &LeaseId,
-    ) -> Result<Option<export_native::Status>> {
-        let AuthorityMode::Managed {
-            filesystem, root, ..
-        } = &self.mode
-        else {
-            return Ok(None);
-        };
-        let owner = filesystem
-            .export_native()
-            .context("managed export native owner is unavailable")?;
-        Ok(Some(owner.status(&export_native::Key::new(
-            root, operation, stage,
-        ))?))
-    }
     pub(crate) fn prepare_export_directory(
         &self,
         directory: &NativePath,
@@ -2239,19 +2132,19 @@ impl CatalogSessionAuthority {
             ensure!(finished == total, "export profile finish length changed");
             Ok(bytes)
         })();
-        if result.is_err() {
-            if let Some(abort_step) = step.checked_add(1) {
-                let request = ExportProfileRequest {
-                    root: root.clone(),
-                    requested: requested.clone(),
-                    transfer,
-                    step: U64(abort_step),
-                    allowance: U64(allowance),
-                    action: ExportProfileAction::Abort,
-                };
-                if let Ok(reply) = filesystem.export_profile_call(&request, cancel) {
-                    let _ = reply.validate(&request);
-                }
+        if result.is_err()
+            && let Some(abort_step) = step.checked_add(1)
+        {
+            let request = ExportProfileRequest {
+                root: root.clone(),
+                requested: requested.clone(),
+                transfer,
+                step: U64(abort_step),
+                allowance: U64(allowance),
+                action: ExportProfileAction::Abort,
+            };
+            if let Ok(reply) = filesystem.export_profile_call(&request, cancel) {
+                let _ = reply.validate(&request);
             }
         }
         result.map(Some)

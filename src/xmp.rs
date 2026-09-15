@@ -335,13 +335,13 @@ pub(crate) fn canonical_admitted<'a>(
     let serialized = serialize(meta)?;
     let mut copy = parse_admitted(&serialized, requested)?;
     copy.sort()?;
-    Ok(copy.to_string_with_options_admitted(
+    copy.to_string_with_options_admitted(
         ToStringOptions::default()
             .omit_packet_wrapper()
             .use_canonical_format()
             .omit_all_formatting(),
         |bytes| requested.scope(bytes),
-    )?)
+    )
 }
 
 pub fn project(bytes: &[u8]) -> Result<Projection> {
@@ -1185,6 +1185,7 @@ pub fn rendered_derivative(base: &[u8], fields: &DerivativeFields) -> Result<Vec
     Ok(output)
 }
 
+#[cfg(test)]
 pub(crate) fn merge_jpeg(main: &[u8], extended: &[u8]) -> Result<Vec<u8>> {
     let admit = |_| Ok(());
     let requested = Requested::new(&admit);

@@ -2,23 +2,26 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
+#[cfg(test)]
+use photocatalog::catalog_migration::importer::Progress;
 use photocatalog::{
     Catalog,
     catalog_migration::{
         artifacts::ArtifactLimits,
         current_repair,
-        importer::{Policy, Progress},
+        importer::Policy,
         keyword_repair,
         lightroom_executor::{self, WorkLimit},
     },
     lightroom::migration_source::{InputSeal, MigrationSource, ReadLimits},
 };
 use serde::de::DeserializeOwned;
+#[cfg(test)]
+use std::path::Component;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
 };
 
 const DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -194,6 +197,7 @@ fn status_database(destination: &Path) -> Result<rusqlite::Connection> {
     lightroom_executor::status_database(destination)
 }
 
+#[cfg(test)]
 fn read_status(destination: &Path, run: &str) -> Result<Progress> {
     ensure!(
         run.len() == 64 && run.bytes().all(|b| b.is_ascii_hexdigit()),

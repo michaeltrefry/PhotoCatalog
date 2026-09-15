@@ -48,27 +48,25 @@ impl Request {
         self.root.root_physical.validate()?;
         self.root.catalog_physical.validate()?;
         self.binding.validate()?;
-        match &self.action {
-            Action::Register {
-                begin,
-                worker_bytes,
-                working_bytes,
-            } => {
-                begin.validate()?;
-                ensure!(
-                    !begin.supervisor
-                        && matches!(begin.action, export_stage::Action::Begin { .. })
-                        && begin.root == self.root
-                        && begin.stage == self.stage
-                        && begin.binding == self.binding,
-                    "export native registration binding mismatch"
-                );
-                ensure!(
-                    worker_bytes.0 > 0 && worker_bytes.0 <= working_bytes.0,
-                    "export native memory admission"
-                );
-            }
-            _ => {}
+        if let Action::Register {
+            begin,
+            worker_bytes,
+            working_bytes,
+        } = &self.action
+        {
+            begin.validate()?;
+            ensure!(
+                !begin.supervisor
+                    && matches!(begin.action, export_stage::Action::Begin { .. })
+                    && begin.root == self.root
+                    && begin.stage == self.stage
+                    && begin.binding == self.binding,
+                "export native registration binding mismatch"
+            );
+            ensure!(
+                worker_bytes.0 > 0 && worker_bytes.0 <= working_bytes.0,
+                "export native memory admission"
+            );
         }
         Ok(())
     }
@@ -196,29 +194,6 @@ pub trait CatalogExportNative: Send + Sync {
     }
     fn call(&self, request: &Request, cancel: &AtomicBool) -> Result<Status>;
     fn status(&self, key: &Key) -> Result<Status>;
-}
-
-pub(crate) fn protocol_layouts() -> [(usize, usize); 6] {
-    [
-        (
-            std::mem::size_of::<Action>(),
-            std::mem::align_of::<Action>(),
-        ),
-        (
-            std::mem::size_of::<Request>(),
-            std::mem::align_of::<Request>(),
-        ),
-        (
-            std::mem::size_of::<Status>(),
-            std::mem::align_of::<Status>(),
-        ),
-        (std::mem::size_of::<Key>(), std::mem::align_of::<Key>()),
-        (std::mem::size_of::<Query>(), std::mem::align_of::<Query>()),
-        (
-            std::mem::size_of::<export_stage::Request>(),
-            std::mem::align_of::<export_stage::Request>(),
-        ),
-    ]
 }
 
 #[cfg(test)]

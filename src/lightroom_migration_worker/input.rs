@@ -102,7 +102,7 @@ impl DocumentSet {
 #[derive(Debug)]
 pub(crate) struct AdmittedPart<G> {
     text: String,
-    digest: [u8; 64],
+    _digest: [u8; 64],
     // Last: requested-storage admission outlives the String it covers.
     _admission: G,
 }
@@ -110,8 +110,9 @@ impl<G> AdmittedPart<G> {
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
+    #[cfg(test)]
     pub(crate) fn digest(&self) -> &str {
-        std::str::from_utf8(&self.digest).expect("validated ASCII digest")
+        std::str::from_utf8(&self._digest).expect("validated ASCII digest")
     }
 }
 
@@ -255,7 +256,7 @@ fn receive_stream_admitted<G>(
                 );
                 return Ok(AdmittedPart {
                     text,
-                    digest: fixed_digest,
+                    _digest: fixed_digest,
                     _admission: admission,
                 });
             }

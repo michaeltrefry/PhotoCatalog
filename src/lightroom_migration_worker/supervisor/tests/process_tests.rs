@@ -590,6 +590,10 @@ fn lm_supervisor_batch2_parent_pool_refuses_before_spawn_and_charges_saved_resul
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "the fixture exercises retention of a partially spawned process through retry"
+)]
 fn lm_supervisor_batch2_failed_wait_stays_addressable_until_checked_retry() -> Result<()> {
     let (_temp, _catalog, parent, _needs) = setup()?;
     let request = serde_json::to_string(&parent.root)?;
@@ -658,6 +662,10 @@ fn lm_supervisor_batch2_failed_wait_stays_addressable_until_checked_retry() -> R
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "the fixture injects a process-owning post-spawn failure"
+)]
 fn lm_supervisor_batch2_postspawn_failure_is_owned_and_drop_drains_last_resort() -> Result<()> {
     let (_temp, _catalog, parent, _needs) = setup()?;
     let request = serde_json::to_string(&parent.root)?;
@@ -1001,6 +1009,10 @@ fn lm_supervisor_batch2_joined_broker_primary_replaces_secondary_pending_cancel(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "the fixture retains process custody across the managed drain path"
+)]
 fn lm_supervisor_batch4_actual_executor_reap_releases_operation_grant_retains_only_result()
 -> Result<()> {
     let (_temp, catalog, parent, _needs) = setup()?;
@@ -1083,6 +1095,10 @@ fn lm_supervisor_batch4_managed_rejection_unknown_wait_retains_charge_until_chec
     managed_rejection_retention(true)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "the fixture retains process custody across rejected and uncertain outcomes"
+)]
 fn managed_rejection_retention(unknown_wait: bool) -> Result<()> {
     let (_temp, _catalog, parent, _needs) = setup()?;
     let pool = crate::preview::ByteBudget::new(2 * 1024 * 1024 * 1024)?;
@@ -1182,6 +1198,10 @@ fn managed_rejection_retention(unknown_wait: bool) -> Result<()> {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "the injected setup failure uses the same process-owning spawn contract"
+)]
 fn lm_supervisor_batch4_setup_failure_retention_uses_same_pool_and_preserves_exact_refusal()
 -> Result<()> {
     for available in [FAILURE_BYTES, FAILURE_BYTES - 1] {

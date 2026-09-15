@@ -275,6 +275,10 @@ impl Completion {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the completed proof remains inline in the bounded stage protocol value"
+)]
 pub enum Value {
     Begun,
     Unit,

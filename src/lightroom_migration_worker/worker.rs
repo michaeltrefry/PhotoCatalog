@@ -710,6 +710,10 @@ fn preflight_destination(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the worker keeps protocol, file-role, relay, and cancellation authorities explicit"
+)]
 fn execute(
     envelope: &Envelope,
     prepared: &PreparedOperation<'_>,
@@ -871,9 +875,11 @@ fn execute(
             };
             lightroom_executor::run_managed(
                 &mut catalog,
-                source,
-                approved.approval_bytes(),
-                approved.policy(),
+                lightroom_executor::RunAuthority {
+                    source,
+                    approval: approved.approval_bytes(),
+                    policy: approved.policy(),
+                },
                 ArtifactLimits {
                     maximum_bytes: max_artifact_bytes.0,
                     open_deadline_ms: artifact_open_ms.0,

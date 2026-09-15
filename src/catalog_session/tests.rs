@@ -73,6 +73,10 @@ struct Facts {
     reject_export_release: AtomicBool,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the test double mirrors inline publication custody and observes its exact drop order"
+)]
 enum TestPublicationState {
     Empty,
     Active {
@@ -1877,13 +1881,13 @@ pub(crate) fn unused_filesystem(base: &Path) -> Result<Arc<dyn CatalogFilesystem
     Ok(Facts::create(base)?.0)
 }
 
-pub(crate) fn export_managed_session(
-    base: &Path,
-) -> Result<(
+pub(crate) type ExportManagedSessionFixture = (
     ManagedSession,
     Arc<Mutex<Vec<PrepareExportDirectory>>>,
     NativePath,
-)> {
+);
+
+pub(crate) fn export_managed_session(base: &Path) -> Result<ExportManagedSessionFixture> {
     let export_directory = base.join("exports");
     fs::create_dir(&export_directory)?;
     let (facts, request) = Facts::create(base)?;

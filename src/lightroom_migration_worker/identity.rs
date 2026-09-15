@@ -35,7 +35,6 @@ pub(crate) enum Role {
     Source,
     Destination,
     ImportLock,
-    Transport,
 }
 struct State {
     held: BTreeMap<FileKey, Role>,
@@ -173,7 +172,7 @@ impl Audit {
         let mut options = OpenOptions::new();
         options
             .read(true)
-            .write(create_new || matches!(role, Role::ImportLock | Role::Transport))
+            .write(create_new || matches!(role, Role::ImportLock))
             .create_new(create_new);
         #[cfg(unix)]
         {

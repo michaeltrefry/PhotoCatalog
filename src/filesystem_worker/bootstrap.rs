@@ -1098,24 +1098,24 @@ impl BootstrapOwner {
                 "export original session mismatch"
             );
             record.verify_root_binding()?;
-            if matches!(request.action, ExportOriginalAction::Begin) {
-                if let Some(active) = &record.export_original {
-                    ensure!(
-                        active.requested == request.requested
-                            && active.transfer == request.transfer
-                            && active.allowance == request.allowance.0,
-                        "export original lease already active"
-                    );
-                    return Ok(ExportOriginalReply {
-                        root: request.root.clone(),
-                        requested: request.requested.clone(),
-                        transfer: request.transfer.clone(),
-                        step: request.step,
-                        value: ExportOriginalValue::Begun {
-                            revision: active.verified.revision().clone(),
-                        },
-                    });
-                }
+            if matches!(request.action, ExportOriginalAction::Begin)
+                && let Some(active) = &record.export_original
+            {
+                ensure!(
+                    active.requested == request.requested
+                        && active.transfer == request.transfer
+                        && active.allowance == request.allowance.0,
+                    "export original lease already active"
+                );
+                return Ok(ExportOriginalReply {
+                    root: request.root.clone(),
+                    requested: request.requested.clone(),
+                    transfer: request.transfer.clone(),
+                    step: request.step,
+                    value: ExportOriginalValue::Begun {
+                        revision: active.verified.revision().clone(),
+                    },
+                });
             }
         }
         let candidate = if matches!(request.action, ExportOriginalAction::Begin) {
@@ -1372,29 +1372,30 @@ impl BootstrapOwner {
                 );
             }
             let mut hashed = PublicationHashProgress::default();
-            let mut checkpoint = |bytes| hashed.checkpoint(bytes, cancel);
-            let prepared = (|| -> Result<_> {
-                let seal = match &request.source {
-                    ExportPublicationSource::Sealed(seal) => seal.clone(),
-                    ExportPublicationSource::Recovery {
-                        snapshot,
-                        authority_digest,
-                    } => {
-                        let seal =
+            let prepared = {
+                let mut checkpoint = |bytes| hashed.checkpoint(bytes, cancel);
+                (|| -> Result<_> {
+                    let seal = match &request.source {
+                        ExportPublicationSource::Sealed(seal) => seal.clone(),
+                        ExportPublicationSource::Recovery {
+                            snapshot,
+                            authority_digest,
+                        } => {
+                            let seal =
                             crate::metadata_export::read_photo_seal_for_restore_with_checkpoint(
                                 snapshot,
                                 authority_digest,
                                 &mut checkpoint,
                             )?;
-                        ensure!(
-                            seal.snapshot == *snapshot
-                                && seal.authority_digest == *authority_digest,
-                            "publication recovery authority mismatch"
-                        );
-                        seal
-                    }
-                };
-                let publication = match request.mode {
+                            ensure!(
+                                seal.snapshot == *snapshot
+                                    && seal.authority_digest == *authority_digest,
+                                "publication recovery authority mismatch"
+                            );
+                            seal
+                        }
+                    };
+                    let publication = match request.mode {
                     ExportPublicationMode::Publish => {
                         crate::metadata_export::PhotoPublication::prepare_with_checkpoint(
                             &seal,
@@ -1407,10 +1408,10 @@ impl BootstrapOwner {
                             &mut checkpoint,
                         )?
                     }
-                };
-                Ok((seal, publication))
-            })();
-            drop(checkpoint);
+                    };
+                    Ok((seal, publication))
+                })()
+            };
             let (seal, publication) = prepared.map_err(|error| {
                 anyhow::Error::new(export_publication_failure(error, hashed.canceled))
             })?;
@@ -1514,84 +1515,85 @@ impl BootstrapOwner {
             .checked_add(1)
             .context("export publication step exhausted")?;
         let mut hashed = PublicationHashProgress::default();
-        let mut checkpoint = |bytes| hashed.checkpoint(bytes, cancel);
-        let value = (|| -> Result<ExportPublicationValue> {
-            if !request.cleanup() {
-                publication_cancel(cancel)?;
-            }
-            ensure!(
-                !matches!(
-                    (request.mode, &request.action),
-                    (
-                        ExportPublicationMode::Restore,
-                        ExportPublicationAction::Capture
-                            | ExportPublicationAction::VerifyCapture
-                            | ExportPublicationAction::Link
-                    ) | (
-                        ExportPublicationMode::Publish,
-                        ExportPublicationAction::RestoreLink
-                            | ExportPublicationAction::VerifyRestored
-                            | ExportPublicationAction::RecheckRestored
-                    )
-                ),
-                "publication action differs from admitted mode"
-            );
-            #[cfg(test)]
-            export_publication_mutation_test_barrier(&request.action, cancel)?;
-            Ok(match &request.action {
-                ExportPublicationAction::Begin => unreachable!(),
-                ExportPublicationAction::RecheckPayload => {
-                    transfer.publication.recheck_payload()?;
-                    ExportPublicationValue::RecheckedPayload
-                }
-                ExportPublicationAction::Capture => {
-                    transfer.publication.capture()?;
-                    ExportPublicationValue::Captured
-                }
-                ExportPublicationAction::VerifyCapture => {
-                    transfer
-                        .publication
-                        .verify_capture_with_checkpoint(&mut checkpoint)?;
-                    ExportPublicationValue::CaptureVerified
-                }
-                ExportPublicationAction::FailureReceipt { detail } => {
-                    let receipt = transfer
-                        .publication
-                        .failure_receipt_with_checkpoint(detail.clone(), &mut checkpoint);
+        let value = {
+            let mut checkpoint = |bytes| hashed.checkpoint(bytes, cancel);
+            (|| -> Result<ExportPublicationValue> {
+                if !request.cleanup() {
                     publication_cancel(cancel)?;
-                    ExportPublicationValue::Receipt(receipt)
                 }
-                ExportPublicationAction::Link => {
-                    transfer.publication.link()?;
-                    ExportPublicationValue::Linked
-                }
-                ExportPublicationAction::VerifyInstalled => ExportPublicationValue::Installed(
-                    transfer
-                        .publication
-                        .verify_installed_with_checkpoint(&mut checkpoint)?,
-                ),
-                ExportPublicationAction::RecheckInstalled => {
-                    transfer.publication.recheck_installed()?;
-                    ExportPublicationValue::RecheckedInstalled
-                }
-                ExportPublicationAction::RestoreLink => {
-                    transfer.publication.restore_link()?;
-                    ExportPublicationValue::RestoredLinked
-                }
-                ExportPublicationAction::VerifyRestored => ExportPublicationValue::Restored(
-                    transfer
-                        .publication
-                        .verify_restored_with_checkpoint(&mut checkpoint)?,
-                ),
-                ExportPublicationAction::RecheckRestored => {
-                    transfer.publication.recheck_restored()?;
-                    ExportPublicationValue::RecheckedRestored
-                }
-                ExportPublicationAction::Finish => ExportPublicationValue::Finished,
-                ExportPublicationAction::Abort => ExportPublicationValue::Aborted,
-            })
-        })();
-        drop(checkpoint);
+                ensure!(
+                    !matches!(
+                        (request.mode, &request.action),
+                        (
+                            ExportPublicationMode::Restore,
+                            ExportPublicationAction::Capture
+                                | ExportPublicationAction::VerifyCapture
+                                | ExportPublicationAction::Link
+                        ) | (
+                            ExportPublicationMode::Publish,
+                            ExportPublicationAction::RestoreLink
+                                | ExportPublicationAction::VerifyRestored
+                                | ExportPublicationAction::RecheckRestored
+                        )
+                    ),
+                    "publication action differs from admitted mode"
+                );
+                #[cfg(test)]
+                export_publication_mutation_test_barrier(&request.action, cancel)?;
+                Ok(match &request.action {
+                    ExportPublicationAction::Begin => unreachable!(),
+                    ExportPublicationAction::RecheckPayload => {
+                        transfer.publication.recheck_payload()?;
+                        ExportPublicationValue::RecheckedPayload
+                    }
+                    ExportPublicationAction::Capture => {
+                        transfer.publication.capture()?;
+                        ExportPublicationValue::Captured
+                    }
+                    ExportPublicationAction::VerifyCapture => {
+                        transfer
+                            .publication
+                            .verify_capture_with_checkpoint(&mut checkpoint)?;
+                        ExportPublicationValue::CaptureVerified
+                    }
+                    ExportPublicationAction::FailureReceipt { detail } => {
+                        let receipt = transfer
+                            .publication
+                            .failure_receipt_with_checkpoint(detail.clone(), &mut checkpoint);
+                        publication_cancel(cancel)?;
+                        ExportPublicationValue::Receipt(receipt)
+                    }
+                    ExportPublicationAction::Link => {
+                        transfer.publication.link()?;
+                        ExportPublicationValue::Linked
+                    }
+                    ExportPublicationAction::VerifyInstalled => ExportPublicationValue::Installed(
+                        transfer
+                            .publication
+                            .verify_installed_with_checkpoint(&mut checkpoint)?,
+                    ),
+                    ExportPublicationAction::RecheckInstalled => {
+                        transfer.publication.recheck_installed()?;
+                        ExportPublicationValue::RecheckedInstalled
+                    }
+                    ExportPublicationAction::RestoreLink => {
+                        transfer.publication.restore_link()?;
+                        ExportPublicationValue::RestoredLinked
+                    }
+                    ExportPublicationAction::VerifyRestored => ExportPublicationValue::Restored(
+                        transfer
+                            .publication
+                            .verify_restored_with_checkpoint(&mut checkpoint)?,
+                    ),
+                    ExportPublicationAction::RecheckRestored => {
+                        transfer.publication.recheck_restored()?;
+                        ExportPublicationValue::RecheckedRestored
+                    }
+                    ExportPublicationAction::Finish => ExportPublicationValue::Finished,
+                    ExportPublicationAction::Abort => ExportPublicationValue::Aborted,
+                })
+            })()
+        };
         let value = match value {
             Ok(value) => value,
             Err(error) => {

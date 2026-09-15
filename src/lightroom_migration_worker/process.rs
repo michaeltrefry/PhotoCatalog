@@ -206,9 +206,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         bytes = add(bytes, channels::pthread_mutexes(2)?)?;
         add(bytes, std::mem::size_of::<std::process::ChildStdout>())
     }
-    pub(crate) fn spawn(executable: &Path, stop: Arc<Stop>) -> Result<Self> {
-        Self::spawn_owned(executable, stop).map_err(|failure| failure.drain_legacy(None))
-    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "a failed spawn must retain the complete process owner until checked drain"
+    )]
     pub(crate) fn spawn_owned(
         executable: &Path,
         stop: Arc<Stop>,
@@ -220,9 +221,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         }
         Self::spawn_role_owned(executable, Role::LightroomMigration, stop)
     }
-    pub(crate) fn spawn_role(executable: &Path, role: Role, stop: Arc<Stop>) -> Result<Self> {
-        Self::spawn_role_with_cleanup(executable, role, stop, None)
-    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "a failed spawn must retain the complete process owner until checked drain"
+    )]
     fn spawn_role_owned(
         executable: &Path,
         role: Role,
@@ -249,6 +251,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         Self::spawn_role_owned(executable, role, stop)
             .map_err(|failure| failure.drain_legacy(before_wait))
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "a failed spawn must retain the complete process owner until checked drain"
+    )]
     fn spawn_command_owned(
         mut command: Command,
         stop: Arc<Stop>,
@@ -265,6 +271,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         Self::spawn_test_command_with_cleanup(command, stop, None)
     }
     #[cfg(test)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the failure fixture verifies custody of a partially spawned process"
+    )]
     pub(crate) fn spawn_test_command_owned(
         mut command: Command,
         stop: Arc<Stop>,
@@ -289,6 +299,10 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
         Self::spawn_test_command_owned(command, stop)
             .map_err(|failure| failure.drain_legacy(before_wait))
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "post-spawn failures return the live process owner for mandatory drain"
+    )]
     fn spawn_configured_owned(
         mut command: Command,
         stop: Arc<Stop>,
@@ -446,6 +460,7 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     pub(crate) fn inject_wait_failures(&mut self, count: usize) {
         self.injected_wait_failures = count;
     }
+    #[cfg(test)]
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }

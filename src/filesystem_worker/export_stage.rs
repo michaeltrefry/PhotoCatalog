@@ -70,15 +70,16 @@ struct Uploaded {
     bytes: u64,
     digest: String,
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the upload owner remains inline with the reservation that charges its exact retained storage"
+)]
+#[derive(Default)]
 enum BlobState {
+    #[default]
     Absent,
     Uploading(Upload),
     Complete(Uploaded),
-}
-impl Default for BlobState {
-    fn default() -> Self {
-        Self::Absent
-    }
 }
 
 struct Stage {
@@ -131,6 +132,7 @@ impl Stage {
     }
 }
 
+#[derive(Default)]
 pub(super) struct Owner {
     stage: Option<Stage>,
     cleanup: Option<Cleanup>,
@@ -140,17 +142,6 @@ pub(super) struct Owner {
 }
 pub(super) fn owner_layout() -> (usize, usize) {
     (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>())
-}
-impl Default for Owner {
-    fn default() -> Self {
-        Self {
-            stage: None,
-            cleanup: None,
-            seal: None,
-            user: None,
-            supervisor: None,
-        }
-    }
 }
 impl Owner {
     pub fn empty(&self) -> bool {
@@ -182,14 +173,15 @@ impl Owner {
         // Seal receipt is terminal and separate from ordinary request replay.
         // Failed/canceled admission is also recorded, so retry never starts an
         // uncertain seal under either the old or a fresh operation identity.
-        if let Some(seal) = &self.seal {
-            if seal.stage == request.stage && matches!(request.action, Action::ResultAndSeal) {
-                ensure!(
-                    seal.operation == request.operation.0 && seal.digest == digest,
-                    "altered or new export seal attempt"
-                );
-                return seal.result.clone().map_err(Into::into);
-            }
+        if let Some(seal) = &self.seal
+            && seal.stage == request.stage
+            && matches!(request.action, Action::ResultAndSeal)
+        {
+            ensure!(
+                seal.operation == request.operation.0 && seal.digest == digest,
+                "altered or new export seal attempt"
+            );
+            return seal.result.clone().map_err(Into::into);
         }
         let cached = if request.supervisor {
             &self.supervisor
@@ -937,6 +929,32 @@ fn admission_fault(point: AdmissionFault) -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+pub(super) fn test_captured_begin_failure() {
+    ADMISSION_FAULTS.with(|faults| {
+        assert!(faults.borrow().is_empty());
+        faults
+            .borrow_mut()
+            .extend([AdmissionFault::ParentClone, AdmissionFault::Cleanup]);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn test_maximum_receipt(
+    work: &crate::catalog_exports::ExportWork,
+    path: &Path,
+) -> Result<()> {
+    fs::write(path.join("output"), b"sealed")?;
+    let mut receipt = tests::facts(work, &path.join("output"))?;
+    receipt.rendered.metadata_notes.push(String::new());
+    let base = serde_json::to_vec(&receipt)?.len();
+    receipt.rendered.metadata_notes[0] = "n".repeat(RECEIPT_BYTES - base);
+    let bytes = serde_json::to_vec(&receipt)?;
+    assert_eq!(bytes.len(), RECEIPT_BYTES);
+    fs::write(path.join("result.json"), bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2418,30 +2436,4 @@ mod tests {
         crate::application::desktop::admit_export_stage_reply(&reply)?;
         Ok(())
     }
-}
-
-#[cfg(test)]
-pub(super) fn test_captured_begin_failure() {
-    ADMISSION_FAULTS.with(|faults| {
-        assert!(faults.borrow().is_empty());
-        faults
-            .borrow_mut()
-            .extend([AdmissionFault::ParentClone, AdmissionFault::Cleanup]);
-    });
-}
-
-#[cfg(test)]
-pub(super) fn test_maximum_receipt(
-    work: &crate::catalog_exports::ExportWork,
-    path: &Path,
-) -> Result<()> {
-    fs::write(path.join("output"), b"sealed")?;
-    let mut receipt = tests::facts(work, &path.join("output"))?;
-    receipt.rendered.metadata_notes.push(String::new());
-    let base = serde_json::to_vec(&receipt)?.len();
-    receipt.rendered.metadata_notes[0] = "n".repeat(RECEIPT_BYTES - base);
-    let bytes = serde_json::to_vec(&receipt)?;
-    assert_eq!(bytes.len(), RECEIPT_BYTES);
-    fs::write(path.join("result.json"), bytes)?;
-    Ok(())
 }

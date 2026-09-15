@@ -6,7 +6,9 @@ pub(crate) mod layout;
 pub(crate) mod requested;
 pub(crate) mod transport;
 
-use anyhow::{Context, Result, ensure};
+#[cfg(test)]
+use anyhow::ensure;
+use anyhow::{Context, Result};
 use std::{
     fmt,
     sync::{Arc, Mutex},
@@ -15,6 +17,7 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct MemoryBudget(Arc<Backend>);
 enum Backend {
+    #[cfg(test)]
     Local(Mutex<State>),
     Parent(Arc<dyn AllocationGrant>),
     Shared(crate::preview::ByteBudget),
@@ -99,6 +102,7 @@ impl fmt::Display for ResourceLimit {
 }
 impl std::error::Error for ResourceLimit {}
 
+#[cfg(test)]
 struct State {
     limit: usize,
     used: usize,
@@ -109,6 +113,7 @@ pub(crate) struct Reservation {
     shared: Option<crate::preview::ByteReservation>,
 }
 impl MemoryBudget {
+    #[cfg(test)]
     pub(crate) fn new(limit: usize) -> Result<Self> {
         ensure!(
             limit != 0,
@@ -132,6 +137,7 @@ impl MemoryBudget {
     /// a local counter as the parent pool's current available allowance.
     pub(crate) fn snapshot(&self) -> Result<Snapshot> {
         match &*self.0 {
+            #[cfg(test)]
             Backend::Local(state) => {
                 let state = state
                     .lock()
@@ -190,6 +196,7 @@ impl Reservation {
             .checked_add(bytes)
             .context("migration allocation charge overflow")?;
         match &*self.budget.0 {
+            #[cfg(test)]
             Backend::Local(state) => {
                 let mut state = state
                     .lock()
@@ -213,10 +220,7 @@ impl Reservation {
             Backend::Shared(budget) => {
                 let bytes = u64::try_from(bytes).context("shared allocation request overflow")?;
                 let refused = if let Some(reservation) = &mut self.shared {
-                    match reservation.grow_exact(bytes) {
-                        Ok(()) => None,
-                        Err(limit) => Some(limit),
-                    }
+                    reservation.grow_exact(bytes).err()
                 } else {
                     match budget.reserve_exact(bytes) {
                         Ok(reservation) => {
@@ -244,6 +248,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        #[cfg(test)]
         if let Backend::Local(state) = &*self.budget.0 {
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             // This owner alone retires its monotonic contribution. No allocation,

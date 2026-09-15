@@ -125,6 +125,10 @@ pub(crate) struct Snapshot {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the bounded snapshot remains inline in the encoded relay reply accounting"
+)]
 pub(crate) enum Reply {
     Ok(Snapshot),
     /// This invocation was rejected before installing acquisition authority.
@@ -357,13 +361,12 @@ impl Request {
             completed,
             total,
         } = &self.action
+            && (phase.len() > 256 || total.is_some_and(|total| completed.0 > total.0))
         {
-            if phase.len() > 256 || total.is_some_and(|total| completed.0 > total.0) {
-                return Err(error(
-                    ErrorCode::InvalidRequest,
-                    "migration progress bounds",
-                ));
-            }
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "migration progress bounds",
+            ));
         }
         if let Action::AcquireTarget {
             catalog,
@@ -1002,31 +1005,28 @@ impl Actor {
             return Ok(self.migration.target.as_ref().unwrap().snapshot());
         }
         let Some(target) = &mut self.migration.target else {
-            if let Some(drained) = &self.migration.drained {
-                if drained.guard == request.guard
-                    && matches!(
-                        request.action,
-                        Action::Status
-                            | Action::Cancel
-                            | Action::DrainOperation
-                            | Action::ReleaseWrite { .. }
-                    )
+            if let Some(drained) = &self.migration.drained
+                && drained.guard == request.guard
+                && matches!(
+                    request.action,
+                    Action::Status
+                        | Action::Cancel
+                        | Action::DrainOperation
+                        | Action::ReleaseWrite { .. }
+                )
+            {
+                if let Action::ReleaseWrite {
+                    sequence,
+                    request_digest,
+                    kind,
+                } = &request.action
+                    && (drained.sequence != Some(*sequence)
+                        || drained.write_kind != Some(*kind)
+                        || drained.request_digest.as_ref() != Some(request_digest))
                 {
-                    if let Action::ReleaseWrite {
-                        sequence,
-                        request_digest,
-                        kind,
-                    } = &request.action
-                    {
-                        if drained.sequence != Some(*sequence)
-                            || drained.write_kind != Some(*kind)
-                            || drained.request_digest.as_ref() != Some(request_digest)
-                        {
-                            return Err(invalid("released attempt identity"));
-                        }
-                    }
-                    return Ok(drained.clone());
+                    return Err(invalid("released attempt identity"));
                 }
+                return Ok(drained.clone());
             }
             if matches!(request.action, Action::Status) {
                 return Ok(Snapshot {
@@ -1274,13 +1274,13 @@ pub(super) fn reject_queued_authority(state: &mut super::State) {
                 .is_ok_and(|request| request.action.recovery())
     }) {
         let message = state.control.remove(index).unwrap();
-        if let Some(entry) = state.pending.remove(&message.id) {
-            if let super::Delivery::Migration(tx) = entry.delivery {
-                let _ = tx.send(Reply::Refused(refusal(
-                    ErrorCode::Closed,
-                    "desktop stopping; migration authority was not sent",
-                )));
-            }
+        if let Some(entry) = state.pending.remove(&message.id)
+            && let super::Delivery::Migration(tx) = entry.delivery
+        {
+            let _ = tx.send(Reply::Refused(refusal(
+                ErrorCode::Closed,
+                "desktop stopping; migration authority was not sent",
+            )));
         }
     }
 }

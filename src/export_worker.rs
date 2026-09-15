@@ -1309,7 +1309,7 @@ impl ClaimedCleanup {
         retired: &CompactRetiredExportTransport,
         record: &mut claim::Record,
         wrapper: &Path,
-        original: &Path,
+        _original: &Path,
     ) -> Result<()> {
         if !self.directory_removed {
             // Optional artifacts first, then request proof, then the tombstone.
@@ -1329,7 +1329,7 @@ impl ClaimedCleanup {
                         1 => "verified-active",
                         _ => "verified-artifact",
                     },
-                    original,
+                    _original,
                 )?;
                 #[cfg(unix)]
                 {
@@ -1372,7 +1372,7 @@ impl ClaimedCleanup {
             record.removing_directory = true;
             record.save(wrapper)?;
             #[cfg(test)]
-            compact_discard_checkpoint("verified-directory", original)?;
+            compact_discard_checkpoint("verified-directory", _original)?;
             #[cfg(unix)]
             {
                 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
@@ -1413,8 +1413,10 @@ impl ClaimedCleanup {
     }
 }
 #[cfg(test)]
+type CompactDiscardHook = Box<dyn FnMut(&str, &Path) -> Result<()>>;
+#[cfg(test)]
 thread_local! {
-    static COMPACT_DISCARD_HOOK: RefCell<Option<Box<dyn FnMut(&str, &Path) -> Result<()>>>> = RefCell::new(None);
+    static COMPACT_DISCARD_HOOK: RefCell<Option<CompactDiscardHook>> = RefCell::new(None);
 }
 #[cfg(test)]
 pub(crate) fn set_compact_discard_hook(hook: impl FnMut(&str, &Path) -> Result<()> + 'static) {

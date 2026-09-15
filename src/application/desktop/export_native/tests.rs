@@ -998,7 +998,7 @@ fn g_replays_lost_stage_release_before_executor_close_and_reacquires() -> Result
     let Action::Register { begin, .. } = &mut successor_registration.action else {
         unreachable!()
     };
-    *begin = Box::new(successor_begin.clone());
+    **begin = successor_begin.clone();
     owner.call(&successor_registration)?;
     owner.stage_call(&successor_begin, &AtomicBool::new(false))?;
     owner.executor_call(
@@ -1273,7 +1273,7 @@ fn ordinary_stage_replay_is_exact_and_unregistered_or_foreign_work_is_rejected()
     let Action::Register { begin, .. } = &mut foreign.action else {
         unreachable!()
     };
-    *begin = Box::new(foreign_begin);
+    **begin = foreign_begin;
     assert!(owner.call(&foreign).is_err());
     owner.finish_after_catalog()?;
     assert_eq!(pool.used(), 0);
@@ -2618,7 +2618,7 @@ fn combined_bootstrap_lost_stage_and_executor_close_reopen_and_stale_lifecycles(
     let Action::Register { begin, .. } = &mut registration.action else {
         unreachable!()
     };
-    *begin = Box::new(begin2.clone());
+    **begin = begin2.clone();
     reopened.call(&registration)?;
     reopened.stage_call(&begin2, &AtomicBool::new(false))?;
     // The real F user cache has now changed. Stale Begin is rejected before it.

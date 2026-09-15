@@ -1218,6 +1218,11 @@ fn restore(value: Response) -> Result<Option<RestoreStatus>> {
 }
 
 #[cfg(test)]
+pub(crate) fn migration_fixture(directory: &Path) -> Result<Client> {
+    tests::migration_fixture(directory)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::filesystem_worker::process::{Handler, OperationContext};
@@ -3061,9 +3066,7 @@ mod tests {
                 io::stderr(),
                 crate::filesystem_worker::FilesystemHandler::new,
             );
-            if let Err(error) = result {
-                return Err(error);
-            }
+            result?;
             // The libtest parent owns stdout outside this ignored connector.
             // Exit after the flushed PCFS stream so its success trailer cannot
             // be mistaken for another filesystem frame.
@@ -3083,9 +3086,4 @@ mod tests {
             },
         )
     }
-}
-
-#[cfg(test)]
-pub(crate) fn migration_fixture(directory: &Path) -> Result<Client> {
-    tests::migration_fixture(directory)
 }

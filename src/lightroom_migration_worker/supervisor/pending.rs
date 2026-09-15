@@ -37,10 +37,12 @@ impl Lease {
         self.retirement.changed.notify_all();
     }
     pub(super) fn retry_retire(&mut self) -> Option<Result<()>> {
-        self.request_retirement();
         let Some(thread) = self.thread.as_ref() else {
             return Some(Ok(()));
         };
+        // A transferred lease leaves an empty shell behind. Dropping that
+        // shell must not retire the thread now owned by the receiving lease.
+        self.request_retirement();
         if !thread.is_finished() {
             return None;
         }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     application::{Config, Limits, Reply, Request, Response},
+    lightroom_migration_worker::input,
     storage_volume::NativePath,
 };
 
@@ -713,11 +714,11 @@ mod actual {
                 .open(path)?;
             writeln!(file, "{} {}", std::process::id(), role)?;
         }
-        if role == "--lightroom-migration-worker" {
-            if let Some(path) = std::env::var_os(PAUSE) {
-                while std::path::Path::new(&path).exists() {
-                    thread::sleep(Duration::from_millis(5));
-                }
+        if role == "--lightroom-migration-worker"
+            && let Some(path) = std::env::var_os(PAUSE)
+        {
+            while std::path::Path::new(&path).exists() {
+                thread::sleep(Duration::from_millis(5));
             }
         }
         if role == "--catalog-desktop-worker" {
@@ -2134,8 +2135,11 @@ mod actual {
                 .lock()
                 .unwrap()
                 .acquire_recovery_seen;
-            if seen && status.phase == api::Phase::DrainPending && status.failure.is_some() {
-                break status.failure.unwrap();
+            if seen
+                && status.phase == api::Phase::DrainPending
+                && let Some(failure) = status.failure
+            {
+                break failure;
             }
             ensure!(
                 Instant::now() < deadline,

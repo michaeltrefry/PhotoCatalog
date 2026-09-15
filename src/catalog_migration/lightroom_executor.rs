@@ -137,26 +137,36 @@ fn status(complete: bool, stopped: bool) -> &'static str {
     }
 }
 
+type ProgressReporter<'a> = dyn FnMut(&str, u64, Option<u64>) -> Result<()> + 'a;
+
+pub(crate) struct RunAuthority<'a> {
+    pub(crate) source: &'a dyn MigrationRead,
+    pub(crate) approval: &'a [u8],
+    pub(crate) policy: &'a Policy,
+}
+
 fn run_with_factory<'a>(
     catalog: &mut Catalog,
-    source: &'a dyn MigrationRead,
-    approval: &[u8],
-    policy: &Policy,
+    authority: RunAuthority<'a>,
     limits: ArtifactLimits,
     work: WorkLimit,
     stop: &dyn Fn() -> Result<bool>,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
     factory: Box<dyn ArtifactFactory + 'a>,
 ) -> Result<Output> {
     work.validate()?;
     limits.validate()?;
     let mut progress = {
         let _phase = super::repair_memory::phase();
-        catalog.begin_selected_import_reader(source, approval, policy)?
+        catalog.begin_selected_import_reader(
+            authority.source,
+            authority.approval,
+            authority.policy,
+        )?
     };
     let mut worker = {
         let _phase = super::repair_memory::phase();
-        Worker::with_readers(source, &progress.id, limits, factory)?
+        Worker::with_readers(authority.source, &progress.id, limits, factory)?
     };
     let started = Instant::now();
     let deadline = started + Duration::from_secs(work.seconds);
@@ -218,9 +228,11 @@ pub fn run_local(
     let mut report = |_: &str, _: u64, _: Option<u64>| Ok(());
     run_with_factory(
         catalog,
-        source,
-        approval,
-        policy,
+        RunAuthority {
+            source,
+            approval,
+            policy,
+        },
         limits,
         work,
         stop,
@@ -231,18 +243,14 @@ pub fn run_local(
 
 pub(crate) fn run_managed<'a>(
     catalog: &mut Catalog,
-    source: &'a dyn MigrationRead,
-    approval: &[u8],
-    policy: &Policy,
+    authority: RunAuthority<'a>,
     limits: ArtifactLimits,
     work: WorkLimit,
     stop: &dyn Fn() -> Result<bool>,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
     factory: Box<dyn ArtifactFactory + 'a>,
 ) -> Result<Output> {
-    run_with_factory(
-        catalog, source, approval, policy, limits, work, stop, report, factory,
-    )
+    run_with_factory(catalog, authority, limits, work, stop, report, factory)
 }
 
 fn repair_current_reader(
@@ -251,7 +259,7 @@ fn repair_current_reader(
     request: &current_repair::Request,
     work: WorkLimit,
     stop: &dyn Fn() -> Result<bool>,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
 ) -> Result<Output> {
     work.validate()?;
     let mut progress = {
@@ -307,7 +315,7 @@ pub(crate) fn repair_current_managed(
     request: &current_repair::Request,
     work: WorkLimit,
     stop: &dyn Fn() -> Result<bool>,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
 ) -> Result<Output> {
     repair_current_reader(catalog, source, request, work, stop, report)
 }
@@ -318,7 +326,7 @@ fn repair_keywords_reader(
     request: &keyword_repair::Request,
     work: WorkLimit,
     stop: &dyn Fn() -> Result<bool>,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
 ) -> Result<Output> {
     work.validate()?;
     let mut progress = {
@@ -378,7 +386,7 @@ pub(crate) fn repair_keywords_managed(
     request: &keyword_repair::Request,
     work: WorkLimit,
     stop: &dyn Fn() -> Result<bool>,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
 ) -> Result<Output> {
     repair_keywords_reader(catalog, source, request, work, stop, report)
 }
@@ -387,7 +395,7 @@ fn prepare_supplements_with_report(
     catalog: &mut Catalog,
     requests: &[supplements::Request],
     stop: &std::sync::atomic::AtomicBool,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
 ) -> Result<Output> {
     ensure!(
         !requests.is_empty() && requests.len() <= 1024,
@@ -423,7 +431,7 @@ pub(crate) fn prepare_supplements_managed(
     catalog: &mut Catalog,
     requests: &[supplements::Request],
     stop: &std::sync::atomic::AtomicBool,
-    report: &mut dyn FnMut(&str, u64, Option<u64>) -> Result<()>,
+    report: &mut ProgressReporter<'_>,
 ) -> Result<Output> {
     prepare_supplements_with_report(catalog, requests, stop, report)
 }

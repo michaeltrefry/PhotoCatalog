@@ -108,7 +108,7 @@ impl Broker {
             Process::spawn_role_with_cleanup(&executable, role, stop, Some(before_wait))
         })
     }
-    pub(crate) fn start_with(
+    fn start_with(
         guard: Guard,
         stop: Arc<Stop>,
         memory: MemoryBudget,
@@ -347,6 +347,7 @@ impl Broker {
         );
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn wait_revoked(&self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         while !state.revoked {
@@ -356,13 +357,6 @@ impl Broker {
                 .wait(state)
                 .unwrap_or_else(|e| e.into_inner());
         }
-    }
-    pub(crate) fn revoked(&self) -> bool {
-        self.shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .revoked
     }
     /// Nonblocking join boundary. A join panic proves the broker thread ended;
     /// its failure is returned as a drained poison rather than a retryable wait.

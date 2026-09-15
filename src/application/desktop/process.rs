@@ -503,7 +503,7 @@ pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Op
             entry.sent_cancel = true;
             return Some(Message::new(Kind::Cancel, id, vec![]));
         }
-        if let Some(index) = s.control.iter().position(|m| migration_recovery(m)) {
+        if let Some(index) = s.control.iter().position(migration_recovery) {
             return s.control.remove(index);
         }
         if active

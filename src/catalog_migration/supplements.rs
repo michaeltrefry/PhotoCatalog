@@ -481,9 +481,6 @@ pub(crate) mod tests {
         fn catalog(&self) -> Result<Catalog> {
             Catalog::open(self.root.join("destination"))
         }
-        pub(crate) fn destination(&self) -> std::path::PathBuf {
-            self.root.join("destination")
-        }
     }
     fn bytes(c: &Catalog, id: &str) -> Result<Vec<u8>> {
         let s = c.migration_evidence(id)?;

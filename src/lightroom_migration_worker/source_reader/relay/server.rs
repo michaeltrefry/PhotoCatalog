@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 
 pub(super) type Charge = Arc<Mutex<Reservation>>;
 pub(super) type Charges = Arc<Mutex<[Option<Charge>; 2]>>;
+pub(super) type Spawn<'a> =
+    dyn FnMut(Kind, Arc<Stop>, &mut dyn FnMut()) -> Result<Process<Reply>> + 'a;
 
 struct Slot {
     process: Process<Reply>,
@@ -63,10 +65,10 @@ impl Owner {
             cursor: 0,
         })
     }
-    pub(crate) fn accept(
+    pub(super) fn accept(
         &mut self,
         command: Command,
-        spawn: &mut dyn FnMut(Kind, Arc<Stop>, &mut dyn FnMut()) -> Result<Process<Reply>>,
+        spawn: &mut Spawn<'_>,
     ) -> Result<Option<Event>> {
         Ok(match command {
             Command::Start {
