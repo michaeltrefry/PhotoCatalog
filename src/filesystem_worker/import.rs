@@ -37,7 +37,7 @@ fn open_regular(path: &Path) -> Result<(File, Stamp)> {
     Ok((file, stamp))
 }
 fn recheck(path: &Path, held: &File, expected: &Stamp) -> Result<()> {
-    let (current, current_stamp) = open_regular(path)?;
+    let (_current, current_stamp) = open_regular(path)?;
     ensure!(
         stamp(held)? == *expected && current_stamp == *expected,
         "source changed before catalog commit"
@@ -389,7 +389,7 @@ impl Owner {
         } else if terminal {
             fs2::FileExt::unlock(&self.active.as_ref().expect("active import").lock)
                 .context("release managed import lock")?;
-            let active = self.active.take().expect("active import");
+            let _active = self.active.take().expect("active import");
             self.terminal = Some(Terminal {
                 transfer: request.transfer.clone(),
                 last: reply.clone(),
@@ -642,7 +642,7 @@ fn inspect(
                 message,
             });
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
     let inspection = match crate::xmp_packets::inspect_cancellable(
         &path,
@@ -666,7 +666,7 @@ fn inspect(
                 message,
             });
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
     recheck(&path, &guard, &stamp)?;
     let encoded = protocol::encode_inspection(inspection)?;

@@ -3048,16 +3048,15 @@ impl Actor {
             import.consumers = remaining;
             if import.cancel.is_canceled()
                 && !matches!(import.status.phase, ImportPhase::CancelRequested)
+                && let Err(error) = import.cancel_owned(&mut o.service)
             {
-                if let Err(error) = import.cancel_owned(&mut o.service) {
-                    import.failure = true;
-                    import.status.error = Some(
-                        format!("import filesystem cleanup retained: {error:#}")
-                            .chars()
-                            .take(2048)
-                            .collect(),
-                    );
-                }
+                import.failure = true;
+                import.status.error = Some(
+                    format!("import filesystem cleanup retained: {error:#}")
+                        .chars()
+                        .take(2048)
+                        .collect(),
+                );
             }
             if matches!(import.status.phase, ImportPhase::CancelRequested) {
                 if let Some(preparation) = &mut import.preparation

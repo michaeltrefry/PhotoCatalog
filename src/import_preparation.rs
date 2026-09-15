@@ -154,17 +154,18 @@ impl Preparation {
         }
     }
     pub(crate) fn finish(&mut self) -> Result<()> {
-        if self.managed && self.thread.is_some() {
-            if let Err(error) = self.command(CommandKind::Retire) {
-                self.request_cancel();
-                self.join_thread()?;
-                if let Err(cleanup) = self.retry_cleanup() {
-                    return Err(error).context(format!(
-                        "managed import retirement cleanup retained: {cleanup:#}"
-                    ));
-                }
-                return Err(error);
+        if self.managed
+            && self.thread.is_some()
+            && let Err(error) = self.command(CommandKind::Retire)
+        {
+            self.request_cancel();
+            self.join_thread()?;
+            if let Err(cleanup) = self.retry_cleanup() {
+                return Err(error).context(format!(
+                    "managed import retirement cleanup retained: {cleanup:#}"
+                ));
             }
+            return Err(error);
         }
         self.receiver.take();
         self.commands.take();
@@ -834,6 +835,10 @@ impl RemoteImport {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit SQL admission and retained cleanup ownership cross the preparation thread boundary"
+)]
 fn prepare_managed(
     session: Arc<crate::catalog_session::CatalogSessionAuthority>,
     admitted: Option<crate::catalog_session::SqlConnection>,

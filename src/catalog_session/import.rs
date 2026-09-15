@@ -104,6 +104,10 @@ pub struct DirectoryFact {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline observations are included in the bounded relay response root"
+)]
 pub enum Value {
     Failed(crate::filesystem_worker::wire::Failure),
     Begun,
@@ -323,13 +327,15 @@ pub fn source_path(source: &Source) -> Result<std::path::PathBuf> {
         NativePath::UnixBytes(source.locator.clone())
     } else {
         ensure!(
-            source.locator.len() % 2 == 0,
+            source.locator.len().is_multiple_of(2),
             "Windows import locator byte width"
         );
         NativePath::WindowsWide(
             source
                 .locator
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|v| u16::from_le_bytes([v[0], v[1]]))
                 .collect(),
         )
