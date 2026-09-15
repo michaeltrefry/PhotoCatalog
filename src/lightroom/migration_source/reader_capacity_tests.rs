@@ -130,7 +130,7 @@ fn grammar_boundaries(template: &InputSeal) -> Result<()> {
             // A nonempty zero-unit array contributes exactly 2*n-1 bytes over
             // its empty array. This is the largest n for this typed document
             // at the caller raw limit; it is not a global path-semantics claim.
-            let units = (maximum - empty_bytes + 1) / 2;
+            let units = (maximum - empty_bytes).div_ceil(2);
             expected.database = if wide {
                 NativePath::WindowsWide(vec![0; units])
             } else {

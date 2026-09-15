@@ -742,10 +742,12 @@ fn broker_stop_fixture(
             && !source_pid_path_text.contains('\n'),
         "fixture path cannot be represented by its fixed shell wrapper"
     );
+    // Production Source transport reads stdout. This test helper writes frames
+    // on stderr, so preserve that pipe and discard the Rust harness banner.
     std::fs::write(
         &source_executable,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{source_pid_path_text}'\nPHOTOCATALOG_OWNED_BROKER_SOURCE_FIXTURE=1 exec '{current}' --exact lightroom_migration_worker::source_reader::relay::broker::tests::owned_broker_source_fixture --nocapture\n"
+            "#!/bin/sh\nPHOTOCATALOG_OWNED_BROKER_SOURCE_FIXTURE=1 PHOTOCATALOG_BROKER_READY_PATH='{source_pid_path_text}' exec '{current}' --exact lightroom_migration_worker::source_reader::relay::broker::tests::owned_broker_source_fixture --nocapture 2>&1 1>/dev/null\n"
         ),
     )?;
     std::fs::set_permissions(&source_executable, std::fs::Permissions::from_mode(0o700))?;
