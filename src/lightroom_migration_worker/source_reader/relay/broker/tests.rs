@@ -16,6 +16,10 @@ fn owned_broker_source_fixture() -> Result<()> {
     if std::env::var_os(ENV).is_none() {
         return Ok(());
     }
+    if let Some(path) = std::env::var_os("PHOTOCATALOG_BROKER_READY_PATH") {
+        // The supervisor waits for actual harness startup, not shell startup.
+        std::fs::write(path, std::process::id().to_string())?;
+    }
     if std::env::var_os("PHOTOCATALOG_BROKER_TYPED_SQL").is_some() {
         crate::lightroom_migration_worker::source_reader::owner::serve_mode(
             std::io::stdin(),
