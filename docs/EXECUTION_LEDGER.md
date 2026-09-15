@@ -75,13 +75,28 @@ fails on same-live-C reuse because normal asynchronous writer release was
 promoted to poisoned failure. Negative receipt `a9022875`, log `f880e4d6`, and
 all before/after artifacts are preserved; all recorded processes retired.
 
-The bounded release repair is now frozen across 16 files and compiles
-(`a9ce319a`, root receipt `09acb107`). It introduces typed Pending/Released
-admission polling and ensures C cannot acknowledge Released before checked
-thread join. A focused independent review is active. Fifty unique exact cases
-are prepared in private `sc-22847-lm4-release-runtime-h50un0k_`, unexecuted
-pending source acceptance; this supersedes earlier unexecuted runtime plans.
-Current freeze: `sc-22847-lm4-release-pending-ak5dfle0/manifest.json` (`9e82e1e4`).
+The bounded release repair passes independent source review `d2eb6b84` and
+compilation `a9ce319a`. The first successor passed 26 exact cases, then exposed
+a fixture SQL-worker count error (negative receipt `ceb04470`). Root corrected
+the expected count from three to two; independent audit `58ee780b` verified
+that correction and production CLI reuse, with a newly compiled test binary.
+
+The corrected gate `sc-22847-lm4-count-runtime-mpf8ijds` passes 28 exact cases,
+including all seven operations. Case29 times out at 488/1024 supplement records
+in the >8 MiB result fixture, leaving DrainPending. Negative receipt `616eff24`,
+log `fad31144`; all 396 source hashes are unchanged. Root recorded and terminated
+two identified orphan synthetic F/C fixtures (`9ca00c4e`); this cleanup is not
+successful managed-retirement evidence. Bounded diagnosis is in progress.
+
+The untouched tail gate `sc-22847-lm4-tail-runtime-2k3rl51m` passes cases30/31.
+Case32 passes abrupt-C lifecycle assertions but fails a final fixture role count:
+PrepareSupplements starts C/LM, not the asserted SQL Source. Negative receipt
+`517d10ac`, log `0d9760e6`; no remaining workers. Case33 in
+`sc-22847-lm4-tail33-runtime-30jotpt0` times out before the intended wait-failure
+injection (negative receipt `c26ced0a`, log `6f0182cc`); no workers remain.
+Runtime is paused for one bounded diagnosis of cases29/32/33. Thirty unique
+cases pass; cases34–50 remain unexecuted.
+Source remains uncommitted pending repairs, focused verification and evidence audit.
 No full facade runtime or S12 acceptance is claimed.
 
 A separate managed-C process trace (`df08341a`) establishes that the closed
@@ -92,8 +107,9 @@ drain. Legacy/unverified/unknown-G states retain the old conservative policy;
 unknown catalog outcome must remain distinct from safe retirement. This path
 is implemented and source-reviewed but still awaits runtime proof.
 
-Next: accept the pending-release source correction independently,
-then run the planned exact behaviors and regressions with a fresh immutable CLI.
+Next: diagnose and repair the large-result deadline/drain and incorrect fixture
+role assertions, finish untouched runtime selections, then independently audit
+the complete exact-source evidence before integration.
 Preserve all seven operations, raw document limits, shared budget, cancellation
 and checked descendant retirement. Managed G export
 custody and C service wiring follow serially because desktop wiring overlaps.
