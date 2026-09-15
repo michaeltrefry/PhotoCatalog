@@ -3,7 +3,7 @@
 mod artifact_factory;
 mod authority_json;
 mod capture_source;
-mod capture_wire;
+pub mod capture_wire;
 mod commit;
 mod owner;
 mod proxy;
@@ -12,6 +12,7 @@ mod transport;
 mod wire;
 
 pub(crate) use artifact_factory::RemoteArtifacts;
+pub use capture_wire::{Authority as CaptureSqlAuthority, MEMBER as CAPTURE_SQL_MEMBER};
 pub(crate) use commit::CommitHealth;
 pub(crate) use proxy::{CaptureSqlReader, Health, RawReader, SqlReader};
 

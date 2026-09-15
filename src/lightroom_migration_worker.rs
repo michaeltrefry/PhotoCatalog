@@ -12,7 +12,7 @@ pub(crate) mod process;
 pub(crate) mod supervisor;
 pub(crate) mod worker;
 
-pub(crate) mod source_reader;
+pub mod source_reader;
 
 pub use source_reader::{managed_source_reader_main, source_reader_main};
 pub use worker::worker_main;

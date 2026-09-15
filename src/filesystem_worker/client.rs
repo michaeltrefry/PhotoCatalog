@@ -176,6 +176,20 @@ pub struct Client {
     pid: u32,
 }
 impl Client {
+    pub(crate) fn lightroom_workbench_io(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomWorkbenchIo,
+        cancel: &AtomicBool,
+    ) -> Result<crate::filesystem_worker::wire::LightroomWorkbenchIoReply> {
+        match self.execute(Operation::LightroomWorkbenchIo(request.clone()), cancel)? {
+            Response::LightroomWorkbenchIo(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("filesystem Workbench response kind"),
+        }
+    }
+
     /// Configured binary only. This API creates no user-selected executable route.
     /// The parent must own this F independently of, and longer than, dependent C.
     pub fn spawn(executable: &Path, original_roots: Vec<NativePath>) -> Result<Self> {

@@ -127,7 +127,7 @@ impl CaptureSource {
         let path = root.join(wire::MEMBER);
         let mut guard = Source::open(&path, authority.maximum_bytes.0)?;
         ensure!(
-            guard.before == authority.logical_revision,
+            authority.logical_revision == guard.before,
             "CaptureSql logical revision differs"
         );
         ensure!(

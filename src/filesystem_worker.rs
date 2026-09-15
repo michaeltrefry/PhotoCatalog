@@ -9,6 +9,7 @@ mod export_stage;
 mod import;
 mod lightroom_artifacts;
 mod lightroom_sealed;
+mod lightroom_workbench;
 mod metadata_files;
 mod preview_io;
 mod preview_stage;
@@ -35,6 +36,7 @@ struct FilesystemHandler {
     lightroom_sealed: lightroom_sealed::Owner,
     lightroom_artifacts: lightroom_artifacts::Owner,
     backup: catalog_backup::managed_filesystem::Owner,
+    lightroom_workbench: lightroom_workbench::Owner,
 }
 pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
     bootstrap::export_profile_transfer_layout()
@@ -62,6 +64,7 @@ impl FilesystemHandler {
             lightroom_sealed: Default::default(),
             lightroom_artifacts: Default::default(),
             backup: Default::default(),
+            lightroom_workbench: Default::default(),
         })
     }
     fn execute_inner(
@@ -119,6 +122,10 @@ impl FilesystemHandler {
                 .lightroom_artifacts
                 .execute(request, cancel)
                 .map(Response::LightroomArtifactPreparation),
+            Operation::LightroomWorkbenchIo(request) => self
+                .lightroom_workbench
+                .execute(request, cancel)
+                .map(Response::LightroomWorkbenchIo),
             Operation::PrepareExportDirectory(request) => self
                 .owner
                 .prepare_export_directory(&request, cancel)

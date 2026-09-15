@@ -10,13 +10,40 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub(crate) const MEMBER: &str = "logical.sqlite3";
-pub(crate) const MAX_SCHEMA_OBJECTS: usize = 4096;
-pub(crate) const MAX_ROWS: usize = 100;
+pub const MEMBER: &str = "logical.sqlite3";
+pub const MAX_SCHEMA_OBJECTS: usize = 4096;
+pub const MAX_ROWS: usize = 100;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRevision {
+    pub object: String,
+    pub bytes: u64,
+    pub modified_ns: Option<u128>,
+    pub changed: String,
+}
+impl From<Revision> for FileRevision {
+    fn from(value: Revision) -> Self {
+        Self {
+            object: value.object,
+            bytes: value.bytes,
+            modified_ns: value.modified_ns,
+            changed: value.changed,
+        }
+    }
+}
+impl PartialEq<Revision> for FileRevision {
+    fn eq(&self, value: &Revision) -> bool {
+        self.object == value.object
+            && self.bytes == value.bytes
+            && self.modified_ns == value.modified_ns
+            && self.changed == value.changed
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Limits {
+pub struct Limits {
     pub open_deadline_ms: U64,
     pub total_deadline_ms: U64,
     pub vm_steps: U64,
@@ -30,7 +57,7 @@ pub(crate) struct Limits {
     pub max_rows: U64,
 }
 impl Limits {
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         ensure!(
             (1..=120_000).contains(&self.open_deadline_ms.0),
             "CaptureSql open deadline"
@@ -81,7 +108,7 @@ impl Limits {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Authority {
+pub struct Authority {
     pub protocol: u8,
     pub build: String,
     pub workbench_instance: String,
@@ -94,7 +121,7 @@ pub(crate) struct Authority {
     pub member: String,
     pub manifest_blake3: String,
     pub revision_id: String,
-    pub logical_revision: Revision,
+    pub logical_revision: FileRevision,
     pub logical_blake3: String,
     pub maximum_bytes: U64,
     pub physical: FileKey,
@@ -132,10 +159,10 @@ impl Authority {
             super::transport::AUTHORITY_BYTES,
         )
     }
-    pub(crate) fn computed_binding(&self) -> Result<String> {
+    pub fn computed_binding(&self) -> Result<String> {
         Ok(crate::lightroom::digest(&self.payload()?))
     }
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         ensure!(self.protocol == 1, "CaptureSql protocol");
         ensure!(
             self.build == crate::lightroom_migration_worker::worker::build_identity(),
@@ -189,7 +216,7 @@ impl Authority {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "query", deny_unknown_fields)]
-pub(crate) enum Query {
+pub enum Query {
     SchemaObjects,
     Variables,
     TableRows {
@@ -202,7 +229,7 @@ pub(crate) enum Query {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ObjectKind {
+pub enum ObjectKind {
     Table,
     Index,
     View,
@@ -211,7 +238,7 @@ pub(crate) enum ObjectKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SchemaObject {
+pub struct SchemaObject {
     pub kind: ObjectKind,
     #[serde(with = "hex_bytes")]
     pub name: Vec<u8>,
@@ -225,7 +252,7 @@ pub(crate) struct SchemaObject {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Column {
+pub struct Column {
     pub cid: I64,
     #[serde(with = "hex_bytes")]
     pub name: Vec<u8>,
@@ -245,14 +272,14 @@ pub(crate) struct Column {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-pub(crate) enum PhysicalCursor {
+pub enum PhysicalCursor {
     PrimaryKey(Vec<U64>),
     RowIdAlias(#[serde(with = "hex_bytes")] Vec<u8>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RetainedOnlyReason {
+pub enum RetainedOnlyReason {
     RootPageZero,
     HiddenColumn,
     NoSafeCursor,
@@ -262,7 +289,7 @@ pub(crate) enum RetainedOnlyReason {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TableDescriptor {
+pub struct TableDescriptor {
     pub table_handle: String,
     pub ordinal: U64,
     pub columns: Vec<Column>,
@@ -275,7 +302,7 @@ pub(crate) struct TableDescriptor {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SchemaObjects {
+pub struct SchemaObjects {
     pub authority_binding: String,
     pub schema_roster_blake3: String,
     pub objects: Vec<SchemaObject>,
@@ -285,14 +312,14 @@ pub(crate) struct SchemaObjects {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TableRow {
+pub struct TableRow {
     pub key: Vec<Cell>,
     pub values: Vec<Cell>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TableBatch {
+pub struct TableBatch {
     pub authority_binding: String,
     pub schema_roster_blake3: String,
     pub table_handle: String,
@@ -305,7 +332,7 @@ pub(crate) struct TableBatch {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TableFailureClass {
+pub enum TableFailureClass {
     RowBytes,
     CellBytes,
     Statement,
@@ -316,7 +343,7 @@ pub(crate) enum TableFailureClass {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TableFailure {
+pub struct TableFailure {
     pub authority_binding: String,
     pub schema_roster_blake3: String,
     pub table_handle: String,
@@ -327,7 +354,7 @@ pub(crate) struct TableFailure {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Current {
+pub struct Current {
     pub authority_binding: String,
     pub schema_roster_blake3: String,
     pub data_version: I64,
@@ -340,7 +367,7 @@ pub(crate) struct Current {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-pub(crate) enum TableValue {
+pub enum TableValue {
     Batch(TableBatch),
     Failure(TableFailure),
 }

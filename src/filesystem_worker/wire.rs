@@ -89,6 +89,7 @@ pub fn build_identity() -> String {
             include_str!("preview_stage.rs"),
             include_str!("lightroom_sealed.rs"),
             include_str!("lightroom_artifacts.rs"),
+            include_str!("lightroom_workbench.rs"),
             include_str!("../catalog_session/preview_stage.rs"),
             include_str!("export_stage.rs"),
             include_str!("../catalog_session/export_stage.rs"),
@@ -148,6 +149,7 @@ pub enum Operation {
     ReadPreviewConfiguration(NativePath),
     LightroomSealedRead(LightroomSealedRead),
     LightroomArtifactPreparation(LightroomArtifactPreparation),
+    LightroomWorkbenchIo(LightroomWorkbenchIo),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     MigrationIdentity(Box<MigrationIdentityRequest>),
@@ -202,6 +204,7 @@ impl Operation {
                 )
             )
             || matches!(self, Self::Backup(r) if r.cleanup())
+            || matches!(self, Self::LightroomWorkbenchIo(value) if value.cleanup())
             || matches!(self, Self::ExportExecutor(r) if r.cleanup())
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
@@ -226,6 +229,7 @@ impl Operation {
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
             Self::LightroomSealedRead(value) => value.validate()?,
             Self::LightroomArtifactPreparation(value) => value.validate()?,
+            Self::LightroomWorkbenchIo(value) => value.validate()?,
             Self::PrepareExportDirectory(value) => value.validate()?,
             Self::ExportDestinationSnapshot(value) => value.validate()?,
             Self::MigrationIdentity(value) => value.validate()?,
@@ -432,6 +436,281 @@ pub enum LightroomArtifactPreparationReply {
         input_json: String,
         input_blake3: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomWorkbenchIo {
+    RootBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        root: NativePath,
+        create: bool,
+    },
+    RootCurrent {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    RootRelease {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    CaptureStart {
+        operation: String,
+        workbench: String,
+        generation: String,
+        executable: NativePath,
+        staging: NativePath,
+        request: crate::lightroom::capture::Request,
+    },
+    CapturePoll {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    CaptureCancel {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    CaptureRetire {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    EvidenceBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+        directory: NativePath,
+        source_generation: String,
+        protected: Vec<crate::lightroom_migration_worker::identity::FileKey>,
+        limits: crate::lightroom_migration_worker::source_reader::capture_wire::Limits,
+    },
+    EvidenceCurrent {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+    },
+    EvidenceRelease {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+    },
+}
+impl LightroomWorkbenchIo {
+    fn ids(&self) -> [&str; 3] {
+        match self {
+            Self::RootBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::RootCurrent {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::RootRelease {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::CaptureStart {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::CapturePoll {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::CaptureCancel {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::CaptureRetire {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::EvidenceBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::EvidenceCurrent {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::EvidenceRelease {
+                operation,
+                workbench,
+                generation,
+                ..
+            } => [operation, workbench, generation],
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        for id in self.ids() {
+            ensure!(
+                !id.is_empty() && id.len() <= 128 && id.is_ascii(),
+                "Workbench F identity"
+            );
+        }
+        match self {
+            Self::RootBegin { root, .. } => validate_path(root)?,
+            Self::CaptureStart {
+                executable,
+                staging,
+                request,
+                ..
+            } => {
+                validate_path(executable)?;
+                validate_path(staging)?;
+                validate_path(&request.source)?;
+                validate_path(&request.output)?;
+                request.limits.validate()?;
+            }
+            Self::EvidenceBegin {
+                directory,
+                capture_generation,
+                source_generation,
+                protected,
+                limits,
+                ..
+            } => {
+                validate_path(directory)?;
+                ensure!(
+                    !capture_generation.is_empty() && capture_generation.len() <= 128,
+                    "capture generation"
+                );
+                ensure!(
+                    !source_generation.is_empty() && source_generation.len() <= 128,
+                    "source generation"
+                );
+                ensure!(protected.len() <= 4096, "protected roster");
+                limits.validate()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    pub(crate) fn cleanup(&self) -> bool {
+        matches!(
+            self,
+            Self::RootRelease { .. }
+                | Self::CaptureCancel { .. }
+                | Self::CaptureRetire { .. }
+                | Self::EvidenceRelease { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomWorkbenchIoReply {
+    Root {
+        operation: String,
+        root: NativePath,
+        database_revision:
+            crate::lightroom_migration_worker::source_reader::capture_wire::FileRevision,
+        physical: crate::lightroom_migration_worker::identity::FileKey,
+    },
+    CaptureRunning {
+        operation: String,
+        pid: U64,
+        staging: NativePath,
+    },
+    CaptureComplete {
+        operation: String,
+        manifest: crate::lightroom::capture::Manifest,
+    },
+    Evidence {
+        operation: String,
+        capture_generation: String,
+        directory: NativePath,
+        manifest: crate::lightroom::capture::Manifest,
+        manifest_blake3: String,
+        authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    },
+    Released {
+        operation: String,
+    },
+}
+impl LightroomWorkbenchIoReply {
+    pub fn validate_for(&self, request: &LightroomWorkbenchIo) -> Result<()> {
+        let requested = request.ids()[0];
+        let actual = match self {
+            Self::Root {
+                operation,
+                root,
+                database_revision,
+                physical,
+            } => {
+                validate_path(root)?;
+                ensure!(
+                    database_revision.bytes <= i64::MAX as u64,
+                    "Workbench root size"
+                );
+                ensure!(
+                    physical.volume.0 != 0 || physical.index.0 != 0,
+                    "Workbench root identity"
+                );
+                operation
+            }
+            Self::CaptureRunning {
+                operation,
+                pid,
+                staging,
+            } => {
+                ensure!(pid.0 > 0, "capture pid");
+                validate_path(staging)?;
+                operation
+            }
+            Self::CaptureComplete {
+                operation,
+                manifest,
+            } => {
+                ensure!(
+                    manifest.protocol == crate::lightroom::PROTOCOL,
+                    "capture manifest protocol"
+                );
+                operation
+            }
+            Self::Evidence {
+                operation,
+                capture_generation,
+                manifest_blake3,
+                authority,
+                ..
+            } => {
+                ensure!(
+                    !capture_generation.is_empty() && capture_generation.len() <= 128,
+                    "capture evidence generation"
+                );
+                ensure!(manifest_blake3.len() == 64, "capture manifest digest");
+                authority.validate()?;
+                operation
+            }
+            Self::Released { operation } => operation,
+        };
+        ensure!(actual == requested, "Workbench F reply operation differs");
+        Ok(())
+    }
 }
 impl LightroomArtifactPreparationReply {
     pub fn validate_for(&self, request: &LightroomArtifactPreparation) -> Result<()> {
@@ -645,6 +924,7 @@ pub enum Response {
     PreviewConfiguration(Vec<u8>),
     LightroomSealedDocument(Option<LightroomSealedDocumentPage>),
     LightroomArtifactPreparation(Option<LightroomArtifactPreparationReply>),
+    LightroomWorkbenchIo(LightroomWorkbenchIoReply),
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     MigrationIdentity(MigrationIdentityReply),

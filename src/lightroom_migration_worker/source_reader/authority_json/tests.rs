@@ -148,7 +148,8 @@ fn capture_sql_authority_is_distinct_and_binding_complete() -> Result<()> {
             bytes: 1,
             modified_ns: None,
             changed: "changed".into(),
-        },
+        }
+        .into(),
         logical_blake3: "3".repeat(64),
         maximum_bytes: U64(1),
         physical: FileKey {
