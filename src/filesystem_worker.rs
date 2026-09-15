@@ -447,6 +447,28 @@ pub(crate) mod export_executor_test_support {
     }
 }
 
+/// In-process access to the real F import owner for exact replay/custody tests.
+#[cfg(test)]
+pub(crate) mod import_test_support {
+    use super::*;
+    #[derive(Default)]
+    pub struct Owner(super::import::Owner);
+    impl Owner {
+        pub fn call(
+            &mut self,
+            catalog: &Path,
+            original_roots: &[NativePath],
+            request: &crate::catalog_session::import::Request,
+            cancel: &AtomicBool,
+        ) -> Result<crate::catalog_session::import::Reply> {
+            self.0.call(catalog, original_roots, request, cancel)
+        }
+        pub fn empty(&self) -> bool {
+            self.0.empty()
+        }
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn delete_export_held(file: &File) -> Result<()> {
     export_stage::delete_held(file)

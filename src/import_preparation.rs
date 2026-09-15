@@ -831,12 +831,39 @@ impl SinglePreparation {
     }
 }
 struct RemoteImport {
-    session: Arc<crate::catalog_session::CatalogSessionAuthority>,
+    route: RemoteImportRoute,
     root: crate::catalog_session::RootCapability,
     transfer: crate::catalog_session::LeaseId,
     step: u64,
     pending: Option<crate::catalog_session::import::Request>,
     active: bool,
+}
+enum RemoteImportRoute {
+    Catalog(Arc<crate::catalog_session::CatalogSessionAuthority>),
+    #[cfg(test)]
+    Callback(
+        Arc<
+            dyn Fn(
+                    &crate::catalog_session::import::Request,
+                    &AtomicBool,
+                ) -> Result<Option<crate::catalog_session::import::Reply>>
+                + Send
+                + Sync,
+        >,
+    ),
+}
+impl RemoteImportRoute {
+    fn call(
+        &self,
+        request: &crate::catalog_session::import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::catalog_session::import::Reply>> {
+        match self {
+            Self::Catalog(session) => session.import_call(request, cancel),
+            #[cfg(test)]
+            Self::Callback(call) => call(request, cancel),
+        }
+    }
 }
 struct RemoteCustody {
     remote: Option<RemoteImport>,
@@ -884,7 +911,7 @@ impl RemoteImport {
             action,
         };
         self.pending = Some(request.clone());
-        let reply = match self.session.import_call(&request, cancel) {
+        let reply = match self.route.call(&request, cancel) {
             Ok(Some(reply)) => reply,
             Ok(None) => {
                 self.pending = None;
@@ -922,7 +949,7 @@ impl RemoteImport {
         let Some(request) = self.pending.clone() else {
             return Ok(None);
         };
-        let reply = match self.session.import_call(&request, &AtomicBool::new(false)) {
+        let reply = match self.route.call(&request, &AtomicBool::new(false)) {
             Ok(Some(reply)) => reply,
             Ok(None) => {
                 self.pending = None;
@@ -1020,7 +1047,7 @@ fn prepare_managed(
     let discovery = catalog_metadata::ImportDiscovery::from_admitted(db, cancel.clone())?;
     let mut custody = RemoteCustody::new(
         RemoteImport {
-            session,
+            route: RemoteImportRoute::Catalog(session),
             root,
             transfer: crate::catalog_session::LeaseId::new(),
             step: 0,
@@ -1335,6 +1362,185 @@ mod tests {
     use super::*;
     use crate::edit::{Recipe, RecipeV1};
     use crate::storage_volume::{IdentityScheme, MountedVolume, PersistentVolumeId};
+
+    #[test]
+    fn remote_release_replays_unknown_acknowledgements_against_real_f_owner() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let catalog = temp.path().join("catalog");
+        let originals = temp.path().join("originals");
+        fs::create_dir(&catalog)?;
+        fs::create_dir(&originals)?;
+        let catalog = catalog.canonicalize()?;
+        let originals = originals.canonicalize()?;
+        let original = originals.join("image.jpg");
+        fs::write(&original, b"original")?;
+        let catalog_file = File::create(catalog.join("catalog.sqlite3"))?;
+        let catalog_directory = crate::filesystem_worker::open_directory(&catalog)?;
+        let root = crate::catalog_session::RootCapability {
+            epoch: crate::catalog_session::LeaseId::new(),
+            token: crate::catalog_session::LeaseId::new(),
+            session: crate::catalog_session::LeaseId::new(),
+            canonical_root: NativePath::from_path(&catalog),
+            root_physical: crate::catalog_storage::physical_object_id(&catalog_directory)?,
+            catalog_physical: crate::catalog_storage::physical_object_id(&catalog_file)?,
+        };
+        let owner = Arc::new(std::sync::Mutex::new(
+            crate::filesystem_worker::import_test_support::Owner::default(),
+        ));
+        let lost = Arc::new(std::sync::Mutex::new(BTreeSet::from([
+            "inspection",
+            "file",
+        ])));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route = {
+            let owner = owner.clone();
+            let lost = lost.clone();
+            let requests = requests.clone();
+            let catalog = catalog.clone();
+            let original_roots = vec![NativePath::from_path(&originals)];
+            RemoteImportRoute::Callback(Arc::new(move |request, cancel| {
+                requests.lock().unwrap().push(request.clone());
+                let reply =
+                    owner
+                        .lock()
+                        .unwrap()
+                        .call(&catalog, &original_roots, request, cancel)?;
+                let release = match &request.action {
+                    crate::catalog_session::import::Action::ReleaseInspection { .. } => {
+                        Some("inspection")
+                    }
+                    crate::catalog_session::import::Action::ReleaseFile { .. } => Some("file"),
+                    _ => None,
+                };
+                if release.is_some_and(|release| lost.lock().unwrap().remove(release)) {
+                    return Err(crate::filesystem_worker::wire::Failure::new(
+                        crate::filesystem_worker::wire::FailureKind::Unknown,
+                        "injected lost successful release acknowledgement",
+                    )
+                    .into());
+                }
+                Ok(Some(reply))
+            }))
+        };
+        let mut remote = RemoteImport {
+            route,
+            root,
+            transfer: crate::catalog_session::LeaseId::new(),
+            step: 0,
+            pending: None,
+            active: false,
+        };
+        assert!(matches!(
+            remote.call(
+                crate::catalog_session::import::Action::Begin {
+                    source: NativePath::from_path(&originals),
+                },
+                &AtomicBool::new(false),
+            )?,
+            crate::catalog_session::import::Value::Begun
+        ));
+        loop {
+            match remote.call(
+                crate::catalog_session::import::Action::Next,
+                &AtomicBool::new(false),
+            )? {
+                crate::catalog_session::import::Value::Header { path, .. } => {
+                    ensure!(
+                        path == NativePath::from_path(&original),
+                        "unexpected original"
+                    );
+                    break;
+                }
+                crate::catalog_session::import::Value::DirectoryStart { .. }
+                | crate::catalog_session::import::Value::DirectoryFacts { .. }
+                | crate::catalog_session::import::Value::DirectoryEnd { .. } => {}
+                value => anyhow::bail!("unexpected pre-header import value: {value:?}"),
+            }
+        }
+        let missing = originals.join("image.xmp");
+        assert!(matches!(
+            remote.call(
+                crate::catalog_session::import::Action::Inspect {
+                    source: Source {
+                        kind: "sidecar".into(),
+                        locator: location_bytes(&missing),
+                        display: missing.to_string_lossy().into_owned(),
+                        ambiguous: false,
+                        provenance: serde_json::json!({"fixture":"lost-release"}),
+                    },
+                },
+                &AtomicBool::new(false),
+            )?,
+            crate::catalog_session::import::Value::InspectionFailed { .. }
+        ));
+        let inspection_grant = match remote.call(
+            crate::catalog_session::import::Action::ValidateInspection,
+            &AtomicBool::new(false),
+        )? {
+            crate::catalog_session::import::Value::InspectionValidated { grant } => grant,
+            value => anyhow::bail!("unexpected inspection validation value: {value:?}"),
+        };
+        assert!(matches!(
+            remote.release(
+                crate::catalog_session::import::Action::ReleaseInspection {
+                    grant: inspection_grant.clone(),
+                }
+            )?,
+            crate::catalog_session::import::Value::InspectionReleased { grant }
+                if grant == inspection_grant
+        ));
+        let file_grant = match remote.call(
+            crate::catalog_session::import::Action::ValidateFile,
+            &AtomicBool::new(false),
+        )? {
+            crate::catalog_session::import::Value::FileValidated { grant } => grant,
+            value => anyhow::bail!("unexpected file validation value: {value:?}"),
+        };
+        assert!(matches!(
+            remote.release(crate::catalog_session::import::Action::ReleaseFile {
+                grant: file_grant.clone(),
+            })?,
+            crate::catalog_session::import::Value::FileReleased { grant } if grant == file_grant
+        ));
+        remote.abort()?;
+        ensure!(
+            owner.lock().unwrap().empty(),
+            "F import owner did not retire"
+        );
+        ensure!(
+            remote.pending.is_none() && !remote.active,
+            "remote custody remained active"
+        );
+        ensure!(
+            lost.lock().unwrap().is_empty(),
+            "release loss was not exercised"
+        );
+        let requests = requests.lock().unwrap();
+        for release in ["inspection", "file"] {
+            let matching: Vec<_> = requests
+                .iter()
+                .filter(|request| {
+                    matches!(
+                        (&request.action, release),
+                        (
+                            crate::catalog_session::import::Action::ReleaseInspection { .. },
+                            "inspection"
+                        ) | (
+                            crate::catalog_session::import::Action::ReleaseFile { .. },
+                            "file"
+                        )
+                    )
+                })
+                .collect();
+            ensure!(matching.len() == 2, "release was not replayed exactly once");
+            ensure!(
+                matching[0].step == matching[1].step
+                    && matching[0].digest()? == matching[1].digest()?,
+                "release replay changed the retained request"
+            );
+        }
+        Ok(())
+    }
 
     fn observation(path: &Path, relative: &Path) -> VolumeLocation {
         VolumeLocation {
