@@ -100,6 +100,7 @@ enum Work {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 enum CallbackRequest {
     Filesystem {
         request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
@@ -131,6 +132,7 @@ enum CallbackRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 enum CallbackValue {
     Filesystem(crate::filesystem_worker::wire::LightroomWorkbenchIoReply),
     Source(String),
@@ -162,6 +164,7 @@ impl Failure {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 enum Outcome {
     Ready {
         instance: crate::catalog_session::LeaseId,
@@ -644,6 +647,7 @@ impl Client {
     pub fn spawn(executable: &Path) -> Result<Self> {
         Self::spawn_inner(executable, None)
     }
+    #[allow(dead_code)]
     pub(crate) fn spawn_managed(
         executable: &Path,
         managed: &Arc<dyn super::lightroom::ManagedIo>,

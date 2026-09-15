@@ -17,7 +17,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeSet,
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},

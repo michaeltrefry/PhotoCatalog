@@ -192,6 +192,7 @@ pub(super) fn serve_mode(
     result
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Roster {
     Sql(MigrationSource),
     Artifact(ArtifactReader),

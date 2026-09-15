@@ -303,7 +303,7 @@ impl Owner {
     }
     fn capture_limits(&self) -> capture_wire::Limits {
         capture_wire::Limits {
-            open_deadline_ms: U64(self.config.limits.deadline_ms.min(120_000).max(1)),
+            open_deadline_ms: U64(self.config.limits.deadline_ms.clamp(1, 120_000)),
             total_deadline_ms: U64(self.config.limits.deadline_ms.max(1)),
             vm_steps: U64(self.config.limits.vm_steps.max(1)),
             schema_objects: U64(capture_wire::MAX_SCHEMA_OBJECTS as u64),
@@ -538,7 +538,7 @@ impl Owner {
                 anyhow::bail!("seal hash reply kind")
             };
             let seal = review.managed_input_seal(&preparation, database, identity, blake3)?;
-            let remaining = self.config.limits.deadline_ms.min(120_000).max(1);
+            let remaining = self.config.limits.deadline_ms.clamp(1, 120_000);
             let limits = core::migration_source::ReadLimits {
                 open_deadline_ms: self.config.limits.deadline_ms.max(1),
                 deadline_ms: remaining,
@@ -943,15 +943,15 @@ impl Owner {
     }
     fn close(&mut self) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(review) = self.review.take() {
-            if let Err(error) = review.close_checked() {
-                failures.push(format!("selection review close: {error:#}"));
-            }
+        if let Some(review) = self.review.take()
+            && let Err(error) = review.close_checked()
+        {
+            failures.push(format!("selection review close: {error:#}"));
         }
-        if let Some(plan) = self.plan.take() {
-            if let Err(error) = plan.close_checked() {
-                failures.push(format!("inspection plan close: {error:#}"));
-            }
+        if let Some(plan) = self.plan.take()
+            && let Err(error) = plan.close_checked()
+        {
+            failures.push(format!("inspection plan close: {error:#}"));
         }
         if let Some(io) = &self.managed {
             let request = LightroomWorkbenchIo::RootRelease {

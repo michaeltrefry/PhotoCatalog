@@ -872,6 +872,7 @@ impl LightroomWorkbenchIo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum LightroomWorkbenchIoReply {
     Root {
         operation: String,

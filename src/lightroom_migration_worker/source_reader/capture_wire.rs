@@ -372,12 +372,14 @@ mod hex_bytes {
     }
     pub(super) fn decode(value: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
-            value.len() % 2 == 0 && value.is_ascii(),
+            value.len().is_multiple_of(2) && value.is_ascii(),
             "invalid hex bytes"
         );
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|v| u8::from_str_radix(std::str::from_utf8(v)?, 16).map_err(Into::into))
             .collect()
     }

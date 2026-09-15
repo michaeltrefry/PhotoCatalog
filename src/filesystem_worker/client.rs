@@ -176,6 +176,7 @@ pub struct Client {
     pid: u32,
 }
 impl Client {
+    #[allow(dead_code)]
     pub(crate) fn lightroom_workbench_io(
         &self,
         request: &crate::filesystem_worker::wire::LightroomWorkbenchIo,

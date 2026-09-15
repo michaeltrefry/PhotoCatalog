@@ -662,9 +662,11 @@ pub(crate) struct RawReader {
     ticket: Option<super::commit::RawTicket>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct CaptureSqlReader {
     session: RefCell<Session>,
 }
+#[allow(dead_code)]
 impl CaptureSqlReader {
     pub(crate) fn open(
         relay: Arc<Client>,

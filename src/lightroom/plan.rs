@@ -1950,9 +1950,9 @@ impl Plan {
             let source_id = row.get::<_, String>(1)?;
             let encoded_path = row.get::<_, String>(2)?;
             let path: NativePath = serde_json::from_str(&encoded_path)?;
-            let token = digest(&bounded_json(
+            let token = digest(&super::bounded_json(
                 &(revision, sequence, &source_id, &path, packets),
-                PAGE_BYTES,
+                super::PAGE_BYTES,
             )?);
             let candidate = OriginalCandidate {
                 revision: revision.into(),
@@ -1963,11 +1963,11 @@ impl Plan {
                 limits: manifest.request.limits.clone(),
                 token,
             };
-            let size = bounded_json(&candidate, PAGE_BYTES)?.len();
+            let size = super::bounded_json(&candidate, super::PAGE_BYTES)?.len();
             if bytes
                 .checked_add(size)
                 .context("original candidate bytes")?
-                > PAGE_BYTES
+                > super::PAGE_BYTES
             {
                 ensure!(!out.is_empty(), "original candidate exceeds page bytes");
                 break;
@@ -2000,7 +2000,7 @@ impl Plan {
             "original candidate state changed before commit"
         );
         let path: NativePath = serde_json::from_str(&encoded_path)?;
-        let expected = digest(&bounded_json(
+        let expected = digest(&super::bounded_json(
             &(
                 candidate.revision.as_str(),
                 candidate.sequence,
@@ -2008,7 +2008,7 @@ impl Plan {
                 &path,
                 candidate.packets,
             ),
-            PAGE_BYTES,
+            super::PAGE_BYTES,
         )?);
         ensure!(
             expected == candidate.token
