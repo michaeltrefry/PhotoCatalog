@@ -732,7 +732,7 @@ mod tests {
         };
         #[cfg(windows)]
         let physical = |index| PhysicalObjectId::Windows {
-            volume_serial: U64(u64::MAX),
+            volume_serial: U64(u32::MAX as u64),
             file_index: U64(index),
         };
         let mut request = e::Request {
@@ -740,10 +740,7 @@ mod tests {
                 epoch: LeaseId::new(),
                 token: LeaseId::new(),
                 session: LeaseId::new(),
-                canonical_root: NativePath::from_path(&std::path::PathBuf::from(format!(
-                    "/{}",
-                    "x".repeat(crate::catalog_session::PATH_UNITS - 1)
-                ))),
+                canonical_root: crate::catalog_session::maximum_absolute_native_path_for_test(),
                 root_physical: physical(u64::MAX - 1),
                 catalog_physical: physical(u64::MAX),
             },

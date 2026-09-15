@@ -6,7 +6,6 @@ use crate::{
     },
     catalog_images::ImageMetadataIdentity,
     catalog_metadata::RenderIdentity,
-    catalog_session::PhysicalObjectId,
     edit::Recipe,
     image_export::{AlphaPolicy, IntegerDepth, OutputFormat, OutputSize},
     metadata_export::{DestinationSnapshot, FileRevision},
@@ -221,6 +220,10 @@ pub(crate) struct Fixture {
 pub(crate) fn fixture() -> Result<Fixture> {
     let temp = tempfile::tempdir()?;
     let base = temp.path().canonicalize()?;
+    let root_file = crate::filesystem_worker::open_directory(&base)?;
+    let catalog_path = base.join("fixture-catalog.sqlite3");
+    std::fs::write(&catalog_path, [])?;
+    let catalog_file = std::fs::File::open(&catalog_path)?;
     let recipe = Recipe::default();
     let fingerprint = "a".repeat(64);
     let plan = PhotoExportPlan {
@@ -289,14 +292,8 @@ pub(crate) fn fixture() -> Result<Fixture> {
         token: LeaseId::new(),
         session: LeaseId::new(),
         canonical_root: NativePath::from_path(&base),
-        root_physical: PhysicalObjectId::Unix {
-            device: U64(1),
-            inode: U64(2),
-        },
-        catalog_physical: PhysicalObjectId::Unix {
-            device: U64(1),
-            inode: U64(3),
-        },
+        root_physical: crate::catalog_storage::physical_object_id(&root_file)?,
+        catalog_physical: crate::catalog_storage::physical_object_id(&catalog_file)?,
     };
     let stage = LeaseId::new();
     let executor = export_executor::executor_id(&root, 1)?;

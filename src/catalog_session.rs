@@ -1168,6 +1168,21 @@ pub fn validate_path(path: &NativePath) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn maximum_absolute_native_path_for_test() -> NativePath {
+    let base = std::env::temp_dir();
+    let base_units = match NativePath::from_path(&base) {
+        NativePath::UnixBytes(value) => value.len(),
+        NativePath::WindowsWide(value) => value.len(),
+    };
+    let one_units = match NativePath::from_path(&base.join("x")) {
+        NativePath::UnixBytes(value) => value.len(),
+        NativePath::WindowsWide(value) => value.len(),
+    };
+    let separator_units = one_units - base_units - 1;
+    NativePath::from_path(&base.join("x".repeat(PATH_UNITS - base_units - separator_units)))
+}
+
 mod roles;
 use crate::{Catalog, catalog_writer};
 pub(crate) use roles::DISCOVERY as DISCOVERY_ROLE;
