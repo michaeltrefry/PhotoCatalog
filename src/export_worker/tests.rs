@@ -256,6 +256,42 @@ fn busy_worker_is_retained_and_delayed_open_cannot_cross_retirement() {
     assert_eq!(recovered.retired.len(), 1);
     discard_retired_export_transport(&recovered.retired[0]).unwrap();
 }
+#[cfg(windows)]
+#[test]
+fn busy_worker_with_non_delete_shared_directory_remains_retained() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let request = request(temp.path());
+    let path = stage(temp.path(), &request, true);
+    // Match the real export worker's directory access and sharing contract.
+    let directory = OpenOptions::new()
+        .read(true)
+        .access_mode(0x80000000)
+        .share_mode(1 | 2)
+        .custom_flags(0x02000000 | 0x00200000)
+        .open(&path)?;
+    let directory_identity = lease_identity(&directory)?;
+    let live = open_lease(&path)?;
+    live.try_lock_exclusive()?;
+
+    match fence_transport(&path)? {
+        Inspection::Retained(reason) => assert!(reason.contains("worker lease is busy")),
+        _ => bail!("active worker transport was not retained"),
+    }
+    assert_eq!(
+        lease_identity(&crate::filesystem_worker::open_directory(&path)?)?,
+        directory_identity
+    );
+
+    FileExt::unlock(&live)?;
+    drop(live);
+    drop(directory);
+    let recovered = recover_export_transports(temp.path(), 1)?;
+    assert_eq!(recovered.retired.len(), 1);
+    discard_retired_export_transport(&recovered.retired[0])?;
+    Ok(())
+}
 #[cfg(unix)]
 #[test]
 fn completed_recovery_releases_duplicate_description() {
