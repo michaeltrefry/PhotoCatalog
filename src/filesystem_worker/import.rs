@@ -1373,15 +1373,45 @@ mod tests {
             ambiguous: false,
             provenance: serde_json::json!({"fixture":true}),
         };
+        let length = match call(
+            &mut owner,
+            &fixture,
+            &transfer,
+            &mut step,
+            protocol::Action::Inspect { source },
+        )? {
+            protocol::Value::Inspection { bytes, .. } => bytes.0,
+            value => anyhow::bail!("unexpected inspection: {value:?}"),
+        };
+        // Malformed XMP is retained as a packet observation, not an I/O error.
+        // Complete delivery before changing the file so ValidateInspection is
+        // the exact rejection boundary exercised by this regression.
+        let mut offset = 0;
+        while offset < length {
+            let protocol::Value::Chunk { bytes, .. } = call(
+                &mut owner,
+                &fixture,
+                &transfer,
+                &mut step,
+                protocol::Action::Read {
+                    offset: U64(offset),
+                },
+            )?
+            else {
+                anyhow::bail!("missing inspection chunk");
+            };
+            ensure!(!bytes.is_empty(), "inspection transfer made no progress");
+            offset += bytes.len() as u64;
+        }
         ensure!(matches!(
             call(
                 &mut owner,
                 &fixture,
                 &transfer,
                 &mut step,
-                protocol::Action::Inspect { source }
+                protocol::Action::FinishInspection,
             )?,
-            protocol::Value::InspectionFailed { .. }
+            protocol::Value::InspectionFinished
         ));
         fs::write(&sidecar, b"replacement revision")?;
         let validation = fixture.request(&transfer, step, protocol::Action::ValidateInspection);
