@@ -1038,15 +1038,32 @@ fn rendering_allows_sibling_edit_and_foreground_preview_reaps_export_first() -> 
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
     );
-    let Response::Operation(Some(waiting)) = export(
-        &bridge,
-        &token,
-        Request::Status {
-            operation: Some(op.id.clone()),
-        },
-    )?
-    else {
-        panic!()
+    // Native reap permits the preview to start before export finishes its short
+    // SQL yield transition. Assert the no-hold contract once export has actually
+    // entered its waiting phase, rather than sampling that transition.
+    let until = Instant::now() + Duration::from_secs(5);
+    let waiting = loop {
+        let Response::Operation(Some(status)) = export(
+            &bridge,
+            &token,
+            Request::Status {
+                operation: Some(op.id.clone()),
+            },
+        )?
+        else {
+            panic!()
+        };
+        if status.phase == "waiting_for_previews" {
+            break status;
+        }
+        anyhow::ensure!(
+            Instant::now() < until,
+            "export did not enter preview wait: phase={} stage={} write_hold={}",
+            status.phase,
+            status.stage,
+            status.write_hold
+        );
+        thread::sleep(Duration::from_millis(5));
     };
     assert!(!waiting.write_hold);
     export(

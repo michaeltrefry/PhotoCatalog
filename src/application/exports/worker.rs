@@ -1103,7 +1103,13 @@ fn execute(
                 };
                 let exhausted =
                     processed >= max_items.0 || started.elapsed().as_secs() >= max_seconds.0;
-                let yielding = yielded || foreground || exhausted || permit_unavailable;
+                // Once foreground work has drained the export, let the next
+                // idle tick reach native-permit waiting. Repeating yield on an
+                // inactive service would reacquire SQL holds while previews run.
+                let yielding = yielded
+                    || (foreground && service.is_active())
+                    || exhausted
+                    || permit_unavailable;
                 let event = {
                     let _hold = ctx.authority(true)?;
                     // Cancellation keeps its real token through seal acceptance
