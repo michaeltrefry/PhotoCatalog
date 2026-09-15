@@ -60,6 +60,7 @@ fn session_with_memory(
     let kind = match &authority {
         Authority::Sql { .. } => Kind::Sql,
         Authority::Artifact { .. } => Kind::Raw,
+        Authority::CaptureSql { .. } => Kind::CaptureSql,
     };
     let binding = authority.binding()?;
     let encoded = exact_json(&authority, AUTHORITY_BYTES, &cancel)?;
@@ -73,6 +74,7 @@ fn session_with_memory(
             match kind {
                 Kind::Sql => "sql",
                 Kind::Raw => "raw",
+                Kind::CaptureSql => "capture-sql",
             },
         );
     crate::lightroom_migration_worker::process::source_environment(&mut command);

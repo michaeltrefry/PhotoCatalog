@@ -160,5 +160,9 @@ fn lm_executor_batch3_build_and_role_mismatch_refuse_before_filesystem_use() -> 
         process::Role::SourceRaw.argument(),
         "--lightroom-source-reader-raw"
     );
+    assert_eq!(
+        process::Role::SourceCaptureSql.argument(),
+        "--lightroom-source-reader-capture-sql"
+    );
     Ok(())
 }

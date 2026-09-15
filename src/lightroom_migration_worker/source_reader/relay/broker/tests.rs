@@ -248,11 +248,13 @@ fn absent(pids: &Arc<Mutex<Vec<u32>>>) {
     }
 }
 #[test]
-fn both_actual_sources_revoke_before_broker_join() -> Result<()> {
+fn all_actual_sources_revoke_before_broker_join() -> Result<()> {
     let (mut broker, _, pids) = broker()?;
     let sql = start(&broker, 1, Kind::Sql, "sql")?;
     let raw = start(&broker, 2, Kind::Raw, "raw")?;
+    let capture = start(&broker, 3, Kind::CaptureSql, "capture")?;
     assert_ne!(sql, raw);
+    assert_ne!(raw, capture);
     assert!(broker.ensure_idle().is_err());
     // This isolated broker fixture has no LM child; the caller supplies the
     // revocation acknowledgement only after its own executor is absent.
@@ -260,7 +262,7 @@ fn both_actual_sources_revoke_before_broker_join() -> Result<()> {
     broker.wait_revoked();
     assert!(broker.shared.state.lock().unwrap().revoked);
     broker.finish()?;
-    assert_eq!(pids.lock().unwrap().len(), 2);
+    assert_eq!(pids.lock().unwrap().len(), 3);
     absent(&pids);
     Ok(())
 }

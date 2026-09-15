@@ -1,7 +1,7 @@
 //! LM token proxies. The independent LM control listener updates epoch health
 //! without waiting for the worker's result consumer, writer permit, or data queue.
 use super::super::transport::{Epoch, Reply, Request, digest_valid};
-use super::{Assembly, Command, Event, Kind, Outgoing};
+use super::{Assembly, COUNT, Command, Event, Kind, Outgoing};
 use crate::{
     application::U64,
     lightroom_migration_worker::{
@@ -52,22 +52,22 @@ struct Slot {
 struct OperationMemory {
     retained_graph: usize,
     transient: usize,
-    opening: [usize; 2],
-    producer: [usize; 2],
+    opening: [usize; COUNT],
+    producer: [usize; COUNT],
     core: usize,
     phases: Reservation,
 }
 
 impl OperationMemory {
-    fn required(&self, transient: usize, graph: usize, opening: [usize; 2]) -> Result<usize> {
+    fn required(&self, transient: usize, graph: usize, opening: [usize; COUNT]) -> Result<usize> {
         use crate::lightroom_migration_worker::memory::layout::{add, mul};
-        add(
+        let sources = Kind::ALL.into_iter().try_fold(0usize, |sum, kind| {
             add(
-                add(opening[0], opening[1])?,
-                add(self.producer[0], self.producer[1])?,
-            )?,
-            add(add(transient, mul(3, graph)?)?, self.core)?,
-        )
+                sum,
+                add(opening[kind.index()], self.producer[kind.index()])?,
+            )
+        })?;
+        add(sources, add(add(transient, mul(3, graph)?)?, self.core)?)
     }
 }
 
@@ -75,7 +75,7 @@ pub(crate) struct Client {
     guard: Guard,
     output: Arc<dyn Publish>,
     operation_memory: Mutex<OperationMemory>,
-    slots: Mutex<[Option<Arc<Slot>>; 2]>,
+    slots: Mutex<[Option<Arc<Slot>>; COUNT]>,
     next: AtomicU64,
     #[cfg(test)]
     core_growth_attempts: AtomicU64,
@@ -102,12 +102,12 @@ impl Client {
             operation_memory: Mutex::new(OperationMemory {
                 retained_graph: 0,
                 transient: 0,
-                opening: [0; 2],
-                producer: [0; 2],
+                opening: [0; COUNT],
+                producer: [0; COUNT],
                 core: 0,
                 phases: operation_memory.reservation(),
             }),
-            slots: Mutex::new([None, None]),
+            slots: Mutex::new(std::array::from_fn(|_| None)),
             next: AtomicU64::new(1),
             #[cfg(test)]
             core_growth_attempts: AtomicU64::new(0),
@@ -129,7 +129,7 @@ impl Client {
             )?,
         )?;
         add(
-            add(channels::arc(Layout::new::<Self>())?, mul(2, slots)?)?,
+            add(channels::arc(Layout::new::<Self>())?, mul(COUNT, slots)?)?,
             channels::pthread_mutexes(8)?,
         )
     }

@@ -16,6 +16,7 @@ use std::fmt;
 enum Mode {
     Sql,
     Artifact,
+    CaptureSql,
 }
 struct Envelope<'a> {
     mode: &'a RawValue,
@@ -110,6 +111,12 @@ struct Artifact<'a> {
     #[serde(borrow)]
     protected: &'a RawValue,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureSql<'a> {
+    #[serde(borrow)]
+    value: &'a RawValue,
+}
 // The old adjacent-tag decoder buffered content-before-mode through Content.
 // Validate that scalar/recursion grammar without retaining Content's full tree.
 // This is not serde_json::Value: its special RawValue key has no meaning here.
@@ -195,6 +202,7 @@ pub(super) fn decode(bytes: &[u8], stop: &dyn Fn() -> bool) -> Result<Authority>
         match serde_json::from_str::<String>(e.mode.get())?.as_str() {
             "Sql" => Mode::Sql,
             "Artifact" => Mode::Artifact,
+            "CaptureSql" => Mode::CaptureSql,
             _ => anyhow::bail!("unknown source authority mode"),
         }
     } else {
@@ -255,6 +263,16 @@ pub(super) fn decode(bytes: &[u8], stop: &dyn Fn() -> bool) -> Result<Authority>
                 limits: a.limits,
                 protected: protected(a.protected, stop)?,
             }
+        }
+        Mode::CaptureSql => {
+            // Keep the body behind a RawValue until the outer grammar and mode
+            // have been admitted. The typed authority has only bounded scalar,
+            // native-path, and protected-roster owners and validates its exact
+            // canonical binding before any pathname is resolved.
+            let body: CaptureSql<'_> = serde_json::from_str(e.body.get())?;
+            let value: super::capture_wire::Authority = serde_json::from_str(body.value.get())?;
+            value.validate()?;
+            Authority::CaptureSql { value }
         }
     };
     ensure!(!stop(), "source authority canceled");

@@ -483,6 +483,9 @@ fn main() -> Result<()> {
         Some(arg) if arg == "--lightroom-source-reader-raw" => {
             return photocatalog::lightroom_migration_worker::managed_source_reader_main(true);
         }
+        Some(arg) if arg == "--lightroom-source-reader-capture-sql" => {
+            return photocatalog::lightroom_migration_worker::managed_capture_sql_reader_main();
+        }
         Some(arg) if arg == "--lightroom-workbench-worker" => {
             std::process::exit(
                 if photocatalog::application::lightroom_process::worker_main().is_ok() {

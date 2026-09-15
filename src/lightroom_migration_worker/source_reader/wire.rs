@@ -69,6 +69,14 @@ pub(super) enum Value {
     Count(U64),
     Resolution(Resolution),
     ImageLinks(ImageLinks),
+    CaptureSchemaObjects(super::capture_wire::SchemaObjects),
+    CaptureVariables {
+        authority_binding: String,
+        schema_roster_blake3: String,
+        values: std::collections::BTreeMap<String, String>,
+    },
+    CaptureTable(super::capture_wire::TableValue),
+    CaptureCurrent(super::capture_wire::Current),
 }
 impl Query {
     pub(super) fn read(self, source: &dyn MigrationRead) -> Result<Value> {
@@ -136,6 +144,10 @@ pub(super) enum Kind {
     Count,
     Resolution,
     ImageLinks,
+    CaptureSchemaObjects,
+    CaptureVariables,
+    CaptureTable,
+    CaptureCurrent,
 }
 impl Value {
     /// Inspect the borrowed envelope and expected method before allocating its
@@ -177,6 +189,24 @@ impl Value {
             Kind::Count => Self::Count(serde_json::from_str(body)?),
             Kind::Resolution => Self::Resolution(serde_json::from_str(body)?),
             Kind::ImageLinks => Self::ImageLinks(serde_json::from_str(body)?),
+            Kind::CaptureSchemaObjects => Self::CaptureSchemaObjects(serde_json::from_str(body)?),
+            Kind::CaptureVariables => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Variables {
+                    authority_binding: String,
+                    schema_roster_blake3: String,
+                    values: std::collections::BTreeMap<String, String>,
+                }
+                let v: Variables = serde_json::from_str(body)?;
+                Self::CaptureVariables {
+                    authority_binding: v.authority_binding,
+                    schema_roster_blake3: v.schema_roster_blake3,
+                    values: v.values,
+                }
+            }
+            Kind::CaptureTable => Self::CaptureTable(serde_json::from_str(body)?),
+            Kind::CaptureCurrent => Self::CaptureCurrent(serde_json::from_str(body)?),
             Kind::Verified => unreachable!("verified unit handled before body admission"),
         })
     }
@@ -231,6 +261,11 @@ impl Value {
             )?,
             super::transport::Read::ArtifactVerify
             | super::transport::Read::Sql(Query::Count { .. }) => 0,
+            super::transport::Read::CaptureSql(_) => {
+                // The complete typed CaptureSql graph is bounded by its authority
+                // result/page caps and the exact admitted encoded length.
+                add(mul(4, length)?, 4096)?
+            }
             _ => add(mul(2, length)?, 8)?,
         };
         Ok((transient, graph))
@@ -277,6 +312,15 @@ impl Value {
                     anyhow::bail!("source authority/method mismatch")
                 };
                 chunk(bytes)
+            }
+            super::transport::Read::CaptureSql(_) => {
+                let Budget::Capture(limits) = expected.budget else {
+                    anyhow::bail!("source authority/method mismatch")
+                };
+                add(
+                    mul(6, usize::try_from(limits.result_bytes.0)?)?,
+                    FRAME_BYTES,
+                )?
             }
             super::transport::Read::Sql(query) => {
                 let Budget::Sql(limits) = expected.budget else {

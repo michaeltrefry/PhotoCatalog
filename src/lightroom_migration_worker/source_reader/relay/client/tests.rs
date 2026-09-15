@@ -586,39 +586,44 @@ fn worker_quiescence_clears_queued_payloads_and_waits_for_exact_ack() -> Result<
 }
 
 #[test]
-fn operation_admission_retains_both_opening_roles_and_result_high_water() -> Result<()> {
+fn operation_admission_retains_all_opening_roles_and_result_high_water() -> Result<()> {
     let fixture = fixture()?;
     let client = &fixture.client;
     let baseline = fixture.budget.used();
     assert!(baseline > 0);
     client.admit_opening(Kind::Sql, 100)?;
     client.admit_opening(Kind::Raw, 50)?;
+    client.admit_opening(Kind::CaptureSql, 25)?;
     client.admit_result(20, 10)?;
-    assert_eq!(fixture.budget.used(), baseline + 200);
+    assert_eq!(fixture.budget.used(), baseline + 225);
     client.admit_result(5, 20)?;
     client.admit_opening(Kind::Raw, 10)?;
-    assert_eq!(fixture.budget.used(), baseline + 230);
+    assert_eq!(fixture.budget.used(), baseline + 255);
     // A denied growth must not update any of the successful owner maxima.
     let denied = client.admit_result(1024 * 1024, 1).unwrap_err();
     let denied = denied
         .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
         .unwrap();
-    assert_eq!(denied.available, 1024 * 1024 - baseline - 230);
+    assert_eq!(denied.available, 1024 * 1024 - baseline - 255);
     assert!(client.admit_result(usize::MAX, 1).is_err());
     let owner = client.operation_memory.lock().unwrap();
-    assert_eq!(fixture.budget.used(), baseline + 230);
+    assert_eq!(fixture.budget.used(), baseline + 255);
     assert_eq!(owner.transient, 20);
     assert_eq!(owner.retained_graph, 20);
-    assert_eq!(owner.opening, [100, 50]);
+    assert_eq!(owner.opening, [100, 50, 25]);
     drop(owner);
     client.admit_producer(Kind::Sql, 30)?;
     client.admit_producer(Kind::Raw, 40)?;
-    assert_eq!(fixture.budget.used(), baseline + 300);
+    client.admit_producer(Kind::CaptureSql, 20)?;
+    assert_eq!(fixture.budget.used(), baseline + 345);
     client.admit_producer(Kind::Sql, 10)?;
-    assert_eq!(fixture.budget.used(), baseline + 300);
+    assert_eq!(fixture.budget.used(), baseline + 345);
     assert!(client.admit_producer(Kind::Raw, usize::MAX).is_err());
-    assert_eq!(fixture.budget.used(), baseline + 300);
-    assert_eq!(client.operation_memory.lock().unwrap().producer, [30, 40]);
+    assert_eq!(fixture.budget.used(), baseline + 345);
+    assert_eq!(
+        client.operation_memory.lock().unwrap().producer,
+        [30, 40, 20]
+    );
     Ok(())
 }
 

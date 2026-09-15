@@ -1,7 +1,7 @@
 //! Independent G broker. Failure/control publication never waits for the data
 //! queue or for an actor writer acknowledgement. Only this thread owns Sources.
 use super::super::transport::Reply;
-use super::{Command, Event, Kind, server::Owner};
+use super::{COUNT, Command, Event, Kind, server::Owner};
 use crate::lightroom_migration_worker::{
     memory::MemoryBudget,
     process::{Process, Role as ProcessRole, Stop},
@@ -25,9 +25,9 @@ struct Control {
     active: usize,
     #[cfg(test)]
     event_full: bool,
-    // At most one exact failure for each of the two live epochs. This reserved
+    // At most one exact failure for each live epoch. This reserved
     // storage is independent of the normal event queue's occupancy.
-    urgent: [Option<Event>; 2],
+    urgent: [Option<Event>; COUNT],
     // The original typed broker failure stays here until the broker thread has
     // ended and G performs its checked join. The shared Stop is only a wakeup
     // and must not replace this cause with generic cancellation.
@@ -65,7 +65,7 @@ impl Broker {
         let channels = add(
             channels::broker::<Command, Event>()?,
             mul(
-                2,
+                COUNT,
                 add(
                     Process::<Reply>::allocation_backing()?,
                     super::super::owner::allocation_backing()?,
@@ -73,7 +73,8 @@ impl Broker {
             )?,
         )?;
         let shared = channels::arc(Layout::new::<Shared>())?;
-        let charges = channels::arc(Layout::new::<Mutex<[Option<super::server::Charge>; 2]>>())?;
+        let charges =
+            channels::arc(Layout::new::<Mutex<[Option<super::server::Charge>; COUNT]>>())?;
         let per_charge = channels::arc(Layout::new::<
             Mutex<crate::lightroom_migration_worker::memory::Reservation>,
         >())?;
@@ -82,7 +83,7 @@ impl Broker {
         add(
             add(add(channels, shared)?, charges)?,
             add(
-                mul(2, per_charge)?,
+                mul(COUNT, per_charge)?,
                 add(
                     channels::pthread_mutexes(8)?,
                     channels::pthread_condvars(2)?,
@@ -104,6 +105,7 @@ impl Broker {
             let role = match kind {
                 Kind::Sql => ProcessRole::SourceSql,
                 Kind::Raw => ProcessRole::SourceRaw,
+                Kind::CaptureSql => ProcessRole::SourceCaptureSql,
             };
             Process::spawn_role_with_cleanup(&executable, role, stop, Some(before_wait))
         })
@@ -119,10 +121,10 @@ impl Broker {
         // Managed G admission is backed by the caller's local shared pool;
         // holding a charge lock never invokes an IPC allocation callback.
         memory.snapshot()?;
-        let charges = Arc::new(Mutex::new([None, None]));
+        let charges = Arc::new(Mutex::new(std::array::from_fn(|_| None)));
         let mut owner = Owner::new(guard, memory, charges.clone())?;
-        let (commands, incoming) = mpsc::sync_channel(2);
-        let (outgoing, events) = mpsc::sync_channel(2);
+        let (commands, incoming) = mpsc::sync_channel(COUNT);
+        let (outgoing, events) = mpsc::sync_channel(COUNT);
         let shared = Arc::new(Shared {
             state: Mutex::new(Control {
                 revoke: false,
@@ -131,7 +133,7 @@ impl Broker {
                 active: 0,
                 #[cfg(test)]
                 event_full: false,
-                urgent: [None, None],
+                urgent: std::array::from_fn(|_| None),
                 failure: None,
             }),
             changed: Condvar::new(),

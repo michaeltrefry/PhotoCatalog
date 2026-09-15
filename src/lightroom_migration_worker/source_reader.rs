@@ -2,6 +2,8 @@
 //! immutable values; it never receives a source File or SQLite connection.
 mod artifact_factory;
 mod authority_json;
+mod capture_source;
+mod capture_wire;
 mod commit;
 mod owner;
 mod proxy;
@@ -11,7 +13,7 @@ mod wire;
 
 pub(crate) use artifact_factory::RemoteArtifacts;
 pub(crate) use commit::CommitHealth;
-pub(crate) use proxy::{Health, RawReader, SqlReader};
+pub(crate) use proxy::{CaptureSqlReader, Health, RawReader, SqlReader};
 
 /// Private worker mode on the configured installed executable. Do not initialize
 /// the GUI, a destination Catalog, or file-based logging before dispatching it.
@@ -30,6 +32,14 @@ pub fn managed_source_reader_main(raw: bool) -> anyhow::Result<()> {
         } else {
             relay::Kind::Sql
         }),
+    )
+}
+
+pub fn managed_capture_sql_reader_main() -> anyhow::Result<()> {
+    owner::serve_mode(
+        std::io::stdin(),
+        std::io::stdout().lock(),
+        Some(relay::Kind::CaptureSql),
     )
 }
 

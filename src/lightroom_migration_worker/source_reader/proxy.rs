@@ -113,12 +113,13 @@ impl Session {
     ) -> Result<Self> {
         epoch.validate()?;
         ensure!(
-            (1..=3_600_000).contains(&open_ms) && (1..=120_000).contains(&read_ms),
+            (1..=3_600_000).contains(&open_ms) && (1..=3_600_000).contains(&read_ms),
             "source process deadline bounds"
         );
         let kind = match &authority {
             Authority::Sql { .. } => Kind::Sql,
             Authority::Artifact { .. } => Kind::Raw,
+            Authority::CaptureSql { .. } => Kind::CaptureSql,
         };
         let budget = Budget::from_authority(&authority)?;
         let encoded_length = exact_json_length(&authority, AUTHORITY_BYTES, &cancel)?;
@@ -659,6 +660,84 @@ pub(crate) struct RawReader {
     descriptor: ArtifactDescriptor,
     encoded: Vec<u8>,
     ticket: Option<super::commit::RawTicket>,
+}
+
+pub(crate) struct CaptureSqlReader {
+    session: RefCell<Session>,
+}
+impl CaptureSqlReader {
+    pub(crate) fn open(
+        relay: Arc<Client>,
+        guard: Guard,
+        reader: String,
+        authority: super::capture_wire::Authority,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        authority.validate()?;
+        let limits = authority.limits;
+        let opening = usize::try_from(limits.schema_bytes.0)?
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(usize::try_from(limits.result_bytes.0).ok()?))
+            .context("CaptureSql opening allocation")?;
+        relay.admit_opening(Kind::CaptureSql, opening)?;
+        relay.admit_producer(
+            Kind::CaptureSql,
+            usize::try_from(limits.result_bytes.0)?
+                .checked_mul(6)
+                .context("CaptureSql producer allocation")?,
+        )?;
+        let session = Session::open(
+            relay,
+            Epoch { guard, reader },
+            Authority::CaptureSql { value: authority },
+            opening,
+            cancel,
+            limits.open_deadline_ms.0,
+            limits.total_deadline_ms.0,
+        )?;
+        Ok(Self {
+            session: RefCell::new(session),
+        })
+    }
+    pub(crate) fn health(&self) -> Health {
+        self.session.borrow().health.clone()
+    }
+    fn query(&self, query: super::capture_wire::Query) -> Result<Value> {
+        self.session.borrow_mut().query(Read::CaptureSql(query))
+    }
+    pub(crate) fn schema_objects(&self) -> Result<super::capture_wire::SchemaObjects> {
+        match self.query(super::capture_wire::Query::SchemaObjects)? {
+            Value::CaptureSchemaObjects(v) => Ok(v),
+            _ => anyhow::bail!("CaptureSql schema reply kind"),
+        }
+    }
+    pub(crate) fn variables(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        match self.query(super::capture_wire::Query::Variables)? {
+            Value::CaptureVariables { values, .. } => Ok(values),
+            _ => anyhow::bail!("CaptureSql variables reply kind"),
+        }
+    }
+    pub(crate) fn table_rows(
+        &self,
+        table_handle: String,
+        cursor: Option<Vec<crate::lightroom::plan::Cell>>,
+        limit: usize,
+    ) -> Result<super::capture_wire::TableValue> {
+        match self.query(super::capture_wire::Query::TableRows {
+            table_handle,
+            cursor,
+            limit: U64(limit.try_into()?),
+        })? {
+            Value::CaptureTable(v) => Ok(v),
+            _ => anyhow::bail!("CaptureSql table reply kind"),
+        }
+    }
+    pub(crate) fn current(&self) -> Result<super::capture_wire::Current> {
+        match self.query(super::capture_wire::Query::Current)? {
+            Value::CaptureCurrent(v) => Ok(v),
+            _ => anyhow::bail!("CaptureSql current reply kind"),
+        }
+    }
 }
 impl RawReader {
     pub(crate) fn open(

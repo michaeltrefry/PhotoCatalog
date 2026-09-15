@@ -208,10 +208,10 @@ pub struct Plan {
     root: PathBuf,
     execution: Option<Box<super::control::Control>>,
 }
-fn identifier(value: &str) -> String {
+pub(crate) fn identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
-pub(super) fn uri(path: &Path) -> Result<String> {
+pub(crate) fn uri(path: &Path) -> Result<String> {
     let path = fs::canonicalize(path)?;
     #[cfg(unix)]
     let bytes = {
@@ -239,7 +239,7 @@ pub(super) fn uri(path: &Path) -> Result<String> {
         .collect();
     Ok(format!("file:{escaped}?mode=ro&immutable=1"))
 }
-fn restrict(db: &Connection, limits: &Limits) -> Result<()> {
+pub(crate) fn restrict(db: &Connection, limits: &Limits) -> Result<()> {
     db.busy_timeout(Duration::from_millis(0))?;
     db.pragma_update(None, "trusted_schema", false)?;
     db.pragma_update(None, "mmap_size", 0)?;
