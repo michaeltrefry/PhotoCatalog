@@ -890,6 +890,13 @@ impl WorkerState {
                         base_model.0,
                         &path,
                         &cancel.0,
+                        limits.existing_file_bytes.0,
+                        crate::catalog_export_alias::AliasLimits {
+                            directories: usize::try_from(limits.alias_directories.0)
+                                .map_err(|value| native(value.into()))?,
+                            candidates: usize::try_from(limits.alias_candidates.0)
+                                .map_err(|value| native(value.into()))?,
+                        },
                         attempt,
                         digest,
                     )
@@ -910,6 +917,7 @@ impl WorkerState {
             } => {
                 limits.validate().map_err(native)?;
                 let (_, _, _, plan, _, _) = checked_plan(catalog, &operation, &authority_blake3)?;
+                checked_sidecar_limits(&plan, &limits)?;
                 if plan.expected.is_some() && !overwrite_ack {
                     return Err(error(
                         ErrorCode::InvalidRequest,
@@ -935,7 +943,8 @@ impl WorkerState {
                 limits,
             } => {
                 limits.validate().map_err(native)?;
-                checked_plan(catalog, &operation, &authority_blake3)?;
+                let (_, _, _, plan, _, _) = checked_plan(catalog, &operation, &authority_blake3)?;
+                checked_sidecar_limits(&plan, &limits)?;
                 if !may_publish_ack {
                     return Err(error(
                         ErrorCode::InvalidRequest,
@@ -957,7 +966,8 @@ impl WorkerState {
                 limits,
             } => {
                 limits.validate().map_err(native)?;
-                checked_plan(catalog, &operation, &authority_blake3)?;
+                let (_, _, _, plan, _, _) = checked_plan(catalog, &operation, &authority_blake3)?;
+                checked_sidecar_limits(&plan, &limits)?;
                 let path = recovery_directory
                     .to_path()
                     .map_err(|value| native(value.into()))?;
@@ -1503,7 +1513,7 @@ impl Coordinator {
         catalog: &mut Catalog,
         request: Request,
         bounds: &Limits,
-        _command_cancel: &Cancellation,
+        command_cancel: &Cancellation,
     ) -> Result<Response> {
         match request {
             Request::Options => Ok(Response::Options(options(bounds))),
@@ -1705,8 +1715,10 @@ impl Coordinator {
                 if length == 0 || length as usize > CHUNK {
                     return Err(error(ErrorCode::ResourceLimit, "metadata chunk limit"));
                 }
-                let shared = self.shared.lock().unwrap();
-                let reader = shared
+                let reader = self
+                    .shared
+                    .lock()
+                    .unwrap()
                     .reader
                     .as_ref()
                     .filter(|value| {
@@ -1714,24 +1726,77 @@ impl Coordinator {
                             && value.reference.blake3 == reference.blake3
                             && value.reference.bytes == reference.bytes
                     })
-                    .ok_or_else(|| {
-                        error(ErrorCode::StaleSession, "metadata byte reference changed")
-                    })?;
-                let start = usize::try_from(offset.0).map_err(|value| native(value.into()))?;
-                if start > reader.bytes.len() {
-                    return Err(error(ErrorCode::InvalidRequest, "metadata chunk offset"));
+                    .cloned();
+                if let Some(reader) = reader {
+                    let start = usize::try_from(offset.0).map_err(|value| native(value.into()))?;
+                    if start > reader.bytes.len() {
+                        return Err(error(ErrorCode::InvalidRequest, "metadata chunk offset"));
+                    }
+                    let end = start
+                        .saturating_add(length as usize)
+                        .min(reader.bytes.len());
+                    return Ok(Response::Chunk(Bytes {
+                        bytes: reader.bytes[start..end].to_vec(),
+                        offset,
+                        total: U64(reader.bytes.len() as u64),
+                        next: (end < reader.bytes.len()).then(|| U64(end as u64)),
+                        blake3: reader.reference.blake3,
+                        verified: true,
+                    }));
                 }
-                let end = start
-                    .saturating_add(length as usize)
-                    .min(reader.bytes.len());
-                Ok(Response::Chunk(Bytes {
-                    bytes: reader.bytes[start..end].to_vec(),
-                    offset,
-                    total: U64(reader.bytes.len() as u64),
-                    next: (end < reader.bytes.len()).then(|| U64(end as u64)),
-                    blake3: reader.reference.blake3.clone(),
+                if reference.media_type != "application/octet-stream" {
+                    return Err(error(
+                        ErrorCode::StaleSession,
+                        "metadata byte reference changed",
+                    ));
+                }
+                let (_, _, _, plan, _, _) = catalog
+                    .metadata_export_plan(&reference.token)
+                    .map_err(native)?
+                    .ok_or_else(|| error(ErrorCode::StaleSession, "sidecar plan changed"))?;
+                let expected = plan.expected.as_ref().ok_or_else(|| {
+                    error(
+                        ErrorCode::StaleSession,
+                        "sidecar plan has no existing snapshot",
+                    )
+                })?;
+                if reference.bytes.0 != expected.bytes || reference.blake3 != expected.digest {
+                    return Err(error(
+                        ErrorCode::StaleSession,
+                        "existing destination reference changed",
+                    ));
+                }
+                let value = catalog
+                    .session
+                    .read_metadata_existing(&plan, offset.0, length, &command_cancel.0)
+                    .map_err(native)?
+                    .ok_or_else(|| {
+                        error(
+                            ErrorCode::Native,
+                            "existing destination review requires managed filesystem custody",
+                        )
+                    })?;
+                let crate::catalog_session::metadata_files::Value::Existing {
+                    offset: actual_offset,
+                    total,
+                    bytes,
+                    blake3,
+                } = value
+                else {
+                    return Err(error(
+                        ErrorCode::Native,
+                        "unexpected existing destination chunk",
+                    ));
+                };
+                let end = actual_offset.0.saturating_add(bytes.len() as u64);
+                return Ok(Response::Chunk(Bytes {
+                    bytes,
+                    offset: actual_offset,
+                    total,
+                    next: (end < total.0).then_some(U64(end)),
+                    blake3,
                     verified: true,
-                }))
+                }));
             }
             Request::Plans {
                 owner,
@@ -1990,6 +2055,26 @@ fn checked_plan(
     }
     Ok(value)
 }
+fn checked_sidecar_limits(
+    plan: &crate::metadata_export::ExportPlan,
+    limits: &WriteLimits,
+) -> Result<()> {
+    let alias = crate::catalog_export_alias::AliasLimits {
+        directories: usize::try_from(limits.alias_directories.0)
+            .map_err(|value| native(value.into()))?,
+        candidates: usize::try_from(limits.alias_candidates.0)
+            .map_err(|value| native(value.into()))?,
+    };
+    if plan.max_existing_bytes != Some(limits.existing_file_bytes.0)
+        || plan.alias_limits != Some(alias)
+    {
+        return Err(error(
+            ErrorCode::StaleSession,
+            "sidecar admission limits differ from the reviewed plan",
+        ));
+    }
+    Ok(())
+}
 fn plan_json(catalog: &Catalog, operation: &str) -> AnyResult<Option<serde_json::Value>> {
     catalog
         .metadata_export_plan(operation)?
@@ -2009,7 +2094,21 @@ fn sidecar_json(
     authority: String,
     rowid: i64,
 ) -> serde_json::Value {
-    serde_json::json!({"row":I64(rowid),"operation":plan.operation,"version":U64(plan.version as u64),"owner":owner,"revision":I64(revision),"base_model":I64(base_model),"destination":NativePath::from_path(&plan.destination),"expected":plan.expected,"payload_bytes":U64(plan.payload_bytes),"payload_digest":plan.payload_digest,"authority_blake3":authority,"current":true,"receipt":receipt})
+    let existing = plan.expected.as_ref().map(|value| Reference {
+        token: plan.operation.clone(),
+        bytes: U64(value.bytes),
+        blake3: value.digest.clone(),
+        media_type: "application/octet-stream".into(),
+    });
+    let expected = plan.expected.as_ref().map(|value| {
+        serde_json::json!({
+            "bytes": U64(value.bytes),
+            "digest": value.digest,
+            "modified_ns": value.modified_ns.to_string(),
+            "identity": [U64(value.identity.0), U64(value.identity.1)],
+        })
+    });
+    serde_json::json!({"row":I64(rowid),"operation":plan.operation,"version":U64(plan.version as u64),"owner":owner,"revision":I64(revision),"base_model":I64(base_model),"destination":NativePath::from_path(&plan.destination),"expected":expected,"existing":existing,"max_existing_bytes":plan.max_existing_bytes.map(U64),"alias_limits":plan.alias_limits.map(|value| serde_json::json!({"directories":U64(value.directories as u64),"candidates":U64(value.candidates as u64)})),"payload_bytes":U64(plan.payload_bytes),"payload_digest":plan.payload_digest,"authority_blake3":authority,"current":true,"receipt":receipt})
 }
 
 #[cfg(test)]

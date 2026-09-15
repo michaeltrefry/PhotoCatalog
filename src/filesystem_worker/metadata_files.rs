@@ -127,6 +127,7 @@ impl Owner {
                     Mode::Plan {
                         destination,
                         max_existing_bytes,
+                        alias_limits,
                     } => {
                         let mut checkpoint = |_| {
                             if cancel.load(Ordering::Acquire) {
@@ -142,6 +143,7 @@ impl Owner {
                             &destination.to_path()?,
                             &transfer.bytes,
                             max_existing_bytes.0,
+                            alias_limits,
                             &mut checkpoint,
                         )?)
                     }
@@ -170,6 +172,30 @@ impl Owner {
                             bytes: U64(transfer.expected),
                             blake3: transfer.digest,
                         })
+                    }
+                    Mode::Existing {
+                        plan,
+                        offset,
+                        length,
+                    } => {
+                        ensure!(
+                            transfer.bytes.is_empty(),
+                            "existing-file read payload must be empty"
+                        );
+                        let mut checkpoint = |_| check_io(cancel);
+                        let bytes = crate::metadata_export::read_planned_existing_chunk(
+                            &plan,
+                            offset.0,
+                            length as usize,
+                            &mut checkpoint,
+                        )?;
+                        let expected = plan.expected.as_ref().unwrap();
+                        Value::Existing {
+                            offset,
+                            total: U64(expected.bytes),
+                            bytes,
+                            blake3: expected.digest.clone(),
+                        }
                     }
                 }
             }
@@ -476,6 +502,7 @@ mod tests {
                     mode: Mode::Plan {
                         destination: NativePath::from_path(&destination),
                         max_existing_bytes: U64(1024),
+                        alias_limits: Default::default(),
                     },
                     bytes: U64(payload.len() as u64),
                     blake3: digest.clone(),
@@ -496,6 +523,36 @@ mod tests {
         let Value::Plan(plan) = call(&mut owner, &root, &planning, 3, Action::Finish)? else {
             unreachable!()
         };
+
+        let existing = crate::catalog_session::LeaseId::new();
+        call(
+            &mut owner,
+            &root,
+            &existing,
+            1,
+            Action::Begin {
+                mode: Mode::Existing {
+                    plan: plan.clone(),
+                    offset: U64(1),
+                    length: 4,
+                },
+                bytes: U64(0),
+                blake3: blake3::hash(&[]).to_hex().to_string(),
+            },
+        )?;
+        let Value::Existing {
+            offset,
+            total,
+            bytes,
+            blake3,
+        } = call(&mut owner, &root, &existing, 2, Action::Finish)?
+        else {
+            unreachable!()
+        };
+        assert_eq!(offset, U64(1));
+        assert_eq!(total, U64(b"original sidecar".len() as u64));
+        assert_eq!(bytes, b"rigi");
+        assert_eq!(blake3, plan.expected.as_ref().unwrap().digest);
 
         let applying = crate::catalog_session::LeaseId::new();
         call(

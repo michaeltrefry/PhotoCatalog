@@ -53,6 +53,11 @@ pub struct ExportPlan {
     pub expected: Option<FileRevision>,
     pub payload_digest: String,
     pub payload_bytes: u64,
+    /// Present on bounded metadata-sidecar plans. Legacy plans predate this
+    /// admission and remain readable without being upgraded in place.
+    pub max_existing_bytes: Option<u64>,
+    /// Catalog-original exclusion budget captured by the C owner.
+    pub alias_limits: Option<crate::catalog_export_alias::AliasLimits>,
 }
 
 impl ExportPlan {
@@ -98,6 +103,8 @@ impl SealedPhotoExport {
             expected: self.snapshot.expected.clone(),
             payload_digest: self.payload.digest.clone(),
             payload_bytes: self.payload.bytes,
+            max_existing_bytes: None,
+            alias_limits: None,
         }
     }
     pub fn recovery_directory(&self) -> PathBuf {
@@ -398,6 +405,126 @@ pub(crate) fn validate_export_receipt_basic(receipt: &ExportReceipt) -> Result<(
     Ok(())
 }
 
+pub(crate) fn metadata_recovery_directory(plan: &ExportPlan) -> Result<PathBuf> {
+    validate_plan_wire(plan)?;
+    Ok(recovery_path(plan))
+}
+
+pub(crate) fn validate_metadata_export_receipt_wire(
+    receipt: &ExportReceipt,
+    plan: &ExportPlan,
+) -> Result<()> {
+    validate_export_receipt_basic(receipt)?;
+    let recovery = metadata_recovery_directory(plan)?;
+    ensure!(
+        receipt.destination == plan.destination && receipt.recovery_directory == recovery,
+        "metadata export receipt authority mismatch"
+    );
+    if let Some(captured) = &receipt.captured_original {
+        ensure!(
+            captured == &recovery.join("original"),
+            "metadata export receipt capture path mismatch"
+        );
+    }
+    ensure!(
+        plan.expected.is_some() || receipt.captured_original.is_none(),
+        "metadata receipt captured an unplanned original"
+    );
+    if receipt.state == ExportState::Published && plan.expected.is_some() {
+        ensure!(
+            receipt.captured_original.as_ref() == Some(&recovery.join("original")),
+            "metadata published receipt omitted its captured original"
+        );
+    }
+    if receipt.state == ExportState::Restored {
+        ensure!(
+            receipt.captured_original.is_none(),
+            "metadata restored receipt still claims a captured original"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn read_planned_existing_chunk(
+    plan: &ExportPlan,
+    offset: u64,
+    length: usize,
+    checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> Result<Vec<u8>> {
+    validate_plan(plan)?;
+    let expected = plan
+        .expected
+        .as_ref()
+        .context("metadata plan has no existing destination")?;
+    let limit = plan
+        .max_existing_bytes
+        .context("metadata plan has no existing-file admission")?;
+    ensure!(
+        length > 0 && length <= crate::catalog_session::metadata_files::CHUNK_BYTES,
+        "metadata existing-file chunk limit"
+    );
+    ensure!(
+        offset < expected.bytes,
+        "metadata existing-file chunk offset"
+    );
+    checkpoint(0)?;
+    let file = open_regular(&plan.destination)?;
+    let before = file.metadata()?;
+    ensure!(before.len() <= limit, "existing file byte limit");
+    let file_identity = identity(&file, &before)?;
+    let mut reader = (&file).take(before.len().saturating_add(1));
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hash = blake3::Hasher::new();
+    let mut count = 0u64;
+    let end = offset.saturating_add(length as u64).min(before.len());
+    let mut chunk = Vec::new();
+    chunk.try_reserve_exact(usize::try_from(end.saturating_sub(offset))?)?;
+    loop {
+        checkpoint(count)?;
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        let next = count
+            .checked_add(n as u64)
+            .context("file extent overflow")?;
+        ensure!(
+            next <= limit && next <= before.len(),
+            "file grew during bounded read"
+        );
+        let from = offset.max(count);
+        let to = end.min(next);
+        if from < to {
+            chunk.extend_from_slice(&buffer[(from - count) as usize..(to - count) as usize]);
+        }
+        hash.update(&buffer[..n]);
+        count = next;
+    }
+    let after = file.metadata()?;
+    let current = open_regular(&plan.destination)?;
+    let current_metadata = current.metadata()?;
+    let actual = FileRevision {
+        bytes: count,
+        digest: hash.finalize().to_hex().to_string(),
+        modified_ns: before
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos(),
+        identity: file_identity,
+    };
+    ensure!(
+        &actual == expected
+            && before.len() == after.len()
+            && before.modified()? == after.modified()?
+            && identity(&current, &current_metadata)? == file_identity
+            && current_metadata.len() == before.len()
+            && current_metadata.modified()? == before.modified()?,
+        "existing destination changed since metadata planning"
+    );
+    checkpoint(count)?;
+    Ok(chunk)
+}
+
 /// Fault/race seam used by deterministic tests; hooks never change the protocol.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,6 +549,8 @@ pub fn plan_export(destination: &Path, payload: &[u8]) -> Result<ExportPlan> {
         expected,
         payload_digest: blake3::hash(payload).to_hex().to_string(),
         payload_bytes: payload.len() as u64,
+        max_existing_bytes: None,
+        alias_limits: None,
     };
     admit_paths(&plan)?;
     Ok(plan)
@@ -431,6 +560,7 @@ pub(crate) fn plan_export_controlled(
     destination: &Path,
     payload: &[u8],
     max_existing_bytes: u64,
+    alias_limits: crate::catalog_export_alias::AliasLimits,
     checkpoint: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> Result<ExportPlan> {
     ensure!(
@@ -463,6 +593,8 @@ pub(crate) fn plan_export_controlled(
         expected,
         payload_digest: blake3::hash(payload).to_hex().to_string(),
         payload_bytes: payload.len() as u64,
+        max_existing_bytes: Some(max_existing_bytes),
+        alias_limits: Some(alias_limits),
     };
     validate_plan(&plan)?;
     Ok(plan)
@@ -918,6 +1050,25 @@ fn validate_plan(plan: &ExportPlan) -> Result<()> {
             && plan.payload_digest.bytes().all(|x| x.is_ascii_hexdigit()),
         "invalid payload digest"
     );
+    if let Some(limit) = plan.max_existing_bytes {
+        ensure!(
+            (1..=crate::catalog_session::metadata_files::EVIDENCE_BYTES).contains(&limit),
+            "invalid existing-file admission"
+        );
+        ensure!(
+            plan.expected
+                .as_ref()
+                .is_none_or(|value| value.bytes <= limit),
+            "destination revision exceeds existing-file admission"
+        );
+    }
+    if let Some(limits) = plan.alias_limits {
+        limits.validate()?;
+    }
+    ensure!(
+        plan.max_existing_bytes.is_some() == plan.alias_limits.is_some(),
+        "metadata plan admission is incomplete"
+    );
     Ok(())
 }
 
@@ -937,6 +1088,8 @@ fn validate_snapshot(snapshot: &DestinationSnapshot) -> Result<()> {
         expected: snapshot.expected.clone(),
         payload_digest: "0".repeat(64),
         payload_bytes: 0,
+        max_existing_bytes: None,
+        alias_limits: None,
     })?;
     ensure!(
         uuid::Uuid::parse_str(&snapshot.operation)?.to_string() == snapshot.operation,
@@ -1125,6 +1278,8 @@ fn revision_for_plan(path: &Path, plan: &ExportPlan) -> Result<FileRevision> {
             plan.payload_bytes
                 .max(plan.expected.as_ref().map_or(0, |old| old.bytes)),
         )
+    } else if let Some(existing) = plan.max_existing_bytes {
+        inspect_file_revision(path, plan.payload_bytes.max(existing))
     } else {
         revision(path)
     }
@@ -1137,6 +1292,8 @@ fn revision_if_exists_for_plan(path: &Path, plan: &ExportPlan) -> Result<Option<
             plan.payload_bytes
                 .max(plan.expected.as_ref().map_or(0, |old| old.bytes)),
         )
+    } else if let Some(existing) = plan.max_existing_bytes {
+        revision_if_exists_limited(path, plan.payload_bytes.max(existing))
     } else {
         revision_if_exists(path)
     }
@@ -1435,6 +1592,33 @@ mod snapshot_tests {
         assert!(changed);
         assert!(error.to_string().contains("grew during bounded read"));
         assert_eq!(fs::metadata(destination)?.len(), 128 * 1024 + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_existing_chunk_is_exact_and_rejects_changed_or_oversized_source() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().canonicalize()?.join("existing.xmp");
+        fs::write(&destination, b"0123456789")?;
+        let mut checkpoint = |_| Ok(());
+        assert!(
+            plan_export_controlled(&destination, b"new", 9, Default::default(), &mut checkpoint,)
+                .is_err()
+        );
+        let plan = plan_export_controlled(
+            &destination,
+            b"new",
+            10,
+            Default::default(),
+            &mut checkpoint,
+        )?;
+        assert_eq!(
+            read_planned_existing_chunk(&plan, 3, 4, &mut checkpoint)?,
+            b"3456"
+        );
+        fs::remove_file(&destination)?;
+        fs::write(&destination, b"abcdefghij")?;
+        assert!(read_planned_existing_chunk(&plan, 0, 4, &mut checkpoint).is_err());
         Ok(())
     }
 }

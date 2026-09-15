@@ -2380,6 +2380,8 @@ impl Catalog {
             base_model,
             destination,
             &std::sync::atomic::AtomicBool::new(false),
+            crate::catalog_session::metadata_files::EVIDENCE_BYTES,
+            Default::default(),
         )
     }
     pub(crate) fn plan_metadata_export_with_cancel(
@@ -2389,23 +2391,16 @@ impl Catalog {
         base_model: i64,
         destination: &Path,
         cancel: &std::sync::atomic::AtomicBool,
+        max_existing_bytes: u64,
+        alias_limits: crate::catalog_export_alias::AliasLimits,
     ) -> Result<MetadataExportPlan> {
+        self.require_jobs_released()?;
+        self.reconcile_export_paths(512)?;
+        ensure!(max_existing_bytes > 0, "existing file byte limit");
+        alias_limits.validate()?;
         let (payload, projected) =
             self.resolved_export_xmp(asset, expected_revision, base_model)?;
         let native = crate::storage_volume::NativePath::from_path(destination);
-        let plan = match self.session.plan_metadata_file(
-            &native,
-            &payload,
-            crate::catalog_session::metadata_files::EVIDENCE_BYTES,
-            cancel,
-        )? {
-            Some(plan) => plan,
-            None => crate::metadata_export::plan_export(destination, &payload)?,
-        };
-        let hash = blake3::hash(&payload).to_hex().to_string();
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&payload)?;
-        let compressed = encoder.finish()?;
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
@@ -2416,6 +2411,46 @@ impl Catalog {
             revision(&tx, asset)? == expected_revision,
             "metadata changed during export planning"
         );
+        let mut control = crate::catalog_exports::ExportControl::new(cancel);
+        crate::catalog_exports::protect_catalog_original_destination_controlled(
+            &tx,
+            &self.session,
+            destination,
+            alias_limits,
+            &mut control,
+        )?;
+        let plan = match self.session.plan_metadata_file(
+            &native,
+            &payload,
+            max_existing_bytes,
+            alias_limits,
+            cancel,
+        )? {
+            Some(plan) => plan,
+            None => {
+                let mut checkpoint = |_| {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "metadata planning canceled",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                };
+                crate::metadata_export::plan_export_controlled(
+                    destination,
+                    &payload,
+                    max_existing_bytes,
+                    alias_limits,
+                    &mut checkpoint,
+                )?
+            }
+        };
+        let hash = blake3::hash(&payload).to_hex().to_string();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload)?;
+        let compressed = encoder.finish()?;
         tx.execute(
             "INSERT OR IGNORE INTO metadata_blobs VALUES(?1,?2,?3)",
             params![hash, payload.len() as i64, compressed],
@@ -2534,6 +2569,7 @@ impl Catalog {
         durable: Option<(&str, &str, &str)>,
     ) -> Result<crate::metadata_export::ExportReceipt> {
         self.require_jobs_released()?;
+        self.reconcile_export_paths(512)?;
         // IMMEDIATE prevents a concurrent catalog writer from changing metadata between the
         // revision check and external publication. Filesystem recovery evidence remains durable
         // even if the catalog transaction itself fails after publication.
@@ -2558,10 +2594,21 @@ impl Catalog {
         );
         let plan: crate::metadata_export::ExportPlan = serde_json::from_str(&stored.plan_json)?;
         let payload = read_blob(&tx, &stored.payload_hash)?;
+        if let Some(limits) = plan.alias_limits {
+            let mut control = crate::catalog_exports::ExportControl::new(cancel);
+            crate::catalog_exports::protect_catalog_original_destination_controlled(
+                &tx,
+                &self.session,
+                &plan.destination,
+                limits,
+                &mut control,
+            )?;
+        }
         let receipt = match self.session.apply_metadata_file(&plan, &payload, cancel)? {
             Some(receipt) => receipt,
             None => crate::metadata_export::apply_export(&plan, &payload)?,
         };
+        crate::metadata_export::validate_metadata_export_receipt_wire(&receipt, &plan)?;
         tx.execute(
             "UPDATE metadata_export_plans SET receipt=?1 WHERE operation=?2",
             params![serde_json::to_string(&receipt)?, operation],
@@ -2635,6 +2682,7 @@ impl Catalog {
         durable: Option<(&str, &str)>,
     ) -> Result<crate::metadata_export::ExportReceipt> {
         self.require_jobs_released()?;
+        self.reconcile_export_paths(512)?;
         let name = directory
             .file_name()
             .and_then(|s| s.to_str())
@@ -2670,6 +2718,16 @@ impl Catalog {
         );
         let current = crate::catalog_image_exports::current(&tx, operation, &asset, expected)?;
         let restore = restore_only || !current;
+        if !restore && let Some(limits) = plan.alias_limits {
+            let mut control = crate::catalog_exports::ExportControl::new(cancel);
+            crate::catalog_exports::protect_catalog_original_destination_controlled(
+                &tx,
+                &self.session,
+                &plan.destination,
+                limits,
+                &mut control,
+            )?;
+        }
         let receipt = match if restore {
             self.session.restore_metadata_file(&plan, cancel)?
         } else {
@@ -2679,6 +2737,7 @@ impl Catalog {
             None if restore => crate::metadata_export::restore_planned_export(&plan)?,
             None => crate::metadata_export::recover_export(&expected_directory)?,
         };
+        crate::metadata_export::validate_metadata_export_receipt_wire(&receipt, &plan)?;
         tx.execute(
             "UPDATE metadata_export_plans SET receipt=?1 WHERE operation=?2",
             params![serde_json::to_string(&receipt)?, operation],

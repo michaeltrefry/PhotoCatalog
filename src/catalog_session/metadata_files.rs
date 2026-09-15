@@ -3,7 +3,7 @@
 //! authority and sends packet bytes as fixed-size binary chunks.
 use super::{LeaseId, RootCapability};
 use crate::{application::U64, storage_volume::NativePath};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const CHUNK_BYTES: usize = 16 * 1024;
@@ -21,6 +21,7 @@ pub enum Mode {
     Plan {
         destination: NativePath,
         max_existing_bytes: U64,
+        alias_limits: crate::catalog_export_alias::AliasLimits,
     },
     Apply {
         plan: crate::metadata_export::ExportPlan,
@@ -34,6 +35,11 @@ pub enum Mode {
     Evidence {
         destination: NativePath,
     },
+    Existing {
+        plan: crate::metadata_export::ExportPlan,
+        offset: U64,
+        length: u32,
+    },
 }
 
 impl Mode {
@@ -41,7 +47,7 @@ impl Mode {
         match self {
             Self::Evidence { .. } => EVIDENCE_BYTES,
             Self::Plan { .. } | Self::Apply { .. } => PACKET_BYTES,
-            Self::Recover { .. } | Self::Restore { .. } => 0,
+            Self::Recover { .. } | Self::Restore { .. } | Self::Existing { .. } => 0,
         }
     }
     fn validate(&self) -> Result<()> {
@@ -49,18 +55,42 @@ impl Mode {
             Self::Plan {
                 destination,
                 max_existing_bytes,
+                alias_limits,
             } => {
                 super::validate_path(destination)?;
                 ensure!(
                     (1..=EVIDENCE_BYTES).contains(&max_existing_bytes.0),
                     "existing sidecar byte limit"
                 );
+                alias_limits.validate()?;
             }
             Self::Apply { plan } | Self::Recover { plan } | Self::Restore { plan } => {
                 crate::metadata_export::validate_plan_wire(plan)?;
                 ensure!(plan.is_xmp(), "metadata file operation requires XMP plan");
             }
             Self::Evidence { destination } => super::validate_path(destination)?,
+            Self::Existing {
+                plan,
+                offset,
+                length,
+            } => {
+                crate::metadata_export::validate_plan_wire(plan)?;
+                ensure!(
+                    plan.is_xmp(),
+                    "metadata existing-file read requires XMP plan"
+                );
+                let expected = plan
+                    .expected
+                    .as_ref()
+                    .context("metadata plan has no existing destination")?;
+                ensure!(
+                    plan.max_existing_bytes.is_some()
+                        && *length > 0
+                        && *length as usize <= CHUNK_BYTES
+                        && offset.0 < expected.bytes,
+                    "metadata existing-file chunk authority"
+                );
+            }
         }
         Ok(())
     }
@@ -199,6 +229,12 @@ pub enum Value {
     Plan(crate::metadata_export::ExportPlan),
     Receipt(crate::metadata_export::ExportReceipt),
     Evidence(EvidenceReceipt),
+    Existing {
+        offset: U64,
+        total: U64,
+        bytes: Vec<u8>,
+        blake3: String,
+    },
     Discovery {
         rows: Vec<DiscoveryEntry>,
         next: Option<NativePath>,
@@ -236,6 +272,21 @@ impl Reply {
             (Action::Finish, Value::Evidence(receipt)) => {
                 super::validate_path(&receipt.destination)?;
                 hash(&receipt.blake3)?;
+            }
+            (
+                Action::Finish,
+                Value::Existing {
+                    offset,
+                    total,
+                    bytes,
+                    blake3,
+                },
+            ) => {
+                hash(blake3)?;
+                ensure!(
+                    bytes.len() <= CHUNK_BYTES && offset.0 <= total.0,
+                    "metadata existing-file chunk reply bounds"
+                );
             }
             (
                 Action::Discover {

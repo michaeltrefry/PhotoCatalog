@@ -2243,6 +2243,8 @@ impl CatalogSessionAuthority {
         else {
             return Ok(None);
         };
+        let authority = mode.clone();
+        let payload_digest = blake3::hash(payload).to_hex().to_string();
         let transfer = LeaseId::new();
         let mut operation = 1u64;
         let result = (|| {
@@ -2253,7 +2255,7 @@ impl CatalogSessionAuthority {
                 action: metadata_files::Action::Begin {
                     mode,
                     bytes: U64(u64::try_from(payload.len())?),
-                    blake3: blake3::hash(payload).to_hex().to_string(),
+                    blake3: payload_digest.clone(),
                 },
             };
             let reply = filesystem.metadata_files_call(&request, cancel)?;
@@ -2293,6 +2295,12 @@ impl CatalogSessionAuthority {
             };
             let reply = filesystem.metadata_files_call(&request, cancel)?;
             reply.validate(&request)?;
+            validate_metadata_file_value(
+                &authority,
+                u64::try_from(payload.len())?,
+                &payload_digest,
+                &reply.value,
+            )?;
             Ok(reply.value)
         })();
         if result.is_err()
@@ -2316,12 +2324,14 @@ impl CatalogSessionAuthority {
         destination: &NativePath,
         payload: &[u8],
         max_existing_bytes: u64,
+        alias_limits: crate::catalog_export_alias::AliasLimits,
         cancel: &AtomicBool,
     ) -> Result<Option<crate::metadata_export::ExportPlan>> {
         let value = self.metadata_file_transfer(
             metadata_files::Mode::Plan {
                 destination: destination.clone(),
                 max_existing_bytes: U64(max_existing_bytes),
+                alias_limits,
             },
             payload,
             cancel,
@@ -2331,6 +2341,23 @@ impl CatalogSessionAuthority {
             None => Ok(None),
             _ => anyhow::bail!("unexpected metadata planning result"),
         }
+    }
+    pub(crate) fn read_metadata_existing(
+        &self,
+        plan: &crate::metadata_export::ExportPlan,
+        offset: u64,
+        length: u32,
+        cancel: &AtomicBool,
+    ) -> Result<Option<metadata_files::Value>> {
+        self.metadata_file_transfer(
+            metadata_files::Mode::Existing {
+                plan: plan.clone(),
+                offset: U64(offset),
+                length,
+            },
+            &[],
+            cancel,
+        )
     }
     pub(crate) fn apply_metadata_file(
         &self,
@@ -2699,6 +2726,77 @@ impl CatalogSessionAuthority {
         }
         Ok(())
     }
+}
+
+fn validate_metadata_file_value(
+    mode: &metadata_files::Mode,
+    payload_bytes: u64,
+    payload_digest: &str,
+    value: &metadata_files::Value,
+) -> Result<()> {
+    match (mode, value) {
+        (
+            metadata_files::Mode::Plan {
+                destination,
+                max_existing_bytes,
+                alias_limits,
+            },
+            metadata_files::Value::Plan(plan),
+        ) => {
+            crate::metadata_export::validate_plan_wire(plan)?;
+            ensure!(
+                plan.destination == destination.to_path()?
+                    && plan.payload_bytes == payload_bytes
+                    && plan.payload_digest == payload_digest
+                    && plan.max_existing_bytes == Some(max_existing_bytes.0)
+                    && plan.alias_limits == Some(*alias_limits),
+                "metadata planning reply authority mismatch"
+            );
+        }
+        (
+            metadata_files::Mode::Apply { plan }
+            | metadata_files::Mode::Recover { plan }
+            | metadata_files::Mode::Restore { plan },
+            metadata_files::Value::Receipt(receipt),
+        ) => crate::metadata_export::validate_metadata_export_receipt_wire(receipt, plan)?,
+        (
+            metadata_files::Mode::Evidence { destination },
+            metadata_files::Value::Evidence(receipt),
+        ) => ensure!(
+            receipt.destination == *destination
+                && receipt.bytes.0 == payload_bytes
+                && receipt.blake3 == payload_digest,
+            "metadata evidence reply authority mismatch"
+        ),
+        (
+            metadata_files::Mode::Existing {
+                plan,
+                offset,
+                length,
+            },
+            metadata_files::Value::Existing {
+                offset: actual_offset,
+                total,
+                bytes,
+                blake3,
+            },
+        ) => {
+            let expected = plan.expected.as_ref().context("existing destination")?;
+            let expected_length = expected
+                .bytes
+                .saturating_sub(offset.0)
+                .min(u64::from(*length));
+            ensure!(
+                actual_offset == offset
+                    && total.0 == expected.bytes
+                    && bytes.len() as u64 == expected_length
+                    && blake3 == &expected.digest,
+                "metadata existing-file reply authority mismatch"
+            );
+        }
+        _ => anyhow::bail!("metadata file terminal reply authority mismatch"),
+    }
+    Ok(())
 }
 
 /// No destructor in this owner invokes Connection::drop, SQL or rollback. A
@@ -3094,6 +3192,66 @@ impl Drop for ManagedSession {
         if self.close_attempted || self.close().is_err() {
             std::mem::forget(self.authority.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_reply_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_metadata_replies_are_bound_to_requested_plan_and_receipt_authority() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().canonicalize()?.join("reply.xmp");
+        std::fs::write(&destination, b"old")?;
+        let limits = crate::catalog_export_alias::AliasLimits::default();
+        let mut checkpoint = |_| Ok(());
+        let plan = crate::metadata_export::plan_export_controlled(
+            &destination,
+            b"new",
+            3,
+            limits,
+            &mut checkpoint,
+        )?;
+        let mode = metadata_files::Mode::Plan {
+            destination: NativePath::from_path(&destination),
+            max_existing_bytes: U64(3),
+            alias_limits: limits,
+        };
+        validate_metadata_file_value(
+            &mode,
+            3,
+            &blake3::hash(b"new").to_hex().to_string(),
+            &metadata_files::Value::Plan(plan.clone()),
+        )?;
+        let mut wrong_plan = plan.clone();
+        wrong_plan.payload_digest = blake3::hash(b"other").to_hex().to_string();
+        assert!(
+            validate_metadata_file_value(
+                &mode,
+                3,
+                &blake3::hash(b"new").to_hex().to_string(),
+                &metadata_files::Value::Plan(wrong_plan),
+            )
+            .is_err()
+        );
+        let wrong_receipt = crate::metadata_export::ExportReceipt {
+            state: crate::metadata_export::ExportState::Published,
+            destination: destination.with_file_name("other.xmp"),
+            recovery_directory: crate::metadata_export::metadata_recovery_directory(&plan)?,
+            captured_original: None,
+            detail: "spoofed".into(),
+        };
+        assert!(
+            validate_metadata_file_value(
+                &metadata_files::Mode::Apply { plan },
+                3,
+                &blake3::hash(b"new").to_hex().to_string(),
+                &metadata_files::Value::Receipt(wrong_receipt),
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }
 
