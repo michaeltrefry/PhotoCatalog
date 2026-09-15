@@ -11,3 +11,5 @@
 .lightroom-panel .button-group { flex-wrap: wrap; margin: .75rem 0; }
 .lightroom-result { border-block: 1px solid var(--border, #6666); padding-block: 1rem; }
 .lightroom-activity { flex-wrap: wrap; }
+.migration-document { border-top: 1px solid var(--border, #6666); padding-top: .6rem; }
+.migration-document input { font-family: monospace; }

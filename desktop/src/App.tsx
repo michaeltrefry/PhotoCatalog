@@ -16,6 +16,9 @@ import { copyTerminal } from './editCopy';
 import { usePhotoExport } from './state/usePhotoExport';
 import { useLightroom } from './state/useLightroom';
 import { LightroomPanel, LightroomActivity } from './components/LightroomPanel';
+import { LightroomMigrationActivity, LightroomMigrationPanel } from './components/LightroomMigrationPanel';
+import { useLightroomMigration } from './state/useLightroomMigration';
+import { terminalMigration } from './lightroomMigration';
 import { terminal as exportTerminal } from './photoExport';
 import { ExportPanel, type ExportGate } from './components/ExportPanel';
 import { MetadataPanel } from './components/MetadataPanel';
@@ -54,6 +57,7 @@ export function App() {
   const [showCopy, setShowCopy] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [showLightroom, setShowLightroom] = useState(false);
+  const [showLightroomMigration, setShowLightroomMigration] = useState(false);
   const [copyRefreshing, setCopyRefreshing] = useState<{ catalog: string; stamp: string } | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
   const [organizationScopeName, setOrganizationScopeName] = useState('');
@@ -89,12 +93,14 @@ export function App() {
   const copies = useEditCopy(catalog);
   const outputs = usePhotoExport(catalog);
   const inspection = useLightroom(desktopAvailable);
+  const migration = useLightroomMigration(desktopAvailable);
   const [exportPending, setExportPending] = useState<string | null>(null);
   const exportDirectHeld = catalog !== null && exportPending === catalog;
   const copyEditingHeld = copies.busy || copyRefreshing?.catalog === catalog;
   const copyRefreshed = useRef('');
-  const storageWriteHold = storage.writeHeld || outputs.writeHeld || exportDirectHeld;
-  const exportBlocked = exportDirectHeld || outputs.writeHeld || status.phase !== 'ready' || status.jobs_held || storage.writeHeld || copies.busy || copyRefreshing?.catalog === catalog;
+  const migrationWriteHold = !!(catalog && migration.snapshot?.catalog === catalog && !terminalMigration(migration.snapshot) && !['uploading', 'ready'].includes(migration.snapshot.phase));
+  const storageWriteHold = storage.writeHeld || outputs.writeHeld || exportDirectHeld || migrationWriteHold;
+  const exportBlocked = exportDirectHeld || outputs.writeHeld || migrationWriteHold || status.phase !== 'ready' || status.jobs_held || storage.writeHeld || copies.busy || copyRefreshing?.catalog === catalog;
   const exportBlockedRef = useRef(exportBlocked); exportBlockedRef.current = exportBlocked;
   const exportGate: ExportGate = async action => {
     let result!: Awaited<ReturnType<typeof action>>;
@@ -125,6 +131,14 @@ export function App() {
     // pending draft intact while refreshing the guarded read-only image state.
     return () => abort.abort();
   }, [catalog, outputs.operation]);
+  const migrationRefreshed = useRef('');
+  useEffect(() => {
+    const operation = migration.snapshot;
+    if (!catalog || !operation || operation.catalog !== catalog || operation.phase !== 'complete' || !operation.result) return;
+    const stamp = `${catalog}:${operation.guard.operation}:${operation.result.blake3}`;
+    if (migrationRefreshed.current === stamp) return;
+    migrationRefreshed.current = stamp; setFolderEpoch(value => value + 1); setCursor(null); setPrevious([]); setRefresh(value => value + 1);
+  }, [catalog, migration.snapshot]);
 
   useEffect(() => {
     if (!desktopAvailable) return;
@@ -240,7 +254,7 @@ export function App() {
   });
   const close = async () => perform(async () => {
     if (!catalog) return;
-    try { await queueRef.current?.flush(); setBusy('Closing catalog'); setStatus(await command({ command: 'close', args: { catalog } }, 'status')); setSelected(null); queueRef.current = null; setQueue(null); setImportStatus(null); setPage({ rows: [], next: null, has_more: false, page_complete: true, scanned: 0 }); }
+    try { await queueRef.current?.flush(); if (migration.snapshot?.catalog === catalog && !terminalMigration(migration.snapshot)) { await migration.request({ action: 'cancel', guard: migration.snapshot.guard }); throw new Error('Migration cancellation was requested. Close the catalog after guarded status reaches a checked terminal state.'); } setBusy('Closing catalog'); setStatus(await command({ command: 'close', args: { catalog } }, 'status')); setSelected(null); queueRef.current = null; setQueue(null); setImportStatus(null); setPage({ rows: [], next: null, has_more: false, page_complete: true, scanned: 0 }); }
     catch (e) { setError(errorText(e)); } finally { setBusy(''); }
   });
   const changeScope = async (next: Folder | null) => perform(async () => {
@@ -291,10 +305,12 @@ export function App() {
       {catalog && <nav aria-label="Workspace">{(['library', 'cull', 'develop'] as const).map(value => <button key={value} aria-current={mode === value ? 'page' : undefined} onClick={() => setMode(value)}>{value}</button>)}</nav>}
       {desktopAvailable && <button className="quiet" disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowBackup(true); })}>Backups…</button>}
       {desktopAvailable && <button className="quiet" onClick={() => setShowLightroom(true)}>Inspect Lightroom…</button>}
+      {desktopAvailable && <button className="quiet" onClick={() => setShowLightroomMigration(true)}>Migrate Lightroom…</button>}
       {catalog && <button className="quiet" onClick={() => void close()} disabled={!!busy || transitioning}>Close catalog</button>}
     </header>
     {catalog && <button disabled={transitioning} onClick={() => setShowPreviewSettings(true)}>Preview storage…</button>}
     {desktopAvailable && <LightroomActivity controller={inspection} onOpen={() => setShowLightroom(true)} />}
+    {desktopAvailable && <LightroomMigrationActivity controller={migration} onOpen={() => setShowLightroomMigration(true)} />}
     {error && <ErrorNotice message={error} dismiss={() => setError('')} />}
     {busy && <div className="activity" role="status">{busy}… {operationAbort.current && <button onClick={() => operationAbort.current?.abort()}>Cancel</button>}</div>}
     {!catalog ? <main className="welcome"><div className="welcome-mark" aria-hidden="true">▧</div><h1>Your photographs.<br />One library.</h1><p>Keep every year together. Browse your folders, preserve your originals, and edit without losing where you started.</p>
@@ -334,6 +350,7 @@ export function App() {
       </main><footer className="app-status"><span>{status.phase === 'ready' ? 'Catalog ready' : status.phase}</span><span>{importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase) ? `Import ${importStatus.phase.replaceAll('_', ' ')} · ${importStatus.imported} added` : status.message}</span><span>{backupStatus && ['running', 'cancel_requested'].includes(backupStatus.state) ? `Backup ${backupStatus.state.replaceAll('_', ' ')}` : ''}</span><span>{status.active_previews > 0 ? `${status.active_previews} preview requests` : 'Local catalog'}</span></footer>
     </>}
     {desktopAvailable && <LightroomPanel controller={inspection} open={showLightroom} onClose={() => setShowLightroom(false)} />}
+    {desktopAvailable && <LightroomMigrationPanel controller={migration} catalog={catalog} catalogDisplay={catalogName} open={showLightroomMigration} onClose={() => setShowLightroomMigration(false)} />}
     {catalog && <ExportPanel key={`export:${catalog}`} catalog={catalog} open={showExport} rows={page.rows} controller={outputs} gate={exportGate} blocked={exportBlocked} onDirectPending={pending => setExportPending(pending ? catalog : null)} onClose={() => setShowExport(false)} />}
     {catalog && <CopyPanel key={`copy:${catalog}`} catalog={catalog} open={showCopy} selected={selected} rows={page.rows} source={() => queueRef.current?.value.variant ?? null} controller={copies} mutate={organizationMutation} jobsHeld={status.jobs_held} writeHeld={storageWriteHold} onClose={() => setShowCopy(false)} />}
     {catalog && <RelinkPanel key={`relink:${catalog}`} catalog={catalog} selected={selected} open={showRelink} onClose={() => setShowRelink(false)} controller={storage} mutate={organizationMutation} changed={() => { setPreviewEpoch(v => v + 1); setFolderEpoch(v => v + 1); setCursor(null); setPrevious([]); setRefresh(v => v + 1); const selection = selectedRef.current; const generation = ++storageRefresh.current; const current = () => catalogRef.current === catalog && storageRefresh.current === generation && selectedRef.current === selection; if (selection) void command({ command: 'image', args: { catalog, key: selection.key } }, 'image').then(row => { if (current()) setSelected(row); }).catch(e => { if (current()) setError(errorText(e)); }); }} />}

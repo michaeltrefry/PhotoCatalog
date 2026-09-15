@@ -7,6 +7,7 @@ import type { OrganizationRequest, OrganizationResponse } from './organization';
 import type { MetadataRequest, MetadataResponse } from './metadata';
 import type { RelinkRequest, RelinkResponse } from './relink';
 import type { CopyRequest, CopyResponse } from './editCopy';
+import type { Request as LightroomMigrationRequest, Response as LightroomMigrationResponse } from './lightroomMigration';
 
 export type Decimal = string;
 export type NativePath = { encoding: 'UnixBytes' | 'WindowsWide'; units: number[] };
@@ -28,6 +29,7 @@ type AtCatalog = { catalog: string };
 type AtVariant = AtCatalog & { key: VariantKey };
 type AtRevision = AtVariant & { expected_revision: Decimal };
 export type Request =
+  | {command: 'lightroom_migration';args:{request:LightroomMigrationRequest}}
   | {command: 'lightroom';args:{request:LightroomRequest}}
   | { command: 'export'; args: AtCatalog & { request: ExportRequest } }
   | { command: 'edit_copy'; args: AtCatalog & { request: CopyRequest } }
@@ -61,6 +63,7 @@ export type Request =
   | { command: 'preview_status' | 'cancel_preview'; args: AtCatalog & { ticket: string } };
 export interface Data {
   preview_settings: PreviewSettingsStatus;
+  lightroom_migration: LightroomMigrationResponse;
   lightroom: LightroomResponse;
   export: ExportResponse;
   edit_copy: CopyResponse;
