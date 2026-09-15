@@ -58,6 +58,8 @@ pub(super) struct CaptureSource {
     cancel: Arc<AtomicBool>,
     deadline: Instant,
     vm: Arc<VmProgress>,
+    #[cfg(test)]
+    exhaust_vm_after_initial_verify: AtomicBool,
 }
 
 fn bytes(value: ValueRef<'_>) -> Result<Vec<u8>> {
@@ -217,6 +219,8 @@ impl CaptureSource {
             cancel,
             deadline,
             vm,
+            #[cfg(test)]
+            exhaust_vm_after_initial_verify: AtomicBool::new(false),
         };
         value.verify()?;
         Ok(value)
@@ -538,6 +542,14 @@ impl CaptureSource {
         sequence: u64,
     ) -> Result<std::result::Result<wire::TableBatch, wire::TableFailure>> {
         self.verify()?;
+        #[cfg(test)]
+        if self
+            .exhaust_vm_after_initial_verify
+            .swap(false, Ordering::AcqRel)
+        {
+            let vm = self.vm.clone();
+            self.db.progress_handler(1, Some(move || vm.interrupt(0)))?;
+        }
         ensure!(
             (1..=usize::try_from(self.authority.limits.max_rows.0)?).contains(&limit),
             "CaptureSql requested rows"
@@ -747,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_exhaustion_is_fatal_before_typed_table_failure() -> Result<()> {
+    fn sqlite_progress_vm_exhaustion_is_fatal_before_typed_table_failure() -> Result<()> {
         let (_root, source, handle) = fixture()?;
         let healthy = source.table_rows(handle.clone(), None, 1, 1)?;
         assert!(matches!(
@@ -758,9 +770,15 @@ mod tests {
             })
         ));
 
-        source.vm.exhausted.store(true, Ordering::Release);
+        // Arm an actual SQLite progress callback only after table_rows' initial
+        // health check. The admitted SELECT is interrupted inside SQLite, and
+        // the error path must classify the retained VM reason as fatal.
+        source
+            .exhaust_vm_after_initial_verify
+            .store(true, Ordering::Release);
         let failure = source.table_rows(handle, None, 1, 2).unwrap_err();
         assert!(format!("{failure:#}").contains("CaptureSql VM step limit"));
+        assert!(source.vm.exhausted.load(Ordering::Acquire));
         Ok(())
     }
 

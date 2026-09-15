@@ -80,6 +80,8 @@ struct Seal {
     generation: String,
     token: String,
     requested: NativePath,
+    directory_handle: Option<fs::File>,
+    paths_bound: bool,
     directory: NativePath,
     database: NativePath,
     seal_path: NativePath,
@@ -211,17 +213,56 @@ impl Seal {
         );
         Ok(())
     }
-    fn prepare_uploads(&mut self) -> Result<()> {
-        let directory = fs::canonicalize(self.requested.to_path()?)?;
+    fn verify_directory(&self) -> Result<()> {
+        let held = self
+            .directory_handle
+            .as_ref()
+            .context("seal directory identity was not retained")?;
+        let expected = FileKey::of(held)?;
+        let requested = crate::filesystem_worker::open_directory(&self.requested.to_path()?)?;
         ensure!(
-            fs::symlink_metadata(&directory)?.is_dir(),
-            "seal output is not a direct directory"
+            FileKey::of(&requested)? == expected,
+            "seal output directory moved or was replaced"
         );
-        self.directory = NativePath::from_path(&directory);
-        self.database = NativePath::from_path(&directory.join("inspection.sqlite3"));
-        self.seal_path = NativePath::from_path(&directory.join("input-seal.json"));
-        self.approval.path = NativePath::from_path(&directory.join("approval.json"));
-        self.review.path = NativePath::from_path(&directory.join("review.json"));
+        if self.paths_bound {
+            let directory = crate::filesystem_worker::open_directory(&self.directory.to_path()?)?;
+            ensure!(
+                FileKey::of(&directory)? == expected,
+                "retained seal directory path changed"
+            );
+        }
+        Ok(())
+    }
+    fn prepare_uploads(&mut self, admit_directory: bool) -> Result<()> {
+        if self.directory_handle.is_none() {
+            ensure!(
+                admit_directory,
+                "seal directory identity admission failed; retry cannot adopt a path"
+            );
+            self.directory_handle = Some(crate::filesystem_worker::open_directory(
+                &self.requested.to_path()?,
+            )?);
+        }
+        self.verify_directory()?;
+        if !self.paths_bound {
+            let directory = fs::canonicalize(self.requested.to_path()?)?;
+            let current = crate::filesystem_worker::open_directory(&directory)?;
+            ensure!(
+                FileKey::of(&current)?
+                    == FileKey::of(
+                        self.directory_handle
+                            .as_ref()
+                            .context("seal directory identity was not retained")?,
+                    )?,
+                "seal canonical directory differs from retained directory"
+            );
+            self.directory = NativePath::from_path(&directory);
+            self.database = NativePath::from_path(&directory.join("inspection.sqlite3"));
+            self.seal_path = NativePath::from_path(&directory.join("input-seal.json"));
+            self.approval.path = NativePath::from_path(&directory.join("approval.json"));
+            self.review.path = NativePath::from_path(&directory.join("review.json"));
+            self.paths_bound = true;
+        }
         self.approval.ensure_created()?;
         #[cfg(test)]
         {
@@ -994,7 +1035,7 @@ impl Owner {
                         review_bytes.0,
                         &review_blake3,
                     )?;
-                    value.prepare_uploads()?;
+                    value.prepare_uploads(false)?;
                     ensure!(
                         value.approval.upload()?.written == 0,
                         "seal begin retry follows uploaded approval bytes"
@@ -1019,6 +1060,8 @@ impl Owner {
                     generation,
                     token: token.clone(),
                     requested: output,
+                    directory_handle: None,
+                    paths_bound: false,
                     directory: NativePath::from_path(&requested),
                     database: NativePath::from_path(&requested.join("inspection.sqlite3")),
                     seal_path: NativePath::from_path(&requested.join("input-seal.json")),
@@ -1040,7 +1083,7 @@ impl Owner {
                 self.seal
                     .as_mut()
                     .context("seal custody missing after directory create")?
-                    .prepare_uploads()?;
+                    .prepare_uploads(true)?;
                 Ok(LightroomWorkbenchIoReply::SealUpload {
                     operation,
                     token,
@@ -1099,6 +1142,7 @@ impl Owner {
                 );
                 value.approval.finish()?;
                 value.review.finish()?;
+                value.verify_directory()?;
                 let directory = value.directory.to_path()?;
                 let mut pending = fs::OpenOptions::new()
                     .write(true)
@@ -1149,6 +1193,7 @@ impl Owner {
                     value.state == LightroomWorkbenchSealState::Staged,
                     "seal destination is not staged"
                 );
+                value.verify_directory()?;
                 let path = value.database.to_path()?;
                 companion_free(&path)?;
                 fs::OpenOptions::new().write(true).open(&path)?.sync_all()?;
@@ -1192,6 +1237,7 @@ impl Owner {
                     value.state == LightroomWorkbenchSealState::Hashed && value.seal.is_none(),
                     "seal publication upload phase differs"
                 );
+                value.verify_directory()?;
                 let pending = value.directory.to_path()?.join("input-seal.pending.json");
                 value.seal = Some(Upload::create(&pending, bytes.0, blake3)?);
                 Ok(LightroomWorkbenchIoReply::SealUpload {
@@ -1217,6 +1263,7 @@ impl Owner {
                     value.state == LightroomWorkbenchSealState::PublishReady,
                     "seal is not publishable"
                 );
+                value.verify_directory()?;
                 let upload = value
                     .seal
                     .as_mut()
@@ -1288,6 +1335,7 @@ impl Owner {
                 if let Some(upload) = &mut value.seal {
                     upload.file.take();
                 }
+                value.directory_handle.take();
                 value.state = LightroomWorkbenchSealState::Aborted;
                 Ok(value.reply())
             }
@@ -1556,6 +1604,71 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn seal_begin_retry_rejects_replacement_directory_without_mutating_it() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("replace-target");
+        let retained = temp.path().join("retained-original");
+        let approval = br#"{"approval":true}"#;
+        let review = br#"{"review":true}"#;
+        let begin = LightroomWorkbenchIo::SealBegin {
+            operation: OPERATION.into(),
+            workbench: WORKBENCH.into(),
+            generation: GENERATION.into(),
+            token: TOKEN.into(),
+            output: NativePath::from_path(&output),
+            approval_bytes: U64(approval.len() as u64),
+            approval_blake3: crate::lightroom::digest(approval),
+            review_bytes: U64(review.len() as u64),
+            review_blake3: crate::lightroom::digest(review),
+        };
+        *SEAL_BEGIN_FAIL_AFTER_APPROVAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(fs::canonicalize(temp.path())?.join("replace-target"));
+        let mut owner = Owner::default();
+        assert!(call(&mut owner, begin.clone()).is_err());
+        fs::rename(&output, &retained)?;
+        fs::create_dir(&output)?;
+
+        let retry = call(&mut owner, begin).unwrap_err();
+        assert!(
+            format!("{retry:#}").contains("seal output directory moved or was replaced"),
+            "replacement rejection reason: {retry:#}"
+        );
+        assert!(retained.join("approval.json").is_file());
+        assert!(!retained.join("review.json").exists());
+        assert_eq!(fs::read_dir(&output)?.count(), 0);
+        let seal = owner.seal.as_ref().context("retained seal operation")?;
+        assert_eq!(
+            FileKey::of(
+                seal.directory_handle
+                    .as_ref()
+                    .context("retained directory handle")?
+            )?,
+            FileKey::of(&crate::filesystem_worker::open_directory(&retained)?)?
+        );
+
+        let aborted = call(
+            &mut owner,
+            LightroomWorkbenchIo::SealAbort {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+            },
+        )?;
+        assert!(matches!(
+            aborted,
+            LightroomWorkbenchIoReply::SealState {
+                state: LightroomWorkbenchSealState::Aborted,
+                ..
+            }
+        ));
+        assert_eq!(fs::read_dir(&output)?.count(), 0);
         Ok(())
     }
 
