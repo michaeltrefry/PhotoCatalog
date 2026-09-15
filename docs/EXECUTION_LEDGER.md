@@ -2,6 +2,38 @@
 
 Source of truth: https://app.shortcut.com/trefry/epic/22835
 
+## Current delivery — 2026-09-15
+
+Local production checkpoint `1be970d` adds F export admission custody
+(source `e71ede14`, integrated `967f259`), a shared native ByteBudget with
+real reservations through explicit retirement (source `3f4055a`), and the
+Lightroom dropdown type fix `8d5a6a8` preserving its 13 options.
+
+The F component has 48 passing tests, source review `ccd82250` and evidence
+review `265b1ba3`. The native component has 18 exact passing tests, source
+closure `aab3fad1` and Rust evidence review `67930a65`. Earlier Drop review,
+test-only compile error, absent frontend assets and TS2366 receipts remain
+negative evidence; none is presented as a passing full gate.
+
+Combined source matches 16 authored paths and 398 recorded source hashes.
+Private `sc-22847-export-prereqs-integration-_k2o0tq8` plus tail
+`sc-22847-export-prereqs-tail-7ovt0ksm` pass frontend build, formatting,
+full test-target compilation, fresh CLI, 39 aggregate Rust tests and Tauri
+release check. The main receipt `7b9e068a` preserves a runner-count failure:
+10 normal native tests passed but root expected 12, including two ignored
+entries. Tail `8a77fa86` explicitly runs the actual ignored native-custody
+test; the other ignored entry is only its subprocess entrypoint. No source
+changed or earlier tests were rerun to correct that bookkeeping error.
+CLI `0acc74ff`, libtest `98827aa1`, composition review `30d333fb` are retained.
+Final integrated evidence audit `0c755b64` passes.
+
+S12 sc-22847 and bug sc-23555 remain In Progress. The next source lane is
+G export native ownership and exact ordinary F stage coordination in
+`codex/sc-22847-export-owner`, based on `1be970d`; C ExportService adaptation
+and paired export route admission follow its acceptance. Full installed,
+platform, UI and RSS acceptance and S13 remain open. No RAID/original reads,
+canonical migration, install replacement, push or Actions occurred.
+
 ## Current delivery — 2026-09-14
 
 Latest local checkpoint (supersedes older pending notes below):

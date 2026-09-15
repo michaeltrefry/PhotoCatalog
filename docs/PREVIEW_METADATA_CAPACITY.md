@@ -314,9 +314,9 @@ Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 377,294,746 | 13,021,232,669 | 5,364,516,472 | 13,398,527,415 |
-| Default | 1,091,390,112 | 13,021,242,245 | 5,364,516,472 | 14,112,632,357 |
-| Maximum | 1,066,347,208,248 | 17,538,404,105 | 5,364,516,472 | 1,083,885,612,353 |
+| Minimum | 377,295,266 | 13,021,233,501 | 5,364,516,472 | 13,398,528,767 |
+| Default | 1,091,390,632 | 13,021,243,077 | 5,364,516,472 | 14,112,633,709 |
+| Maximum | 1,066,347,208,768 | 17,538,416,457 | 5,364,516,472 | 1,083,885,625,225 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime
