@@ -65,16 +65,7 @@ fn registered_original_roots(roots: &[NativePath], source: &Path) -> Result<Vec<
         );
         roots.push(native);
     }
-    let bytes = roots.iter().try_fold(0usize, |total, root| {
-        total.checked_add(match root {
-            NativePath::UnixBytes(value) => value.len(),
-            NativePath::WindowsWide(value) => value.len() * std::mem::size_of::<u16>(),
-        })
-    });
-    ensure!(
-        bytes.is_some_and(|bytes| bytes <= protocol::ORIGINAL_ROOT_BYTES),
-        "admitted original root bytes exceed bound"
-    );
+    protocol::validate_original_root_registry(&roots)?;
     Ok(roots)
 }
 fn failure_detail(error: impl std::fmt::Display) -> String {

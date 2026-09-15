@@ -668,6 +668,35 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         active_fs,
         c.mul(2, FAILURE_BYTES)?,
     )?;
+    // F retains the configured registry for subsequent catalog sessions and a
+    // separate registry in the active RootRecord. Begin/restore may clone that
+    // RootRecord registry while validating one new candidate. `vec_growth`
+    // bounds outer Vec capacity. The nested formula applies the allocator-growth
+    // bound to the aggregate admitted bytes and includes the per-path Vec growth
+    // constant at the wider Windows element size. NativePath::to_path is
+    // performed serially, so only one maximum conversion coexists with a clone.
+    let original_root_count = crate::catalog_session::import::ORIGINAL_ROOTS as u64;
+    let original_root_bytes = crate::catalog_session::import::ORIGINAL_ROOT_BYTES as u64;
+    let original_root_nested_backings = c.add(&[
+        c.mul(3, original_root_bytes)?,
+        c.mul(16, original_root_count)?,
+    ])?;
+    let original_root_registry = c.add(&[
+        c.vec_growth(Layout::of::<NativePath>().size, original_root_count)?,
+        original_root_nested_backings,
+    ])?;
+    a.push(
+        "retained.filesystem_original_root_registries",
+        Phase::Retained,
+        2,
+        original_root_registry,
+    )?;
+    a.push(
+        "active.filesystem_original_root_registry_clone_and_conversion",
+        Phase::Active,
+        1,
+        c.add(&[original_root_registry, c.vec(2, PATH_UNITS as u64)?])?,
+    )?;
     let (import_owner_size, import_owner_align) = crate::filesystem_worker::import_owner_layout();
     let import_path = c.vec(2, PATH_UNITS as u64)?;
     let import_fact_chunk = c.add(&[
@@ -2079,6 +2108,8 @@ mod tests {
         );
         assert!(default_report.contributions.len() >= 40);
         for name in [
+            "retained.filesystem_original_root_registries",
+            "active.filesystem_original_root_registry_clone_and_conversion",
             "retained.import_f_source_custody_and_transfer",
             "active.import_f_inspection_parse_and_encoding",
             "active.import_c_transfer_decode_and_preparation",
@@ -2097,6 +2128,38 @@ mod tests {
                 .contributions
                 .iter()
                 .all(|entry| names.insert(entry.name))
+        );
+        let retained_roots = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.filesystem_original_root_registries")
+            .unwrap();
+        let registry = Checked.add(&[
+            Checked.vec_growth(
+                Layout::of::<NativePath>().size,
+                crate::catalog_session::import::ORIGINAL_ROOTS as u64,
+            )?,
+            Checked.mul(
+                3,
+                crate::catalog_session::import::ORIGINAL_ROOT_BYTES as u64,
+            )?,
+            Checked.mul(16, crate::catalog_session::import::ORIGINAL_ROOTS as u64)?,
+        ])?;
+        assert_eq!(retained_roots.phase, Phase::Retained);
+        assert_eq!(retained_roots.count, 2);
+        assert_eq!(retained_roots.each, registry);
+        let active_roots = default_report
+            .contributions
+            .iter()
+            .find(|entry| {
+                entry.name == "active.filesystem_original_root_registry_clone_and_conversion"
+            })
+            .unwrap();
+        assert_eq!(active_roots.phase, Phase::Active);
+        assert_eq!(active_roots.count, 1);
+        assert_eq!(
+            active_roots.each,
+            Checked.add(&[registry, Checked.vec(2, PATH_UNITS as u64)?])?
         );
         let export_caller = default_report
             .contributions

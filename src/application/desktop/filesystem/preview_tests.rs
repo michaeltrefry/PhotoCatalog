@@ -5,7 +5,7 @@ use crate::application::{
     Config, Limits, PreviewState, PreviewStatus, PreviewTier, Reply, Request, Response, U64,
 };
 use crate::catalog_edits::VariantKey;
-use crate::catalog_session::{RootCapability, native as n};
+use crate::catalog_session::{CatalogFilesystem, RootCapability, native as n};
 use crate::filesystem_worker::client::Client;
 use crate::storage_volume::NativePath;
 use anyhow::{Context, Result, ensure};
@@ -53,6 +53,7 @@ struct Running {
     parent: Arc<Parent>,
     client: Arc<Client>,
     observed: Arc<Mutex<Vec<Observation>>>,
+    restored_roots: Arc<Mutex<Vec<RootCapability>>>,
     metadata: crate::preview::ByteBudget,
     native: crate::preview::ByteBudget,
     temporary: Arc<tempfile::TempDir>,
@@ -69,6 +70,7 @@ struct ExportFixtureOptions<'a> {
     workers: usize,
     export_executable: &'a Path,
     worker_bytes: u64,
+    configured_originals: bool,
 }
 type ManagedExportMetadataJob = (String, PathBuf, &'static str, Vec<u8>);
 type ExportObserverRecord = (String, [u8; 32]);
@@ -130,6 +132,7 @@ impl Running {
             workers,
             export_executable: executable,
             worker_bytes: 64 * 1024 * 1024,
+            configured_originals: true,
         })
     }
     fn start_export_options(options: ExportFixtureOptions<'_>) -> Result<(Self, String)> {
@@ -143,11 +146,15 @@ impl Running {
             workers,
             export_executable,
             worker_bytes,
+            configured_originals,
         } = options;
         ensure!((1..=2).contains(&workers), "fixture worker count");
         let client = Arc::new(Client::spawn(
             executable,
-            vec![NativePath::from_path(originals)],
+            configured_originals
+                .then(|| NativePath::from_path(originals))
+                .into_iter()
+                .collect(),
         )?);
         let parent = Parent::new(client.clone());
         let mut before_catalog = BeforeCatalog {
@@ -176,7 +183,10 @@ impl Running {
         let config = Config {
             worker_executable: executable.to_owned(),
             cache_root: None,
-            original_roots: vec![originals.to_owned()],
+            original_roots: configured_originals
+                .then(|| originals.to_owned())
+                .into_iter()
+                .collect(),
             preview_policy: policy,
             preview_limits: limits.clone(),
             limits: Limits::default(),
@@ -186,9 +196,14 @@ impl Running {
         parent.configure_native(executable.to_owned(), limits, &native)?;
         parent.configure_export_native(export_executable.to_owned(), workers, &native)?;
         let observed: Arc<Mutex<Vec<Observation>>> = Default::default();
+        let restored_roots: Arc<Mutex<Vec<RootCapability>>> = Default::default();
         let weak = Arc::downgrade(&parent);
         let observations = observed.clone();
+        let restored = restored_roots.clone();
         *parent.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
+            if after && let Call::RestoreOriginalRoot(request) = call {
+                restored.lock().unwrap().push(request.root.clone());
+            }
             if after
                 && let Call::Native(request) = call
                 && let n::Action::Spawn { work, .. } = &request.action
@@ -249,6 +264,7 @@ impl Running {
             parent,
             client,
             observed,
+            restored_roots,
             metadata,
             native,
             temporary,
@@ -1547,6 +1563,103 @@ fn managed_export_max_metadata_fixture_matches_derivative_limits() -> Result<()>
 }
 
 #[test]
+#[ignore = "requires explicitly configured built CLI; actual paired C/G/F import and reopen fixture"]
+fn actual_empty_config_actor_import_close_reopen_restores_export_authority() -> Result<()> {
+    use crate::application::ImportPhase;
+    use crate::catalog_session::InspectExportOriginal;
+
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let temporary = Arc::new(tempfile::tempdir()?);
+    let base = temporary.path().canonicalize()?;
+    let root = base.join("catalog");
+    let originals = base.join("selected-originals");
+    std::fs::create_dir(&originals)?;
+    let original = originals.join("selected.png");
+    image::RgbImage::from_pixel(16, 12, image::Rgb([30u8, 60, 90])).save(&original)?;
+    drop(crate::Catalog::open(&root)?);
+
+    let options = |temporary: Arc<tempfile::TempDir>| ExportFixtureOptions {
+        temporary,
+        executable: &executable,
+        root: &root,
+        originals: &originals,
+        small: false,
+        codec: crate::preview::Codec::Jpeg,
+        workers: 1,
+        export_executable: &executable,
+        worker_bytes: 64 * 1024 * 1024,
+        configured_originals: false,
+    };
+    let (first, token) = Running::start_export_options(options(temporary.clone()))?;
+    let Response::Import(Some(started)) = command(
+        &first.bridge,
+        Request::ImportStart {
+            catalog: token.clone(),
+            source: NativePath::from_path(&originals),
+        },
+    )?
+    else {
+        anyhow::bail!("managed import did not start")
+    };
+    ensure!(
+        started.source == NativePath::from_path(&originals),
+        "F did not return the selected canonical root"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let completed = loop {
+        let Response::Import(Some(status)) = command(
+            &first.bridge,
+            Request::ImportStatus {
+                catalog: token.clone(),
+            },
+        )?
+        else {
+            anyhow::bail!("managed import status disappeared")
+        };
+        if status.phase == ImportPhase::Complete {
+            break status;
+        }
+        ensure!(
+            !matches!(status.phase, ImportPhase::Failed | ImportPhase::Canceled),
+            "managed import ended {:?}: {:?}",
+            status.phase,
+            status.error
+        );
+        ensure!(Instant::now() < deadline, "managed import timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    ensure!(completed.imported.0 == 1, "managed import count changed");
+    first.finish(token)?;
+    ensure!(
+        crate::Catalog::open(&root)?.browse(0, 10)?.len() == 1,
+        "managed actor did not commit the selected image"
+    );
+
+    let parked = base.join("selected-originals-offline");
+    std::fs::rename(&originals, &parked)?;
+    let (second, token) = Running::start_export_options(options(temporary.clone()))?;
+    let restored = second.restored_roots.lock().unwrap().clone();
+    ensure!(
+        restored.len() == 1,
+        "managed reopen did not restore exactly one persisted original root"
+    );
+    std::fs::rename(&parked, &originals)?;
+    second.client.inspect_export_original(
+        &InspectExportOriginal {
+            root: restored[0].clone(),
+            requested: NativePath::from_path(&original),
+            allowance: U64(std::fs::metadata(&original)?.len()),
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    second.finish(token)?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires explicitly configured built CLI; actual paired C/G/F/N export fixture"]
 fn actual_managed_export_replays_stage_and_native_acknowledgements_and_reuses_preview_pool()
 -> Result<()> {
@@ -1568,6 +1681,7 @@ fn actual_managed_export_replays_stage_and_native_acknowledgements_and_reuses_pr
         workers: 1,
         export_executable: &executable,
         worker_bytes: 512 * 1024 * 1024,
+        configured_originals: true,
     })?;
     let preview = running.ready(&token, &key, 1)?;
     let preview_bytes = running.bytes(&token, &preview.ticket)?;
@@ -1871,6 +1985,7 @@ fn actual_managed_export_failed_launch_drains_releases_and_restores_preview_capa
         workers: 1,
         export_executable: &export_executable,
         worker_bytes: 64 * 1024 * 1024,
+        configured_originals: true,
     })?;
     running.ready(&token, &key, 1)?;
     let calls = Arc::new(Mutex::new(Vec::new()));

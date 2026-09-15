@@ -577,7 +577,7 @@ fn actual_f_import_alias_read_and_lock_custody_preserve_c_posix_sql_lock() -> an
 
 #[test]
 #[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
-fn actual_empty_config_import_root_survives_close_reopen_for_export() -> anyhow::Result<()> {
+fn actual_f_protocol_restores_offline_import_root_for_export() -> anyhow::Result<()> {
     use crate::catalog_session::{
         InspectExportOriginal, RestoreOriginalRootRequest,
         import::{Action, Request as ImportRequest, Value},

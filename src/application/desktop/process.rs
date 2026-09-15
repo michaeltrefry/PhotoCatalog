@@ -1481,6 +1481,10 @@ fn paired_preview_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
             | Request::Create { .. }
             | Request::Status
             | Request::Close { .. }
+            | Request::ImportStart { .. }
+            | Request::ImportResume { .. }
+            | Request::ImportStatus { .. }
+            | Request::ImportCancel { .. }
             | Request::Preview { .. }
             | Request::PreviewStatus { .. }
             | Request::CancelPreview { .. }
@@ -1757,7 +1761,7 @@ fn child_input(
 mod tests {
     use super::*;
     #[test]
-    fn paired_preview_route_admits_preview_and_export_lifecycle() {
+    fn paired_preview_route_admits_preview_import_and_export_lifecycle() {
         let path = crate::storage_volume::NativePath::from_path(std::path::Path::new("/fixture"));
         let catalog = "catalog".to_owned();
         for request in [
@@ -1766,6 +1770,25 @@ mod tests {
             Request::Status,
             Request::Close {
                 catalog: catalog.clone(),
+            },
+            Request::ImportStart {
+                catalog: catalog.clone(),
+                source: crate::storage_volume::NativePath::from_path(std::path::Path::new(
+                    "/fixture/source",
+                )),
+            },
+            Request::ImportResume {
+                catalog: catalog.clone(),
+                source: crate::storage_volume::NativePath::from_path(std::path::Path::new(
+                    "/fixture/source",
+                )),
+            },
+            Request::ImportStatus {
+                catalog: catalog.clone(),
+            },
+            Request::ImportCancel {
+                catalog: catalog.clone(),
+                import: "import".into(),
             },
             Request::Preview {
                 catalog: catalog.clone(),
@@ -1799,13 +1822,6 @@ mod tests {
                     .unwrap()
             );
         }
-        let request = Request::ImportCancel {
-            catalog: catalog.clone(),
-            import: "import".into(),
-        };
-        assert!(
-            !paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap()).unwrap()
-        );
         assert!(paired_preview_route(Kind::Bytes, b"{}").unwrap());
         assert!(!paired_preview_route(Kind::Hello, b"{}").unwrap());
     }

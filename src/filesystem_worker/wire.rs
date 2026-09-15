@@ -46,6 +46,7 @@ impl Startup {
             "filesystem helper build mismatch"
         );
         encode(self, CONFIG_BYTES)?;
+        crate::catalog_session::import::validate_original_root_registry(&self.original_roots)?;
         for path in &self.original_roots {
             validate_path(path)?;
         }
@@ -1353,18 +1354,15 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn configuration_and_native_path_boundaries_preserve_full_roster() -> Result<()> {
+    fn configuration_and_native_path_boundaries_preserve_bounded_roster() -> Result<()> {
         #[cfg(unix)]
         let path = NativePath::UnixBytes(b"/a".to_vec());
         #[cfg(windows)]
         let path = NativePath::WindowsWide("C:\\a".encode_utf16().collect());
         let mut startup = Startup::new(vec![])?;
-        let base = encode(&startup, CONFIG_BYTES)?.len();
-        let item = encode(&path, MESSAGE_BYTES)?.len();
-        let count = (CONFIG_BYTES - base + 1) / (item + 1);
+        let count = crate::catalog_session::import::ORIGINAL_ROOTS;
         startup.original_roots = vec![path.clone(); count];
         let encoded = encode(&startup, CONFIG_BYTES)?;
-        assert!(CONFIG_BYTES - encoded.len() < item + 1);
         let decoded: Startup = decode(&encoded, CONFIG_BYTES)?;
         decoded.validate()?;
         assert_eq!(decoded.original_roots.len(), count);
@@ -1379,6 +1377,17 @@ mod tests {
             }
         }
         validate_path(&maximum)?;
+        let maximum_bytes = match &maximum {
+            NativePath::UnixBytes(units) => units.len(),
+            NativePath::WindowsWide(units) => units.len() * std::mem::size_of::<u16>(),
+        };
+        let mut oversized = Startup::new(vec![])?;
+        oversized.original_roots =
+            vec![
+                maximum.clone();
+                crate::catalog_session::import::ORIGINAL_ROOT_BYTES / maximum_bytes + 1
+            ];
+        assert!(oversized.validate().is_err());
         match &mut maximum {
             NativePath::UnixBytes(units) => units.push(b'a'),
             NativePath::WindowsWide(units) => units.push(b'a' as u16),

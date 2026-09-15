@@ -961,13 +961,16 @@ impl BootstrapOwner {
                 "original root overlaps preview storage"
             );
         }
-        let duplicate = record
-            .original_roots
-            .iter()
-            .map(NativePath::to_path)
-            .collect::<Result<Vec<_>>>()?
-            .iter()
-            .any(|existing| existing == &original);
+        // Convert one retained root at a time. Besides avoiding an unnecessary
+        // aggregate allocation, this keeps the active conversion backing at one
+        // bounded native path in the metadata-capacity formula.
+        let mut duplicate = false;
+        for existing in &record.original_roots {
+            if existing.to_path()? == original {
+                duplicate = true;
+                break;
+            }
+        }
         let mut roots = record.original_roots.clone();
         if !duplicate {
             ensure!(
@@ -976,18 +979,7 @@ impl BootstrapOwner {
             );
             roots.push(request.original.clone());
         }
-        let bytes = roots.iter().try_fold(0usize, |total, root| {
-            total.checked_add(match root {
-                NativePath::UnixBytes(value) => value.len(),
-                NativePath::WindowsWide(value) => value.len() * std::mem::size_of::<u16>(),
-            })
-        });
-        ensure!(
-            bytes.is_some_and(|bytes| {
-                bytes <= crate::catalog_session::import::ORIGINAL_ROOT_BYTES
-            }),
-            "admitted original root bytes exceed bound"
-        );
+        crate::catalog_session::import::validate_original_root_registry(&roots)?;
         check_cancel(cancel)?;
         record.original_roots = roots;
         record.verify_root_binding()?;
@@ -1312,7 +1304,13 @@ impl BootstrapOwner {
             }
         }
         let candidate = if matches!(request.action, ExportOriginalAction::Begin) {
-            let path = self.export_original_path(&request.requested)?;
+            let path = {
+                let record = self
+                    .record
+                    .as_ref()
+                    .context("export original catalog root is not retained")?;
+                Self::export_original_path(&record.original_roots, &request.requested)?
+            };
             original_cancel(cancel)?;
             let mut canceled_while_reading = false;
             let verified = crate::metadata_export::VerifiedFile::read_with_checkpoint(

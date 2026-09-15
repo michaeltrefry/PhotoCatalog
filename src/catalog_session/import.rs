@@ -23,6 +23,24 @@ pub const MAX_INSPECTION_BYTES: usize =
 pub const ORIGINAL_ROOTS: usize = 1024;
 pub const ORIGINAL_ROOT_BYTES: usize = 2 * 1024 * 1024;
 
+pub(crate) fn validate_original_root_registry(roots: &[NativePath]) -> Result<()> {
+    ensure!(
+        roots.len() <= ORIGINAL_ROOTS,
+        "admitted original root count exceeds bound"
+    );
+    let bytes = roots.iter().try_fold(0usize, |total, root| {
+        total.checked_add(match root {
+            NativePath::UnixBytes(value) => value.len(),
+            NativePath::WindowsWide(value) => value.len() * std::mem::size_of::<u16>(),
+        })
+    });
+    ensure!(
+        bytes.is_some_and(|bytes| bytes <= ORIGINAL_ROOT_BYTES),
+        "admitted original root bytes exceed bound"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_source_root(source: &NativePath) -> Result<()> {
     validate_path(source)?;
     ensure!(

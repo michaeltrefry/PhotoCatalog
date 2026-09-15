@@ -274,7 +274,9 @@ pub struct RestoreOriginalRootRequest {
 }
 impl RestoreOriginalRootRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_root(&self.root)?;
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
         self.manifest_physical.validate()?;
         validate_path(&self.original)?;
         let path = self.original.to_path()?;
