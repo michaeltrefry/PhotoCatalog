@@ -136,7 +136,13 @@ fixture, three final reruns). All 196 recorded command/fixture-child process
 retirements reconcile. This is explicitly not one 51-test run, and earlier
 negative gates/manual cleanup remain preserved. Local source commit
 `312b924c1064e08c1ee6d71a3d4904cfb30bd172` contains the accepted 16-file component;
-root integration and combined desktop checks follow.
+integrated as `aeff1722f96ec8b46994d592001ba8b51dd3ae8a`. The combined ten-step
+gate `sc-22847-lm-facade-integration-2bh9gds5` passes (receipt `aea803ee`): format,
+full test-target compile, fresh CLI/capture, managed startup, cold/warm preview,
+four capacity tests, retirement invariant, actual Run/Status/all-role migration,
+and Tauri check. CLI remains `0432d408`; requested capacity figures are unchanged.
+Independent composition `5cd40605` and runtime audit `ae06be79` pass, reconciling
+396 source hashes, all 16 authored files and 20 recorded process retirements.
 No full facade runtime or S12 acceptance is claimed.
 
 A separate managed-C process trace (`df08341a`) establishes that the closed
@@ -147,12 +153,10 @@ drain. Legacy/unverified/unknown-G states retain the old conservative policy;
 unknown catalog outcome must remain distinct from safe retirement. This path
 is implemented and source-reviewed but still awaits runtime proof.
 
-Next: diagnose and repair the large-result deadline/drain and incorrect fixture
-role assertions, finish untouched runtime selections, then independently audit
-the complete exact-source evidence before integration.
-Preserve all seven operations, raw document limits, shared budget, cancellation
-and checked descendant retirement. Managed G export
-custody and C service wiring follow serially because desktop wiring overlaps.
+Next: implement the already-planned managed G export-native owner and C service
+adapter, preserving exact F stage/work identity, SQL ordering, shared-pool
+admission, checked child retirement, lost-ACK recovery and existing durable
+publication/failure policy. A bounded read-only code-path map is underway.
 Full S12 installed workflows and S13 readiness remain open. No push, CI,
 installation replacement, canonical migration or RAID access occurred.
 

@@ -302,10 +302,10 @@ that same `ProcessReservation`, proves one-byte-short refusal and retained-owner
 charging, then retries the same pool after release. This is requested Rust
 backing only. Native worker/codec working storage, OS handles and mappings,
 allocator overhead, and observed RSS require their own admission and evidence.
-The integrated export-stage and migration-prerequisite gate on macOS arm64,
-Rust 1.98.0, reported the following totals at source `a4729ac`. All four capacity
-tests passed; evidence is retained in private
-`sc-22847-stage-lm-prerequisite-integration-9_wo22yf/capacity.log`.
+The integrated export-stage and full Lightroom-facade gate on macOS arm64,
+Rust 1.98.0, reported the following unchanged totals at source `aeff1722`. All four
+capacity tests passed; evidence is retained in private
+`sc-22847-lm-facade-integration-2bh9gds5/capacity.log`.
 Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
