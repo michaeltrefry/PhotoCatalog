@@ -521,6 +521,109 @@ impl Owner {
             stage,
         })
     }
+    fn inspect_originals_managed(
+        &mut self,
+        operation: &str,
+        revision: &str,
+        maximum: usize,
+        packets: bool,
+        control: &Control,
+    ) -> Result<usize> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let candidates = self
+            .plan(control)?
+            .managed_original_candidates(revision, maximum, packets)?;
+        let mut processed = 0usize;
+        for candidate in candidates {
+            control.check()?;
+            let begin = LightroomWorkbenchIo::OriginalBegin {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                candidate: candidate.clone(),
+                maximum_result_bytes: U64(self.config.limits.result_bytes as u64),
+            };
+            let reply = io.filesystem(begin.clone(), &control.cancel)?;
+            reply.validate_for(&begin)?;
+            let LightroomWorkbenchIoReply::OriginalReady {
+                token,
+                bytes,
+                blake3,
+                ..
+            } = reply
+            else {
+                anyhow::bail!("original begin reply kind")
+            };
+            ensure!(token == candidate.token, "original begin token differs");
+            let length = usize::try_from(bytes.0)?;
+            let mut encoded = Vec::new();
+            encoded.try_reserve_exact(length)?;
+            while encoded.len() < length {
+                control.check()?;
+                let page = LightroomWorkbenchIo::OriginalPage {
+                    operation: operation.into(),
+                    workbench: self.workbench.clone(),
+                    generation: self.generation.clone(),
+                    token: token.clone(),
+                    offset: U64(encoded.len() as u64),
+                    limit: U64((length - encoded.len()).min(16 * 1024) as u64),
+                };
+                let part = io.filesystem(page.clone(), &control.cancel)?;
+                part.validate_for(&page)?;
+                let LightroomWorkbenchIoReply::OriginalChunk {
+                    token: actual,
+                    offset,
+                    bytes,
+                    ..
+                } = part
+                else {
+                    anyhow::bail!("original page reply kind")
+                };
+                ensure!(
+                    actual == token && offset.0 == encoded.len() as u64,
+                    "original page continuity"
+                );
+                encoded.extend_from_slice(&bytes);
+            }
+            ensure!(
+                crate::lightroom::digest(&encoded) == blake3,
+                "original result digest differs"
+            );
+            let observation: core::plan::OriginalObservation = serde_json::from_slice(&encoded)?;
+            let current = LightroomWorkbenchIo::OriginalCurrent {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: token.clone(),
+            };
+            let current_reply = io.filesystem(current.clone(), &control.cancel)?;
+            current_reply.validate_for(&current)?;
+            ensure!(
+                matches!(current_reply, LightroomWorkbenchIoReply::OriginalReady { ref token, ref blake3, .. } if token == &candidate.token && blake3 == &crate::lightroom::digest(&encoded)),
+                "original current evidence differs"
+            );
+            self.verify_root(control)?;
+            self.plan(control)?
+                .apply_managed_original(&candidate, observation)?;
+            let release = LightroomWorkbenchIo::OriginalRelease {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token,
+            };
+            let released = io.filesystem(release.clone(), &AtomicBool::new(false))?;
+            released.validate_for(&release)?;
+            processed += 1;
+            control.progress(processed as u64);
+        }
+        self.verify_root(control)?;
+        self.plan(control)?.finish_managed_originals(revision)?;
+        Ok(processed)
+    }
     fn verify_root(&mut self, control: &Control) -> Result<()> {
         if let Some(io) = &self.managed {
             let request = LightroomWorkbenchIo::RootCurrent {
@@ -721,7 +824,17 @@ impl Owner {
             } => {
                 let rows = count(rows, 1000)?;
                 let packets = matches!(inspection, OriginalInspection::Packets);
-                let processed = self.plan(control)?.check_paths(&revision, rows, packets)?;
+                let processed = if self.managed.is_some() {
+                    self.inspect_originals_managed(
+                        &self.current_operation(shared),
+                        &revision,
+                        rows,
+                        packets,
+                        control,
+                    )?
+                } else {
+                    self.plan(control)?.check_paths(&revision, rows, packets)?
+                };
                 control.progress(processed as u64);
                 encode(
                     &serde_json::json!({"revision":revision,"processed":U64(processed as u64),"inspection":inspection}),

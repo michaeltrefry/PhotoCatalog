@@ -90,6 +90,8 @@ pub fn build_identity() -> String {
             include_str!("lightroom_sealed.rs"),
             include_str!("lightroom_artifacts.rs"),
             include_str!("lightroom_workbench.rs"),
+            include_str!("../lightroom/plan.rs"),
+            include_str!("../lightroom_migration_worker/source_reader/capture_wire.rs"),
             include_str!("../catalog_session/preview_stage.rs"),
             include_str!("export_stage.rs"),
             include_str!("../catalog_session/export_stage.rs"),
@@ -503,6 +505,33 @@ pub enum LightroomWorkbenchIo {
         generation: String,
         capture_generation: String,
     },
+    OriginalBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        candidate: crate::lightroom::plan::OriginalCandidate,
+        maximum_result_bytes: U64,
+    },
+    OriginalCurrent {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    OriginalPage {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        offset: U64,
+        limit: U64,
+    },
+    OriginalRelease {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
 }
 impl LightroomWorkbenchIo {
     fn ids(&self) -> [&str; 3] {
@@ -561,6 +590,30 @@ impl LightroomWorkbenchIo {
                 workbench,
                 generation,
                 ..
+            }
+            | Self::OriginalBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::OriginalCurrent {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::OriginalPage {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::OriginalRelease {
+                operation,
+                workbench,
+                generation,
+                ..
             } => [operation, workbench, generation],
         }
     }
@@ -605,6 +658,27 @@ impl LightroomWorkbenchIo {
                 ensure!(protected.len() <= 4096, "protected roster");
                 limits.validate()?;
             }
+            Self::OriginalBegin {
+                candidate,
+                maximum_result_bytes,
+                ..
+            } => {
+                validate_path(&candidate.path)?;
+                ensure!(
+                    !candidate.token.is_empty()
+                        && candidate.token.len() <= 128
+                        && (1..=64 * 1024 * 1024).contains(&maximum_result_bytes.0),
+                    "original inspection admission"
+                );
+            }
+            Self::OriginalCurrent { token, .. } | Self::OriginalRelease { token, .. } => ensure!(
+                !token.is_empty() && token.len() <= 128,
+                "original inspection token"
+            ),
+            Self::OriginalPage { token, limit, .. } => ensure!(
+                !token.is_empty() && token.len() <= 128 && (1..=16 * 1024).contains(&limit.0),
+                "original inspection page"
+            ),
             _ => {}
         }
         Ok(())
@@ -616,6 +690,7 @@ impl LightroomWorkbenchIo {
                 | Self::CaptureCancel { .. }
                 | Self::CaptureRetire { .. }
                 | Self::EvidenceRelease { .. }
+                | Self::OriginalRelease { .. }
         )
     }
 }
@@ -646,6 +721,18 @@ pub enum LightroomWorkbenchIoReply {
         manifest: crate::lightroom::capture::Manifest,
         manifest_blake3: String,
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    },
+    OriginalReady {
+        operation: String,
+        token: String,
+        bytes: U64,
+        blake3: String,
+    },
+    OriginalChunk {
+        operation: String,
+        token: String,
+        offset: U64,
+        bytes: Vec<u8>,
     },
     Released {
         operation: String,
@@ -706,9 +793,74 @@ impl LightroomWorkbenchIoReply {
                 authority.validate()?;
                 operation
             }
+            Self::OriginalReady {
+                operation,
+                token,
+                bytes,
+                blake3,
+            } => {
+                ensure!(
+                    !token.is_empty()
+                        && token.len() <= 128
+                        && bytes.0 > 0
+                        && bytes.0 <= 64 * 1024 * 1024
+                        && blake3.len() == 64,
+                    "original ready reply"
+                );
+                operation
+            }
+            Self::OriginalChunk {
+                operation,
+                token,
+                offset: _,
+                bytes,
+            } => {
+                ensure!(
+                    !token.is_empty()
+                        && token.len() <= 128
+                        && !bytes.is_empty()
+                        && bytes.len() <= 16 * 1024,
+                    "original chunk reply"
+                );
+                operation
+            }
             Self::Released { operation } => operation,
         };
         ensure!(actual == requested, "Workbench F reply operation differs");
+        match (request, self) {
+            (
+                LightroomWorkbenchIo::OriginalBegin { candidate, .. },
+                LightroomWorkbenchIoReply::OriginalReady { token, .. },
+            ) => ensure!(token == &candidate.token, "original ready token differs"),
+            (
+                LightroomWorkbenchIo::OriginalCurrent {
+                    token: expected, ..
+                },
+                LightroomWorkbenchIoReply::OriginalReady { token, .. },
+            ) => ensure!(token == expected, "original current token differs"),
+            (
+                LightroomWorkbenchIo::OriginalPage { token, offset, .. },
+                LightroomWorkbenchIoReply::OriginalChunk {
+                    token: actual,
+                    offset: actual_offset,
+                    ..
+                },
+            ) => ensure!(
+                token == actual && offset == actual_offset,
+                "original chunk binding differs"
+            ),
+            (
+                LightroomWorkbenchIo::OriginalRelease { .. },
+                LightroomWorkbenchIoReply::Released { .. },
+            ) => {}
+            (LightroomWorkbenchIo::OriginalBegin { .. }, _)
+            | (LightroomWorkbenchIo::OriginalCurrent { .. }, _)
+            | (LightroomWorkbenchIo::OriginalPage { .. }, _)
+            | (LightroomWorkbenchIo::OriginalRelease { .. }, _) => {
+                anyhow::bail!("original reply kind differs")
+            }
+            _ => {}
+        }
         Ok(())
     }
 }

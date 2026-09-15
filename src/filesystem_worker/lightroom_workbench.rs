@@ -14,6 +14,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeSet,
     fs,
+    io::Write,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -48,14 +49,25 @@ struct Evidence {
     raw: Vec<Source>,
     authority: CaptureSqlAuthority,
 }
+struct Original {
+    operation: String,
+    workbench: String,
+    generation: String,
+    candidate: crate::lightroom::plan::OriginalCandidate,
+    maximum_result_bytes: usize,
+    encoded: Vec<u8>,
+    blake3: String,
+}
 #[derive(Default)]
 pub(super) struct Owner {
     root: Option<Root>,
     capture: Option<Capture>,
     evidence: Option<Evidence>,
+    original: Option<Original>,
     released_root: Option<ReleaseReceipt>,
     released_capture: Option<ReleaseReceipt>,
     released_evidence: Option<ReleaseReceipt>,
+    released_original: Option<ReleaseReceipt>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -133,6 +145,126 @@ fn companion_free(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+fn bounded_json(value: &impl serde::Serialize, maximum: usize) -> Result<Vec<u8>> {
+    struct Counter {
+        bytes: usize,
+        maximum: usize,
+    }
+    impl Write for Counter {
+        fn write(&mut self, value: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(value.len())
+                .filter(|size| *size <= self.maximum)
+                .ok_or_else(|| std::io::Error::other("original result byte limit"))?;
+            Ok(value.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, maximum };
+    serde_json::to_writer(&mut counter, value)?;
+    let mut encoded = Vec::new();
+    encoded.try_reserve_exact(counter.bytes)?;
+    serde_json::to_writer(&mut encoded, value)?;
+    ensure!(encoded.len() == counter.bytes, "original encoding changed");
+    Ok(encoded)
+}
+
+fn inspect_original(
+    candidate: &crate::lightroom::plan::OriginalCandidate,
+    cancel: &AtomicBool,
+) -> Result<crate::lightroom::plan::OriginalObservation> {
+    canceled(cancel)?;
+    let path = candidate.path.to_path()?;
+    let (base_state, metadata) = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ("missing", serde_json::json!({"missing":true}))
+        }
+        Err(error) => (
+            "unavailable",
+            serde_json::json!({"error":error.to_string()}),
+        ),
+        Ok(value) if !value.is_file() || value.file_type().is_symlink() => {
+            ("non_regular", serde_json::json!({"regular":false}))
+        }
+        Ok(value) => ("available", serde_json::json!({"bytes":value.len()})),
+    };
+    let mut files = Vec::new();
+    let mut gaps = false;
+    if candidate.packets {
+        let limits = crate::xmp_packets::Limits {
+            max_source_bytes: candidate.limits.max_file_bytes,
+            max_retained_bytes: candidate.limits.max_cell_bytes,
+            max_parse_bytes: candidate.limits.max_cell_bytes,
+            ..Default::default()
+        };
+        let mut paths = vec![("embedded".to_owned(), path.clone())];
+        for suffix in ["xmp", "XMP"] {
+            paths.push((format!("sidecar_{suffix}"), path.with_extension(suffix)));
+            let mut appended = path.as_os_str().to_os_string();
+            appended.push(format!(".{suffix}"));
+            paths.push((
+                format!("sidecar_appended_{suffix}"),
+                Path::new(&appended).to_path_buf(),
+            ));
+        }
+        for (origin, path) in paths {
+            canceled(cancel)?;
+            let result = match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    files.push(crate::lightroom::plan::OriginalFileObservation {
+                        origin,
+                        path: NativePath::from_path(&path),
+                        state: "absent".into(),
+                        error: None,
+                        inspection: None,
+                    });
+                    continue;
+                }
+                Err(error) => Err(error),
+                Ok(_) if origin == "embedded" => {
+                    crate::xmp_packets::inspect_cancellable(&path, &limits, false, cancel)
+                }
+                Ok(_) => crate::xmp_packets::inspect_cancellable(&path, &limits, true, cancel),
+            };
+            match result {
+                Ok(value) => {
+                    gaps |= !matches!(
+                        value.status,
+                        crate::xmp_packets::Status::Complete | crate::xmp_packets::Status::Absent
+                    );
+                    files.push(crate::lightroom::plan::OriginalFileObservation {
+                        origin,
+                        path: NativePath::from_path(&path),
+                        state: "inspected".into(),
+                        error: None,
+                        inspection: Some(value),
+                    });
+                }
+                Err(error) => {
+                    canceled(cancel)?;
+                    gaps = true;
+                    files.push(crate::lightroom::plan::OriginalFileObservation {
+                        origin,
+                        path: NativePath::from_path(&path),
+                        state: "unavailable".into(),
+                        error: Some(error.to_string()),
+                        inspection: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(crate::lightroom::plan::OriginalObservation {
+        token: candidate.token.clone(),
+        base_state: base_state.into(),
+        metadata,
+        files,
+        packet_gaps: gaps,
+    })
 }
 
 impl Owner {
@@ -532,6 +664,120 @@ impl Owner {
                 value.verify(cancel)?;
                 self.evidence.take();
                 self.released_evidence = Some(receipt.clone());
+                Ok(receipt.reply())
+            }
+            LightroomWorkbenchIo::OriginalBegin {
+                operation,
+                workbench,
+                generation,
+                candidate,
+                maximum_result_bytes,
+            } => {
+                ensure!(
+                    self.original.is_none(),
+                    "original inspection already retained"
+                );
+                self.released_original = None;
+                let observation = inspect_original(&candidate, cancel)?;
+                let maximum = usize::try_from(maximum_result_bytes.0)?;
+                let encoded = bounded_json(&observation, maximum)?;
+                let blake3 = crate::lightroom::digest(&encoded);
+                let value = Original {
+                    operation: operation.clone(),
+                    workbench,
+                    generation,
+                    candidate,
+                    maximum_result_bytes: maximum,
+                    encoded,
+                    blake3: blake3.clone(),
+                };
+                let reply = LightroomWorkbenchIoReply::OriginalReady {
+                    operation,
+                    token: value.candidate.token.clone(),
+                    bytes: U64(value.encoded.len() as u64),
+                    blake3,
+                };
+                self.original = Some(value);
+                Ok(reply)
+            }
+            LightroomWorkbenchIo::OriginalCurrent {
+                operation,
+                workbench,
+                generation,
+                token,
+            } => {
+                let value = self
+                    .original
+                    .as_mut()
+                    .context("no original inspection retained")?;
+                same(
+                    (&value.operation, &value.workbench, &value.generation),
+                    (&operation, &workbench, &generation),
+                )?;
+                ensure!(value.candidate.token == token, "original token differs");
+                let current = inspect_original(&value.candidate, cancel)?;
+                let encoded = bounded_json(&current, value.maximum_result_bytes)?;
+                ensure!(
+                    crate::lightroom::digest(&encoded) == value.blake3,
+                    "original or sidecar changed before commit"
+                );
+                Ok(LightroomWorkbenchIoReply::OriginalReady {
+                    operation,
+                    token,
+                    bytes: U64(value.encoded.len() as u64),
+                    blake3: value.blake3.clone(),
+                })
+            }
+            LightroomWorkbenchIo::OriginalPage {
+                operation,
+                workbench,
+                generation,
+                token,
+                offset,
+                limit,
+            } => {
+                let value = self
+                    .original
+                    .as_ref()
+                    .context("no original inspection retained")?;
+                same(
+                    (&value.operation, &value.workbench, &value.generation),
+                    (&operation, &workbench, &generation),
+                )?;
+                ensure!(value.candidate.token == token, "original token differs");
+                let start = usize::try_from(offset.0)?;
+                let count = usize::try_from(limit.0)?;
+                ensure!(start < value.encoded.len(), "original page offset");
+                let end = start.saturating_add(count).min(value.encoded.len());
+                Ok(LightroomWorkbenchIoReply::OriginalChunk {
+                    operation,
+                    token,
+                    offset,
+                    bytes: value.encoded[start..end].to_vec(),
+                })
+            }
+            LightroomWorkbenchIo::OriginalRelease {
+                operation,
+                workbench,
+                generation,
+                token,
+            } => {
+                let receipt =
+                    ReleaseReceipt::new(&operation, &workbench, &generation, Some(&token));
+                if self.released_original.as_ref() == Some(&receipt) {
+                    return Ok(receipt.reply());
+                }
+                let value = self
+                    .original
+                    .as_ref()
+                    .context("no original inspection retained")?;
+                same(
+                    (&value.operation, &value.workbench, &value.generation),
+                    (&operation, &workbench, &generation),
+                )?;
+                ensure!(value.candidate.token == token, "original token differs");
+                self.original.take();
+                self.released_original = Some(receipt.clone());
                 Ok(receipt.reply())
             }
         }

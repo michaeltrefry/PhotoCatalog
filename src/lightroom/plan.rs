@@ -203,6 +203,35 @@ pub struct Progress {
     pub retained_this_call: usize,
     pub stage: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalCandidate {
+    pub revision: String,
+    pub sequence: i64,
+    pub source_id: String,
+    pub path: NativePath,
+    pub packets: bool,
+    pub limits: Limits,
+    pub token: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalFileObservation {
+    pub origin: String,
+    pub path: NativePath,
+    pub state: String,
+    pub error: Option<String>,
+    pub inspection: Option<xmp_packets::Inspection>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalObservation {
+    pub token: String,
+    pub base_state: String,
+    pub metadata: serde_json::Value,
+    pub files: Vec<OriginalFileObservation>,
+    pub packet_gaps: bool,
+}
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedTable {
     pub name: String,
@@ -1899,6 +1928,160 @@ impl Plan {
         )?;
         transaction.commit()?;
         Ok(stage.into())
+    }
+    pub(crate) fn managed_original_candidates(
+        &self,
+        revision: &str,
+        limit: usize,
+        packets: bool,
+    ) -> Result<Vec<OriginalCandidate>> {
+        ensure!((1..=1000).contains(&limit), "path budget must be 1..1000");
+        let (_, manifest) = self.capture(revision)?;
+        let mut statement = self.db.prepare(if packets {
+            PATH_PACKET_QUEUE
+        } else {
+            PATH_QUEUE
+        })?;
+        let mut rows = statement.query(params![revision, limit as i64])?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            let sequence = row.get::<_, i64>(0)?;
+            let source_id = row.get::<_, String>(1)?;
+            let encoded_path = row.get::<_, String>(2)?;
+            let path: NativePath = serde_json::from_str(&encoded_path)?;
+            let token = digest(&bounded_json(
+                &(revision, sequence, &source_id, &path, packets),
+                PAGE_BYTES,
+            )?);
+            let candidate = OriginalCandidate {
+                revision: revision.into(),
+                sequence,
+                source_id,
+                path,
+                packets,
+                limits: manifest.request.limits.clone(),
+                token,
+            };
+            let size = bounded_json(&candidate, PAGE_BYTES)?.len();
+            if bytes
+                .checked_add(size)
+                .context("original candidate bytes")?
+                > PAGE_BYTES
+            {
+                ensure!(!out.is_empty(), "original candidate exceeds page bytes");
+                break;
+            }
+            bytes += size;
+            out.push(candidate);
+        }
+        Ok(out)
+    }
+    pub(crate) fn apply_managed_original(
+        &mut self,
+        candidate: &OriginalCandidate,
+        observation: OriginalObservation,
+    ) -> Result<()> {
+        ensure!(
+            observation.token == candidate.token,
+            "original evidence token differs"
+        );
+        let (source_id, encoded_path, state, evidence): (String, String, String, Option<String>) = self.db.query_row(
+            "SELECT source_id,inspection_path,state,evidence FROM paths WHERE revision=? AND sequence=?",
+            params![candidate.revision, candidate.sequence],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        ensure!(
+            state == "pending"
+                || (candidate.packets
+                    && evidence
+                        .as_deref()
+                        .is_some_and(|value| value.contains("embedded_sidecar_xmp"))),
+            "original candidate state changed before commit"
+        );
+        let path: NativePath = serde_json::from_str(&encoded_path)?;
+        let expected = digest(&bounded_json(
+            &(
+                candidate.revision.as_str(),
+                candidate.sequence,
+                &source_id,
+                &path,
+                candidate.packets,
+            ),
+            PAGE_BYTES,
+        )?);
+        ensure!(
+            expected == candidate.token
+                && source_id == candidate.source_id
+                && path == candidate.path,
+            "original candidate changed before commit"
+        );
+        let transaction = self.db.transaction()?;
+        let mut inspections = Vec::new();
+        for file in &observation.files {
+            if let Some(value) = &file.inspection {
+                for (index, packet) in value.packets.iter().enumerate() {
+                    let detail = serde_json::json!({"container":packet.container,"ranges":packet.ranges,"group":packet.group,"attributes":packet.attributes,"source_revision":value.revision,"inspection_status":value.status,"source_path":file.path});
+                    transaction.execute("INSERT OR IGNORE INTO packets(revision,source_id,origin,raw_digest,raw,detail) VALUES(?,?,?,?,?,?)",params![candidate.revision,candidate.source_id,format!("{}:packet:{index}",file.origin),packet.blake3,packet.bytes,detail.to_string()])?;
+                }
+                for (index, input) in value.parse_inputs.iter().enumerate() {
+                    let detail = serde_json::json!({"transformation":input.transformation,"packet_indices":input.packet_indices,"group":input.group,"input_blake3":input.blake3,"source_revision":value.revision,"inspection_status":value.status});
+                    transaction.execute("INSERT OR IGNORE INTO packets(revision,source_id,origin,raw_digest,raw,decoded,detail) VALUES(?,?,?,?,?,?,?)",params![candidate.revision,candidate.source_id,format!("{}:parse_input:{index}",file.origin),input.blake3,Vec::<u8>::new(),input.bytes,detail.to_string()])?;
+                    if value.status == xmp_packets::Status::Complete {
+                        retain_facts(
+                            &transaction,
+                            &candidate.revision,
+                            &candidate.source_id,
+                            Some(&candidate.source_id),
+                            &file.origin,
+                            &input.blake3,
+                            &input.bytes,
+                        )?;
+                    }
+                }
+            }
+            inspections.push(serde_json::json!({"origin":file.origin,"path":file.path,"state":file.state,"error":file.error,"status":file.inspection.as_ref().map(|v|v.status),"revision":file.inspection.as_ref().map(|v|&v.revision),"packets":file.inspection.as_ref().map_or(0,|v|v.packets.len()),"parse_inputs":file.inspection.as_ref().map_or(0,|v|v.parse_inputs.len()),"issues":file.inspection.as_ref().map(|v|&v.issues)}));
+        }
+        let state = if candidate.packets && observation.base_state == "available" {
+            if observation.packet_gaps {
+                "available_packet_gaps"
+            } else {
+                "available_packets_retained"
+            }
+        } else if !candidate.packets && observation.base_state == "available" {
+            "available_packets_uninspected"
+        } else {
+            &observation.base_state
+        };
+        let evidence = if candidate.packets {
+            serde_json::json!({"metadata":observation.metadata,"inspections":inspections,"packet_gaps":observation.packet_gaps})
+        } else {
+            serde_json::json!({"metadata":observation.metadata,"embedded_sidecar_xmp":"not inspected by explicit metadata-only mode"})
+        };
+        transaction.execute(
+            "UPDATE paths SET state=?,evidence=? WHERE revision=? AND sequence=?",
+            params![
+                state,
+                serde_json::to_string(&evidence)?,
+                candidate.revision,
+                candidate.sequence
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",
+            [&candidate.revision],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+    pub(crate) fn finish_managed_originals(&mut self, revision: &str) -> Result<()> {
+        let pending: i64 = self
+            .db
+            .query_row(PATH_PENDING, [revision], |row| row.get(0))?;
+        if pending == 0 {
+            self.db.execute("UPDATE captures SET stage='inspection_complete_with_reported_gaps' WHERE revision=? AND stage='rows_reconciled_paths_pending'",[revision])?;
+        }
+        Ok(())
     }
     /// Bounded direct-path inspection. No directory recursion or root guessing.
     /// `packets=false` performs metadata lookups only and leaves explicit XMP gaps.
