@@ -96,7 +96,47 @@ PrepareSupplements starts C/LM, not the asserted SQL Source. Negative receipt
 injection (negative receipt `c26ced0a`, log `6f0182cc`); no workers remain.
 Runtime is paused for one bounded diagnosis of cases29/32/33. Thirty unique
 cases pass; cases34–50 remain unexecuted.
-Source remains uncommitted pending repairs, focused verification and evidence audit.
+The fixture-only repair is frozen at `sc-22847-lm4-fixture-lifecycle-6v_b95l9`
+(manifest `cb45b558`; other 395 source files unchanged). Full compilation passes
+`aaa5d1bd` / receipt `5e281d79`; independent review `3cedf702` passes. The required
+1024 preparation case retains full coverage with a test-only 600-second execution
+allowance; failure cleanup has a separate drain window and preserves the original
+unknown outcome. Case32 roster and case33 fault ordering are corrected, and a new
+actual deadline/cleanup regression is added. Fresh libtest inventory is building
+in `sc-22847-lm4-fixture-build-coluxlhq`. Planned focused gate
+`sc-22847-lm4-fixture-runtime-is8ndnle` covers four repaired/new cases, 17 untouched
+tail cases, and prior cases26/27 to exercise the edited shared helper. The expensive
+1024 case runs last. Prior unaffected evidence remains explicitly tied to its
+source snapshot; independent aggregate evidence review is required before acceptance.
+The rebuilt libtest `d7e0912c` inventories all 51 filters (receipt `4b1e3814`).
+New actual deadline/unknown/cleanup test passes; abrupt-C reaches verified
+retirement but its final helper requests shutdown again and receives the retained
+abnormal F diagnostic (negative receipt `c7415402`). Tail `sc-22847-lm4-fixture-tail-
+77995x5a` passes all 20 preceding cases, including normal multi-operation helpers.
+The 1024 case runs 370.95s and fails a desktop protocol-header check (negative
+receipt `8c286f1d`); all workers retired.
+
+Root isolated probes on the exact libtest establish the cause: the nested default
+libtest writes a 120-byte slow-test notice into restored C protocol stdout after
+60 seconds (hash `3d0aad72`). With `--test-threads=1`, the 65-second control emits
+zero bytes. Both precisely owned probe children were explicitly terminated/waited;
+these diagnostics admitted no C configuration or downstream workers. Evidence:
+`sc-22847-lm4-harness-channel-probe-00jlg7z8` and
+`sc-22847-lm4-harness-single-thread-probe-mvhw7ntv/comparison.json`.
+The minimal fixture-only wrapper/finalization successor is frozen at
+`sc-22847-lm4-fixture-protocol-finalization-c6rtslma` (manifest `bab5a36f`).
+Full compile `43b86d43` / receipt `331ba2a0` and independent review `80c2de3a` pass.
+Fresh libtest `be6ab63b` inventories 51 filters (build receipt `22531553`); unchanged
+production CLI `0432d408` is reused under audited identity evidence.
+`sc-22847-lm4-protocol-runtime-otr0zsc8` passes abrupt-C retirement (`fb207373`)
+and normal Run/Status/all-role retirement (`11e9942c`). Its 1024-result case passes in 370.3s (`6094f60b`), with root receipt `931a9a1a`.
+Independent aggregate audit `9b7ca85c` and matrix `f38650dd` pass: 51 canonical
+filters have exact 1/1 positive evidence (28 reviewed prior-snapshot, 20 lifecycle
+fixture, three final reruns). All 196 recorded command/fixture-child process
+retirements reconcile. This is explicitly not one 51-test run, and earlier
+negative gates/manual cleanup remain preserved. Local source commit
+`312b924c1064e08c1ee6d71a3d4904cfb30bd172` contains the accepted 16-file component;
+root integration and combined desktop checks follow.
 No full facade runtime or S12 acceptance is claimed.
 
 A separate managed-C process trace (`df08341a`) establishes that the closed
