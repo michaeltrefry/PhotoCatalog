@@ -2,6 +2,13 @@
 //! migration constructors require a G token client and never fall back to spawn.
 use super::*;
 use crate::lightroom_migration_worker::source_reader::relay::client::Remote;
+#[cfg_attr(
+    all(test, windows),
+    allow(
+        clippy::large_enum_variant,
+        reason = "Test-only revoke and checked-drain probes enlarge the Windows Process owner; preserve the inline production transport layout"
+    )
+)]
 pub(super) enum Transport {
     Direct(Process<Reply>),
     Managed(Remote),
