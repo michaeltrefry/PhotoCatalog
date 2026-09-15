@@ -691,6 +691,7 @@ fn local_route(request: &Request) -> bool {
         | Request::PreviewStatus { .. }
         | Request::CancelPreview { .. }
         | Request::ReleaseViewport { .. }
+        | Request::PreviewSettings { .. }
         | Request::Metadata { .. }
         | Request::Organization { .. } => false,
     }

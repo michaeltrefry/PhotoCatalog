@@ -20,6 +20,7 @@ pub use scheduler::{
     Completion, Consumer, PreviewScheduler, Priority, SchedulerLimits, SchedulerUsage, WorkLease,
     WorkerOutcome,
 };
+pub(crate) use store::OriginalRootReview;
 pub use store::{
     CacheQuotaExceeded, CachedPreview, EditInputProvenance, Layout, PreviewKey, PreviewStore,
     Publication, RelocationProgress, RenderRecord, StoreConfig, StoreUsage, Tier,

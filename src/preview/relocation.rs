@@ -1,6 +1,19 @@
 //! Incremental relocation keeps the old location authoritative until every
 //! immutable object is copied and verified. Cleanup starts only after the switch.
 use super::*;
+fn nonnegative_count(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RelocationProgress {
     pub tier: Tier,
@@ -8,6 +21,18 @@ pub struct RelocationProgress {
     pub processed: usize,
     pub object_bytes: u64,
     pub complete: bool,
+}
+#[derive(Debug, Clone)]
+pub struct RelocationSnapshot {
+    pub tier: Tier,
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub phase: String,
+    /// Older in-flight journals have no counters; they are never invented.
+    pub objects: Option<u64>,
+    pub bytes: Option<u64>,
+    pub total_objects: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 pub(super) fn lock_root(
     root: &Path,
@@ -153,6 +178,20 @@ impl PreviewStore {
         Ok(self
             .db
             .query_row("SELECT EXISTS(SELECT 1 FROM relocations)", [], |r| r.get(0))?)
+    }
+    pub fn relocation_snapshot(&self) -> Result<Option<RelocationSnapshot>> {
+        self.db
+            .query_row("SELECT r.tier,CASE WHEN length(CAST(r.source AS BLOB))<=1048576 THEN r.source ELSE NULL END,CASE WHEN length(CAST(r.target AS BLOB))<=1048576 THEN r.target ELSE NULL END,r.phase,p.objects,p.bytes,p.total_objects,p.total_bytes FROM relocations r LEFT JOIN relocation_progress p ON p.tier=r.tier LIMIT 1", [], |row| {
+                let tier: String = row.get(0)?;
+                let tier = match tier.as_str() {
+                    "thumbnail" => Tier::Thumbnail,
+                    "large" => Tier::Large,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(RelocationSnapshot { tier, source: read_path(row,1)?, target: read_path(row,2)?, phase: row.get(3)?, objects: nonnegative_count(row,4)?, bytes: nonnegative_count(row,5)?, total_objects: nonnegative_count(row,6)?, total_bytes: nonnegative_count(row,7)? })
+            })
+            .optional()
+            .map_err(Into::into)
     }
     /// Changing quotas never evicts a retained thumbnail. A lower retained budget
     /// simply prevents new publication until the owner supplies sufficient space.
@@ -336,15 +375,16 @@ impl PreviewStore {
             id
         };
         after_markers()?;
-        self.db.execute(
+        let source = encode_path(self.root(tier))?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO relocations VALUES(?1,?2,?3,?4,'copy','')",
-            params![
-                tier.name(),
-                id,
-                encode_path(self.root(tier))?,
-                encode_path(&destination)?
-            ],
+            params![tier.name(), id, source, encode_path(&destination)?],
         )?;
+        tx.execute("INSERT INTO relocation_progress SELECT tier,0,0,objects,bytes FROM usage WHERE tier=?1", [tier.name()])?;
+        tx.commit()?;
         self._relocation_lock = target_lock;
         self.managed_relocation = reservation;
         Ok(())
@@ -528,10 +568,22 @@ impl PreviewStore {
                     }
                 }
             }
-            self.db.execute(
+            let tx = self
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
                 "UPDATE relocations SET cursor=?1 WHERE tier=?2",
                 params![key, tier.name()],
             )?;
+            tx.execute(
+                "UPDATE relocation_progress SET objects=objects+1,bytes=bytes+?1 WHERE tier=?2",
+                params![
+                    i64::try_from(*length)
+                        .context("relocation object length exceeds SQLite integer range")?,
+                    tier.name()
+                ],
+            )?;
+            tx.commit()?;
             progress.processed += 1;
             progress.object_bytes += *length;
         }
@@ -546,6 +598,10 @@ impl PreviewStore {
                 )?;
                 tx.execute(
                     "UPDATE relocations SET phase='cleanup',cursor='' WHERE tier=?1",
+                    [tier.name()],
+                )?;
+                tx.execute(
+                    "UPDATE relocation_progress SET objects=0,bytes=0 WHERE tier=?1",
                     [tier.name()],
                 )?;
                 tx.commit()?;
@@ -614,7 +670,7 @@ impl PreviewStore {
             "not a preview manifest"
         );
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        ensure!((1..=5).contains(&version), "unsupported preview manifest");
+        ensure!((1..=6).contains(&version), "unsupported preview manifest");
         validate_paths(db)?;
         for tier in [Tier::Thumbnail, Tier::Large] {
             let path = db.query_row(

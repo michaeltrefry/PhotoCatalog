@@ -77,13 +77,15 @@ pub async fn catalog_choose_folder(app: tauri::AppHandle, create_catalog: bool) 
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocationPurpose { Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal, ExportDirectory, ExportProfile, LightroomNewWorkbench, LightroomWorkbench, LightroomCaptureStaging, LightroomDiscoveryRoot, LightroomSourceCatalog, LightroomCaptureEvidence, LightroomNewCapture, LightroomNewSeal, LightroomApprovalDestination, LightroomNewApprovalDestination }
+pub enum LocationPurpose { PreviewDestination, OriginalRoot, Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal, ExportDirectory, ExportProfile, LightroomNewWorkbench, LightroomWorkbench, LightroomCaptureStaging, LightroomDiscoveryRoot, LightroomSourceCatalog, LightroomCaptureEvidence, LightroomNewCapture, LightroomNewSeal, LightroomApprovalDestination, LightroomNewApprovalDestination }
 
 #[tauri::command]
 pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPurpose) -> Result<Option<SelectedPath>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = app.dialog().file();
         let selected = match purpose {
+            LocationPurpose::PreviewDestination => dialog.set_title("Choose a new empty preview folder").set_file_name("LensWorks Previews").blocking_save_file(),
+            LocationPurpose::OriginalRoot => dialog.set_title("Choose an original-photo root folder").blocking_pick_folder(),
             LocationPurpose::LightroomNewWorkbench => dialog.set_title("Choose a new Lightroom inspection folder").set_file_name("Lightroom Inspection").blocking_save_file(),
             LocationPurpose::LightroomWorkbench => dialog.set_title("Open an existing Lightroom inspection folder").blocking_pick_folder(),
             LocationPurpose::LightroomCaptureStaging => dialog.set_title("Choose the folder for temporary Lightroom capture files").blocking_pick_folder(),

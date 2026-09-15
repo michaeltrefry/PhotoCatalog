@@ -10,7 +10,7 @@ mod relocation;
 use super::{CodecSettings, PREPARATION_VERSION};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
-pub use relocation::RelocationProgress;
+pub use relocation::{RelocationProgress, RelocationSnapshot};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -189,6 +189,11 @@ pub struct StoreUsage {
     pub pending_objects: u64,
     pub objects: u64,
 }
+#[derive(Debug, Clone)]
+pub(crate) struct OriginalRootReview {
+    pub roots: Vec<PathBuf>,
+    pub storage_epoch: Option<u64>,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Publication {
     Attached,
@@ -355,6 +360,27 @@ pub struct PreviewStore {
     clock: Cell<i64>,
     touches: RefCell<HashMap<String, i64>>,
 }
+
+fn validate_original_roots(roots: &[PathBuf]) -> Result<()> {
+    ensure!(!roots.is_empty(), "at least one original root is required");
+    ensure!(roots.len() <= 1024, "original root count exceeds bound");
+    let mut bytes = 0usize;
+    for (index, root) in roots.iter().enumerate() {
+        ensure!(root.is_absolute(), "original root must be absolute");
+        let encoded = encode_path(root)?;
+        ensure!(
+            encoded.len() <= 256 * 1024,
+            "original root exceeds byte bound"
+        );
+        bytes = bytes
+            .checked_add(encoded.len())
+            .filter(|value| *value <= 2 * 1024 * 1024)
+            .context("original root bytes exceed bound")?;
+        ensure!(!roots[..index].contains(root), "duplicate original root");
+    }
+    Ok(())
+}
+
 impl PreviewStore {
     /// Enforce separation from authoritative and in-flight owned cache roots,
     /// even when a library caller omitted a source from its configured root list.
@@ -400,6 +426,9 @@ impl PreviewStore {
                 && config.large_bytes <= i64::MAX as u64,
             "invalid cache quotas"
         );
+        if !original_roots.is_empty() {
+            validate_original_roots(original_roots)?;
+        }
         let roots = [
             prospective(&config.manifest_root)?,
             prospective(&config.thumbnail_root)?,
@@ -443,7 +472,7 @@ impl PreviewStore {
             .context("preview service already owns this cache")?;
         let lock = AcquiredPreviewLock(lock);
         let db = Connection::open(config.manifest_root.join("previews.sqlite3"))?;
-        Self::initialize(config, db.into(), Some(lock), None)
+        Self::initialize(config, db.into(), Some(lock), None, original_roots)
     }
     pub(crate) fn open_admitted(
         config: StoreConfig,
@@ -463,13 +492,14 @@ impl PreviewStore {
                 && config.large_bytes <= i64::MAX as u64,
             "invalid cache quotas"
         );
-        Self::initialize(config, db, None, Some(files))
+        Self::initialize(config, db, None, Some(files), &[])
     }
     fn initialize(
         config: StoreConfig,
         db: crate::catalog_session::SqlConnection,
         lock: Option<AcquiredPreviewLock>,
         files: Option<std::sync::Arc<dyn AdmittedStoreFiles>>,
+        original_roots: &[PathBuf],
     ) -> Result<Self> {
         let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -482,7 +512,7 @@ impl PreviewStore {
             ensure!(count == 0 && app == 0, "unrelated preview manifest");
         } else {
             ensure!(
-                (1..=5).contains(&version) && app == 0x50435056,
+                (1..=6).contains(&version) && app == 0x50435056,
                 "unsupported preview manifest"
             );
         }
@@ -498,6 +528,10 @@ impl PreviewStore {
             CREATE TABLE IF NOT EXISTS store_identity(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS budgets(tier TEXT PRIMARY KEY,bytes INTEGER NOT NULL CHECK(bytes>0));
             CREATE TABLE IF NOT EXISTS relocations(tier TEXT PRIMARY KEY,id TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,phase TEXT NOT NULL,cursor TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS relocation_progress(tier TEXT PRIMARY KEY REFERENCES relocations(tier) ON DELETE CASCADE,objects INTEGER NOT NULL CHECK(objects>=0),bytes INTEGER NOT NULL CHECK(bytes>=0),total_objects INTEGER NOT NULL CHECK(total_objects>=objects),total_bytes INTEGER NOT NULL CHECK(total_bytes>=bytes));
+            CREATE TABLE IF NOT EXISTS original_roots(id INTEGER PRIMARY KEY,path BLOB NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS original_root_review(id INTEGER PRIMARY KEY CHECK(id=1),storage_epoch INTEGER CHECK(storage_epoch IS NULL OR storage_epoch>=0));
+            INSERT OR IGNORE INTO original_root_review VALUES(1,NULL);
             CREATE TABLE IF NOT EXISTS render_records(key TEXT PRIMARY KEY REFERENCES objects(key) ON DELETE CASCADE,record TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS objects_eviction ON objects(tier,status,touched,key);
             CREATE INDEX IF NOT EXISTS objects_recovery ON objects(status,key);
@@ -532,7 +566,19 @@ impl PreviewStore {
                 db.execute_batch("ALTER TABLE wanted ADD COLUMN image_pixel_generation INTEGER CHECK(image_pixel_generation IS NULL OR image_pixel_generation>=0)")?;
                 restore_image_scopes(&db)?;
             }
-            db.execute_batch("PRAGMA user_version=5")?;
+            for source in original_roots {
+                let inserted = db.execute(
+                    "INSERT OR IGNORE INTO original_roots(path) VALUES(?1)",
+                    [encode_path(source)?],
+                )?;
+                if inserted != 0 {
+                    db.execute(
+                        "UPDATE original_root_review SET storage_epoch=NULL WHERE id=1",
+                        [],
+                    )?;
+                }
+            }
+            db.execute_batch("PRAGMA user_version=6")?;
             Ok(())
         })();
         finish(&db, migration)?;
@@ -644,6 +690,77 @@ impl PreviewStore {
     }
     pub fn configuration(&self) -> &StoreConfig {
         &self.config
+    }
+    pub(crate) fn original_root_review(&self) -> Result<OriginalRootReview> {
+        let storage_epoch = self
+            .db
+            .query_row(
+                "SELECT storage_epoch FROM original_root_review WHERE id=1",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .map(u64::try_from)
+            .transpose()?;
+        let mut statement = self.db.prepare(
+            "SELECT CASE WHEN length(CAST(path AS BLOB))<=262144 THEN path ELSE NULL END FROM original_roots ORDER BY id LIMIT 1025",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut roots = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            ensure!(roots.len() < 1024, "original root count exceeds bound");
+            let root = read_path(row, 0)?;
+            bytes = bytes
+                .checked_add(encode_path(&root)?.len())
+                .filter(|value| *value <= 2 * 1024 * 1024)
+                .context("original root bytes exceed bound")?;
+            roots.push(root);
+        }
+        Ok(OriginalRootReview {
+            roots,
+            storage_epoch,
+        })
+    }
+    pub(crate) fn replace_original_root_review(
+        &mut self,
+        roots: &[PathBuf],
+        storage_epoch: u64,
+    ) -> Result<()> {
+        validate_original_roots(roots)?;
+        ensure!(storage_epoch <= i64::MAX as u64, "storage epoch overflow");
+        let encoded = roots
+            .iter()
+            .map(|root| encode_path(root))
+            .collect::<Result<Vec<_>>>()?;
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM original_roots", [])?;
+        for root in encoded {
+            tx.execute("INSERT INTO original_roots(path) VALUES(?1)", [root])?;
+        }
+        tx.execute(
+            "UPDATE original_root_review SET storage_epoch=?1 WHERE id=1",
+            [i64::try_from(storage_epoch)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn register_original_root(&mut self, root: &Path) -> Result<()> {
+        let root = root.to_path_buf();
+        validate_original_roots(std::slice::from_ref(&root))?;
+        self.ensure_original_separate(&root)?;
+        let tx = self.db.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO original_roots(path) VALUES(?1)",
+            [encode_path(&root)?],
+        )?;
+        if inserted != 0 {
+            tx.execute(
+                "UPDATE original_root_review SET storage_epoch=NULL WHERE id=1",
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
     fn root(&self, tier: Tier) -> &Path {
         match tier {
@@ -1843,6 +1960,77 @@ mod tests {
     }
     fn authority(attach: &mut dyn FnMut() -> Result<Publication>) -> Result<Publication> {
         attach()
+    }
+    #[test]
+    fn relocation_progress_survives_reopen_and_tracks_copy_and_cleanup() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path(), 1000, 1000);
+        let mut store = PreviewStore::open(cfg.clone(), &[])?;
+        for asset in ["one", "two"] {
+            let mut key = key(1, Tier::Thumbnail);
+            key.asset_id = asset.into();
+            store.desire(&key, || Ok(true))?;
+            store.publish(&key, b"preview", authority)?;
+        }
+        store.begin_relocation(Tier::Thumbnail, &root.path().join("moved"), &[])?;
+        let first = store.relocation_step(Tier::Thumbnail, 1, 1024)?;
+        assert_eq!(first.processed, 1);
+        drop(store);
+        let cfg = PreviewStore::current_configuration(cfg)?;
+        let mut store = PreviewStore::open(cfg, &[])?;
+        let state = store.relocation_snapshot()?.unwrap();
+        assert_eq!(state.phase, "copy");
+        assert_eq!(
+            (
+                state.objects,
+                state.bytes,
+                state.total_objects,
+                state.total_bytes
+            ),
+            (Some(1), Some(7), Some(2), Some(14))
+        );
+        store.relocation_step(Tier::Thumbnail, 10, 1024)?;
+        let state = store.relocation_snapshot()?.unwrap();
+        assert_eq!(state.phase, "cleanup");
+        assert_eq!((state.objects, state.bytes), (Some(0), Some(0)));
+        store.relocation_step(Tier::Thumbnail, 1, 1024)?;
+        let state = store.relocation_snapshot()?.unwrap();
+        assert_eq!((state.objects, state.bytes), (Some(1), Some(7)));
+        store.relocation_step(Tier::Thumbnail, 10, 1024)?;
+        assert!(store.relocation_snapshot()?.is_none());
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM relocation_progress", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+    #[test]
+    fn version_five_inflight_relocation_retains_unknown_counts_without_backfill() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path(), 1000, 1000);
+        let mut store = PreviewStore::open(cfg.clone(), &[])?;
+        store.begin_relocation(Tier::Large, &root.path().join("moved"), &[])?;
+        store
+            .db
+            .execute_batch("DROP TABLE relocation_progress; PRAGMA user_version=5;")?;
+        drop(store);
+        let mut store = PreviewStore::open(cfg, &[])?;
+        assert_eq!(
+            store
+                .db
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
+            6
+        );
+        let state = store.relocation_snapshot()?.unwrap();
+        assert_eq!(state.phase, "copy");
+        assert!(state.objects.is_none());
+        store.relocation_step(Tier::Large, 1, 1024)?;
+        store.relocation_step(Tier::Large, 1, 1024)?;
+        assert!(store.relocation_snapshot()?.is_none());
+        Ok(())
     }
     #[test]
     fn offline_fallback_and_quota_preserve_previous_thumbnail() {

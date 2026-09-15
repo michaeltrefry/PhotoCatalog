@@ -1,3 +1,4 @@
+import { PreviewSettingsPanel } from './components/PreviewSettingsPanel';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -46,6 +47,7 @@ export function App() {
   const [folderEpoch, setFolderEpoch] = useState(0);
   const [showImport, setShowImport] = useState(false);
   const [showBackup, setShowBackup] = useState(false);
+  const [showPreviewSettings, setShowPreviewSettings] = useState(false);
   const [showOrganization, setShowOrganization] = useState(false);
   const [showMetadata, setShowMetadata] = useState(false);
   const [showRelink, setShowRelink] = useState(false);
@@ -291,6 +293,7 @@ export function App() {
       {desktopAvailable && <button className="quiet" onClick={() => setShowLightroom(true)}>Inspect Lightroom…</button>}
       {catalog && <button className="quiet" onClick={() => void close()} disabled={!!busy || transitioning}>Close catalog</button>}
     </header>
+    {catalog && <button disabled={transitioning} onClick={() => setShowPreviewSettings(true)}>Preview storage…</button>}
     {desktopAvailable && <LightroomActivity controller={inspection} onOpen={() => setShowLightroom(true)} />}
     {error && <ErrorNotice message={error} dismiss={() => setError('')} />}
     {busy && <div className="activity" role="status">{busy}… {operationAbort.current && <button onClick={() => operationAbort.current?.abort()}>Cancel</button>}</div>}
@@ -338,6 +341,7 @@ export function App() {
     {desktopAvailable && <BackupPanel catalog={catalog} open={showBackup} onClose={() => setShowBackup(false)} onProgress={setBackupStatus} />}
     {catalog && selected && showMetadata && <MetadataPanel key={`${catalog}:${imageKey(selected.key)}`} catalog={catalog} variant={selected.key} filename={selected.filename} mutate={organizationMutation} onClose={() => setShowMetadata(false)} />}
     {catalog && <OrganizationPanel phase={status.phase} open={showOrganization} onOpen={() => setShowOrganization(true)} key={`organization:${catalog}`} catalog={catalog} selected={selected} selectedVariantLabel={editor?.variant.label ?? null} rows={page.rows} mutate={organizationMutation} onClose={() => setShowOrganization(false)} onSelect={async row => { await gate.current.afterCurrent(async () => { setTransitioning(true); try { await queueRef.current?.flush(); const variant = await command({ command: 'variant', args: { catalog, key: row.key } }, 'variant'); setSelected(row); attachVariant(variant); } finally { setTransitioning(false); } }); }} onFilter={(filter, name) => { setFilters(value => ({ ...value, ...filter })); setOrganizationScopeName(name); setScope(null); setCursor(null); setPrevious([]); setMode('library'); setShowOrganization(false); }} />}
+    {catalog && <PreviewSettingsPanel key={`preview-settings:${catalog}`} catalog={catalog} open={showPreviewSettings} onClose={() => setShowPreviewSettings(false)} />}
     {showFilters && <SearchFilters value={filters} onApply={value => { setFilters(value); setCursor(null); setPrevious([]); }} onClose={() => setShowFilters(false)} />}
     {copyName !== null && <Dialog title="Create independent variant" onClose={() => setCopyName(null)}><p>Start a new edit from the current saved settings. The original and existing variant remain unchanged.</p><label className="form-field">Variant name<input autoFocus value={copyName} maxLength={256} onChange={event => setCopyName(event.target.value)} /></label><button className="primary" disabled={transitioning || !copyName.trim()} onClick={() => void createCopy()}>Create variant</button></Dialog>}
     {history && <Dialog title="Edit history" onClose={() => setHistory(null)}>{history.length ? <ol>{history.map(entry => <li key={entry.revision}><strong>Revision {entry.revision}</strong> · {entry.kind}</li>)}</ol> : <p>No saved history for this variant.</p>}</Dialog>}

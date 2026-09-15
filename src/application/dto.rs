@@ -35,6 +35,10 @@ decimal!(U64, u64);
     deny_unknown_fields
 )]
 pub enum Request {
+    PreviewSettings {
+        catalog: String,
+        request: Box<super::preview_settings::Request>,
+    },
     LightroomMigration {
         request: Box<super::lightroom_migration::Request>,
     },
@@ -330,6 +334,7 @@ pub struct PreviewStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
+    PreviewSettings(Box<super::preview_settings::Status>),
     LightroomMigration(Box<super::lightroom_migration::Response>),
     Lightroom(Box<super::lightroom_bridge::Response>),
     Export(Box<super::exports::Response>),

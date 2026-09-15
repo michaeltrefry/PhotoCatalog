@@ -13,6 +13,7 @@ pub mod lightroom_migration;
 pub mod metadata;
 pub mod organization;
 mod preview_delivery;
+pub mod preview_settings;
 pub mod relink;
 use crate::{
     Catalog,
@@ -1026,6 +1027,7 @@ struct Open {
     import: Option<ImportTask>,
     hydration: hydration::State,
     relink: relink::Coordinator,
+    preview_settings: preview_settings::State,
 }
 struct ImportTask {
     import_lock: Option<crate::ImportLock>,
@@ -1146,6 +1148,9 @@ fn during_relink_hold(request: &Request) -> bool {
                 )
         }
         Request::EditCopy { request, .. } => request.read_only(),
+        Request::PreviewSettings { request, .. } => {
+            matches!(request.as_ref(), preview_settings::Request::Status)
+        }
         Request::Metadata { request, .. } => {
             !matches!(request.as_ref(), metadata::Request::Resolve { .. })
         }
@@ -1671,6 +1676,7 @@ impl Actor {
                 import: None,
                 hydration: hydration::State::default(),
                 relink: relink::Coordinator::default(),
+                preview_settings: preview_settings::State::default(),
             })
         })();
         match opened {
@@ -1814,6 +1820,7 @@ impl Actor {
                     import: None,
                     hydration: hydration::State::default(),
                     relink: relink::Coordinator::default(),
+                    preview_settings: preview_settings::State::default(),
                 });
                 if cancel.is_canceled() {
                     self.close()?;
@@ -1937,6 +1944,26 @@ impl Actor {
             ));
         }
         match r {
+            Request::PreviewSettings { catalog, request } => {
+                let open = self.current(&catalog)?;
+                if !matches!(request.as_ref(), preview_settings::Request::Status)
+                    && (open.jobs_held || open.import.as_ref().is_some_and(|i| !i.terminal()))
+                {
+                    return Err(error(
+                        ErrorCode::Busy,
+                        "finish folder import and release restored jobs before changing preview storage",
+                    ));
+                }
+                let Open {
+                    catalog,
+                    service,
+                    preview_settings,
+                    ..
+                } = open;
+                Ok(Response::PreviewSettings(Box::new(
+                    preview_settings::execute(catalog, service, preview_settings, *request)?,
+                )))
+            }
             Request::LightroomMigration { .. } => Err(error(
                 ErrorCode::InvalidRequest,
                 "migration requests require the managed desktop owner",
@@ -2047,6 +2074,10 @@ impl Actor {
                 let path = std::fs::canonicalize(path).map_err(|e| native(e.into()))?;
                 // Both controls remain authoritative: restored-job hold and cache/source separation.
                 core!(o.service.ensure_original_separate(&path));
+                // The exact admitted folder is retained as a future root-review candidate.
+                // The storage epoch changes during import, so relocation remains blocked until
+                // bounded coverage is revalidated against the completed catalog state.
+                core!(o.service.register_original_root(&path));
                 let import_lock = core!(crate::ImportLock::acquire(
                     &o.catalog.root.join("import.lock")
                 ));

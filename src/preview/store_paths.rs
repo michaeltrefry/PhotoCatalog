@@ -1,4 +1,4 @@
-//! Cache schema 5 writes native paths as versioned BLOBs. Legacy TEXT remains
+//! Cache schema 5 and later write native paths as versioned BLOBs. Legacy TEXT remains
 //! literal Unicode path authority; no prefix can collide with the new format.
 use super::*;
 use crate::storage_volume::NativePath;
@@ -107,6 +107,28 @@ pub(super) fn validate_paths(db: &Connection) -> Result<()> {
             for column in 0..columns {
                 read_path(row, column)?;
             }
+        }
+    }
+    let roots_exist: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='original_roots')",
+        [],
+        |row| row.get(0),
+    )?;
+    if roots_exist {
+        let mut statement = db.prepare(
+            "SELECT CASE WHEN length(CAST(path AS BLOB))<=262144 THEN path ELSE NULL END,length(CAST(path AS BLOB)) FROM original_roots ORDER BY id LIMIT 1025",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            ensure!(count <= 1024, "original root count exceeds bound");
+            bytes = bytes
+                .checked_add(usize::try_from(row.get::<_, i64>(1)?)?)
+                .filter(|value| *value <= 2 * 1024 * 1024)
+                .context("original root bytes exceed bound")?;
+            read_path(row, 0)?;
         }
     }
     Ok(())

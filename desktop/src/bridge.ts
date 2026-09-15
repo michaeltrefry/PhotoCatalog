@@ -1,3 +1,4 @@
+import type { PreviewSettingsRequest, PreviewSettingsStatus } from './previewSettings';
 import type {Request as LightroomRequest,Response as LightroomResponse} from './lightroom';
 import type { Request as ExportRequest, Response as ExportResponse } from './photoExport';
 import { invoke, isTauri } from '@tauri-apps/api/core';
@@ -33,6 +34,7 @@ export type Request =
   | { command: 'relink'; args: AtCatalog & { request: RelinkRequest } }
   | { command: 'metadata'; args: AtCatalog & { request: MetadataRequest } }
   | { command: 'organization'; args: AtCatalog & { request: OrganizationRequest } }
+  | { command: 'preview_settings'; args: AtCatalog & { request: PreviewSettingsRequest } }
   | { command: 'status' | 'backup_status' }
   | { command: 'backup_create'; args: AtCatalog & { bundle: NativePath } }
   | { command: 'backup_inspect'; args: { bundle: NativePath } }
@@ -58,6 +60,7 @@ export type Request =
   | { command: 'release_viewport'; args: AtCatalog & { viewport: string; generation: Decimal } }
   | { command: 'preview_status' | 'cancel_preview'; args: AtCatalog & { ticket: string } };
 export interface Data {
+  preview_settings: PreviewSettingsStatus;
   lightroom: LightroomResponse;
   export: ExportResponse;
   edit_copy: CopyResponse;
@@ -109,7 +112,7 @@ export async function chooseFolder(createCatalog = false): Promise<{ path: Nativ
 
 export async function chooseSource(): Promise<{ path: NativePath; display: string } | null> { return chooseLocation('originals'); }
 
-export async function chooseLocation(purpose: 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
+export async function chooseLocation(purpose: 'preview_destination' | 'original_root' | 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
 
 export async function previewBlob(catalog: string, ticket: string): Promise<Blob> {
   const handoff = crypto.randomUUID();
