@@ -32,7 +32,7 @@ fn decimal_and_native_path_wire_are_lossless() {
     }
 }
 
-fn disconnected() -> Bridge {
+pub(super) fn disconnected() -> Bridge {
     let shared = Arc::new(Shared {
         managed_catalog: false,
         lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),

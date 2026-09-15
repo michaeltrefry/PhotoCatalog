@@ -268,15 +268,22 @@ canonical path plus its two optional retained stage IDs. Every active render or
 read Job separately owns its spawn root/stage, possible status IDs and Stage ID.
 The proxy binding IDs and completed digest are also named contributions.
 
-The stateful publication macOS arm64 Rust 1.98.0 execution reported these
-checked application-requested backing assemblies. All 19 focused tests passed,
-including the capacity case. Requested is Retained + max(Active, Startup).
+The private migration relay adds independent ordinary/migration multipart
+owners, one authority and sixteen recovery slots, complete destination pins,
+bounded parsers and queue backing to the same process reservation. Frame size
+bounds each fragment; configured message allowances bound complete headers.
+
+The migration relay macOS arm64 Rust 1.98.0 execution reported these checked
+application-requested backing assemblies. All 28 relay tests, one existing
+ordinary-admission test and three capacity tests passed. Requested is Retained
++ max(Active, Startup). Evidence is retained in private
+`sc-22847-lm4-final-test-fix-pafzm7h6`.
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 318,729,802 | 8,231,328,677 | 5,364,516,472 | 8,550,058,479 |
-| Default | 1,032,825,168 | 8,231,338,253 | 5,364,516,472 | 9,264,163,421 |
-| Maximum | 1,066,288,643,304 | 12,748,496,033 | 5,364,516,472 | 1,079,037,139,337 |
+| Minimum | 318,729,802 | 12,596,823,189 | 5,364,516,472 | 12,915,552,991 |
+| Default | 1,032,825,168 | 12,596,832,765 | 5,364,516,472 | 13,629,657,933 |
+| Maximum | 1,066,288,643,304 | 17,113,990,545 | 5,364,516,472 | 1,083,402,633,849 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime

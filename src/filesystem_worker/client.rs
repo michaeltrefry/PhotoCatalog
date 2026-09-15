@@ -8,8 +8,9 @@ use crate::{
         ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
         ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
         ExportPublicationReply, ExportPublicationRequest, InspectExportOriginal,
-        InspectedExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
+        InspectedExportOriginal, LeaseId, MigrationIdentityReply, MigrationIdentityRequest,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
+        SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
 };
@@ -1012,6 +1013,22 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected export destination snapshot response"),
         }
     }
+    fn migration_identity(
+        &self,
+        request: &MigrationIdentityRequest,
+        cancel: &AtomicBool,
+    ) -> Result<MigrationIdentityReply> {
+        match self.execute(
+            Operation::MigrationIdentity(Box::new(request.clone())),
+            cancel,
+        )? {
+            Response::MigrationIdentity(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected migration identity response"),
+        }
+    }
     fn export_alias_fact(
         &self,
         request: &ExportAliasFactRequest,
@@ -1626,6 +1643,37 @@ mod tests {
         publication_barrier: Option<&Path>,
         faults: Faults,
     ) -> Result<NoDependents> {
+        connect_fixture(
+            role,
+            directory,
+            original_roots,
+            snapshot_barrier,
+            original_barrier,
+            publication_barrier,
+            faults,
+        )
+        .map(NoDependents)
+    }
+    pub(super) fn migration_fixture(directory: &Path) -> Result<Client> {
+        connect_fixture(
+            "filesystem",
+            directory,
+            vec![],
+            None,
+            None,
+            None,
+            Faults::default(),
+        )
+    }
+    fn connect_fixture(
+        role: &str,
+        directory: &Path,
+        original_roots: Vec<NativePath>,
+        snapshot_barrier: Option<&Path>,
+        original_barrier: Option<&Path>,
+        publication_barrier: Option<&Path>,
+        faults: Faults,
+    ) -> Result<Client> {
         let startup = Startup::new(original_roots)?;
         let hello = encode(&startup, CONFIG_BYTES)?;
         let mut command = Command::new(std::env::current_exe()?);
@@ -1671,7 +1719,7 @@ mod tests {
             copied: 0,
         };
         let control = child.stderr.take().unwrap();
-        Ok(NoDependents(Client::connect(
+        Ok(Client::connect(
             startup,
             hello,
             Owner {
@@ -1681,7 +1729,7 @@ mod tests {
             },
             (input, output, control),
             pid,
-        )))
+        ))
     }
     fn has_child(client: &Client) -> bool {
         client.owner.lock().unwrap().child.is_some()
@@ -3009,4 +3057,9 @@ mod tests {
             },
         )
     }
+}
+
+#[cfg(test)]
+pub(crate) fn migration_fixture(directory: &Path) -> Result<Client> {
+    tests::migration_fixture(directory)
 }

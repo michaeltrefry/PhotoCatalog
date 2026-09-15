@@ -9,8 +9,9 @@ use crate::{
         ExportAliasFactRequest, ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest,
         ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
         ExportPublicationReply, ExportPublicationRequest, InspectExportOriginal,
-        InspectedExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, store,
+        InspectedExportOriginal, LeaseId, MigrationIdentityReply, MigrationIdentityRequest,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
+        SqlAdmissionConfirmed, store,
     },
     filesystem_worker::{
         client::Client,
@@ -63,6 +64,7 @@ pub(super) enum Call {
     ReadPreviewConfiguration(NativePath),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
+    MigrationIdentity(Box<MigrationIdentityRequest>),
     ExportAliasFact(Box<ExportAliasFactRequest>),
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
@@ -87,6 +89,7 @@ impl Call {
                 | Self::ReadPreviewConfiguration(_)
                 | Self::PrepareExportDirectory(_)
                 | Self::ExportDestinationSnapshot(_)
+                | Self::MigrationIdentity(_)
                 | Self::ExportAliasFact(_)
                 | Self::InspectExportOriginal(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
@@ -131,6 +134,7 @@ impl Call {
             Self::ReadPreviewConfiguration(path) => store::path(path),
             Self::PrepareExportDirectory(request) => request.validate(),
             Self::ExportDestinationSnapshot(request) => request.validate(),
+            Self::MigrationIdentity(request) => request.validate(),
             Self::ExportAliasFact(request) => request.validate(),
             Self::InspectExportOriginal(request) => request.validate(),
             Self::ExportOriginal(request) => request.validate(),
@@ -148,6 +152,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
+        std::mem::size_of::<MigrationIdentityRequest>(),
         std::mem::size_of::<ExportAliasFactRequest>(),
         std::mem::size_of::<InspectExportOriginal>(),
         std::mem::size_of::<ExportOriginalRequest>(),
@@ -175,6 +180,7 @@ pub(super) enum Value {
     Configuration(Vec<u8>),
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
+    MigrationIdentity(MigrationIdentityReply),
     ExportAliasFact(ExportAliasFactReply),
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
@@ -1091,6 +1097,9 @@ impl Parent {
                 Call::ExportDestinationSnapshot(request) => Value::ExportDestinationSnapshot(
                     self.client.export_destination_snapshot(request, cancel)?,
                 ),
+                Call::MigrationIdentity(request) => {
+                    Value::MigrationIdentity(self.client.migration_identity(request, cancel)?)
+                }
                 Call::ExportAliasFact(request) => {
                     Value::ExportAliasFact(self.client.export_alias_fact(request, cancel)?)
                 }
@@ -1708,6 +1717,19 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("wrong export destination snapshot reply"),
         }
     }
+    fn migration_identity(
+        &self,
+        request: &MigrationIdentityRequest,
+        cancel: &AtomicBool,
+    ) -> Result<MigrationIdentityReply> {
+        match self.call(Call::MigrationIdentity(Box::new(request.clone())), cancel)? {
+            Value::MigrationIdentity(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected migration identity relay response"),
+        }
+    }
     fn export_alias_fact(
         &self,
         request: &ExportAliasFactRequest,
@@ -1810,6 +1832,9 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
             value.validate_for(request)?
         }
         (Call::ExportDestinationSnapshot(request), Value::ExportDestinationSnapshot(value)) => {
+            value.validate_for(request)?
+        }
+        (Call::MigrationIdentity(request), Value::MigrationIdentity(value)) => {
             value.validate_for(request)?
         }
         (Call::ExportAliasFact(request), Value::ExportAliasFact(value)) => {

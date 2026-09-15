@@ -251,6 +251,10 @@ fn reply(r: std::result::Result<Response, BridgeError>) -> Reply {
 }
 
 enum Work {
+    MigrationAdmission(
+        desktop::lightroom_migration::Request,
+        mpsc::SyncSender<desktop::lightroom_migration::Reply>,
+    ),
     Shutdown(mpsc::SyncSender<std::result::Result<(), BridgeError>>),
     Command(Request, mpsc::SyncSender<Reply>),
     Bytes {
@@ -268,7 +272,7 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
-            Work::Shutdown(_) => 0,
+            Work::Shutdown(_) | Work::MigrationAdmission(..) => 0,
             Work::Command(Request::Lightroom { .. }, _) => 4,
             Work::Command(Request::Export { request, .. }, _) => {
                 if matches!(
@@ -340,6 +344,11 @@ impl Envelope {
     }
     fn reject(self, code: ErrorCode, message: &str) {
         match self.work {
+            Work::MigrationAdmission(_, tx) => {
+                let _ = tx.send(desktop::lightroom_migration::Reply::Error(error(
+                    code, message,
+                )));
+            }
             Work::Shutdown(tx) => {
                 let _ = tx.send(Err(error(code, message)));
             }
@@ -1064,6 +1073,7 @@ pub(crate) struct ManagedCatalogConfig {
     pub(crate) filesystem: Arc<dyn crate::catalog_session::CatalogFilesystem>,
 }
 struct Actor {
+    migration: desktop::lightroom_migration::Admission,
     failed_admission: Option<crate::catalog_session::AdmissionCleanup>,
     failed_session: Option<crate::catalog_session::ManagedSession>,
     managed: Option<ManagedCatalogConfig>,
@@ -1186,6 +1196,7 @@ impl Actor {
             #[cfg(test)]
             retained_on_drop: None,
             managed: None,
+            migration: Default::default(),
             failed_admission: None,
             failed_session: None,
             next_admission: 0,
@@ -1235,6 +1246,9 @@ impl Actor {
                     e.reject(ErrorCode::Canceled, "queued operation expired");
                 } else {
                     match e.work {
+                        Work::MigrationAdmission(request, tx) => {
+                            let _ = tx.send(self.migration_request(request, &e.cancel));
+                        }
                         Work::Shutdown(tx) => {
                             self.shared
                                 .lightroom
@@ -1316,7 +1330,7 @@ impl Actor {
                 q.active_cancel = None;
                 q.stopping
             };
-            if !stopping {
+            if !stopping && !self.migration.held() {
                 self.maintain();
             }
         }
@@ -1334,6 +1348,13 @@ impl Actor {
         self.lightroom.shutdown();
     }
     fn close(&mut self) -> std::result::Result<(), BridgeError> {
+        if self.migration.held() {
+            self.migration.cancel();
+            return Err(error(
+                ErrorCode::Busy,
+                "migration descendants and permit must drain before Close",
+            ));
+        }
         self.set_phase(Phase::Closing, None);
         let result = self.close_inner();
         if let Err(e) = &result {
@@ -1848,6 +1869,25 @@ impl Actor {
             return Err(error(
                 ErrorCode::Busy,
                 "catalog is closing; retry Close after cleanup failure",
+            ));
+        }
+        if self.migration.held()
+            && !matches!(
+                &r,
+                Request::Status
+                    | Request::Close { .. }
+                    | Request::Folders { .. }
+                    | Request::Images { .. }
+                    | Request::Search { .. }
+                    | Request::Image { .. }
+                    | Request::Variant { .. }
+                    | Request::Variants { .. }
+                    | Request::History { .. }
+            )
+        {
+            return Err(error(
+                ErrorCode::Busy,
+                "migration target hold: catalog mutation waits for checked drain",
             ));
         }
         let limits = self.config.limits.clone();

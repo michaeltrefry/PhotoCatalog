@@ -409,6 +409,56 @@ impl Drop for Owner {
         }
     }
 }
+fn migration_recovery(message: &Message) -> bool {
+    message.kind == Kind::MigrationAdmission
+        && message.bytes.len() <= wire::CHUNK
+        && serde_json::from_slice::<super::lightroom_migration::Request>(&message.bytes)
+            .is_ok_and(|request| request.action.recovery())
+}
+
+/// Two bounded partial messages, never an id-indexed allocation map. Small
+/// complete controls may interrupt either lane without taking its custody.
+#[derive(Default)]
+struct MigrationAssemblies {
+    ordinary: Option<Assembly>,
+    migration: Option<Assembly>,
+}
+impl MigrationAssemblies {
+    fn incomplete(&self) -> bool {
+        self.ordinary.is_some() || self.migration.is_some()
+    }
+    fn push(&mut self, frame: Frame, cap: usize) -> std::io::Result<Option<(Kind, u64, Vec<u8>)>> {
+        let migration = matches!(frame.kind, Kind::MigrationAdmission | Kind::MigrationReply);
+        if frame.offset == 0 && frame.total == frame.payload.len() {
+            if frame.total > cap
+                || (!matches!(frame.kind, Kind::Ready | Kind::DrainError | Kind::Drained)
+                    && [&self.ordinary, &self.migration]
+                        .iter()
+                        .any(|slot| slot.as_ref().is_some_and(|a| a.id() == frame.id)))
+            {
+                return Err(wire::invalid("inline message admission/identity"));
+            }
+            return Ok(Some((frame.kind, frame.id, frame.payload)));
+        }
+        let (slot, other) = if migration {
+            (&mut self.migration, &self.ordinary)
+        } else {
+            (&mut self.ordinary, &self.migration)
+        };
+        if other.as_ref().is_some_and(|a| a.id() == frame.id) {
+            return Err(wire::invalid("partial message changed lane"));
+        }
+        let assembly = match slot.as_mut() {
+            Some(value) => value,
+            None => slot.insert(Assembly::start(&frame, cap)?),
+        };
+        if !assembly.push(frame)? {
+            return Ok(None);
+        }
+        Ok(Some(slot.take().unwrap().finish()))
+    }
+}
+
 pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Option<Message> {
     let mut s = shared.state.lock().unwrap();
     loop {
@@ -416,16 +466,24 @@ pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Op
             return None;
         }
         if s.stopping {
-            if let Some(index) = s
-                .control
-                .iter()
-                .position(|m| matches!(m.kind, Kind::Ack | Kind::DrainAck))
-            {
+            super::lightroom_migration::reject_queued_authority(&mut s);
+            if let Some(index) = s.control.iter().position(|m| {
+                matches!(
+                    m.kind,
+                    Kind::Ack | Kind::DrainAck | Kind::MigrationAdmission
+                )
+            }) {
                 return s.control.remove(index);
             }
             if s.shutdown_sent < s.shutdown_attempt {
                 s.shutdown_sent = s.shutdown_attempt;
                 return Some(Message::new(Kind::Shutdown, s.shutdown_attempt, vec![]));
+            }
+            if active
+                .as_ref()
+                .is_some_and(|m| m.kind == Kind::MigrationAdmission)
+            {
+                return active.take();
             }
             s = shared
                 .wake
@@ -444,6 +502,15 @@ pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Op
         {
             entry.sent_cancel = true;
             return Some(Message::new(Kind::Cancel, id, vec![]));
+        }
+        if let Some(index) = s.control.iter().position(|m| migration_recovery(m)) {
+            return s.control.remove(index);
+        }
+        if active
+            .as_ref()
+            .is_some_and(|m| m.kind == Kind::MigrationAdmission)
+        {
+            return active.take();
         }
         if let Some(m) = s.control.pop_front() {
             return Some(m);
@@ -464,9 +531,33 @@ pub(super) fn next_outgoing(shared: &Shared, active: &mut Option<Message>) -> Op
         }
     }
 }
+#[derive(Default)]
+struct ParentMessages {
+    ordinary: Option<Message>,
+    migration: Option<Message>,
+}
+impl ParentMessages {
+    fn next(&mut self, shared: &Shared) -> Option<Frame> {
+        let slot = if self.migration.is_some() {
+            &mut self.migration
+        } else {
+            &mut self.ordinary
+        };
+        let mut message = next_outgoing(shared, slot)?;
+        let frame = message.next(shared.session);
+        if !message.finished() {
+            if message.kind == Kind::MigrationAdmission {
+                self.migration = Some(message);
+            } else {
+                self.ordinary = Some(message);
+            }
+        }
+        Some(frame)
+    }
+}
 fn parent_write(mut w: impl Write, shared: &Shared, hello: Vec<u8>) -> std::io::Result<()> {
     Message::new(Kind::Hello, 0, hello).write(shared.session, &mut w)?;
-    let mut active = None;
+    let mut messages = ParentMessages::default();
     let mut relay: Option<RelayOutput> = None;
     let mut admission: Option<RelayOutput> = None;
     let mut store: Option<RelayOutput> = None;
@@ -525,11 +616,8 @@ fn parent_write(mut w: impl Write, shared: &Shared, hello: Vec<u8>) -> std::io::
                 }
             }
         }
-        if let Some(mut m) = next_outgoing(shared, &mut active) {
-            m.next(shared.session).write(&mut w)?;
-            if !m.finished() {
-                active = Some(m);
-            }
+        if let Some(frame) = messages.next(shared) {
+            frame.write(&mut w)?;
         }
     }
 }
@@ -541,7 +629,7 @@ fn session(f: &Frame, shared: &Shared) -> std::io::Result<()> {
 }
 fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
     let mut relay = RelayAssembly::default();
-    let mut assembly: Option<Assembly> = None;
+    let mut assembly = MigrationAssemblies::default();
     while let Some(f) = Frame::read(&mut r)? {
         session(&f, shared)?;
         #[cfg(test)]
@@ -576,25 +664,23 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
         }
         if !matches!(
             f.kind,
-            Kind::Ready | Kind::Reply | Kind::BytesError | Kind::DrainError | Kind::Drained
+            Kind::Ready
+                | Kind::Reply
+                | Kind::BytesError
+                | Kind::DrainError
+                | Kind::Drained
+                | Kind::MigrationReply
         ) {
             return Err(wire::invalid("unexpected control frame"));
         }
-        let a = match assembly.as_mut() {
-            Some(a) => a,
-            None => assembly.insert(Assembly::start(
-                &f,
-                if matches!(f.kind, Kind::Ready | Kind::DrainError | Kind::Drained) {
-                    wire::CHUNK
-                } else {
-                    shared.limits.reply_bytes.max(wire::ERROR_BYTES)
-                },
-            )?),
+        let cap = match f.kind {
+            Kind::MigrationReply => shared.limits.reply_bytes.max(wire::CHUNK),
+            Kind::Ready | Kind::DrainError | Kind::Drained => wire::CHUNK,
+            _ => shared.limits.reply_bytes.max(wire::ERROR_BYTES),
         };
-        if !a.push(f)? {
+        let Some((kind, id, bytes)) = assembly.push(f, cap)? else {
             continue;
-        }
-        let (kind, id, bytes) = assembly.take().unwrap().finish();
+        };
         if kind == Kind::Drained {
             let mut s = shared.state.lock().unwrap();
             if id < s.shutdown_attempt {
@@ -640,6 +726,16 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
         } else {
             None
         };
+        let decoded_migration = if kind == Kind::MigrationReply {
+            let reply: super::lightroom_migration::Reply = serde_json::from_slice(&bytes)
+                .map_err(|_| wire::invalid("invalid migration reply"))?;
+            reply
+                .validate()
+                .map_err(|_| wire::invalid("migration reply field bounds"))?;
+            Some(reply)
+        } else {
+            None
+        };
         let decoded_error = if kind == Kind::BytesError {
             Some(
                 serde_json::from_slice::<BridgeError>(&bytes)
@@ -655,6 +751,15 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
         {
             return Err(wire::invalid("success reply exceeds configured budget"));
         }
+        if bytes.len() > shared.limits.reply_bytes
+            && decoded_migration
+                .as_ref()
+                .is_some_and(|reply| matches!(reply, super::lightroom_migration::Reply::Ok(_)))
+        {
+            return Err(wire::invalid(
+                "migration success reply exceeds configured allowance",
+            ));
+        }
         let entry = {
             let mut state = shared.state.lock().unwrap();
             let pending = state
@@ -663,13 +768,18 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
                 .ok_or_else(|| wire::invalid("unowned desktop reply"))?;
             if !matches!(
                 (kind, &pending.delivery),
-                (Kind::Reply, Delivery::Command(_)) | (Kind::BytesError, Delivery::Bytes { .. })
+                (Kind::Reply, Delivery::Command(_))
+                    | (Kind::BytesError, Delivery::Bytes { .. })
+                    | (Kind::MigrationReply, Delivery::Migration(_))
             ) {
                 return Err(wire::invalid("reply kind does not match request"));
             }
             state.pending.remove(&id).unwrap()
         };
         match (kind, entry.delivery) {
+            (Kind::MigrationReply, Delivery::Migration(tx)) => {
+                let _ = tx.send(decoded_migration.unwrap());
+            }
             (Kind::Reply, Delivery::Command(tx)) => {
                 let reply = decoded_reply.unwrap();
                 let _ = tx.send(reply);
@@ -681,7 +791,7 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
             _ => return Err(wire::invalid("reply kind does not match request")),
         }
     }
-    if assembly.is_some() || relay.incomplete() {
+    if assembly.incomplete() || relay.incomplete() {
         return Err(wire::invalid("truncated control message"));
     }
     if !shared.state.lock().unwrap().stopping {
@@ -821,14 +931,22 @@ fn parent_binary(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
 }
 
 enum ChildPending {
+    Migration(super::lightroom_migration::Pending),
     Command(Pending),
     Bytes(PendingBytes, BytesRequest),
     Reply(Message),
     Binary(Arc<PreviewBytes>, BytesRequest),
 }
+pub(super) fn migration_pending_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<(u64, ChildPending)>(),
+        std::mem::align_of::<(u64, ChildPending)>(),
+    )
+}
 struct ChildState {
     pending: HashMap<u64, ChildPending>,
     cancels: HashMap<u64, Cancellation>,
+    migration: HashMap<u64, bool>,
     early: std::collections::HashSet<u64>,
     retained: HashMap<u64, Arc<PreviewBytes>>,
     stopping: bool,
@@ -842,10 +960,14 @@ struct BinaryOutput {
 fn output_writer(
     mut w: impl Write,
     rx: mpsc::Receiver<Message>,
+    migration_rx: mpsc::Receiver<Message>,
     session: [u8; 16],
     proxy: Option<Arc<filesystem::Proxy>>,
 ) {
     let mut ordinary: Option<Message> = None;
+    let mut migration: Option<Message> = None;
+    let mut ordinary_closed = false;
+    let mut migration_closed = false;
     let mut relay: Option<RelayOutput> = None;
     let mut admission: Option<RelayOutput> = None;
     let mut store: Option<RelayOutput> = None;
@@ -891,11 +1013,26 @@ fn output_writer(
                     }
                 }
             }
+            if migration.is_none() {
+                match migration_rx.try_recv() {
+                    Ok(message) => migration = Some(message),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => migration_closed = true,
+                }
+            }
+            // Migration has reserved output capacity and gets a frame before
+            // ordinary replies. Each class retains exactly one partial message.
+            if let Some(message) = &mut migration {
+                message.next(session).write(&mut w)?;
+                if message.finished() {
+                    migration = None;
+                }
+            }
             if ordinary.is_none() {
                 match rx.recv_timeout(Duration::from_millis(2)) {
                     Ok(m) => ordinary = Some(m),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(false),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => ordinary_closed = true,
                 }
             }
             if let Some(m) = &mut ordinary {
@@ -903,6 +1040,9 @@ fn output_writer(
                 if m.finished() {
                     ordinary = None;
                 }
+            }
+            if ordinary_closed && migration_closed && ordinary.is_none() && migration.is_none() {
+                return Ok(false);
             }
             Ok(true)
         })();
@@ -949,6 +1089,11 @@ fn binary_writer(mut w: impl Write, rx: mpsc::Receiver<BinaryOutput>, session: [
     }
 }
 fn checked_message(kind: Kind, id: u64, value: &impl serde::Serialize, limit: usize) -> Message {
+    assert_ne!(
+        kind,
+        Kind::MigrationReply,
+        "migration replies use their bounded identity-preserving encoder"
+    );
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     if bytes.len() <= limit {
         Message::new(kind, id, bytes)
@@ -965,6 +1110,7 @@ fn checked_message(kind: Kind, id: u64, value: &impl serde::Serialize, limit: us
 fn collect(
     shared: &ChildShared,
     tx: &mpsc::SyncSender<Message>,
+    migration: &mpsc::SyncSender<Message>,
     binary: &mpsc::SyncSender<BinaryOutput>,
     limit: usize,
 ) {
@@ -973,6 +1119,20 @@ fn collect(
     for id in ids {
         let p = state.pending.remove(&id).unwrap();
         let ready = match p {
+            ChildPending::Migration(p) => match p.receiver.try_recv() {
+                Ok(reply) => ChildPending::Reply(reply.message(id, limit)),
+                Err(mpsc::TryRecvError::Empty) => {
+                    state.pending.insert(id, ChildPending::Migration(p));
+                    continue;
+                }
+                Err(_) => ChildPending::Reply(
+                    super::lightroom_migration::Reply::Error(error(
+                        ErrorCode::Closed,
+                        "migration actor disconnected",
+                    ))
+                    .message(id, limit),
+                ),
+            },
             ChildPending::Command(p) => match p.receiver.try_recv() {
                 Ok(r) => ChildPending::Reply(checked_message(Kind::Reply, id, &r, limit)),
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1003,9 +1163,16 @@ fn collect(
             ready => ready,
         };
         match ready {
-            ChildPending::Reply(m) => match tx.try_send(m) {
+            ChildPending::Reply(m) => match (if m.kind == Kind::MigrationReply {
+                migration
+            } else {
+                tx
+            })
+            .try_send(m)
+            {
                 Ok(()) => {
                     state.cancels.remove(&id);
+                    state.migration.remove(&id);
                 }
                 Err(mpsc::TrySendError::Full(m)) => {
                     state.pending.insert(id, ChildPending::Reply(m));
@@ -1207,22 +1374,31 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
     let shared = Arc::new(Mutex::new(ChildState {
         pending: HashMap::new(),
         cancels: HashMap::new(),
+        migration: HashMap::new(),
         early: Default::default(),
         retained: HashMap::new(),
         stopping: false,
     }));
     let (tx, rx) = mpsc::sync_channel(limits.queued + CONTROL_SLOTS);
+    let (migration_tx, migration_rx) = mpsc::sync_channel(CONTROL_SLOTS + 1);
     let (binary, binary_rx) = mpsc::sync_channel(1);
     let output_proxy = proxy.clone();
-    let control =
-        thread::spawn(move || output_writer(std::io::stderr().lock(), rx, session, output_proxy));
+    let control = thread::spawn(move || {
+        output_writer(
+            std::io::stderr().lock(),
+            rx,
+            migration_rx,
+            session,
+            output_proxy,
+        )
+    });
     let data = thread::spawn(move || binary_writer(std::io::stdout().lock(), binary_rx, session));
     let state = shared.clone();
     let results = tx.clone();
     let result_limit = limits.reply_bytes;
     let collector = thread::spawn(move || {
         while !state.lock().unwrap().stopping {
-            collect(&state, &results, &binary, result_limit);
+            collect(&state, &results, &migration_tx, &binary, result_limit);
             thread::sleep(Duration::from_millis(2));
         }
     });
@@ -1243,7 +1419,10 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
             &mut input,
             session,
             &mut |kind, bytes| {
-                if proxy.is_some() && !paired_preview_route(kind, bytes)? {
+                if proxy.is_some()
+                    && kind != Kind::MigrationAdmission
+                    && !paired_preview_route(kind, bytes)?
+                {
                     return Ok(Err(error(
                         ErrorCode::InvalidRequest,
                         "request unavailable on the managed preview custody route",
@@ -1309,6 +1488,11 @@ fn paired_preview_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
     ))
 }
 fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<ChildPending>> {
+    if kind == Kind::MigrationAdmission {
+        return Ok(bridge
+            .migration_admission(serde_json::from_slice(bytes)?)
+            .map(ChildPending::Migration));
+    }
     if kind == Kind::Command {
         let request: Request = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
@@ -1336,7 +1520,7 @@ fn child_input_relay(
     drain: &mut impl FnMut(u64) -> Result<bool>,
     proxy: Option<&filesystem::Proxy>,
 ) -> anyhow::Result<()> {
-    let mut active: Option<Assembly> = None;
+    let mut active = MigrationAssemblies::default();
     let mut seen = Seen::default();
     let mut drain_attempt = 0;
     let mut closing = false;
@@ -1401,7 +1585,7 @@ fn child_input_relay(
                         c.cancel();
                     } else if !seen.contains(f.id) && !state.retained.contains_key(&f.id) {
                         anyhow::ensure!(
-                            state.early.len() < limits.queued + CONTROL_SLOTS,
+                            state.early.len() < limits.queued + 2 * CONTROL_SLOTS + 1,
                             "early cancellation bounds"
                         );
                         state.early.insert(f.id);
@@ -1418,36 +1602,77 @@ fn child_input_relay(
             continue;
         }
         anyhow::ensure!(
-            matches!(f.kind, Kind::Command | Kind::Bytes),
+            matches!(
+                f.kind,
+                Kind::Command | Kind::Bytes | Kind::MigrationAdmission
+            ),
             "unexpected request kind"
         );
-        // Priority requests are single frames and may interleave a large request.
-        let (kind, id, bytes) = if f.offset == 0 && f.total == f.payload.len() {
-            anyhow::ensure!(f.total <= limits.request_bytes, "request byte admission");
-            (f.kind, f.id, f.payload)
+        let request_cap = if f.kind == Kind::MigrationAdmission {
+            limits.request_bytes.max(wire::CHUNK)
         } else {
-            let a = match active.as_mut() {
-                Some(a) => a,
-                None => active.insert(Assembly::start(&f, limits.request_bytes)?),
-            };
-            if !a.push(f)? {
-                continue;
-            }
-            active.take().unwrap().finish()
+            limits.request_bytes
         };
-        seen.insert(id, limits.queued + CONTROL_SLOTS + 1)?;
+        let Some((kind, id, bytes)) = active.push(f, request_cap)? else {
+            continue;
+        };
+        let recovery = if kind == Kind::MigrationAdmission {
+            let request: super::lightroom_migration::Request = serde_json::from_slice(&bytes)?;
+            request.validate()?;
+            anyhow::ensure!(
+                bytes.len()
+                    <= if request.action.recovery() {
+                        wire::CHUNK
+                    } else {
+                        limits.request_bytes
+                    },
+                "migration configured request allowance"
+            );
+            Some(request.action.recovery())
+        } else {
+            None
+        };
+        seen.insert(id, limits.queued + 2 * CONTROL_SLOTS + 2)?;
         // Only this input loop admits requests; the collector can only remove
         // pending entries. Check capacity and consume a winning early cancel
         // before calling any engine entry point, including synchronous commands.
         let canceled = {
             let mut state = shared.lock().unwrap();
             anyhow::ensure!(
-                state.pending.len() < limits.queued + CONTROL_SLOTS,
+                state.pending.len() < limits.queued + 2 * CONTROL_SLOTS + 1,
                 "child pending bounds"
             );
+            if let Some(recovery) = recovery {
+                anyhow::ensure!(
+                    state.migration.len() < CONTROL_SLOTS + 1,
+                    "migration pending bounds"
+                );
+                anyhow::ensure!(
+                    closing
+                        || state
+                            .migration
+                            .values()
+                            .filter(|value| **value == recovery)
+                            .count()
+                            < if recovery { CONTROL_SLOTS } else { 1 },
+                    "migration reserved recovery admission"
+                );
+                state.migration.insert(id, recovery);
+            } else {
+                anyhow::ensure!(
+                    state
+                        .pending
+                        .keys()
+                        .filter(|id| !state.migration.contains_key(*id))
+                        .count()
+                        < limits.queued + CONTROL_SLOTS,
+                    "ordinary pending bounds"
+                );
+            }
             state.early.remove(&id)
         };
         let during_close = closing
+            && recovery != Some(true)
             && !(kind == Kind::Command
                 && serde_json::from_slice::<Request>(&bytes)
                     .is_ok_and(|request| matches!(request, Request::Status)));
@@ -1468,6 +1693,7 @@ fn child_input_relay(
         match admitted {
             Ok(p) => {
                 let c = match &p {
+                    ChildPending::Migration(p) => p.cancel.clone(),
                     ChildPending::Command(p) => p.cancellation(),
                     ChildPending::Bytes(p, _) => p.cancellation(),
                     _ => unreachable!(),
@@ -1477,7 +1703,9 @@ fn child_input_relay(
             }
             Err(e) => {
                 state.early.remove(&id);
-                let m = if kind == Kind::Command {
+                let m = if kind == Kind::MigrationAdmission {
+                    super::lightroom_migration::Reply::Error(e).message(id, limits.reply_bytes)
+                } else if kind == Kind::Command {
                     checked_message(
                         Kind::Reply,
                         id,
@@ -1494,7 +1722,7 @@ fn child_input_relay(
         let _ = tx; // completion publication stays independent of this input loop.
     }
     anyhow::ensure!(
-        active.is_none() && !relay.incomplete(),
+        !active.incomplete() && !relay.incomplete(),
         "truncated desktop request"
     );
     Ok(())
@@ -1586,6 +1814,7 @@ mod tests {
         Arc::new(Mutex::new(ChildState {
             pending: HashMap::new(),
             cancels: HashMap::new(),
+            migration: HashMap::new(),
             early: Default::default(),
             retained: HashMap::new(),
             stopping: false,
@@ -1676,12 +1905,12 @@ mod tests {
         );
         let (tx, rx) = mpsc::sync_channel(1);
         let (blocked, _held) = mpsc::sync_channel(0);
-        collect(&shared, &tx, &blocked, 1024);
+        collect(&shared, &tx, &tx, &blocked, 1024);
         assert_eq!(rx.try_recv().unwrap().id, 2);
         assert!(shared.lock().unwrap().pending.contains_key(&1));
         assert_eq!(usage.load(Ordering::Acquire), 4);
         let (binary, delivery) = mpsc::sync_channel(1);
-        collect(&shared, &tx, &binary, 1024);
+        collect(&shared, &tx, &tx, &binary, 1024);
         let output = delivery.try_recv().unwrap();
         assert!(!shared.lock().unwrap().pending.contains_key(&1));
         drop(output); // OS pipe delivery is not acknowledgement.
@@ -1874,7 +2103,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("child pending bounds")
+                .contains("ordinary pending bounds")
         );
         assert_eq!(
             mutations.get(),
@@ -2089,6 +2318,510 @@ mod tests {
             relay_input(&mut assembly, changed).is_err(),
             "interleaving must not relax packet continuity"
         );
+    }
+    #[test]
+    fn lm_desktop_relay_child_shutdown_refuses_authority_and_dispatches_only_recovery() {
+        use super::super::lightroom_migration::{
+            Action, Reply as MigrationReply, Request as MigrationRequest,
+        };
+        use crate::lightroom_migration_worker::protocol::{Guard, WriteKind};
+        let shared = child_state();
+        let (tx, _rx) = mpsc::sync_channel(2);
+        let mut input = Vec::new();
+        Message::new(Kind::Shutdown, 1, vec![])
+            .write([9; 16], &mut input)
+            .unwrap();
+        let actions = [
+            Action::AcquireTarget {
+                catalog: None,
+                destination: NativePath::from_path(std::path::Path::new("/must-not-create")),
+                expected: None,
+            },
+            Action::AcquireWrite {
+                sequence: crate::application::U64(1),
+                kind: WriteKind::Bootstrap,
+                target: "a".repeat(64),
+                lock: None,
+                request_digest: "b".repeat(64),
+            },
+            Action::Progress {
+                phase: "not a recovery".into(),
+                completed: crate::application::U64(0),
+                total: None,
+            },
+            Action::ReleaseWrite {
+                sequence: crate::application::U64(1),
+                kind: WriteKind::Bootstrap,
+                request_digest: "b".repeat(64),
+            },
+            Action::Status,
+            Action::Cancel,
+            Action::DrainOperation,
+        ];
+        for (index, action) in actions.into_iter().enumerate() {
+            let request = MigrationRequest {
+                guard: Guard {
+                    session: "fixture".into(),
+                    generation: "a".repeat(64),
+                    operation: "operation".into(),
+                },
+                action,
+            };
+            Message::new(
+                Kind::MigrationAdmission,
+                index as u64 + 1,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .write([9; 16], &mut input)
+            .unwrap();
+        }
+        let mut dispatched = 0;
+        child_input_relay(
+            &mut std::io::Cursor::new(input),
+            [9; 16],
+            &mut |kind, bytes| {
+                assert_eq!(kind, Kind::MigrationAdmission);
+                let request: MigrationRequest = serde_json::from_slice(bytes)?;
+                assert!(
+                    request.action.recovery(),
+                    "new authority reached a closing Actor"
+                );
+                dispatched += 1;
+                Ok(Err(error(ErrorCode::Native, "recovery reached Actor")))
+            },
+            &shared,
+            &Limits::default(),
+            &tx,
+            &mut |_| Ok(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dispatched, 4);
+        let state = shared.lock().unwrap();
+        for id in 1..=7 {
+            let ChildPending::Reply(message) = state.pending.get(&id).unwrap() else {
+                panic!()
+            };
+            let MigrationReply::Error(failure) =
+                serde_json::from_slice::<MigrationReply>(&message.bytes).unwrap()
+            else {
+                panic!()
+            };
+            assert!(if id <= 3 {
+                matches!(failure.code, ErrorCode::Closed)
+            } else {
+                matches!(failure.code, ErrorCode::Native)
+            });
+        }
+    }
+    fn migration_fixture_request(
+        action: super::super::lightroom_migration::Action,
+    ) -> super::super::lightroom_migration::Request {
+        super::super::lightroom_migration::Request {
+            guard: crate::lightroom_migration_worker::protocol::Guard {
+                session: "fixture".into(),
+                generation: "a".repeat(64),
+                operation: "operation".into(),
+            },
+            action,
+        }
+    }
+    #[test]
+    fn lm_desktop_relay_multipart_request_custody_preserves_recovery_and_shutdown()
+    -> anyhow::Result<()> {
+        use super::super::lightroom_migration::{Action, Client};
+        for closing in [false, true] {
+            let shared = super::super::tests::shared(8);
+            let client = Client::new(&shared);
+            let mut output = ParentMessages::default();
+            let mut input = Vec::new();
+            let ordinary = vec![b'x'; wire::CHUNK * 2 + 19];
+            if !closing {
+                shared.state.lock().unwrap().data.push_back(Message::new(
+                    Kind::Command,
+                    100,
+                    ordinary.clone(),
+                ));
+                output.next(&shared).unwrap().write(&mut input)?;
+                assert!(output.ordinary.is_some());
+            }
+            let acquire = migration_fixture_request(Action::AcquireTarget {
+                catalog: None,
+                destination: NativePath::UnixBytes(vec![b'x'; 12000]),
+                expected: None,
+            });
+            let expected = serde_json::to_vec(&acquire)?;
+            let _pending = client.submit(acquire)?;
+            output.next(&shared).unwrap().write(&mut input)?;
+            assert!(output.migration.is_some());
+            if closing {
+                shared.stop();
+                let shutdown = output.next(&shared).unwrap();
+                assert_eq!(shutdown.kind, Kind::Shutdown);
+                shutdown.write(&mut input)?;
+            }
+            let _recovery = client.submit(migration_fixture_request(Action::Status))?;
+            let recovery = output.next(&shared).unwrap();
+            assert_eq!(recovery.id, 2);
+            assert_eq!(recovery.offset, 0);
+            recovery.write(&mut input)?;
+            while output.migration.is_some() {
+                output.next(&shared).unwrap().write(&mut input)?;
+            }
+            if !closing {
+                assert!(
+                    output.ordinary.is_some(),
+                    "multipart authority overwrote ordinary custody"
+                );
+                while output.ordinary.is_some() {
+                    output.next(&shared).unwrap().write(&mut input)?;
+                }
+            }
+            let child = child_state();
+            let (tx, _rx) = mpsc::sync_channel(2);
+            let mut calls = Vec::new();
+            child_input_relay(
+                &mut &input[..],
+                shared.session,
+                &mut |kind, bytes| {
+                    calls.push((kind, bytes.to_vec()));
+                    Ok(Err(error(ErrorCode::Native, "fixture observation")))
+                },
+                &child,
+                &shared.limits,
+                &tx,
+                &mut |_| Ok(false),
+                None,
+            )?;
+            assert_eq!(calls.len(), if closing { 1 } else { 3 });
+            let recovery: super::super::lightroom_migration::Request =
+                serde_json::from_slice(&calls[0].1)?;
+            assert!(matches!(recovery.action, Action::Status));
+            if !closing {
+                assert_eq!(calls[1], (Kind::MigrationAdmission, expected));
+                assert_eq!(calls[2], (Kind::Command, ordinary));
+            } else {
+                let state = child.lock().unwrap();
+                let ChildPending::Reply(reply) = state.pending.get(&1).unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    serde_json::from_slice::<super::super::lightroom_migration::Reply>(
+                        &reply.bytes
+                    )?,
+                    super::super::lightroom_migration::Reply::Error(BridgeError {
+                        code: ErrorCode::Closed,
+                        ..
+                    })
+                ));
+            }
+            shared.complete_failure();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lm_desktop_relay_multipart_assemblies_reject_changed_kind_offset_and_second_owner()
+    -> anyhow::Result<()> {
+        for fault in ["kind", "offset", "second", "inline"] {
+            let mut assembly = MigrationAssemblies::default();
+            let mut message = Message::new(Kind::MigrationAdmission, 1, vec![1; wire::CHUNK * 2]);
+            assert!(
+                assembly
+                    .push(message.next([9; 16]), wire::CHUNK * 2)?
+                    .is_none()
+            );
+            let mut changed = message.next([9; 16]);
+            match fault {
+                "kind" => changed.kind = Kind::Command,
+                "offset" => changed.offset += 1,
+                "second" => {
+                    changed.id = 2;
+                    changed.offset = 0;
+                }
+                "inline" => {
+                    changed.offset = 0;
+                    changed.total = changed.payload.len();
+                }
+                _ => unreachable!(),
+            }
+            assert!(assembly.push(changed, wire::CHUNK * 2).is_err(), "{fault}");
+            assert!(assembly.incomplete());
+        }
+        let mut assembly = MigrationAssemblies::default();
+        let mut oversized = Message::new(Kind::MigrationReply, 1, vec![1; wire::CHUNK + 1]);
+        assert!(assembly.push(oversized.next([9; 16]), wire::CHUNK).is_err());
+        assert!(!assembly.incomplete());
+        Ok(())
+    }
+
+    #[test]
+    fn lm_desktop_relay_multipart_replies_interleave_without_pin_loss_or_shared_queue_pressure()
+    -> anyhow::Result<()> {
+        use super::super::lightroom_migration::{
+            Action, Client, Phase, Reply as MigrationReply, Snapshot,
+        };
+        use crate::application::{I64, U64};
+        use crate::lightroom_migration_worker::{identity::FileKey, lease::DestinationPin};
+        let shared = super::super::tests::shared(8);
+        let pending = Client::new(&shared).submit(migration_fixture_request(Action::Status))?;
+        let pin = DestinationPin {
+            root: NativePath::WindowsWide(vec![65535; crate::catalog_session::PATH_UNITS]),
+            root_key: FileKey {
+                volume: U64(1),
+                index: U64(u64::MAX),
+            },
+            database_key: FileKey {
+                volume: U64(2),
+                index: U64(3),
+            },
+            schema: I64(1),
+        };
+        let snapshot = Snapshot {
+            guard: migration_fixture_request(Action::Status).guard,
+            phase: Phase::Target,
+            catalog: None,
+            destination: Some(pin.clone()),
+            sequence: None,
+            request_digest: None,
+            write_kind: None,
+            cancel_requested: false,
+            progress: None,
+            failure: None,
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        shared.state.lock().unwrap().pending.insert(
+            2,
+            Entry {
+                delivery: Delivery::Command(reply_tx),
+                cancel: Cancellation::default(),
+                sent_cancel: false,
+                control: false,
+            },
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (migration_tx, migration_rx) = mpsc::sync_channel(CONTROL_SLOTS + 1);
+        let ordinary = checked_message(
+            Kind::Reply,
+            2,
+            &Reply::Error {
+                error: error(ErrorCode::Native, "o".repeat(wire::CHUNK * 3)),
+            },
+            shared.limits.reply_bytes,
+        );
+        tx.send(ordinary).unwrap(); // Completely fill the ordinary output lane.
+        let child = child_state();
+        let (actor_tx, actor_rx) = mpsc::sync_channel(1);
+        actor_tx.send(MigrationReply::Ok(snapshot)).unwrap();
+        child.lock().unwrap().pending.insert(
+            1,
+            ChildPending::Migration(super::super::lightroom_migration::Pending {
+                receiver: actor_rx,
+                cancel: Cancellation::default(),
+            }),
+        );
+        let (binary, _binary_rx) = mpsc::sync_channel(1);
+        collect(
+            &child,
+            &tx,
+            &migration_tx,
+            &binary,
+            shared.limits.reply_bytes,
+        );
+        assert!(
+            child.lock().unwrap().pending.is_empty(),
+            "ordinary output pressure consumed migration capacity"
+        );
+        drop(tx);
+        drop(migration_tx);
+        let mut bytes = Vec::new();
+        output_writer(&mut bytes, rx, migration_rx, shared.session, None);
+        let mut cursor = &bytes[..];
+        let first = Frame::read(&mut cursor)?.unwrap();
+        let second = Frame::read(&mut cursor)?.unwrap();
+        assert_eq!(first.kind, Kind::MigrationReply);
+        assert_eq!(second.kind, Kind::Reply);
+        assert!(first.total > first.payload.len() && second.total > second.payload.len());
+        shared.state.lock().unwrap().stopping = true;
+        parent_control(&bytes[..], &shared)?;
+        let MigrationReply::Ok(reply) = pending.receiver.recv()? else {
+            panic!("pin lost")
+        };
+        assert_eq!(reply.destination, Some(pin));
+        assert!(matches!(reply_rx.recv()?, Reply::Error { .. }));
+        assert!(shared.state.lock().unwrap().pending.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn lm_desktop_relay_parent_valid_saturation_preserves_each_class_and_rejects_overflow()
+    -> anyhow::Result<()> {
+        use super::super::lightroom_migration::{Action, Client};
+        let mut parent = super::super::tests::shared(8);
+        Arc::get_mut(&mut parent).unwrap().limits.queued = 3;
+        let ordinary_cap = parent.limits.queued + CONTROL_SLOTS;
+        let aggregate_cap = ordinary_cap + CONTROL_SLOTS + 1;
+        let ordinary_bytes = serde_json::to_vec(&Request::Status)?;
+        // Fill both ordinary allowances exactly as admitted by the parent:
+        // queued data plus sixteen small controls, all before migration submit.
+        {
+            let mut state = parent.state.lock().unwrap();
+            for index in 0..ordinary_cap {
+                let id = state.next;
+                state.next += 1;
+                let control = index >= parent.limits.queued;
+                let (tx, _rx) = mpsc::sync_channel(1);
+                state.pending.insert(
+                    id,
+                    Entry {
+                        delivery: Delivery::Command(tx),
+                        cancel: Cancellation::default(),
+                        sent_cancel: false,
+                        control,
+                    },
+                );
+                let message = Message::new(Kind::Command, id, ordinary_bytes.clone());
+                if control {
+                    state.control.push_back(message);
+                } else {
+                    state.data.push_back(message);
+                }
+            }
+            assert_eq!(
+                state
+                    .pending
+                    .values()
+                    .filter(|entry| !entry.control)
+                    .count(),
+                parent.limits.queued
+            );
+            assert_eq!(
+                state.pending.values().filter(|entry| entry.control).count(),
+                CONTROL_SLOTS
+            );
+        }
+        let client = Client::new(&parent);
+        let _authority = client.submit(migration_fixture_request(Action::AcquireTarget {
+            catalog: None,
+            destination: NativePath::from_path(std::path::Path::new("/fixture")),
+            expected: None,
+        }))?;
+        let mut recoveries = Vec::new();
+        for _ in 0..CONTROL_SLOTS {
+            recoveries.push(client.submit(migration_fixture_request(Action::Status))?);
+        }
+        assert_eq!(parent.state.lock().unwrap().pending.len(), aggregate_cap);
+        let mut messages = ParentMessages::default();
+        let mut input = Vec::new();
+        let mut ids = Vec::new();
+        for index in 0..aggregate_cap {
+            let frame = messages.next(&parent).unwrap();
+            if index < CONTROL_SLOTS {
+                assert_eq!(frame.kind, Kind::MigrationAdmission);
+            }
+            assert_eq!(frame.total, frame.payload.len());
+            ids.push(frame.id);
+            frame.write(&mut input)?;
+        }
+        assert_eq!(
+            *ids.last().unwrap(),
+            parent.limits.queued as u64,
+            "last queued ordinary request must still be admitted"
+        );
+        assert!(parent.state.lock().unwrap().control.is_empty());
+        assert!(parent.state.lock().unwrap().data.is_empty());
+
+        let run = |bytes: &[u8]| {
+            let child = child_state();
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let mut dispatched = 0;
+            let result = child_input_relay(
+                &mut &bytes[..],
+                parent.session,
+                &mut |_, _| {
+                    dispatched += 1;
+                    Ok(Err(error(ErrorCode::Native, "retained fixture completion")))
+                },
+                &child,
+                &parent.limits,
+                &tx,
+                &mut |_| Ok(false),
+                None,
+            );
+            (result, child, dispatched)
+        };
+        // No collector runs: completion timing cannot release any admission.
+        let (result, child, dispatched) = run(&input);
+        result?;
+        assert_eq!(dispatched, aggregate_cap);
+        {
+            let state = child.lock().unwrap();
+            assert_eq!(state.pending.len(), aggregate_cap);
+            assert_eq!(state.migration.len(), CONTROL_SLOTS + 1);
+            assert_eq!(
+                state
+                    .pending
+                    .keys()
+                    .filter(|id| !state.migration.contains_key(*id))
+                    .count(),
+                ordinary_cap
+            );
+            assert!(state.pending.contains_key(ids.last().unwrap()));
+        }
+        let mut aggregate_overflow = input;
+        Message::new(Kind::Command, 1000, ordinary_bytes.clone())
+            .write(parent.session, &mut aggregate_overflow)?;
+        let (result, child, dispatched) = run(&aggregate_overflow);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("child pending bounds")
+        );
+        assert_eq!(dispatched, aggregate_cap);
+        assert_eq!(child.lock().unwrap().pending.len(), aggregate_cap);
+
+        for class in ["ordinary", "authority", "recovery"] {
+            let admitted = match class {
+                "ordinary" => ordinary_cap,
+                "authority" => 1,
+                _ => CONTROL_SLOTS,
+            };
+            let mut bytes = Vec::new();
+            for index in 0..=admitted {
+                let (kind, body) = if class == "ordinary" {
+                    (Kind::Command, ordinary_bytes.clone())
+                } else {
+                    let action = if class == "authority" {
+                        Action::AcquireTarget {
+                            catalog: None,
+                            destination: NativePath::from_path(std::path::Path::new("/fixture")),
+                            expected: None,
+                        }
+                    } else {
+                        Action::Status
+                    };
+                    (
+                        Kind::MigrationAdmission,
+                        serde_json::to_vec(&migration_fixture_request(action))?,
+                    )
+                };
+                Message::new(kind, index as u64 + 1, body).write(parent.session, &mut bytes)?;
+            }
+            let (result, child, dispatched) = run(&bytes);
+            let failure = result.unwrap_err().to_string();
+            assert!(
+                failure.contains(if class == "ordinary" {
+                    "ordinary pending bounds"
+                } else {
+                    "migration reserved recovery admission"
+                }),
+                "{class}: {failure}"
+            );
+            assert_eq!(dispatched, admitted);
+            assert_eq!(child.lock().unwrap().pending.len(), admitted);
+        }
+        parent.complete_failure();
+        Ok(())
     }
 }
 

@@ -9,8 +9,9 @@ use crate::{
         ExportProfileAction, ExportProfileReply, ExportProfileRequest, ExportProfileValue,
         ExportPublicationAction, ExportPublicationMode, ExportPublicationReply,
         ExportPublicationRequest, ExportPublicationSource, ExportPublicationValue,
-        InspectExportOriginal, InspectedExportOriginal, LeaseId, PinnedDatabase, PrepareCatalog,
-        PrepareExportDirectory, PreparedExportDirectory, RootCapability, validate_path,
+        InspectExportOriginal, InspectedExportOriginal, LeaseId, MigrationIdentityReply,
+        MigrationIdentityRequest, PinnedDatabase, PrepareCatalog, PrepareExportDirectory,
+        PreparedExportDirectory, RootCapability, validate_path,
     },
     catalog_storage::{open_regular, physical_object_id},
     storage_volume::NativePath,
@@ -782,6 +783,57 @@ impl BootstrapOwner {
                 snapshot,
             })
         })
+    }
+    pub fn migration_identity(
+        &self,
+        request: &MigrationIdentityRequest,
+        cancel: &AtomicBool,
+    ) -> Result<MigrationIdentityReply> {
+        request.validate()?;
+        export_fact_cancel(cancel)?;
+        let path = request.root.canonical_root.to_path()?;
+        // Physical identity alone cannot detect an ancestor replaced by a
+        // symlink back to the same tree. Bootstrap has no lock leaf to check.
+        crate::lightroom::source::reject_links(&path)?;
+        let result = self.with_root(&request.root, |root| {
+            let record = self
+                .record
+                .as_ref()
+                .context("migration root not retained")?;
+            // Validate the manifest too: it is protected even though LM never
+            // writes it. These raw descriptors belong exclusively to F.
+            ensure!(
+                physical_object_id(&open_regular(&record.bootstrap.manifest.path.to_path()?)?)?
+                    == record.bootstrap.manifest.physical,
+                "admitted manifest was replaced"
+            );
+            if let Some(expected) = request.lock {
+                let path = root.join(".lightroom-import.lock");
+                crate::lightroom::source::reject_links(&path)?;
+                let file = open_regular(&path)?;
+                let physical = physical_object_id(&file)?;
+                ensure!(
+                    physical != record.bootstrap.root_physical
+                        && physical != record.bootstrap.catalog.physical
+                        && physical != record.bootstrap.manifest.physical,
+                    "migration lock aliases a protected catalog object"
+                );
+                ensure!(physical == expected, "migration lock identity changed");
+                // Detect replacement during the observation; the second call
+                // from the permit owner repeats this after actual Writers wait.
+                ensure!(
+                    physical_object_id(&open_regular(&path)?)? == physical,
+                    "migration lock path changed during observation"
+                );
+            }
+            export_fact_cancel(cancel)?;
+            Ok(MigrationIdentityReply {
+                root: request.root.clone(),
+                lock: request.lock,
+            })
+        });
+        crate::lightroom::source::reject_links(&path)?;
+        result
     }
     pub fn export_alias_fact(
         &self,

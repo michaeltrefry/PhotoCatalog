@@ -9,7 +9,7 @@ pub(super) const CONFIG_BYTES: usize = 4 * 1024 * 1024;
 // reply budget is smaller than a serialized ResourceLimit error.
 pub(super) const ERROR_BYTES: usize = 1024;
 const HEADER: usize = 48;
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -33,6 +33,8 @@ pub(super) enum Kind {
     DrainAck = 17,
     FilesystemAdmission = 18,
     FilesystemStore = 19,
+    MigrationAdmission = 20,
+    MigrationReply = 21,
     #[cfg(test)]
     Fixture = 250,
 }
@@ -58,6 +60,8 @@ impl Kind {
             17 => Ok(Self::DrainAck),
             18 => Ok(Self::FilesystemAdmission),
             19 => Ok(Self::FilesystemStore),
+            20 => Ok(Self::MigrationAdmission),
+            21 => Ok(Self::MigrationReply),
             #[cfg(test)]
             250 => Ok(Self::Fixture),
             _ => Err(invalid("unknown desktop frame kind")),
@@ -183,6 +187,9 @@ pub(super) struct Assembly {
     bytes: Vec<u8>,
 }
 impl Assembly {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
     pub fn start(f: &Frame, cap: usize) -> std::io::Result<Self> {
         if f.offset != 0 || f.total > cap {
             return Err(invalid("message admission bounds"));
@@ -227,7 +234,8 @@ pub(super) struct ConfigWire {
     limits: Limits,
 }
 pub(super) fn build_identity() -> String {
-    blake3::hash(
+    let mut hash = blake3::Hasher::new();
+    hash.update(
         concat!(
             env!("CARGO_PKG_VERSION"),
             include_str!("../../lib.rs"),
@@ -241,6 +249,7 @@ pub(super) fn build_identity() -> String {
             include_str!("../../metadata_export.rs"),
             include_str!("../../metadata_export/photo_phases.rs"),
             include_str!("wire.rs"),
+            include_str!("lightroom_migration.rs"),
             include_str!("../../catalog_session/preview_io.rs"),
             include_str!("../../filesystem_worker/preview_io.rs"),
             include_str!("../../preview/store_io.rs"),
@@ -297,9 +306,9 @@ pub(super) fn build_identity() -> String {
             include_str!("../../../Cargo.lock")
         )
         .as_bytes(),
-    )
-    .to_hex()
-    .to_string()
+    );
+    hash.update(crate::lightroom_migration_worker::worker::build_identity().as_bytes());
+    hash.finalize().to_hex().to_string()
 }
 impl ConfigWire {
     pub fn from_config(c: &Config) -> Self {

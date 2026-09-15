@@ -175,7 +175,7 @@ fn sqlite_contender() {
         Err(_) => 21,
     });
 }
-fn contender(path: &Path) -> anyhow::Result<bool> {
+pub(super) fn contender(path: &Path) -> anyhow::Result<bool> {
     let mut child = Command::new(std::env::current_exe()?)
         .args([
             "--exact",

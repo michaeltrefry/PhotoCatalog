@@ -293,6 +293,42 @@ pub enum ExportAliasFactKind {
     CanonicalFile,
 }
 
+/// F-only observation for migration admission. The optional lock always names
+/// the fixed import-lock leaf under this exact admitted root; no arbitrary path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationIdentityRequest {
+    pub root: RootCapability,
+    pub lock: Option<PhysicalObjectId>,
+}
+impl MigrationIdentityRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_path(&self.root.canonical_root)?;
+        self.root.root_physical.validate()?;
+        self.root.catalog_physical.validate()?;
+        if let Some(lock) = self.lock {
+            lock.validate()?;
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationIdentityReply {
+    pub root: RootCapability,
+    pub lock: Option<PhysicalObjectId>,
+}
+impl MigrationIdentityReply {
+    pub fn validate_for(&self, request: &MigrationIdentityRequest) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            self.root == request.root && self.lock == request.lock,
+            "migration identity observation changed"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportObjectKey {
@@ -1021,6 +1057,13 @@ pub trait CatalogFilesystem: Send + Sync {
         _cancel: &AtomicBool,
     ) -> Result<ExportDestinationSnapshotReply> {
         anyhow::bail!("filesystem owner does not support export destination snapshots")
+    }
+    fn migration_identity(
+        &self,
+        _request: &MigrationIdentityRequest,
+        _cancel: &AtomicBool,
+    ) -> Result<MigrationIdentityReply> {
+        anyhow::bail!("filesystem owner does not support migration identity observation")
     }
     fn export_alias_fact(
         &self,
@@ -2100,6 +2143,26 @@ impl CatalogSessionAuthority {
         let reply = filesystem.export_destination_snapshot(&request, cancel)?;
         reply.validate_for(&request)?;
         Ok(Some(reply.snapshot))
+    }
+    pub(crate) fn verify_migration_identity(
+        &self,
+        lock: Option<PhysicalObjectId>,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            anyhow::bail!("migration relay requires a managed catalog session")
+        };
+        let request = MigrationIdentityRequest {
+            root: root.clone(),
+            lock,
+        };
+        request.validate()?;
+        filesystem
+            .migration_identity(&request, cancel)?
+            .validate_for(&request)
     }
     pub(crate) fn export_alias_fact(
         &self,

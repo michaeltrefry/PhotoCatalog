@@ -77,6 +77,11 @@ impl FilesystemHandler {
                 .export_destination_snapshot(&request, cancel)
                 .map_err(export_directory_failure)
                 .map(Response::ExportDestinationSnapshot),
+            Operation::MigrationIdentity(request) => self
+                .owner
+                .migration_identity(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::MigrationIdentity),
             Operation::ExportAliasFact(request) => self
                 .owner
                 .export_alias_fact(&request, cancel)

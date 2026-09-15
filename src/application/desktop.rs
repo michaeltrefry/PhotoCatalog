@@ -18,6 +18,7 @@ use std::{
 mod filesystem;
 #[cfg(test)]
 mod filesystem_tests;
+pub(crate) mod lightroom_migration;
 mod native;
 mod preview_metadata_admission;
 pub(crate) mod preview_metadata_capacity;
@@ -47,6 +48,7 @@ pub struct TransportStatus {
     pub pid: u32,
 }
 enum Delivery {
+    Migration(mpsc::SyncSender<lightroom_migration::Reply>),
     Command(mpsc::SyncSender<Reply>),
     Bytes {
         request: BytesRequest,
@@ -188,6 +190,12 @@ impl Shared {
         for (_, e) in entries {
             let message = "desktop process stopped; unacknowledged operation outcome is unknown; explicitly reopen and inspect saved state";
             match e.delivery {
+                Delivery::Migration(tx) => {
+                    let _ = tx.send(lightroom_migration::Reply::Error(error(
+                        ErrorCode::Closed,
+                        message,
+                    )));
+                }
                 Delivery::Command(tx) => {
                     let _ = tx.send(failure(ErrorCode::Closed, message));
                 }

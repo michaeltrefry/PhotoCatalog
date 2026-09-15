@@ -737,6 +737,84 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.parse(SAVED_DESCRIPTOR_BYTES, 2, actor_partial)?,
     )?;
 
+    // Private migration uses the same process reservation/shared ByteBudget.
+    // One authority request and sixteen recovery requests have independent
+    // bounded custody in G/C. Include both encodings, both incoming parsers,
+    // queues, complete pins and snapshots; CHUNK only bounds individual frames.
+    let migration_slots = super::CONTROL_SLOTS as u64 + 1;
+    let migration_request = (config.limits.request_bytes as u64).max(CHUNK_BYTES);
+    let migration_reply = (config.limits.reply_bytes as u64).max(CHUNK_BYTES);
+    a.push(
+        "relay.migration_complete_message_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(4, migration_request)?,
+            c.mul(3 * super::CONTROL_SLOTS as u64, CHUNK_BYTES)?,
+            c.mul(c.add(&[c.mul(2, migration_slots)?, 4])?, migration_reply)?,
+            c.mul(4, CHUNK_BYTES)?,
+        ])?,
+    )?;
+    let migration_root = Layout::of::<super::lightroom_migration::Request>()
+        .size
+        .max(Layout::of::<super::lightroom_migration::Reply>().size);
+    // After validation there are at most two NativePaths and bounded strings.
+    let migration_typed = c.add(&[
+        migration_root,
+        // Guard, catalog, target/digest, progress and bounded refusal strings.
+        c.vec_growth(1, 3 * 64 + 128 + 2 * 64 + 128 + 1024)?,
+        c.mul(2, c.vec_growth(2, PATH_UNITS as u64)?)?,
+    ])?;
+    let pending_demand = c.add(&[
+        config.limits.queued as u64,
+        2 * super::CONTROL_SLOTS as u64,
+        1,
+    ])?;
+    let child_pending = super::process::migration_pending_layout();
+    a.push(
+        "relay.migration_retained_typed_graphs",
+        Phase::Active,
+        c.add(&[c.mul(3, migration_slots)?, 8])?,
+        migration_typed,
+    )?;
+    // Malformed JSON can allocate before semantic native-unit validation.
+    // Each parser retains its complete raw input and bounded serde Content tree.
+    for (name, bytes) in [
+        ("relay.migration_request_parser", migration_request),
+        ("relay.migration_reply_parser", migration_reply),
+        ("relay.migration_recovery_classifier", CHUNK_BYTES),
+    ] {
+        let partial = c.add(&[
+            migration_root,
+            bytes,
+            c.mul(2, c.vec_growth(2, bytes / 2)?)?,
+        ])?;
+        a.push(name, Phase::Active, 1, c.parse(bytes, 6, partial)?)?;
+    }
+    a.push(
+        "relay.migration_queue_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.vec_growth(Layout::of::<super::wire::Message>().size, migration_slots)?,
+            c.table(Layout::of::<(u64, super::Entry)>(), pending_demand)?,
+            c.table(
+                Layout {
+                    size: child_pending.0 as u64,
+                    align: child_pending.1 as u64,
+                },
+                pending_demand,
+            )?,
+            c.table(
+                Layout::of::<(u64, super::super::Cancellation)>(),
+                pending_demand,
+            )?,
+            c.table(Layout::of::<u64>(), pending_demand)?,
+            c.table(Layout::of::<(u64, bool)>(), migration_slots)?,
+            c.vec_growth(Layout::of::<(u64, u64)>().size, pending_demand + 1)?,
+        ])?,
+    )?;
+
     let packet_partial = wire_typed_graph(c, RELAY_BYTES)?;
     let data_parse = c.parse(RELAY_BYTES, 6, packet_partial)?;
     // Three assembly/current buffers retain the raw parse input, so subtract the

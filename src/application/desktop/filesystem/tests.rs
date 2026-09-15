@@ -96,6 +96,55 @@ fn exact_encoding_and_epoch_bounds_precede_reply_adoption() -> Result<()> {
 }
 
 #[test]
+fn lm_desktop_relay_identity_fact_roundtrips_private_f_lane_and_rejects_changed_binding()
+-> Result<()> {
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let request = MigrationIdentityRequest {
+        root: bootstrap(&request(), &binding).root_capability(),
+        lock: Some(physical_object(u64::MAX - 7)),
+    };
+    let call = Call::MigrationIdentity(Box::new(request.clone()));
+    call.validate()?;
+    assert!(call.cancellable());
+    let reply = MigrationIdentityReply {
+        root: request.root.clone(),
+        lock: request.lock,
+    };
+    validate_reply(&call, &Value::MigrationIdentity(reply.clone()), &binding)?;
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Call {
+            id: U64(9),
+            call: call.clone(),
+        },
+    };
+    let bytes = encode(&packet, BYTES)?;
+    assert!(encode(&packet, bytes.len() - 1).is_err());
+    let Body::Call {
+        call: Call::MigrationIdentity(decoded),
+        ..
+    } = decode(&binding, &bytes, Lane::Data)?
+    else {
+        panic!("migration identity wire shape changed")
+    };
+    assert_eq!(*decoded, request);
+    let mut changed_binding = binding.clone();
+    changed_binding.epoch = LeaseId::new();
+    assert!(decode(&changed_binding, &bytes, Lane::Data).is_err());
+    assert!(decode(&binding, &bytes, Lane::Control).is_err());
+    let mut changed = reply.clone();
+    changed.lock = None;
+    assert!(validate_reply(&call, &Value::MigrationIdentity(changed), &binding).is_err());
+    let mut changed = reply;
+    changed.root.catalog_physical = physical_object(1);
+    assert!(validate_reply(&call, &Value::MigrationIdentity(changed), &binding).is_err());
+    Ok(())
+}
+
+#[test]
 fn export_directory_reply_requires_exact_root_and_requested_path() -> Result<()> {
     let binding = Binding {
         nonce: LeaseId::new(),
