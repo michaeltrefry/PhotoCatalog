@@ -831,7 +831,7 @@ fn restored_manifest_root_authority_accepts_offline_path_and_rejects_wrong_names
     );
     let mut cache_overlap = restore.clone();
     cache_overlap.original =
-        NativePath::from_path(&bootstrap.manifest.path.to_path()?.parent().unwrap());
+        NativePath::from_path(bootstrap.manifest.path.to_path()?.parent().unwrap());
     assert!(
         owner
             .restore_original_root(&cache_overlap, &AtomicBool::new(false))

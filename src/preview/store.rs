@@ -419,7 +419,7 @@ impl PreviewStore {
         }
         for root in roots {
             ensure!(
-                !source.starts_with(&root) && !root.starts_with(&source),
+                !source.starts_with(&root) && !root.starts_with(source),
                 "original overlaps preview storage"
             );
         }
