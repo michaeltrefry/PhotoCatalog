@@ -45,13 +45,31 @@ all 392 source hashes, the exact 21 disjoint authored paths, all six logs and
 seven logged C/F/N fixture-child retirements. No integrated source edits were
 needed beyond the accepted component cherry-picks.
 
-Next: remaining LM G coordinator/public application facade on
-codex/sc-22847-lm-supervisor, preserving all seven operations and raw document
-limits. Export-only F stage on codex/sc-22847-export-stage compiled, but is NOT
-accepted: independent review bad867aa found eight relay/serialization/replay/
-drain/cleanup/reply-bound/allocation/supervisor-authority defects. The complete
-repair batch was escalated to a stronger implementation agent with separate
-review. Managed G export custody and C service wiring follow that dependency.
+Export filesystem staging is accepted: source `282ce0c`, integrated `4a41a71`.
+All 42 component tests pass (13 stage, four capacity, four admission, 14 worker,
+seven service), receipt `4939943b`, independent source review `f7acbbed` and
+runtime audit `63462096`. Earlier failed gates remain preserved as negative
+evidence; the final fixture correction only canonicalizes test paths.
+
+LM target inspection and retained-result/failure prerequisites are accepted:
+source `87487a0`, integrated `a4729ac`. All eleven exact tests pass, receipt
+`846dae33`, source review `f9a11684`, independent runtime audit `dfe16b57`.
+Operation charges survive unknown drain and release after checked retirement;
+bounded result or failure storage remains independently charged until discard.
+
+Combined `a4729ac50ae780729712ae27048e617460f20065` passes format, full test-target
+compile, fresh CLI build, actual managed startup refusal/retry, cold/warm preview,
+four capacity tests and Tauri check. Private evidence:
+`sc-22847-stage-lm-prerequisite-integration-9_wo22yf`; receipt `d2281741`,
+immutable CLI `14befba9`, source-composition review `212ba89f`, independent
+evidence audit `db04e2db`. All 394 source hashes and 21 authored entries match;
+seven command processes and eight logged fixture processes retired. The capacity
+table now records this combined source, explicitly requested backing, not RSS.
+
+Next: full LM G coordinator/public application facade on
+`codex/sc-22847-lm-facade`, preserving all seven operations, raw document limits,
+shared budget, cancellation and checked descendant retirement. Managed G export
+custody and C service wiring follow serially because desktop wiring overlaps.
 Full S12 installed workflows and S13 readiness remain open. No push, CI,
 installation replacement, canonical migration or RAID access occurred.
 

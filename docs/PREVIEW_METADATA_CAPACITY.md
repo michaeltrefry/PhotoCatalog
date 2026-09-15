@@ -302,15 +302,17 @@ that same `ProcessReservation`, proves one-byte-short refusal and retained-owner
 charging, then retries the same pool after release. This is requested Rust
 backing only. Native worker/codec working storage, OS handles and mappings,
 allocator overhead, and observed RSS require their own admission and evidence.
-The historical table below is the accepted migration-relay checkpoint before
-export staging integration. A successor integrated capacity run is required
-before quoting current totals. Requested is Retained + max(Active, Startup).
+The integrated export-stage and migration-prerequisite gate on macOS arm64,
+Rust 1.98.0, reported the following totals at source `a4729ac`. All four capacity
+tests passed; evidence is retained in private
+`sc-22847-stage-lm-prerequisite-integration-9_wo22yf/capacity.log`.
+Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 318,729,802 | 12,596,823,189 | 5,364,516,472 | 12,915,552,991 |
-| Default | 1,032,825,168 | 12,596,832,765 | 5,364,516,472 | 13,629,657,933 |
-| Maximum | 1,066,288,643,304 | 17,113,990,545 | 5,364,516,472 | 1,083,402,633,849 |
+| Minimum | 377,294,746 | 13,021,232,669 | 5,364,516,472 | 13,398,527,415 |
+| Default | 1,091,390,112 | 13,021,242,245 | 5,364,516,472 | 14,112,632,357 |
+| Maximum | 1,066,347,208,248 | 17,538,404,105 | 5,364,516,472 | 1,083,885,612,353 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime
