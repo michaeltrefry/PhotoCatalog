@@ -68,17 +68,23 @@ struct Upload {
     written: u64,
     hasher: blake3::Hasher,
 }
+struct RetainedUpload {
+    path: NativePath,
+    expected_bytes: u64,
+    expected_blake3: String,
+    upload: Option<Upload>,
+}
 struct Seal {
     operation: String,
     workbench: String,
     generation: String,
     token: String,
+    requested: NativePath,
     directory: NativePath,
     database: NativePath,
-    approval_path: NativePath,
     seal_path: NativePath,
-    approval: Upload,
-    review: Upload,
+    approval: RetainedUpload,
+    review: RetainedUpload,
     seal: Option<Upload>,
     database_physical: Option<FileKey>,
     database_identity: Option<crate::lightroom::source::Revision>,
@@ -142,6 +148,41 @@ impl Upload {
     }
 }
 
+impl RetainedUpload {
+    fn new(path: &Path, expected_bytes: u64, expected_blake3: String) -> Self {
+        Self {
+            path: NativePath::from_path(path),
+            expected_bytes,
+            expected_blake3,
+            upload: None,
+        }
+    }
+    fn ensure_created(&mut self) -> Result<()> {
+        if self.upload.is_none() {
+            let upload = Upload::create(
+                &self.path.to_path()?,
+                self.expected_bytes,
+                self.expected_blake3.clone(),
+            )?;
+            // Adopt the open file immediately. Any later failure remains
+            // reachable through this Seal operation's Status/Abort lifecycle.
+            self.upload = Some(upload);
+        }
+        Ok(())
+    }
+    fn upload(&mut self) -> Result<&mut Upload> {
+        self.upload.as_mut().context("seal document is not created")
+    }
+    fn finish(&mut self) -> Result<()> {
+        self.upload()?.finish()
+    }
+    fn close(&mut self) {
+        if let Some(upload) = &mut self.upload {
+            upload.file.take();
+        }
+    }
+}
+
 impl Seal {
     fn same(&self, operation: &str, workbench: &str, generation: &str, token: &str) -> Result<()> {
         same(
@@ -151,10 +192,54 @@ impl Seal {
         ensure!(self.token == token, "seal token differs");
         Ok(())
     }
+    fn same_begin(
+        &self,
+        output: &NativePath,
+        approval_bytes: u64,
+        approval_blake3: &str,
+        review_bytes: u64,
+        review_blake3: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.state == LightroomWorkbenchSealState::Staging
+                && &self.requested == output
+                && self.approval.expected_bytes == approval_bytes
+                && self.approval.expected_blake3 == approval_blake3
+                && self.review.expected_bytes == review_bytes
+                && self.review.expected_blake3 == review_blake3,
+            "seal begin retry differs"
+        );
+        Ok(())
+    }
+    fn prepare_uploads(&mut self) -> Result<()> {
+        let directory = fs::canonicalize(self.requested.to_path()?)?;
+        ensure!(
+            fs::symlink_metadata(&directory)?.is_dir(),
+            "seal output is not a direct directory"
+        );
+        self.directory = NativePath::from_path(&directory);
+        self.database = NativePath::from_path(&directory.join("inspection.sqlite3"));
+        self.seal_path = NativePath::from_path(&directory.join("input-seal.json"));
+        self.approval.path = NativePath::from_path(&directory.join("approval.json"));
+        self.review.path = NativePath::from_path(&directory.join("review.json"));
+        self.approval.ensure_created()?;
+        #[cfg(test)]
+        {
+            let mut failure = SEAL_BEGIN_FAIL_AFTER_APPROVAL
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if failure.as_deref() == Some(directory.as_path()) {
+                *failure = None;
+                anyhow::bail!("injected seal begin failure after approval create");
+            }
+        }
+        self.review.ensure_created()?;
+        Ok(())
+    }
     fn upload(&mut self, document: LightroomWorkbenchSealDocument) -> Result<&mut Upload> {
         match document {
-            LightroomWorkbenchSealDocument::Approval => Ok(&mut self.approval),
-            LightroomWorkbenchSealDocument::Review => Ok(&mut self.review),
+            LightroomWorkbenchSealDocument::Approval => self.approval.upload(),
+            LightroomWorkbenchSealDocument::Review => self.review.upload(),
             LightroomWorkbenchSealDocument::Seal => self
                 .seal
                 .as_mut()
@@ -168,11 +253,15 @@ impl Seal {
             state: self.state,
             directory: self.directory.clone(),
             seal_path: self.seal_path.clone(),
-            approval_path: self.approval_path.clone(),
+            approval_path: self.approval.path.clone(),
             seal_blake3: self.published_blake3.clone(),
         }
     }
 }
+
+#[cfg(test)]
+static SEAL_BEGIN_FAIL_AFTER_APPROVAL: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
 
 #[derive(Clone, PartialEq, Eq)]
 struct ReleaseReceipt {
@@ -895,35 +984,50 @@ impl Owner {
                 review_bytes,
                 review_blake3,
             } => {
-                ensure!(self.seal.is_none(), "seal operation already retained");
                 canceled(cancel)?;
+                if let Some(value) = &mut self.seal {
+                    value.same(&operation, &workbench, &generation, &token)?;
+                    value.same_begin(
+                        &output,
+                        approval_bytes.0,
+                        &approval_blake3,
+                        review_bytes.0,
+                        &review_blake3,
+                    )?;
+                    value.prepare_uploads()?;
+                    ensure!(
+                        value.approval.upload()?.written == 0,
+                        "seal begin retry follows uploaded approval bytes"
+                    );
+                    return Ok(LightroomWorkbenchIoReply::SealUpload {
+                        operation,
+                        token,
+                        document: LightroomWorkbenchSealDocument::Approval,
+                        offset: U64(0),
+                    });
+                }
                 let requested = output.to_path()?;
                 ensure!(requested.is_absolute(), "seal output must be absolute");
                 let parent = requested.parent().context("seal output parent absent")?;
                 crate::lightroom::source::reject_links(parent)?;
                 fs::create_dir(&requested).context("seal output must be a new directory")?;
-                let directory = fs::canonicalize(&requested)?;
-                ensure!(
-                    fs::symlink_metadata(&directory)?.is_dir(),
-                    "seal output is not a direct directory"
-                );
-                let approval_path = directory.join("approval.json");
-                let review_path = directory.join("review.json");
-                let database = directory.join("inspection.sqlite3");
-                let seal_path = directory.join("input-seal.json");
-                let approval = Upload::create(&approval_path, approval_bytes.0, approval_blake3)?;
-                let review = Upload::create(&review_path, review_bytes.0, review_blake3)?;
+                let approval_path = requested.join("approval.json");
+                let review_path = requested.join("review.json");
                 self.seal = Some(Seal {
                     operation: operation.clone(),
                     workbench,
                     generation,
                     token: token.clone(),
-                    directory: NativePath::from_path(&directory),
-                    database: NativePath::from_path(&database),
-                    approval_path: NativePath::from_path(&approval_path),
-                    seal_path: NativePath::from_path(&seal_path),
-                    approval,
-                    review,
+                    requested: output,
+                    directory: NativePath::from_path(&requested),
+                    database: NativePath::from_path(&requested.join("inspection.sqlite3")),
+                    seal_path: NativePath::from_path(&requested.join("input-seal.json")),
+                    approval: RetainedUpload::new(
+                        &approval_path,
+                        approval_bytes.0,
+                        approval_blake3,
+                    ),
+                    review: RetainedUpload::new(&review_path, review_bytes.0, review_blake3),
                     seal: None,
                     database_physical: None,
                     database_identity: None,
@@ -931,6 +1035,12 @@ impl Owner {
                     published_blake3: None,
                     state: LightroomWorkbenchSealState::Staging,
                 });
+                // From create_dir onward the operation is retained. Each file
+                // is adopted before the next fallible create.
+                self.seal
+                    .as_mut()
+                    .context("seal custody missing after directory create")?
+                    .prepare_uploads()?;
                 Ok(LightroomWorkbenchIoReply::SealUpload {
                     operation,
                     token,
@@ -1173,8 +1283,8 @@ impl Owner {
                     value.state != LightroomWorkbenchSealState::Published,
                     "published seal cannot be aborted"
                 );
-                value.approval.file.take();
-                value.review.file.take();
+                value.approval.close();
+                value.review.close();
                 if let Some(upload) = &mut value.seal {
                     upload.file.take();
                 }
@@ -1379,6 +1489,73 @@ mod tests {
             }
         ));
         assert!(temp.path().join("sealed/input-seal.json").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn seal_begin_failure_after_first_document_retains_status_retry_and_abort() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("retained-partial-seal");
+        let approval = br#"{"approval":true}"#;
+        let review = br#"{"review":true}"#;
+        let begin = LightroomWorkbenchIo::SealBegin {
+            operation: OPERATION.into(),
+            workbench: WORKBENCH.into(),
+            generation: GENERATION.into(),
+            token: TOKEN.into(),
+            output: NativePath::from_path(&output),
+            approval_bytes: U64(approval.len() as u64),
+            approval_blake3: crate::lightroom::digest(approval),
+            review_bytes: U64(review.len() as u64),
+            review_blake3: crate::lightroom::digest(review),
+        };
+        *SEAL_BEGIN_FAIL_AFTER_APPROVAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(fs::canonicalize(temp.path())?.join("retained-partial-seal"));
+        let mut owner = Owner::default();
+        assert!(call(&mut owner, begin.clone()).is_err());
+        assert!(output.join("approval.json").is_file());
+        assert!(!output.join("review.json").exists());
+
+        let status = call(
+            &mut owner,
+            LightroomWorkbenchIo::SealStatus {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+            },
+        )?;
+        assert!(matches!(
+            status,
+            LightroomWorkbenchIoReply::SealState {
+                state: LightroomWorkbenchSealState::Staging,
+                ..
+            }
+        ));
+
+        // The exact retry resumes from retained custody and create-news only
+        // the document that was not adopted before the injected failure.
+        call(&mut owner, begin)?;
+        assert!(output.join("approval.json").is_file());
+        assert!(output.join("review.json").is_file());
+        let aborted = call(
+            &mut owner,
+            LightroomWorkbenchIo::SealAbort {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+            },
+        )?;
+        assert!(matches!(
+            aborted,
+            LightroomWorkbenchIoReply::SealState {
+                state: LightroomWorkbenchSealState::Aborted,
+                ..
+            }
+        ));
         Ok(())
     }
 

@@ -25,6 +25,29 @@ struct AdmittedTable {
     keys: Vec<String>,
 }
 
+#[derive(Default)]
+struct VmProgress {
+    steps: AtomicU64,
+    exhausted: AtomicBool,
+}
+impl VmProgress {
+    fn interrupt(&self, maximum: u64) -> bool {
+        if self.steps.fetch_add(1000, Ordering::AcqRel) >= maximum {
+            self.exhausted.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.exhausted.load(Ordering::Acquire),
+            "CaptureSql VM step limit"
+        );
+        Ok(())
+    }
+}
+
 pub(super) struct CaptureSource {
     db: Connection,
     guard: Source,
@@ -34,6 +57,7 @@ pub(super) struct CaptureSource {
     initial_data_version: i64,
     cancel: Arc<AtomicBool>,
     deadline: Instant,
+    vm: Arc<VmProgress>,
 }
 
 fn bytes(value: ValueRef<'_>) -> Result<Vec<u8>> {
@@ -171,15 +195,15 @@ impl CaptureSource {
         let deadline = Instant::now() + Duration::from_millis(authority.limits.total_deadline_ms.0);
         let progress_cancel = cancel.clone();
         let progress_deadline = deadline;
-        let progress_steps = Arc::new(AtomicU64::new(0));
-        let counter = progress_steps.clone();
+        let vm = Arc::new(VmProgress::default());
+        let progress = vm.clone();
         let maximum_steps = authority.limits.vm_steps.0;
         db.progress_handler(
             1000,
             Some(move || {
                 progress_cancel.load(Ordering::Acquire)
                     || Instant::now() >= progress_deadline
-                    || counter.fetch_add(1000, Ordering::AcqRel) >= maximum_steps
+                    || progress.interrupt(maximum_steps)
             }),
         )?;
         let (schema, tables) = Self::admit_schema(&db, &authority)?;
@@ -192,6 +216,7 @@ impl CaptureSource {
             initial_data_version,
             cancel,
             deadline,
+            vm,
         };
         value.verify()?;
         Ok(value)
@@ -200,6 +225,7 @@ impl CaptureSource {
     fn verify(&self) -> Result<()> {
         ensure!(!self.cancel.load(Ordering::Acquire), "CaptureSql canceled");
         ensure!(Instant::now() < self.deadline, "CaptureSql deadline");
+        self.vm.check()?;
         self.guard.verify()?;
         no_companions(&self.guard.path)?;
         crate::catalog_storage::verify_database_object(&self.db, &self.guard.file)?;
@@ -644,5 +670,106 @@ impl CaptureSource {
             rows,
             next_cursor,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage_volume::NativePath;
+
+    fn fixture() -> Result<(tempfile::TempDir, CaptureSource, String)> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join(wire::MEMBER);
+        let db = Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE sample(id INTEGER PRIMARY KEY, value BLOB NOT NULL);\
+             INSERT INTO sample VALUES(1, zeroblob(256));",
+        )?;
+        drop(db);
+
+        let mut source = Source::open(&path, u64::MAX)?;
+        let revision = source.before.clone();
+        let physical = FileKey::of(&source.file)?;
+        let digest = source.copy_and_hash_controlled(None, || Ok(()))?;
+        drop(source);
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis()
+            .checked_add(60_000)
+            .context("fixture expiry")?;
+        let mut authority = wire::Authority {
+            protocol: 1,
+            build: crate::lightroom_migration_worker::worker::build_identity().into(),
+            workbench_instance: "workbench".into(),
+            workbench_generation: "generation".into(),
+            filesystem_lease: "filesystem".into(),
+            operation: "operation".into(),
+            capture_generation: "capture".into(),
+            expires_unix_ms: U64(u64::try_from(expires)?),
+            capture_root: NativePath::from_path(root.path()),
+            member: wire::MEMBER.into(),
+            manifest_blake3: "1".repeat(64),
+            revision_id: "2".repeat(64),
+            logical_revision: revision.into(),
+            logical_blake3: digest,
+            maximum_bytes: U64(1024 * 1024),
+            physical,
+            companion_generation: "companions".into(),
+            raw_roster_blake3: "3".repeat(64),
+            limits: wire::Limits {
+                open_deadline_ms: U64(10_000),
+                total_deadline_ms: U64(60_000),
+                vm_steps: U64(u32::MAX as u64),
+                schema_objects: U64(64),
+                schema_bytes: U64(PAGE_BYTES as u64),
+                page_bytes: U64(64),
+                max_cell_bytes: U64(1024),
+                result_bytes: U64(1024 * 1024),
+                inline_bytes: U64(1024),
+                chunk_bytes: U64(1024),
+                max_rows: U64(10),
+            },
+            protected: vec![],
+            binding_blake3: String::new(),
+        };
+        authority.binding_blake3 = authority.computed_binding()?;
+        let source = CaptureSource::open(authority, Arc::new(AtomicBool::new(false)))?;
+        let handle = source
+            .schema
+            .tables
+            .iter()
+            .find(|table| table.retained_only.is_none())
+            .context("fixture admitted table")?
+            .table_handle
+            .clone();
+        Ok((root, source, handle))
+    }
+
+    #[test]
+    fn vm_exhaustion_is_fatal_before_typed_table_failure() -> Result<()> {
+        let (_root, source, handle) = fixture()?;
+        let healthy = source.table_rows(handle.clone(), None, 1, 1)?;
+        assert!(matches!(
+            healthy,
+            Err(wire::TableFailure {
+                class: wire::TableFailureClass::RowBytes,
+                ..
+            })
+        ));
+
+        source.vm.exhausted.store(true, Ordering::Release);
+        let failure = source.table_rows(handle, None, 1, 2).unwrap_err();
+        assert!(format!("{failure:#}").contains("CaptureSql VM step limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn progress_limit_records_the_interrupt_reason() -> Result<()> {
+        let progress = VmProgress::default();
+        assert!(!progress.interrupt(1000));
+        assert!(progress.interrupt(1000));
+        assert!(progress.check().is_err());
+        Ok(())
     }
 }
