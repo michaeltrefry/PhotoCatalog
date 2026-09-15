@@ -1029,6 +1029,13 @@ pub trait CatalogFilesystem: Send + Sync {
         )
         .into())
     }
+    fn backup_call(
+        &self,
+        _request: &crate::catalog_backup::managed_filesystem::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<crate::catalog_backup::managed_filesystem::Reply> {
+        anyhow::bail!("filesystem owner does not support backup custody")
+    }
     fn storage_call(
         &self,
         _request: &storage::Request,
@@ -1830,6 +1837,9 @@ pub(crate) struct CatalogSessionAuthority {
     managed_export: export_managed::Registry,
 }
 impl CatalogSessionAuthority {
+    pub(crate) fn managed_physical_identity(&self) -> Option<PhysicalObjectId> {
+        matches!(&self.mode, AuthorityMode::Managed { .. }).then_some(self.physical)
+    }
     pub(crate) fn legacy(file: Arc<File>) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             physical: crate::catalog_storage::physical_object_id(&file)?,

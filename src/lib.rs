@@ -340,6 +340,9 @@ pub(crate) fn initialize_catalog_connection(
 }
 
 impl Catalog {
+    pub(crate) fn managed_physical_identity(&self) -> Option<catalog_session::PhysicalObjectId> {
+        self.session.managed_physical_identity()
+    }
     pub(crate) fn require_jobs_released(&self) -> Result<()> {
         self.session.require_jobs_released(&self.root)
     }

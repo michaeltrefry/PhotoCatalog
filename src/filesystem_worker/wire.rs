@@ -109,6 +109,7 @@ pub fn build_identity() -> String {
             include_str!("../preview/worker/read_transport.rs"),
             include_str!("../preview/transport_task.rs"),
             include_str!("../catalog_backup.rs"),
+            include_str!("../catalog_backup/managed_filesystem.rs"),
             include_str!("../lib.rs"),
             include_str!("../catalog_storage.rs"),
             include_str!("../metadata_export.rs"),
@@ -135,6 +136,7 @@ pub fn build_identity() -> String {
 // confirmation inline instead of adding a separate allocation to every decode.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    Backup(Box<crate::catalog_backup::managed_filesystem::Request>),
     ExportExecutor(crate::catalog_session::export_executor::Request),
     Import(crate::catalog_session::import::Request),
     PreviewStore(crate::catalog_session::store::Request),
@@ -197,6 +199,7 @@ impl Operation {
                         | LightroomArtifactPreparation::DiscardReceipt { .. }
                 )
             )
+            || matches!(self, Self::Backup(r) if r.cleanup())
             || matches!(self, Self::ExportExecutor(r) if r.cleanup())
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
@@ -210,6 +213,7 @@ impl Operation {
     }
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::Backup(value) => value.validate()?,
             Self::ExportExecutor(value) => value.validate()?,
             Self::Import(value) => value.validate()?,
             Self::PreviewStore(value) => value.validate()?,
@@ -627,6 +631,7 @@ impl AdmissionSnapshot {
     reason = "inline response variants preserve the bounded protocol root without an extra heap owner"
 )]
 pub enum Response {
+    Backup(crate::catalog_backup::managed_filesystem::Reply),
     ExportExecutor(crate::catalog_session::export_executor::Reply),
     Import(crate::catalog_session::import::Reply),
     PreviewStore(crate::catalog_session::store::Reply),

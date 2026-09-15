@@ -25,6 +25,8 @@ pub enum Request {
     Create {
         source: NativePath,
         bundle: NativePath,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_source: Option<crate::catalog_session::PhysicalObjectId>,
     },
     Inspect {
         bundle: NativePath,
@@ -138,14 +140,33 @@ struct Active {
 /// IDs are minted here, not supplied/replayed by callers; stale cancel IDs fail.
 pub struct Coordinator {
     limits: core::Limits,
+    backend: Backend,
     latest: Option<Snapshot>,
     active: Option<Active>,
+}
+enum Backend {
+    Legacy,
+    Managed(PathBuf),
 }
 impl Coordinator {
     pub fn new(limits: core::Limits) -> Result<Self> {
         limits.validate()?;
         Ok(Self {
             limits,
+            backend: Backend::Legacy,
+            latest: None,
+            active: None,
+        })
+    }
+    pub(crate) fn new_managed(limits: core::Limits, executable: PathBuf) -> Result<Self> {
+        limits.validate()?;
+        ensure!(
+            executable.is_absolute(),
+            "managed backup executable must be absolute"
+        );
+        Ok(Self {
+            limits,
+            backend: Backend::Managed(executable),
             latest: None,
             active: None,
         })
@@ -171,6 +192,11 @@ impl Coordinator {
         let progress = Arc::new(Mutex::new(None));
         let worker_progress = Arc::clone(&progress);
         let limits = self.limits.clone();
+        let worker_operation = operation.clone();
+        let managed = match &self.backend {
+            Backend::Legacy => None,
+            Backend::Managed(executable) => Some((executable.clone(), prepared.managed()?)),
+        };
         let worker = thread::Builder::new()
             .name("catalog-backup".into())
             .spawn(move || {
@@ -183,9 +209,24 @@ impl Coordinator {
                     observer(&p);
                     Ok(())
                 };
-                prepared
-                    .run(&limits, &worker_cancel, callback)
-                    .map_err(failure)
+                match managed {
+                    Some((executable, request)) => core::managed::run_process(
+                        &executable,
+                        worker_operation,
+                        request,
+                        limits,
+                        &worker_cancel,
+                        |p| callback(p),
+                    )
+                    .map(|receipt| match receipt {
+                        core::managed::Receipt::Backup(value) => Receipt::Backup(value.into()),
+                        core::managed::Receipt::Restore(value) => Receipt::Restore(value.into()),
+                    })
+                    .map_err(failure),
+                    None => prepared
+                        .run(&limits, &worker_cancel, callback)
+                        .map_err(failure),
+                }
             })
             .context("start owned backup worker")?;
         let snapshot = Snapshot {
@@ -302,8 +343,13 @@ impl Drop for Coordinator {
     }
 }
 
+#[derive(Clone)]
 enum Prepared {
-    Create(PathBuf, PathBuf),
+    Create(
+        PathBuf,
+        PathBuf,
+        Option<crate::catalog_session::PhysicalObjectId>,
+    ),
     Inspect(PathBuf),
     Restore(PathBuf, PathBuf),
 }
@@ -326,7 +372,11 @@ impl Prepared {
             Ok(p)
         }
         Ok(match request {
-            Request::Create { source, bundle } => Self::Create(path(source)?, path(bundle)?),
+            Request::Create {
+                source,
+                bundle,
+                expected_source,
+            } => Self::Create(path(source)?, path(bundle)?, expected_source),
             Request::Inspect { bundle } => Self::Inspect(path(bundle)?),
             Request::Restore {
                 bundle,
@@ -348,7 +398,7 @@ impl Prepared {
         callback: F,
     ) -> Result<Receipt> {
         match self {
-            Self::Create(source, bundle) => {
+            Self::Create(source, bundle, _) => {
                 core::backup_catalog_with_control(source, bundle, limits, cancel, callback)
                     .map(|r| Receipt::Backup(r.into()))
             }
@@ -361,6 +411,23 @@ impl Prepared {
                     .map(|r| Receipt::Restore(r.into()))
             }
         }
+    }
+    fn managed(&self) -> Result<core::managed::Request> {
+        Ok(match self {
+            Self::Create(source, bundle, expected) => core::managed::Request::Create {
+                source: NativePath::from_path(source),
+                bundle: NativePath::from_path(bundle),
+                expected_source: expected
+                    .context("managed backup requires the active catalog identity")?,
+            },
+            Self::Inspect(bundle) => core::managed::Request::Inspect {
+                bundle: NativePath::from_path(bundle),
+            },
+            Self::Restore(bundle, destination) => core::managed::Request::Restore {
+                bundle: NativePath::from_path(bundle),
+                destination: NativePath::from_path(destination),
+            },
+        })
     }
 }
 fn failure(error: anyhow::Error) -> Failure {
@@ -417,6 +484,7 @@ mod tests {
         let started = c.start(Request::Create {
             source: native(&source),
             bundle: native(&bundle),
+            expected_source: None,
         })?;
         let done = c.join()?.unwrap();
         assert_eq!(done.state, State::Complete);
@@ -465,6 +533,7 @@ mod tests {
             Request::Create {
                 source: native(&source),
                 bundle: native(&bundle),
+                expected_source: None,
             },
             move |p| {
                 if p.phase == core::Phase::Copy && !once {
@@ -512,6 +581,7 @@ mod tests {
             Request::Create {
                 source: native(&source),
                 bundle: native(&bundle),
+                expected_source: None,
             },
             move |p| {
                 if p.phase == core::Phase::Copy && !once {
@@ -603,6 +673,7 @@ mod tests {
         c.start(Request::Create {
             source: native(&source),
             bundle: native(&target),
+            expected_source: None,
         })?;
         assert_eq!(c.join()?.unwrap().state, State::Failed);
         assert_eq!(std::fs::read(target.join("keep"))?, b"unchanged");

@@ -995,6 +995,16 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected managed import reply"),
         }
     }
+    fn backup_call(
+        &self,
+        request: &crate::catalog_backup::managed_filesystem::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_backup::managed_filesystem::Reply> {
+        match self.execute(Operation::Backup(Box::new(request.clone())), cancel)? {
+            Response::Backup(reply) => Ok(reply),
+            _ => anyhow::bail!("unexpected backup custody response"),
+        }
+    }
     fn export_executor_call(
         &self,
         request: &crate::catalog_session::export_executor::Request,

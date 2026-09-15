@@ -34,6 +34,7 @@ struct FilesystemHandler {
     owner: BootstrapOwner,
     lightroom_sealed: lightroom_sealed::Owner,
     lightroom_artifacts: lightroom_artifacts::Owner,
+    backup: catalog_backup::managed_filesystem::Owner,
 }
 pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
     bootstrap::export_profile_transfer_layout()
@@ -60,6 +61,7 @@ impl FilesystemHandler {
             owner: BootstrapOwner::new(startup.epoch, startup.original_roots),
             lightroom_sealed: Default::default(),
             lightroom_artifacts: Default::default(),
+            backup: Default::default(),
         })
     }
     fn execute_inner(
@@ -70,6 +72,7 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::Backup(request) => self.backup.call(&request, cancel).map(Response::Backup),
             Operation::Storage(request) => self
                 .owner
                 .storage_call(&request, cancel)
@@ -248,6 +251,12 @@ impl Handler for FilesystemHandler {
         })
     }
     fn shutdown(&mut self) -> std::result::Result<(), Failure> {
+        if !self.backup.is_idle() {
+            return Err(Failure::new(
+                FailureKind::Unknown,
+                "filesystem backup owner still retains an operation",
+            ));
+        }
         self.owner
             .shutdown()
             .map_err(|error| Failure::new(FailureKind::Unknown, error))

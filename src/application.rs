@@ -512,13 +512,18 @@ impl Bridge {
     }
     fn spawn_engine(config: Config, managed: Option<ManagedCatalogConfig>) -> Result<Self> {
         config.validate()?;
+        let backups = if managed.is_some() {
+            backup::Coordinator::new_managed(Default::default(), std::env::current_exe()?)?
+        } else {
+            backup::Coordinator::new(Default::default())?
+        };
         let shared = Arc::new(Shared {
             managed_catalog: managed.is_some(),
             lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),
             exports: Arc::new(Mutex::new(exports::Control::default())),
             relink: Arc::new(Mutex::new(relink::Control::default())),
             copy: Arc::new(Mutex::new(copy::Control::default())),
-            backups: Mutex::new(backup::Coordinator::new(Default::default())?),
+            backups: Mutex::new(backups),
             queue: Mutex::new(Queue {
                 pending: VecDeque::new(),
                 stopping: false,
@@ -2200,14 +2205,16 @@ impl Actor {
                 self.shared.queue.lock().unwrap().import_status.clone(),
             )),
             Request::BackupCreate { catalog, bundle } => {
-                let source = NativePath::from_path(&self.current(&catalog)?.catalog.root);
-                let snapshot = core!(
-                    self.shared
-                        .backups
-                        .lock()
-                        .unwrap()
-                        .start(backup::Request::Create { source, bundle })
-                );
+                let current = self.current(&catalog)?;
+                let source = NativePath::from_path(&current.catalog.root);
+                let expected_source = current.catalog.managed_physical_identity();
+                let snapshot = core!(self.shared.backups.lock().unwrap().start(
+                    backup::Request::Create {
+                        source,
+                        bundle,
+                        expected_source
+                    }
+                ));
                 Ok(Response::Backup(Some(snapshot)))
             }
             Request::BackupInspect { bundle } => {

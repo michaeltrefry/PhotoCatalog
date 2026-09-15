@@ -499,6 +499,18 @@ fn main() -> Result<()> {
     }
     if std::env::args_os()
         .nth(1)
+        .is_some_and(|arg| arg == "--catalog-backup-worker")
+    {
+        std::process::exit(
+            if photocatalog::catalog_backup::managed::worker_main().is_ok() {
+                0
+            } else {
+                1
+            },
+        );
+    }
+    if std::env::args_os()
+        .nth(1)
         .is_some_and(|arg| arg == "--catalog-desktop-worker")
     {
         return photocatalog::application::desktop::worker_main();
