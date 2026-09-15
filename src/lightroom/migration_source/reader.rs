@@ -714,7 +714,7 @@ impl MigrationSource {
         );
         ensure!(
             app == 0x50434c49 && version == plan::PLAN_SCHEMA_VERSION,
-            "requires sealed inspection schema3; old derived keys cannot be migrated implicitly"
+            "requires the current sealed inspection schema; old derived keys cannot be migrated implicitly"
         );
         for table in [
             "captures",

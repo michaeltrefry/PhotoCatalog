@@ -1381,4 +1381,25 @@ mod tests {
         assert!(temp.path().join("sealed/input-seal.json").is_file());
         Ok(())
     }
+
+    #[test]
+    fn malformed_seal_request_has_no_filesystem_effect() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("must-not-exist");
+        let mut owner = Owner::default();
+        let request = LightroomWorkbenchIo::SealBegin {
+            operation: OPERATION.into(),
+            workbench: WORKBENCH.into(),
+            generation: GENERATION.into(),
+            token: TOKEN.into(),
+            output: NativePath::from_path(&output),
+            approval_bytes: U64(0),
+            approval_blake3: "0".repeat(64),
+            review_bytes: U64(1),
+            review_blake3: "0".repeat(64),
+        };
+        assert!(call(&mut owner, request).is_err());
+        assert!(!output.exists());
+        Ok(())
+    }
 }

@@ -621,7 +621,7 @@ impl SelectionReview {
         let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
             app == 0x50434c49 && schema == PLAN_SCHEMA_VERSION,
-            "selection requires existing schema3 inspection; old evidence was not migrated"
+            "selection requires the current inspection schema; old evidence was not migrated"
         );
         let baseline = version(&db)?;
         let plan = Plan {

@@ -159,7 +159,7 @@ fn exact_result_tokens_decimal_cursors_and_bounded_cache_replace() {
     ))
     .unwrap();
     let opening = value(&reopened);
-    assert_eq!(opening["schema"], 3);
+    assert_eq!(opening["schema"], core::plan::PLAN_SCHEMA_VERSION);
     assert!(opening.get("rows").is_none());
     close(&mut reopened);
 }
