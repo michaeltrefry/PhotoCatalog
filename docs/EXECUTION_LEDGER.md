@@ -31,14 +31,28 @@ fixture-only canonical-path correction in sc-22847-export-service-path-fix-
 4ls1a2tm (receipt 8da015dc). Fresh CLI 63fe2a28 and independent final audit
 3c3bd3dc are retained. Earlier failed gates remain negative evidence.
 
-Next: export-only F stage implementation on codex/sc-22847-export-stage;
-managed G native custody and C service wiring follow that dependency. LM batch4
-C relay ancestry repair compiled and independently passed, but the same review
-found a whole-message frame cap that narrows accepted native paths and drops
-reply pins. Bounded multipart request/reply repair is active on
-codex/sc-22847-lm-desktop; review 309de124 records the exact open finding.
-LM batch4 G integration/public application bridge, managed N/G export executor,
-full S12 installed workflows and S13 readiness remain open. No push, CI,
+LM C relay is locally committed as 8d2544e and integrated as 7b092f5.
+Independent source closure 6c5d3192 and corrected evidence audit f7f183a6 pass;
+28 relay tests, one existing ordinary-admission test and three capacity tests
+pass (receipt 84130676). All 15 logged F fixture children retired. The table
+now records all three current requested-backing reports, explicitly not RSS.
+
+Combined source 7b092f5 passes formatting, full test-target compilation, fresh
+CLI build, actual managed startup refusal/retry, cold/warm preview delivery,
+and Tauri check. Evidence: private sc-22847-lm-relay-export-integration-70o_2mrf;
+receipt 375cf1b0, immutable CLI a77b62a6. Independent audit 16b4a005 verifies
+all 392 source hashes, the exact 21 disjoint authored paths, all six logs and
+seven logged C/F/N fixture-child retirements. No integrated source edits were
+needed beyond the accepted component cherry-picks.
+
+Next: remaining LM G coordinator/public application facade on
+codex/sc-22847-lm-supervisor, preserving all seven operations and raw document
+limits. Export-only F stage on codex/sc-22847-export-stage compiled, but is NOT
+accepted: independent review bad867aa found eight relay/serialization/replay/
+drain/cleanup/reply-bound/allocation/supervisor-authority defects. The complete
+repair batch was escalated to a stronger implementation agent with separate
+review. Managed G export custody and C service wiring follow that dependency.
+Full S12 installed workflows and S13 readiness remain open. No push, CI,
 installation replacement, canonical migration or RAID access occurred.
 
 LM startupFIFO plus checked receiver verdict passes compile5d381c99 and
