@@ -221,10 +221,11 @@ impl Owner {
         };
         let result = result.map_err(|error| {
             let mut failure = error.downcast_ref::<Failure>().cloned().unwrap_or_else(|| {
-                let kind = if matches!(
-                    request.action,
-                    Action::NativeDrained { .. } | Action::ResultAndSeal
-                ) {
+                let kind = if self.cleanup.is_some()
+                    || matches!(
+                        request.action,
+                        Action::NativeDrained { .. } | Action::ResultAndSeal
+                    ) {
                     FailureKind::Unknown
                 } else {
                     FailureKind::Rejected
@@ -277,19 +278,34 @@ impl Owner {
                     crate::export_worker::prepare_managed_request(work, *limits, &path)?;
                 let parent_directory = owned_directory(&root)?;
                 ensure!(!path.try_exists()?, "export stage identity already exists");
-                fs::create_dir(&path)?;
-                let directory = owned_directory(&path)?;
+                // Publish custody before mkdir: an error after its namespace
+                // effect must not make the root look empty. Until a directory
+                // handle is captured, its identity is unknown and path-only
+                // cleanup or later adoption would risk deleting a replacement.
                 self.cleanup = Some(Cleanup {
                     id: request.stage.clone(),
                     root: request.root.clone(),
                     binding: request.binding.clone(),
                     path: path.clone(),
-                    directory: directory.try_clone()?,
-                    parent_directory: parent_directory.try_clone()?,
+                    directory: None,
+                    parent_directory,
                     locks: Vec::new(),
                     removed: false,
                 });
                 let constructed = (|| -> Result<Stage> {
+                    fs::create_dir(&path)?;
+                    #[cfg(test)]
+                    admission_fault(AdmissionFault::DirectoryOpen)?;
+                    // Move each acquired handle into the retained owner before
+                    // any further fallible work, including handle duplication.
+                    self.cleanup.as_mut().unwrap().directory = Some(owned_directory(&path)?);
+                    let cleanup = self.cleanup.as_ref().unwrap();
+                    #[cfg(test)]
+                    admission_fault(AdmissionFault::DirectoryClone)?;
+                    let directory = cleanup.directory.as_ref().unwrap().try_clone()?;
+                    #[cfg(test)]
+                    admission_fault(AdmissionFault::ParentClone)?;
+                    let parent_directory = cleanup.parent_directory.try_clone()?;
                     let parent_lock = create(&path.join(Artifact::ParentLock.name()), b"")?;
                     parent_lock
                         .try_lock_exclusive()
@@ -542,9 +558,15 @@ impl Owner {
                 && cleanup.root == request.root,
             "export stage cleanup binding mismatch"
         );
+        let directory = cleanup
+            .directory
+            .as_ref()
+            .context("export stage admission directory identity was not captured")?;
+        #[cfg(test)]
+        admission_fault(AdmissionFault::Cleanup)?;
         remove_closed(
             &cleanup.path,
-            &cleanup.directory,
+            directory,
             &cleanup.parent_directory,
             &mut cleanup.removed,
         )?;
@@ -558,7 +580,9 @@ struct Cleanup {
     root: RootCapability,
     binding: Binding,
     path: PathBuf,
-    directory: File,
+    // None is retained uncertainty, never evidence that mkdir had no effect.
+    // This inline state is included in Owner's measured capacity layout.
+    directory: Option<File>,
     parent_directory: File,
     locks: Vec<File>,
     removed: bool,
@@ -876,6 +900,8 @@ fn remove_closed(path: &Path, directory: &File, parent: &File, removed: &mut boo
         delete_held(directory)?;
         *removed = true;
     }
+    #[cfg(test)]
+    admission_fault(AdmissionFault::CleanupSync)?;
     // A failed durability barrier retries on the retained parent, never on a
     // newly created path. The closed stage no longer names any mutable files.
     #[cfg(unix)]
@@ -884,6 +910,33 @@ fn remove_closed(path: &Path, directory: &File, parent: &File, removed: &mut boo
     sync_directory(parent_path)?;
     let _ = parent_path;
     Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionFault {
+    DirectoryOpen,
+    DirectoryClone,
+    ParentClone,
+    Cleanup,
+    CleanupSync,
+}
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_FAULTS: std::cell::RefCell<Vec<AdmissionFault>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+#[cfg(test)]
+fn admission_fault(point: AdmissionFault) -> Result<()> {
+    ADMISSION_FAULTS.with(|faults| {
+        let mut faults = faults.borrow_mut();
+        if faults.first() == Some(&point) {
+            faults.remove(0);
+            anyhow::bail!("injected export admission {point:?}");
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1089,6 +1142,338 @@ mod tests {
             &AtomicBool::new(false),
         )?;
         Ok((stage, binding))
+    }
+
+    struct InjectAdmissionFaults;
+    impl Drop for InjectAdmissionFaults {
+        fn drop(&mut self) {
+            ADMISSION_FAULTS.with(|faults| faults.borrow_mut().clear());
+        }
+    }
+    fn inject_admission_faults(points: &[AdmissionFault]) -> InjectAdmissionFaults {
+        ADMISSION_FAULTS.with(|faults| {
+            assert!(faults.borrow().is_empty());
+            faults.borrow_mut().extend_from_slice(points);
+        });
+        InjectAdmissionFaults
+    }
+    fn admission_request(f: &Fixture) -> Result<Request> {
+        let work = work(f._temp.path(), None, None)?;
+        Ok(request(
+            &f.root,
+            &LeaseId::new(),
+            1,
+            false,
+            &Binding::from_work(&work),
+            Action::Begin {
+                work: Box::new(work),
+                limits: limits(),
+            },
+        ))
+    }
+    fn admission_failure(owner: &mut Owner, f: &Fixture, request: &Request) -> Result<Failure> {
+        let failure = owner
+            .call(&f.manifest, request, &AtomicBool::new(false))
+            .unwrap_err()
+            .downcast::<Failure>()?;
+        let receipt = failure.object_receipt.as_ref().context("failure receipt")?;
+        assert_eq!(receipt.operation, request.operation);
+        assert_eq!(receipt.request_digest, request.digest()?);
+        Ok(failure)
+    }
+    fn admission_cleanup(begin: &Request, operation: u64, action: Action) -> Request {
+        Request {
+            operation: U64(operation),
+            action,
+            ..begin.clone()
+        }
+    }
+
+    #[test]
+    fn admission_handle_clone_failures_reject_only_after_verified_cleanup() -> Result<()> {
+        for point in [AdmissionFault::DirectoryClone, AdmissionFault::ParentClone] {
+            let f = fixture()?;
+            let begin = admission_request(&f)?;
+            let path = f
+                .manifest
+                .join("export-workers")
+                .join(format!("photo-worker-{}", begin.stage.as_str()));
+            let mut owner = Owner::default();
+            let _faults = inject_admission_faults(&[point]);
+            let failed = admission_failure(&mut owner, &f, &begin)?;
+            assert_eq!(failed.kind, FailureKind::Rejected);
+            assert!(owner.empty());
+            assert!(!path.exists());
+            let replay = admission_failure(&mut owner, &f, &begin)?;
+            assert_eq!(serde_json::to_vec(&failed)?, serde_json::to_vec(&replay)?);
+            assert!(!path.exists(), "replay must not repeat admission");
+            let mut next = begin.clone();
+            next.stage = LeaseId::new();
+            owner.call(&f.manifest, &next, &AtomicBool::new(false))?;
+            owner.call(
+                &f.manifest,
+                &admission_cleanup(&next, 2, Action::Abort),
+                &AtomicBool::new(true),
+            )?;
+            assert!(owner.empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admission_uncaptured_directory_identity_stays_unknown_without_path_adoption() -> Result<()> {
+        let f = fixture()?;
+        let begin = admission_request(&f)?;
+        let mut owner = Owner::default();
+        let _faults = inject_admission_faults(&[AdmissionFault::DirectoryOpen]);
+        let failed = admission_failure(&mut owner, &f, &begin)?;
+        assert_eq!(failed.kind, FailureKind::Unknown);
+        assert!(!owner.empty());
+        let cleanup = owner.cleanup.as_ref().unwrap();
+        assert!(cleanup.directory.is_none());
+        let path = cleanup.path.clone();
+        assert!(
+            path.is_dir(),
+            "mkdir succeeded before directory acquisition failed"
+        );
+        let replay = admission_failure(&mut owner, &f, &begin)?;
+        assert_eq!(serde_json::to_vec(&failed)?, serde_json::to_vec(&replay)?);
+        let mut foreign = begin.clone();
+        foreign.root.token = LeaseId::new();
+        assert!(
+            owner
+                .call(&f.manifest, &foreign, &AtomicBool::new(false))
+                .is_err()
+        );
+        let mut altered = begin.clone();
+        altered.action = Action::Abort;
+        assert!(
+            owner
+                .call(&f.manifest, &altered, &AtomicBool::new(false))
+                .is_err()
+        );
+        // Even an empty or absent pathname does not identify the mkdir result.
+        fs::remove_dir(&path)?;
+        let abort = admission_cleanup(&begin, 2, Action::Abort);
+        assert_eq!(
+            admission_failure(&mut owner, &f, &abort)?.kind,
+            FailureKind::Unknown
+        );
+        assert!(!owner.empty());
+        fs::create_dir(&path)?;
+        create(&path.join("output"), b"foreign")?;
+        let release = admission_cleanup(&begin, 3, Action::Release);
+        assert_eq!(
+            admission_failure(&mut owner, &f, &release)?.kind,
+            FailureKind::Unknown
+        );
+        assert_eq!(fs::read(path.join("output"))?, b"foreign");
+        assert!(!owner.empty());
+        let retry = admission_cleanup(&begin, 4, begin.action.clone());
+        assert_eq!(
+            admission_failure(&mut owner, &f, &retry)?.kind,
+            FailureKind::Unknown
+        );
+        assert_eq!(fs::read(path.join("output"))?, b"foreign");
+        Ok(())
+    }
+
+    #[test]
+    fn admission_cleanup_failure_retains_exact_owner_for_abort_and_release_retry() -> Result<()> {
+        for (point, action) in [
+            (AdmissionFault::DirectoryClone, Action::Abort),
+            (AdmissionFault::ParentClone, Action::Release),
+        ] {
+            let f = fixture()?;
+            let begin = admission_request(&f)?;
+            let mut owner = Owner::default();
+            let _faults = inject_admission_faults(&[point, AdmissionFault::Cleanup]);
+            let failed = admission_failure(&mut owner, &f, &begin)?;
+            assert_eq!(failed.kind, FailureKind::Unknown);
+            assert!(!owner.empty());
+            let cleanup = owner.cleanup.as_ref().unwrap();
+            let path = cleanup.path.clone();
+            verify_directory(
+                &path,
+                cleanup.directory.as_ref().unwrap(),
+                &cleanup.parent_directory,
+            )?;
+            let replay = admission_failure(&mut owner, &f, &begin)?;
+            assert_eq!(serde_json::to_vec(&failed)?, serde_json::to_vec(&replay)?);
+            assert!(path.is_dir());
+            let cleanup_request = admission_cleanup(&begin, 2, action);
+            let cleaned = owner.call(&f.manifest, &cleanup_request, &AtomicBool::new(true))?;
+            assert!(owner.empty());
+            assert!(!path.exists());
+            let replay = owner.call(&f.manifest, &cleanup_request, &AtomicBool::new(true))?;
+            assert_eq!(serde_json::to_vec(&cleaned)?, serde_json::to_vec(&replay)?);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_captured_identity_refuses_replacement_and_recovers_only_original() -> Result<()> {
+        let f = fixture()?;
+        let begin = admission_request(&f)?;
+        let mut owner = Owner::default();
+        let _faults =
+            inject_admission_faults(&[AdmissionFault::ParentClone, AdmissionFault::Cleanup]);
+        assert_eq!(
+            admission_failure(&mut owner, &f, &begin)?.kind,
+            FailureKind::Unknown
+        );
+        let path = owner.cleanup.as_ref().unwrap().path.clone();
+        let moved = path.with_extension("owned");
+        fs::rename(&path, &moved)?;
+        fs::create_dir(&path)?;
+        create(&path.join("output"), b"replacement")?;
+        let abort = admission_cleanup(&begin, 2, Action::Abort);
+        assert_eq!(
+            admission_failure(&mut owner, &f, &abort)?.kind,
+            FailureKind::Unknown
+        );
+        assert_eq!(fs::read(path.join("output"))?, b"replacement");
+        assert!(moved.is_dir());
+        assert!(!owner.empty());
+        fs::remove_file(path.join("output"))?;
+        fs::remove_dir(&path)?;
+        let victim = f._temp.path().join("victim");
+        fs::create_dir(&victim)?;
+        create(&victim.join("output"), b"victim")?;
+        std::os::unix::fs::symlink(&victim, &path)?;
+        let release = admission_cleanup(&begin, 3, Action::Release);
+        assert_eq!(
+            admission_failure(&mut owner, &f, &release)?.kind,
+            FailureKind::Unknown
+        );
+        assert_eq!(fs::read(victim.join("output"))?, b"victim");
+        fs::remove_file(&path)?;
+        fs::rename(&moved, &path)?;
+        owner.call(
+            &f.manifest,
+            &admission_cleanup(&begin, 4, Action::Abort),
+            &AtomicBool::new(true),
+        )?;
+        assert!(owner.empty());
+        assert!(!path.exists());
+        assert_eq!(fs::read(victim.join("output"))?, b"victim");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_cleanup_sync_retry_never_touches_a_reused_path() -> Result<()> {
+        let f = fixture()?;
+        let begin = admission_request(&f)?;
+        let mut owner = Owner::default();
+        let _faults =
+            inject_admission_faults(&[AdmissionFault::DirectoryClone, AdmissionFault::CleanupSync]);
+        let failed = admission_failure(&mut owner, &f, &begin)?;
+        assert_eq!(failed.kind, FailureKind::Unknown);
+        let cleanup = owner.cleanup.as_ref().unwrap();
+        assert!(cleanup.removed);
+        let path = cleanup.path.clone();
+        assert!(!path.exists());
+        assert!(!owner.empty());
+        fs::create_dir(&path)?;
+        create(&path.join("output"), b"replacement after removal")?;
+        let replay = admission_failure(&mut owner, &f, &begin)?;
+        assert_eq!(serde_json::to_vec(&failed)?, serde_json::to_vec(&replay)?);
+        owner.call(
+            &f.manifest,
+            &admission_cleanup(&begin, 2, Action::Release),
+            &AtomicBool::new(true),
+        )?;
+        assert!(owner.empty());
+        assert_eq!(fs::read(path.join("output"))?, b"replacement after removal");
+        Ok(())
+    }
+
+    #[test]
+    fn admission_uncertainty_blocks_actual_root_release_until_exact_cleanup() -> Result<()> {
+        use super::super::bootstrap::BootstrapOwner;
+        use crate::catalog_session::{
+            BootstrapMode, ConfirmSqlAdmission, PrepareCatalog, SQL_ROLES, SqlRole,
+            SqlRoleObservation,
+        };
+        for point in [AdmissionFault::DirectoryOpen, AdmissionFault::ParentClone] {
+            let temp = tempfile::tempdir()?;
+            let base = temp.path().canonicalize()?;
+            let mut root_owner = BootstrapOwner::new(LeaseId::new(), vec![]);
+            let cancel = AtomicBool::new(false);
+            let bootstrap = root_owner.prepare(
+                &PrepareCatalog {
+                    operation: U64(1),
+                    session: LeaseId::new(),
+                    mode: BootstrapMode::DesktopCreate,
+                    root: NativePath::from_path(&base.join("catalog")),
+                    manifest_root: NativePath::from_path(&base.join("manifest")),
+                    import_source: None,
+                },
+                &cancel,
+                |_| Ok(()),
+            )?;
+            let root = bootstrap.root_capability();
+            root_owner.confirm(
+                &ConfirmSqlAdmission {
+                    operation: bootstrap.operation,
+                    root: root.clone(),
+                    roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                        role,
+                        physical: if role == SqlRole::Manifest {
+                            bootstrap.manifest.physical
+                        } else {
+                            bootstrap.catalog.physical
+                        },
+                    }),
+                },
+                &cancel,
+            )?;
+            let w = work(&base, None, None)?;
+            let begin = request(
+                &root,
+                &LeaseId::new(),
+                1,
+                false,
+                &Binding::from_work(&w),
+                Action::Begin {
+                    work: Box::new(w),
+                    limits: limits(),
+                },
+            );
+            let points = if point == AdmissionFault::DirectoryOpen {
+                vec![point]
+            } else {
+                vec![point, AdmissionFault::Cleanup]
+            };
+            let _faults = inject_admission_faults(&points);
+            let failed = root_owner
+                .export_stage_call(&begin, &cancel)
+                .unwrap_err()
+                .downcast::<Failure>()?;
+            assert_eq!(failed.kind, FailureKind::Unknown);
+            assert!(
+                root_owner
+                    .release(&root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("export stage/native/seal owner has not drained")
+            );
+            let cleanup = admission_cleanup(&begin, 2, Action::Abort);
+            if point == AdmissionFault::DirectoryOpen {
+                let failed = root_owner
+                    .export_stage_call(&cleanup, &cancel)
+                    .unwrap_err()
+                    .downcast::<Failure>()?;
+                assert_eq!(failed.kind, FailureKind::Unknown);
+                assert!(root_owner.release(&root).is_err());
+            } else {
+                root_owner.export_stage_call(&cleanup, &cancel)?;
+                root_owner.release(&root)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
