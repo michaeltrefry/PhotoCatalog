@@ -161,13 +161,13 @@ impl CaptureSource {
         db.pragma_update(None, "query_only", true)?;
         db.pragma_update(None, "temp_store", "MEMORY")?;
         db.busy_timeout(Duration::ZERO)?;
-        guard.verify()?;
-        no_companions(&path)?;
-        guard.lock(0x4000_0000, 512)?;
-        guard.verify()?;
-        no_companions(&path)?;
-        crate::catalog_storage::verify_database_object(&db, &guard.file)?;
-        let initial_data_version = db.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        let roster =
+            crate::lightroom_migration_worker::closed_roster::ClosedImmutableRoster::finish(
+                db,
+                guard,
+                || no_companions(&path),
+            )?;
+        let (db, guard, initial_data_version) = roster.into_parts();
         let deadline = Instant::now() + Duration::from_millis(authority.limits.total_deadline_ms.0);
         let progress_cancel = cancel.clone();
         let progress_deadline = deadline;

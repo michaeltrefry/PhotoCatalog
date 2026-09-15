@@ -96,7 +96,8 @@ pub struct SelectedCapture {
 }
 
 /// These are per-operation bounds, not a claim about total import work.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadLimits {
     pub page_bytes: usize,
     pub inline_bytes: usize,

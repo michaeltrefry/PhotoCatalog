@@ -445,7 +445,7 @@ impl Coordinator {
                 limits: limits.try_into()?,
             };
             let w = if let Some(managed) = &self.managed {
-                lw::Workbench::spawn_managed(config, managed.clone())?
+                lw::Workbench::spawn_managed(config, managed)?
             } else {
                 lw::Workbench::spawn(config)?
             };

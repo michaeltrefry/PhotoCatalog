@@ -34,6 +34,7 @@ pub fn build_identity() -> String {
             include_str!("../lightroom/plan/desktop.rs"),
             include_str!("../lightroom/plan/selection.rs"),
             include_str!("../lightroom/plan/selection/snapshot.rs"),
+            include_str!("../lightroom/migration_source.rs"),
             include_str!("../lightroom/migration_source/reader.rs"),
             include_str!("../../Cargo.lock")
         )
@@ -105,6 +106,11 @@ enum CallbackRequest {
     },
     SourceOpen {
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    },
+    SourceSqlOpen {
+        seal: crate::lightroom::migration_source::InputSeal,
+        limits: crate::lightroom::migration_source::ReadLimits,
+        protected: Vec<crate::lightroom_migration_worker::identity::FileKey>,
     },
     SourceSchema {
         source: String,
@@ -420,6 +426,25 @@ impl super::lightroom::ManagedIo for CallbackProxy {
             _ => anyhow::bail!("Workbench source-open callback result kind"),
         }
     }
+    fn source_sql_open(
+        &self,
+        seal: crate::lightroom::migration_source::InputSeal,
+        limits: crate::lightroom::migration_source::ReadLimits,
+        protected: Vec<crate::lightroom_migration_worker::identity::FileKey>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String> {
+        match self.call(
+            CallbackRequest::SourceSqlOpen {
+                seal,
+                limits,
+                protected,
+            },
+            &cancel,
+        )? {
+            CallbackValue::Source(value) => Ok(value),
+            _ => anyhow::bail!("Workbench SQL13 source-open callback result kind"),
+        }
+    }
     fn source_schema(
         &self,
         source: &str,
@@ -478,6 +503,12 @@ impl super::lightroom::ManagedIo for CallbackProxy {
             CallbackValue::Retired => Ok(()),
             _ => anyhow::bail!("Workbench source-retire callback result kind"),
         }
+    }
+    fn drain(&self) -> Result<()> {
+        // This is W's callback proxy, not the G owner. W explicitly retires
+        // every token before terminal acknowledgement; G invokes drain on its
+        // concrete owner after W exits or is revoked.
+        Ok(())
     }
 }
 
@@ -615,9 +646,11 @@ impl Client {
     }
     pub(crate) fn spawn_managed(
         executable: &Path,
-        managed: Arc<dyn super::lightroom::ManagedIo>,
+        managed: &Arc<dyn super::lightroom::ManagedIo>,
     ) -> Result<Self> {
-        Self::spawn_inner(executable, Some(managed))
+        // The caller retains the authoritative owner if W startup fails and
+        // can explicitly drain/retry it; an app-setup error cannot consume F/S.
+        Self::spawn_inner(executable, Some(managed.clone()))
     }
     fn spawn_inner(
         executable: &Path,
@@ -676,6 +709,16 @@ impl Client {
             CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source(
                 managed.source_open(authority, Arc::new(cancel))?,
             )),
+            CallbackRequest::SourceSqlOpen {
+                seal,
+                limits,
+                protected,
+            } => Ok(CallbackValue::Source(managed.source_sql_open(
+                seal,
+                limits,
+                protected,
+                Arc::new(cancel),
+            )?)),
             CallbackRequest::SourceSchema { source } => {
                 Ok(CallbackValue::Schema(managed.source_schema(&source)?))
             }
@@ -825,16 +868,28 @@ impl Client {
                 .wait()?;
             ensure!(status.success(), "Workbench child exited {status}");
             owner.child.take();
+            if let Some(managed) = &self.managed {
+                managed
+                    .drain()
+                    .context("managed Workbench dependents did not drain")?;
+            }
             owner.drained = true;
             Ok(())
         })();
         match result {
             Ok(()) => Ok(()),
             Err(primary) => {
-                match owner.revoke() {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => Err(primary
+                let revoke = owner.revoke();
+                let dependents = self.managed.as_ref().map(|managed| managed.drain());
+                match (revoke, dependents) {
+                    (Ok(()), None | Some(Ok(()))) => Err(primary),
+                    (Err(cleanup), None | Some(Ok(()))) => Err(primary
                         .context(format!("Workbench checked revoke also failed: {cleanup:#}"))),
+                    (Ok(()), Some(Err(cleanup))) => Err(primary
+                        .context(format!("Workbench dependent drain also failed: {cleanup:#}"))),
+                    (Err(revoke), Some(Err(dependents))) => Err(primary.context(format!(
+                        "Workbench revoke failed: {revoke:#}; dependent drain failed: {dependents:#}"
+                    ))),
                 }
             }
         }

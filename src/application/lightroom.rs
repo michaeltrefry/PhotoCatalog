@@ -31,6 +31,13 @@ pub(crate) trait ManagedIo: Send + Sync + 'static {
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
         cancel: Arc<AtomicBool>,
     ) -> Result<String>;
+    fn source_sql_open(
+        &self,
+        seal: crate::lightroom::migration_source::InputSeal,
+        limits: crate::lightroom::migration_source::ReadLimits,
+        protected: Vec<crate::lightroom_migration_worker::identity::FileKey>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String>;
     fn source_schema(
         &self,
         source: &str,
@@ -47,6 +54,10 @@ pub(crate) trait ManagedIo: Send + Sync + 'static {
         source: &str,
     ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::Current>;
     fn source_retire(&self, source: &str) -> Result<()>;
+    /// G-owned terminal gate. Implementations revoke and checked-reap every S
+    /// generation and reconcile retained F resources for this W owner. It does
+    /// not stop the shared F process, which application shutdown drains last.
+    fn drain(&self) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -497,8 +508,8 @@ impl Workbench {
     pub fn spawn(config: Config) -> Result<Self> {
         Self::spawn_inner(config, || {}, None)
     }
-    pub(crate) fn spawn_managed(config: Config, io: Arc<dyn ManagedIo>) -> Result<Self> {
-        Self::spawn_inner(config, || {}, Some(io))
+    pub(crate) fn spawn_managed(config: Config, io: &Arc<dyn ManagedIo>) -> Result<Self> {
+        Self::spawn_inner(config, || {}, Some(io.clone()))
     }
     #[cfg(test)]
     pub(crate) fn spawn_held(

@@ -532,6 +532,73 @@ pub enum LightroomWorkbenchIo {
         generation: String,
         token: String,
     },
+    SealBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        output: NativePath,
+        approval_bytes: U64,
+        approval_blake3: String,
+        review_bytes: U64,
+        review_blake3: String,
+    },
+    SealChunk {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        document: LightroomWorkbenchSealDocument,
+        offset: U64,
+        bytes: Vec<u8>,
+    },
+    SealStage {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    SealSyncHash {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        maximum_bytes: U64,
+    },
+    SealPublishBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        bytes: U64,
+        blake3: String,
+    },
+    SealPublish {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    SealStatus {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    SealAbort {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightroomWorkbenchSealDocument {
+    Approval,
+    Review,
+    Seal,
 }
 impl LightroomWorkbenchIo {
     fn ids(&self) -> [&str; 3] {
@@ -614,6 +681,54 @@ impl LightroomWorkbenchIo {
                 workbench,
                 generation,
                 ..
+            }
+            | Self::SealBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealChunk {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealStage {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealSyncHash {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealPublishBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealPublish {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealStatus {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealAbort {
+                operation,
+                workbench,
+                generation,
+                ..
             } => [operation, workbench, generation],
         }
     }
@@ -679,6 +794,65 @@ impl LightroomWorkbenchIo {
                 !token.is_empty() && token.len() <= 128 && (1..=16 * 1024).contains(&limit.0),
                 "original inspection page"
             ),
+            Self::SealBegin {
+                token,
+                output,
+                approval_bytes,
+                approval_blake3,
+                review_bytes,
+                review_blake3,
+                ..
+            } => {
+                validate_path(output)?;
+                ensure!(
+                    !token.is_empty()
+                        && token.len() <= 128
+                        && approval_bytes.0 > 0
+                        && approval_bytes.0 <= crate::lightroom::MANIFEST_BYTES as u64
+                        && review_bytes.0 > 0
+                        && review_bytes.0 <= 256 * 1024 * 1024
+                        && approval_blake3.len() == 64
+                        && review_blake3.len() == 64,
+                    "seal staging admission"
+                );
+            }
+            Self::SealChunk { token, bytes, .. } => ensure!(
+                !token.is_empty()
+                    && token.len() <= 128
+                    && !bytes.is_empty()
+                    && bytes.len() <= CHUNK_BYTES,
+                "seal document chunk admission"
+            ),
+            Self::SealStage { token, .. }
+            | Self::SealPublish { token, .. }
+            | Self::SealStatus { token, .. }
+            | Self::SealAbort { token, .. } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal token")
+            }
+            Self::SealSyncHash {
+                token,
+                maximum_bytes,
+                ..
+            } => ensure!(
+                !token.is_empty()
+                    && token.len() <= 128
+                    && maximum_bytes.0 > 0
+                    && maximum_bytes.0 <= i64::MAX as u64,
+                "seal hash admission"
+            ),
+            Self::SealPublishBegin {
+                token,
+                bytes,
+                blake3,
+                ..
+            } => ensure!(
+                !token.is_empty()
+                    && token.len() <= 128
+                    && bytes.0 > 0
+                    && bytes.0 <= crate::lightroom::MANIFEST_BYTES as u64
+                    && blake3.len() == 64,
+                "seal publication admission"
+            ),
             _ => {}
         }
         Ok(())
@@ -691,6 +865,7 @@ impl LightroomWorkbenchIo {
                 | Self::CaptureRetire { .. }
                 | Self::EvidenceRelease { .. }
                 | Self::OriginalRelease { .. }
+                | Self::SealAbort { .. }
         )
     }
 }
@@ -734,9 +909,50 @@ pub enum LightroomWorkbenchIoReply {
         offset: U64,
         bytes: Vec<u8>,
     },
+    SealUpload {
+        operation: String,
+        token: String,
+        document: LightroomWorkbenchSealDocument,
+        offset: U64,
+    },
+    SealStaged {
+        operation: String,
+        token: String,
+        directory: NativePath,
+        database: NativePath,
+        physical: crate::lightroom_migration_worker::identity::FileKey,
+    },
+    SealHashed {
+        operation: String,
+        token: String,
+        identity: crate::lightroom::source::Revision,
+        blake3: String,
+        directory: NativePath,
+        database: NativePath,
+    },
+    SealState {
+        operation: String,
+        token: String,
+        state: LightroomWorkbenchSealState,
+        directory: NativePath,
+        seal_path: NativePath,
+        approval_path: NativePath,
+        seal_blake3: Option<String>,
+    },
     Released {
         operation: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightroomWorkbenchSealState {
+    Staging,
+    Staged,
+    Hashed,
+    PublishReady,
+    Published,
+    Aborted,
 }
 impl LightroomWorkbenchIoReply {
     pub fn validate_for(&self, request: &LightroomWorkbenchIo) -> Result<()> {
@@ -824,6 +1040,68 @@ impl LightroomWorkbenchIoReply {
                 );
                 operation
             }
+            Self::SealUpload {
+                operation,
+                token,
+                offset,
+                ..
+            } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal upload token");
+                ensure!(offset.0 <= 256 * 1024 * 1024, "seal upload offset");
+                operation
+            }
+            Self::SealStaged {
+                operation,
+                token,
+                directory,
+                database,
+                physical,
+            } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal stage token");
+                validate_path(directory)?;
+                validate_path(database)?;
+                ensure!(
+                    physical.volume.0 != 0 || physical.index.0 != 0,
+                    "seal database identity"
+                );
+                operation
+            }
+            Self::SealHashed {
+                operation,
+                token,
+                identity,
+                blake3,
+                directory,
+                database,
+            } => {
+                ensure!(
+                    !token.is_empty() && token.len() <= 128 && blake3.len() == 64,
+                    "seal hash reply"
+                );
+                ensure!(identity.bytes > 0, "sealed database is empty");
+                validate_path(directory)?;
+                validate_path(database)?;
+                operation
+            }
+            Self::SealState {
+                operation,
+                token,
+                directory,
+                seal_path,
+                approval_path,
+                seal_blake3,
+                ..
+            } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal state token");
+                validate_path(directory)?;
+                validate_path(seal_path)?;
+                validate_path(approval_path)?;
+                ensure!(
+                    seal_blake3.as_ref().is_none_or(|v| v.len() == 64),
+                    "seal state digest"
+                );
+                operation
+            }
             Self::Released { operation } => operation,
         };
         ensure!(actual == requested, "Workbench F reply operation differs");
@@ -858,6 +1136,78 @@ impl LightroomWorkbenchIoReply {
             | (LightroomWorkbenchIo::OriginalPage { .. }, _)
             | (LightroomWorkbenchIo::OriginalRelease { .. }, _) => {
                 anyhow::bail!("original reply kind differs")
+            }
+            (
+                LightroomWorkbenchIo::SealChunk {
+                    token,
+                    document,
+                    offset,
+                    bytes,
+                    ..
+                },
+                LightroomWorkbenchIoReply::SealUpload {
+                    token: actual,
+                    document: actual_document,
+                    offset: next,
+                    ..
+                },
+            ) => ensure!(
+                token == actual
+                    && document == actual_document
+                    && next.0 == offset.0 + bytes.len() as u64,
+                "seal upload acknowledgement differs"
+            ),
+            (
+                LightroomWorkbenchIo::SealBegin { token, .. },
+                LightroomWorkbenchIoReply::SealUpload {
+                    token: actual,
+                    document,
+                    offset,
+                    ..
+                },
+            ) => ensure!(
+                token == actual
+                    && *document == LightroomWorkbenchSealDocument::Approval
+                    && offset.0 == 0,
+                "seal initial upload acknowledgement differs"
+            ),
+            (
+                LightroomWorkbenchIo::SealPublishBegin { token, .. },
+                LightroomWorkbenchIoReply::SealUpload {
+                    token: actual,
+                    document,
+                    offset,
+                    ..
+                },
+            ) => ensure!(
+                token == actual
+                    && *document == LightroomWorkbenchSealDocument::Seal
+                    && offset.0 == 0,
+                "seal publication upload acknowledgement differs"
+            ),
+            (
+                LightroomWorkbenchIo::SealStage { token, .. },
+                LightroomWorkbenchIoReply::SealStaged { token: actual, .. },
+            )
+            | (
+                LightroomWorkbenchIo::SealSyncHash { token, .. },
+                LightroomWorkbenchIoReply::SealHashed { token: actual, .. },
+            )
+            | (
+                LightroomWorkbenchIo::SealPublish { token, .. }
+                | LightroomWorkbenchIo::SealStatus { token, .. }
+                | LightroomWorkbenchIo::SealAbort { token, .. },
+                LightroomWorkbenchIoReply::SealState { token: actual, .. },
+            ) => ensure!(token == actual, "seal reply token differs"),
+            (LightroomWorkbenchIo::SealBegin { .. }, _)
+            | (LightroomWorkbenchIo::SealChunk { .. }, _)
+            | (LightroomWorkbenchIo::SealStage { .. }, _)
+            | (LightroomWorkbenchIo::SealSyncHash { .. }, _)
+            | (LightroomWorkbenchIo::SealPublishBegin { .. }, _)
+            | (LightroomWorkbenchIo::SealPublish { .. }, _)
+            | (LightroomWorkbenchIo::SealStatus { .. }, _)
+            | (LightroomWorkbenchIo::SealAbort { .. }, _) => {
+                anyhow::bail!("seal reply kind differs")
             }
             _ => {}
         }
@@ -1501,6 +1851,41 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn seal_chunk(bytes: Vec<u8>) -> LightroomWorkbenchIo {
+        LightroomWorkbenchIo::SealChunk {
+            operation: "operation".into(),
+            workbench: "workbench".into(),
+            generation: "generation".into(),
+            token: "token".into(),
+            document: LightroomWorkbenchSealDocument::Review,
+            offset: U64(0),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn workbench_seal_documents_are_chunk_framed_and_exactly_acknowledged() -> Result<()> {
+        let request = seal_chunk(vec![0xa5; CHUNK_BYTES]);
+        request.validate()?;
+        let encoded = encode_operation(&Operation::LightroomWorkbenchIo(request.clone()))?;
+        assert!(encoded.len() < MESSAGE_BYTES);
+        let reply = LightroomWorkbenchIoReply::SealUpload {
+            operation: "operation".into(),
+            token: "token".into(),
+            document: LightroomWorkbenchSealDocument::Review,
+            offset: U64(CHUNK_BYTES as u64),
+        };
+        reply.validate_for(&request)?;
+
+        assert!(seal_chunk(vec![0; CHUNK_BYTES + 1]).validate().is_err());
+        let mut wrong = reply;
+        if let LightroomWorkbenchIoReply::SealUpload { offset, .. } = &mut wrong {
+            *offset = U64(1);
+        }
+        assert!(wrong.validate_for(&request).is_err());
+        Ok(())
+    }
+
     #[test]
     fn import_outcome_uses_one_exact_16k_binary_trailer() -> Result<()> {
         use crate::catalog_session::{PhysicalObjectId, import as i};

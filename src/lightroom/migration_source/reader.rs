@@ -472,6 +472,7 @@ impl MigrationSource {
         let _capacity_open = crate::capacity_probes::phase(crate::capacity_probes::OPEN_AUTHORITY);
         limits.validate()?;
         seal.validate()?;
+        let closed_roster = protected.is_some();
         if let Some(protected) = protected {
             ensure!(
                 protected.len() <= 4096,
@@ -574,7 +575,10 @@ impl MigrationSource {
         } else {
             None
         };
-        guard.lock(0x4000_0000, 512)?;
+        if !closed_roster {
+            // Preserve the historical synchronous CLI lock/hash ordering.
+            guard.lock(0x4000_0000, 512)?;
+        }
         let deadline = Instant::now() + Duration::from_millis(limits.open_deadline_ms);
         guard.file.seek(SeekFrom::Start(0))?;
         let mut left = guard.before.bytes;
@@ -600,11 +604,15 @@ impl MigrationSource {
         );
         guard.verify()?;
         verify_companions()?;
-        let db = if let Some(db) = admitted {
-            // Re-identify the already-open descriptor; never reopen after lock.
-            crate::catalog_storage::verify_database_object(&db, &guard.file)
-                .context("locked sealed inspection opened object")?;
-            db
+        let (db, guard) = if let Some(db) = admitted {
+            let roster =
+                crate::lightroom_migration_worker::closed_roster::ClosedImmutableRoster::finish(
+                    db,
+                    guard,
+                    verify_companions,
+                )?;
+            let (db, guard, _) = roster.into_parts();
+            (db, guard)
         } else {
             // Keep the historical synchronous CLI ordering unchanged.
             let db = open.take().expect("one legacy sealed SQL opener")(&path, None)?;
@@ -612,7 +620,7 @@ impl MigrationSource {
                 .context("sealed inspection opened object")?;
             db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
             db.busy_timeout(Duration::ZERO)?;
-            db
+            (db, guard)
         };
         let namespace = seal.binding_blake3()?;
         let value = Self {

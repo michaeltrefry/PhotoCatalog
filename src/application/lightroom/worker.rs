@@ -5,7 +5,10 @@ use crate::lightroom::{
     plan::{Plan, desktop::InspectionPin},
 };
 use crate::{
-    filesystem_worker::wire::{LightroomWorkbenchIo, LightroomWorkbenchIoReply},
+    filesystem_worker::wire::{
+        LightroomWorkbenchIo, LightroomWorkbenchIoReply, LightroomWorkbenchSealDocument,
+        LightroomWorkbenchSealState,
+    },
     lightroom_migration_worker::{
         identity::FileKey,
         source_reader::capture_wire::{self, TableValue},
@@ -139,8 +142,21 @@ pub(super) fn run(
                         workbench: opening_workbench,
                         generation: initial_generation.clone(),
                     };
-                    return match io.filesystem(release, &AtomicBool::new(false)) {
-                        Ok(_) => Err(primary),
+                    return match io.filesystem(release.clone(), &AtomicBool::new(false)) {
+                        Ok(reply) => match reply.validate_for(&release) {
+                            Ok(())
+                                if matches!(reply, LightroomWorkbenchIoReply::Released { .. }) =>
+                            {
+                                Err(primary)
+                            }
+                            Ok(()) => {
+                                Err(primary
+                                    .context("managed root startup cleanup reply kind differs"))
+                            }
+                            Err(cleanup) => Err(primary.context(format!(
+                                "managed root startup cleanup receipt invalid: {cleanup:#}"
+                            ))),
+                        },
                         Err(cleanup) => Err(primary.context(format!(
                             "managed root startup cleanup also failed: {cleanup:#}"
                         ))),
@@ -389,6 +405,258 @@ impl Owner {
             "capture evidence release reply kind"
         );
         Ok(())
+    }
+    fn seal_upload(
+        &self,
+        operation: &str,
+        token: &str,
+        document: LightroomWorkbenchSealDocument,
+        bytes: &[u8],
+        control: &Control,
+    ) -> Result<()> {
+        let io = self.managed.as_ref().context("managed owner absent")?;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            control.check()?;
+            let end = offset
+                .checked_add(crate::filesystem_worker::wire::CHUNK_BYTES)
+                .context("seal upload offset overflow")?
+                .min(bytes.len());
+            let request = LightroomWorkbenchIo::SealChunk {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: token.into(),
+                document,
+                offset: U64(offset as u64),
+                bytes: bytes[offset..end].to_vec(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            offset = end;
+        }
+        Ok(())
+    }
+    fn seal_managed(
+        &mut self,
+        operation: &str,
+        review_token: &str,
+        approval_blake3: &str,
+        approval_json: &str,
+        output: NativePath,
+        control: &Control,
+    ) -> Result<selection::SealedSelection> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let mut review = self
+            .review
+            .take()
+            .context("prepare an explicit selection review first")?;
+        let mut retained_token = None;
+        let mut publication_started = false;
+        let result = (|| -> Result<selection::SealedSelection> {
+            let preparation = review.prepare_managed_seal(
+                review_token,
+                approval_blake3,
+                approval_json.as_bytes(),
+                output,
+                control.cancel.clone(),
+            )?;
+            let seal_token = token();
+            retained_token = Some(seal_token.clone());
+            let request = LightroomWorkbenchIo::SealBegin {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+                output: preparation.output.clone(),
+                approval_bytes: U64(preparation.approval_bytes.len() as u64),
+                approval_blake3: core::digest(&preparation.approval_bytes),
+                review_bytes: U64(preparation.review_bytes.len() as u64),
+                review_blake3: core::digest(&preparation.review_bytes),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            self.seal_upload(
+                operation,
+                &seal_token,
+                LightroomWorkbenchSealDocument::Approval,
+                &preparation.approval_bytes,
+                control,
+            )?;
+            self.seal_upload(
+                operation,
+                &seal_token,
+                LightroomWorkbenchSealDocument::Review,
+                &preparation.review_bytes,
+                control,
+            )?;
+            let request = LightroomWorkbenchIo::SealStage {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::SealStaged {
+                directory,
+                database,
+                physical,
+                ..
+            } = reply
+            else {
+                anyhow::bail!("seal stage reply kind")
+            };
+            let progress = control.processed.clone();
+            review.backup_managed(
+                review_token,
+                &database,
+                &physical,
+                control.cancel.clone(),
+                move |value| progress.store(value.completed, Ordering::Release),
+            )?;
+            let request = LightroomWorkbenchIo::SealSyncHash {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+                maximum_bytes: U64(preparation.snapshot_bytes),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::SealHashed {
+                identity,
+                blake3,
+                database,
+                ..
+            } = reply
+            else {
+                anyhow::bail!("seal hash reply kind")
+            };
+            let seal = review.managed_input_seal(&preparation, database, identity, blake3)?;
+            let remaining = self.config.limits.deadline_ms.min(120_000).max(1);
+            let limits = core::migration_source::ReadLimits {
+                open_deadline_ms: self.config.limits.deadline_ms.max(1),
+                deadline_ms: remaining,
+                vm_steps: self.config.limits.vm_steps.min(1_000_000_000),
+                ..Default::default()
+            };
+            let mut protected = vec![physical];
+            if let Some(root) = &self.root_identity {
+                protected.push(root.clone());
+            }
+            let source =
+                io.source_sql_open(seal.clone(), limits, protected, control.cancel.clone())?;
+            io.source_retire(&source)
+                .context("SQL13 source did not drain")?;
+            review.current_managed_seal(review_token)?;
+            self.verify_root(control)?;
+            let seal_bytes = core::bounded_json(&seal, core::MANIFEST_BYTES)?;
+            let seal_digest = core::digest(&seal_bytes);
+            let request = LightroomWorkbenchIo::SealPublishBegin {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+                bytes: U64(seal_bytes.len() as u64),
+                blake3: seal_digest.clone(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            self.seal_upload(
+                operation,
+                &seal_token,
+                LightroomWorkbenchSealDocument::Seal,
+                &seal_bytes,
+                control,
+            )?;
+            // Publication is the selection point. After this request begins,
+            // success wins over cancellation and an unknown reply is reconciled
+            // only with the exact status operation, never by replaying publish.
+            control.check()?;
+            let publish = LightroomWorkbenchIo::SealPublish {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+            };
+            publication_started = true;
+            let published = match io.filesystem(publish.clone(), &AtomicBool::new(false)) {
+                Ok(reply) => {
+                    reply.validate_for(&publish)?;
+                    reply
+                }
+                Err(unknown) => {
+                    let status = LightroomWorkbenchIo::SealStatus {
+                        operation: operation.into(),
+                        workbench: self.workbench.clone(),
+                        generation: self.generation.clone(),
+                        token: seal_token.clone(),
+                    };
+                    let reply = io
+                        .filesystem(status.clone(), &AtomicBool::new(false))
+                        .with_context(|| {
+                            format!("seal publication outcome unknown: {unknown:#}")
+                        })?;
+                    reply.validate_for(&status)?;
+                    reply
+                }
+            };
+            let LightroomWorkbenchIoReply::SealState {
+                state,
+                seal_path,
+                approval_path,
+                seal_blake3,
+                ..
+            } = published
+            else {
+                anyhow::bail!("seal publication reply kind")
+            };
+            ensure!(
+                state == LightroomWorkbenchSealState::Published
+                    && seal_blake3.as_deref() == Some(seal_digest.as_str()),
+                "seal publication did not reach exact published receipt"
+            );
+            Ok(selection::SealedSelection {
+                seal,
+                approval: preparation.approval.clone(),
+                approval_bytes: preparation.approval_bytes.clone(),
+                directory,
+                seal_path,
+                approval_path,
+            })
+        })();
+        let result = match (result, retained_token, publication_started) {
+            (Err(primary), Some(token), false) => {
+                let abort = LightroomWorkbenchIo::SealAbort {
+                    operation: operation.into(),
+                    workbench: self.workbench.clone(),
+                    generation: self.generation.clone(),
+                    token,
+                };
+                match io.filesystem(abort.clone(), &AtomicBool::new(false)) {
+                    Ok(reply) => {
+                        if let Err(cleanup) = reply.validate_for(&abort) {
+                            Err(primary.context(format!(
+                                "seal abort receipt validation also failed: {cleanup:#}"
+                            )))
+                        } else {
+                            Err(primary)
+                        }
+                    }
+                    Err(cleanup) => Err(primary.context(format!(
+                        "seal abort also failed and remains retained: {cleanup:#}"
+                    ))),
+                }
+            }
+            (result, _, _) => result,
+        };
+        self.review = Some(review);
+        result
     }
     fn add_capture_managed(
         &mut self,
@@ -674,11 +942,16 @@ impl Owner {
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
         if let Some(review) = self.review.take() {
-            review.close_checked()?;
+            if let Err(error) = review.close_checked() {
+                failures.push(format!("selection review close: {error:#}"));
+            }
         }
         if let Some(plan) = self.plan.take() {
-            plan.close_checked()?;
+            if let Err(error) = plan.close_checked() {
+                failures.push(format!("inspection plan close: {error:#}"));
+            }
         }
         if let Some(io) = &self.managed {
             let request = LightroomWorkbenchIo::RootRelease {
@@ -686,12 +959,19 @@ impl Owner {
                 workbench: self.workbench.clone(),
                 generation: self.generation.clone(),
             };
-            let reply = io.filesystem(request.clone(), &AtomicBool::new(false))?;
-            reply.validate_for(&request)?;
-            ensure!(
-                matches!(reply, LightroomWorkbenchIoReply::Released { .. }),
-                "Workbench root release reply kind"
-            );
+            match io.filesystem(request.clone(), &AtomicBool::new(false)) {
+                Ok(reply) => {
+                    if let Err(error) = reply.validate_for(&request) {
+                        failures.push(format!("Workbench root release receipt: {error:#}"));
+                    } else if !matches!(reply, LightroomWorkbenchIoReply::Released { .. }) {
+                        failures.push("Workbench root release reply kind".into());
+                    }
+                }
+                Err(error) => failures.push(format!("Workbench root release: {error:#}")),
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!("Workbench close failed: {}", failures.join("; "));
         }
         Ok(())
     }
@@ -956,21 +1236,33 @@ impl Owner {
                     response_bound <= limit,
                     "seal response requires a larger result_bytes budget before publication"
                 );
-                let review = self
-                    .review
-                    .as_mut()
-                    .context("prepare an explicit selection review first")?;
-                let progress = control.processed.clone();
-                let result = review.seal(
-                    &review_token,
-                    &approval_blake3,
-                    approval_json.as_bytes(),
-                    output,
-                    control.cancel.clone(),
-                    move |p| {
-                        progress.store(p.completed, Ordering::Release);
-                    },
-                )?;
+                let result = if self.managed.is_some() {
+                    let operation = self.current_operation(shared);
+                    self.seal_managed(
+                        &operation,
+                        &review_token,
+                        &approval_blake3,
+                        &approval_json,
+                        output,
+                        control,
+                    )?
+                } else {
+                    let review = self
+                        .review
+                        .as_mut()
+                        .context("prepare an explicit selection review first")?;
+                    let progress = control.processed.clone();
+                    review.seal(
+                        &review_token,
+                        &approval_blake3,
+                        approval_json.as_bytes(),
+                        output,
+                        control.cancel.clone(),
+                        move |p| {
+                            progress.store(p.completed, Ordering::Release);
+                        },
+                    )?
+                };
                 // The immutable approval bytes remain exact strings; no integer
                 // or NativePath reserialization changes approval authority.
                 encode(

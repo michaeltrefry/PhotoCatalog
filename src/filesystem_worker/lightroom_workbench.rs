@@ -1,6 +1,9 @@
 //! Filesystem-owned Workbench resources. F retains every opened object and
 //! capture child by exact W generation/operation until an explicit release.
-use super::wire::{LightroomWorkbenchIo, LightroomWorkbenchIoReply};
+use super::wire::{
+    LightroomWorkbenchIo, LightroomWorkbenchIoReply, LightroomWorkbenchSealDocument,
+    LightroomWorkbenchSealState,
+};
 use crate::{
     application::U64,
     lightroom::{
@@ -14,7 +17,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -58,16 +61,117 @@ struct Original {
     encoded: Vec<u8>,
     blake3: String,
 }
+struct Upload {
+    file: Option<fs::File>,
+    expected_bytes: u64,
+    expected_blake3: String,
+    written: u64,
+    hasher: blake3::Hasher,
+}
+struct Seal {
+    operation: String,
+    workbench: String,
+    generation: String,
+    token: String,
+    directory: NativePath,
+    database: NativePath,
+    approval_path: NativePath,
+    seal_path: NativePath,
+    approval: Upload,
+    review: Upload,
+    seal: Option<Upload>,
+    database_physical: Option<FileKey>,
+    database_identity: Option<crate::lightroom::source::Revision>,
+    database_blake3: Option<String>,
+    published_blake3: Option<String>,
+    state: LightroomWorkbenchSealState,
+}
 #[derive(Default)]
 pub(super) struct Owner {
     root: Option<Root>,
     capture: Option<Capture>,
     evidence: Option<Evidence>,
     original: Option<Original>,
+    seal: Option<Seal>,
     released_root: Option<ReleaseReceipt>,
     released_capture: Option<ReleaseReceipt>,
     released_evidence: Option<ReleaseReceipt>,
     released_original: Option<ReleaseReceipt>,
+}
+
+impl Upload {
+    fn create(path: &Path, expected_bytes: u64, expected_blake3: String) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Self {
+            file: Some(file),
+            expected_bytes,
+            expected_blake3,
+            written: 0,
+            hasher: blake3::Hasher::new(),
+        })
+    }
+    fn append(&mut self, offset: u64, bytes: &[u8]) -> Result<u64> {
+        ensure!(offset == self.written, "seal upload offset differs");
+        let next = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .filter(|v| *v <= self.expected_bytes)
+            .context("seal upload exceeds admitted length")?;
+        self.file
+            .as_mut()
+            .context("seal upload is already closed")?
+            .write_all(bytes)?;
+        self.hasher.update(bytes);
+        self.written = next;
+        Ok(next)
+    }
+    fn finish(&mut self) -> Result<()> {
+        ensure!(
+            self.written == self.expected_bytes
+                && self.hasher.finalize().to_hex().as_str() == self.expected_blake3,
+            "seal uploaded document differs"
+        );
+        self.file
+            .take()
+            .context("seal upload is already closed")?
+            .sync_all()?;
+        Ok(())
+    }
+}
+
+impl Seal {
+    fn same(&self, operation: &str, workbench: &str, generation: &str, token: &str) -> Result<()> {
+        same(
+            (&self.operation, &self.workbench, &self.generation),
+            (operation, workbench, generation),
+        )?;
+        ensure!(self.token == token, "seal token differs");
+        Ok(())
+    }
+    fn upload(&mut self, document: LightroomWorkbenchSealDocument) -> Result<&mut Upload> {
+        match document {
+            LightroomWorkbenchSealDocument::Approval => Ok(&mut self.approval),
+            LightroomWorkbenchSealDocument::Review => Ok(&mut self.review),
+            LightroomWorkbenchSealDocument::Seal => self
+                .seal
+                .as_mut()
+                .context("seal publication upload not begun"),
+        }
+    }
+    fn reply(&self) -> LightroomWorkbenchIoReply {
+        LightroomWorkbenchIoReply::SealState {
+            operation: self.operation.clone(),
+            token: self.token.clone(),
+            state: self.state,
+            directory: self.directory.clone(),
+            seal_path: self.seal_path.clone(),
+            approval_path: self.approval_path.clone(),
+            seal_blake3: self.published_blake3.clone(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -780,6 +884,303 @@ impl Owner {
                 self.released_original = Some(receipt.clone());
                 Ok(receipt.reply())
             }
+            LightroomWorkbenchIo::SealBegin {
+                operation,
+                workbench,
+                generation,
+                token,
+                output,
+                approval_bytes,
+                approval_blake3,
+                review_bytes,
+                review_blake3,
+            } => {
+                ensure!(self.seal.is_none(), "seal operation already retained");
+                canceled(cancel)?;
+                let requested = output.to_path()?;
+                ensure!(requested.is_absolute(), "seal output must be absolute");
+                let parent = requested.parent().context("seal output parent absent")?;
+                crate::lightroom::source::reject_links(parent)?;
+                fs::create_dir(&requested).context("seal output must be a new directory")?;
+                let directory = fs::canonicalize(&requested)?;
+                ensure!(
+                    fs::symlink_metadata(&directory)?.is_dir(),
+                    "seal output is not a direct directory"
+                );
+                let approval_path = directory.join("approval.json");
+                let review_path = directory.join("review.json");
+                let database = directory.join("inspection.sqlite3");
+                let seal_path = directory.join("input-seal.json");
+                let approval = Upload::create(&approval_path, approval_bytes.0, approval_blake3)?;
+                let review = Upload::create(&review_path, review_bytes.0, review_blake3)?;
+                self.seal = Some(Seal {
+                    operation: operation.clone(),
+                    workbench,
+                    generation,
+                    token: token.clone(),
+                    directory: NativePath::from_path(&directory),
+                    database: NativePath::from_path(&database),
+                    approval_path: NativePath::from_path(&approval_path),
+                    seal_path: NativePath::from_path(&seal_path),
+                    approval,
+                    review,
+                    seal: None,
+                    database_physical: None,
+                    database_identity: None,
+                    database_blake3: None,
+                    published_blake3: None,
+                    state: LightroomWorkbenchSealState::Staging,
+                });
+                Ok(LightroomWorkbenchIoReply::SealUpload {
+                    operation,
+                    token,
+                    document: LightroomWorkbenchSealDocument::Approval,
+                    offset: U64(0),
+                })
+            }
+            LightroomWorkbenchIo::SealChunk {
+                operation,
+                workbench,
+                generation,
+                token,
+                document,
+                offset,
+                bytes,
+            } => {
+                canceled(cancel)?;
+                let value = self.seal.as_mut().context("no seal operation retained")?;
+                value.same(&operation, &workbench, &generation, &token)?;
+                ensure!(
+                    match document {
+                        LightroomWorkbenchSealDocument::Seal => {
+                            value.state == LightroomWorkbenchSealState::Hashed
+                        }
+                        _ => value.state == LightroomWorkbenchSealState::Staging,
+                    },
+                    "seal upload phase differs"
+                );
+                let (next, complete) = {
+                    let upload = value.upload(document)?;
+                    let next = upload.append(offset.0, &bytes)?;
+                    (next, next == upload.expected_bytes)
+                };
+                if document == LightroomWorkbenchSealDocument::Seal && complete {
+                    value.state = LightroomWorkbenchSealState::PublishReady;
+                }
+                Ok(LightroomWorkbenchIoReply::SealUpload {
+                    operation,
+                    token,
+                    document,
+                    offset: U64(next),
+                })
+            }
+            LightroomWorkbenchIo::SealStage {
+                operation,
+                workbench,
+                generation,
+                token,
+            } => {
+                canceled(cancel)?;
+                let value = self.seal.as_mut().context("no seal operation retained")?;
+                value.same(&operation, &workbench, &generation, &token)?;
+                ensure!(
+                    value.state == LightroomWorkbenchSealState::Staging,
+                    "seal is not staging"
+                );
+                value.approval.finish()?;
+                value.review.finish()?;
+                let directory = value.directory.to_path()?;
+                let mut pending = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(directory.join("pending.json"))?;
+                serde_json::to_writer(
+                    &mut pending,
+                    &serde_json::json!({
+                        "protocol": 1,
+                        "state": "pending",
+                        "token": value.token,
+                        "approval_blake3": value.approval.expected_blake3,
+                        "review_blake3": value.review.expected_blake3,
+                        "admission": "Only the atomic final input-seal.json is completed authority"
+                    }),
+                )?;
+                pending.sync_all()?;
+                let path = value.database.to_path()?;
+                let database = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                database.sync_all()?;
+                let physical = FileKey::of(&database)?;
+                drop(database);
+                value.database_physical = Some(physical.clone());
+                value.state = LightroomWorkbenchSealState::Staged;
+                Ok(LightroomWorkbenchIoReply::SealStaged {
+                    operation,
+                    token,
+                    directory: value.directory.clone(),
+                    database: value.database.clone(),
+                    physical,
+                })
+            }
+            LightroomWorkbenchIo::SealSyncHash {
+                operation,
+                workbench,
+                generation,
+                token,
+                maximum_bytes,
+            } => {
+                canceled(cancel)?;
+                let value = self.seal.as_mut().context("no seal operation retained")?;
+                value.same(&operation, &workbench, &generation, &token)?;
+                ensure!(
+                    value.state == LightroomWorkbenchSealState::Staged,
+                    "seal destination is not staged"
+                );
+                let path = value.database.to_path()?;
+                companion_free(&path)?;
+                fs::OpenOptions::new().write(true).open(&path)?.sync_all()?;
+                let mut source = Source::open(&path, maximum_bytes.0)?;
+                ensure!(
+                    FileKey::of(&source.file)?
+                        == value
+                            .database_physical
+                            .clone()
+                            .context("seal database identity absent")?,
+                    "seal destination object changed"
+                );
+                let digest = source.copy_and_hash_controlled(None, || canceled(cancel))?;
+                source.verify()?;
+                let identity = source.before.clone();
+                drop(source);
+                value.database_identity = Some(identity.clone());
+                value.database_blake3 = Some(digest.clone());
+                value.state = LightroomWorkbenchSealState::Hashed;
+                Ok(LightroomWorkbenchIoReply::SealHashed {
+                    operation,
+                    token,
+                    identity,
+                    blake3: digest,
+                    directory: value.directory.clone(),
+                    database: value.database.clone(),
+                })
+            }
+            LightroomWorkbenchIo::SealPublishBegin {
+                operation,
+                workbench,
+                generation,
+                token,
+                bytes,
+                blake3,
+            } => {
+                canceled(cancel)?;
+                let value = self.seal.as_mut().context("no seal operation retained")?;
+                value.same(&operation, &workbench, &generation, &token)?;
+                ensure!(
+                    value.state == LightroomWorkbenchSealState::Hashed && value.seal.is_none(),
+                    "seal publication upload phase differs"
+                );
+                let pending = value.directory.to_path()?.join("input-seal.pending.json");
+                value.seal = Some(Upload::create(&pending, bytes.0, blake3)?);
+                Ok(LightroomWorkbenchIoReply::SealUpload {
+                    operation,
+                    token,
+                    document: LightroomWorkbenchSealDocument::Seal,
+                    offset: U64(0),
+                })
+            }
+            LightroomWorkbenchIo::SealPublish {
+                operation,
+                workbench,
+                generation,
+                token,
+            } => {
+                let value = self.seal.as_mut().context("no seal operation retained")?;
+                value.same(&operation, &workbench, &generation, &token)?;
+                if value.state == LightroomWorkbenchSealState::Published {
+                    return Ok(value.reply());
+                }
+                canceled(cancel)?;
+                ensure!(
+                    value.state == LightroomWorkbenchSealState::PublishReady,
+                    "seal is not publishable"
+                );
+                let upload = value
+                    .seal
+                    .as_mut()
+                    .context("seal publication upload absent")?;
+                upload.finish()?;
+                let digest = upload.expected_blake3.clone();
+                let mut database = Source::open(
+                    &value.database.to_path()?,
+                    value
+                        .database_identity
+                        .as_ref()
+                        .context("sealed database identity absent")?
+                        .bytes,
+                )?;
+                companion_free(&database.path)?;
+                ensure!(
+                    database.before
+                        == *value
+                            .database_identity
+                            .as_ref()
+                            .context("sealed database identity absent")?
+                        && FileKey::of(&database.file)?
+                            == value
+                                .database_physical
+                                .clone()
+                                .context("sealed database physical identity absent")?,
+                    "sealed database changed before publication"
+                );
+                let database_digest = database.copy_and_hash_controlled(None, || Ok(()))?;
+                companion_free(&database.path)?;
+                database.verify()?;
+                companion_free(&database.path)?;
+                ensure!(
+                    Some(&database_digest) == value.database_blake3.as_ref(),
+                    "sealed database bytes changed before publication"
+                );
+                drop(database);
+                let pending = value.directory.to_path()?.join("input-seal.pending.json");
+                fs::hard_link(&pending, value.seal_path.to_path()?)
+                    .context("atomic create-new selection seal publication")?;
+                value.published_blake3 = Some(digest);
+                value.state = LightroomWorkbenchSealState::Published;
+                Ok(value.reply())
+            }
+            LightroomWorkbenchIo::SealStatus {
+                operation,
+                workbench,
+                generation,
+                token,
+            } => {
+                let value = self.seal.as_ref().context("no seal operation retained")?;
+                value.same(&operation, &workbench, &generation, &token)?;
+                Ok(value.reply())
+            }
+            LightroomWorkbenchIo::SealAbort {
+                operation,
+                workbench,
+                generation,
+                token,
+            } => {
+                let value = self.seal.as_mut().context("no seal operation retained")?;
+                value.same(&operation, &workbench, &generation, &token)?;
+                ensure!(
+                    value.state != LightroomWorkbenchSealState::Published,
+                    "published seal cannot be aborted"
+                );
+                value.approval.file.take();
+                value.review.file.take();
+                if let Some(upload) = &mut value.seal {
+                    upload.file.take();
+                }
+                value.state = LightroomWorkbenchSealState::Aborted;
+                Ok(value.reply())
+            }
         }
     }
 }
@@ -813,5 +1214,171 @@ impl Evidence {
             manifest_blake3: self.manifest_blake3.clone(),
             authority: self.authority.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OPERATION: &str = "operation";
+    const WORKBENCH: &str = "workbench";
+    const GENERATION: &str = "generation";
+    const TOKEN: &str = "seal-token";
+
+    fn call(owner: &mut Owner, request: LightroomWorkbenchIo) -> Result<LightroomWorkbenchIoReply> {
+        request.validate()?;
+        let reply = owner.execute(request.clone(), &AtomicBool::new(false))?;
+        reply.validate_for(&request)?;
+        Ok(reply)
+    }
+
+    fn request_chunk(
+        document: LightroomWorkbenchSealDocument,
+        bytes: &[u8],
+    ) -> LightroomWorkbenchIo {
+        LightroomWorkbenchIo::SealChunk {
+            operation: OPERATION.into(),
+            workbench: WORKBENCH.into(),
+            generation: GENERATION.into(),
+            token: TOKEN.into(),
+            document,
+            offset: U64(0),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn staged(owner: &mut Owner, root: &Path) -> Result<NativePath> {
+        let approval = br#"{"approval":true}"#;
+        let review = br#"{"review":true}"#;
+        call(
+            owner,
+            LightroomWorkbenchIo::SealBegin {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+                output: NativePath::from_path(root),
+                approval_bytes: U64(approval.len() as u64),
+                approval_blake3: crate::lightroom::digest(approval),
+                review_bytes: U64(review.len() as u64),
+                review_blake3: crate::lightroom::digest(review),
+            },
+        )?;
+        call(
+            owner,
+            request_chunk(LightroomWorkbenchSealDocument::Approval, approval),
+        )?;
+        call(
+            owner,
+            request_chunk(LightroomWorkbenchSealDocument::Review, review),
+        )?;
+        let reply = call(
+            owner,
+            LightroomWorkbenchIo::SealStage {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+            },
+        )?;
+        let LightroomWorkbenchIoReply::SealStaged { database, .. } = reply else {
+            anyhow::bail!("stage reply")
+        };
+        Ok(database)
+    }
+
+    fn hashed(owner: &mut Owner, database: &NativePath) -> Result<()> {
+        let db = rusqlite::Connection::open(database.to_path()?)?;
+        db.execute_batch(
+            "PRAGMA journal_mode=DELETE; CREATE TABLE evidence(value TEXT NOT NULL); INSERT INTO evidence VALUES ('stable');",
+        )?;
+        drop(db);
+        call(
+            owner,
+            LightroomWorkbenchIo::SealSyncHash {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+                maximum_bytes: U64(1024 * 1024),
+            },
+        )?;
+        let seal = br#"{"protocol":1}"#;
+        call(
+            owner,
+            LightroomWorkbenchIo::SealPublishBegin {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+                bytes: U64(seal.len() as u64),
+                blake3: crate::lightroom::digest(seal),
+            },
+        )?;
+        call(
+            owner,
+            request_chunk(LightroomWorkbenchSealDocument::Seal, seal),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn seal_rejects_staged_database_change_before_publication() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut owner = Owner::default();
+        let database = staged(&mut owner, &temp.path().join("sealed"))?;
+        hashed(&mut owner, &database)?;
+        let db = rusqlite::Connection::open(database.to_path()?)?;
+        db.execute("INSERT INTO evidence VALUES ('changed')", [])?;
+        drop(db);
+        let result = call(
+            &mut owner,
+            LightroomWorkbenchIo::SealPublish {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(!temp.path().join("sealed/input-seal.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn seal_status_recovers_lost_successful_publication_reply() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut owner = Owner::default();
+        let database = staged(&mut owner, &temp.path().join("sealed"))?;
+        hashed(&mut owner, &database)?;
+        call(
+            &mut owner,
+            LightroomWorkbenchIo::SealPublish {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+            },
+        )?;
+        let reply = call(
+            &mut owner,
+            LightroomWorkbenchIo::SealStatus {
+                operation: OPERATION.into(),
+                workbench: WORKBENCH.into(),
+                generation: GENERATION.into(),
+                token: TOKEN.into(),
+            },
+        )?;
+        assert!(matches!(
+            reply,
+            LightroomWorkbenchIoReply::SealState {
+                state: LightroomWorkbenchSealState::Published,
+                seal_blake3: Some(_),
+                ..
+            }
+        ));
+        assert!(temp.path().join("sealed/input-seal.json").is_file());
+        Ok(())
     }
 }

@@ -42,15 +42,229 @@ fn write_exact(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 struct Backup(*mut rusqlite::ffi::sqlite3_backup);
+impl Backup {
+    fn finish(mut self) -> Result<()> {
+        let pointer = self.0;
+        self.0 = std::ptr::null_mut();
+        let code = unsafe { rusqlite::ffi::sqlite3_backup_finish(pointer) };
+        ensure!(
+            code == rusqlite::ffi::SQLITE_OK,
+            "selection SQLite backup finish failed ({code})"
+        );
+        Ok(())
+    }
+}
 impl Drop for Backup {
     fn drop(&mut self) {
-        unsafe {
-            rusqlite::ffi::sqlite3_backup_finish(self.0);
+        if !self.0.is_null() {
+            unsafe {
+                rusqlite::ffi::sqlite3_backup_finish(self.0);
+            }
         }
     }
 }
 
+pub(crate) struct ManagedSealPreparation {
+    pub(crate) approval: ApprovalDocument,
+    pub(crate) approval_bytes: Vec<u8>,
+    pub(crate) review_bytes: Vec<u8>,
+    pub(crate) output: NativePath,
+    pub(crate) snapshot_bytes: u64,
+}
+
 impl SelectionReview {
+    pub(crate) fn prepare_managed_seal(
+        &self,
+        expected_review_token: &str,
+        expected_approval_blake3: &str,
+        approval_json: &[u8],
+        output: NativePath,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ManagedSealPreparation> {
+        let limits = self.summary.limits;
+        let until = Instant::now() + Duration::from_millis(limits.deadline_ms);
+        check(&cancel, until)?;
+        self.current(expected_review_token)?;
+        ensure!(
+            controlled_digest(approval_json, &cancel, until)? == expected_approval_blake3,
+            "exact approval bytes changed after approval"
+        );
+        let approval = approval(approval_json, expected_review_token, limits)?;
+        local(&output, limits.native_path_units)?;
+        let selected_revisions: BTreeSet<_> = self
+            .evidence
+            .captures
+            .iter()
+            .filter(|capture| capture.selected)
+            .map(|capture| capture.revision.as_str())
+            .collect();
+        for artifact in &approval.policy.artifacts {
+            ensure!(
+                selected_revisions.contains(artifact.capture_revision.as_str()),
+                "approval artifact is outside selected roster"
+            );
+        }
+        for supplement in &approval.policy.supplements {
+            ensure!(
+                selected_revisions.contains(supplement.capture_revision.as_str()),
+                "approval supplement policy is outside selected roster"
+            );
+        }
+        for supplement in &approval.supplements {
+            ensure!(
+                selected_revisions.contains(supplement.revision.as_str()),
+                "approval supplement pin is outside selected roster"
+            );
+        }
+        let snapshot_bytes = database_bytes(&self.plan.db, limits.snapshot_bytes)?;
+        let review_bytes = bounded_json(&self.evidence, limits.review_bytes)?;
+        Ok(ManagedSealPreparation {
+            approval,
+            approval_bytes: approval_json.to_vec(),
+            review_bytes,
+            output,
+            snapshot_bytes,
+        })
+    }
+
+    pub(crate) fn backup_managed(
+        &mut self,
+        expected_review_token: &str,
+        database: &NativePath,
+        expected_physical: &crate::lightroom_migration_worker::identity::FileKey,
+        cancel: Arc<AtomicBool>,
+        mut progress: impl FnMut(SelectionProgress),
+    ) -> Result<()> {
+        let limits = self.summary.limits;
+        let until = Instant::now() + Duration::from_millis(limits.deadline_ms);
+        check(&cancel, until)?;
+        self.current(expected_review_token)?;
+        ensure!(
+            self.managed_identity.as_ref() != Some(&super::super::physical(expected_physical)),
+            "seal destination aliases inspection source"
+        );
+        let path = local(database, limits.native_path_units)?;
+        let budget = SqlBudget::new(&self.plan.db, limits, cancel.clone());
+        let transaction = self.plan.db.unchecked_transaction()?;
+        database_bytes(&self.plan.db, limits.snapshot_bytes)?;
+        let _: i64 = self
+            .plan
+            .db
+            .query_row("SELECT count(*) FROM captures", [], |row| row.get(0))?;
+        let target = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        target.busy_timeout(Duration::ZERO)?;
+        let target_file = fs::File::open(&path)?;
+        ensure!(
+            crate::lightroom_migration_worker::identity::FileKey::of(&target_file)?
+                == *expected_physical,
+            "seal destination object changed before backup"
+        );
+        crate::catalog_storage::verify_database_object(&target, &target_file)?;
+        let backup = unsafe {
+            rusqlite::ffi::sqlite3_backup_init(
+                target.handle(),
+                c"main".as_ptr(),
+                self.plan.db.handle(),
+                c"main".as_ptr(),
+            )
+        };
+        ensure!(
+            !backup.is_null(),
+            "selection SQLite backup initialization failed"
+        );
+        let backup = Backup(backup);
+        loop {
+            check(&cancel, until)?;
+            let code = unsafe { rusqlite::ffi::sqlite3_backup_step(backup.0, 64) };
+            let total = unsafe { rusqlite::ffi::sqlite3_backup_pagecount(backup.0) };
+            let remaining = unsafe { rusqlite::ffi::sqlite3_backup_remaining(backup.0) };
+            ensure!(
+                total >= 0 && remaining >= 0,
+                "selection SQLite backup progress invalid"
+            );
+            progress(SelectionProgress {
+                phase: "copying_snapshot".into(),
+                completed: (total - remaining) as u64,
+                total: Some(total as u64),
+            });
+            if code == rusqlite::ffi::SQLITE_DONE {
+                break;
+            }
+            ensure!(
+                code == rusqlite::ffi::SQLITE_OK,
+                "selection SQLite backup interrupted or busy ({code})"
+            );
+        }
+        backup.finish()?;
+        target.pragma_update(None, "journal_mode", "DELETE")?;
+        drop(target);
+        drop(target_file);
+        transaction.commit()?;
+        budget.check()?;
+        drop(budget);
+        self.current(expected_review_token)?;
+        Ok(())
+    }
+
+    pub(crate) fn managed_input_seal(
+        &self,
+        preparation: &ManagedSealPreparation,
+        database: NativePath,
+        identity: crate::lightroom::source::Revision,
+        blake3: String,
+    ) -> Result<InputSeal> {
+        let families: BTreeMap<_, _> = self
+            .evidence
+            .report
+            .families
+            .iter()
+            .map(|family| (family.id.as_str(), family.evidence_digest.as_str()))
+            .collect();
+        let selected = self
+            .evidence
+            .captures
+            .iter()
+            .filter(|capture| capture.selected)
+            .map(|capture| SelectedCapture {
+                revision: capture.revision.clone(),
+                family: capture.family.clone(),
+                family_evidence_digest: families[capture.family.as_str()].to_owned(),
+                manifest_blake3: capture.manifest_blake3.clone(),
+                evidence_revision: capture.evidence_revision,
+            })
+            .collect();
+        let excluded_revisions = self
+            .evidence
+            .captures
+            .iter()
+            .filter(|capture| !capture.selected)
+            .map(|capture| capture.revision.clone())
+            .collect();
+        let mut seal = InputSeal {
+            protocol: 1,
+            database,
+            identity,
+            blake3,
+            approval: SelectionApproval {
+                document_blake3: digest(&preparation.approval_bytes),
+                scope: preparation.approval.scope.wire().into(),
+                roster_blake3: String::new(),
+            },
+            selected,
+            excluded_revisions,
+            supplements: preparation.approval.supplements.clone(),
+        };
+        seal.approval.roster_blake3 = seal.roster_blake3()?;
+        Ok(seal)
+    }
+
+    pub(crate) fn current_managed_seal(&self, expected_review_token: &str) -> Result<()> {
+        self.current(expected_review_token)
+    }
+
     /// Produces new immutable authority; never opens the migration destination,
     /// original paths or capture artifact paths retained in the approval.
     ///
