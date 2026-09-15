@@ -194,6 +194,7 @@ struct RootRecord {
     export_executor: super::export_executor::Owner,
     export_stage: super::export_stage::Owner,
     metadata_files: super::metadata_files::Owner,
+    import: super::import::Owner,
     export_profile: Option<ExportProfileTransfer>,
     export_profile_terminal: Option<ExportProfileTerminal>,
     export_original: Option<ExportOriginalTransfer>,
@@ -509,6 +510,7 @@ impl BootstrapOwner {
             export_executor: super::export_executor::Owner::default(),
             export_stage: super::export_stage::Owner::default(),
             metadata_files: super::metadata_files::Owner::default(),
+            import: super::import::Owner::default(),
             export_profile: None,
             export_profile_terminal: None,
             export_original: None,
@@ -597,6 +599,10 @@ impl BootstrapOwner {
             ensure!(
                 record.export_executor.empty(),
                 "export executor lock has not been released"
+            );
+            ensure!(
+                record.import.empty(),
+                "managed import custody has not drained"
             );
             ensure!(
                 record.export_profile.is_none(),
@@ -856,6 +862,32 @@ impl BootstrapOwner {
     }
     pub fn require_jobs_released(&self, root: &RootCapability) -> Result<()> {
         self.with_root(root, catalog_backup::require_jobs_released)
+    }
+    pub fn import_call(
+        &mut self,
+        request: &crate::catalog_session::import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::import::Reply> {
+        request.validate()?;
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "managed import requires confirmed SQL admission"
+        );
+        let original_roots = self.original_roots.clone();
+        let record = self
+            .record
+            .as_mut()
+            .context("catalog filesystem root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "managed import belongs to another catalog session"
+        );
+        let root = record.verify_root_binding()?;
+        let result = record.import.call(&root, &original_roots, request, cancel);
+        record.verify_root_binding()?;
+        result
     }
     pub fn prepare_export_directory(
         &self,

@@ -1996,8 +1996,8 @@ fn index_directory(
         return Ok(());
     }
     // Enumeration only opens a directory; regular-file content remains the
-    // source reader's responsibility. The SQL seam also consumes bounded facts
-    // from an eventual F stream without moving this connection to that owner.
+    // source reader's responsibility. Managed callers use the same SQL seam for
+    // bounded F facts without moving this connection to that owner.
     index_directory_facts(
         db,
         directory,
@@ -2091,7 +2091,8 @@ pub(crate) fn initialize_discovery_connection(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Worker-owned directory facts; no catalog connection or authority is held.
+/// C-owned bounded directory-fact index. Managed callers insert only facts
+/// transferred from F; this owner retains the Discovery SQL role.
 pub(crate) struct ImportDiscovery {
     db: crate::catalog_session::SqlConnection,
     progress_registered: bool,
@@ -2125,9 +2126,67 @@ impl ImportDiscovery {
     ) -> Result<Vec<Source>> {
         let directory = path.parent().context("original has no parent")?;
         index_directory(&self.db, directory, Some(cancel))?;
+        self.sidecars_indexed(path, cancel)
+    }
+    pub(crate) fn begin_directory(&self, directory: &Path) -> Result<()> {
+        let key = location_bytes(directory);
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM metadata_scan_files WHERE directory=?1", [&key])?;
+        tx.execute("DELETE FROM metadata_scan_dirs WHERE directory=?1", [&key])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn directory_facts(
+        &self,
+        directory: &Path,
+        facts: impl IntoIterator<Item = Result<DirectoryFact>>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
+        index_directory_fact_chunk(&self.db, directory, facts, cancel)
+    }
+    pub(crate) fn finish_directory(&self, directory: &Path) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO metadata_scan_dirs VALUES(?1)",
+            [location_bytes(directory)],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn sidecars_indexed(
+        &self,
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Source>> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "metadata discovery canceled"
+        );
+        let directory = path.parent().context("original has no parent")?;
+        let indexed: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata_scan_dirs WHERE directory=?1)",
+            [location_bytes(directory)],
+            |r| r.get(0),
+        )?;
+        ensure!(indexed, "metadata directory facts are incomplete");
         let stem = name_key(path.file_stem().context("original has no stem")?);
         let name = name_key(path.file_name().context("original has no filename")?);
-        let rows=self.db.prepare("SELECT path,display,stem FROM metadata_scan_files WHERE directory=?1 AND sidecar=1 AND (stem=?2 OR stem=?3) ORDER BY name LIMIT 1025")?.query_map(params![location_bytes(directory),stem,name],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = self
+            .db
+            .prepare(concat!(
+                "SELECT CASE WHEN length(path)<=32768 THEN path END, ",
+                "CASE WHEN length(CAST(display AS BLOB))<=131072 THEN display END, ",
+                "CASE WHEN length(stem)<=32768 THEN stem END ",
+                "FROM metadata_scan_files ",
+                "WHERE directory=?1 AND sidecar=1 AND (stem=?2 OR stem=?3) ",
+                "ORDER BY name LIMIT 1025",
+            ))?
+            .query_map(params![location_bytes(directory), stem, name], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         ensure!(
             rows.len() <= 1024,
             "sidecar association limit exceeded; no associations silently discarded"
@@ -2139,6 +2198,64 @@ impl ImportDiscovery {
                 provenance:serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}})})
         }).collect()
     }
+}
+
+fn index_directory_fact_chunk(
+    db: &Connection,
+    directory: &Path,
+    facts: impl IntoIterator<Item = Result<DirectoryFact>>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let key = location_bytes(directory);
+    let tx = db.unchecked_transaction()?;
+    for fact in facts {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "metadata discovery canceled"
+        );
+        let fact = fact?;
+        ensure!(
+            fact.path.parent() == Some(directory),
+            "directory fact belongs to another parent"
+        );
+        let native = crate::storage_volume::NativePath::from_path(&fact.path);
+        let units = match &native {
+            crate::storage_volume::NativePath::UnixBytes(v) => v.len(),
+            crate::storage_volume::NativePath::WindowsWide(v) => v.len(),
+        };
+        ensure!(
+            units <= crate::catalog_session::PATH_UNITS,
+            "directory fact path exceeds byte admission"
+        );
+        if !fact.regular {
+            continue;
+        }
+        let path = fact.path;
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext != "xmp" && !crate::media::supported_extension(&ext) {
+            continue;
+        }
+        let name = path.file_name().context("source has no filename")?;
+        let stem = path.file_stem().context("source has no stem")?;
+        tx.execute(
+            "INSERT INTO metadata_scan_files VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                key,
+                location_bytes(Path::new(name)),
+                name_key(stem),
+                name_key(name),
+                location_bytes(&path),
+                path.to_string_lossy(),
+                ext == "xmp"
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 impl Drop for ImportDiscovery {
     fn drop(&mut self) {
@@ -2155,6 +2272,48 @@ impl Drop for ImportDiscovery {
         }
     }
 }
+
+#[cfg(test)]
+mod managed_import_discovery_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn transferred_directory_facts_drive_c_sql_without_local_enumeration() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "photocatalog-nonexistent-managed-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(!directory.exists());
+        let original = directory.join("IMG_0001.JPG");
+        let sidecar = directory.join("img_0001.xMp");
+        let cancel = AtomicBool::new(false);
+        let discovery = ImportDiscovery::new()?;
+        discovery.begin_directory(&directory)?;
+        discovery.directory_facts(
+            &directory,
+            [
+                Ok(DirectoryFact {
+                    path: original.clone(),
+                    regular: true,
+                }),
+                Ok(DirectoryFact {
+                    path: sidecar.clone(),
+                    regular: true,
+                }),
+            ],
+            &cancel,
+        )?;
+        discovery.finish_directory(&directory)?;
+        let sources = discovery.sidecars_indexed(&original, &cancel)?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].locator, location_bytes(&sidecar));
+        assert_eq!(sources[0].kind, "sidecar");
+        assert_eq!(sources[0].provenance["matching_photos"], 1);
+        Ok(())
+    }
+}
+
 pub(crate) struct PreparedImportSource {
     pub(crate) source: Source,
     pub(crate) prepared: std::result::Result<Prepared, String>,
@@ -2195,6 +2354,52 @@ pub(crate) fn prepare_import_source(
         source,
         prepared,
         warning,
+    })
+}
+
+pub(crate) fn prepare_import_inspection(
+    source: Source,
+    inspection: xmp_packets::Inspection,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedImportSource> {
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    let prepared = Prepared::new(&inspection, &source)?;
+    let warning = !matches!(inspection.status, Status::Complete | Status::Absent)
+        || prepared
+            .models
+            .iter()
+            .any(|m| m.error.is_some() || !m.projection.issues.is_empty());
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    Ok(PreparedImportSource {
+        source,
+        prepared: Ok(prepared),
+        warning,
+    })
+}
+
+pub(crate) fn prepare_import_failure(
+    source: Source,
+    message: String,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedImportSource> {
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    ensure!(
+        !message.is_empty() && message.len() <= 2048,
+        "metadata inspection failure detail limit"
+    );
+    Ok(PreparedImportSource {
+        source,
+        prepared: Err(message),
+        warning: true,
     })
 }
 

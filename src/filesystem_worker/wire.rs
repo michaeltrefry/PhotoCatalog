@@ -73,12 +73,15 @@ pub fn build_identity() -> String {
             include_str!("client.rs"),
             include_str!("process.rs"),
             include_str!("../catalog_session.rs"),
+            include_str!("../catalog_session/import.rs"),
             include_str!("../catalog_session/storage.rs"),
             include_str!("../catalog_session/store.rs"),
             include_str!("../catalog_session/preview_io.rs"),
             include_str!("../catalog_session/export_managed.rs"),
             include_str!("../preview/store.rs"),
             include_str!("../filesystem_worker.rs"),
+            include_str!("import.rs"),
+            include_str!("../import_storage.rs"),
             include_str!("bootstrap.rs"),
             include_str!("store.rs"),
             include_str!("preview_io.rs"),
@@ -133,6 +136,7 @@ pub fn build_identity() -> String {
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
     ExportExecutor(crate::catalog_session::export_executor::Request),
+    Import(crate::catalog_session::import::Request),
     PreviewStore(crate::catalog_session::store::Request),
     PreviewIo(crate::catalog_session::preview_io::Request),
     PreviewStage(crate::catalog_session::preview_stage::Request),
@@ -202,10 +206,12 @@ impl Operation {
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
             || matches!(self, Self::PreviewStage(r) if r.cleanup())
             || matches!(self, Self::ExportStage(r) if r.cleanup())
+            || matches!(self, Self::Import(r) if r.cleanup())
     }
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::ExportExecutor(value) => value.validate()?,
+            Self::Import(value) => value.validate()?,
             Self::PreviewStore(value) => value.validate()?,
             Self::PreviewIo(value) => value.validate()?,
             Self::PreviewStage(value) => value.validate()?,
@@ -622,6 +628,7 @@ impl AdmissionSnapshot {
 )]
 pub enum Response {
     ExportExecutor(crate::catalog_session::export_executor::Reply),
+    Import(crate::catalog_session::import::Reply),
     PreviewStore(crate::catalog_session::store::Reply),
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
@@ -1032,6 +1039,7 @@ pub(crate) fn encode_outcome(value: &Outcome) -> Result<Vec<u8>> {
         Ok(Response::PreviewIo(r)) => r.binary(),
         Ok(Response::PreviewStage(r)) => (!r.binary().is_empty()).then(|| r.binary()),
         Ok(Response::ExportProfile(r)) => r.binary(),
+        Ok(Response::Import(r)) => r.value.binary(),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -1043,6 +1051,7 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
         Ok(Response::PreviewIo(r)) => r.set_binary(binary)?,
         Ok(Response::PreviewStage(r)) => r.set_binary(binary.to_vec())?,
         Ok(Response::ExportProfile(r)) => r.set_binary(binary)?,
+        Ok(Response::Import(r)) => r.value.set_binary(binary)?,
         _ => ensure!(binary.is_empty(), "unexpected outcome binary trailer"),
     }
     Ok(value)
@@ -1051,6 +1060,56 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn import_outcome_uses_one_exact_16k_binary_trailer() -> Result<()> {
+        use crate::catalog_session::{PhysicalObjectId, import as i};
+        #[cfg(unix)]
+        let physical = |index| PhysicalObjectId::Unix {
+            device: U64(1),
+            inode: U64(index),
+        };
+        #[cfg(windows)]
+        let physical = |index| PhysicalObjectId::Windows {
+            volume_serial: U64(1),
+            file_index: U64(index),
+        };
+        let request = i::Request {
+            root: RootCapability {
+                epoch: LeaseId::new(),
+                token: LeaseId::new(),
+                session: LeaseId::new(),
+                canonical_root: NativePath::from_path(&std::env::temp_dir()),
+                root_physical: physical(2),
+                catalog_physical: physical(3),
+            },
+            transfer: LeaseId::new(),
+            step: U64(7),
+            action: i::Action::Read { offset: U64(0) },
+        };
+        let bytes = vec![0xa5; i::CHUNK_BYTES];
+        let reply = i::Reply {
+            root: request.root.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            request_digest: request.digest()?,
+            value: i::Value::Chunk {
+                offset: U64(0),
+                checksum: blake3::hash(&bytes).to_hex().to_string(),
+                bytes: bytes.clone(),
+            },
+        };
+        reply.validate(&request)?;
+        let encoded = encode_outcome(&Ok(Response::Import(reply)))?;
+        assert!(encoded.len() < bytes.len() + 2048);
+        let Ok(Response::Import(decoded)) = decode_outcome(&encoded)? else {
+            anyhow::bail!("import outcome shape")
+        };
+        decoded.validate(&request)?;
+        assert_eq!(decoded.value.binary(), Some(bytes.as_slice()));
+        crate::application::desktop::test_import_relay_admission(&request, &decoded)?;
+        Ok(())
+    }
+
     #[test]
     fn maximum_export_executor_request_and_reply_round_trip() -> Result<()> {
         use crate::catalog_session::{PhysicalObjectId, export_executor as e};

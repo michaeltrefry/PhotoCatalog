@@ -982,6 +982,19 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected metadata file reply"),
         }
     }
+    fn import_call(
+        &self,
+        request: &crate::catalog_session::import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::import::Reply> {
+        match self.execute(Operation::Import(request.clone()), cancel)? {
+            Response::Import(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected managed import reply"),
+        }
+    }
     fn export_executor_call(
         &self,
         request: &crate::catalog_session::export_executor::Request,

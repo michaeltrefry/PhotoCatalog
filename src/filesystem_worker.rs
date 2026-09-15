@@ -9,6 +9,7 @@ mod export_stage;
 mod lightroom_artifacts;
 mod lightroom_sealed;
 mod metadata_files;
+mod import;
 mod preview_io;
 mod preview_stage;
 pub mod process;
@@ -49,6 +50,9 @@ pub(crate) fn export_stage_owner_layout() -> (usize, usize) {
 pub(crate) fn export_executor_owner_layout() -> (usize, usize) {
     export_executor::owner_layout()
 }
+pub(crate) fn import_owner_layout() -> (usize, usize) {
+    import::owner_layout()
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;
@@ -70,6 +74,10 @@ impl FilesystemHandler {
                 .owner
                 .storage_call(&request, cancel)
                 .map(Response::Storage),
+            Operation::Import(request) => self
+                .owner
+                .import_call(&request, cancel)
+                .map(Response::Import),
             Operation::ExportExecutor(request) => self
                 .owner
                 .export_executor_call(&request, cancel)

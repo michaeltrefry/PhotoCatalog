@@ -1096,9 +1096,13 @@ impl ImportTask {
         self.status.pending_previews = 0;
         self.status.phase = ImportPhase::CancelRequested;
     }
-    fn cancel_owned(&mut self, service: &mut PreviewService) {
+    fn cancel_owned(&mut self, service: &mut PreviewService) -> Result<()> {
         self.request_cancel_owned(service);
+        if let Some(preparation) = &mut self.preparation {
+            preparation.cancel_and_finish()?;
+        }
         self.preparation = None; // Join after signaling every owned consumer.
+        Ok(())
     }
 }
 #[derive(Clone)]
@@ -1474,6 +1478,9 @@ impl Actor {
                 open.exports.shutdown(&self.shared.exports);
                 copy::close(&mut open.catalog, &self.shared.copy);
                 if let Some(import) = &mut open.import {
+                    if let Some(preparation) = &mut import.preparation {
+                        preparation.cancel_and_finish().map_err(native)?;
+                    }
                     import.preparation = None;
                 }
                 // The complete Open, including import lock/catalog, remains owned on
@@ -2118,7 +2125,10 @@ impl Actor {
                 #[cfg(test)]
                 let checkpoint = self.config.import_checkpoint.clone();
                 let o = self.current(&catalog)?;
-                if o.import.as_ref().is_some_and(|i| !i.terminal()) {
+                if o.import
+                    .as_ref()
+                    .is_some_and(|i| !i.terminal() || i.preparation.is_some())
+                {
                     return Err(error(
                         ErrorCode::Busy,
                         "an import is still running or canceling",
@@ -2131,16 +2141,24 @@ impl Actor {
                         "import source must be absolute",
                     ));
                 }
-                let path = std::fs::canonicalize(path).map_err(|e| native(e.into()))?;
-                // Both controls remain authoritative: restored-job hold and cache/source separation.
-                core!(o.service.ensure_original_separate(&path));
-                // The exact admitted folder is retained as a future root-review candidate.
-                // The storage epoch changes during import, so relocation remains blocked until
-                // bounded coverage is revalidated against the completed catalog state.
-                core!(o.service.register_original_root(&path));
-                let import_lock = core!(crate::ImportLock::acquire(
-                    &o.catalog.root.join("import.lock")
-                ));
+                let managed_import = o.catalog.session.managed_import_root().is_some();
+                let path = if managed_import {
+                    // F alone resolves and observes a managed source path. The
+                    // canonical path returned in Header becomes C's SQL identity.
+                    path
+                } else {
+                    let path = std::fs::canonicalize(path).map_err(|e| native(e.into()))?;
+                    core!(o.service.ensure_original_separate(&path));
+                    core!(o.service.register_original_root(&path));
+                    path
+                };
+                let import_lock = if managed_import {
+                    None
+                } else {
+                    Some(core!(crate::ImportLock::acquire(
+                        &o.catalog.root.join("import.lock")
+                    )))
+                };
                 let preparation = core!(crate::import_preparation::Preparation::spawn(
                     &o.catalog,
                     &path,
@@ -2164,7 +2182,7 @@ impl Actor {
                     error_source: None,
                 };
                 o.import = Some(ImportTask {
-                    import_lock: Some(import_lock),
+                    import_lock,
                     preparation: Some(preparation),
                     reference: None,
                     status: status.clone(),
@@ -3031,10 +3049,23 @@ impl Actor {
             if import.cancel.is_canceled()
                 && !matches!(import.status.phase, ImportPhase::CancelRequested)
             {
-                import.cancel_owned(&mut o.service);
+                if let Err(error) = import.cancel_owned(&mut o.service) {
+                    import.failure = true;
+                    import.status.error = Some(
+                        format!("import filesystem cleanup retained: {error:#}")
+                            .chars()
+                            .take(2048)
+                            .collect(),
+                    );
+                }
             }
             if matches!(import.status.phase, ImportPhase::CancelRequested) {
-                if o.service.native_work_drained() {
+                if let Some(preparation) = &mut import.preparation
+                    && preparation.cancel_and_finish().is_ok()
+                {
+                    import.preparation = None;
+                }
+                if import.preparation.is_none() && o.service.native_work_drained() {
                     import.status.phase = if import.failure {
                         ImportPhase::Failed
                     } else {
@@ -3071,8 +3102,18 @@ impl Actor {
                                 .as_mut()
                                 .context("metadata without import reference")?
                                 .source(&mut o.catalog, &source)?;
+                            import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?
+                                .inspection_committed()?;
                         }
                         Event::End => {
+                            import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?
+                                .recheck_current()?;
                             let reference = import
                                 .reference
                                 .take()
@@ -3080,6 +3121,11 @@ impl Actor {
                             let path = reference.source_path();
                             let (consumer, changed, warnings) =
                                 reference.finish(&mut o.catalog, &mut o.service)?;
+                            import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?
+                                .file_committed()?;
                             import.status.metadata_updated.0 += u64::from(changed);
                             import.status.metadata_warnings.0 += warnings;
                             if let Some(consumer) = consumer {
@@ -3098,9 +3144,6 @@ impl Actor {
                                 "source ended inside a prepared file"
                             );
                             import.discovery_finished = true;
-                            if let Some(preparation) = import.preparation.take() {
-                                preparation.finish();
-                            }
                         }
                         Event::Failed { source, message } => {
                             import.status.error_source = Some(source);
@@ -3118,7 +3161,14 @@ impl Actor {
                         let _ = reference.fail(&mut o.catalog, &message);
                     }
                     import.status.error = Some(message.chars().take(2048).collect());
-                    import.cancel_owned(&mut o.service);
+                    if let Err(cleanup) = import.cancel_owned(&mut o.service) {
+                        import.status.error = Some(
+                            format!("{message}; filesystem cleanup retained: {cleanup:#}")
+                                .chars()
+                                .take(2048)
+                                .collect(),
+                        );
+                    }
                 }
             }
             import.update_counts();
@@ -3130,7 +3180,26 @@ impl Actor {
             {
                 import.status.phase = ImportPhase::Draining;
                 if import.consumers.is_empty() && !o.index_pending {
-                    import.status.phase = ImportPhase::Complete;
+                    let retired = import
+                        .preparation
+                        .as_mut()
+                        .map_or(Ok(()), crate::import_preparation::Preparation::finish);
+                    match retired {
+                        Ok(()) => {
+                            import.preparation = None;
+                            import.status.phase = ImportPhase::Complete;
+                        }
+                        Err(error) => {
+                            import.failure = true;
+                            import.status.error = Some(
+                                format!("import filesystem retirement failed: {error:#}")
+                                    .chars()
+                                    .take(2048)
+                                    .collect(),
+                            );
+                            import.status.phase = ImportPhase::Failed;
+                        }
+                    }
                 }
             }
             let mut queue = self.shared.queue.lock().unwrap();

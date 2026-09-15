@@ -845,3 +845,11 @@ pub(crate) fn test_export_executor_relay_admission(
     filesystem::roundtrip_export_executor(request)?;
     filesystem::admit_export_executor_reply(request, reply)
 }
+
+#[cfg(test)]
+pub(crate) fn test_import_relay_admission(
+    request: &crate::catalog_session::import::Request,
+    reply: &crate::catalog_session::import::Reply,
+) -> anyhow::Result<()> {
+    filesystem::admit_import_reply(request, reply)
+}

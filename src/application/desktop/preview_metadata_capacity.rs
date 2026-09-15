@@ -668,6 +668,75 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         active_fs,
         c.mul(2, FAILURE_BYTES)?,
     )?;
+    let (import_owner_size, import_owner_align) = crate::filesystem_worker::import_owner_layout();
+    let import_path = c.vec(2, PATH_UNITS as u64)?;
+    let import_fact_chunk = c.add(&[
+        c.vec_growth(
+            Layout::of::<crate::catalog_session::import::DirectoryFact>().size,
+            crate::catalog_session::import::DIRECTORY_FACTS as u64,
+        )?,
+        c.vec(
+            2,
+            crate::catalog_session::import::DIRECTORY_FACT_PATH_UNITS as u64,
+        )?,
+    ])?;
+    // F retains one bounded inspection envelope until C has committed its exact
+    // observation. Directory identities are fixed-width; paths live only in the
+    // current source/directory and one bounded fact reply. Exact retry retains
+    // one request/reply envelope pair alongside those domain objects.
+    a.push(
+        "retained.import_f_source_custody_and_transfer",
+        Phase::Retained,
+        1,
+        c.add(&[
+            c.align(
+                u64::try_from(import_owner_size)?,
+                u64::try_from(import_owner_align)?,
+            )?,
+            c.mul(4, LEASE_ID_BYTES)?,
+            c.mul(8, import_path)?,
+            c.mul(2, RELAY_BYTES)?,
+            c.mul(crate::catalog_session::import::MAX_DIRECTORIES as u64, 128)?,
+            import_fact_chunk,
+            crate::catalog_session::import::MAX_INSPECTION_BYTES as u64,
+        ])?,
+    )?;
+    // Packet extraction, compact-envelope construction, and its metadata JSON
+    // can coexist in F before the source packet/input vectors are released.
+    a.push(
+        "active.import_f_inspection_parse_and_encoding",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(
+                2,
+                crate::catalog_session::import::MAX_INSPECTION_BYTES as u64,
+            )?,
+            crate::catalog_session::import::MAX_INSPECTION_METADATA_BYTES as u64,
+        ])?,
+    )?;
+    // At peak F's retained envelope coexists with C's exact assembly, decoded
+    // packet/input bytes, and Prepared's copied blob graph. Relay envelopes and
+    // a maximum directory fact chunk are charged independently.
+    a.push(
+        "active.import_c_transfer_decode_and_preparation",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(
+                3,
+                crate::catalog_session::import::MAX_INSPECTION_BYTES as u64,
+            )?,
+            c.parse(
+                crate::catalog_session::import::MAX_INSPECTION_METADATA_BYTES as u64,
+                6,
+                crate::catalog_session::import::MAX_INSPECTION_METADATA_BYTES as u64,
+            )?,
+            c.mul(4, RELAY_BYTES)?,
+            c.mul(4, import_fact_chunk)?,
+            c.mul(8, CHUNK_BYTES)?,
+        ])?,
+    )?;
     a.push(
         "active.ready_batch_metadata_graphs",
         Phase::Active,
@@ -2009,6 +2078,19 @@ mod tests {
                 .unwrap()
         );
         assert!(default_report.contributions.len() >= 40);
+        for name in [
+            "retained.import_f_source_custody_and_transfer",
+            "active.import_f_inspection_parse_and_encoding",
+            "active.import_c_transfer_decode_and_preparation",
+        ] {
+            assert!(
+                default_report
+                    .contributions
+                    .iter()
+                    .any(|entry| entry.name == name && entry.total > 0),
+                "missing {name}"
+            );
+        }
         let mut names = std::collections::HashSet::new();
         assert!(
             default_report

@@ -1,4 +1,5 @@
-//! One owned source-I/O preparer. It never opens the destination catalog or renders.
+//! One owned import preparer. Legacy mode performs source I/O here; managed mode
+//! keeps every source read in F and only associates facts in C's Discovery SQL.
 //! Rendezvous delivery bounds unpublished work; the catalog actor alone commits it.
 use crate::{
     Catalog,
@@ -45,6 +46,15 @@ pub(crate) struct Preparation {
     receiver: Option<mpsc::Receiver<Event>>,
     cancel: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    commands: Option<mpsc::SyncSender<Command>>,
+    managed: bool,
+    cleanup: Arc<std::sync::Mutex<Option<RemoteImport>>>,
+}
+enum Command {
+    InspectionCommitted(mpsc::SyncSender<Result<()>>),
+    Recheck(mpsc::SyncSender<Result<()>>),
+    FileCommitted(mpsc::SyncSender<Result<()>>),
+    Retire(mpsc::SyncSender<Result<()>>),
 }
 impl Preparation {
     pub(crate) fn spawn(
@@ -54,30 +64,51 @@ impl Preparation {
         #[cfg(test)] checkpoint: Option<Checkpoint>,
     ) -> Result<Self> {
         catalog.require_jobs_released()?;
-        ensure!(source.is_dir(), "import source must be a directory");
-        ensure!(
-            !source.starts_with(&catalog.root) && !catalog.root.starts_with(source),
-            "catalog and originals must be separate directories"
-        );
+        let managed = catalog.session.managed_import_root();
+        if managed.is_none() {
+            ensure!(source.is_dir(), "import source must be a directory");
+            ensure!(
+                !source.starts_with(&catalog.root) && !catalog.root.starts_with(source),
+                "catalog and originals must be separate directories"
+            );
+        }
         let discovery = if let Some(pool) = catalog.session.pool() {
             Some(pool.lease(crate::catalog_session::DISCOVERY_ROLE)?)
         } else {
             None
         };
         let (sender, receiver) = mpsc::sync_channel(0);
+        let (command_sender, command_receiver) = mpsc::sync_channel(0);
         let source = source.to_path_buf();
         let stop = cancel.clone();
+        let is_managed = managed.is_some();
+        let session = catalog.session.clone();
+        let cleanup = Arc::new(std::sync::Mutex::new(None));
+        let failed_cleanup = cleanup.clone();
         let worker = thread::Builder::new()
             .name("catalog-source-preparation".into())
             .spawn(move || {
-                let result = prepare_walk(
-                    discovery,
-                    &source,
-                    &sender,
-                    &stop,
-                    #[cfg(test)]
-                    checkpoint,
-                );
+                let result = if let Some(root) = managed {
+                    prepare_managed(
+                        session,
+                        discovery,
+                        root,
+                        &source,
+                        &sender,
+                        &command_receiver,
+                        &stop,
+                        &failed_cleanup,
+                    )
+                } else {
+                    prepare_walk(
+                        discovery,
+                        &source,
+                        &sender,
+                        &stop,
+                        #[cfg(test)]
+                        checkpoint,
+                    )
+                };
                 if let Err(e) = result
                     && !stop.load(Ordering::Acquire)
                 {
@@ -103,6 +134,9 @@ impl Preparation {
             receiver: Some(receiver),
             cancel,
             thread: Some(worker),
+            commands: Some(command_sender),
+            managed: is_managed,
+            cleanup,
         })
     }
     pub(crate) fn poll(&self) -> Result<Option<Event>> {
@@ -119,34 +153,116 @@ impl Preparation {
             }
         }
     }
-    pub(crate) fn finish(mut self) {
-        self.receiver.take();
-        if let Some(worker) = self.thread.take() {
-            let healthy = worker.join().is_ok();
-            if let Some(pool) = self.session.pool() {
-                let _ = pool.joined(crate::catalog_session::DISCOVERY_ROLE, healthy);
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        if self.managed && self.thread.is_some() {
+            if let Err(error) = self.command(CommandKind::Retire) {
+                self.request_cancel();
+                self.join_thread()?;
+                if let Err(cleanup) = self.retry_cleanup() {
+                    return Err(error).context(format!(
+                        "managed import retirement cleanup retained: {cleanup:#}"
+                    ));
+                }
+                return Err(error);
             }
+        }
+        self.receiver.take();
+        self.commands.take();
+        self.join_thread()?;
+        self.retry_cleanup()
+    }
+    fn command(&self, kind: CommandKind) -> Result<()> {
+        ensure!(
+            self.managed,
+            "managed import command used by legacy preparation"
+        );
+        let (tx, rx) = mpsc::sync_channel(0);
+        let command = match kind {
+            CommandKind::InspectionCommitted => Command::InspectionCommitted(tx),
+            CommandKind::Recheck => Command::Recheck(tx),
+            CommandKind::FileCommitted => Command::FileCommitted(tx),
+            CommandKind::Retire => Command::Retire(tx),
+        };
+        self.commands
+            .as_ref()
+            .context("managed import commands stopped")?
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("managed import owner stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("managed import acknowledgement lost"))?
+    }
+    pub(crate) fn inspection_committed(&self) -> Result<()> {
+        if self.managed {
+            self.command(CommandKind::InspectionCommitted)
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn recheck_current(&self) -> Result<()> {
+        if self.managed {
+            self.command(CommandKind::Recheck)
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn file_committed(&self) -> Result<()> {
+        if self.managed {
+            self.command(CommandKind::FileCommitted)
+        } else {
+            Ok(())
         }
     }
     pub(crate) fn request_cancel(&mut self) {
         if self.thread.is_some() {
             self.cancel.store(true, Ordering::Release);
         }
+        self.commands.take(); // Unblock a managed custody acknowledgement wait.
         self.receiver.take(); // Unblock a rendezvous send before joining.
     }
-    pub(crate) fn stop(&mut self) {
+    pub(crate) fn cancel_and_finish(&mut self) -> Result<()> {
         self.request_cancel();
+        self.join_thread()?;
+        self.retry_cleanup()
+    }
+    fn join_thread(&mut self) -> Result<()> {
         if let Some(worker) = self.thread.take() {
             let healthy = worker.join().is_ok();
             if let Some(pool) = self.session.pool() {
                 let _ = pool.joined(crate::catalog_session::DISCOVERY_ROLE, healthy);
+            }
+            ensure!(healthy, "source preparation owner panicked");
+        }
+        Ok(())
+    }
+    fn retry_cleanup(&self) -> Result<()> {
+        let mut slot = self.cleanup.lock().unwrap();
+        let Some(mut remote) = slot.take() else {
+            return Ok(());
+        };
+        match remote.abort() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                *slot = Some(remote);
+                Err(error).context("managed import cleanup remains retained")
             }
         }
     }
 }
 impl Drop for Preparation {
     fn drop(&mut self) {
-        self.stop();
+        if self.cancel_and_finish().is_err()
+            && self
+                .cleanup
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        {
+            // An unexpected last-owner drop is not evidence that F released the
+            // source/lock. Quarantine the exact request/session owner rather than
+            // letting Arc drop guess at retirement. Normal Close retains `self`
+            // and retries this cleanup instead of reaching this branch.
+            std::mem::forget(self.cleanup.clone());
+        }
     }
 }
 fn canceled(cancel: &AtomicBool) -> Result<()> {
@@ -482,6 +598,7 @@ pub(crate) struct SinglePreparation {
 impl SinglePreparation {
     pub(crate) fn spawn(
         path: PathBuf,
+        session: Arc<crate::catalog_session::CatalogSessionAuthority>,
         #[cfg(test)] checkpoint: Option<Checkpoint>,
     ) -> Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -498,13 +615,19 @@ impl SinglePreparation {
                         }
                     }) as Checkpoint
                 });
-                let result = fingerprint(
-                    &path,
-                    &stop,
-                    #[cfg(test)]
-                    checkpoint.as_ref(),
-                )
-                .map(|(digest, _, _)| digest)
+                let result = if session.pool().is_some() {
+                    crate::catalog_session::storage::Observer(session)
+                        .evidence(&path, &stop)
+                        .map(|evidence| evidence.hash)
+                } else {
+                    fingerprint(
+                        &path,
+                        &stop,
+                        #[cfg(test)]
+                        checkpoint.as_ref(),
+                    )
+                    .map(|(digest, _, _)| digest)
+                }
                 .map_err(|e| format!("prepare original: {e:#}"));
                 if !stop.load(Ordering::Acquire) {
                     let _ = sender.send(result);
@@ -552,6 +675,454 @@ impl SinglePreparation {
         }
         Ok(None)
     }
+}
+#[derive(Clone, Copy)]
+enum CommandKind {
+    InspectionCommitted,
+    Recheck,
+    FileCommitted,
+    Retire,
+}
+
+struct RemoteImport {
+    session: Arc<crate::catalog_session::CatalogSessionAuthority>,
+    root: crate::catalog_session::RootCapability,
+    transfer: crate::catalog_session::LeaseId,
+    step: u64,
+    pending: Option<crate::catalog_session::import::Request>,
+    active: bool,
+}
+struct RemoteCustody {
+    remote: Option<RemoteImport>,
+    cleanup: Arc<std::sync::Mutex<Option<RemoteImport>>>,
+}
+impl RemoteCustody {
+    fn new(remote: RemoteImport, cleanup: Arc<std::sync::Mutex<Option<RemoteImport>>>) -> Self {
+        Self {
+            remote: Some(remote),
+            cleanup,
+        }
+    }
+    fn remote(&mut self) -> &mut RemoteImport {
+        self.remote.as_mut().expect("managed import custody")
+    }
+    fn retired(&mut self) {
+        self.remote = None;
+    }
+}
+impl Drop for RemoteCustody {
+    fn drop(&mut self) {
+        if let Some(remote) = self.remote.take() {
+            let mut cleanup = self
+                .cleanup
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cleanup.get_or_insert(remote);
+        }
+    }
+}
+impl RemoteImport {
+    fn call(
+        &mut self,
+        action: crate::catalog_session::import::Action,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::import::Value> {
+        ensure!(
+            self.pending.is_none(),
+            "managed import has an unreconciled request"
+        );
+        let request = crate::catalog_session::import::Request {
+            root: self.root.clone(),
+            transfer: self.transfer.clone(),
+            step: crate::application::U64(self.step),
+            action,
+        };
+        self.pending = Some(request.clone());
+        let reply = match self.session.import_call(&request, cancel) {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                self.pending = None;
+                anyhow::bail!("managed catalog did not route import to F")
+            }
+            Err(error) => {
+                if error
+                    .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+                    .is_some_and(|failure| {
+                        failure.kind != crate::filesystem_worker::wire::FailureKind::Unknown
+                    })
+                {
+                    self.pending = None;
+                }
+                return Err(error);
+            }
+        };
+        reply.validate(&request)?;
+        self.pending = None;
+        self.step = self
+            .step
+            .checked_add(1)
+            .context("managed import step exhausted")?;
+        self.observe(&reply.value);
+        match reply.value {
+            crate::catalog_session::import::Value::Failed(failure) => {
+                Err(anyhow::Error::new(failure))
+            }
+            value => Ok(value),
+        }
+    }
+    /// An outer cancellation or lost reply never establishes whether F consumed
+    /// a step. Replay only the exact retained request and validate its digest.
+    fn reconcile(&mut self) -> Result<Option<crate::catalog_session::import::Value>> {
+        let Some(request) = self.pending.clone() else {
+            return Ok(None);
+        };
+        let reply = match self.session.import_call(&request, &AtomicBool::new(false)) {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                self.pending = None;
+                anyhow::bail!("managed catalog did not route retained import request")
+            }
+            Err(error) => {
+                if error
+                    .downcast_ref::<crate::filesystem_worker::wire::Failure>()
+                    .is_some_and(|failure| {
+                        failure.kind != crate::filesystem_worker::wire::FailureKind::Unknown
+                    })
+                {
+                    self.pending = None;
+                }
+                return Err(error);
+            }
+        };
+        reply.validate(&request)?;
+        self.pending = None;
+        self.step = self
+            .step
+            .checked_add(1)
+            .context("managed import step exhausted")?;
+        self.observe(&reply.value);
+        Ok(Some(reply.value))
+    }
+    fn abort(&mut self) -> Result<()> {
+        if self.pending.is_none() && !self.active {
+            return Ok(());
+        }
+        if matches!(
+            self.reconcile()?,
+            Some(
+                crate::catalog_session::import::Value::Finished
+                    | crate::catalog_session::import::Value::Aborted
+            )
+        ) {
+            return Ok(());
+        }
+        match self.call(
+            crate::catalog_session::import::Action::Abort,
+            &AtomicBool::new(false),
+        )? {
+            crate::catalog_session::import::Value::Aborted => Ok(()),
+            _ => anyhow::bail!("managed import abort reply mismatch"),
+        }
+    }
+    fn observe(&mut self, value: &crate::catalog_session::import::Value) {
+        match value {
+            crate::catalog_session::import::Value::Begun => self.active = true,
+            crate::catalog_session::import::Value::Finished
+            | crate::catalog_session::import::Value::Aborted => self.active = false,
+            _ => {}
+        }
+    }
+}
+
+fn prepare_managed(
+    session: Arc<crate::catalog_session::CatalogSessionAuthority>,
+    admitted: Option<crate::catalog_session::SqlConnection>,
+    root: crate::catalog_session::RootCapability,
+    source_root: &Path,
+    sender: &mpsc::SyncSender<Event>,
+    commands: &mpsc::Receiver<Command>,
+    cancel: &Arc<AtomicBool>,
+    cleanup: &Arc<std::sync::Mutex<Option<RemoteImport>>>,
+) -> Result<()> {
+    let db = admitted.context("managed import discovery SQL role is unavailable")?;
+    let discovery = catalog_metadata::ImportDiscovery::from_admitted(db, cancel.clone())?;
+    let mut custody = RemoteCustody::new(
+        RemoteImport {
+            session,
+            root,
+            transfer: crate::catalog_session::LeaseId::new(),
+            step: 0,
+            pending: None,
+            active: false,
+        },
+        cleanup.clone(),
+    );
+    let run = (|| -> Result<()> {
+        let remote = custody.remote();
+        match remote.call(
+            crate::catalog_session::import::Action::Begin {
+                source: NativePath::from_path(source_root),
+            },
+            cancel,
+        )? {
+            crate::catalog_session::import::Value::Begun => {}
+            _ => anyhow::bail!("managed import begin reply mismatch"),
+        }
+        loop {
+            match remote.call(crate::catalog_session::import::Action::Next, cancel)? {
+                crate::catalog_session::import::Value::DirectoryStart { directory } => {
+                    discovery.begin_directory(&directory.to_path()?)?
+                }
+                crate::catalog_session::import::Value::DirectoryFacts { directory, facts } => {
+                    let directory = directory.to_path()?;
+                    discovery.directory_facts(
+                        &directory,
+                        facts.into_iter().map(|fact| {
+                            Ok(catalog_metadata::DirectoryFact {
+                                path: fact.path.to_path()?,
+                                regular: fact.regular,
+                            })
+                        }),
+                        cancel,
+                    )?;
+                }
+                crate::catalog_session::import::Value::DirectoryEnd { directory } => {
+                    discovery.finish_directory(&directory.to_path()?)?
+                }
+                crate::catalog_session::import::Value::Skipped => {
+                    send(sender, cancel, Event::Skipped)?
+                }
+                crate::catalog_session::import::Value::Header {
+                    path,
+                    fingerprint,
+                    observation,
+                } => {
+                    let path = path.to_path()?;
+                    send(
+                        sender,
+                        cancel,
+                        Event::Header(Box::new(Header {
+                            path: path.clone(),
+                            fingerprint,
+                            observation,
+                        })),
+                    )?;
+                    let embedded = Source {
+                        kind: "embedded".into(),
+                        locator: location_bytes(&path),
+                        display: path.to_string_lossy().into_owned(),
+                        ambiguous: false,
+                        provenance: serde_json::json!({"discovery":"original file"}),
+                    };
+                    for source in
+                        std::iter::once(embedded).chain(discovery.sidecars_indexed(&path, cancel)?)
+                    {
+                        let prepared = match remote.call(
+                            crate::catalog_session::import::Action::Inspect {
+                                source: source.clone(),
+                            },
+                            cancel,
+                        )? {
+                            crate::catalog_session::import::Value::Inspection {
+                                source: expected_source,
+                                bytes,
+                                checksum,
+                            } => {
+                                ensure!(
+                                    expected_source.kind == source.kind
+                                        && expected_source.locator == source.locator
+                                        && expected_source.display == source.display
+                                        && expected_source.ambiguous == source.ambiguous
+                                        && expected_source.provenance == source.provenance,
+                                    "managed inspection source changed"
+                                );
+                                let length = usize::try_from(bytes.0)?;
+                                ensure!(
+                                    length <= crate::catalog_session::import::MAX_INSPECTION_BYTES,
+                                    "managed inspection byte limit"
+                                );
+                                let mut encoded = Vec::new();
+                                encoded.try_reserve_exact(length)?;
+                                while encoded.len() < length {
+                                    let offset = encoded.len() as u64;
+                                    match remote.call(
+                                        crate::catalog_session::import::Action::Read {
+                                            offset: crate::application::U64(offset),
+                                        },
+                                        cancel,
+                                    )? {
+                                        crate::catalog_session::import::Value::Chunk {
+                                            offset: actual,
+                                            bytes,
+                                            ..
+                                        } => {
+                                            ensure!(
+                                                actual.0 == offset
+                                                    && bytes.len() <= length - encoded.len(),
+                                                "managed inspection chunk range"
+                                            );
+                                            encoded.extend_from_slice(&bytes);
+                                        }
+                                        _ => {
+                                            anyhow::bail!("managed inspection chunk reply mismatch")
+                                        }
+                                    }
+                                }
+                                ensure!(
+                                    blake3::hash(&encoded).to_hex().as_str() == checksum,
+                                    "managed inspection transfer checksum"
+                                );
+                                match remote.call(
+                                    crate::catalog_session::import::Action::FinishInspection,
+                                    cancel,
+                                )? {
+                                    crate::catalog_session::import::Value::InspectionFinished => {}
+                                    _ => anyhow::bail!("managed inspection finish reply mismatch"),
+                                }
+                                let inspection =
+                                    crate::catalog_session::import::decode_inspection(&encoded)?;
+                                catalog_metadata::prepare_import_inspection(
+                                    source.clone(),
+                                    inspection,
+                                    cancel,
+                                )?
+                            }
+                            crate::catalog_session::import::Value::InspectionFailed {
+                                source: expected_source,
+                                message,
+                            } => {
+                                ensure!(
+                                    expected_source.kind == source.kind
+                                        && expected_source.locator == source.locator
+                                        && expected_source.display == source.display
+                                        && expected_source.ambiguous == source.ambiguous
+                                        && expected_source.provenance == source.provenance,
+                                    "managed failed-inspection source changed"
+                                );
+                                catalog_metadata::prepare_import_failure(
+                                    source.clone(),
+                                    message,
+                                    cancel,
+                                )?
+                            }
+                            _ => anyhow::bail!("managed inspection begin reply mismatch"),
+                        };
+                        send(sender, cancel, Event::Source(Box::new(prepared)))?;
+                        let Command::InspectionCommitted(reply) =
+                            commands.recv().map_err(|_| {
+                                anyhow::anyhow!(
+                                    "managed import inspection acknowledgement channel closed"
+                                )
+                            })?
+                        else {
+                            anyhow::bail!("managed import command ordering mismatch")
+                        };
+                        let result = remote
+                            .call(
+                                crate::catalog_session::import::Action::CommitInspection,
+                                &AtomicBool::new(false),
+                            )
+                            .and_then(|value| {
+                                ensure!(
+                                    matches!(
+                                        value,
+                                        crate::catalog_session::import::Value::InspectionCommitted
+                                    ),
+                                    "managed inspection commit reply mismatch"
+                                );
+                                Ok(())
+                            });
+                        let failed = result.is_err();
+                        let _ = reply.send(result);
+                        ensure!(!failed, "managed inspection commit failed");
+                    }
+                    send(sender, cancel, Event::End)?;
+                    let Command::Recheck(reply) = commands
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("managed import recheck channel closed"))?
+                    else {
+                        anyhow::bail!("managed import command ordering mismatch")
+                    };
+                    let result = remote
+                        .call(
+                            crate::catalog_session::import::Action::Recheck,
+                            &AtomicBool::new(false),
+                        )
+                        .and_then(|value| {
+                            ensure!(
+                                matches!(value, crate::catalog_session::import::Value::Rechecked),
+                                "managed import recheck reply mismatch"
+                            );
+                            Ok(())
+                        });
+                    let failed = result.is_err();
+                    let _ = reply.send(result);
+                    ensure!(!failed, "managed import recheck failed");
+                    let Command::FileCommitted(reply) = commands
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("managed import commit channel closed"))?
+                    else {
+                        anyhow::bail!("managed import command ordering mismatch")
+                    };
+                    let result = remote
+                        .call(
+                            crate::catalog_session::import::Action::CommitFile,
+                            &AtomicBool::new(false),
+                        )
+                        .and_then(|value| {
+                            ensure!(
+                                matches!(
+                                    value,
+                                    crate::catalog_session::import::Value::FileCommitted
+                                ),
+                                "managed import commit reply mismatch"
+                            );
+                            Ok(())
+                        });
+                    let failed = result.is_err();
+                    let _ = reply.send(result);
+                    ensure!(!failed, "managed import commit failed");
+                }
+                crate::catalog_session::import::Value::WalkFinished => {
+                    send(sender, cancel, Event::Finished)?;
+                    let Command::Retire(reply) = commands
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("managed import retirement channel closed"))?
+                    else {
+                        anyhow::bail!("managed import command ordering mismatch")
+                    };
+                    let result = remote
+                        .call(
+                            crate::catalog_session::import::Action::Finish,
+                            &AtomicBool::new(false),
+                        )
+                        .and_then(|value| {
+                            ensure!(
+                                matches!(value, crate::catalog_session::import::Value::Finished),
+                                "managed import finish reply mismatch"
+                            );
+                            Ok(())
+                        });
+                    let failed = result.is_err();
+                    let _ = reply.send(result);
+                    ensure!(!failed, "managed import retirement failed");
+                    return Ok(());
+                }
+                _ => anyhow::bail!("managed import walk reply mismatch"),
+            }
+        }
+    })();
+    if let Err(error) = run {
+        if let Err(cleanup_error) = custody.remote().abort() {
+            return Err(error).context(format!(
+                "managed import cleanup retained after failure: {cleanup_error:#}"
+            ));
+        }
+        custody.retired();
+        return Err(error);
+    }
+    custody.retired();
+    Ok(())
 }
 impl Drop for SinglePreparation {
     fn drop(&mut self) {

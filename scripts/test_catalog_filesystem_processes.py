@@ -35,6 +35,7 @@ def main():
     ]
     if os.name == "posix":
         tests.append("filesystem_tests::actual_f_binary_shm_alias_read_does_not_release_c_posix_lock")
+        tests.append("filesystem_tests::actual_f_import_alias_read_and_lock_custody_preserve_c_posix_sql_lock")
     for test in tests:
         name = f"application::desktop::{test}"
         command = ["cargo", "test", "--locked", "--lib"]

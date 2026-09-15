@@ -1007,6 +1007,7 @@ pub(crate) fn managed_export_registry_layouts() -> [(usize, usize); 5] {
 }
 pub mod export_native;
 pub mod export_stage;
+pub mod import;
 pub mod native;
 pub mod preview_io;
 pub mod preview_stage;
@@ -1017,6 +1018,17 @@ pub mod storage;
 pub mod store;
 
 pub trait CatalogFilesystem: Send + Sync {
+    fn import_call(
+        &self,
+        _request: &import::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<import::Reply> {
+        Err(crate::filesystem_worker::wire::Failure::new(
+            crate::filesystem_worker::wire::FailureKind::Rejected,
+            "filesystem owner does not support managed import custody",
+        )
+        .into())
+    }
     fn storage_call(
         &self,
         _request: &storage::Request,
@@ -1838,6 +1850,32 @@ impl CatalogSessionAuthority {
         match &self.mode {
             AuthorityMode::Managed { pool, .. } => Some(pool),
             _ => None,
+        }
+    }
+    pub(crate) fn import_call(
+        &self,
+        request: &import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<Option<import::Reply>> {
+        match &self.mode {
+            AuthorityMode::Legacy(_) => Ok(None),
+            AuthorityMode::Managed {
+                filesystem, root, ..
+            } => {
+                ensure!(
+                    &request.root == root,
+                    "managed import root differs from catalog session"
+                );
+                let reply = filesystem.import_call(request, cancel)?;
+                reply.validate(request)?;
+                Ok(Some(reply))
+            }
+        }
+    }
+    pub(crate) fn managed_import_root(&self) -> Option<RootCapability> {
+        match &self.mode {
+            AuthorityMode::Managed { root, .. } => Some(root.clone()),
+            AuthorityMode::Legacy(_) => None,
         }
     }
     pub(crate) fn prepare_export_directory(

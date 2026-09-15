@@ -64,6 +64,7 @@ pub(super) enum Call {
     ExportStage(Box<crate::catalog_session::export_stage::Request>),
     MetadataFiles(Box<crate::catalog_session::metadata_files::Request>),
     ExportExecutor(crate::catalog_session::export_executor::Request),
+    Import(crate::catalog_session::import::Request),
     ExportNative(Box<crate::catalog_session::export_native::Request>),
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
@@ -89,6 +90,7 @@ impl Call {
             || matches!(self, Self::ExportProfile(request) if request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if request.cleanup())
             || matches!(self, Self::ExportPublication(request) if request.cleanup())
+            || matches!(self, Self::Import(request) if request.cleanup())
     }
     fn cancellable(&self) -> bool {
         matches!(
@@ -111,6 +113,7 @@ impl Call {
             || matches!(self, Self::ExportProfile(request) if !request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if !request.cleanup())
             || matches!(self, Self::ExportPublication(request) if !request.cleanup())
+            || matches!(self, Self::Import(request) if !request.cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -160,6 +163,7 @@ impl Call {
             }
             Self::MetadataFiles(request) => request.validate(),
             Self::ExportExecutor(request) => request.validate(),
+            Self::Import(request) => request.validate(),
             Self::ReadPreviewConfiguration(path) => store::path(path),
             Self::PrepareExportDirectory(request) => request.validate(),
             Self::ExportDestinationSnapshot(request) => request.validate(),
@@ -183,6 +187,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<crate::catalog_session::export_stage::Request>(),
         std::mem::size_of::<crate::catalog_session::metadata_files::Request>(),
         std::mem::size_of::<crate::catalog_session::export_executor::Request>(),
+        std::mem::size_of::<crate::catalog_session::import::Request>(),
         std::mem::size_of::<crate::catalog_session::export_native::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
@@ -224,6 +229,7 @@ pub(super) enum Value {
     ExportStage(crate::catalog_session::export_stage::Reply),
     MetadataFiles(crate::catalog_session::metadata_files::Reply),
     ExportExecutor(crate::catalog_session::export_executor::Reply),
+    Import(crate::catalog_session::import::Reply),
     ExportNative(crate::catalog_session::export_native::Status),
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
@@ -606,6 +612,10 @@ fn encode_packet(packet: &Packet, cap: usize) -> Result<Vec<u8>> {
             outcome: Ok(Value::ExportProfile(r)),
             ..
         } => r.binary(),
+        Body::Reply {
+            outcome: Ok(Value::Import(r)),
+            ..
+        } => r.value.binary(),
         _ => return encode(packet, cap),
     };
     crate::catalog_session::preview_io::pack(packet, binary, cap)
@@ -652,6 +662,10 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
             outcome: Ok(Value::ExportProfile(r)),
             ..
         } => r.set_binary(binary)?,
+        Body::Reply {
+            outcome: Ok(Value::Import(r)),
+            ..
+        } => r.value.set_binary(binary)?,
         _ => ensure!(binary.is_empty(), "unexpected relay binary trailer"),
     }
     ensure!(&packet.binding == binding, "relay nonce/epoch mismatch");
@@ -1241,6 +1255,7 @@ impl Parent {
                 Call::ExportExecutor(request) => Value::ExportExecutor(
                     self.export_native_owner()?.executor_call(request, cancel)?,
                 ),
+                Call::Import(request) => Value::Import(self.client.import_call(request, cancel)?),
                 Call::PreviewIo(request) => {
                     Value::PreviewIo(self.client.preview_io_call(request, cancel)?)
                 }
@@ -1702,6 +1717,23 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("unexpected metadata file relay reply"),
         }
     }
+    fn import_call(
+        &self,
+        request: &crate::catalog_session::import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::import::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch,
+            "managed import relay authority"
+        );
+        match self.call(Call::Import(request.clone()), cancel)? {
+            Value::Import(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected managed import relay reply"),
+        }
+    }
     fn export_executor_call(
         &self,
         request: &crate::catalog_session::export_executor::Request,
@@ -2073,6 +2105,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::ExportStage(request), Value::ExportStage(reply)) => reply.validate(request)?,
         (Call::MetadataFiles(request), Value::MetadataFiles(reply)) => reply.validate(request)?,
         (Call::ExportExecutor(request), Value::ExportExecutor(reply)) => reply.validate(request)?,
+        (Call::Import(request), Value::Import(reply)) => reply.validate(request)?,
         (Call::PreviewStore(request), Value::PreviewStore(reply)) => {
             store::validate_reply(request, reply)?
         }
@@ -2255,4 +2288,37 @@ pub(crate) fn admit_export_executor_reply(
         anyhow::bail!("export executor C reply round trip");
     };
     decoded.validate(request)
+}
+
+#[cfg(test)]
+pub(crate) fn admit_import_reply(
+    request: &crate::catalog_session::import::Request,
+    reply: &crate::catalog_session::import::Reply,
+) -> Result<()> {
+    reply.validate(request)?;
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: request.root.epoch.clone(),
+    };
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Reply {
+            id: U64(u64::MAX),
+            outcome: Ok(Value::Import(reply.clone())),
+        },
+    };
+    let encoded = encode_packet(&packet, BYTES)?;
+    let Body::Reply {
+        outcome: Ok(Value::Import(decoded)),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        anyhow::bail!("import C reply round trip");
+    };
+    decoded.validate(request)?;
+    ensure!(
+        decoded.value.binary() == reply.value.binary(),
+        "import C binary trailer changed"
+    );
+    Ok(())
 }
