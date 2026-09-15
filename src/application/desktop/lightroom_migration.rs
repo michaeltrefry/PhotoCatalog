@@ -36,6 +36,10 @@ pub(crate) struct Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Action {
+    InspectTarget {
+        catalog: String,
+        destination: NativePath,
+    },
     AcquireTarget {
         catalog: Option<String>,
         destination: NativePath,
@@ -66,6 +70,7 @@ pub(crate) enum Action {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
+    Inspected,
     Target,
     Attempted,
     Held,
@@ -277,6 +282,21 @@ impl Request {
     pub(crate) fn validate(&self) -> Result<()> {
         self.guard.validate().map_err(invalid)?;
         match &self.action {
+            Action::InspectTarget {
+                catalog,
+                destination,
+            } => {
+                if catalog.is_empty() || catalog.len() > 128 {
+                    return Err(invalid("migration catalog token allowance"));
+                }
+                let units = match destination {
+                    NativePath::UnixBytes(v) => v.len(),
+                    NativePath::WindowsWide(v) => v.len(),
+                };
+                if !(1..=crate::catalog_session::PATH_UNITS).contains(&units) {
+                    return Err(invalid("migration native path allowance"));
+                }
+            }
             Action::AcquireWrite {
                 target,
                 request_digest,
@@ -759,6 +779,54 @@ impl Actor {
     ) -> Result<Snapshot> {
         request.validate()?;
         encoded_len(&request, request_cap(&request, &self.config.limits))?;
+        if let Action::InspectTarget {
+            catalog,
+            destination,
+        } = &request.action
+        {
+            let open = self
+                .open
+                .as_ref()
+                .ok_or_else(|| error(ErrorCode::StaleSession, "migration catalog is not open"))?;
+            if open.closing {
+                return Err(error(ErrorCode::Closed, "migration catalog is closing"));
+            }
+            if self.managed.is_none() || open.token != *catalog {
+                return Err(error(
+                    ErrorCode::StaleSession,
+                    "migration inspection catalog token changed",
+                ));
+            }
+            let pin = managed_pin(open)?;
+            let path = destination.to_path().map_err(invalid)?;
+            crate::lightroom::source::reject_links(&path).map_err(invalid)?;
+            if std::fs::canonicalize(&path).map_err(native)?
+                != pin.root.to_path().map_err(invalid)?
+            {
+                return Err(error(
+                    ErrorCode::StaleSession,
+                    "migration inspection path changed",
+                ));
+            }
+            open.catalog
+                .session
+                .verify_migration_identity(None, &cancel.0)
+                .map_err(native)?;
+            let snapshot = Snapshot {
+                guard: request.guard,
+                phase: Phase::Inspected,
+                catalog: Some(catalog.clone()),
+                destination: Some(pin),
+                sequence: None,
+                request_digest: None,
+                write_kind: None,
+                cancel_requested: false,
+                progress: None,
+                failure: None,
+            };
+            encoded_len(&Reply::Ok(snapshot.clone()), self.config.limits.reply_bytes)?;
+            return Ok(snapshot);
+        }
         if let Action::AcquireTarget {
             catalog,
             destination,
@@ -928,7 +996,7 @@ impl Actor {
             ));
         }
         match request.action {
-            Action::AcquireTarget { .. } => unreachable!(),
+            Action::AcquireTarget { .. } | Action::InspectTarget { .. } => unreachable!(),
             Action::Status => {}
             Action::Cancel => target.cancel(),
             Action::Progress {

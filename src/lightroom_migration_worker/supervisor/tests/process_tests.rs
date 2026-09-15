@@ -116,6 +116,14 @@ fn owned_executor_fixture() -> Result<()> {
         request_blake3: request.digest,
         build: crate::lightroom_migration_worker::worker::build_identity().into(),
     })?;
+    if mode == "rejected" {
+        output.publish(&ChildFrame::Failed {
+            guard: request.guard.clone(),
+            detail: "managed fixture rejected the operation".into(),
+            poisoned: false,
+        })?;
+        std::process::exit(0);
+    }
     let audit = Audit::new(Arc::new(AtomicBool::new(false)), vec![])?;
     let scope = audit.install()?;
     let review = DestinationReview::existing(&root, None, &audit)?;
@@ -159,7 +167,7 @@ fn owned_executor_fixture() -> Result<()> {
     phase.grow(12345)?;
     let verified = lease.clone();
     let writers = Writers::with_external(Arc::new(Grants {
-        controls,
+        controls: controls.clone(),
         output: output.clone(),
         write: WriteKind::Catalog,
         target_token: target,
@@ -177,11 +185,26 @@ fn owned_executor_fixture() -> Result<()> {
             // The parent must retain its permit until it has reaped this PID.
             std::process::exit(75);
         }
-        ensure!(mode == "normal", "unknown synthetic helper mode");
+        ensure!(
+            matches!(mode.as_str(), "normal" | "streamed_normal"),
+            "unknown synthetic helper mode"
+        );
     }
     drop(writers);
     drop(lease);
     drop(scope);
+    if mode == "streamed_normal" {
+        let value = serde_json::json!({"committed": true});
+        let measured = crate::lightroom_migration_worker::protocol::result::measure(&value, 1024)?;
+        let grant = controls.request_result(&measured, 1024, output.as_ref())?;
+        crate::lightroom_migration_worker::protocol::result::publish(
+            &value,
+            grant,
+            &request.guard,
+            output.as_ref(),
+        )?;
+        std::process::exit(0);
+    }
     let result = "{\"committed\":true}";
     output.publish(&ChildFrame::Result {
         guard: request.guard.clone(),
@@ -974,5 +997,309 @@ fn lm_supervisor_batch2_joined_broker_primary_replaces_secondary_pending_cancel(
     println!(
         "LM_BROKER_PRIMARY_AFTER_PENDING required=2 available=1 secondary=canceled lm_pid={lm_pid} source_pid={source_pid} checked_reap=true held_after_drain=60 final_charge=0"
     );
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch4_actual_executor_reap_releases_operation_grant_retains_only_result()
+-> Result<()> {
+    let (_temp, catalog, parent, _needs) = setup()?;
+    let released = parent.released.clone();
+    let pool = crate::preview::ByteBudget::new(2 * 1024 * 1024 * 1024)?;
+    let grant =
+        crate::lightroom_migration_worker::memory::SharedAllocationGrant::new(pool.clone())?;
+    let budget = MemoryBudget::from_parent(grant.clone());
+    let result_budget = MemoryBudget::from_shared(pool.clone());
+    let request = serde_json::to_string(&parent.root)?;
+    let mut pid = None;
+    let operation = execute_operation_with_broker_and_result_budget(
+        |stop| {
+            let process = Process::spawn_test_command_owned(
+                command("streamed_normal").map_err(|error| SpawnFailure {
+                    error,
+                    process: None,
+                })?,
+                stop,
+            )?;
+            pid = Some(process.pid());
+            Ok(process)
+        },
+        None,
+        guard(),
+        &request,
+        Arc::new(Stop::default()),
+        Instant::now() + Duration::from_secs(20),
+        parent,
+        budget,
+        result_budget,
+        &[],
+        Some(1024),
+    );
+    drop(grant);
+    let result = operation.drain_blocking().into_result()?;
+    let text = "{\"committed\":true}";
+    let digest = blake3::hash(text.as_bytes()).to_hex().to_string();
+    assert_eq!(result.identity(), Some((text.len(), digest.as_str())));
+    assert_eq!(result.page_count(), 1);
+    assert_eq!(result.page(0), Some(text));
+    let storage =
+        crate::lightroom_migration_worker::protocol::result::retained_storage_bytes(text.len())?.0;
+    assert_eq!(pool.used(), storage as u64);
+    assert!(!released.lock().unwrap().is_empty());
+    assert_eq!(
+        catalog
+            .db
+            .query_row("SELECT value FROM lm_owned_process_probe", [], |row| row
+                .get::<_, String>(
+                0
+            ))?,
+        "committed by sole lock owner"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            unsafe { libc::kill(pid.context("spawned PID")? as i32, 0) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    drop(result);
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch4_managed_rejection_releases_operation_charge_after_checked_reap()
+-> Result<()> {
+    managed_rejection_retention(false)
+}
+
+#[test]
+fn lm_supervisor_batch4_managed_rejection_unknown_wait_retains_charge_until_checked_retry()
+-> Result<()> {
+    managed_rejection_retention(true)
+}
+
+fn managed_rejection_retention(unknown_wait: bool) -> Result<()> {
+    let (_temp, _catalog, parent, _needs) = setup()?;
+    let pool = crate::preview::ByteBudget::new(2 * 1024 * 1024 * 1024)?;
+    let grant =
+        crate::lightroom_migration_worker::memory::SharedAllocationGrant::new(pool.clone())?;
+    let budget = MemoryBudget::from_parent(grant);
+    let request = serde_json::to_string(&parent.root)?;
+    let mut pid = None;
+    let mut operation = execute_operation_with_broker_and_result_budget(
+        |stop| {
+            let mut process = Process::spawn_test_command_owned(
+                command(if unknown_wait {
+                    "hang_before_input"
+                } else {
+                    "rejected"
+                })
+                .map_err(|error| SpawnFailure {
+                    error,
+                    process: None,
+                })?,
+                stop,
+            )?;
+            pid = Some(process.pid());
+            if unknown_wait {
+                process.inject_wait_failures(1);
+                return Err(SpawnFailure {
+                    error: anyhow::anyhow!("managed fixture rejected the operation"),
+                    process: Some(process),
+                });
+            }
+            Ok(process)
+        },
+        None,
+        guard(),
+        &request,
+        Arc::new(Stop::default()),
+        Instant::now() + Duration::from_secs(20),
+        parent,
+        budget,
+        MemoryBudget::from_shared(pool.clone()),
+        &[],
+        Some(1024),
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    while !operation.poll() {
+        ensure!(Instant::now() < until, "managed rejection deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let Operation::DrainPending(pending) = &operation else {
+        anyhow::bail!("rejection skipped checked drain")
+    };
+    let failure = pending.failure().context("retained rejection")?;
+    assert!(
+        matches!(&failure.cause, FailureCause::Rejected(detail) if detail == "managed fixture rejected the operation")
+    );
+    assert!(!failure.poisoned && !failure.outcome_unknown);
+    let retained = pool.used();
+    assert!(retained > FAILURE_BYTES as u64);
+    if unknown_wait {
+        assert!(operation.retry_drain().is_none());
+        let Operation::DrainPending(pending) = &operation else {
+            unreachable!()
+        };
+        let failure = pending
+            .failure()
+            .context("unknown wait retains original rejection")?;
+        assert!(failure.poisoned && failure.outcome_unknown);
+        assert_eq!(pool.used(), retained);
+    }
+    while operation.retry_drain().is_none() {
+        ensure!(Instant::now() < until, "managed rejection drain deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let Operation::Drained(Drained::Failed(failure)) = &operation else {
+        anyhow::bail!("rejection lost at drain")
+    };
+    assert!(
+        matches!(&failure.cause, FailureCause::Rejected(detail) if detail == "managed fixture rejected the operation")
+    );
+    assert_eq!(failure.poisoned, unknown_wait);
+    assert_eq!(failure.outcome_unknown, unknown_wait);
+    assert_eq!(pool.used(), FAILURE_BYTES as u64);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            unsafe { libc::kill(pid.context("spawned PID")? as i32, 0) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    drop(operation);
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch4_setup_failure_retention_uses_same_pool_and_preserves_exact_refusal()
+-> Result<()> {
+    for available in [FAILURE_BYTES, FAILURE_BYTES - 1] {
+        let (_temp, _catalog, parent, _needs) = setup()?;
+        let pool = crate::preview::ByteBudget::new((12345 + available) as u64)?;
+        let grant =
+            crate::lightroom_migration_worker::memory::SharedAllocationGrant::new(pool.clone())?;
+        let budget = MemoryBudget::from_parent(grant);
+        let mut input_owner = budget.reservation();
+        input_owner.grow(12345)?;
+        drop(input_owner);
+        let mut invalid = guard();
+        invalid.session.clear();
+        let operation = execute_operation_with_broker_and_result_budget(
+            |_| panic!("invalid guard cannot spawn"),
+            None,
+            invalid,
+            "{}",
+            Arc::new(Stop::default()),
+            Instant::now() + Duration::from_secs(10),
+            parent,
+            budget,
+            MemoryBudget::from_shared(pool.clone()),
+            &[],
+            Some(1024),
+        );
+        let Operation::Drained(Drained::Failed(failure)) = &operation else {
+            anyhow::bail!("setup failure must be drained")
+        };
+        assert!(!failure.poisoned && !failure.outcome_unknown);
+        if available == FAILURE_BYTES {
+            assert!(
+                matches!(&failure.cause, FailureCause::Rejected(detail) if !detail.is_empty() && detail.len() <= FAILURE_BYTES)
+            );
+            assert_eq!(pool.used(), FAILURE_BYTES as u64);
+        } else {
+            assert!(
+                matches!(&failure.cause, FailureCause::ResourceLimit(limit) if (limit.required, limit.available) == (FAILURE_BYTES, available))
+            );
+            assert_eq!(pool.used(), 0);
+        }
+        drop(operation);
+        assert_eq!(pool.used(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_batch4_first_failure_during_unknown_wait_uses_retained_failure_budget()
+-> Result<()> {
+    let pool = crate::preview::ByteBudget::new((12345 + FAILURE_BYTES) as u64)?;
+    let grant =
+        crate::lightroom_migration_worker::memory::SharedAllocationGrant::new(pool.clone())?;
+    let budget = MemoryBudget::from_parent(grant);
+    let mut memory = budget.reservation();
+    memory.grow(12345)?;
+    drop(budget);
+    let mut process =
+        Process::spawn_test_command(command("hang_before_input")?, Arc::new(Stop::default()))?;
+    let pid = process.pid();
+    process.inject_wait_failures(1);
+    let state = State::new_streaming(
+        Admit {
+            writers: Arc::new(Writers::default()),
+            releases: Arc::new(Mutex::new(vec![])),
+        },
+        guard(),
+        "a".repeat(64),
+        memory,
+        MemoryBudget::from_shared(pool.clone()).reservation(),
+        1024,
+    );
+    let mut pending = DrainPending::new(
+        Owned {
+            process: Some(process),
+            broker: None,
+            state,
+            lm_drained: false,
+            broker_drained: false,
+            drain_fault: None,
+            primary_broker_failure: None,
+        },
+        None,
+        None,
+    );
+    assert!(pending.retry_drain().is_none());
+    assert!(
+        matches!(&pending.failure().unwrap().cause, FailureCause::Rejected(detail) if detail == "injected migration child wait failure")
+    );
+    assert_eq!(pool.used(), (12345 + FAILURE_BYTES) as u64);
+    let until = Instant::now() + Duration::from_secs(10);
+    let drained = loop {
+        if let Some(drained) = pending.retry_drain() {
+            break drained;
+        }
+        ensure!(
+            Instant::now() < until,
+            "unknown wait checked retry deadline"
+        );
+        thread::sleep(Duration::from_millis(2));
+    };
+    let Drained::Failed(failure) = &drained else {
+        anyhow::bail!("unknown wait failure disappeared")
+    };
+    assert!(failure.poisoned && failure.outcome_unknown);
+    assert!(
+        matches!(&failure.cause, FailureCause::Rejected(detail) if detail == "injected migration child wait failure")
+    );
+    assert_eq!(pool.used(), FAILURE_BYTES as u64);
+    #[cfg(unix)]
+    {
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    drop(drained);
+    assert_eq!(pool.used(), 0);
     Ok(())
 }

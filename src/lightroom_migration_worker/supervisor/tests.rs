@@ -884,3 +884,133 @@ fn lm_executor_batch3_pre_admission_failure_is_bounded_guarded_and_terminal() ->
     assert!(valid.held.is_none());
     Ok(())
 }
+
+#[test]
+fn lm_supervisor_batch4_shared_retaining_grant_retries_exact_result_and_releases_at_drain()
+-> Result<()> {
+    let bytes = RESULT_BYTES + 37;
+    let (storage, expected_pages) =
+        crate::lightroom_migration_worker::protocol::result::retained_storage_bytes(bytes)?;
+    let operation_bytes = 17usize + 31;
+    let pool = crate::preview::ByteBudget::new((storage + operation_bytes).try_into()?)?;
+    let grant =
+        crate::lightroom_migration_worker::memory::SharedAllocationGrant::new(pool.clone())?;
+    let operation_budget = MemoryBudget::from_parent(grant.clone());
+    let budget = MemoryBudget::from_shared(pool.clone());
+    let mut competitor = budget.reservation();
+    competitor.grow(1)?;
+    let mut state = State::new_streaming(
+        Admit {
+            writers: Arc::new(Writers::default()),
+            releases: Arc::new(Mutex::new(vec![])),
+        },
+        guard(),
+        "a".repeat(64),
+        operation_budget.reservation(),
+        budget.reservation(),
+        bytes,
+    );
+    state.memory.grow(17)?;
+    let mut nested = operation_budget.reservation();
+    nested.grow(31)?;
+    drop(nested);
+    assert_eq!(pool.used(), (operation_bytes + 1) as u64);
+    drop(operation_budget);
+    drop(grant);
+    let stop = Arc::new(Stop::default());
+    admitted(&mut state, &stop)?;
+    let digest = {
+        let mut hash = blake3::Hasher::new();
+        let block = [b'x'; crate::lightroom_migration_worker::protocol::result::CHUNK];
+        let mut remaining = bytes;
+        while remaining != 0 {
+            let length = remaining.min(block.len());
+            hash.update(&block[..length]);
+            remaining -= length;
+        }
+        hash.finalize().to_hex().to_string()
+    };
+    let begin = || ChildFrame::BeginResult {
+        guard: guard(),
+        bytes: U64(bytes as u64),
+        blake3: digest.clone(),
+    };
+    let error = state
+        .accept_wait(begin(), &stop, Instant::now() + Duration::from_secs(5))
+        .unwrap_err();
+    let limit = error
+        .downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>()
+        .context("typed streamed-result ResourceLimit")?;
+    assert_eq!((limit.required, limit.available), (storage, storage - 1));
+    let typed = Failure::from_error(error, false, false, &budget);
+    assert!(matches!(
+        typed.cause,
+        FailureCause::ResourceLimit(crate::lightroom_migration_worker::memory::ResourceLimit {
+            required,
+            available
+        }) if (required, available) == (storage, storage - 1)
+    ));
+    assert!(!typed.poisoned && !typed.outcome_unknown);
+    assert!(state.streamed_result.is_none());
+    assert_eq!(pool.used(), (operation_bytes + 1) as u64);
+    drop(competitor);
+    assert!(matches!(
+        state.accept_wait(
+            begin(),
+            &stop,
+            Instant::now() + Duration::from_secs(5)
+        )?,
+        Some(ParentFrame::ResultGrant { bytes: U64(actual), .. }) if actual == bytes as u64
+    ));
+    assert_eq!(pool.used(), (storage + operation_bytes) as u64);
+    let mut offset = 0usize;
+    while offset != bytes {
+        let length =
+            (bytes - offset).min(crate::lightroom_migration_worker::protocol::result::CHUNK);
+        state.accept_wait(
+            ChildFrame::Result {
+                guard: guard(),
+                offset: U64(offset as u64),
+                text: "x".repeat(length),
+            },
+            &stop,
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        offset += length;
+    }
+    state.accept_wait(
+        ChildFrame::Finished {
+            guard: guard(),
+            result_blake3: digest.clone(),
+            bytes: U64(bytes as u64),
+        },
+        &stop,
+        Instant::now() + Duration::from_secs(5),
+    )?;
+    let mut pending = DrainPending::new(
+        Owned {
+            process: None,
+            broker: None,
+            state,
+            lm_drained: false,
+            broker_drained: false,
+            drain_fault: None,
+            primary_broker_failure: None,
+        },
+        None,
+        None,
+    );
+    let result = match pending.retry_drain().context("checked drain")? {
+        Drained::Complete(result) => result,
+        Drained::Failed(failure) => return Err(failure.into()),
+    };
+    assert_eq!(result.identity(), Some((bytes, digest.as_str())));
+    assert_eq!(result.page_count(), expected_pages);
+    assert!(result.page(0).is_some());
+    assert!(result.page(expected_pages).is_none());
+    drop(pending);
+    assert_eq!(pool.used(), storage as u64);
+    drop(result);
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}

@@ -9,7 +9,7 @@ pub(super) const CONFIG_BYTES: usize = 4 * 1024 * 1024;
 // reply budget is smaller than a serialized ResourceLimit error.
 pub(super) const ERROR_BYTES: usize = 1024;
 const HEADER: usize = 48;
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

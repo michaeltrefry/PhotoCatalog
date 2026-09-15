@@ -2332,6 +2332,10 @@ mod tests {
             .write([9; 16], &mut input)
             .unwrap();
         let actions = [
+            Action::InspectTarget {
+                catalog: "catalog".into(),
+                destination: NativePath::from_path(std::path::Path::new("/must-not-open")),
+            },
             Action::AcquireTarget {
                 catalog: None,
                 destination: NativePath::from_path(std::path::Path::new("/must-not-create")),
@@ -2398,7 +2402,7 @@ mod tests {
         .unwrap();
         assert_eq!(dispatched, 4);
         let state = shared.lock().unwrap();
-        for id in 1..=7 {
+        for id in 1..=8 {
             let ChildPending::Reply(message) = state.pending.get(&id).unwrap() else {
                 panic!()
             };
@@ -2407,7 +2411,7 @@ mod tests {
             else {
                 panic!()
             };
-            assert!(if id <= 3 {
+            assert!(if id <= 4 {
                 matches!(failure.code, ErrorCode::Closed)
             } else {
                 matches!(failure.code, ErrorCode::Native)

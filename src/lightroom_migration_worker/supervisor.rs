@@ -90,6 +90,9 @@ struct State<A: Admission> {
     streamed_maximum: Option<usize>,
     terminal: Option<Result<()>>,
     terminal_poisoned: bool,
+    // Terminal failures use the same independently retained budget as saved results.
+    // Legacy callers keep their original single-budget behavior.
+    failure_budget: MemoryBudget,
     // Last: these reservations outlive every owner they fund.
     memory: Reservation,
     streamed_memory: Option<Reservation>,
@@ -133,7 +136,11 @@ impl<A: Admission> State<A> {
         streamed_maximum: Option<usize>,
         streamed_memory: Option<Reservation>,
     ) -> Self {
+        let failure_budget = streamed_memory
+            .as_ref()
+            .map_or_else(|| memory.budget(), Reservation::budget);
         Self {
+            failure_budget,
             admission: Some(admission),
             pending: None,
             guard,
@@ -950,7 +957,7 @@ impl<A: Admission> DrainPending<A> {
                         error,
                         true,
                         true,
-                        &owner.state.memory.budget(),
+                        &owner.state.failure_budget,
                     ));
                 }
                 return None;
@@ -965,7 +972,7 @@ impl<A: Admission> DrainPending<A> {
                     error,
                     true,
                     false,
-                    &owner.state.memory.budget(),
+                    &owner.state.failure_budget,
                 ));
             }
         }
@@ -981,10 +988,10 @@ impl<A: Admission> DrainPending<A> {
                 error,
                 true,
                 outcome_unknown || (owner.state.admitted && owner.state.terminal.is_none()),
-                &owner.state.memory.budget(),
+                &owner.state.failure_budget,
             ));
         }
-        let failure_budget = owner.state.memory.budget();
+        let failure_budget = owner.state.failure_budget.clone();
         let mut owner = self.owner.take().expect("completed drain owner");
         let drained = if let Some(failure) = self.failure.take() {
             Drained::Failed(failure)
@@ -1179,6 +1186,36 @@ fn execute_owned_operation<A: Admission>(
         streamed_result_maximum,
     )
 }
+/// Managed G callers separate retained operation grants from exact cached result
+/// ownership. Both budgets must wrap the same configured desktop ByteBudget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_operation_with_result_budget<A: Admission>(
+    executable: &Path,
+    guard: Guard,
+    operation: &str,
+    stop: Arc<Stop>,
+    until: Instant,
+    admission: A,
+    budget: MemoryBudget,
+    result_budget: MemoryBudget,
+    documents: &[InputPart<'_>],
+    result_maximum: usize,
+) -> Operation<A> {
+    execute_operation_with_broker_and_result_budget(
+        |stop| Process::spawn_owned(executable, stop),
+        Some(executable),
+        guard,
+        operation,
+        stop,
+        until,
+        admission,
+        budget,
+        result_budget,
+        documents,
+        Some(result_maximum),
+    )
+}
+
 fn execute_operation_with_broker<A: Admission>(
     spawn: impl FnOnce(Arc<Stop>) -> std::result::Result<Process, SpawnFailure>,
     source_executable: Option<&Path>,
@@ -1188,6 +1225,35 @@ fn execute_operation_with_broker<A: Admission>(
     until: Instant,
     admission: A,
     budget: MemoryBudget,
+    documents: &[InputPart<'_>],
+    streamed_result_maximum: Option<usize>,
+) -> Operation<A> {
+    let result_budget = budget.clone();
+    execute_operation_with_broker_and_result_budget(
+        spawn,
+        source_executable,
+        guard,
+        request,
+        stop,
+        until,
+        admission,
+        budget,
+        result_budget,
+        documents,
+        streamed_result_maximum,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn execute_operation_with_broker_and_result_budget<A: Admission>(
+    spawn: impl FnOnce(Arc<Stop>) -> std::result::Result<Process, SpawnFailure>,
+    source_executable: Option<&Path>,
+    guard: Guard,
+    request: &str,
+    stop: Arc<Stop>,
+    until: Instant,
+    admission: A,
+    budget: MemoryBudget,
+    result_budget: MemoryBudget,
     documents: &[InputPart<'_>],
     streamed_result_maximum: Option<usize>,
 ) -> Operation<A> {
@@ -1224,7 +1290,7 @@ fn execute_operation_with_broker<A: Admission>(
         // Source retirement; it is separate from per-query/result/core phases.
         memory.grow(super::memory::transport::payloads(source_executable.is_some())?.total()?)?;
         let (state, result_memory) = if let Some(maximum) = streamed_result_maximum {
-            let streamed_memory = budget.reservation();
+            let streamed_memory = result_budget.reservation();
             (
                 State::new_streaming(
                     admission,
@@ -1268,7 +1334,10 @@ fn execute_operation_with_broker<A: Admission>(
         Ok(setup) => setup,
         Err(error) => {
             return Operation::Drained(Drained::Failed(Failure::from_error(
-                error, false, false, &budget,
+                error,
+                false,
+                false,
+                &result_budget,
             )));
         }
     };
@@ -1287,7 +1356,7 @@ fn execute_operation_with_broker<A: Admission>(
         primary_broker_failure: None,
     };
     if let Some(error) = spawn_error {
-        let failure = Failure::from_error(error, false, false, &owner.state.memory.budget());
+        let failure = Failure::from_error(error, false, false, &owner.state.failure_budget);
         return Operation::DrainPending(DrainPending::new(owner, result_memory, Some(failure)));
     }
     if let Err(error) = send_inputs(
@@ -1321,7 +1390,7 @@ fn failure_for_owner<A: Admission>(owner: &Owned<A>, error: anyhow::Error) -> Fa
         error,
         owner.state.terminal_poisoned || (acted && !terminal_known),
         acted && !terminal_known,
-        &owner.state.memory.budget(),
+        &owner.state.failure_budget,
     )
 }
 

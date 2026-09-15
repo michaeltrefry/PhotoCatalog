@@ -28,6 +28,55 @@ pub(crate) trait AllocationGrant: Send + Sync {
         None
     }
 }
+/// G's monotonic operation grant. Nested reservations cannot release storage
+/// that may still be owned by LM or a Source. The last grant owner disappears
+/// only after checked descendant drain and all operation-funded values drop.
+pub(crate) struct SharedAllocationGrant {
+    pool: crate::preview::ByteBudget,
+    held: Mutex<Option<crate::preview::ByteReservation>>,
+}
+impl SharedAllocationGrant {
+    pub(crate) fn new(pool: crate::preview::ByteBudget) -> Result<Arc<Self>> {
+        usize::try_from(pool.snapshot().0)
+            .context("shared operation allowance exceeds target usize")?;
+        Ok(Arc::new(Self {
+            pool,
+            held: Mutex::new(None),
+        }))
+    }
+}
+impl AllocationGrant for SharedAllocationGrant {
+    fn reserve(&self, bytes: usize) -> Result<()> {
+        let bytes = u64::try_from(bytes).context("shared operation request overflow")?;
+        let mut held = self
+            .held
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared operation grant poisoned"))?;
+        let result = if let Some(held) = &mut *held {
+            held.grow_exact(bytes)
+        } else {
+            self.pool.reserve_exact(bytes).map(|reservation| {
+                *held = Some(reservation);
+            })
+        };
+        result.map_err(|refused| {
+            ResourceLimit {
+                required: usize::try_from(refused.required).expect("request originated as usize"),
+                available: usize::try_from(refused.available)
+                    .expect("pool validated for target usize"),
+            }
+            .into()
+        })
+    }
+    fn snapshot(&self) -> Option<Snapshot> {
+        let (limit, used) = self.pool.snapshot();
+        Some(Snapshot {
+            limit: limit as usize,
+            used: used as usize,
+            available: (limit - used) as usize,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub limit: usize,

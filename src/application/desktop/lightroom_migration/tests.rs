@@ -1184,3 +1184,130 @@ fn lm_desktop_relay_multipart_backing_is_charged_to_same_configured_pool() -> an
     assert_eq!(pool.used(), 0);
     Ok(())
 }
+
+#[test]
+fn lm_desktop_relay_inspect_target_returns_pin_without_target_or_writer_authority()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?.join("catalog");
+    let (_filesystem, mut actor, acquire) = open_actor(&root)?;
+    let Action::AcquireTarget {
+        catalog: Some(catalog),
+        destination,
+        expected,
+    } = &acquire.action
+    else {
+        panic!()
+    };
+    let snapshot = actor.migration_action(request(Action::InspectTarget {
+        catalog: catalog.clone(),
+        destination: destination.clone(),
+    }))?;
+    assert_eq!(snapshot.phase, Phase::Inspected);
+    assert_eq!(snapshot.destination, *expected);
+    assert!(snapshot.sequence.is_none() && snapshot.request_digest.is_none());
+    assert!(actor.migration.target.is_none());
+    drop(
+        actor
+            .open
+            .as_ref()
+            .unwrap()
+            .catalog
+            .writers
+            .enter(Priority::Foreground)?,
+    );
+    assert_eq!(actor.migration_action(acquire)?.phase, Phase::Target);
+    drain(&mut actor);
+    actor.close()?;
+    Ok(())
+}
+
+#[test]
+fn lm_desktop_relay_inspect_target_rejects_token_path_and_close_without_recovery_admission()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?.join("catalog");
+    let (_filesystem, mut actor, acquire) = open_actor(&root)?;
+    let Action::AcquireTarget {
+        catalog: Some(catalog),
+        destination,
+        ..
+    } = &acquire.action
+    else {
+        panic!()
+    };
+    let inspect = request(Action::InspectTarget {
+        catalog: catalog.clone(),
+        destination: destination.clone(),
+    });
+    assert!(!inspect.action.recovery());
+    assert!(
+        actor
+            .migration_action(request(Action::InspectTarget {
+                catalog: "changed".into(),
+                destination: destination.clone()
+            }))
+            .is_err()
+    );
+    assert!(
+        actor
+            .migration_action(request(Action::InspectTarget {
+                catalog: catalog.clone(),
+                destination: NativePath::from_path(root.parent().unwrap())
+            }))
+            .is_err()
+    );
+    actor.open.as_mut().unwrap().closing = true;
+    assert!(matches!(
+        actor.migration_action(inspect.clone()).unwrap_err().code,
+        ErrorCode::Closed
+    ));
+    actor.open.as_mut().unwrap().closing = false;
+    assert!(actor.migration.target.is_none());
+    actor.close()?;
+    assert!(actor.migration_action(inspect.clone()).is_err());
+    let shared = super::super::tests::shared(8);
+    shared.stop();
+    assert!(matches!(
+        Client::new(&shared).submit(inspect).err().unwrap().code,
+        ErrorCode::Closed
+    ));
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn lm_desktop_relay_inspected_pin_cannot_authorize_replaced_root() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let base = temp.path().canonicalize()?;
+    let root = base.join("catalog");
+    let moved = base.join("original-catalog");
+    let (_filesystem, mut actor, acquire) = open_actor(&root)?;
+    let Action::AcquireTarget {
+        catalog: Some(catalog),
+        destination,
+        ..
+    } = &acquire.action
+    else {
+        panic!()
+    };
+    let pin = actor
+        .migration_action(request(Action::InspectTarget {
+            catalog: catalog.clone(),
+            destination: destination.clone(),
+        }))?
+        .destination;
+    std::fs::rename(&root, &moved)?;
+    std::fs::create_dir(&root)?;
+    let result = actor.migration_action(request(Action::AcquireTarget {
+        catalog: Some(catalog.clone()),
+        destination: destination.clone(),
+        expected: pin,
+    }));
+    std::fs::remove_dir(&root)?;
+    std::fs::rename(&moved, &root)?;
+    assert!(result.is_err());
+    assert!(actor.migration.target.is_none());
+    actor.close()?;
+    Ok(())
+}
