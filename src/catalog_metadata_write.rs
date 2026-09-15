@@ -72,17 +72,19 @@ pub(crate) struct ExportPlanRow {
     pub receipt_json: Option<String>,
 }
 
+type RawExportPlan = (
+    Option<String>,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
 pub(crate) fn export_plan_row(db: &Connection, operation: &str) -> Result<ExportPlanRow> {
     validate_operation(operation)?;
-    let row: (
-        Option<String>,
-        i64,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        bool,
-    ) = db
+    let row: RawExportPlan = db
         .query_row(
             "SELECT CASE WHEN length(CAST(asset_id AS BLOB))<=256 THEN asset_id END,revision,base_model,CASE WHEN length(CAST(plan AS BLOB))<=65536 THEN plan END,CASE WHEN length(CAST(payload_hash AS BLOB))=64 THEN payload_hash END,CASE WHEN length(CAST(receipt AS BLOB))<=65536 THEN receipt END,receipt IS NULL FROM metadata_export_plans WHERE operation=?1",
             [operation],
@@ -138,6 +140,16 @@ pub(crate) fn insert(
     Ok(())
 }
 
+type RawReceipt = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
 pub(crate) fn existing(
     db: &Connection,
     attempt: &str,
@@ -145,15 +157,7 @@ pub(crate) fn existing(
 ) -> Result<Option<Receipt>> {
     validate_attempt(attempt)?;
     validate_digest(request_digest)?;
-    let row: Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i64,
-        Option<String>,
-        Option<String>,
-    )> = db
+    let row: Option<RawReceipt> = db
         .query_row(
             "SELECT CASE WHEN length(CAST(attempt AS BLOB))=36 THEN attempt END,CASE WHEN length(CAST(request_digest AS BLOB))=64 THEN request_digest END,CASE WHEN length(CAST(kind AS BLOB))<=32 THEN kind END,CASE WHEN length(CAST(owner_json AS BLOB))<=32768 THEN owner_json END,result_version,CASE WHEN length(CAST(result_json AS BLOB))<=65536 THEN result_json END,CASE WHEN length(CAST(created_at AS BLOB))<=1024 THEN created_at END FROM metadata_write_receipts WHERE attempt=?1",
             [attempt],
@@ -187,6 +191,29 @@ pub(crate) fn existing(
     }))
 }
 
+pub(crate) type SavedExportPlan = (
+    crate::catalog_metadata_write::Owner,
+    i64,
+    i64,
+    crate::metadata_export::ExportPlan,
+    Option<crate::metadata_export::ExportReceipt>,
+    String,
+);
+
+pub(crate) type ExportPlanPage = (
+    Vec<(
+        i64,
+        crate::catalog_metadata_write::Owner,
+        i64,
+        i64,
+        crate::metadata_export::ExportPlan,
+        Option<crate::metadata_export::ExportReceipt>,
+        String,
+    )>,
+    Option<i64>,
+    usize,
+);
+
 impl Catalog {
     pub fn metadata_write_receipt(&self, attempt: &str) -> Result<Option<Receipt>> {
         validate_attempt(attempt)?;
@@ -206,19 +233,7 @@ impl Catalog {
         }
     }
 
-    pub(crate) fn metadata_export_plan(
-        &self,
-        operation: &str,
-    ) -> Result<
-        Option<(
-            crate::catalog_metadata_write::Owner,
-            i64,
-            i64,
-            crate::metadata_export::ExportPlan,
-            Option<crate::metadata_export::ExportReceipt>,
-            String,
-        )>,
-    > {
+    pub(crate) fn metadata_export_plan(&self, operation: &str) -> Result<Option<SavedExportPlan>> {
         let row = match export_plan_row(&self.db, operation) {
             Ok(row) => row,
             Err(error)
@@ -255,19 +270,7 @@ impl Catalog {
         after: i64,
         limit: usize,
         scan_limit: usize,
-    ) -> Result<(
-        Vec<(
-            i64,
-            crate::catalog_metadata_write::Owner,
-            i64,
-            i64,
-            crate::metadata_export::ExportPlan,
-            Option<crate::metadata_export::ExportReceipt>,
-            String,
-        )>,
-        Option<i64>,
-        usize,
-    )> {
+    ) -> Result<ExportPlanPage> {
         ensure!(
             after >= 0 && (1..=100).contains(&limit) && (limit..=1000).contains(&scan_limit),
             "metadata plan page bounds"

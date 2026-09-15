@@ -2512,6 +2512,10 @@ impl CatalogSessionAuthority {
         }
         result.map(Some)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the explicit reviewed authority, limits and cancellation contract at this boundary."
+    )]
     pub(crate) fn discover_metadata_files(
         &self,
         transfer: &LeaseId,
@@ -3217,7 +3221,7 @@ mod metadata_reply_tests {
         validate_metadata_file_value(
             &mode,
             3,
-            &blake3::hash(b"new").to_hex().to_string(),
+            blake3::hash(b"new").to_hex().as_ref(),
             &metadata_files::Value::Plan(plan.clone()),
         )?;
         let mut wrong_plan = plan.clone();
@@ -3226,7 +3230,7 @@ mod metadata_reply_tests {
             validate_metadata_file_value(
                 &mode,
                 3,
-                &blake3::hash(b"new").to_hex().to_string(),
+                blake3::hash(b"new").to_hex().as_ref(),
                 &metadata_files::Value::Plan(wrong_plan),
             )
             .is_err()
@@ -3242,7 +3246,7 @@ mod metadata_reply_tests {
             validate_metadata_file_value(
                 &metadata_files::Mode::Apply { plan },
                 3,
-                &blake3::hash(b"new").to_hex().to_string(),
+                blake3::hash(b"new").to_hex().as_ref(),
                 &metadata_files::Value::Receipt(wrong_receipt),
             )
             .is_err()

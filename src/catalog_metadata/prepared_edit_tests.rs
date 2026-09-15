@@ -263,7 +263,7 @@ fn durable_attempt_replays_exact_result_and_failed_cas_writes_no_receipt() -> Re
         crate::catalog_metadata_write::existing(
             &catalog.db,
             &attempt,
-            &blake3::hash(b"different request").to_hex().to_string(),
+            blake3::hash(b"different request").to_hex().as_ref(),
         )
         .unwrap_err()
         .to_string()

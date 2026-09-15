@@ -228,11 +228,11 @@ impl Request {
 )]
 pub enum Response {
     Options(Options),
-    Status(Status),
+    Status(Box<Status>),
     Admitted(Admitted),
     Input(Input),
     Receipt(Option<crate::catalog_metadata_write::Receipt>),
-    Review(Review),
+    Review(Box<Review>),
     ReviewFields(Page<ReviewField>),
     Chunk(Bytes),
     Plans(Page<serde_json::Value>),
@@ -1003,7 +1003,7 @@ struct SharedState {
 
 enum WorkerTask {
     Run {
-        operation: Operation,
+        operation: Box<Operation>,
         action: Action,
         bounds: Limits,
         cancel: Cancellation,
@@ -1128,12 +1128,13 @@ impl Coordinator {
                 while let Ok(task) = receiver.recv() {
                     match task {
                         WorkerTask::Run {
-                            mut operation,
+                            operation,
                             action,
                             bounds,
                             cancel,
                             write_ready,
                         } => {
+                            let mut operation = *operation;
                             let result = if action_write_hold(&action) {
                                 loop {
                                     if cancel.is_canceled() {
@@ -1287,7 +1288,7 @@ impl Coordinator {
                 }) {
                     return Err(error(ErrorCode::StaleSession, "metadata operation changed"));
                 }
-                Ok(Response::Status(Status {
+                Ok(Response::Status(Box::new(Status {
                     catalog: catalog_name.into(),
                     epoch: U64(shared.epoch),
                     operation: shared.operation.clone(),
@@ -1295,7 +1296,7 @@ impl Coordinator {
                     closing: shared.closing,
                     input: shared.input.clone(),
                     review: shared.review.clone(),
-                }))
+                })))
             }
             Request::Cancel { operation, epoch } => {
                 valid_uuid(&operation)?;
@@ -1311,7 +1312,7 @@ impl Coordinator {
                         operation.cancel_requested = true;
                     }
                 }
-                Ok(Response::Status(Status {
+                Ok(Response::Status(Box::new(Status {
                     catalog: catalog_name.into(),
                     epoch: U64(shared.epoch),
                     operation: shared.operation.clone(),
@@ -1319,7 +1320,7 @@ impl Coordinator {
                     closing: shared.closing,
                     input: shared.input.clone(),
                     review: shared.review.clone(),
-                }))
+                })))
             }
             Request::Start { attempt, action } => {
                 self.release_completed()?;
@@ -1394,7 +1395,7 @@ impl Coordinator {
                     .unwrap()
                     .sender
                     .send(WorkerTask::Run {
-                        operation,
+                        operation: Box::new(operation),
                         action,
                         bounds: bounds.clone(),
                         cancel,
@@ -1432,7 +1433,7 @@ impl Coordinator {
                     .as_ref()
                     .filter(|value| value.token == token && value.digest == digest)
                     .ok_or_else(|| error(ErrorCode::StaleSession, "metadata review changed"))?;
-                Ok(Response::Review(review.clone()))
+                Ok(Response::Review(Box::new(review.clone())))
             }
             Request::ReviewFields {
                 token,
@@ -1499,7 +1500,7 @@ impl Coordinator {
                         bytes: reader.bytes[start..end].to_vec(),
                         offset,
                         total: U64(reader.bytes.len() as u64),
-                        next: (end < reader.bytes.len()).then(|| U64(end as u64)),
+                        next: (end < reader.bytes.len()).then_some(U64(end as u64)),
                         blake3: reader.reference.blake3,
                         verified: true,
                     }));
@@ -1549,14 +1550,14 @@ impl Coordinator {
                     ));
                 };
                 let end = actual_offset.0.saturating_add(bytes.len() as u64);
-                return Ok(Response::Chunk(Bytes {
+                Ok(Response::Chunk(Bytes {
                     bytes,
                     offset: actual_offset,
                     total,
                     next: (end < total.0).then_some(U64(end)),
                     blake3,
                     verified: true,
-                }));
+                }))
             }
             Request::Plans {
                 owner,

@@ -2384,6 +2384,10 @@ impl Catalog {
             Default::default(),
         )
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the explicit reviewed authority, limits and cancellation contract at this boundary."
+    )]
     pub(crate) fn plan_metadata_export_with_cancel(
         &mut self,
         asset: &str,

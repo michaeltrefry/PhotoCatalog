@@ -122,6 +122,10 @@ impl Catalog {
             None,
         )
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the explicit reviewed authority, limits and cancellation contract at this boundary."
+    )]
     pub(crate) fn plan_image_metadata_export_with_receipt(
         &mut self,
         key: &VariantKey,
@@ -145,6 +149,10 @@ impl Catalog {
             Some((attempt, request_digest)),
         )
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the explicit reviewed authority, limits and cancellation contract at this boundary."
+    )]
     fn plan_image_metadata_export_controlled(
         &mut self,
         key: &VariantKey,
