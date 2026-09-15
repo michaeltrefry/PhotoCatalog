@@ -35,6 +35,7 @@ pub enum RelinkOverride {
 }
 #[derive(Debug)]
 pub struct RelinkPreparation {
+    observer: crate::catalog_session::storage::Observer,
     plan: String,
     revision: i64,
     epoch: i64,
@@ -516,6 +517,7 @@ impl Catalog {
         }
         tx.commit()?;
         Ok(RelinkPreparation {
+            observer: crate::catalog_session::storage::Observer(self.session.clone()),
             plan: plan.into(),
             revision,
             epoch: snapshot,
@@ -802,6 +804,7 @@ impl RelinkPreparation {
                 )
             } else {
                 evaluate(
+                    &self.observer,
                     &row.paths,
                     row.data.expected_identity.as_deref(),
                     &self.root,
@@ -812,15 +815,21 @@ impl RelinkPreparation {
             check_cancel(cancel)?;
             row.data.candidates = candidates;
             if let Some((path, evidence)) = selected {
-                row.data.binding = Some(binding_draft(&path.to_path()?));
+                row.data.binding = Some(binding_draft(&self.observer, &path.to_path()?, cancel)?);
                 row.data.destination = Some(path);
                 row.data.evidence = Some(evidence);
             }
             let mut sources = Vec::new();
             for source in row.sources {
                 check_cancel(cancel)?;
-                let (id, status, detail, data) =
-                    prepare_source(source, &row.data, &row.request, &self.root, cancel)?;
+                let (id, status, detail, data) = prepare_source(
+                    &self.observer,
+                    source,
+                    &row.data,
+                    &row.request,
+                    &self.root,
+                    cancel,
+                )?;
                 sources.push((id, status, detail, data));
             }
             rows.push(PreparedRow {
@@ -840,6 +849,7 @@ impl RelinkPreparation {
     }
 }
 fn prepare_source(
+    observer: &crate::catalog_session::storage::Observer,
     source: SourceInput,
     item: &ItemData,
     request: &RelinkScope,
@@ -886,7 +896,14 @@ fn prepare_source(
             source
                 .override_paths
                 .unwrap_or(sidecar_paths(request, item, data.old_native.clone())?);
-        evaluate(&paths, source.expected.as_deref(), root, false, cancel)
+        evaluate(
+            observer,
+            &paths,
+            source.expected.as_deref(),
+            root,
+            false,
+            cancel,
+        )
     };
     check_cancel(cancel)?;
     data.candidates = candidates;

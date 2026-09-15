@@ -70,6 +70,7 @@ pub(super) enum Call {
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     MigrationIdentity(Box<MigrationIdentityRequest>),
     ExportAliasFact(Box<ExportAliasFactRequest>),
+    Storage(Box<crate::catalog_session::storage::Request>),
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
     ExportPublication(Box<ExportPublicationRequest>),
@@ -97,6 +98,7 @@ impl Call {
                 | Self::ExportDestinationSnapshot(_)
                 | Self::MigrationIdentity(_)
                 | Self::ExportAliasFact(_)
+                | Self::Storage(_)
                 | Self::InspectExportOriginal(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
@@ -159,6 +161,7 @@ impl Call {
             Self::ExportDestinationSnapshot(request) => request.validate(),
             Self::MigrationIdentity(request) => request.validate(),
             Self::ExportAliasFact(request) => request.validate(),
+            Self::Storage(request) => request.validate(),
             Self::InspectExportOriginal(request) => request.validate(),
             Self::ExportOriginal(request) => request.validate(),
             Self::ExportPublication(request) => request.validate(),
@@ -180,6 +183,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
         std::mem::size_of::<MigrationIdentityRequest>(),
         std::mem::size_of::<ExportAliasFactRequest>(),
+        std::mem::size_of::<crate::catalog_session::storage::Request>(),
         std::mem::size_of::<InspectExportOriginal>(),
         std::mem::size_of::<ExportOriginalRequest>(),
         std::mem::size_of::<ExportPublicationRequest>(),
@@ -201,7 +205,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "inline replies preserve the explicitly bounded relay root without an unaccounted heap owner"
 )]
@@ -221,6 +225,7 @@ pub(super) enum Value {
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     MigrationIdentity(MigrationIdentityReply),
     ExportAliasFact(ExportAliasFactReply),
+    Storage(crate::catalog_session::storage::Reply),
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
     ExportPublication(ExportPublicationReply),
@@ -1223,6 +1228,9 @@ impl Parent {
                 Call::MigrationIdentity(request) => {
                     Value::MigrationIdentity(self.client.migration_identity(request, cancel)?)
                 }
+                Call::Storage(request) => {
+                    Value::Storage(self.client.storage_call(request, cancel)?)
+                }
                 Call::ExportAliasFact(request) => {
                     Value::ExportAliasFact(self.client.export_alias_fact(request, cancel)?)
                 }
@@ -1909,6 +1917,19 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("unexpected migration identity relay response"),
         }
     }
+    fn storage_call(
+        &self,
+        request: &crate::catalog_session::storage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::storage::Reply> {
+        match self.call(Call::Storage(Box::new(request.clone())), cancel)? {
+            Value::Storage(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected storage observation relay response"),
+        }
+    }
     fn export_alias_fact(
         &self,
         request: &ExportAliasFactRequest,
@@ -2019,6 +2040,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::MigrationIdentity(request), Value::MigrationIdentity(value)) => {
             value.validate_for(request)?
         }
+        (Call::Storage(request), Value::Storage(value)) => value.validate(request)?,
         (Call::ExportAliasFact(request), Value::ExportAliasFact(value)) => {
             value.validate_for(request)?
         }

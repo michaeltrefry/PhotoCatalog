@@ -1055,6 +1055,19 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected migration identity response"),
         }
     }
+    fn storage_call(
+        &self,
+        request: &crate::catalog_session::storage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::storage::Reply> {
+        match self.execute(Operation::Storage(Box::new(request.clone())), cancel)? {
+            Response::Storage(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected storage observation response"),
+        }
+    }
     fn export_alias_fact(
         &self,
         request: &ExportAliasFactRequest,

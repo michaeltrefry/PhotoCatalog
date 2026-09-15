@@ -1009,12 +1009,20 @@ pub mod export_stage;
 pub mod native;
 pub mod preview_io;
 pub mod preview_stage;
+pub mod storage;
 /// Calls run on the admission/operation owner, never the GUI thread. An F client
 /// must keep its independent cancel/status controls live while awaiting a reply.
 /// Implementations must not fall back to local filesystem access after failure.
 pub mod store;
 
 pub trait CatalogFilesystem: Send + Sync {
+    fn storage_call(
+        &self,
+        _request: &storage::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<storage::Reply> {
+        anyhow::bail!("filesystem owner does not support storage observations")
+    }
     fn native(&self) -> Option<&dyn native::CatalogNative> {
         None
     }

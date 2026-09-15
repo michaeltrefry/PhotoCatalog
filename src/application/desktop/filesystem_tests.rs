@@ -353,6 +353,12 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
                     anyhow::bail!("injected loss of actual F confirmation reply")
                 }
             }
+            Call::Storage(_) => {
+                ensure!(
+                    !contender(&database)?,
+                    "writer lock escaped F storage observation"
+                );
+            }
             Call::RestoreStatus(_) | Call::Resume { .. } => {
                 ensure!(
                     !contender(&database)?,

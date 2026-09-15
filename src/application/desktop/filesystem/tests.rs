@@ -53,6 +53,38 @@ fn bootstrap(r: &PrepareCatalog, b: &Binding) -> CatalogBootstrap {
         },
     }
 }
+
+#[test]
+fn storage_observation_reply_cannot_cross_root_or_action() -> Result<()> {
+    use crate::catalog_session::storage;
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let r = request();
+    let request = storage::Request {
+        root: bootstrap(&r, &binding).root_capability(),
+        action: storage::Action::Object(r.root),
+    };
+    let reply = storage::Reply {
+        request: request.clone(),
+        value: storage::Value::Object {
+            device: U64(u64::MAX),
+            object: U64(u64::MAX - 1),
+        },
+    };
+    reply.validate(&request)?;
+    let mut other = request.clone();
+    other.root.token = LeaseId::new();
+    assert!(reply.validate(&other).is_err());
+    other = request.clone();
+    other.action = storage::Action::Mounts;
+    assert!(reply.validate(&other).is_err());
+    let call = Call::Storage(Box::new(request.clone()));
+    let value = Value::Storage(reply);
+    validate_reply(&call, &value, &binding)?;
+    Ok(())
+}
 #[test]
 fn exact_encoding_and_epoch_bounds_precede_reply_adoption() -> Result<()> {
     let binding = Binding {

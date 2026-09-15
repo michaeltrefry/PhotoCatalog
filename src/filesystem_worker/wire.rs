@@ -72,6 +72,7 @@ pub fn build_identity() -> String {
             include_str!("client.rs"),
             include_str!("process.rs"),
             include_str!("../catalog_session.rs"),
+            include_str!("../catalog_session/storage.rs"),
             include_str!("../catalog_session/store.rs"),
             include_str!("../catalog_session/preview_io.rs"),
             include_str!("../catalog_session/export_managed.rs"),
@@ -136,6 +137,7 @@ pub enum Operation {
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     MigrationIdentity(Box<MigrationIdentityRequest>),
     ExportAliasFact(Box<ExportAliasFactRequest>),
+    Storage(Box<crate::catalog_session::storage::Request>),
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
     ExportPublication(Box<ExportPublicationRequest>),
@@ -193,6 +195,7 @@ impl Operation {
             Self::ExportDestinationSnapshot(value) => value.validate()?,
             Self::MigrationIdentity(value) => value.validate()?,
             Self::ExportAliasFact(value) => value.validate()?,
+            Self::Storage(value) => value.validate()?,
             Self::InspectExportOriginal(value) => value.validate()?,
             Self::ExportOriginal(value) => value.validate()?,
             Self::ExportPublication(value) => value.validate()?,
@@ -293,7 +296,7 @@ impl AdmissionSnapshot {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "inline response variants preserve the bounded protocol root without an extra heap owner"
 )]
@@ -308,6 +311,7 @@ pub enum Response {
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     MigrationIdentity(MigrationIdentityReply),
     ExportAliasFact(ExportAliasFactReply),
+    Storage(crate::catalog_session::storage::Reply),
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
     ExportPublication(ExportPublicationReply),

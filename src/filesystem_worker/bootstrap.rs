@@ -323,6 +323,22 @@ impl BootstrapOwner {
         }
     }
 
+    pub fn storage_call(
+        &self,
+        request: &crate::catalog_session::storage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::storage::Reply> {
+        request.validate()?;
+        self.with_root(&request.root, |_| {
+            let value = crate::catalog_session::storage::execute(&request.action, cancel)?;
+            let reply = crate::catalog_session::storage::Reply {
+                request: request.clone(),
+                value,
+            };
+            reply.validate(request)?;
+            Ok(reply)
+        })
+    }
     pub fn progress(&self) -> Option<&PreparationProgress> {
         self.progress.as_ref()
     }

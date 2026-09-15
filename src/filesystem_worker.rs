@@ -59,6 +59,10 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::Storage(request) => self
+                .owner
+                .storage_call(&request, cancel)
+                .map(Response::Storage),
             Operation::ExportExecutor(request) => self
                 .owner
                 .export_executor_call(&request, cancel)
