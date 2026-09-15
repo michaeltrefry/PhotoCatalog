@@ -196,7 +196,7 @@ impl Owner {
             directory: snapshot.directory.clone(),
             path: snapshot.path.clone(),
             document: snapshot.document,
-            physical: snapshot.physical.clone(),
+            physical: snapshot.physical,
             total_bytes: U64(snapshot.bytes.len() as u64),
             blake3: snapshot.blake3.clone(),
             offset: U64(offset as u64),

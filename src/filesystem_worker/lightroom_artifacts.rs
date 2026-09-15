@@ -298,7 +298,7 @@ impl Snapshot {
             session: self.session.clone(),
             directory: self.directory.clone(),
             manifest_path: self.manifest_path.clone(),
-            manifest_physical: self.manifest_physical.clone(),
+            manifest_physical: self.manifest_physical,
             capture_revision: self.capture_revision.clone(),
             manifest_blake3: self.manifest_blake3.clone(),
             manifest_bytes: U64(self.bytes.len() as u64),
