@@ -666,7 +666,7 @@ fn inspect(
                 message,
             });
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     recheck(&path, &guard, &stamp)?;
     let encoded = protocol::encode_inspection(inspection)?;
