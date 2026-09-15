@@ -358,6 +358,21 @@ impl Broker {
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
+    #[cfg(test)]
+    pub(crate) fn check_failure_limit(&self, required: usize, available: usize) -> Result<()> {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let error = state
+            .failure
+            .as_ref()
+            .context("broker stopped without its expected primary failure")?;
+        let limit =
+            error.downcast_ref::<crate::lightroom_migration_worker::memory::ResourceLimit>();
+        ensure!(
+            limit.is_some_and(|v| v.required == required && v.available == available),
+            "broker fixture failed before expected allocation refusal: {error:#}"
+        );
+        Ok(())
+    }
     /// Nonblocking join boundary. A join panic proves the broker thread ended;
     /// its failure is returned as a drained poison rather than a retryable wait.
     pub(crate) fn retry_finish(&mut self) -> Option<DrainReport> {

@@ -120,13 +120,27 @@ fn send(broker: &Broker, mut command: Command) -> Result<()> {
         thread::sleep(Duration::from_millis(2));
     }
 }
+#[track_caller]
 fn event(broker: &Broker) -> Result<Event> {
+    let caller = std::panic::Location::caller();
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(event) = broker.try_receive()? {
             return Ok(event);
         }
-        ensure!(Instant::now() < until, "broker fixture event deadline");
+        if Instant::now() >= until {
+            let state = broker
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            anyhow::bail!(
+                "broker fixture event deadline at {caller}; active={} revoked={} original_failure={:#?}",
+                state.active,
+                state.revoked,
+                state.failure
+            );
+        }
         thread::sleep(Duration::from_millis(2));
     }
 }

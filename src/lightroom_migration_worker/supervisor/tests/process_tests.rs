@@ -874,6 +874,19 @@ fn broker_stop_fixture(
         }),
         result_memory: None,
     });
+    if internal_failure {
+        let Operation::Running(running) = &operation else {
+            unreachable!()
+        };
+        running
+            .owner
+            .as_ref()
+            .unwrap()
+            .broker
+            .as_ref()
+            .unwrap()
+            .check_failure_limit(2, 1)?;
+    }
     Ok((temp, operation, pool, competing, lm_pid, source_pid))
 }
 
