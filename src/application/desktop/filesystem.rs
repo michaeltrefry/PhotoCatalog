@@ -1,5 +1,6 @@
 //! Private C→G→F relay. G owns the real F process; C holds only this proxy.
 //! This is additive until every managed actor dependency exists.
+mod export_native;
 mod native;
 use crate::{
     application::U64,
@@ -61,6 +62,7 @@ pub(super) enum Call {
     PreviewIo(Box<crate::catalog_session::preview_io::Request>),
     PreviewStage(Box<crate::catalog_session::preview_stage::Request>),
     ExportStage(Box<crate::catalog_session::export_stage::Request>),
+    ExportNative(Box<crate::catalog_session::export_native::Request>),
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
@@ -125,6 +127,13 @@ impl Call {
                 );
                 request.validate()
             }
+            Self::ExportNative(request) => {
+                ensure!(
+                    !request.cleanup(),
+                    "export native cleanup requires reserved control"
+                );
+                request.validate()
+            }
             Self::PreviewStore(request) => request.validate(),
             Self::PreviewIo(request) => request.validate(),
             Self::PreviewStage(request) => {
@@ -161,6 +170,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
         std::mem::size_of::<crate::catalog_session::export_stage::Request>(),
+        std::mem::size_of::<crate::catalog_session::export_native::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
         std::mem::size_of::<MigrationIdentityRequest>(),
@@ -173,10 +183,16 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
     .into_iter()
     .max()
     .unwrap();
-    single.max(
-        std::mem::size_of::<crate::catalog_session::native::Request>()
-            + std::mem::size_of::<crate::preview::RenderWork>(),
-    )
+    single
+        .max(
+            std::mem::size_of::<crate::catalog_session::native::Request>()
+                + std::mem::size_of::<crate::preview::RenderWork>(),
+        )
+        .max(
+            std::mem::size_of::<crate::catalog_session::export_native::Request>()
+                + std::mem::size_of::<crate::catalog_session::export_stage::Request>()
+                + std::mem::size_of::<crate::catalog_exports::ExportWork>(),
+        )
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
@@ -188,6 +204,7 @@ pub(super) enum Value {
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     ExportStage(crate::catalog_session::export_stage::Reply),
+    ExportNative(crate::catalog_session::export_native::Status),
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
     ExportDirectory(PreparedExportDirectory),
@@ -203,6 +220,8 @@ pub(super) enum Value {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Fault {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    busy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     object_receipt: Option<crate::catalog_session::preview_io::FailureReceipt>,
     message: String,
@@ -218,6 +237,7 @@ impl Fault {
         };
         let failure = Failure::new(kind, message);
         Self {
+            busy: false,
             object_receipt: None,
             message: failure.message,
             unknown,
@@ -243,6 +263,7 @@ impl Fault {
             .and_then(|f| f.object_receipt);
         let failure = Failure::new(kind, error);
         Self {
+            busy: false,
             object_receipt,
             message: failure.message,
             unknown: kind == FailureKind::Unknown,
@@ -250,6 +271,10 @@ impl Fault {
         }
     }
     fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.busy || (self.kind == FailureKind::Rejected && self.object_receipt.is_none()),
+            "relay Busy authority mismatch"
+        );
         ensure!(
             self.message.len() <= 4096 && self.unknown == (self.kind == FailureKind::Unknown),
             "relay failure bounds/category mismatch"
@@ -260,6 +285,9 @@ impl Fault {
         Ok(())
     }
     fn into_error(self) -> anyhow::Error {
+        if self.busy {
+            return crate::preview::stage_io::Busy("export native lifecycle busy; retry").into();
+        }
         anyhow::Error::new(Failure {
             object_receipt: self.object_receipt,
             kind: self.kind,
@@ -271,6 +299,18 @@ type Outcome = std::result::Result<Value, Fault>;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(super) enum Control {
+    ExportNativeStop {
+        key: crate::catalog_session::export_native::Key,
+    },
+    ExportNativeQuery {
+        id: U64,
+        query: crate::catalog_session::export_native::Query,
+    },
+    ExportNativeReply {
+        id: U64,
+        query: crate::catalog_session::export_native::Query,
+        value: std::result::Result<crate::catalog_session::export_native::Status, Fault>,
+    },
     NativeStop {
         key: crate::catalog_session::native::Key,
     },
@@ -422,12 +462,18 @@ struct Output {
     native_stop: Slot,
     native_query: Slot,
     native_reply: Slot,
+    export_native_stop: Slot,
+    export_native_query: Slot,
+    export_native_reply: Slot,
     data: VecDeque<Arc<Vec<u8>>>,
 }
 impl Output {
     fn push(&mut self, binding: &Binding, body: Body) -> Result<()> {
         // Classify by borrowed scalars before moving the potentially large body.
         let class = match &body {
+            Body::Control(Control::ExportNativeStop { key }) => (13, key.operation.0),
+            Body::Control(Control::ExportNativeQuery { id, .. }) => (14, id.0),
+            Body::Control(Control::ExportNativeReply { id, .. }) => (15, id.0),
             Body::Control(Control::NativeStop { key }) => (10, key.operation.0),
             Body::Control(Control::NativeQuery { id, .. }) => (11, id.0),
             Body::Control(Control::NativeReply { id, .. }) => (12, id.0),
@@ -466,6 +512,9 @@ impl Output {
             (10, id) => self.native_stop.push(id, bytes, 16),
             (11, id) => self.native_query.push(id, bytes, 1),
             (12, id) => self.native_reply.push(id, bytes, 1),
+            (13, id) => self.export_native_stop.push(id, bytes, 16),
+            (14, id) => self.export_native_query.push(id, bytes, 1),
+            (15, id) => self.export_native_reply.push(id, bytes, 1),
             _ => self.encoded(bytes),
         }
     }
@@ -483,6 +532,9 @@ impl Output {
             Lane::Control => self
                 .failed
                 .take()
+                .or_else(|| self.export_native_stop.take())
+                .or_else(|| self.export_native_query.take())
+                .or_else(|| self.export_native_reply.take())
                 .or_else(|| self.native_stop.take())
                 .or_else(|| self.native_query.take())
                 .or_else(|| self.native_reply.take())
@@ -611,6 +663,8 @@ enum ReadQuery {
     Store(u64, store::StatusQuery),
 }
 struct ParentState {
+    export_native_next: u64,
+    export_native_result: Option<(u64, crate::catalog_session::export_native::Query, Body)>,
     native_next: u64,
     native_result: Option<(u64, crate::catalog_session::native::Query, Body)>,
     next: u64,
@@ -641,6 +695,7 @@ pub(super) struct Parent {
     pub binding: Binding,
     client: Arc<Client>,
     native: Mutex<Option<Arc<super::native::Owner>>>,
+    export_native: Mutex<Option<Arc<super::export_native::Owner>>>,
     state: Mutex<ParentState>,
     wake: Condvar,
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -670,7 +725,10 @@ impl Parent {
             },
             client,
             native: Mutex::new(None),
+            export_native: Mutex::new(None),
             state: Mutex::new(ParentState {
+                export_native_next: 1,
+                export_native_result: None,
                 native_next: 1,
                 native_result: None,
                 next: 1,
@@ -747,6 +805,9 @@ impl Parent {
         }
     }
     pub fn fail(&self, error: impl std::fmt::Display) {
+        if let Ok(owner) = self.export_native_owner() {
+            owner.stop_all();
+        }
         if let Ok(native) = self.native_owner() {
             native.stop_all();
         }
@@ -763,6 +824,9 @@ impl Parent {
         self.wake.notify_all();
     }
     pub fn closing(&self) {
+        if let Ok(owner) = self.export_native_owner() {
+            owner.stop_all();
+        }
         if let Ok(native) = self.native_owner() {
             native.stop_all();
         }
@@ -783,6 +847,9 @@ impl Parent {
     }
     pub fn receive(&self, bytes: &[u8], lane: Lane) -> Result<()> {
         let body = decode(&self.binding, bytes, lane)?;
+        if self.receive_export_native(&body)? {
+            return Ok(());
+        }
         if self.receive_native(&body)? {
             return Ok(());
         }
@@ -1018,7 +1085,9 @@ impl Parent {
                     s = self.wake.wait(s).unwrap();
                 }
             };
-            let dispatched = if pending.call.cancellable() && pending.cancel.load(Ordering::Acquire)
+            let dispatched = if pending.call.cancellable()
+                && !matches!(pending.call, Call::ExportStage(_))
+                && pending.cancel.load(Ordering::Acquire)
             {
                 Err(anyhow::Error::new(Failure::new(
                     FailureKind::Canceled,
@@ -1075,6 +1144,9 @@ impl Parent {
                 }
                 Call::Confirm(r) => {
                     let confirmed = self.client.confirm_sql_admission(r, cancel)?;
+                    if let Ok(owner) = self.export_native_owner() {
+                        owner.bind(&confirmed.root)?;
+                    }
                     if let Ok(native) = self.native_owner() {
                         native.bind(&confirmed.root)?;
                     }
@@ -1091,21 +1163,30 @@ impl Parent {
                     *acknowledge,
                 )?)),
                 Call::Release(r) => {
+                    if let Ok(owner) = self.export_native_owner() {
+                        owner.retire_root(r)?;
+                    }
                     if let Ok(native) = self.native_owner() {
                         native.retire_root(r)?;
                     }
                     self.client.release_root(r)?;
+                    if let Ok(owner) = self.export_native_owner() {
+                        owner.forget_released_root(r)?;
+                    }
                     if let Ok(native) = self.native_owner() {
                         native.forget_released_root(r)?;
                     }
                     Value::Unit
                 }
                 Call::Native(request) => Value::Native(self.native_owner()?.call(request)?),
+                Call::ExportNative(request) => {
+                    Value::ExportNative(self.export_native_owner()?.call(request)?)
+                }
                 Call::PreviewStage(request) => {
                     Value::PreviewStage(self.client.preview_stage_call(request, cancel)?)
                 }
                 Call::ExportStage(request) => {
-                    Value::ExportStage(self.client.export_stage_call(request, cancel)?)
+                    Value::ExportStage(self.export_native_owner()?.stage_call(request, cancel)?)
                 }
                 Call::PreviewIo(request) => {
                     Value::PreviewIo(self.client.preview_io_call(request, cancel)?)
@@ -1247,6 +1328,9 @@ impl Parent {
     /// Only after C and every dependent native owner has been verified drained.
     /// F retirement releases any blocked F calls; only then can these threads join.
     pub fn finish_after_dependents(&self, terminate: bool) -> Result<()> {
+        if let Ok(owner) = self.export_native_owner() {
+            owner.finish_after_catalog()?;
+        }
         if let Ok(native) = self.native_owner() {
             native.finish_after_catalog()?;
         }
@@ -1289,6 +1373,10 @@ struct StoreQuery {
     result: Option<std::result::Result<store::Status, Fault>>,
 }
 struct ChildState {
+    export_native_next: u64,
+    export_native_query: Option<export_native::Pending>,
+    export_native_last: Option<export_native::Pending>,
+    export_native_dead: bool,
     native_next: u64,
     native_query: Option<native::Pending>,
     native_dead: bool,
@@ -1319,6 +1407,10 @@ impl Proxy {
         Arc::new(Self {
             binding,
             state: Mutex::new(ChildState {
+                export_native_next: 1,
+                export_native_query: None,
+                export_native_last: None,
+                export_native_dead: false,
                 native_next: 1,
                 native_query: None,
                 native_dead: false,
@@ -1342,6 +1434,7 @@ impl Proxy {
     pub fn fail(&self, message: impl std::fmt::Display) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.fault.get_or_insert_with(|| Fault::new(message, true));
+        s.export_native_dead = true;
         s.native_dead = true;
         self.wake.notify_all();
     }
@@ -1351,6 +1444,9 @@ impl Proxy {
     }
     pub fn receive(&self, bytes: &[u8], lane: Lane) -> Result<()> {
         let body = decode(&self.binding, bytes, lane)?;
+        if self.receive_export_native_reply(&body)? {
+            return Ok(());
+        }
         if self.receive_native_reply(&body)? {
             return Ok(());
         }
@@ -1534,6 +1630,11 @@ impl Proxy {
 }
 impl CatalogFilesystem for Proxy {
     fn native(&self) -> Option<&dyn crate::catalog_session::native::CatalogNative> {
+        Some(self)
+    }
+    fn export_native(
+        &self,
+    ) -> Option<&dyn crate::catalog_session::export_native::CatalogExportNative> {
         Some(self)
     }
     fn preview_stage_call(
@@ -1850,6 +1951,7 @@ fn unit(v: Value) -> Result<()> {
 
 fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
     match (call, value) {
+        (Call::ExportNative(request), Value::ExportNative(status)) => status.validate(request)?,
         (Call::Native(r), Value::Native(v)) => v.validate(&r.root, r.operation)?,
         (Call::Prepare(r), Value::Bootstrap(v)) => {
             v.validate()?;

@@ -886,3 +886,498 @@ fn actual_idle_f_death_is_monitored_but_normal_retirement_is_not_failure() -> Re
     assert!(normal.0.next(Lane::Control).is_none());
     Ok(())
 }
+
+fn export_relay_fixture() -> Result<(
+    EmptyOwner,
+    Arc<Proxy>,
+    super::super::export_native::tests::Fixture,
+    crate::preview::ByteBudget,
+    Arc<super::super::export_native::tests::FakeStages>,
+)> {
+    let parent = real_empty_owner()?;
+    let mut f = super::super::export_native::tests::fixture()?;
+    f.root.epoch = parent.0.binding.epoch.clone();
+    f.begin.root = f.root.clone();
+    let pool = crate::preview::ByteBudget::new(f.worker)?;
+    let stages = super::super::export_native::tests::FakeStages::new(f._temp.path().to_owned());
+    let owner = Arc::new(super::super::export_native::Owner::new(
+        f._temp.path().join("missing-worker"),
+        stages.clone(),
+        1,
+        &pool,
+    )?);
+    owner.bind(&f.root)?;
+    *parent.0.export_native.lock().unwrap() = Some(owner);
+    let proxy = Proxy::new(parent.0.binding.clone());
+    Ok((parent, proxy, f, pool, stages))
+}
+fn pump_export_relay<T: Send + 'static>(
+    parent: &Parent,
+    proxy: &Arc<Proxy>,
+    operation: impl FnOnce(Arc<Proxy>) -> Result<T> + Send + 'static,
+    drop_control_reply: bool,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let proxy = proxy.clone();
+        thread::spawn(move || {
+            let _ = tx.send(operation(proxy));
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut dropped = None;
+    let mut queries = Vec::new();
+    loop {
+        // Deliver cancellation before its queued ordinary request.
+        for lane in [Lane::Control, Lane::Data] {
+            if let Some(out) = proxy.next(lane) {
+                if let Body::Control(Control::ExportNativeQuery { id, query }) =
+                    decode(&parent.binding, &out.bytes, lane)?
+                {
+                    queries.push((id, query));
+                }
+                parent.receive(&out.bytes, lane)?;
+            }
+        }
+        for lane in [Lane::Control, Lane::Data] {
+            if let Some(out) = parent.next(lane) {
+                if drop_control_reply
+                    && dropped.is_none()
+                    && matches!(
+                        decode(&parent.binding, &out.bytes, lane)?,
+                        Body::Control(Control::ExportNativeReply { .. })
+                    )
+                {
+                    dropped = Some(out.bytes);
+                } else {
+                    proxy.receive(&out.bytes, lane)?;
+                }
+            }
+        }
+        match rx.try_recv() {
+            Ok(result) => {
+                worker.join().unwrap();
+                // Flush the ordinary ACK before the next operation.
+                while let Some(out) = proxy.next(Lane::Control) {
+                    parent.receive(&out.bytes, Lane::Control)?;
+                }
+                if drop_control_reply {
+                    assert!(dropped.is_some());
+                    assert!(queries.len() >= 2);
+                    assert!(
+                        queries.iter().all(|q| q == &queries[0]),
+                        "resends must retain exact id/action"
+                    );
+                    // A late duplicate remains harmless after the caller consumed its result.
+                    proxy.receive(&dropped.unwrap(), Lane::Control)?;
+                }
+                return result;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "export Parent/Proxy relay deadline"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+#[test]
+#[ignore = "requires exact built F executable via PHOTOCATALOG_TEST_EXECUTABLE; run serialized"]
+fn export_native_parent_proxy_canceled_queue_records_highwater_and_contiguous_cleanup() -> Result<()>
+{
+    use super::super::export_native::tests::{ordinary, register};
+    use crate::catalog_session::{export_native::CatalogExportNative, export_stage};
+    let (parent, proxy, f, pool, _stages) = export_relay_fixture()?;
+    let registration = register(&f);
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &registration, &AtomicBool::new(false)),
+        false,
+    )?;
+    let begin = f.begin.clone();
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| p.call(Call::ExportStage(Box::new(begin)), &AtomicBool::new(false)),
+        false,
+    )?;
+    let canceled = ordinary(
+        &f,
+        2,
+        export_stage::Action::Ready {
+            icc: None,
+            xmp: None,
+        },
+    );
+    let error = pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| {
+            p.call(
+                Call::ExportStage(Box::new(canceled)),
+                &AtomicBool::new(true),
+            )
+        },
+        false,
+    )
+    .err()
+    .context("queued cancellation")?;
+    assert_eq!(
+        error
+            .downcast_ref::<Failure>()
+            .context("typed cancellation")?
+            .kind,
+        FailureKind::Canceled
+    );
+    let key = crate::catalog_session::export_native::Key::new(&f.root, U64(9), &f.stage);
+    let result = pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::status(p.as_ref(), &key),
+        false,
+    )?;
+    assert_eq!(result.stage_high_water, U64(2));
+    assert_eq!(
+        result.pending_dispatch,
+        crate::catalog_session::export_native::DispatchState::NeverDispatched
+    );
+    let abort = ordinary(&f, 3, export_stage::Action::Abort);
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| p.call(Call::ExportStage(Box::new(abort)), &AtomicBool::new(false)),
+        false,
+    )?;
+    let retire = super::super::export_native::tests::lifecycle(
+        &f,
+        crate::catalog_session::export_native::Action::Retire,
+    );
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &retire, &AtomicBool::new(false)),
+        false,
+    )?;
+    assert_eq!(pool.used(), 0);
+    parent.0.finish_after_dependents(true)?;
+    eprintln!(
+        "export canceled relay verified F={} checked reap and relay join",
+        parent.0.client.pid()
+    );
+    Ok(())
+}
+#[test]
+#[ignore = "requires exact built F executable via PHOTOCATALOG_TEST_EXECUTABLE; run serialized"]
+fn export_native_parent_proxy_lost_status_drain_retire_replies_replay_exact_ids() -> Result<()> {
+    use super::super::export_native::tests::{lifecycle, ordinary, register};
+    use crate::catalog_session::{
+        export_native::{Action, CatalogExportNative, Key, Phase},
+        export_stage,
+    };
+    let (parent, proxy, f, pool, _stages) = export_relay_fixture()?;
+    let request = register(&f);
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &request, &AtomicBool::new(false)),
+        false,
+    )?;
+    let key = Key::new(&f.root, U64(9), &f.stage);
+    let status = pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::status(p.as_ref(), &key),
+        true,
+    )?;
+    assert_eq!(status.phase, Phase::Registered);
+    assert_eq!(pool.used(), f.worker);
+    for request in [
+        f.begin.clone(),
+        ordinary(
+            &f,
+            2,
+            export_stage::Action::Ready {
+                icc: None,
+                xmp: None,
+            },
+        ),
+    ] {
+        pump_export_relay(
+            &parent.0,
+            &proxy,
+            move |p| {
+                p.call(
+                    Call::ExportStage(Box::new(request)),
+                    &AtomicBool::new(false),
+                )
+            },
+            false,
+        )?;
+    }
+    let request = lifecycle(&f, Action::Spawn);
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &request, &AtomicBool::new(false)),
+        false,
+    )?;
+    let request = lifecycle(&f, Action::RetryDrain);
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &request, &AtomicBool::new(false)),
+        true,
+    )?;
+    let owner = parent.0.export_native_owner()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if owner
+            .query(&crate::catalog_session::export_native::Query {
+                key: Key::new(&f.root, U64(9), &f.stage),
+                action: crate::catalog_session::export_native::QueryAction::Status,
+            })?
+            .phase
+            == Phase::Drained
+        {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "drain deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let release = ordinary(&f, 3, export_stage::Action::Release);
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| {
+            p.call(
+                Call::ExportStage(Box::new(release)),
+                &AtomicBool::new(false),
+            )
+        },
+        false,
+    )?;
+    let request = lifecycle(&f, Action::Retire);
+    let status = pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &request, &AtomicBool::new(false)),
+        true,
+    )?;
+    assert_eq!(status.phase, Phase::Released);
+    assert_eq!(pool.used(), 0);
+    assert_eq!(pool.reserve_exact(f.worker)?.bytes(), f.worker);
+    parent.0.finish_after_dependents(true)?;
+    eprintln!(
+        "export lost-control relay verified F={} checked reap and relay join",
+        parent.0.client.pid()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires exact built F executable via PHOTOCATALOG_TEST_EXECUTABLE; run serialized"]
+fn export_native_parent_proxy_held_arm_keeps_busy_stop_status_control_available() -> Result<()> {
+    use super::super::export_native::tests::{lifecycle, ordinary, register};
+    use crate::catalog_session::{
+        export_native::{Action, CatalogExportNative, Key, Phase},
+        export_stage,
+    };
+    let (parent, proxy, f, pool, stages) = export_relay_fixture()?;
+    let request = register(&f);
+    pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &request, &AtomicBool::new(false)),
+        false,
+    )?;
+    for request in [
+        f.begin.clone(),
+        ordinary(
+            &f,
+            2,
+            export_stage::Action::Ready {
+                icc: None,
+                xmp: None,
+            },
+        ),
+    ] {
+        pump_export_relay(
+            &parent.0,
+            &proxy,
+            move |p| {
+                p.call(
+                    Call::ExportStage(Box::new(request)),
+                    &AtomicBool::new(false),
+                )
+            },
+            false,
+        )?;
+    }
+    stages.pause_arm();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawn = {
+        let proxy = proxy.clone();
+        let request = lifecycle(&f, Action::Spawn);
+        thread::spawn(move || {
+            let _ = tx.send(CatalogExportNative::call(
+                proxy.as_ref(),
+                &request,
+                &AtomicBool::new(false),
+            ));
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(out) = proxy.next(Lane::Data) {
+            parent.0.receive(&out.bytes, Lane::Data)?;
+            break;
+        }
+        ensure!(Instant::now() < deadline, "held Arm dispatch deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    stages.wait_ready_entered();
+    // This order formerly blocked the reader and ParentState on lifecycle.
+    for action in [Action::Retire, Action::RetryDrain] {
+        let request = lifecycle(&f, action);
+        let error = pump_export_relay(
+            &parent.0,
+            &proxy,
+            move |p| CatalogExportNative::call(p.as_ref(), &request, &AtomicBool::new(false)),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::preview::stage_io::Busy>()
+                .is_some(),
+            "reserved refusal must remain typed Busy through Proxy: {error}"
+        );
+        assert_eq!(pool.used(), f.worker);
+    }
+    let stop = lifecycle(&f, Action::Stop);
+    let stopped = pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::call(p.as_ref(), &stop, &AtomicBool::new(false)),
+        false,
+    )?;
+    assert_eq!(stopped.phase, Phase::StopRequested);
+    assert!(stopped.pid.is_none());
+    let key = Key::new(&f.root, U64(9), &f.stage);
+    let status = pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |p| CatalogExportNative::status(p.as_ref(), &key),
+        false,
+    )?;
+    assert_eq!(status.phase, Phase::StopRequested);
+    assert_eq!(pool.used(), f.worker);
+    assert!(rx.try_recv().is_err(), "Arm is still barrier-held");
+    stages.resume_arm();
+    let spawned = pump_export_relay(
+        &parent.0,
+        &proxy,
+        move |_| rx.recv_timeout(Duration::from_secs(5))?,
+        false,
+    )?;
+    spawn.join().unwrap();
+    assert_eq!(spawned.phase, Phase::WaitFailed);
+    assert!(spawned.pid.is_none());
+    parent.0.export_native_owner()?.retire_root(&f.root)?;
+    assert_eq!(pool.used(), 0);
+    parent.0.finish_after_dependents(true)?;
+    eprintln!(
+        "held Arm reserved-control fixture verified F={} checked reap and relay join",
+        parent.0.client.pid()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires exact built F executable via PHOTOCATALOG_TEST_EXECUTABLE; run serialized"]
+fn export_native_parent_proxy_contiguous_query_supersedes_queued_prior_duplicate() -> Result<()> {
+    use super::super::export_native::tests::register;
+    use crate::catalog_session::export_native::{Key, Query, QueryAction};
+    let (parent, _proxy, f, pool, _stages) = export_relay_fixture()?;
+    let owner = parent.0.export_native_owner()?;
+    owner.call(&register(&f))?;
+    let send = |id, action| -> Result<()> {
+        let body = Body::Control(Control::ExportNativeQuery {
+            id: U64(id),
+            query: Query {
+                key: Key::new(&f.root, U64(9), &f.stage),
+                action,
+            },
+        });
+        parent.0.receive(
+            &encode(
+                &Packet {
+                    binding: parent.0.binding.clone(),
+                    body,
+                },
+                BYTES,
+            )?,
+            Lane::Control,
+        )
+    };
+    send(1, QueryAction::Status)?;
+    let first = await_lane(&parent.0, Lane::Control)?; // C can now consume reply 1.
+    send(1, QueryAction::Status)?; // Duplicate reply 1 deliberately stays unsent.
+    assert_eq!(
+        parent
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .output
+            .export_native_reply
+            .entries
+            .len(),
+        1
+    );
+    send(2, QueryAction::Retire)?; // Advancing is the acknowledgement of reply 1.
+    assert_eq!(pool.used(), 0);
+    {
+        let state = parent.0.state.lock().unwrap();
+        let queued = &state.output.export_native_reply.entries;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, 2);
+        assert_eq!(state.export_native_result.as_ref().unwrap().0, 2);
+    }
+    send(2, QueryAction::Retire)?; // Same identity deduplicates in the one slot.
+    let second = await_lane(&parent.0, Lane::Control)?;
+    assert!(matches!(
+        decode(&parent.0.binding, &first.bytes, Lane::Control)?,
+        Body::Control(Control::ExportNativeReply {
+            id: U64(1),
+            value: Ok(_),
+            ..
+        })
+    ));
+    assert!(matches!(
+        decode(&parent.0.binding, &second.bytes, Lane::Control)?,
+        Body::Control(Control::ExportNativeReply {
+            id: U64(2),
+            value: Ok(_),
+            ..
+        })
+    ));
+    send(2, QueryAction::Retire)?;
+    assert_eq!(
+        await_lane(&parent.0, Lane::Control)?.bytes.as_slice(),
+        second.bytes.as_slice()
+    );
+    assert_eq!(pool.used(), 0);
+    assert_eq!(pool.reserve_exact(f.worker)?.bytes(), f.worker);
+    assert!(send(2, QueryAction::Status).is_err());
+    assert!(send(1, QueryAction::Status).is_err());
+    parent.0.finish_after_dependents(true)?;
+    eprintln!(
+        "queued duplicate-control fixture verified F={} checked reap and relay join",
+        parent.0.client.pid()
+    );
+    Ok(())
+}

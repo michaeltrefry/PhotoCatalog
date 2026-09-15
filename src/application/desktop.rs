@@ -19,6 +19,7 @@ mod filesystem;
 pub(crate) use filesystem::admit_export_stage_reply;
 #[cfg(test)]
 pub(crate) use filesystem::roundtrip_export_stage;
+mod export_native;
 #[cfg(test)]
 mod filesystem_tests;
 pub(crate) mod lightroom_migration;
@@ -353,6 +354,11 @@ impl DesktopBridge {
             parent.configure_native(
                 config.worker_executable.clone(),
                 config.preview_limits.clone(),
+                native,
+            )?;
+            parent.configure_export_native(
+                config.worker_executable.clone(),
+                config.preview_limits.workers,
                 native,
             )?;
             Self::spawn_inner(config, Some(parent), Some(metadata))

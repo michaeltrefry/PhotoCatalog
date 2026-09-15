@@ -1588,7 +1588,7 @@ mod tests {
         Ok(())
     }
 
-    fn facts(
+    pub(super) fn facts(
         work: &ExportWork,
         output: &Path,
     ) -> Result<crate::export_worker::ExportRenderingFacts> {
@@ -2401,4 +2401,30 @@ mod tests {
         crate::application::desktop::admit_export_stage_reply(&reply)?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_captured_begin_failure() {
+    ADMISSION_FAULTS.with(|faults| {
+        assert!(faults.borrow().is_empty());
+        faults
+            .borrow_mut()
+            .extend([AdmissionFault::ParentClone, AdmissionFault::Cleanup]);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn test_maximum_receipt(
+    work: &crate::catalog_exports::ExportWork,
+    path: &Path,
+) -> Result<()> {
+    fs::write(path.join("output"), b"sealed")?;
+    let mut receipt = tests::facts(work, &path.join("output"))?;
+    receipt.rendered.metadata_notes.push(String::new());
+    let base = serde_json::to_vec(&receipt)?.len();
+    receipt.rendered.metadata_notes[0] = "n".repeat(RECEIPT_BYTES - base);
+    let bytes = serde_json::to_vec(&receipt)?;
+    assert_eq!(bytes.len(), RECEIPT_BYTES);
+    fs::write(path.join("result.json"), bytes)?;
+    Ok(())
 }

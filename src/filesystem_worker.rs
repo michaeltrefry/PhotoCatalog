@@ -334,3 +334,30 @@ pub fn worker_main() -> Result<()> {
 
 #[cfg(test)]
 mod bootstrap_tests;
+
+/// In-process access to the real F state machine for G custody tests.
+#[cfg(test)]
+pub(crate) mod export_stage_test_support {
+    use super::*;
+    #[derive(Default)]
+    pub struct Owner(super::export_stage::Owner);
+    impl Owner {
+        pub fn call(
+            &mut self,
+            manifest: &Path,
+            request: &crate::catalog_session::export_stage::Request,
+            cancel: &AtomicBool,
+        ) -> Result<crate::catalog_session::export_stage::Reply> {
+            self.0.call(manifest, request, cancel)
+        }
+        pub fn empty(&self) -> bool {
+            self.0.empty()
+        }
+    }
+    pub fn maximum_receipt(work: &crate::catalog_exports::ExportWork, path: &Path) -> Result<()> {
+        super::export_stage::test_maximum_receipt(work, path)
+    }
+    pub fn captured_begin_failure() {
+        super::export_stage::test_captured_begin_failure();
+    }
+}

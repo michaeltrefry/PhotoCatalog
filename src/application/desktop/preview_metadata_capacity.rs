@@ -1556,6 +1556,95 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         1,
         c.vec_growth(Layout::of::<Arc<()>>().size, w)?,
     )?;
+    let [
+        export_owner,
+        export_slot,
+        export_stage_state,
+        export_pending,
+        export_completed,
+    ] = super::export_native::owner_layouts();
+    let export_owner = Layout {
+        size: u64::try_from(export_owner.0)?,
+        align: u64::try_from(export_owner.1)?,
+    };
+    let export_slot = Layout {
+        size: u64::try_from(export_slot.0)?,
+        align: u64::try_from(export_slot.1)?,
+    };
+    a.push(
+        "fixed.export_native_g_owner_arc_backing",
+        Phase::Retained,
+        1,
+        c.arc(export_owner)?,
+    )?;
+    a.push(
+        "fixed.export_native_g_slot_arc_backings",
+        Phase::Active,
+        w,
+        c.arc(export_slot)?,
+    )?;
+    a.push(
+        "fixed.export_native_g_slot_registry_backing",
+        Phase::Active,
+        1,
+        c.vec_growth(Layout::of::<Arc<()>>().size, w)?,
+    )?;
+    a.push(
+        "fixed.export_native_g_slot_state_and_relay_backings",
+        Phase::Active,
+        w,
+        c.add(&[
+            c.layout_upper(&[
+                Layout {
+                    size: u64::try_from(export_stage_state.0)?,
+                    align: u64::try_from(export_stage_state.1)?,
+                },
+                Layout {
+                    size: u64::try_from(export_pending.0)?,
+                    align: u64::try_from(export_pending.1)?,
+                },
+                Layout {
+                    size: u64::try_from(export_completed.0)?,
+                    align: u64::try_from(export_completed.1)?,
+                },
+            ])?
+            .size,
+            // Registration, pending dispatch, cached outcome, exact work/plan,
+            // enriched receipt, and the C/G plus G/F wrapper pair.
+            c.mul(3, export_stage_work)?,
+            export_stage_completion,
+            c.mul(3, export_stage_cached_small)?, // terminal supervisor result plus dispatch/return clones
+            c.mul(2, export_stage_binding)?,
+            c.mul(2, RELAY_BYTES)?,
+            crate::catalog_session::export_stage::REQUEST_BYTES as u64,
+            crate::catalog_session::export_stage::RECEIPT_BYTES as u64,
+            c.mul(2, crate::catalog_session::export_stage::BLOB_BYTES)?,
+            crate::catalog_session::export_stage::CHUNK_BYTES as u64,
+        ])?,
+    )?;
+    // Export control coexists with ordinary data: G completed replay, C
+    // active query, C consumed replay, query/reply outputs, and the receiving
+    // decode/return copy. Account whole envelopes and typed graphs, not only
+    // the inner Status error or an F receipt. The output classes also retain
+    // all 16 early Stop keys independently of the one query/result pair.
+    let export_control = super::filesystem::CONTROL_BYTES as u64;
+    a.push(
+        "relay.export_native_control_lifetimes",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(6, export_control)?,
+            c.mul(6, wire_typed_graph(c, export_control)?)?,
+            c.mul(6, c.arc(Layout::of::<Vec<u8>>())?)?,
+            c.mul(3, c.vec_growth(slot_item, 1)?)?,
+            c.vec_growth(slot_item, 16)?,
+            c.vec_growth(
+                Layout::of::<crate::catalog_session::export_native::Key>().size,
+                16,
+            )?,
+            c.mul(16 * 5, LEASE_ID_BYTES)?,
+        ])?,
+    )?;
     let [calls, calls_state] = crate::preview::stage_io::metadata_layouts();
     let calls_root = Layout {
         size: u64::try_from(calls.0)?,
@@ -2006,6 +2095,61 @@ mod tests {
                 )?
             )
         );
+        Ok(())
+    }
+    #[test]
+    fn export_native_g_slots_count_every_legal_worker_and_registry_backing() -> Result<()> {
+        let config = config();
+        let report = report(&config)?;
+        let [owner, slot, ..] = super::super::export_native::owner_layouts();
+        let owner = Layout {
+            size: u64::try_from(owner.0)?,
+            align: u64::try_from(owner.1)?,
+        };
+        let slot = Layout {
+            size: u64::try_from(slot.0)?,
+            align: u64::try_from(slot.1)?,
+        };
+        let owner_entry = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.export_native_g_owner_arc_backing")
+            .context("export native G owner layout contribution")?;
+        assert_eq!(
+            (owner_entry.count, owner_entry.each),
+            (1, Checked.arc(owner)?)
+        );
+        let slots = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.export_native_g_slot_arc_backings")
+            .context("export native G slot layout contribution")?;
+        assert_eq!(
+            (slots.count, slots.each),
+            (config.preview_limits.workers as u64, Checked.arc(slot)?)
+        );
+        let registry = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.export_native_g_slot_registry_backing")
+            .context("export native G registry layout contribution")?;
+        assert_eq!(
+            (registry.count, registry.each),
+            (
+                1,
+                Checked.vec_growth(
+                    Layout::of::<Arc<()>>().size,
+                    config.preview_limits.workers as u64,
+                )?
+            )
+        );
+        let retained = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.export_native_g_slot_state_and_relay_backings")
+            .context("export native G retained relay contribution")?;
+        assert_eq!(retained.count, config.preview_limits.workers as u64);
+        assert!(retained.each >= 2 * RELAY_BYTES);
         Ok(())
     }
     #[test]
