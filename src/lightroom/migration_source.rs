@@ -10,6 +10,7 @@ pub(crate) mod manifest_json;
 mod reader;
 pub(crate) mod record_json;
 pub(crate) mod seal_json;
+mod supplement_json;
 pub(crate) use access::MigrationRead;
 pub(crate) use reader::IMAGE_LINK_LIMITATIONS;
 pub use reader::MigrationSource;

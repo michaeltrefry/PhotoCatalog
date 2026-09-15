@@ -17,8 +17,6 @@ use std::{
 };
 
 use crate::lightroom::source::closed_path as reader_uri;
-#[path = "supplement_json.rs"]
-mod supplement_json;
 
 pub(crate) const IMAGE_LINK_LIMITATIONS: &str = "Only exact unique retained schema3 links; missing is not proof of a master sentinel or current settings. History/snapshots and unknown tables remain separately retained.";
 
