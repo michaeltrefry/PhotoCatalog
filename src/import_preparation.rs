@@ -838,19 +838,18 @@ struct RemoteImport {
     pending: Option<crate::catalog_session::import::Request>,
     active: bool,
 }
+#[cfg(test)]
+type ImportRouteCallback = dyn Fn(
+        &crate::catalog_session::import::Request,
+        &AtomicBool,
+    ) -> Result<Option<crate::catalog_session::import::Reply>>
+    + Send
+    + Sync;
+
 enum RemoteImportRoute {
     Catalog(Arc<crate::catalog_session::CatalogSessionAuthority>),
     #[cfg(test)]
-    Callback(
-        Arc<
-            dyn Fn(
-                    &crate::catalog_session::import::Request,
-                    &AtomicBool,
-                ) -> Result<Option<crate::catalog_session::import::Reply>>
-                + Send
-                + Sync,
-        >,
-    ),
+    Callback(Arc<ImportRouteCallback>),
 }
 impl RemoteImportRoute {
     fn call(
