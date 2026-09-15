@@ -1,15 +1,16 @@
 //! One owned export process. Small IPC carries only admission; selected packets
 //! and ICC profiles use bounded, hash-bound files. EOF revokes native ownership.
 use crate::{
-    catalog_exports::{ExportWork, StoredProfile},
+    catalog_exports::{ExportWork, StoredOutput, StoredProfile},
     image_export::{OutputProfile, OutputSpec},
-    metadata_export::{self, SealedPhotoExport},
+    metadata_export::{self, FileRevision, SealedPhotoExport, VerifiedFile},
     photo_render::{self, PhotoRenderLimits, PhotoRenderRequest, StagedPhoto},
 };
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -34,6 +35,21 @@ pub struct CompletedExport {
     pub sealed: SealedPhotoExport,
     pub rendered: StagedPhoto,
     pub seal_ms: f64,
+    pub peak_resident_bytes: Option<u64>,
+    pub peak_method: String,
+}
+/// Bounded facts emitted by the native renderer. Destination sealing is a
+/// separate parent operation after the exact child has exited.
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "wire::RenderingCompletion")]
+pub struct ExportRenderingFacts {
+    pub job: String,
+    pub sequence: i64,
+    pub authority: String,
+    pub attempt: String,
+    pub output: StoredOutput,
+    pub output_revision: FileRevision,
+    pub rendered: StagedPhoto,
     pub peak_resident_bytes: Option<u64>,
     pub peak_method: String,
 }
@@ -117,9 +133,11 @@ fn validate_persisted(request: &Request) -> Result<()> {
 pub struct ExportWorkerProcess {
     child: Child,
     lease: Option<ChildStdin>,
+    parent_lease: RefCell<Option<File>>,
     staging: PathBuf,
     request: Request,
     exited: bool,
+    consumed: bool,
 }
 impl ExportWorkerProcess {
     pub fn spawn(
@@ -180,6 +198,14 @@ impl ExportWorkerProcess {
             .tempdir_in(&staging_root)?
             .keep();
         admit_output_path(&request.work, &staging.join("output"))?;
+        // This distinct parent lease protects the stage after child wait while
+        // poll validates the receipt and seals/reads back the rendered output.
+        write(&staging.join("parent.lock"), b"")?;
+        let parent_lease = metadata_export::open_regular(&staging.join("parent.lock"))?;
+        parent_lease
+            .try_lock_exclusive()
+            .context("acquire export parent lease")?;
+        check_parent_lease(&staging, &parent_lease)?;
         // The owner creates the lease before a child can be canceled or delayed
         // before startup. Children open it; they never recreate a retired lease.
         write(&staging.join("active.lock"), b"")?;
@@ -204,9 +230,11 @@ impl ExportWorkerProcess {
         let mut value = Self {
             child,
             lease: Some(lease),
+            parent_lease: RefCell::new(Some(parent_lease)),
             staging,
             request,
             exited: false,
+            consumed: false,
         };
         let lease = value.lease.as_mut().unwrap();
         lease.write_all(b"!")?;
@@ -223,61 +251,55 @@ impl ExportWorkerProcess {
         &self.request.work
     }
     pub fn poll(&mut self, canceled: &AtomicBool) -> Result<Option<CompletedExport>> {
-        ensure!(!self.exited, "export worker already consumed");
-        if canceled.load(Ordering::Acquire) {
-            self.stop()?;
-            bail!("export worker canceled");
+        ensure!(!self.consumed, "export worker already consumed");
+        if let Some(parent_lease) = self.parent_lease.borrow().as_ref() {
+            check_parent_lease(&self.staging, parent_lease)?;
         }
-        let Some(status) = self.child.try_wait()? else {
-            return Ok(None);
-        };
-        self.exited = true;
-        self.lease.take();
-        if !status.success() {
-            let detail = read(&self.staging.join("error.json"), RECEIPT_LIMIT)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<String>(&b).ok())
-                .unwrap_or_else(|| format!("export worker failed ({status})"));
-            bail!("{detail}");
+        if !self.exited {
+            if canceled.load(Ordering::Acquire) {
+                self.stop()?;
+                self.consumed = true;
+                bail!("export worker canceled");
+            }
+            let Some(status) = self.child.try_wait()? else {
+                return Ok(None);
+            };
+            self.exited = true;
+            self.lease.take();
+            if !status.success() {
+                self.consumed = true;
+                let detail = read(&self.staging.join("error.json"), RECEIPT_LIMIT)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<String>(&b).ok())
+                    .unwrap_or_else(|| format!("export worker failed ({status})"));
+                bail!("{detail}");
+            }
         }
-        let result: CompletedExport =
-            serde_json::from_slice(&read(&self.staging.join("result.json"), RECEIPT_LIMIT)?)?;
+        self.consumed = true;
+        let result =
+            wire::decode_completion(&read(&self.staging.join("result.json"), RECEIPT_LIMIT)?)?;
         let work = &self.request.work;
-        ensure!(
-            result.authority == work.authority
-                && result.attempt == work.attempt
-                && result.sealed.authority_digest == work.authority
-                && result.sealed.snapshot == work.plan.destination
-                && result.sealed.max_payload_bytes == work.plan.max_payload_bytes
-                && result.rendered.renderer_identity == work.plan.renderer_identity
-                && result.rendered.staging == self.staging.join("output")
-                && result.rendered.encoding.source_fingerprint
-                    == work.plan.original_revision.digest
-                && result.rendered.encoding.recipe_digest == work.plan.identity.recipe_digest
-                && result.rendered.encoding.encoded_extent == result.sealed.payload.bytes,
-            "export worker result binding mismatch"
-        );
-        // Verify the complete staged object under the durable seal, never an
-        // untrusted worker pathname or encoded whole-image transport.
-        ensure!(
-            metadata_export::read_photo_seal_with_checkpoint(
-                &work.plan.destination,
-                &work.authority,
-                &mut |_| {
-                    if canceled.load(Ordering::Acquire) {
-                        Err(std::io::Error::other(
-                            "export cancellation requested during seal verification",
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                }
-            )? == result.sealed,
-            "export worker seal changed"
-        );
+        let result = match result {
+            wire::DecodedCompletion::Legacy(result) => {
+                validate_completed(work, &self.staging, &result)?;
+                // Old children sealed before exit. Preserve their strict parent
+                // readback so an existing version-1/2 receipt remains usable.
+                ensure!(
+                    read_seal_checked(work, canceled)? == result.sealed,
+                    "export worker seal changed"
+                );
+                result
+            }
+            wire::DecodedCompletion::Rendering(facts) => {
+                validate_rendering(work, &self.staging, &facts)?;
+                complete_rendering(work, facts, canceled)?
+            }
+        };
         Ok(Some(result))
     }
     pub fn stop(&mut self) -> Result<()> {
+        // Stop permanently revokes result consumption, including when wait must retry.
+        self.consumed = true;
         if !self.exited {
             self.lease.take();
             if self.child.try_wait()?.is_none() {
@@ -290,10 +312,30 @@ impl ExportWorkerProcess {
         }
         Ok(())
     }
+    #[cfg(test)]
+    fn wait_for_rendering_exit_for_test(&mut self) -> Result<()> {
+        ensure!(!self.exited, "export worker already exited");
+        let status = self.child.wait()?;
+        self.exited = true;
+        self.lease.take();
+        if !status.success() {
+            let detail = read(&self.staging.join("error.json"), RECEIPT_LIMIT)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<String>(&bytes).ok())
+                .unwrap_or_else(|| "no bounded worker error receipt".into());
+            bail!("export worker failed ({status}): {detail}");
+        }
+        Ok(())
+    }
     /// Only this reaped worker's disposable transport files are removed. Durable
     /// publication/restore evidence resides in its separately sealed directory.
     pub fn retire_transport(&self) -> Result<()> {
         ensure!(self.exited, "cannot retire a live export worker");
+        if let Some(parent_lease) = self.parent_lease.borrow_mut().take() {
+            check_parent_lease(&self.staging, &parent_lease)?;
+            FileExt::unlock(&parent_lease)?;
+            drop(parent_lease);
+        }
         match fence_transport(&self.staging)? {
             Inspection::Retired(retired) => {
                 ensure!(
@@ -307,6 +349,167 @@ impl ExportWorkerProcess {
         }
     }
 }
+
+fn cancellation_checkpoint(canceled: &AtomicBool, operation: &str) -> std::io::Result<()> {
+    if canceled.load(Ordering::Acquire) {
+        Err(std::io::Error::other(format!(
+            "export cancellation requested during {operation}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn verified_checkpoint(
+    output: &VerifiedFile,
+    canceled: &AtomicBool,
+    operation: &str,
+) -> std::io::Result<()> {
+    let rechecked = output
+        .recheck()
+        .map_err(|error| std::io::Error::other(format!("{error:#}")));
+    let cancellation = cancellation_checkpoint(canceled, operation);
+    rechecked?;
+    cancellation
+}
+
+fn validate_rendered(work: &ExportWork, staging: &Path, rendered: &StagedPhoto) -> Result<()> {
+    ensure!(
+        rendered.renderer_identity == work.plan.renderer_identity
+            && rendered.staging == staging.join("output")
+            && rendered.encoding.source_fingerprint == work.plan.original_revision.digest
+            && rendered.encoding.recipe_digest == work.plan.identity.recipe_digest
+            && rendered.encoding.encoded_extent > 0
+            && rendered.encoding.encoded_extent <= work.plan.max_payload_bytes,
+        "export worker result binding mismatch"
+    );
+    Ok(())
+}
+
+fn validate_rendering(
+    work: &ExportWork,
+    staging: &Path,
+    facts: &ExportRenderingFacts,
+) -> Result<()> {
+    let output_matches = facts.output.size == work.plan.output.size
+        && facts.output.format == work.plan.output.format
+        && facts.output.alpha == work.plan.output.alpha
+        && match (&facts.output.profile, &work.plan.output.profile) {
+            (StoredProfile::Srgb, StoredProfile::Srgb)
+            | (StoredProfile::LinearSrgb, StoredProfile::LinearSrgb) => true,
+            (StoredProfile::Icc { blob: actual }, StoredProfile::Icc { blob: expected }) => {
+                actual == expected
+            }
+            _ => false,
+        };
+    ensure!(
+        facts.job == work.job
+            && facts.sequence == work.sequence
+            && facts.authority == work.authority
+            && facts.attempt == work.attempt
+            && output_matches
+            && facts.output_revision.bytes == facts.rendered.encoding.encoded_extent,
+        "export worker result binding mismatch"
+    );
+    validate_rendered(work, staging, &facts.rendered)
+}
+
+fn validate_completed(work: &ExportWork, staging: &Path, result: &CompletedExport) -> Result<()> {
+    ensure!(
+        result.authority == work.authority
+            && result.attempt == work.attempt
+            && result.sealed.authority_digest == work.authority
+            && result.sealed.snapshot == work.plan.destination
+            && result.sealed.max_payload_bytes == work.plan.max_payload_bytes
+            && result.rendered.encoding.encoded_extent == result.sealed.payload.bytes,
+        "export worker result binding mismatch"
+    );
+    validate_rendered(work, staging, &result.rendered)
+}
+
+fn read_seal_checked(work: &ExportWork, canceled: &AtomicBool) -> Result<SealedPhotoExport> {
+    metadata_export::read_photo_seal_with_checkpoint(
+        &work.plan.destination,
+        &work.authority,
+        &mut |_| cancellation_checkpoint(canceled, "seal verification"),
+    )
+}
+
+fn complete_rendering(
+    work: &ExportWork,
+    facts: ExportRenderingFacts,
+    canceled: &AtomicBool,
+) -> Result<CompletedExport> {
+    let started = std::time::Instant::now();
+    let verified = VerifiedFile::read_with_checkpoint(
+        &facts.rendered.staging,
+        work.plan.max_payload_bytes,
+        &mut |_| cancellation_checkpoint(canceled, "fresh-output verification"),
+    )?;
+    ensure!(
+        verified.revision() == &facts.output_revision,
+        "native output changed before parent sealing"
+    );
+    let prior_directory = work
+        .plan
+        .destination
+        .destination
+        .parent()
+        .context("export destination parent")?
+        .join(format!(
+            ".photocatalog-photo-export-{}",
+            work.plan.destination.operation
+        ));
+    let sealed = if prior_directory.try_exists()? {
+        // A fenced retry independently rendered again. Reuse is allowed only
+        // after strict verification of both durable and fresh complete bytes.
+        let prior = metadata_export::read_photo_seal_with_checkpoint(
+            &work.plan.destination,
+            &work.authority,
+            &mut |_| verified_checkpoint(&verified, canceled, "seal verification"),
+        )?;
+        ensure!(
+            facts.output_revision.bytes == prior.payload.bytes
+                && facts.output_revision.digest == prior.payload.digest,
+            "orphan seal differs from fresh render; prepare a new export plan"
+        );
+        prior
+    } else {
+        metadata_export::seal_photo_export(
+            &work.plan.destination,
+            &facts.rendered.staging,
+            work.plan.max_payload_bytes,
+            &work.authority,
+            |_| verified_checkpoint(&verified, canceled, "seal creation"),
+        )?
+    };
+    ensure!(
+        sealed.payload.bytes == facts.output_revision.bytes
+            && sealed.payload.digest == facts.output_revision.digest,
+        "export worker result binding mismatch"
+    );
+    // Always reread the installed durable evidence before exposing the same
+    // CompletedExport value that standalone callers already consume.
+    ensure!(
+        metadata_export::read_photo_seal_with_checkpoint(
+            &work.plan.destination,
+            &work.authority,
+            &mut |_| verified_checkpoint(&verified, canceled, "seal verification"),
+        )? == sealed,
+        "export worker seal changed"
+    );
+    Ok(CompletedExport {
+        authority: facts.authority,
+        attempt: facts.attempt,
+        sealed,
+        rendered: facts.rendered,
+        // This interval now explicitly belongs to the local parent and includes
+        // fresh/orphan comparison or creation plus strict durable readback.
+        seal_ms: started.elapsed().as_secs_f64() * 1000.,
+        peak_resident_bytes: facts.peak_resident_bytes,
+        peak_method: facts.peak_method,
+    })
+}
 impl Drop for ExportWorkerProcess {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -315,6 +518,7 @@ impl Drop for ExportWorkerProcess {
 
 const RETIRED_PREFIX: &str = "photo-retired-";
 const TRANSPORT_FILES: &[&str] = &[
+    "parent.lock",
     "active.lock",
     "request.json",
     "profile.icc",
@@ -394,6 +598,33 @@ fn open_lease(path: &Path) -> Result<File> {
         .truncate(false)
         .open(target)?)
 }
+enum ParentLeaseInspection {
+    Absent,
+    Acquired(AcquiredLease),
+    Busy,
+}
+fn acquire_parent_lease(path: &Path) -> Result<ParentLeaseInspection> {
+    let target = path.join("parent.lock");
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "invalid export parent lease type"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ParentLeaseInspection::Absent);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let file = metadata_export::open_regular(&target)?;
+    if let Err(error) = file.try_lock_exclusive() {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            return Ok(ParentLeaseInspection::Busy);
+        }
+        return Err(error.into());
+    }
+    check_parent_lease(path, &file)?;
+    Ok(ParentLeaseInspection::Acquired(AcquiredLease(file)))
+}
 // Construct only after successful acquisition. Closing one descriptor does not
 // release flock while a concurrent fork/dup retains its open-file description.
 // Explicit unlock ends this authority on every return/error before file close.
@@ -419,6 +650,24 @@ fn mark_retired(lock: &mut File) -> Result<()> {
 }
 fn lease_identity(file: &File) -> std::io::Result<(u64, u128)> {
     crate::storage_volume::held_object_key(file)
+}
+fn check_parent_lease(path: &Path, lock: &File) -> Result<()> {
+    ensure!(
+        lock.metadata()?.len() == 0,
+        "invalid export parent lease marker"
+    );
+    ensure!(
+        fs::symlink_metadata(path.join("parent.lock"))?
+            .file_type()
+            .is_file(),
+        "export parent lease type changed"
+    );
+    ensure!(
+        lease_identity(lock)?
+            == lease_identity(&metadata_export::open_regular(&path.join("parent.lock"))?)?,
+        "export parent lease identity changed"
+    );
+    Ok(())
 }
 fn check_live_lease(path: &Path, lock: &File) -> Result<()> {
     ensure!(
@@ -476,6 +725,15 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         fs::remove_dir(path)?;
         return Ok(Inspection::Cleaned);
     }
+    let parent = match acquire_parent_lease(path)? {
+        ParentLeaseInspection::Absent => None,
+        ParentLeaseInspection::Acquired(parent) => Some(parent),
+        ParentLeaseInspection::Busy => {
+            return Ok(Inspection::Retained(
+                "parent lease is busy; stage remains owned".into(),
+            ));
+        }
+    };
     let lock = open_lease(path)?;
     if let Err(error) = lock.try_lock_exclusive() {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
@@ -499,6 +757,7 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         if retired {
             // Only discard removes request.json, after the catalog owner has
             // reconciled the returned retirement proof. No work is fabricated.
+            drop(parent);
             discard_files(path, lock, paths)?;
             return Ok(Inspection::Cleaned);
         }
@@ -522,6 +781,7 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         fs::rename(path, &claimed)?;
         claimed
     };
+    drop(parent);
     Ok(Inspection::Retired(Box::new(RetiredExportTransport {
         staging,
         work: request.work,
@@ -589,6 +849,11 @@ pub fn recover_export_transports_with_checkpoint(
 pub fn discard_retired_export_transport(retired: &RetiredExportTransport) -> Result<()> {
     ensure!(retired_name(&retired.staging), "transport was not fenced");
     let paths = transport_files(&retired.staging)?;
+    let parent = match acquire_parent_lease(&retired.staging)? {
+        ParentLeaseInspection::Absent => None,
+        ParentLeaseInspection::Acquired(parent) => Some(parent),
+        ParentLeaseInspection::Busy => bail!("retired export parent lease busy"),
+    };
     let lock = open_lease(&retired.staging)?;
     lock.try_lock_exclusive()
         .context("retired export lease busy")?;
@@ -604,6 +869,7 @@ pub fn discard_retired_export_transport(retired: &RetiredExportTransport) -> Res
         same_work(&retired.work, &request.work),
         "retired export attempt changed"
     );
+    drop(parent);
     discard_files(&retired.staging, lock, paths)
 }
 
@@ -670,44 +936,23 @@ pub fn export_worker_main() -> Result<()> {
             request.limits,
             &(),
         )?;
-        let seal_started = std::time::Instant::now();
-        let prior_directory = plan
-            .destination
-            .destination
-            .parent()
-            .context("export destination parent")?
-            .join(format!(
-                ".photocatalog-photo-export-{}",
-                plan.destination.operation
-            ));
-        let sealed = if prior_directory.try_exists()? {
-            // A fenced retry must independently render again. It may reuse old
-            // sealed bytes only after a complete fresh-byte equality check.
-            let prior =
-                metadata_export::read_photo_seal(&plan.destination, &request.work.authority)?;
-            let fresh =
-                metadata_export::inspect_file_revision(&rendered.staging, plan.max_payload_bytes)?;
-            ensure!(
-                fresh.bytes == prior.payload.bytes && fresh.digest == prior.payload.digest,
-                "orphan seal differs from fresh render; prepare a new export plan"
-            );
-            prior
-        } else {
-            metadata_export::seal_photo_export(
-                &plan.destination,
-                &rendered.staging,
-                plan.max_payload_bytes,
-                &request.work.authority,
-                |_| Ok(()),
-            )?
-        };
+        let native_output = VerifiedFile::read_with_checkpoint(
+            &rendered.staging,
+            plan.max_payload_bytes,
+            &mut |_| Ok(()),
+        )?;
+        let output_revision = native_output.revision().clone();
+        native_output.recheck()?;
+        let output = plan.output.clone();
         let (peak_resident_bytes, peak_method) = crate::preview::peak_resident_memory();
-        let receipt = CompletedExport {
+        let receipt = ExportRenderingFacts {
+            job: request.work.job,
+            sequence: request.work.sequence,
             authority: request.work.authority,
             attempt: request.work.attempt,
-            sealed,
+            output,
+            output_revision,
             rendered,
-            seal_ms: seal_started.elapsed().as_secs_f64() * 1000.,
             peak_resident_bytes,
             peak_method,
         };

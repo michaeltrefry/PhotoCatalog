@@ -474,8 +474,7 @@ fn undo_aba_invalidates_active_export_before_any_destination_publication() -> an
 }
 
 #[test]
-fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan()
--> anyhow::Result<()> {
+fn parent_sealing_rerenders_before_reusing_orphan() -> anyhow::Result<()> {
     for mode in ["resume", "canceled", "stale"] {
         let root = tempfile::tempdir()?;
         let (mut c, key, mut p, _) = setup(root.path())?;
@@ -500,6 +499,10 @@ fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan
             xmp.as_deref(),
             limits().render,
         )?;
+        let recovery = path.parent().unwrap().canonicalize()?.join(format!(
+            ".photocatalog-photo-export-{}",
+            work.plan.destination.operation
+        ));
         let deadline = Instant::now() + Duration::from_secs(30);
         let result = loop {
             if let Some(result) = worker.poll(&AtomicBool::new(false))? {
@@ -508,10 +511,11 @@ fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
         };
-        // This is the crash boundary: the process completed and sealed bytes, but
-        // no catalog acceptance or destination publication happened.
+        // This is the crash boundary: the local parent sealed the child output,
+        // but no catalog acceptance or destination publication happened.
         assert!(!path.exists());
-        assert!(result.sealed.recovery_directory().is_dir());
+        assert_eq!(result.sealed.recovery_directory(), recovery);
+        assert!(recovery.is_dir());
         drop(worker);
         drop(service);
         if mode == "canceled" {

@@ -4,13 +4,67 @@ use crate::{
     catalog_exports::{MetadataSelection, PhotoExportPlan, StoredOutput},
     catalog_metadata::RenderIdentity,
     edit::{Recipe, RenderLimits},
-    image_export::{AlphaPolicy, EncodeLimits, IntegerDepth, OutputFormat, OutputSize},
+    image_export::{
+        AlphaPolicy, EncodeLimits, EncodingReport, IntegerDepth, OutputDescriptor, OutputFormat,
+        OutputSize,
+    },
     media::DecodeLimits,
     metadata_export::{DestinationSnapshot, FileRevision},
     storage_volume::NativePath,
 };
 
+fn rendering_facts(request: &Request, staging: PathBuf, bytes: u64) -> ExportRenderingFacts {
+    ExportRenderingFacts {
+        job: request.work.job.clone(),
+        sequence: request.work.sequence,
+        authority: request.work.authority.clone(),
+        attempt: request.work.attempt.clone(),
+        output: request.work.plan.output.clone(),
+        output_revision: metadata_export::inspect_file_revision(&staging, 16 * 1024).unwrap(),
+        rendered: StagedPhoto {
+            staging,
+            encoding: EncodingReport {
+                output: OutputDescriptor {
+                    width: 1,
+                    height: 1,
+                    channels: 4,
+                    bits_per_sample: 8,
+                    floating_point: false,
+                    orientation: 1,
+                    icc_blake3: "fixture".into(),
+                    integer_clips_to_unit_range: true,
+                    alpha: AlphaPolicy::Preserve,
+                },
+                encoded_extent: bytes,
+                source_fingerprint: request.work.plan.original_revision.digest.clone(),
+                recipe_digest: request.work.plan.identity.recipe_digest.clone(),
+                metadata_blake3: "fixture".into(),
+                compression: "fixture".into(),
+            },
+            renderer_identity: request.work.plan.renderer_identity.clone(),
+            metadata_notes: Vec::new(),
+            timings: crate::photo_render::PhotoRenderTimings {
+                source_verification_before_ms: 0.,
+                staging_setup_ms: 0.,
+                decode_ms: 0.,
+                recipe_ms: 0.,
+                metadata_ms: 0.,
+                encode_ms: 0.,
+                source_verification_after_ms: 0.,
+                sync_ms: 0.,
+                total_ms: 0.,
+            },
+        },
+        peak_resident_bytes: None,
+        peak_method: "fixture".into(),
+    }
+}
+
 fn request(root: &Path) -> Request {
+    // DestinationSnapshot compares a normalized parent with the planned path.
+    // macOS temp directories may be reached through the /var -> /private/var
+    // alias, so fixtures must plan with the canonical spelling used at seal.
+    let root = root.canonicalize().unwrap();
     let recipe = Recipe::default();
     let fingerprint = "a".repeat(64);
     let plan = PhotoExportPlan {
@@ -85,6 +139,44 @@ fn request(root: &Path) -> Request {
             max_encoded_extent: 1024,
         },
     }
+}
+
+fn native_request(root: &Path) -> Result<(Request, OutputSpec, FileRevision)> {
+    const NATIVE_FIXTURE_BYTES: u64 = 8 * 1024 * 1024;
+    let original = root.join("original.png");
+    image::RgbaImage::from_pixel(8, 6, image::Rgba([20, 40, 80, 255])).save(&original)?;
+    let original_revision =
+        metadata_export::inspect_file_revision(&original, NATIVE_FIXTURE_BYTES)?;
+    let mut request = request(root);
+    let mut plan = (*request.work.plan).clone();
+    plan.renderer_identity = photo_render::output_renderer_identity().into();
+    plan.original = NativePath::from_path(&original);
+    plan.original_revision = original_revision.clone();
+    plan.identity.source.fingerprint = Some(original_revision.digest.clone());
+    // Match the proven PhotoExportService fixture ceiling. The rendered PNG
+    // carries profile and metadata chunks, so the synthetic 1 KiB recovery
+    // ceiling is not a valid bound for this actual-render fixture.
+    plan.max_original_bytes = NATIVE_FIXTURE_BYTES;
+    plan.max_payload_bytes = NATIVE_FIXTURE_BYTES;
+    let raw = serde_json::to_string(&plan)?;
+    let authority = blake3::hash(raw.as_bytes()).to_hex().to_string();
+    request.version = 2;
+    request.work.authority = authority.clone();
+    request.work.plan = crate::catalog_exports::checked_plan(&raw, &authority)?;
+    request.limits.decode.max_encoded_bytes = NATIVE_FIXTURE_BYTES;
+    request.limits.max_encoded_extent = NATIVE_FIXTURE_BYTES;
+    Ok((
+        request,
+        OutputSpec {
+            size: OutputSize::Original,
+            format: OutputFormat::Png {
+                depth: IntegerDepth::Eight,
+            },
+            profile: OutputProfile::Srgb,
+            alpha: AlphaPolicy::Preserve,
+        },
+        original_revision,
+    ))
 }
 fn stage(root: &Path, request: &Request, with_lock: bool) -> PathBuf {
     let path = root.join(format!("photo-worker-{}", uuid::Uuid::new_v4()));
@@ -275,6 +367,169 @@ fn transport_read_admits_exact_length_and_rejects_excess() {
 }
 
 #[test]
+fn parent_seal_requires_exact_fresh_orphan_bytes_and_preserves_strict_readback() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let request = request(temp.path());
+    let canceled = AtomicBool::new(false);
+    let bytes = b"aaaaaaaa";
+
+    let first_stage = temp.path().join("first-stage");
+    fs::create_dir(&first_stage)?;
+    write(&first_stage.join("output"), bytes)?;
+    let first = rendering_facts(&request, first_stage.join("output"), bytes.len() as u64);
+    validate_rendering(&request.work, &first_stage, &first)?;
+    let completed = complete_rendering(&request.work, first, &canceled)?;
+    assert_eq!(
+        read_seal_checked(&request.work, &canceled)?,
+        completed.sealed
+    );
+
+    let equal_stage = temp.path().join("equal-stage");
+    fs::create_dir(&equal_stage)?;
+    write(&equal_stage.join("output"), bytes)?;
+    let equal = rendering_facts(&request, equal_stage.join("output"), bytes.len() as u64);
+    validate_rendering(&request.work, &equal_stage, &equal)?;
+    assert_eq!(
+        complete_rendering(&request.work, equal, &canceled)?.sealed,
+        completed.sealed
+    );
+
+    let different_stage = temp.path().join("different-stage");
+    fs::create_dir(&different_stage)?;
+    write(&different_stage.join("output"), b"bbbbbbbb")?;
+    let different = rendering_facts(&request, different_stage.join("output"), bytes.len() as u64);
+    validate_rendering(&request.work, &different_stage, &different)?;
+    let error = complete_rendering(&request.work, different, &canceled)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("orphan seal differs from fresh render"));
+
+    let oversized_stage = temp.path().join("oversized-stage");
+    fs::create_dir(&oversized_stage)?;
+    write(&oversized_stage.join("output"), &vec![0; 1025])?;
+    let oversized = rendering_facts(&request, oversized_stage.join("output"), 1025);
+    assert!(validate_rendering(&request.work, &oversized_stage, &oversized).is_err());
+    assert_eq!(
+        read_seal_checked(&request.work, &canceled)?,
+        completed.sealed
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_lease_admission_is_nofollow_nonblocking_and_rechecks_exact_object() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir()?;
+    let stage = temp.path().join("stage");
+    fs::create_dir(&stage)?;
+    let lease_path = stage.join("parent.lock");
+    write(&lease_path, b"")?;
+    let held = metadata_export::open_regular(&lease_path)?;
+    held.try_lock_exclusive()?;
+    fs::remove_file(&lease_path)?;
+    write(&lease_path, b"")?;
+    assert!(check_parent_lease(&stage, &held).is_err());
+    FileExt::unlock(&held)?;
+    drop(held);
+
+    fs::remove_file(&lease_path)?;
+    let target = stage.join("target");
+    write(&target, b"")?;
+    std::os::unix::fs::symlink(&target, &lease_path)?;
+    assert!(acquire_parent_lease(&stage).is_err());
+    fs::remove_file(&lease_path)?;
+
+    let encoded = std::ffi::CString::new(lease_path.as_os_str().as_bytes())?;
+    ensure!(
+        unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) } == 0,
+        "mkfifo failed"
+    );
+    assert!(acquire_parent_lease(&stage).is_err());
+    fs::remove_file(&lease_path)?;
+    fs::create_dir(&lease_path)?;
+    assert!(acquire_parent_lease(&stage).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a fresh CLI via PHOTOCATALOG_TEST_EXECUTABLE"]
+fn actual_render_exit_retains_parent_stage_and_rejects_output_substitution() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    for case in 0..3 {
+        let temp = tempfile::tempdir()?;
+        let (request, output, original_revision) = native_request(temp.path())?;
+        let workers = temp.path().join("workers");
+        let recovery = request
+            .work
+            .plan
+            .destination
+            .destination
+            .parent()
+            .unwrap()
+            .join(format!(
+                ".photocatalog-photo-export-{}",
+                request.work.plan.destination.operation
+            ));
+        let mut worker = ExportWorkerProcess::spawn(
+            &executable,
+            &workers,
+            request.work.clone(),
+            &output,
+            None,
+            request.limits,
+        )?;
+        worker.wait_for_rendering_exit_for_test()?;
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&read(&worker.staging.join("result.json"), RECEIPT_LIMIT)?)?;
+        assert_eq!(receipt["version"], 3);
+        assert!(!recovery.exists());
+        let recovered = recover_export_transports(&workers, 1)?;
+        assert_eq!(recovered.retained.len(), 1);
+        assert!(recovered.retired.is_empty());
+
+        if case == 0 {
+            // A valid completed render is still ineligible for sealing after Stop.
+            worker.stop()?;
+            let error = worker
+                .poll(&AtomicBool::new(false))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("export worker already consumed"));
+        } else {
+            let staged = worker.staging.join("output");
+            let original_output = fs::read(&staged)?;
+            let substituted = vec![original_output[0] ^ 0xff; original_output.len()];
+            if case == 2 {
+                fs::remove_file(&staged)?;
+                write(&staged, &substituted)?;
+            } else {
+                let mut file = OpenOptions::new().write(true).open(&staged)?;
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&substituted)?;
+                file.sync_all()?;
+            }
+            let error = worker
+                .poll(&AtomicBool::new(false))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("native output changed before parent sealing"));
+        }
+        assert!(!recovery.exists());
+        worker.retire_transport()?;
+        assert!(!worker.staging.exists());
+        assert_eq!(
+            metadata_export::inspect_file_revision(&temp.path().join("original.png"), 1024)?,
+            original_revision
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn pre_admission_child_entry() {
     let Some(ready) = std::env::var_os("PHOTOCATALOG_EXPORT_TEST_READY") else {
         return;
@@ -303,9 +558,11 @@ fn cancellation_reaps_actual_pre_admission_child_and_retires_missing_lease() {
     let mut process = ExportWorkerProcess {
         child,
         lease,
+        parent_lease: RefCell::new(None),
         staging: staging.clone(),
         request,
         exited: false,
+        consumed: false,
     };
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !ready.exists() {
@@ -395,6 +652,41 @@ fn native_completion_keeps_non_utf_staging_and_legacy_completion_still_reads() -
     let decoded: CompletedExport =
         serde_json::from_slice(&read(&temp.path().join("result.json"), RECEIPT_LIMIT)?)?;
     assert_eq!(decoded.rendered.staging, completion.rendered.staging);
+
+    let facts = ExportRenderingFacts {
+        job: r.work.job.clone(),
+        sequence: r.work.sequence,
+        authority: r.work.authority.clone(),
+        attempt: r.work.attempt.clone(),
+        output: r.work.plan.output.clone(),
+        output_revision: r.work.plan.original_revision.clone(),
+        rendered: decoded.rendered,
+        peak_resident_bytes: None,
+        peak_method: "fixture".into(),
+    };
+    validate_rendering(&r.work, &parent, &facts)?;
+    let rendering_json = serde_json::to_vec(&facts)?;
+    let rendering_value: serde_json::Value = serde_json::from_slice(&rendering_json)?;
+    assert_eq!(rendering_value["version"], 3);
+    assert!(rendering_value.get("sealed").is_none());
+    assert!(rendering_value.get("seal_ms").is_none());
+    let wire::DecodedCompletion::Rendering(mut decoded_facts) =
+        wire::decode_completion(&rendering_json)?
+    else {
+        anyhow::bail!("render receipt decoded as legacy completion")
+    };
+    validate_rendering(&r.work, &parent, &decoded_facts)?;
+    decoded_facts.rendered.staging = parent.join("foreign-output");
+    assert!(validate_rendering(&r.work, &parent, &decoded_facts).is_err());
+
+    let mut foreign = rendering_value;
+    foreign["authority"] = "f".repeat(64).into();
+    let wire::DecodedCompletion::Rendering(foreign) =
+        wire::decode_completion(&serde_json::to_vec(&foreign)?)?
+    else {
+        anyhow::bail!("render receipt decoded as legacy completion")
+    };
+    assert!(validate_rendering(&r.work, &parent, &foreign).is_err());
 
     let mut invalid: serde_json::Value = serde_json::from_slice(&json)?;
     invalid["version"] = 1.into();

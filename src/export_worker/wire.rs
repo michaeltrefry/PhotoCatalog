@@ -117,6 +117,40 @@ struct Rendered {
     metadata_notes: Vec<String>,
     timings: PhotoRenderTimings,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RenderingCompletion {
+    version: u32,
+    job: String,
+    sequence: i64,
+    authority: String,
+    attempt: String,
+    output: StoredOutput,
+    output_revision: FileRevision,
+    rendered: Rendered,
+    peak_resident_bytes: Option<u64>,
+    peak_method: String,
+}
+
+pub(super) enum DecodedCompletion {
+    Legacy(CompletedExport),
+    Rendering(ExportRenderingFacts),
+}
+
+pub(super) fn decode_completion(bytes: &[u8]) -> Result<DecodedCompletion> {
+    #[derive(Deserialize)]
+    struct Version {
+        #[serde(default = "legacy")]
+        version: u32,
+    }
+    match serde_json::from_slice::<Version>(bytes)?.version {
+        1 | 2 => Ok(DecodedCompletion::Legacy(serde_json::from_slice(bytes)?)),
+        3 => Ok(DecodedCompletion::Rendering(serde_json::from_slice(bytes)?)),
+        _ => bail!("unsupported export completion version"),
+    }
+}
+
 impl Serialize for CompletedExport {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -141,6 +175,61 @@ impl Serialize for CompletedExport {
         .serialize(serializer)
     }
 }
+
+impl Serialize for ExportRenderingFacts {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        RenderingCompletion {
+            version: 3,
+            job: self.job.clone(),
+            sequence: self.sequence,
+            authority: self.authority.clone(),
+            attempt: self.attempt.clone(),
+            output: self.output.clone(),
+            output_revision: self.output_revision.clone(),
+            rendered: Rendered {
+                staging: StoredPath::Native(NativePath::from_path(&self.rendered.staging)),
+                encoding: self.rendered.encoding.clone(),
+                renderer_identity: self.rendered.renderer_identity.clone(),
+                metadata_notes: self.rendered.metadata_notes.clone(),
+                timings: self.rendered.timings.clone(),
+            },
+            peak_resident_bytes: self.peak_resident_bytes,
+            peak_method: self.peak_method.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl TryFrom<RenderingCompletion> for ExportRenderingFacts {
+    type Error = anyhow::Error;
+    fn try_from(c: RenderingCompletion) -> Result<Self> {
+        ensure!(
+            c.version == 3,
+            "unsupported export rendering receipt version"
+        );
+        Ok(Self {
+            job: c.job,
+            sequence: c.sequence,
+            authority: c.authority,
+            attempt: c.attempt,
+            output: c.output,
+            output_revision: c.output_revision,
+            rendered: StagedPhoto {
+                staging: c.rendered.staging.local(true)?,
+                encoding: c.rendered.encoding,
+                renderer_identity: c.rendered.renderer_identity,
+                metadata_notes: c.rendered.metadata_notes,
+                timings: c.rendered.timings,
+            },
+            peak_resident_bytes: c.peak_resident_bytes,
+            peak_method: c.peak_method,
+        })
+    }
+}
+
 impl TryFrom<Completion> for CompletedExport {
     type Error = anyhow::Error;
     fn try_from(c: Completion) -> Result<Self> {
