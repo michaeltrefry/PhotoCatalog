@@ -1152,11 +1152,29 @@ fn held_directory_rename_uses_delete_capable_handles_and_refuses_replacement() -
     let source_handle = discard_directory(&source)?;
     let source_identity = lease_identity(&source_handle)?;
 
-    rename_directory_held(&source_handle, &parent, std::ffi::OsStr::new("moved"))?;
+    // A one-code-unit name exercises the FILE_RENAME_INFO fixed header size;
+    // passing only offsetof(FileName) plus this payload is invalid on Windows.
+    rename_directory_held(&source_handle, &parent, std::ffi::OsStr::new("m"))?;
     assert!(!source.try_exists()?);
     assert_eq!(
-        lease_identity(&discard_directory(&root.join("moved"))?)?,
+        lease_identity(&discard_directory(&root.join("m"))?)?,
         source_identity
+    );
+
+    let longest_name = "m".repeat(128);
+    let longest_source = root.join("longest-source");
+    fs::create_dir(&longest_source)?;
+    let longest_source_handle = discard_directory(&longest_source)?;
+    let longest_source_identity = lease_identity(&longest_source_handle)?;
+    rename_directory_held(
+        &longest_source_handle,
+        &parent,
+        std::ffi::OsStr::new(&longest_name),
+    )?;
+    assert!(!longest_source.try_exists()?);
+    assert_eq!(
+        lease_identity(&discard_directory(&root.join(longest_name))?)?,
+        longest_source_identity
     );
 
     let collision_source = root.join("collision-source");

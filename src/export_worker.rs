@@ -1194,7 +1194,10 @@ fn discard_directory(path: &Path) -> Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         let file = OpenOptions::new()
             .read(true)
-            .access_mode(0x80000000 | 0x10000)
+            // GENERIC_READ | DELETE keeps the exact directory removable;
+            // FILE_TRAVERSE lets this same held handle serve as RootDirectory
+            // for a relative FILE_RENAME_INFO target.
+            .access_mode(0x80000000 | 0x10000 | 0x20)
             .share_mode(1 | 2 | 4)
             .custom_flags(0x02000000 | 0x00200000)
             .open(path)?;
@@ -1232,11 +1235,11 @@ fn discard_file(path: &Path) -> Result<File> {
 fn rename_directory_held(source: &File, parent: &File, name: &std::ffi::OsStr) -> Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     #[repr(C)]
-    struct RenameInfo {
+    struct RenameInfo<const N: usize> {
         replace_if_exists: u32,
         root_directory: *mut std::ffi::c_void,
         file_name_length: u32,
-        file_name: [u16; 128],
+        file_name: [u16; N],
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1252,22 +1255,30 @@ fn rename_directory_held(source: &File, parent: &File, name: &std::ffi::OsStr) -
         !encoded.is_empty() && encoded.len() <= 128 && !encoded.contains(&0),
         "invalid retired export name"
     );
-    let mut info = RenameInfo {
+    // FILE_RENAME_INFO declares FileName[1], and Windows requires the input
+    // buffer to include sizeof(FILE_RENAME_INFO) plus the named UTF-16 bytes.
+    // Keep one extra code unit in the backing object so that formula is valid
+    // on both 32- and 64-bit Windows, including the maximum accepted name.
+    let mut info = RenameInfo::<129> {
         replace_if_exists: 0,
         root_directory: parent.as_raw_handle(),
         file_name_length: u32::try_from(encoded.len() * std::mem::size_of::<u16>())?,
-        file_name: [0; 128],
+        file_name: [0; 129],
     };
     info.file_name[..encoded.len()].copy_from_slice(&encoded);
-    let bytes = std::mem::offset_of!(RenameInfo, file_name)
+    let bytes = std::mem::size_of::<RenameInfo<1>>()
         .checked_add(encoded.len() * std::mem::size_of::<u16>())
         .context("retired export rename buffer")?;
+    ensure!(
+        bytes <= std::mem::size_of_val(&info),
+        "retired export name overflow"
+    );
     ensure!(
         unsafe {
             SetFileInformationByHandle(
                 source.as_raw_handle(),
                 3, // FileRenameInfo: fail rather than replace an existing target.
-                (&info as *const RenameInfo).cast(),
+                std::ptr::from_ref(&info).cast(),
                 u32::try_from(bytes)?,
             )
         } != 0,
