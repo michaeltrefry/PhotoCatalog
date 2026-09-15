@@ -364,7 +364,6 @@ struct WorkerState {
     input: Option<InputState>,
     review: Option<ReviewState>,
     reader: Option<Reader>,
-    operation: Option<Operation>,
     discovery: Option<DiscoveryState>,
 }
 impl Default for WorkerState {
@@ -374,7 +373,6 @@ impl Default for WorkerState {
             input: None,
             review: None,
             reader: None,
-            operation: None,
             discovery: None,
         }
     }
@@ -392,166 +390,6 @@ impl WorkerState {
         self.reader = None;
         Ok(())
     }
-    pub fn execute(
-        &mut self,
-        catalog_name: &str,
-        catalog: &mut Catalog,
-        request: Request,
-        bounds: &Limits,
-        cancel: &Cancellation,
-    ) -> Result<Response> {
-        match request {
-            Request::Options => Ok(Response::Options(options(bounds))),
-            Request::Status { operation } => {
-                if let Some(id) = operation {
-                    valid_uuid(&id)?;
-                }
-                Ok(Response::Status(self.status(catalog_name)))
-            }
-            Request::Cancel { operation, epoch } => {
-                valid_uuid(&operation)?;
-                if epoch.0 != self.epoch {
-                    return Err(error(
-                        ErrorCode::StaleSession,
-                        "metadata operation epoch changed",
-                    ));
-                }
-                if let Some(active) = self
-                    .operation
-                    .as_mut()
-                    .filter(|value| value.id == operation)
-                {
-                    active.cancel_requested = true;
-                }
-                Ok(Response::Status(self.status(catalog_name)))
-            }
-            Request::Start { attempt, action } => {
-                self.start(catalog, attempt, action, bounds, cancel)
-            }
-            Request::InputStatus { token, generation } => {
-                let input = self
-                    .input
-                    .as_ref()
-                    .filter(|value| value.dto.token == token && value.dto.generation == generation)
-                    .ok_or_else(|| {
-                        error(ErrorCode::StaleSession, "metadata input token changed")
-                    })?;
-                Ok(Response::Input(input.dto.clone()))
-            }
-            Request::Receipt { attempt } => Ok(Response::Receipt(
-                catalog.metadata_write_receipt(&attempt).map_err(native)?,
-            )),
-            Request::Review { token, digest } => Ok(Response::Review(
-                self.checked_review(&token, &digest)?.dto.clone(),
-            )),
-            Request::ReviewFields {
-                token,
-                digest,
-                after,
-                limit,
-            } => self.review_fields(&token, &digest, after, limit, bounds),
-            Request::Chunk {
-                reference,
-                offset,
-                length,
-            } => self.chunk(reference, offset, length),
-            Request::Plans {
-                owner,
-                after,
-                limit,
-            } => self.plans(catalog, owner.as_ref(), after, limit, bounds),
-            Request::Plan { operation } => Ok(Response::Plan(
-                plan_json(catalog, &operation).map_err(native)?,
-            )),
-            Request::RecoveryEntries {
-                token,
-                after,
-                limit,
-            } => self.recovery_entries(catalog, token, after, limit, bounds, cancel),
-        }
-    }
-
-    fn start(
-        &mut self,
-        catalog: &mut Catalog,
-        attempt: String,
-        action: Action,
-        bounds: &Limits,
-        cancel: &Cancellation,
-    ) -> Result<Response> {
-        crate::catalog_metadata_write::validate_attempt(&attempt).map_err(native)?;
-        let action_bytes = serde_json::to_vec(&action).map_err(|value| native(value.into()))?;
-        let digest =
-            blake3::hash(&[b"photocatalog-metadata-write-v1\0", action_bytes.as_slice()].concat())
-                .to_hex()
-                .to_string();
-        if let Some(receipt) = catalog.metadata_write_receipt(&attempt).map_err(native)? {
-            if receipt.request_digest != digest {
-                return Err(error(
-                    ErrorCode::InvalidRequest,
-                    "attempt already belongs to a different request",
-                ));
-            }
-            self.operation = Some(terminal(
-                &attempt,
-                &digest,
-                &kind(&action),
-                self.epoch,
-                serde_json::to_value(&receipt.result).unwrap(),
-            ));
-            return Ok(Response::Admitted(Admitted {
-                operation: self.operation.as_ref().unwrap().id.clone(),
-                attempt,
-                request_digest: digest,
-                epoch: U64(self.epoch),
-            }));
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        self.operation = Some(Operation {
-            id: id.clone(),
-            attempt: attempt.clone(),
-            request_digest: digest.clone(),
-            epoch: U64(self.epoch),
-            kind: kind(&action),
-            phase: "running".into(),
-            stage: "admitting".into(),
-            cancel_requested: false,
-            progress: U64(0),
-            result: None,
-            error: None,
-        });
-        let result = self.run(catalog, &attempt, &digest, action, bounds, cancel);
-        match result {
-            Ok(value) => {
-                if let Some(operation) = self.operation.as_mut() {
-                    operation.phase = "complete".into();
-                    operation.stage = "draining".into();
-                    operation.progress = U64(1);
-                    operation.result = Some(value);
-                }
-            }
-            Err(failure) => {
-                if let Some(operation) = self.operation.as_mut() {
-                    operation.phase = if cancel.is_canceled() {
-                        "canceled"
-                    } else {
-                        "failed"
-                    }
-                    .into();
-                    operation.stage = "draining".into();
-                    operation.error = Some(failure.message.clone());
-                }
-                return Err(failure);
-            }
-        }
-        Ok(Response::Admitted(Admitted {
-            operation: id,
-            attempt,
-            request_digest: digest,
-            epoch: U64(self.epoch),
-        }))
-    }
-
     fn run(
         &mut self,
         catalog: &mut Catalog,
@@ -1037,84 +875,6 @@ impl WorkerState {
         }
     }
 
-    fn checked_review(&self, token: &str, digest: &str) -> Result<&ReviewState> {
-        self.review
-            .as_ref()
-            .filter(|value| value.dto.token == token && value.dto.digest == digest)
-            .ok_or_else(|| error(ErrorCode::StaleSession, "metadata review changed"))
-    }
-    fn status(&self, catalog: &str) -> Status {
-        Status {
-            catalog: catalog.into(),
-            epoch: U64(self.epoch),
-            operation: self.operation.clone(),
-            write_hold: self.operation.as_ref().is_some_and(|value| {
-                value.phase == "running"
-                    && matches!(
-                        value.stage.as_str(),
-                        "waiting_writer" | "committing" | "capturing" | "publishing" | "restoring"
-                    )
-            }),
-            closing: false,
-            input: self.input.as_ref().map(|value| value.dto.clone()),
-            review: self.review.as_ref().map(|value| value.dto.clone()),
-        }
-    }
-    fn review_fields(
-        &self,
-        token: &str,
-        digest: &str,
-        after: Option<String>,
-        limit: u16,
-        bounds: &Limits,
-    ) -> Result<Response> {
-        if limit == 0 || limit > bounds.page_rows {
-            return Err(error(
-                ErrorCode::ResourceLimit,
-                "metadata review page limit",
-            ));
-        }
-        let review = self.checked_review(token, digest)?;
-        let start = after
-            .as_deref()
-            .map(|value| value.parse::<usize>())
-            .transpose()
-            .map_err(|_| error(ErrorCode::InvalidRequest, "invalid review cursor"))?
-            .unwrap_or(0);
-        let end = (start + usize::from(limit)).min(review.fields.len());
-        Ok(Response::ReviewFields(Page {
-            rows: review.fields[start..end].to_vec(),
-            next: (end < review.fields.len()).then(|| end.to_string()),
-            scanned: U64((end - start) as u64),
-        }))
-    }
-    fn chunk(&self, reference: Reference, offset: U64, length: u32) -> Result<Response> {
-        if length == 0 || length as usize > CHUNK {
-            return Err(error(ErrorCode::ResourceLimit, "metadata chunk limit"));
-        }
-        let reader = self
-            .reader
-            .as_ref()
-            .filter(|value| {
-                value.reference.token == reference.token
-                    && value.reference.blake3 == reference.blake3
-                    && value.reference.bytes == reference.bytes
-            })
-            .ok_or_else(|| error(ErrorCode::StaleSession, "metadata byte reference changed"))?;
-        let start = usize::try_from(offset.0).map_err(|value| native(value.into()))?;
-        if start > reader.bytes.len() {
-            return Err(error(ErrorCode::InvalidRequest, "metadata chunk offset"));
-        }
-        let end = (start + length as usize).min(reader.bytes.len());
-        Ok(Response::Chunk(Bytes {
-            bytes: reader.bytes[start..end].to_vec(),
-            offset,
-            total: U64(reader.bytes.len() as u64),
-            next: (end < reader.bytes.len()).then(|| U64(end as u64)),
-            blake3: reader.reference.blake3.clone(),
-            verified: true,
-        }))
-    }
     fn plans(
         &self,
         catalog: &Catalog,

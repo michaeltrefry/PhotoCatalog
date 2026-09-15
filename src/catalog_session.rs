@@ -2408,25 +2408,6 @@ impl CatalogSessionAuthority {
             _ => anyhow::bail!("unexpected metadata restore result"),
         }
     }
-    pub(crate) fn write_metadata_evidence(
-        &self,
-        destination: &NativePath,
-        bytes: &[u8],
-        cancel: &AtomicBool,
-    ) -> Result<Option<metadata_files::EvidenceReceipt>> {
-        let value = self.metadata_file_transfer(
-            metadata_files::Mode::Evidence {
-                destination: destination.clone(),
-            },
-            bytes,
-            cancel,
-        )?;
-        match value {
-            Some(metadata_files::Value::Evidence(receipt)) => Ok(Some(receipt)),
-            None => Ok(None),
-            _ => anyhow::bail!("unexpected metadata evidence result"),
-        }
-    }
     pub(crate) fn write_metadata_evidence_stream(
         &self,
         destination: &NativePath,

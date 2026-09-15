@@ -600,13 +600,6 @@ pub(crate) fn plan_export_controlled(
     Ok(plan)
 }
 
-pub(crate) fn write_evidence_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_evidence_new_stream(path, |file| {
-        file.write_all(bytes)?;
-        Ok(())
-    })
-}
-
 pub(crate) fn write_evidence_new_stream(
     path: &Path,
     emit: impl FnOnce(&mut dyn Write) -> Result<()>,
