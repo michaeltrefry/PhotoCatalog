@@ -317,8 +317,12 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
     let database = root.join("catalog.sqlite3");
     let observer_client = client.clone();
     let original = request.clone();
+    let last_relay = Arc::new(Mutex::new(String::from("no relay call")));
+    let observed_relay = last_relay.clone();
     *relay.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
         use filesystem::Call;
+        *observed_relay.lock().unwrap() =
+            format!("{:?}, after={after}", std::mem::discriminant(call));
         match call {
             Call::Prepare(_) if after => {
                 if lost_prepare {
@@ -442,7 +446,22 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
             result.map_err(anyhow::Error::msg)?;
             break;
         }
-        ensure!(Instant::now() < deadline, "actual paired fixture timed out");
+        if Instant::now() >= deadline {
+            let state = shared.state.lock().unwrap();
+            anyhow::bail!(
+                "actual paired fixture timed out: last_relay={}; C phase={:?}, ready={}, stopping={}, reaped={}, finished={}, exit={:?}, message={:?}, drain_error={:?}; F={:?}",
+                last_relay.lock().unwrap(),
+                state.phase,
+                state.ready,
+                state.stopping,
+                state.reaped,
+                state.child_finished,
+                state.child_exit,
+                state.message,
+                state.drain_error,
+                client.status()
+            );
+        }
         thread::sleep(Duration::from_millis(5));
     }
     pair.finish(lost_confirm)?;
