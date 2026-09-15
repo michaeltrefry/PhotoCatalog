@@ -518,6 +518,35 @@ impl DesktopBridge {
         let _ = self.try_shutdown();
     }
     pub fn submit(&self, request: Request) -> Result<Pending> {
+        if let Request::Lightroom { request } = &request
+            && let super::lightroom_bridge::Request::SealedDocument { request } = request.as_ref()
+        {
+            let filesystem = self.0.shared.filesystem.clone().ok_or_else(|| {
+                error(
+                    ErrorCode::InvalidRequest,
+                    "sealed document reads require the managed filesystem owner",
+                )
+            })?;
+            let request = request.clone();
+            let cancel = Cancellation::default();
+            let execution_cancel = cancel.flag();
+            let (tx, receiver) = mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("lightroom-sealed-document-read".into())
+                .spawn(move || {
+                    let result = filesystem
+                        .lightroom_sealed_read(&request, &execution_cancel)
+                        .map(|value| Reply::Ok {
+                            value: super::Response::Lightroom(Box::new(
+                                super::lightroom_bridge::Response::SealedDocument(value),
+                            )),
+                        })
+                        .unwrap_or_else(|failure| super::reply(Err(super::native(failure))));
+                    let _ = tx.send(result);
+                })
+                .map_err(|failure| error(ErrorCode::Native, failure))?;
+            return Ok(Pending { receiver, cancel });
+        }
         if let Request::LightroomMigration { request } = request {
             let response = self.0.migration.request(*request)?;
             let (tx, receiver) = mpsc::sync_channel(1);

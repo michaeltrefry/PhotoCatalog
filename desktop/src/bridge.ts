@@ -115,7 +115,7 @@ export async function chooseFolder(createCatalog = false): Promise<{ path: Nativ
 
 export async function chooseSource(): Promise<{ path: NativePath; display: string } | null> { return chooseLocation('originals'); }
 
-export async function chooseLocation(purpose: 'preview_destination' | 'original_root' | 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
+export async function chooseLocation(purpose: 'preview_destination' | 'original_root' | 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
 
 export async function previewBlob(catalog: string, ticket: string): Promise<Blob> {
   const handoff = crypto.randomUUID();

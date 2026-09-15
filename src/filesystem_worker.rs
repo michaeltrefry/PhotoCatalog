@@ -6,6 +6,7 @@ pub(crate) use bootstrap::open_directory;
 pub mod client;
 mod export_executor;
 mod export_stage;
+mod lightroom_sealed;
 mod preview_io;
 mod preview_stage;
 pub mod process;
@@ -28,6 +29,7 @@ use wire::{
 
 struct FilesystemHandler {
     owner: BootstrapOwner,
+    lightroom_sealed: lightroom_sealed::Owner,
 }
 pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
     bootstrap::export_profile_transfer_layout()
@@ -49,6 +51,7 @@ impl FilesystemHandler {
         startup.validate()?;
         Ok(Self {
             owner: BootstrapOwner::new(startup.epoch, startup.original_roots),
+            lightroom_sealed: Default::default(),
         })
     }
     fn execute_inner(
@@ -89,6 +92,10 @@ impl FilesystemHandler {
             Operation::ReadPreviewConfiguration(path) => {
                 store::read_configuration(&path, cancel).map(Response::PreviewConfiguration)
             }
+            Operation::LightroomSealedRead(request) => self
+                .lightroom_sealed
+                .execute(request, cancel)
+                .map(Response::LightroomSealedDocument),
             Operation::PrepareExportDirectory(request) => self
                 .owner
                 .prepare_export_directory(&request, cancel)

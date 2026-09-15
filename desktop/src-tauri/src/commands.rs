@@ -77,7 +77,7 @@ pub async fn catalog_choose_folder(app: tauri::AppHandle, create_catalog: bool) 
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocationPurpose { PreviewDestination, OriginalRoot, Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal, ExportDirectory, ExportProfile, LightroomNewWorkbench, LightroomWorkbench, LightroomCaptureStaging, LightroomDiscoveryRoot, LightroomSourceCatalog, LightroomCaptureEvidence, LightroomNewCapture, LightroomNewSeal, LightroomApprovalDestination, LightroomNewApprovalDestination }
+pub enum LocationPurpose { PreviewDestination, OriginalRoot, Originals, BackupBundle, NewBackup, NewRestore, RelinkFolder, RelinkOriginal, ExportDirectory, ExportProfile, LightroomNewWorkbench, LightroomWorkbench, LightroomCaptureStaging, LightroomDiscoveryRoot, LightroomSourceCatalog, LightroomCaptureEvidence, LightroomNewCapture, LightroomNewSeal, LightroomSeal, LightroomApprovalDestination, LightroomNewApprovalDestination }
 
 #[tauri::command]
 pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPurpose) -> Result<Option<SelectedPath>, String> {
@@ -94,6 +94,7 @@ pub async fn catalog_choose_location(app: tauri::AppHandle, purpose: LocationPur
             LocationPurpose::LightroomCaptureEvidence => dialog.set_title("Open a retained Lightroom capture").blocking_pick_folder(),
             LocationPurpose::LightroomNewCapture => dialog.set_title("Choose a new Lightroom capture folder").set_file_name("Lightroom Capture").blocking_save_file(),
             LocationPurpose::LightroomNewSeal => dialog.set_title("Choose a new Lightroom selection folder").set_file_name("Lightroom Selection").blocking_save_file(),
+            LocationPurpose::LightroomSeal => dialog.set_title("Open an existing sealed Lightroom selection").blocking_pick_folder(),
             LocationPurpose::LightroomApprovalDestination => dialog.set_title("Choose an existing LensWorks destination").blocking_pick_folder(),
             LocationPurpose::LightroomNewApprovalDestination => dialog.set_title("Choose a new LensWorks destination").set_file_name("LensWorks Import").blocking_save_file(),
             LocationPurpose::ExportDirectory => dialog.set_title("Choose the export destination folder").blocking_pick_folder(),

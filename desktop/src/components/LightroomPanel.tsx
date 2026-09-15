@@ -1,5 +1,5 @@
 import {useEffect,useRef,useState} from 'react';
-import {chooseLocation,errorText,type NativePath} from '../bridge';
+import {chooseLocation,displayPath,errorText,type NativePath} from '../bridge';
 import {inspectionTerminal,type Action,type InspectionLimits,type Query,type SelectionLimits,type WorkbenchLimits} from '../lightroom';
 import {useLightroom,inspectionGuard,sameInspection} from '../state/useLightroom';
 import {useLightroomInput} from '../state/useLightroomInput';
@@ -25,7 +25,7 @@ export function LightroomActivity({controller:c,onOpen}:{controller:Controller;o
   if(!c.status&&!c.error&&!c.admitting)return null;
   return <div className="activity lightroom-activity" role="status"><span>Lightroom inspection: {!c.ready?'checking status':c.closePending?'closing and draining':c.admitting?'waiting for admission':c.status?.phase??'unavailable'}{c.status?` · ${c.status.processed} processed`:''}. Independent of the photo catalog.</span><button onClick={onOpen}>Inspect Lightroom…</button>{c.status&&!inspectionTerminal(c.status)&&<button onClick={()=>void c.cancel()}>Cancel inspection</button>}{c.status&&!c.status.closed&&<button onClick={()=>void c.close()}>Close inspection</button>}{c.closePending&&<button onClick={()=>void c.retryClose()}>Retry closing inspection</button>}<button onClick={c.retry}>Recheck inspection status</button>{c.error&&<span>{c.error}</span>}</div>;
 }
-export function LightroomPanel({controller:c,open,onClose}:{controller:Controller;open:boolean;onClose:()=>void}) {
+export function LightroomPanel({controller:c,open,onClose,onSealed}:{controller:Controller;open:boolean;onClose:()=>void;onSealed:(location:Location)=>void}) {
   const [mode,setMode]=useState<'Create'|'OpenExisting'>('Create');
   const [root,setRoot]=useState<Location|null>(null),[staging,setStaging]=useState<Location|null>(null),[discovery,setDiscovery]=useState<Location|null>(null),[source,setSource]=useState<Location|null>(null),[capture,setCapture]=useState<Location|null>(null),[evidenceDir,setEvidenceDir]=useState<Location|null>(null),[sealOutput,setSealOutput]=useState<Location|null>(null);
   const [recents,setRecents]=useState(recent);
@@ -81,6 +81,7 @@ export function LightroomPanel({controller:c,open,onClose}:{controller:Controlle
     if(!sameInspection(current.current.current(),inspectionGuard(value.status)))return;setReview(value);
     if(descriptor?.operation===value.status.operation&&descriptor.query?.kind==='Families'){try{const rows=families(value.node);setFamilyReport({rows,review:value});setDecisions({});}catch(e){setError(errorText(e));}}
     if(descriptor?.operation===value.status.operation&&['Capture','AddCapture'].includes(descriptor.action?.kind??'')){try{const id=field(value.node,'revision_id')??field(value.node,'revision');if(id)setRevision(scalar(id));}catch{/* Exact raw evidence remains visible if a result has another shape. */}}
+    if(descriptor?.operation===value.status.operation&&descriptor.action?.kind==='Seal'){try{const path=nativePath(field(value.node,'directory')!);onSealed({path,display:displayPath(path)});}catch(e){setError(errorText(e));}}
   };
   const next=()=>{if(!review||!descriptor?.query||descriptor.operation!==review.status.operation)throw new Error('Assemble the current query result first.');const q=nextQuery(descriptor.query,review.node);if(!q)throw new Error('This result has no continuation.');return inspect(q,'query');};
   const stage=(raw:string,purpose:Parameters<typeof input.begin>[1])=>void run(`Stage ${purpose}`,()=>input.begin(raw,purpose,digest||null));

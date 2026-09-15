@@ -193,6 +193,9 @@ impl Control {
                 };
                 Ok(Response::Input(value))
             }
+            Request::SealedDocument { .. } => {
+                anyhow::bail!("sealed document reads require the managed filesystem owner")
+            }
             _ => anyhow::bail!("inspection request requires actor admission"),
         }
     }

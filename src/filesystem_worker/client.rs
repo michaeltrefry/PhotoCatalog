@@ -1007,6 +1007,25 @@ impl CatalogFilesystem for Client {
             _ => anyhow::bail!("unexpected preview configuration response"),
         }
     }
+    pub(crate) fn lightroom_sealed_read(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
+        match self.execute(Operation::LightroomSealedRead(request.clone()), cancel)? {
+            Response::LightroomSealedDocument(value) => match (request, value) {
+                (crate::filesystem_worker::wire::LightroomSealedRead::Discard { .. }, None) => {
+                    Ok(None)
+                }
+                (_, Some(value)) => {
+                    value.validate_for(request)?;
+                    Ok(Some(value))
+                }
+                _ => anyhow::bail!("sealed document response is absent"),
+            },
+            _ => anyhow::bail!("unexpected sealed document response"),
+        }
+    }
     fn prepare_export_directory(
         &self,
         request: &PrepareExportDirectory,

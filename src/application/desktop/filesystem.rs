@@ -724,6 +724,13 @@ pub(super) struct Parent {
     metadata: Mutex<Option<super::preview_metadata_admission::ProcessReservation>>,
 }
 impl Parent {
+    pub(super) fn lightroom_sealed_read(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
+        self.client.lightroom_sealed_read(request, cancel)
+    }
     pub fn retain_metadata(
         &self,
         reservation: super::preview_metadata_admission::ProcessReservation,

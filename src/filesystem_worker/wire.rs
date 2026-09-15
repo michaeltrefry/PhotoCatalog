@@ -7,8 +7,9 @@ use crate::{
         ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportOriginalReply,
         ExportOriginalRequest, ExportProfileReply, ExportProfileRequest, ExportPublicationReply,
         ExportPublicationRequest, InspectExportOriginal, InspectedExportOriginal, LeaseId,
-        MigrationIdentityReply, MigrationIdentityRequest, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, validate_path,
+        MigrationIdentityReply, MigrationIdentityRequest, PhysicalObjectId, PrepareCatalog,
+        PrepareExportDirectory, PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed,
+        validate_path,
     },
     storage_volume::NativePath,
 };
@@ -82,6 +83,7 @@ pub fn build_identity() -> String {
             include_str!("store.rs"),
             include_str!("preview_io.rs"),
             include_str!("preview_stage.rs"),
+            include_str!("lightroom_sealed.rs"),
             include_str!("../catalog_session/preview_stage.rs"),
             include_str!("export_stage.rs"),
             include_str!("../catalog_session/export_stage.rs"),
@@ -133,6 +135,7 @@ pub enum Operation {
     PreviewStage(crate::catalog_session::preview_stage::Request),
     ExportStage(crate::catalog_session::export_stage::Request),
     ReadPreviewConfiguration(NativePath),
+    LightroomSealedRead(LightroomSealedRead),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     MigrationIdentity(Box<MigrationIdentityRequest>),
@@ -174,6 +177,10 @@ pub enum Operation {
 impl Operation {
     pub(crate) fn is_cleanup(&self) -> bool {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
+            || matches!(
+                self,
+                Self::LightroomSealedRead(LightroomSealedRead::Discard { .. })
+            )
             || matches!(self, Self::ExportExecutor(r) if r.cleanup())
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
@@ -191,6 +198,7 @@ impl Operation {
             Self::PreviewStage(value) => value.validate()?,
             Self::ExportStage(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
+            Self::LightroomSealedRead(value) => value.validate()?,
             Self::PrepareExportDirectory(value) => value.validate()?,
             Self::ExportDestinationSnapshot(value) => value.validate()?,
             Self::MigrationIdentity(value) => value.validate()?,
@@ -226,6 +234,138 @@ impl Operation {
             } => {
                 validate_path(root)?;
                 uuid::Uuid::parse_str(restore_id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightroomSealedDocument {
+    Seal,
+    Approval,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomSealedRead {
+    Begin {
+        session: String,
+        directory: NativePath,
+        document: LightroomSealedDocument,
+    },
+    Page {
+        session: String,
+        offset: U64,
+        limit: U64,
+    },
+    Discard {
+        session: String,
+    },
+}
+impl LightroomSealedRead {
+    pub fn validate(&self) -> Result<()> {
+        let session = match self {
+            Self::Begin {
+                session, directory, ..
+            } => {
+                validate_path(directory)?;
+                session
+            }
+            Self::Page {
+                session,
+                offset,
+                limit,
+            } => {
+                ensure!(
+                    offset.0 <= crate::lightroom::MANIFEST_BYTES as u64,
+                    "sealed document offset limit"
+                );
+                ensure!(
+                    (1..=CHUNK_BYTES as u64).contains(&limit.0),
+                    "sealed document page limit"
+                );
+                session
+            }
+            Self::Discard { session } => session,
+        };
+        uuid::Uuid::parse_str(session)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightroomSealedDocumentPage {
+    pub session: String,
+    pub directory: NativePath,
+    pub path: NativePath,
+    pub document: LightroomSealedDocument,
+    pub physical: PhysicalObjectId,
+    pub total_bytes: U64,
+    pub blake3: String,
+    pub offset: U64,
+    pub next: Option<U64>,
+    pub bytes: Vec<u8>,
+}
+impl LightroomSealedDocumentPage {
+    pub fn validate_for(&self, request: &LightroomSealedRead) -> Result<()> {
+        uuid::Uuid::parse_str(&self.session)?;
+        validate_path(&self.directory)?;
+        validate_path(&self.path)?;
+        self.physical.validate()?;
+        ensure!(
+            (1..=crate::lightroom::MANIFEST_BYTES as u64).contains(&self.total_bytes.0)
+                && self.offset.0 <= self.total_bytes.0
+                && self.bytes.len() <= CHUNK_BYTES,
+            "sealed document response bounds"
+        );
+        ensure!(
+            self.blake3.len() == 64
+                && self
+                    .blake3
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "sealed document response digest"
+        );
+        match request {
+            LightroomSealedRead::Begin {
+                session, document, ..
+            } => ensure!(
+                self.session == *session
+                    && self.document == *document
+                    && self.offset.0 == 0
+                    && self.bytes.is_empty()
+                    && self.next == Some(U64(0)),
+                "sealed document admission reply differs"
+            ),
+            LightroomSealedRead::Page {
+                session,
+                offset,
+                limit,
+            } => {
+                let end = offset
+                    .0
+                    .checked_add(self.bytes.len() as u64)
+                    .context("sealed document response overflow")?;
+                ensure!(
+                    self.session == *session
+                        && self.offset == *offset
+                        && !self.bytes.is_empty()
+                        && self.bytes.len() as u64 <= limit.0
+                        && end <= self.total_bytes.0
+                        && self.next
+                            == if end < self.total_bytes.0 {
+                                Some(U64(end))
+                            } else {
+                                None
+                            },
+                    "sealed document page reply differs"
+                )
+            }
+            LightroomSealedRead::Discard { .. } => {
+                anyhow::bail!("sealed document discard returned a page")
             }
         }
         Ok(())
@@ -307,6 +447,7 @@ pub enum Response {
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     ExportStage(crate::catalog_session::export_stage::Reply),
     PreviewConfiguration(Vec<u8>),
+    LightroomSealedDocument(Option<LightroomSealedDocumentPage>),
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     MigrationIdentity(MigrationIdentityReply),

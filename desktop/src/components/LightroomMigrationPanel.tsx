@@ -1,7 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { chooseLocation, errorText, type NativePath } from '../bridge';
 import { beginRequest, documentDigest, operationParts, readResultPage, terminalMigration, uploadExact, type ExactPart, type InputRole, type Operation, type Snapshot } from '../lightroomMigration';
 import type { useLightroomMigration } from '../state/useLightroomMigration';
+import type { RetainedRead } from '../lightroomSealed';
 import { Dialog, ErrorNotice, Section } from './Controls';
 import './lightroom.css';
 
@@ -9,12 +10,15 @@ type Controller = ReturnType<typeof useLightroomMigration>;
 type Location = { path: NativePath; display: string };
 type Kind = Operation['operation'];
 type Document = { text: string; blake3: string };
+export type SealedSelectionLocation = { generation: number; location: Location };
 const blank = (): Document => ({ text: '', blake3: '' });
 const names: Record<InputRole, string> = { operation: 'Operation', seal: 'Sealed selection', approval: 'Approval', policy: 'Migration policy', repair_request: 'Repair request', supplement_requests: 'Supplement requests', execution_authorization: 'Execution authorization' };
 const phaseLabel = (snapshot: Snapshot) => snapshot.phase.replaceAll('_', ' ');
 const currentOnly = (kind: Kind) => ['status', 'repair_current', 'repair_status', 'repair_keywords', 'keyword_repair_status'].includes(kind);
 const writesDestination = (kind: Kind) => ['run', 'prepare_supplements', 'repair_current', 'repair_keywords'].includes(kind);
 const discardable = (snapshot: Snapshot) => snapshot.phase === 'uploading' || snapshot.phase === 'ready' || snapshot.phase === 'complete' || snapshot.phase === 'failed';
+const READ_STORAGE='photocatalog.lightroom.sealed-read.v1';
+function savedRead():RetainedRead|null{try{const value:unknown=JSON.parse(sessionStorage.getItem(READ_STORAGE)??'null');return value&&typeof value==='object'&&typeof (value as RetainedRead).session==='string'&&['seal','approval'].includes((value as RetainedRead).document)?value as RetainedRead:null;}catch{return null;}}
 
 function operationFor(kind: Kind, values: { steps: string; seconds: string; source: string; artifact: string; artifactBytes: string; identity: string; approval: string }): Operation {
   if (kind === 'run') return { operation: kind, approval_blake3: values.approval, max_steps: values.steps, max_seconds: values.seconds, source_open_ms: values.source, artifact_open_ms: values.artifact, max_artifact_bytes: values.artifactBytes };
@@ -31,16 +35,7 @@ function rolesFor(kind: Kind, authorization: boolean): InputRole[] {
   return [];
 }
 
-export function LightroomMigrationActivity({ controller, onOpen }: { controller: Controller; onOpen: () => void }) {
-  const value = controller.snapshot;
-  if (!value && !controller.outcomeUnknown && !controller.stale && !controller.statusError) return null;
-  return <div className="activity lightroom-activity" role={controller.stale || controller.outcomeUnknown ? 'alert' : 'status'}>
-    <span>{value ? `Lightroom migration: ${phaseLabel(value)}${value.progress ? ` · ${value.progress[0]} ${value.progress[1]}${value.progress[2] ? ` of ${value.progress[2]}` : ''}` : ''}` : controller.stale ? 'The retained migration guard is stale; backend ownership is unknown.' : 'Migration command acknowledgement is unknown; guarded status will reconcile it.'}</span>
-    <button onClick={onOpen}>Review migration…</button>
-  </div>;
-}
-
-export function LightroomMigrationPanel({ controller: c, catalog, catalogDisplay, open, onClose }: { controller: Controller; catalog: string | null; catalogDisplay: string; open: boolean; onClose: () => void }) {
+export function LightroomMigrationPanel({ controller: c, catalog, catalogDisplay, sealedSelection, open, onClose }: { controller: Controller; catalog: string | null; catalogDisplay: string; sealedSelection: SealedSelectionLocation | null; open: boolean; onClose: () => void }) {
   const [kind, setKind] = useState<Kind>('run');
   const [destinationMode, setDestinationMode] = useState<'new' | 'current'>('new');
   const [destination, setDestination] = useState<Location | null>(null);
@@ -49,13 +44,34 @@ export function LightroomMigrationPanel({ controller: c, catalog, catalogDisplay
   const [steps, setSteps] = useState('1000000'), [seconds, setSeconds] = useState('3600'), [sourceOpen, setSourceOpen] = useState('30000'), [artifactOpen, setArtifactOpen] = useState('30000'), [artifactBytes, setArtifactBytes] = useState('1073741824'), [timeout, setTimeoutValue] = useState('3900000');
   const [identity, setIdentity] = useState(''), [reviewed, setReviewed] = useState(false), [authorizationReviewed, setAuthorizationReviewed] = useState(false);
   const [page, setPage] = useState('0'), [result, setResult] = useState(''), [localError, setLocalError] = useState(''), [notice, setNotice] = useState('');
+  const [sealedLocation, setSealedLocation] = useState<Location | null>(null), [sealedBusy, setSealedBusy] = useState(false), [retainedRead, setRetainedRead] = useState<RetainedRead | null>(savedRead);
   const frozen = useRef<ExactPart[] | null>(null);
   const admission = useRef<ReturnType<typeof beginRequest> | null>(null);
+  const sealedAbort = useRef<AbortController | null>(null), sealedReading = useRef(false), loadedSeed = useRef(0);
   const value = c.snapshot;
   const existing = currentOnly(kind) || ((kind === 'run' || kind === 'prepare_supplements') && destinationMode === 'current');
   const roles = rolesFor(kind, includeAuthorization);
-  const updateDocument = (role: InputRole, field: keyof Document, next: string) => setDocuments(current => ({ ...current, [role]: { ...current[role], [field]: next } }));
   const run = async (action: () => Promise<void>) => { setLocalError(''); try { await action(); } catch (error) { setLocalError(errorText(error)); } };
+  const rememberRead = (value: RetainedRead | null) => { setRetainedRead(value); try { if(value)sessionStorage.setItem(READ_STORAGE,JSON.stringify(value));else sessionStorage.removeItem(READ_STORAGE); } catch { /* Backend custody remains visible in component state. */ } };
+  const loadSelection = async (location: Location) => {
+    if (sealedReading.current || retainedRead) { setLocalError('Finish or discard the retained sealed-document read first.'); return; }
+    const abort = new AbortController(); sealedAbort.current = abort; sealedReading.current = true; setSealedBusy(true); setLocalError(''); setNotice('');
+    try {
+      const { loadSealedBundle } = await import('../lightroomSealed');
+      const bundle = await loadSealedBundle(location.path, abort.signal, rememberRead);
+      setDocuments(current => ({ ...current, seal: bundle.seal, approval: bundle.approval, policy: bundle.policy }));
+      setDestination(bundle.destination); setSealedLocation({ path: bundle.directory, display: location.display }); setKind('run'); setIncludeAuthorization(false);
+      setDestinationMode(catalog ? 'current' : 'new'); setReviewed(false); setAuthorizationReviewed(false); frozen.current = null;
+      setNotice('Loaded exact input-seal.json and approval.json through the isolated filesystem owner. The policy and approved destination below come from that exact approval; review them before admission.');
+    } catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) setLocalError(errorText(error)); }
+    finally { if (sealedAbort.current === abort) sealedAbort.current = null; sealedReading.current = false; setSealedBusy(false); }
+  };
+  useEffect(() => {
+    if (open && sealedSelection && sealedSelection.generation !== loadedSeed.current && !c.snapshot) {
+      loadedSeed.current = sealedSelection.generation; setSealedLocation(sealedSelection.location); void loadSelection(sealedSelection.location);
+    }
+  }, [open, sealedSelection?.generation]);
+  const close = () => { sealedAbort.current?.abort(); onClose(); };
   const chooseDestination = () => run(async () => {
     const choice = await chooseLocation(existing ? 'lightroom_approval_destination' : 'lightroom_new_approval_destination');
     if (choice) { setDestination(choice); setReviewed(false); setAuthorizationReviewed(false); }
@@ -85,7 +101,7 @@ export function LightroomMigrationPanel({ controller: c, catalog, catalogDisplay
   });
   const readPage = () => run(async () => { if (!c.current.current) throw new Error('No complete result is owned.'); setResult(await readResultPage(c.current.current, page, c.request)); });
   if (!open) return null;
-  return <Dialog title="Lightroom migration and recovery" onClose={onClose}><div className="lightroom-panel">
+  return <Dialog title="Lightroom migration and recovery" onClose={close}><div className="lightroom-panel">
     <p>Run a sealed Lightroom migration, prepare supplement evidence, or inspect and repair a migration already written to the open catalog. Originals, Lightroom catalogs, and source XMP remain unchanged. Every destination write requires an explicit reviewed operation.</p>
     {(localError || c.error) && <ErrorNotice message={localError || c.error} dismiss={() => setLocalError('')} />}
     {c.statusError && <ErrorNotice message={`Guarded status check: ${c.statusError}`} />}
@@ -93,6 +109,13 @@ export function LightroomMigrationPanel({ controller: c, catalog, catalogDisplay
     {c.outcomeUnknown && <p role="alert">The last transport acknowledgement is unknown. Do not replay a different operation. Guarded polling will reconcile the retained operation when possible.{!value && admission.current ? ' The identical admission can be retried safely with its retained operation ID and header.' : ''}</p>}
     {c.outcomeUnknown && !value && admission.current && <button disabled={c.busy} onClick={() => void run(async () => { const reply = await c.request(admission.current!); if (reply.kind !== 'status') throw new Error('Unexpected migration admission response.'); })}>Retry identical guarded admission</button>}
     {c.stale && <section aria-label="Stale migration ownership"><p role="alert">The saved guard no longer identifies the backend slot. The backend may have restarted or another owner may exist. Forgetting this reference does not cancel or discard backend work.</p><button onClick={c.forgetStale}>Forget stale local reference</button></section>}
+    <Section title="Load a sealed selection">
+      <p>Choose an existing seal folder to load its fixed <code>input-seal.json</code> and <code>approval.json</code>. The isolated filesystem owner reads and hashes each file once, retains a bounded byte snapshot while paging, then discards it explicitly. The derived policy keeps exact numeric lexemes and key order; the original seal and approval bytes are never reserialized.</p>
+      <button disabled={sealedBusy || !!value || c.busy || !!retainedRead} onClick={() => void run(async () => { const location = await chooseLocation('lightroom_seal'); if (location) { setSealedLocation(location); await loadSelection(location); } })}>Choose and load sealed selection…</button>
+      {sealedLocation && <p className="source-path">{sealedLocation.display}</p>}
+      {sealedBusy && <p role="status">Reading and hashing a bounded sealed document… <button onClick={() => sealedAbort.current?.abort()}>Cancel read</button></p>}
+      {retainedRead && <p role="alert">Filesystem read session <code>{retainedRead.session}</code> for {retainedRead.document} may still retain its bounded snapshot. <button disabled={sealedBusy} onClick={() => void run(async () => { const { discardRetainedSealedRead } = await import('../lightroomSealed'); await discardRetainedSealedRead(retainedRead.session); rememberRead(null); setNotice('Retained sealed-document snapshot discarded.'); })}>Retry exact discard</button> <button disabled={sealedBusy} onClick={() => { rememberRead(null); setNotice('Forgot the local read reference. This does not discard a snapshot still retained by the backend.'); }}>Forget stale local reference</button></p>}
+    </Section>
     <Section title="Operation and destination">
       <label>Migration operation<select value={kind} disabled={!!value || c.busy || c.outcomeUnknown} onChange={event => { const next = event.target.value as Kind; setKind(next); setDestination(null); setDestinationMode(currentOnly(next) ? 'current' : 'new'); setReviewed(false); setAuthorizationReviewed(false); setResult(''); }}>
         <option value="run">Run approved migration</option><option value="status">Read migration run status</option><option value="prepare_supplements">Prepare supplement requests</option><option value="repair_current">Repair current-photo state</option><option value="repair_status">Read current-state repair status</option><option value="repair_keywords">Repair keyword state</option><option value="keyword_repair_status">Read keyword repair status</option>

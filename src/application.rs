@@ -172,6 +172,9 @@ impl Cancellation {
     pub fn is_canceled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
 }
 pub struct Pending {
     receiver: mpsc::Receiver<Reply>,

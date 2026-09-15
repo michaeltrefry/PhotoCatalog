@@ -451,6 +451,9 @@ impl From<Query> for lw::Query {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Request {
+    SealedDocument {
+        request: crate::filesystem_worker::wire::LightroomSealedRead,
+    },
     Options {},
     Open {
         attempt: String,
@@ -513,6 +516,7 @@ impl Request {
         matches!(
             self,
             Self::Options {}
+                | Self::SealedDocument { .. }
                 | Self::Status { .. }
                 | Self::Cancel { .. }
                 | Self::Close { .. }
@@ -600,4 +604,5 @@ pub enum Response {
     Status(Option<Status>),
     Result(ResultPage),
     Input(Option<InputStatus>),
+    SealedDocument(Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>),
 }
