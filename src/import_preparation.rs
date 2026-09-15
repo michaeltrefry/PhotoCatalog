@@ -34,6 +34,7 @@ pub(crate) struct Header {
     pub(crate) observation: VolumeLocation,
 }
 pub(crate) enum Event {
+    Begun { source: NativePath },
     Header(Box<Header>),
     Source(Box<PreparedImportSource>),
     End,
@@ -1020,7 +1021,7 @@ impl RemoteImport {
     }
     fn observe(&mut self, value: &crate::catalog_session::import::Value) {
         match value {
-            crate::catalog_session::import::Value::Begun => self.active = true,
+            crate::catalog_session::import::Value::Begun { .. } => self.active = true,
             crate::catalog_session::import::Value::Finished
             | crate::catalog_session::import::Value::Aborted => self.active = false,
             _ => {}
@@ -1057,15 +1058,18 @@ fn prepare_managed(
     );
     let run = (|| -> Result<()> {
         let remote = custody.remote();
-        match remote.call(
+        let source = match remote.call(
             crate::catalog_session::import::Action::Begin {
                 source: NativePath::from_path(source_root),
             },
             cancel,
         )? {
-            crate::catalog_session::import::Value::Begun => {}
+            crate::catalog_session::import::Value::Begun { source } => source,
             _ => anyhow::bail!("managed import begin reply mismatch"),
-        }
+        };
+        // Rendezvous delivery blocks F before its first walk step until C has
+        // durably registered the exact canonical root returned by F.
+        send(sender, cancel, Event::Begun { source })?;
         loop {
             match remote.call(crate::catalog_session::import::Action::Next, cancel)? {
                 crate::catalog_session::import::Value::DirectoryStart { directory } => {
@@ -1436,7 +1440,8 @@ mod tests {
                 },
                 &AtomicBool::new(false),
             )?,
-            crate::catalog_session::import::Value::Begun
+            crate::catalog_session::import::Value::Begun { source }
+                if source == NativePath::from_path(&originals)
         ));
         loop {
             match remote.call(

@@ -48,6 +48,35 @@ fn canceled(cancel: &AtomicBool) -> Result<()> {
     ensure!(!cancel.load(Ordering::Acquire), "managed import canceled");
     Ok(())
 }
+fn registered_original_roots(roots: &[NativePath], source: &Path) -> Result<Vec<NativePath>> {
+    let native = NativePath::from_path(source);
+    protocol::validate_source_root(&native)?;
+    let registered = roots.iter().any(|root| {
+        root.to_path()
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .is_some_and(|root| source == root)
+    });
+    let mut roots = roots.to_vec();
+    if !registered {
+        ensure!(
+            roots.len() < protocol::ORIGINAL_ROOTS,
+            "admitted original root count exceeds bound"
+        );
+        roots.push(native);
+    }
+    let bytes = roots.iter().try_fold(0usize, |total, root| {
+        total.checked_add(match root {
+            NativePath::UnixBytes(value) => value.len(),
+            NativePath::WindowsWide(value) => value.len() * std::mem::size_of::<u16>(),
+        })
+    });
+    ensure!(
+        bytes.is_some_and(|bytes| bytes <= protocol::ORIGINAL_ROOT_BYTES),
+        "admitted original root bytes exceed bound"
+    );
+    Ok(roots)
+}
 fn failure_detail(error: impl std::fmt::Display) -> String {
     let mut value = format!("inspection failed: {error}");
     let mut end = value.len().min(2048);
@@ -166,10 +195,23 @@ impl Owner {
         self.active.is_none()
     }
 
+    #[cfg(test)]
     pub fn call(
         &mut self,
         catalog_root: &Path,
         original_roots: &[NativePath],
+        request: &protocol::Request,
+        cancel: &AtomicBool,
+    ) -> Result<protocol::Reply> {
+        let mut original_roots = original_roots.to_vec();
+        self.call_managed(catalog_root, &[], &mut original_roots, request, cancel)
+    }
+
+    pub fn call_managed(
+        &mut self,
+        catalog_root: &Path,
+        cache_roots: &[PathBuf],
+        original_roots: &mut Vec<NativePath>,
         request: &protocol::Request,
         cancel: &AtomicBool,
     ) -> Result<protocol::Reply> {
@@ -208,13 +250,13 @@ impl Owner {
                         !source.starts_with(catalog_root) && !catalog_root.starts_with(&source),
                         "catalog and originals must be separate directories"
                     );
-                    let admitted = original_roots.iter().any(|root| {
-                        root.to_path()
-                            .ok()
-                            .and_then(|p| p.canonicalize().ok())
-                            .is_some_and(|root| source.starts_with(root))
-                    });
-                    ensure!(admitted, "import source is outside admitted original roots");
+                    for cache in cache_roots {
+                        ensure!(
+                            !source.starts_with(cache) && !cache.starts_with(&source),
+                            "import source overlaps preview storage"
+                        );
+                    }
+                    let registered = registered_original_roots(original_roots, &source)?;
                     let source_directory = super::bootstrap::open_directory(&source)?;
                     let source_identity = directory_identity(&source, &source_directory)?;
                     let lock = OpenOptions::new()
@@ -225,6 +267,7 @@ impl Owner {
                         .open(catalog_root.join("import.lock"))?;
                     lock.try_lock_exclusive()
                         .context("another import owns this catalog")?;
+                    canceled(cancel)?;
                     self.terminal = None;
                     self.active = Some(Active {
                         transfer: request.transfer.clone(),
@@ -248,7 +291,10 @@ impl Owner {
                         next_step: 0,
                         last: None,
                     });
-                    Ok(protocol::Value::Begun)
+                    *original_roots = registered;
+                    Ok(protocol::Value::Begun {
+                        source: NativePath::from_path(&source),
+                    })
                 })();
                 match result {
                     Ok(value) => value,
@@ -879,7 +925,7 @@ mod tests {
                     source: NativePath::from_path(&fixture.originals)
                 },
             )?,
-            protocol::Value::Begun
+            protocol::Value::Begun { .. }
         ));
         Ok(())
     }
@@ -1000,6 +1046,142 @@ mod tests {
             )?,
             protocol::Value::Aborted
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_root_is_registered_but_cache_overlap_and_cancellation_have_no_custody() -> Result<()>
+    {
+        let fixture = Fixture::new()?;
+        let transfer = LeaseId::new();
+        let begin = fixture.request(
+            &transfer,
+            0,
+            protocol::Action::Begin {
+                source: NativePath::from_path(&fixture.originals),
+            },
+        );
+        let mut roots = Vec::new();
+        let mut owner = Owner::default();
+        let reply = owner.call_managed(
+            &fixture.catalog,
+            &[],
+            &mut roots,
+            &begin,
+            &AtomicBool::new(false),
+        )?;
+        assert!(matches!(
+            reply.value,
+            protocol::Value::Begun { source }
+                if source == NativePath::from_path(&fixture.originals)
+        ));
+        assert_eq!(roots, vec![NativePath::from_path(&fixture.originals)]);
+        let abort = fixture.request(&transfer, 1, protocol::Action::Abort);
+        assert!(matches!(
+            owner
+                .call_managed(
+                    &fixture.catalog,
+                    &[],
+                    &mut roots,
+                    &abort,
+                    &AtomicBool::new(false),
+                )?
+                .value,
+            protocol::Value::Aborted
+        ));
+        assert!(owner.empty());
+
+        let configured = Fixture::new()?;
+        let selected = configured.originals.join("selected");
+        fs::create_dir(&selected)?;
+        let transfer = LeaseId::new();
+        let begin = configured.request(
+            &transfer,
+            0,
+            protocol::Action::Begin {
+                source: NativePath::from_path(&selected),
+            },
+        );
+        let mut configured_roots = vec![NativePath::from_path(&configured.originals)];
+        let mut configured_owner = Owner::default();
+        let reply = configured_owner.call_managed(
+            &configured.catalog,
+            &[],
+            &mut configured_roots,
+            &begin,
+            &AtomicBool::new(false),
+        )?;
+        assert!(matches!(
+            reply.value,
+            protocol::Value::Begun { source }
+                if source == NativePath::from_path(&selected)
+        ));
+        assert_eq!(
+            configured_roots,
+            vec![
+                NativePath::from_path(&configured.originals),
+                NativePath::from_path(&selected)
+            ]
+        );
+        let abort = configured.request(&transfer, 1, protocol::Action::Abort);
+        assert!(matches!(
+            configured_owner
+                .call_managed(
+                    &configured.catalog,
+                    &[],
+                    &mut configured_roots,
+                    &abort,
+                    &AtomicBool::new(false),
+                )?
+                .value,
+            protocol::Value::Aborted
+        ));
+
+        let overlap = Fixture::new()?;
+        let request = overlap.request(
+            &LeaseId::new(),
+            0,
+            protocol::Action::Begin {
+                source: NativePath::from_path(&overlap.originals),
+            },
+        );
+        let mut overlap_roots = Vec::new();
+        let mut overlap_owner = Owner::default();
+        let reply = overlap_owner.call_managed(
+            &overlap.catalog,
+            std::slice::from_ref(&overlap.originals),
+            &mut overlap_roots,
+            &request,
+            &AtomicBool::new(false),
+        )?;
+        assert!(matches!(reply.value, protocol::Value::Failed(_)));
+        assert!(overlap_roots.is_empty() && overlap_owner.empty());
+        assert!(!overlap.catalog.join("import.lock").exists());
+
+        let canceled = Fixture::new()?;
+        let request = canceled.request(
+            &LeaseId::new(),
+            0,
+            protocol::Action::Begin {
+                source: NativePath::from_path(&canceled.originals),
+            },
+        );
+        let mut canceled_roots = Vec::new();
+        let mut canceled_owner = Owner::default();
+        assert!(matches!(
+            canceled_owner
+                .call_managed(
+                    &canceled.catalog,
+                    &[],
+                    &mut canceled_roots,
+                    &request,
+                    &AtomicBool::new(true),
+                )?
+                .value,
+            protocol::Value::Failed(_)
+        ));
+        assert!(canceled_roots.is_empty() && canceled_owner.empty());
+        assert!(!canceled.catalog.join("import.lock").exists());
         Ok(())
     }
 

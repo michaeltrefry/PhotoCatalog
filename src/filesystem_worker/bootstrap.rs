@@ -183,6 +183,7 @@ pub(super) struct PreparationProgress {
 
 struct RootRecord {
     bootstrap: CatalogBootstrap,
+    original_roots: Vec<NativePath>,
     root: File,
     catalog: Option<File>,
     manifest: Option<File>,
@@ -499,6 +500,7 @@ impl BootstrapOwner {
         bootstrap.validate()?;
         let record = RootRecord {
             bootstrap: bootstrap.clone(),
+            original_roots: self.original_roots.clone(),
             root,
             catalog: Some(catalog),
             manifest: Some(manifest),
@@ -832,7 +834,7 @@ impl BootstrapOwner {
         );
         let result = record.store.execute(
             &record.bootstrap,
-            &self.original_roots,
+            &record.original_roots,
             request,
             cancel,
             publish,
@@ -875,7 +877,6 @@ impl BootstrapOwner {
                 .is_some_and(|p| p.state == PreparationState::Confirmed),
             "managed import requires confirmed SQL admission"
         );
-        let original_roots = self.original_roots.clone();
         let record = self
             .record
             .as_mut()
@@ -885,7 +886,32 @@ impl BootstrapOwner {
             "managed import belongs to another catalog session"
         );
         let root = record.verify_root_binding()?;
-        let result = record.import.call(&root, &original_roots, request, cancel);
+        let cache_roots = if matches!(
+            &request.action,
+            crate::catalog_session::import::Action::Begin { .. }
+        ) {
+            let mut roots = record.store.protected_roots()?;
+            roots.push(
+                record
+                    .bootstrap
+                    .manifest
+                    .path
+                    .to_path()?
+                    .parent()
+                    .context("preview manifest parent")?
+                    .to_path_buf(),
+            );
+            roots
+        } else {
+            Vec::new()
+        };
+        let result = record.import.call_managed(
+            &root,
+            &cache_roots,
+            &mut record.original_roots,
+            request,
+            cancel,
+        );
         record.verify_root_binding()?;
         result
     }
@@ -1086,7 +1112,10 @@ impl BootstrapOwner {
             Ok(reply)
         })
     }
-    fn export_original_path(&self, requested: &NativePath) -> Result<PathBuf> {
+    fn export_original_path(
+        original_roots: &[NativePath],
+        requested: &NativePath,
+    ) -> Result<PathBuf> {
         let path = requested.to_path()?;
         let parent = path
             .parent()
@@ -1094,7 +1123,7 @@ impl BootstrapOwner {
             .canonicalize()?;
         let normalized = parent.join(path.file_name().context("original filename required")?);
         let mut admitted = false;
-        for root in &self.original_roots {
+        for root in original_roots {
             if let Ok(root) = root.to_path()?.canonicalize()
                 && normalized.starts_with(root)
             {
@@ -1115,10 +1144,15 @@ impl BootstrapOwner {
     ) -> Result<InspectedExportOriginal> {
         request.validate()?;
         original_cancel(cancel)?;
+        let original_roots = &self
+            .record
+            .as_ref()
+            .context("catalog filesystem root is not retained")?
+            .original_roots;
         self.with_root(&request.root, |_| {
             // Authenticate and revalidate the retained catalog root before
             // resolving or opening any caller-supplied original path.
-            let path = self.export_original_path(&request.requested)?;
+            let path = Self::export_original_path(original_roots, &request.requested)?;
             let mut canceled_while_reading = false;
             let revision = crate::metadata_export::inspect_file_revision_with_checkpoint(
                 &path,

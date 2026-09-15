@@ -396,6 +396,13 @@ impl PreviewStore {
                 return Err(error).context("resolve original location for cache separation");
             }
         };
+        self.ensure_resolved_original_separate(&source)
+    }
+    fn ensure_resolved_original_separate(&self, source: &Path) -> Result<()> {
+        ensure!(
+            source.is_absolute(),
+            "observed original root must be absolute"
+        );
         let mut roots = vec![
             self.config.manifest_root.clone(),
             self.config.thumbnail_root.clone(),
@@ -748,10 +755,29 @@ impl PreviewStore {
         let root = root.to_path_buf();
         validate_original_roots(std::slice::from_ref(&root))?;
         self.ensure_original_separate(&root)?;
+        self.persist_original_root(&root)
+    }
+    /// F already canonicalized and retained this root before returning it.
+    /// C compares that fact with its saved cache namespace and performs only
+    /// the manifest transaction; it never reopens the caller-supplied path.
+    pub(crate) fn register_observed_original_root(&mut self, root: &Path) -> Result<()> {
+        let root = root.to_path_buf();
+        validate_original_roots(std::slice::from_ref(&root))?;
+        self.ensure_resolved_original_separate(&root)?;
+        self.persist_original_root(&root)
+    }
+    fn persist_original_root(&mut self, root: &Path) -> Result<()> {
+        let mut roots = self.original_root_review()?.roots;
+        if roots.iter().any(|existing| existing == root) {
+            return Ok(());
+        }
+        roots.push(root.to_path_buf());
+        validate_original_roots(&roots)?;
+        let encoded = encode_path(root)?;
         let tx = self.db.transaction()?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO original_roots(path) VALUES(?1)",
-            [encode_path(&root)?],
+            [&encoded],
         )?;
         if inserted != 0 {
             tx.execute(
@@ -2489,6 +2515,31 @@ mod tests {
         let mut changed = cfg;
         changed.thumbnail_root = root.path().join("elsewhere");
         assert!(PreviewStore::open(changed, &[]).is_err());
+    }
+    #[test]
+    fn f_observed_original_root_persists_without_reopen_and_invalidates_review() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cfg = config(root.path(), 100, 100);
+        let mut store = PreviewStore::open(cfg, &[])?;
+        let cache = store.configuration().thumbnail_root.clone();
+        let first = root.path().join("observed-but-now-offline");
+        store.register_observed_original_root(&first)?;
+        store.replace_original_root_review(std::slice::from_ref(&first), 17)?;
+        assert_eq!(store.original_root_review()?.storage_epoch, Some(17));
+        store.register_observed_original_root(&first)?;
+        assert_eq!(store.original_root_review()?.storage_epoch, Some(17));
+
+        let second = root.path().join("second-observed-root");
+        store.register_observed_original_root(&second)?;
+        let review = store.original_root_review()?;
+        assert_eq!(review.roots, vec![first, second]);
+        assert_eq!(review.storage_epoch, None);
+        assert!(
+            store
+                .register_observed_original_root(&cache.join("overlap"))
+                .is_err()
+        );
+        Ok(())
     }
     #[test]
     fn scoped_namespace_upgrade_reopen_preserves_newer_pending_pixels() {

@@ -1071,6 +1071,7 @@ struct ImportTask {
     status: ImportStatus,
     consumers: Vec<(preview::Consumer, NativePath)>,
     cancel: Cancellation,
+    source_registered: bool,
     discovery_finished: bool,
     failure: bool,
 }
@@ -2149,7 +2150,7 @@ impl Actor {
                 let managed_import = o.catalog.session.managed_import_root().is_some();
                 let path = if managed_import {
                     // F alone resolves and observes a managed source path. The
-                    // canonical path returned in Header becomes C's SQL identity.
+                    // canonical Begin reply becomes C's SQL identity.
                     path
                 } else {
                     let path = std::fs::canonicalize(path).map_err(|e| native(e.into()))?;
@@ -2193,6 +2194,7 @@ impl Actor {
                     status: status.clone(),
                     consumers: Vec::new(),
                     cancel: cancel.clone(),
+                    source_registered: !managed_import,
                     discovery_finished: false,
                     failure: false,
                 });
@@ -3094,7 +3096,21 @@ impl Actor {
                     };
                     use crate::import_preparation::Event;
                     match event {
+                        Event::Begun { source } => {
+                            ensure!(
+                                !import.source_registered && import.reference.is_none(),
+                                "managed import source was already registered"
+                            );
+                            let path = source.to_path()?;
+                            o.service.register_observed_original_root(&path)?;
+                            import.status.source = source;
+                            import.source_registered = true;
+                        }
                         Event::Header(header) => {
+                            ensure!(
+                                import.source_registered,
+                                "managed import source root was not registered"
+                            );
                             ensure!(import.reference.is_none(), "unfinished import reference");
                             import.status.error_source = Some(NativePath::from_path(&header.path));
                             import.reference = Some(crate::import_preparation::Reference::begin(
@@ -3146,8 +3162,8 @@ impl Actor {
                         Event::Skipped => import.status.skipped.0 += 1,
                         Event::Finished => {
                             ensure!(
-                                import.reference.is_none(),
-                                "source ended inside a prepared file"
+                                import.source_registered && import.reference.is_none(),
+                                "source ended before root registration or inside a prepared file"
                             );
                             import.discovery_finished = true;
                         }

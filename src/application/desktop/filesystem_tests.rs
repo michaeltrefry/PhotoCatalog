@@ -548,7 +548,7 @@ fn actual_f_import_alias_read_and_lock_custody_preserve_c_posix_sql_lock() -> an
         import(Action::Begin {
             source: NativePath::from_path(&originals)
         })?,
-        Value::Begun
+        Value::Begun { .. }
     ));
     loop {
         match import(Action::Next)? {

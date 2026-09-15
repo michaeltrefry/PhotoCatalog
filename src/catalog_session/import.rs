@@ -20,6 +20,17 @@ pub const MAX_INSPECTION_METADATA_BYTES: usize = 8 * 1024 * 1024;
 // every one of the 2 * 1024 length prefixes, and the fixed envelope header.
 pub const MAX_INSPECTION_BYTES: usize =
     136 * 1024 * 1024 + 2 * 1024 * std::mem::size_of::<u64>() + 20;
+pub const ORIGINAL_ROOTS: usize = 1024;
+pub const ORIGINAL_ROOT_BYTES: usize = 2 * 1024 * 1024;
+
+pub(crate) fn validate_source_root(source: &NativePath) -> Result<()> {
+    validate_path(source)?;
+    ensure!(
+        source.to_path()?.is_absolute(),
+        "import source must be absolute"
+    );
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -60,7 +71,7 @@ impl Request {
         self.root.catalog_physical.validate()?;
         ensure!(self.step.0 < u64::MAX, "import step exhausted");
         match &self.action {
-            Action::Begin { source } => validate_path(source)?,
+            Action::Begin { source } => validate_source_root(source)?,
             Action::Inspect { source } => {
                 ensure!(
                     matches!(source.kind.as_str(), "embedded" | "sidecar"),
@@ -111,7 +122,9 @@ pub struct DirectoryFact {
 )]
 pub enum Value {
     Failed(crate::filesystem_worker::wire::Failure),
-    Begun,
+    Begun {
+        source: NativePath,
+    },
     DirectoryStart {
         directory: NativePath,
     },
@@ -206,7 +219,7 @@ impl Reply {
         );
         match (&request.action, &self.value) {
             (_, Value::Failed(failure)) => failure.validate()?,
-            (Action::Begin { .. }, Value::Begun)
+            (Action::Begin { .. }, Value::Begun { .. })
             | (
                 Action::Next,
                 Value::Skipped
@@ -226,6 +239,9 @@ impl Reply {
             | (Action::Finish, Value::Finished)
             | (Action::Abort, Value::Aborted) => {}
             _ => anyhow::bail!("unexpected import reply"),
+        }
+        if let Value::Begun { source } = &self.value {
+            validate_source_root(source)?;
         }
         if let Value::DirectoryFacts { directory, facts } = &self.value {
             validate_path(directory)?;

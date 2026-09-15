@@ -867,6 +867,7 @@ fn publication_actor(
         },
         consumers: Vec::new(),
         cancel: Cancellation::default(),
+        source_registered: true,
         discovery_finished: false,
         failure: false,
     });

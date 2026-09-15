@@ -1946,6 +1946,9 @@ impl PreviewService {
     pub(crate) fn register_original_root(&mut self, root: &Path) -> Result<()> {
         self.store.register_original_root(root)
     }
+    pub(crate) fn register_observed_original_root(&mut self, root: &Path) -> Result<()> {
+        self.store.register_observed_original_root(root)
+    }
     pub fn begin_relocation(
         &mut self,
         tier: Tier,
