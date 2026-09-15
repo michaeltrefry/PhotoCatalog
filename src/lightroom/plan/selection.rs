@@ -270,6 +270,8 @@ pub struct SelectionReview {
     plan: Plan,
     guard: Option<Source>,
     managed_identity: Option<crate::catalog_session::PhysicalObjectId>,
+    // A failed SQL12 operation retains its destination until checked close or W reap.
+    managed_destination: Option<Connection>,
     version: i64,
     companion_objects: Vec<String>,
     summary: ReviewSummary,
@@ -761,6 +763,7 @@ impl SelectionReview {
             plan,
             guard,
             managed_identity,
+            managed_destination: None,
             version: baseline,
             companion_objects: initial_companions,
             summary,

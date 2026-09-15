@@ -72,7 +72,23 @@ pub(crate) struct ManagedSealPreparation {
     pub(crate) snapshot_bytes: u64,
 }
 
+fn close_managed_destination(slot: &mut Option<Connection>) -> Result<()> {
+    let Some(connection) = slot.take() else {
+        return Ok(());
+    };
+    match connection.close() {
+        Ok(()) => Ok(()),
+        Err((connection, error)) => {
+            *slot = Some(connection);
+            Err(error.into())
+        }
+    }
+}
+
 impl SelectionReview {
+    pub(crate) fn close_managed_destination(&mut self) -> Result<()> {
+        close_managed_destination(&mut self.managed_destination)
+    }
     pub(crate) fn prepare_managed_seal(
         &self,
         expected_review_token: &str,
@@ -145,24 +161,28 @@ impl SelectionReview {
         );
         let path = local(database, limits.native_path_units)?;
         let budget = SqlBudget::new(&self.plan.db, limits, cancel.clone());
-        let transaction = self.plan.db.unchecked_transaction()?;
+        ensure!(
+            self.managed_destination.is_none(),
+            "seal destination still retained"
+        );
+        // On failure, retain the source snapshot as well as the destination.
+        // The W owner poisons the operation and closes both before releasing F.
+        self.plan.db.execute_batch("BEGIN DEFERRED")?;
         database_bytes(&self.plan.db, limits.snapshot_bytes)?;
         let _: i64 = self
             .plan
             .db
             .query_row("SELECT count(*) FROM captures", [], |row| row.get(0))?;
-        let target = Connection::open_with_flags(
+        self.managed_destination = Some(Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?);
+        let target = self.managed_destination.as_ref().unwrap();
+        crate::catalog_storage::verify_database_identity(
+            target,
+            &super::super::physical(expected_physical),
         )?;
         target.busy_timeout(Duration::ZERO)?;
-        let target_file = fs::File::open(&path)?;
-        ensure!(
-            crate::lightroom_migration_worker::identity::FileKey::of(&target_file)?
-                == *expected_physical,
-            "seal destination object changed before backup"
-        );
-        crate::catalog_storage::verify_database_object(&target, &target_file)?;
         let backup = unsafe {
             rusqlite::ffi::sqlite3_backup_init(
                 target.handle(),
@@ -199,10 +219,13 @@ impl SelectionReview {
             );
         }
         backup.finish()?;
+        crate::catalog_storage::verify_database_identity(
+            target,
+            &super::super::physical(expected_physical),
+        )?;
         target.pragma_update(None, "journal_mode", "DELETE")?;
-        drop(target);
-        drop(target_file);
-        transaction.commit()?;
+        close_managed_destination(&mut self.managed_destination)?;
+        self.plan.db.execute_batch("COMMIT")?;
         budget.check()?;
         drop(budget);
         self.current(expected_review_token)?;
@@ -532,5 +555,45 @@ impl SelectionReview {
             );
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod managed_destination_tests {
+    use super::*;
+
+    #[test]
+    fn busy_destination_close_retains_exact_connection_until_statement_finalized() -> Result<()> {
+        let mut destination = Some(Connection::open_in_memory()?);
+        let handle = unsafe { destination.as_ref().unwrap().handle() };
+        let mut statement = std::ptr::null_mut();
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_prepare_v2(
+                handle,
+                c"SELECT 1".as_ptr(),
+                -1,
+                &mut statement,
+                std::ptr::null_mut(),
+            )
+        };
+        ensure!(code == rusqlite::ffi::SQLITE_OK, "prepare held statement");
+        let failed = close_managed_destination(&mut destination);
+        let retained = destination
+            .as_ref()
+            .map(|connection| unsafe { connection.handle() })
+            == Some(handle);
+        let finalized = unsafe { rusqlite::ffi::sqlite3_finalize(statement) };
+        ensure!(failed.is_err(), "busy close unexpectedly succeeded");
+        ensure!(retained, "failed close discarded destination ownership");
+        ensure!(
+            finalized == rusqlite::ffi::SQLITE_OK,
+            "finalize held statement"
+        );
+        close_managed_destination(&mut destination)?;
+        ensure!(
+            destination.is_none(),
+            "successful close retained destination"
+        );
+        Ok(())
     }
 }
