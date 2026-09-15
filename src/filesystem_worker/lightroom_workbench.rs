@@ -266,10 +266,11 @@ impl Seal {
         self.approval.ensure_created()?;
         #[cfg(test)]
         {
+            let retained_directory = self.directory.to_path()?;
             let mut failure = SEAL_BEGIN_FAIL_AFTER_APPROVAL
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if failure.as_deref() == Some(directory.as_path()) {
+            if failure.as_deref() == Some(retained_directory.as_path()) {
                 *failure = None;
                 anyhow::bail!("injected seal begin failure after approval create");
             }
