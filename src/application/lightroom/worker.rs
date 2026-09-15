@@ -385,6 +385,16 @@ impl Owner {
                     limit,
                 )
             }
+            Action::ApprovalDocuments { draft_json } => {
+                let review = self
+                    .review
+                    .as_ref()
+                    .context("prepare an explicit selection review first")?;
+                encode(
+                    &review.approval_documents(draft_json.as_bytes(), control.cancel.clone())?,
+                    limit,
+                )
+            }
             Action::ReleaseReview => {
                 drop(self.review.take());
                 self.plan(control)?;

@@ -34,7 +34,7 @@ use std::{
 
 pub(crate) mod descriptor_json;
 mod preparation;
-pub use preparation::{MappingPreparation, prepare_mapping};
+pub use preparation::{MappingPreparation, prepare_manifest_artifact, prepare_mapping};
 
 const DESCRIPTOR_LIMIT: usize = 64 * 1024;
 

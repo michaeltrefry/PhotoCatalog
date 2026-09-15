@@ -134,6 +134,9 @@ pub enum Action {
         approval_json: String,
         output: NativePath,
     },
+    ApprovalDocuments {
+        draft_json: String,
+    },
     ReleaseReview,
 }
 impl Action {
@@ -150,7 +153,10 @@ impl Action {
         )
     }
     fn allowed_during_review(&self) -> bool {
-        matches!(self, Self::Seal { .. } | Self::ReleaseReview)
+        matches!(
+            self,
+            Self::Seal { .. } | Self::ApprovalDocuments { .. } | Self::ReleaseReview
+        )
     }
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -378,6 +384,9 @@ pub(crate) enum DeferredAction {
         approval_blake3: String,
         output: NativePath,
     },
+    ApprovalDocuments {
+        json: Payload,
+    },
 }
 enum PendingAction {
     Typed(Action),
@@ -394,7 +403,9 @@ impl PendingAction {
     fn allowed_during_review(&self) -> bool {
         match self {
             Self::Typed(a) => a.allowed_during_review(),
-            Self::Deferred(DeferredAction::Seal { .. }) => true,
+            Self::Deferred(
+                DeferredAction::Seal { .. } | DeferredAction::ApprovalDocuments { .. },
+            ) => true,
             _ => false,
         }
     }
@@ -422,6 +433,11 @@ impl PendingAction {
                 approval_blake3,
                 output,
             },
+            Self::Deferred(DeferredAction::ApprovalDocuments { json }) => {
+                Action::ApprovalDocuments {
+                    draft_json: json.json(control)?,
+                }
+            }
         };
         control.check()?;
         Ok(action)
@@ -564,7 +580,8 @@ impl WorkbenchControl {
                 let json = match a {
                     DeferredAction::Inventory(j)
                     | DeferredAction::Selection { json: j, .. }
-                    | DeferredAction::Seal { json: j, .. } => j,
+                    | DeferredAction::Seal { json: j, .. }
+                    | DeferredAction::ApprovalDocuments { json: j } => j,
                 };
                 ensure!(
                     json.bytes <= limits.request_bytes,

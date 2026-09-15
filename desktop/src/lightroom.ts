@@ -2,9 +2,18 @@
  * Close or application shutdown cancels it. No request here implies import. */
 import {command,type Decimal,type NativePath} from './bridge';
 export type Guard = {workbench:string;generation:string;operation:string};
-export type InputPurpose = 'Inventory'|'SelectionRequest'|'Approval';
+export type InputPurpose = 'Inventory'|'SelectionRequest'|'Approval'|'ApprovalDraft';
+export type ExactDocument={json:string;blake3:string};
+export type ArtifactPreparationRequest=
+ | {action:'begin';session:string;directory:NativePath;capture_revision:string;manifest_blake3:string;maximum_bytes:Decimal;open_deadline_ms:Decimal}
+ | {action:'member';session:string;member_index:Decimal}
+ | {action:'discard';session:string};
+export type ArtifactPreparationReply=
+ | {kind:'begun';session:string;directory:NativePath;manifest_path:NativePath;manifest_physical:unknown;capture_revision:string;manifest_blake3:string;manifest_bytes:Decimal;members:Decimal}
+ | {kind:'prepared';session:string;member_index:Decimal;input_json:string;input_blake3:string};
 export type Request =
  | {kind:'SealedDocument';request:SealedDocumentRequest}
+ | {kind:'ArtifactPreparation';request:ArtifactPreparationRequest}
  | {kind:'Options'}
  | {kind:'Open';attempt:string;root:NativePath;mode:'Create'|'OpenExisting';capture_staging:NativePath;limits:WorkbenchLimits}
  | {kind:'Status';workbench:string|null;attempt:string|null}
@@ -33,6 +42,7 @@ export type Action =
  | {kind:'Choose';family:string;revision:string;expected_evidence:string;reason:string}
  | {kind:'PrepareSelection';input:string;limits:SelectionLimits}
  | {kind:'Seal';review_token:string;approval_blake3:string;input:string;output:NativePath}
+ | {kind:'ApprovalDocuments';input:string;review_token:string}
  | {kind:'ReleaseReview'};
 export type Query =
  | {kind:'CaptureManifest';directory:NativePath}
@@ -54,7 +64,7 @@ export type SealedDocumentRequest=
 export type SealedDocumentPage={session:string;directory:NativePath;path:NativePath;document:SealedDocumentKind;physical:unknown;total_bytes:Decimal;blake3:string;offset:Decimal;next:Decimal|null;bytes:number[]};
 export type Status = { attempt:string;workbench:string;generation:string;operation:string;phase:'Opening'|'Running'|'Complete'|'Failed'|'CancelRequested'|'Canceled'|'Closing'|'Closed';initialized:boolean;closed:boolean;root:NativePath;limits:WorkbenchLimits;processed:Decimal;result_token:string|null;result_bytes:Decimal;review_token:string|null;capture_pid:Decimal|null;capture_staging:NativePath|null;error:string|null };
 export type InputStatus = {guard:Guard;attempt:string;input:string;purpose:InputPurpose;total_bytes:Decimal;received_bytes:Decimal;blake3:string|null;expected_blake3:string|null;complete:boolean};
-export type Response = {kind:'Options';value:Options} | {kind:'Status';value:Status|null} | {kind:'Result';value:ResultPage} | {kind:'Input';value:InputStatus|null} | {kind:'SealedDocument';value:SealedDocumentPage|null};
+export type Response = {kind:'Options';value:Options} | {kind:'Status';value:Status|null} | {kind:'Result';value:ResultPage} | {kind:'Input';value:InputStatus|null} | {kind:'SealedDocument';value:SealedDocumentPage|null} | {kind:'ArtifactPreparation';value:ArtifactPreparationReply|null};
 
 export async function lightroom(request:Request,signal?:AbortSignal):Promise<Response> {
   return command({command:'lightroom',args:{request}},'lightroom',signal);
@@ -64,4 +74,5 @@ export async function sealedDocument(request:SealedDocumentRequest,signal?:Abort
   if(response.kind!=='SealedDocument')throw new Error('Unexpected sealed document response.');
   return response.value;
 }
+export async function artifactPreparation(request:ArtifactPreparationRequest,signal?:AbortSignal):Promise<ArtifactPreparationReply|null>{const response=await lightroom({kind:'ArtifactPreparation',request},signal);if(response.kind!=='ArtifactPreparation')throw new Error('Unexpected artifact preparation response.');return response.value;}
 export const inspectionTerminal=(s:Status)=>s.closed || ['Complete','Failed','Canceled','Closed'].includes(s.phase);

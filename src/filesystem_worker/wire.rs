@@ -13,7 +13,7 @@ use crate::{
     },
     storage_volume::NativePath,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read, Write};
 
@@ -84,6 +84,7 @@ pub fn build_identity() -> String {
             include_str!("preview_io.rs"),
             include_str!("preview_stage.rs"),
             include_str!("lightroom_sealed.rs"),
+            include_str!("lightroom_artifacts.rs"),
             include_str!("../catalog_session/preview_stage.rs"),
             include_str!("export_stage.rs"),
             include_str!("../catalog_session/export_stage.rs"),
@@ -136,6 +137,7 @@ pub enum Operation {
     ExportStage(crate::catalog_session::export_stage::Request),
     ReadPreviewConfiguration(NativePath),
     LightroomSealedRead(LightroomSealedRead),
+    LightroomArtifactPreparation(LightroomArtifactPreparation),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     MigrationIdentity(Box<MigrationIdentityRequest>),
@@ -181,6 +183,10 @@ impl Operation {
                 self,
                 Self::LightroomSealedRead(LightroomSealedRead::Discard { .. })
             )
+            || matches!(
+                self,
+                Self::LightroomArtifactPreparation(LightroomArtifactPreparation::Discard { .. })
+            )
             || matches!(self, Self::ExportExecutor(r) if r.cleanup())
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
@@ -199,6 +205,7 @@ impl Operation {
             Self::ExportStage(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
             Self::LightroomSealedRead(value) => value.validate()?,
+            Self::LightroomArtifactPreparation(value) => value.validate()?,
             Self::PrepareExportDirectory(value) => value.validate()?,
             Self::ExportDestinationSnapshot(value) => value.validate()?,
             Self::MigrationIdentity(value) => value.validate()?,
@@ -308,6 +315,149 @@ pub struct LightroomSealedDocumentPage {
     pub offset: U64,
     pub next: Option<U64>,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomArtifactPreparation {
+    Begin {
+        session: String,
+        directory: NativePath,
+        capture_revision: String,
+        manifest_blake3: String,
+        maximum_bytes: U64,
+        open_deadline_ms: U64,
+    },
+    Member {
+        session: String,
+        member_index: U64,
+    },
+    Discard {
+        session: String,
+    },
+}
+impl LightroomArtifactPreparation {
+    pub fn validate(&self) -> Result<()> {
+        let session = match self {
+            Self::Begin {
+                session,
+                directory,
+                capture_revision,
+                manifest_blake3,
+                maximum_bytes,
+                open_deadline_ms,
+            } => {
+                validate_path(directory)?;
+                for digest in [capture_revision, manifest_blake3] {
+                    ensure!(
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                        "artifact preparation digest"
+                    );
+                }
+                ensure!(
+                    maximum_bytes.0 > 0 && maximum_bytes.0 <= i64::MAX as u64,
+                    "artifact preparation byte limit"
+                );
+                ensure!(
+                    (1..=3_600_000).contains(&open_deadline_ms.0),
+                    "artifact preparation deadline"
+                );
+                session
+            }
+            Self::Member {
+                session,
+                member_index,
+            } => {
+                ensure!(member_index.0 < 16_384, "artifact member index bound");
+                session
+            }
+            Self::Discard { session } => session,
+        };
+        uuid::Uuid::parse_str(session)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomArtifactPreparationReply {
+    Begun {
+        session: String,
+        directory: NativePath,
+        manifest_path: NativePath,
+        manifest_physical: PhysicalObjectId,
+        capture_revision: String,
+        manifest_blake3: String,
+        manifest_bytes: U64,
+        members: U64,
+    },
+    Prepared {
+        session: String,
+        member_index: U64,
+        input_json: String,
+        input_blake3: String,
+    },
+}
+impl LightroomArtifactPreparationReply {
+    pub fn validate_for(&self, request: &LightroomArtifactPreparation) -> Result<()> {
+        match (request, self) {
+            (
+                LightroomArtifactPreparation::Begin {
+                    session,
+                    capture_revision,
+                    manifest_blake3,
+                    ..
+                },
+                Self::Begun {
+                    session: actual,
+                    directory,
+                    manifest_path,
+                    manifest_physical,
+                    capture_revision: revision,
+                    manifest_blake3: digest,
+                    manifest_bytes,
+                    members,
+                },
+            ) => {
+                validate_path(directory)?;
+                validate_path(manifest_path)?;
+                manifest_physical.validate()?;
+                ensure!(
+                    actual == session
+                        && revision == capture_revision
+                        && digest == manifest_blake3
+                        && (1..=crate::lightroom::MANIFEST_BYTES as u64)
+                            .contains(&manifest_bytes.0)
+                        && (1..=16_384).contains(&members.0),
+                    "artifact preparation admission reply differs"
+                );
+            }
+            (
+                LightroomArtifactPreparation::Member {
+                    session,
+                    member_index,
+                },
+                Self::Prepared {
+                    session: actual,
+                    member_index: actual_index,
+                    input_json,
+                    input_blake3,
+                },
+            ) => ensure!(
+                actual == session
+                    && actual_index == member_index
+                    && !input_json.is_empty()
+                    && input_json.len() <= 65_536
+                    && blake3::hash(input_json.as_bytes()).to_hex().as_str() == input_blake3,
+                "prepared artifact reply differs"
+            ),
+            _ => anyhow::bail!("artifact preparation reply kind differs"),
+        }
+        Ok(())
+    }
 }
 impl LightroomSealedDocumentPage {
     pub fn validate_for(&self, request: &LightroomSealedRead) -> Result<()> {
@@ -448,6 +598,7 @@ pub enum Response {
     ExportStage(crate::catalog_session::export_stage::Reply),
     PreviewConfiguration(Vec<u8>),
     LightroomSealedDocument(Option<LightroomSealedDocumentPage>),
+    LightroomArtifactPreparation(Option<LightroomArtifactPreparationReply>),
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     MigrationIdentity(MigrationIdentityReply),

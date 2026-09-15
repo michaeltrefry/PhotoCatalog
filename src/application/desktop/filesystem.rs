@@ -731,6 +731,13 @@ impl Parent {
     ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
         self.client.lightroom_sealed_read(request, cancel)
     }
+    pub(super) fn lightroom_artifact_preparation(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>> {
+        self.client.lightroom_artifact_preparation(request, cancel)
+    }
     pub fn retain_metadata(
         &self,
         reservation: super::preview_metadata_admission::ProcessReservation,

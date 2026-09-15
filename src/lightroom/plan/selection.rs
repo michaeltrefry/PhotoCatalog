@@ -158,6 +158,33 @@ pub struct ApprovalDocument {
     pub authorization: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDraft {
+    pub protocol: u32,
+    pub review_token: String,
+    pub destination: NativePath,
+    pub import_source: String,
+    pub overlap: crate::catalog_migration::importer::OverlapPolicy,
+    pub keyword_overlap: crate::catalog_migration::importer::KeywordOverlap,
+    pub artifacts: Vec<ExactDocument>,
+    pub supplements: Vec<ExactDocument>,
+    pub authorization: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactDocument {
+    pub json: String,
+    pub blake3: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDocuments {
+    pub approval_json: String,
+    pub approval_blake3: String,
+    pub policy_json: String,
+    pub policy_blake3: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureEvidence {
     pub revision: String,
     pub family: String,
@@ -230,6 +257,7 @@ struct ReviewEvidence {
     choices: Vec<(String, String, String, String)>,
     inventories: Vec<String>,
 }
+mod approval_factory;
 mod preparation;
 pub use preparation::{
     PREPARATION_CHUNK_BYTES, PREPARATION_PAGE_ROWS, PreparationChunk, PreparationDocument,

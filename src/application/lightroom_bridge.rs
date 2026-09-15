@@ -196,6 +196,9 @@ impl Control {
             Request::SealedDocument { .. } => {
                 anyhow::bail!("sealed document reads require the managed filesystem owner")
             }
+            Request::ArtifactPreparation { .. } => {
+                anyhow::bail!("artifact preparation requires the managed filesystem owner")
+            }
             _ => anyhow::bail!("inspection request requires actor admission"),
         }
     }
@@ -385,6 +388,30 @@ impl Coordinator {
                                 approval_blake3,
                                 output,
                             },
+                        )?;
+                    }
+                    Action::ApprovalDocuments {
+                        input,
+                        review_token,
+                    } => {
+                        let u = c.input(&g, &input)?;
+                        ensure!(
+                            u.purpose == InputPurpose::ApprovalDraft,
+                            "input purpose differs"
+                        );
+                        ensure!(
+                            c.status().as_ref().and_then(|s| s.review_token.as_ref())
+                                == Some(&review_token),
+                            "approval factory review token differs"
+                        );
+                        let json = lw::Payload {
+                            chunks: u.sealed.clone().context("input is incomplete")?,
+                            bytes: u.total,
+                        };
+                        w.bridge_deferred(
+                            &g.generation,
+                            &g.operation,
+                            lw::DeferredAction::ApprovalDocuments { json },
                         )?;
                     }
                     value => {

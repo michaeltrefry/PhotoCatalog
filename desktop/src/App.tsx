@@ -17,6 +17,7 @@ import { usePhotoExport } from './state/usePhotoExport';
 import { useLightroom } from './state/useLightroom';
 import { LightroomPanel, LightroomActivity } from './components/LightroomPanel';
 import type { SealedSelectionLocation } from './components/LightroomMigrationPanel';
+import type {ExactDocument} from './lightroom';
 import { LightroomMigrationActivity } from './components/LightroomMigrationActivity';
 import { useLightroomMigration } from './state/useLightroomMigration';
 import { terminalMigration } from './lightroomMigration';
@@ -61,6 +62,7 @@ export function App() {
   const [showLightroom, setShowLightroom] = useState(false);
   const [showLightroomMigration, setShowLightroomMigration] = useState(false);
   const [sealedSelection, setSealedSelection] = useState<SealedSelectionLocation | null>(null);
+  const [preparedSupplements,setPreparedSupplements]=useState<ExactDocument[]>([]);
   const [copyRefreshing, setCopyRefreshing] = useState<{ catalog: string; stamp: string } | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
   const [organizationScopeName, setOrganizationScopeName] = useState('');
@@ -352,8 +354,8 @@ export function App() {
         </> : <div className="empty-state"><p>Select a photo to inspect its metadata and edits.</p></div>}</aside>}
       </main><footer className="app-status"><span>{status.phase === 'ready' ? 'Catalog ready' : status.phase}</span><span>{importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase) ? `Import ${importStatus.phase.replaceAll('_', ' ')} · ${importStatus.imported} added` : status.message}</span><span>{backupStatus && ['running', 'cancel_requested'].includes(backupStatus.state) ? `Backup ${backupStatus.state.replaceAll('_', ' ')}` : ''}</span><span>{status.active_previews > 0 ? `${status.active_previews} preview requests` : 'Local catalog'}</span></footer>
     </>}
-    {desktopAvailable && <LightroomPanel controller={inspection} open={showLightroom} onClose={() => setShowLightroom(false)} onSealed={location => { setSealedSelection(current => ({ generation: (current?.generation ?? 0) + 1, location })); setShowLightroom(false); setShowLightroomMigration(true); }} />}
-    {desktopAvailable && <Suspense fallback={null}><LightroomMigrationPanel controller={migration} catalog={catalog} catalogDisplay={catalogName} sealedSelection={sealedSelection} open={showLightroomMigration} onClose={() => setShowLightroomMigration(false)} /></Suspense>}
+    {desktopAvailable && <LightroomPanel controller={inspection} preparedSupplements={preparedSupplements} open={showLightroom} onClose={() => setShowLightroom(false)} onSealed={location => { setSealedSelection(current => ({ generation: (current?.generation ?? 0) + 1, location })); setShowLightroom(false); setShowLightroomMigration(true); }} />}
+    {desktopAvailable && <Suspense fallback={null}><LightroomMigrationPanel controller={migration} catalog={catalog} catalogDisplay={catalogName} sealedSelection={sealedSelection} open={showLightroomMigration} onClose={() => setShowLightroomMigration(false)} onPreparedSupplements={value=>{setPreparedSupplements(value);setShowLightroomMigration(false);setShowLightroom(true);}} /></Suspense>}
     {catalog && <ExportPanel key={`export:${catalog}`} catalog={catalog} open={showExport} rows={page.rows} controller={outputs} gate={exportGate} blocked={exportBlocked} onDirectPending={pending => setExportPending(pending ? catalog : null)} onClose={() => setShowExport(false)} />}
     {catalog && <CopyPanel key={`copy:${catalog}`} catalog={catalog} open={showCopy} selected={selected} rows={page.rows} source={() => queueRef.current?.value.variant ?? null} controller={copies} mutate={organizationMutation} jobsHeld={status.jobs_held} writeHeld={storageWriteHold} onClose={() => setShowCopy(false)} />}
     {catalog && <RelinkPanel key={`relink:${catalog}`} catalog={catalog} selected={selected} open={showRelink} onClose={() => setShowRelink(false)} controller={storage} mutate={organizationMutation} changed={() => { setPreviewEpoch(v => v + 1); setFolderEpoch(v => v + 1); setCursor(null); setPrevious([]); setRefresh(v => v + 1); const selection = selectedRef.current; const generation = ++storageRefresh.current; const current = () => catalogRef.current === catalog && storageRefresh.current === generation && selectedRef.current === selection; if (selection) void command({ command: 'image', args: { catalog, key: selection.key } }, 'image').then(row => { if (current()) setSelected(row); }).catch(e => { if (current()) setError(errorText(e)); }); }} />}

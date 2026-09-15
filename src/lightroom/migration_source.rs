@@ -49,6 +49,18 @@ pub struct SupplementPin {
     pub historical_status: crate::xmp_packets::Status,
     pub proof_blake3: String,
 }
+pub(crate) fn validate_supplement_pin(
+    evidence: &[u8],
+    pin: &SupplementPin,
+    stop: &dyn Fn() -> bool,
+) -> Result<()> {
+    let (source, status) = supplement_json::select(evidence, &pin.origin, stop)?;
+    ensure!(
+        source == pin.source_revision && status == pin.historical_status,
+        "supplement differs from retained original identity/status"
+    );
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StableSource {

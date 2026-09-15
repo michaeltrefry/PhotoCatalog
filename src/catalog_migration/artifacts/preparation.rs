@@ -11,6 +11,68 @@ pub struct MappingPreparation {
     pub root: NativePath,
     pub relative: NativePath,
 }
+
+/// Prepare one member from an already parsed and digest-verified capture
+/// manifest. The caller owns the immutable manifest snapshot and supplies the
+/// relative path taken from that exact snapshot.
+pub fn prepare_manifest_artifact(
+    artifact: &Artifact,
+    root: &NativePath,
+    relative: &NativePath,
+    limits: ArtifactLimits,
+    stop: &dyn Fn() -> bool,
+) -> Result<ArtifactMapping> {
+    limits.validate()?;
+    ensure!(
+        artifact.revision.bytes <= limits.maximum_bytes,
+        "artifact exceeds declared maximum bytes"
+    );
+    ensure!(!stop(), "artifact preparation stopped");
+    let deadline = Instant::now() + Duration::from_millis(limits.open_deadline_ms);
+    let path = mapping_path_parts(root, relative)?;
+    #[cfg(windows)]
+    let _write_lease = {
+        use std::os::windows::fs::OpenOptionsExt;
+        reject_links(&path)?;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)?
+    };
+    let mut source = Source::open(&path, limits.maximum_bytes)?;
+    ensure!(
+        source.before.bytes == artifact.revision.bytes,
+        "artifact retained copy length differs"
+    );
+    source.lock(0, 0)?;
+    let mut hash = blake3::Hasher::new();
+    let mut remaining = source.before.bytes;
+    let mut buffer = [0; 128 * 1024];
+    while remaining != 0 {
+        ensure!(
+            Instant::now() < deadline && !stop(),
+            "artifact preparation deadline/stop"
+        );
+        let size = remaining.min(buffer.len() as u64) as usize;
+        source.file.read_exact(&mut buffer[..size])?;
+        hash.update(&buffer[..size]);
+        remaining -= size as u64;
+    }
+    source.verify()?;
+    ensure!(
+        hash.finalize().to_hex().as_str() == artifact.blake3,
+        "artifact retained copy bytes differ from reviewed manifest"
+    );
+    ensure!(
+        Instant::now() < deadline && !stop(),
+        "artifact preparation deadline/stop"
+    );
+    Ok(ArtifactMapping {
+        root: root.clone(),
+        relative: relative.clone(),
+        copy_identity: source.before.clone(),
+    })
+}
 /// The caller must obtain `manifest_json` and its pinned revision/digest from
 /// the live SelectionReview owner, or another already-validated sealed source.
 /// This verifies bytes and the current retained-copy identity; it neither
@@ -55,55 +117,7 @@ pub fn prepare_mapping(
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "artifact manifest digest encoding"
     );
-    ensure!(
-        artifact.revision.bytes <= limits.maximum_bytes,
-        "artifact exceeds declared maximum bytes"
-    );
-    ensure!(!stop(), "artifact preparation stopped");
-    let deadline = Instant::now() + Duration::from_millis(limits.open_deadline_ms);
-    let path = mapping_path_parts(&request.root, &request.relative)?;
-    #[cfg(windows)]
-    let _write_lease = {
-        use std::os::windows::fs::OpenOptionsExt;
-        reject_links(&path)?;
-        fs::OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .open(&path)?
-    };
-    let mut source = Source::open(&path, limits.maximum_bytes)?;
-    ensure!(
-        source.before.bytes == artifact.revision.bytes,
-        "artifact retained copy length differs"
-    );
-    source.lock(0, 0)?;
-    let mut hash = blake3::Hasher::new();
-    let mut remaining = source.before.bytes;
-    let mut buffer = [0; 128 * 1024];
-    while remaining != 0 {
-        ensure!(
-            Instant::now() < deadline && !stop(),
-            "artifact preparation deadline/stop"
-        );
-        let size = remaining.min(buffer.len() as u64) as usize;
-        source.file.read_exact(&mut buffer[..size])?;
-        hash.update(&buffer[..size]);
-        remaining -= size as u64;
-    }
-    source.verify()?;
-    ensure!(
-        hash.finalize().to_hex().as_str() == artifact.blake3,
-        "artifact retained copy bytes differ from reviewed manifest"
-    );
-    ensure!(
-        Instant::now() < deadline && !stop(),
-        "artifact preparation deadline/stop"
-    );
-    Ok(ArtifactMapping {
-        root: request.root.clone(),
-        relative: request.relative.clone(),
-        copy_identity: source.before.clone(),
-    })
+    prepare_manifest_artifact(artifact, &request.root, &request.relative, limits, stop)
 }
 
 #[cfg(test)]

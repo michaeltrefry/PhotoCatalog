@@ -125,3 +125,14 @@ export async function readResultPage(snapshot: Snapshot, page: string, send: (re
     offset = reply.data.next_offset;
   }
 }
+
+export async function readCompleteResult(snapshot:Snapshot,send:(request:Request)=>Promise<Response>):Promise<string>{
+  if(snapshot.phase!=='complete'||!snapshot.result)throw new Error('A checked complete result is required.');
+  const pages=BigInt(decimal(snapshot.result.pages,'Result page count',1n,1000000n));let raw='';
+  for(let page=0n;page<pages;page++)raw+=await readResultPage(snapshot,page.toString(),send);
+  const bytes=encodeInput(raw,16*1024*1024);
+  if(BigInt(bytes.length)!==BigInt(snapshot.result.bytes))throw new Error('Complete migration result length differs.');
+  const [{blake3},{bytesToHex}]=await Promise.all([import('@noble/hashes/blake3.js'),import('@noble/hashes/utils.js')]);
+  if(bytesToHex(blake3(bytes))!==snapshot.result.blake3)throw new Error('Complete migration result digest differs.');
+  return raw;
+}

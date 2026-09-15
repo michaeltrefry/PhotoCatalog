@@ -544,7 +544,37 @@ impl DesktopBridge {
                         .unwrap_or_else(|failure| super::reply(Err(super::native(failure))));
                     let _ = tx.send(result);
                 })
-                .map_err(|failure| error(ErrorCode::Native, failure))?;
+                .map_err(|failure| error(ErrorCode::Native, failure.to_string()))?;
+            return Ok(Pending { receiver, cancel });
+        }
+        if let Request::Lightroom { request } = &request
+            && let super::lightroom_bridge::Request::ArtifactPreparation { request } =
+                request.as_ref()
+        {
+            let filesystem = self.0.shared.filesystem.clone().ok_or_else(|| {
+                error(
+                    ErrorCode::InvalidRequest,
+                    "artifact preparation requires the managed filesystem owner",
+                )
+            })?;
+            let request = request.clone();
+            let cancel = Cancellation::default();
+            let execution_cancel = cancel.flag();
+            let (tx, receiver) = mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("lightroom-artifact-preparation".into())
+                .spawn(move || {
+                    let result = filesystem
+                        .lightroom_artifact_preparation(&request, &execution_cancel)
+                        .map(|value| Reply::Ok {
+                            value: super::Response::Lightroom(Box::new(
+                                super::lightroom_bridge::Response::ArtifactPreparation(value),
+                            )),
+                        })
+                        .unwrap_or_else(|failure| super::reply(Err(super::native(failure))));
+                    let _ = tx.send(result);
+                })
+                .map_err(|failure| error(ErrorCode::Native, failure.to_string()))?;
             return Ok(Pending { receiver, cancel });
         }
         if let Request::LightroomMigration { request } = request {

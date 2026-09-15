@@ -917,6 +917,54 @@ fn read_loop(mut input: impl Read, control: bool, shared: &Shared) -> Result<()>
     Ok(())
 }
 
+impl Client {
+    pub(crate) fn lightroom_artifact_preparation(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>> {
+        match self.execute(
+            Operation::LightroomArtifactPreparation(request.clone()),
+            cancel,
+        )? {
+            Response::LightroomArtifactPreparation(value) => match (request, value) {
+                (
+                    crate::filesystem_worker::wire::LightroomArtifactPreparation::Discard {
+                        ..
+                    },
+                    None,
+                ) => Ok(None),
+                (_, Some(value)) => {
+                    value.validate_for(request)?;
+                    Ok(Some(value))
+                }
+                _ => anyhow::bail!("artifact preparation response is absent"),
+            },
+            _ => anyhow::bail!("unexpected artifact preparation response"),
+        }
+    }
+
+    pub(crate) fn lightroom_sealed_read(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
+        match self.execute(Operation::LightroomSealedRead(request.clone()), cancel)? {
+            Response::LightroomSealedDocument(value) => match (request, value) {
+                (crate::filesystem_worker::wire::LightroomSealedRead::Discard { .. }, None) => {
+                    Ok(None)
+                }
+                (_, Some(value)) => {
+                    value.validate_for(request)?;
+                    Ok(Some(value))
+                }
+                _ => anyhow::bail!("sealed document response is absent"),
+            },
+            _ => anyhow::bail!("unexpected sealed document response"),
+        }
+    }
+}
+
 impl CatalogFilesystem for Client {
     fn export_executor_call(
         &self,
@@ -1005,25 +1053,6 @@ impl CatalogFilesystem for Client {
                 Ok(value)
             }
             _ => anyhow::bail!("unexpected preview configuration response"),
-        }
-    }
-    pub(crate) fn lightroom_sealed_read(
-        &self,
-        request: &crate::filesystem_worker::wire::LightroomSealedRead,
-        cancel: &AtomicBool,
-    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
-        match self.execute(Operation::LightroomSealedRead(request.clone()), cancel)? {
-            Response::LightroomSealedDocument(value) => match (request, value) {
-                (crate::filesystem_worker::wire::LightroomSealedRead::Discard { .. }, None) => {
-                    Ok(None)
-                }
-                (_, Some(value)) => {
-                    value.validate_for(request)?;
-                    Ok(Some(value))
-                }
-                _ => anyhow::bail!("sealed document response is absent"),
-            },
-            _ => anyhow::bail!("unexpected sealed document response"),
         }
     }
     fn prepare_export_directory(
