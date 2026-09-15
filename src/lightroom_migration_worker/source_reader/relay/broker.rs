@@ -358,7 +358,7 @@ impl Broker {
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn check_failure_limit(&self, required: usize, available: usize) -> Result<()> {
         let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let error = state
