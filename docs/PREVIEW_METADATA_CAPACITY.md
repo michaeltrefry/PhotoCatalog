@@ -306,15 +306,20 @@ control request/reply graphs including encoded and typed copies. Its actual
 native reservations remain in the separate preview-shared native pool until
 explicit retirement; this metadata calculation does not replace that custody.
 
+Managed C also charges its registry, exact replay graphs, preparation and
+active-attempt state, retained full ICC/XMP vectors, and transient chunk/request
+clones. The stable facade and its boxed managed-service pointee are each counted
+once; G retains the predecessor retirement receipt needed for exact replay.
+
 These terms are summed by `requested_preview_metadata_bytes` and reserved from
 the existing shared metadata `ByteBudget`. The focused stage admission test uses
 that same `ProcessReservation`, proves one-byte-short refusal and retained-owner
 charging, then retries the same pool after release. This is requested Rust
 backing only. Native worker/codec working storage, OS handles and mappings,
 allocator overhead, and observed RSS require their own admission and evidence.
-The export-executor gate on macOS arm64, Rust 1.98.0, reported the
-following totals, integrated at source `2c4eea3`. All six capacity tests passed;
-evidence is retained in private `sc-23571-relay-tail-_vb8pvc8/capacity.log`.
+The managed-export integration gate on macOS arm64, Rust 1.98.0, reported the
+following totals at source `b85d78d`. All seven capacity tests passed; evidence
+is retained in private `sc-23612-desktop-integration-_r1ueez8/capacity.log`.
 Executor terms include compact recovery candidates, replay graphs, bounded
 private-claim records and overlapping request-validation scratch. Recovery
 admits at most 1,024 logical transports across both namespaces and separately
@@ -324,9 +329,9 @@ Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 522,025,890 | 13,537,609,744 | 5,364,516,472 | 14,059,635,634 |
-| Default | 1,236,121,256 | 13,537,619,320 | 5,364,516,472 | 14,773,740,576 |
-| Maximum | 1,066,491,939,392 | 20,603,807,140 | 5,364,516,472 | 1,087,095,746,532 |
+| Minimum | 744,320,515 | 13,541,609,808 | 5,364,516,472 | 14,285,930,323 |
+| Default | 1,458,415,881 | 13,541,619,384 | 5,364,516,472 | 15,000,035,265 |
+| Maximum | 1,066,714,234,017 | 20,607,807,204 | 5,364,516,472 | 1,087,322,041,221 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime

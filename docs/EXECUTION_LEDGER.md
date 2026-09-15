@@ -4,7 +4,47 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-15
 
-Latest local production checkpoint `2c4eea3` integrates sc-23571 from
+Local production checkpoint `b85d78d` integrates the managed C export adapter
+(`b0d2f00` → `e17a666`) and the repository-check repair for sc-23612
+(`9e4d053` → `b85d78d`). Paired desktop Export is admitted through the
+session-owned service, exact pending-operation replay, bounded recovery,
+read-only launch revalidation, and checked G/F native/storage ownership.
+The standalone Local backend remains available.
+
+The repair prevents an empty transferred migration lease from releasing its
+new owner's writer permit. It also corrects SQL/Raw test role pinning, phase
+boundary and foreign-path error assertions, and restores strict lint checks.
+Intentionally inline protocol and process-custody values retain their layouts
+with narrow, documented lint expectations; capacity accounting is preserved.
+
+Private `sc-23612-full-regression-6ksvl0py` passes all 48 test targets:
+1,454 passed, zero failed, 68 explicitly ignored. The library contributes
+1,125 passed and 63 ignored. Child helper summaries are not counted twice.
+Formatting and strict all-target Clippy pass in
+`sc-23612-checkpoint-0zgv1pe4`. Independent source reviews cover the original
+adapter, its bounded corrections, the permit repair, and the final lint delta.
+Superseded failed reviews and runs remain retained as negative evidence.
+
+All 408 recorded source hashes match the tested tree after integration.
+`sc-23612-desktop-integration-_r1ueez8` passes frontend build, release test-target
+compilation, fresh CLI build, all 41 native-owner tests and seven capacity tests.
+`sc-23612-desktop-runtime-94w0wt83` passes actual failed-launch recovery,
+six-case metadata/export replay and preview reuse, startup refusal/retry,
+cold/warm preview delivery, checked retirement, and the Tauri release check.
+The six export cases are one test, not six separately counted tests. All 18
+logged process IDs are absent after the run.
+These checks use local synthetic data and captured fresh executables.
+
+sc-23612 is In Review with local implementation and integration verified.
+sc-22847 and the foundation epic remain In Progress: publication, cross-platform
+CI/packages, installation, UI and terminal performance acceptance remain open.
+No RAID/original reads, installation replacement, push or Actions occurred.
+
+Earlier accepted checkpoints:
+
+### Prior sc-23571 integration
+
+Prior local production checkpoint `2c4eea3` integrates sc-23571 from
 `183ef73`: filesystem-owned export executor leases, bounded two-namespace
 recovery, generation fencing, and durable private claims for interrupted
 cleanup. All 21 authored files and 404 recorded source files match the tested
@@ -21,11 +61,12 @@ recorded-process retirement. The component's full test-target compilation and
 Capacity totals are refreshed in `PREVIEW_METADATA_CAPACITY.md`.
 
 sc-23571 is locally accepted; remote publication, platform CI and installation
-remain outstanding. sc-22847 still needs the managed C ExportService adapter
-and complete desktop acceptance; paired Export remains closed. All work in
+remain outstanding. At that checkpoint, sc-22847 still needed the managed C ExportService adapter
+and complete desktop acceptance; paired Export remained closed. All work in
 this checkpoint used local synthetic data, without RAID access or Actions.
 
-Earlier accepted checkpoints:
+
+
 
 Local production checkpoint `d8ba673` integrates G export-native ownership
 (source `7792e5f`) on the accepted `1be970d` foundation. That foundation adds
