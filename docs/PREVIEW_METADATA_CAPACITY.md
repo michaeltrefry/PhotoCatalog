@@ -312,16 +312,21 @@ that same `ProcessReservation`, proves one-byte-short refusal and retained-owner
 charging, then retries the same pool after release. This is requested Rust
 backing only. Native worker/codec working storage, OS handles and mappings,
 allocator overhead, and observed RSS require their own admission and evidence.
-The integrated export-owner gate on macOS arm64, Rust 1.98.0, reported the
-following totals at source `d8ba673`. All six capacity tests passed; evidence is
-retained in private `sc-22847-export-owner-integration-7l17765j/capacity.log`.
+The export-executor gate on macOS arm64, Rust 1.98.0, reported the
+following totals, integrated at source `2c4eea3`. All six capacity tests passed;
+evidence is retained in private `sc-23571-relay-tail-_vb8pvc8/capacity.log`.
+Executor terms include compact recovery candidates, replay graphs, bounded
+private-claim records and overlapping request-validation scratch. Recovery
+admits at most 1,024 logical transports across both namespaces and separately
+bounds one empty claim intent. The maximum-plan fixture retained 755,200 bytes
+of candidate backing against its 135,387,136-byte conservative allowance.
 Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 377,295,642 | 13,216,184,461 | 5,364,516,472 | 13,593,480,103 |
-| Default | 1,091,391,008 | 13,216,194,037 | 5,364,516,472 | 14,307,585,045 |
-| Maximum | 1,066,347,209,144 | 20,282,379,097 | 5,364,516,472 | 1,086,629,588,241 |
+| Minimum | 522,025,890 | 13,537,609,744 | 5,364,516,472 | 14,059,635,634 |
+| Default | 1,236,121,256 | 13,537,619,320 | 5,364,516,472 | 14,773,740,576 |
+| Maximum | 1,066,491,939,392 | 20,603,807,140 | 5,364,516,472 | 1,087,095,746,532 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime

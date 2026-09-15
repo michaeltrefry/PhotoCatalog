@@ -4,6 +4,29 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-15
 
+Latest local production checkpoint `2c4eea3` integrates sc-23571 from
+`183ef73`: filesystem-owned export executor leases, bounded two-namespace
+recovery, generation fencing, and durable private claims for interrupted
+cleanup. All 21 authored files and 404 recorded source files match the tested
+component. Independent source review `29642b6c`, narrow fixture/diagnostic
+reviews, and evidence audit `1b49c89d` qualify 99 unique runnable tests.
+Failed source reviews and runtime attempts remain preserved; only the final
+passing groups are included in that total.
+
+Private `sc-23571-integration-ga99ajvi` passes frontend build, three focused
+desktop startup/render/retirement tests, and Tauri release check. Independent
+integration audit `8b5477c4` verifies the byte-identical composition and bounded
+recorded-process retirement. The component's full test-target compilation and
+99 tests were not repeated solely for a byte-identical cherry-pick.
+Capacity totals are refreshed in `PREVIEW_METADATA_CAPACITY.md`.
+
+sc-23571 is locally accepted; remote publication, platform CI and installation
+remain outstanding. sc-22847 still needs the managed C ExportService adapter
+and complete desktop acceptance; paired Export remains closed. All work in
+this checkpoint used local synthetic data, without RAID access or Actions.
+
+Earlier accepted checkpoints:
+
 Local production checkpoint `d8ba673` integrates G export-native ownership
 (source `7792e5f`) on the accepted `1be970d` foundation. That foundation adds
 F export admission custody
