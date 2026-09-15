@@ -46,10 +46,10 @@ impl InputRole {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PartDescriptor {
-    pub(crate) role: InputRole,
-    pub(crate) bytes: U64,
-    pub(crate) blake3: String,
+pub struct PartDescriptor {
+    pub role: InputRole,
+    pub bytes: U64,
+    pub blake3: String,
 }
 impl PartDescriptor {
     fn validate(&self) -> Result<usize> {

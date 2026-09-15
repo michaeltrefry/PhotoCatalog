@@ -27,6 +27,19 @@ use std::{
 
 type Result<T> = std::result::Result<T, BridgeError>;
 
+#[cfg(test)]
+fn custody_event(event: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("PHOTOCATALOG_LM_CUSTODY_RECEIPTS") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{} {event}", std::process::id()).unwrap();
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
@@ -50,6 +63,16 @@ pub(crate) enum Action {
         kind: WriteKind,
         target: String,
         lock: Option<FileKey>,
+        request_digest: String,
+    },
+    /// Lookup only: usable during shutdown and never installs a target.
+    RecoverTarget {
+        acquire_digest: String,
+    },
+    /// Lookup only: usable during shutdown and never starts a permit owner.
+    RecoverWrite {
+        sequence: U64,
+        kind: WriteKind,
         request_digest: String,
     },
     ReleaseWrite {
@@ -104,6 +127,10 @@ pub(crate) struct Snapshot {
 )]
 pub(crate) enum Reply {
     Ok(Snapshot),
+    /// This invocation was rejected before installing acquisition authority.
+    /// A refusal of a replay says nothing about the original invocation.
+    Refused(BridgeError),
+    /// No authority-outcome proof: includes post-action reply/transport loss.
     Error(BridgeError),
 }
 // Bound raw error text before it enters the retained relay state. Sixfold JSON
@@ -202,7 +229,7 @@ fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
 impl Reply {
     pub(super) fn validate(&self) -> Result<()> {
         let failure = match self {
-            Self::Error(failure) => Some(failure),
+            Self::Refused(failure) | Self::Error(failure) => Some(failure),
             Self::Ok(snapshot) => {
                 snapshot.guard.validate().map_err(invalid)?;
                 if snapshot.catalog.as_ref().is_some_and(|v| v.len() > 128)
@@ -214,7 +241,7 @@ impl Reply {
                         .progress
                         .as_ref()
                         .is_some_and(|(phase, completed, total)| {
-                            phase.len() > 128 || total.is_some_and(|total| completed.0 > total.0)
+                            phase.len() > 256 || total.is_some_and(|total| completed.0 > total.0)
                         })
                 {
                     return Err(invalid("migration snapshot field bounds"));
@@ -240,14 +267,14 @@ impl Reply {
     /// reserves room for its largest recovery snapshot before granting authority.
     pub(super) fn message(mut self, id: u64, limit: usize) -> super::wire::Message {
         match &mut self {
-            Self::Error(failure) => bound_error(failure),
+            Self::Refused(failure) | Self::Error(failure) => bound_error(failure),
             Self::Ok(snapshot) => {
                 if let Some(failure) = snapshot.failure.take() {
                     snapshot.failure = Some(bounded_error(failure));
                 }
             }
         }
-        let allowance = if matches!(self, Self::Error(_)) {
+        let allowance = if matches!(self, Self::Refused(_) | Self::Error(_)) {
             super::wire::CHUNK
         } else {
             limit
@@ -259,10 +286,13 @@ impl Reply {
         });
         super::wire::Message::new(super::wire::Kind::MigrationReply, id, bytes)
     }
-    fn from_result(result: Result<Snapshot>) -> Self {
+    fn from_action_result(result: Result<Snapshot>) -> Self {
         match result {
             Ok(value) => Self::Ok(value),
-            Err(error) => Self::Error(bounded_error(error)),
+            // migration_action_cancellable returns Err before installing the
+            // current Target/Attempt. After Attempt installation, even native
+            // acquisition failures are retained in an Ok(Snapshot).
+            Err(error) => Self::Refused(bounded_error(error)),
         }
     }
 }
@@ -274,7 +304,12 @@ impl Action {
     pub(crate) fn recovery(&self) -> bool {
         matches!(
             self,
-            Self::ReleaseWrite { .. } | Self::Status | Self::Cancel | Self::DrainOperation
+            Self::RecoverTarget { .. }
+                | Self::RecoverWrite { .. }
+                | Self::ReleaseWrite { .. }
+                | Self::Status
+                | Self::Cancel
+                | Self::DrainOperation
         )
     }
 }
@@ -306,8 +341,14 @@ impl Request {
                     return Err(invalid("migration write identity bounds"));
                 }
             }
-            Action::ReleaseWrite { request_digest, .. } if request_digest.len() != 64 => {
+            Action::ReleaseWrite { request_digest, .. }
+            | Action::RecoverWrite { request_digest, .. }
+                if request_digest.len() != 64 =>
+            {
                 return Err(invalid("migration release identity bounds"));
+            }
+            Action::RecoverTarget { acquire_digest } if acquire_digest.len() != 64 => {
+                return Err(invalid("migration target recovery identity bounds"));
             }
             _ => {}
         }
@@ -317,7 +358,7 @@ impl Request {
             total,
         } = &self.action
         {
-            if phase.len() > 128 || total.is_some_and(|total| completed.0 > total.0) {
+            if phase.len() > 256 || total.is_some_and(|total| completed.0 > total.0) {
                 return Err(error(
                     ErrorCode::InvalidRequest,
                     "migration progress bounds",
@@ -417,6 +458,8 @@ struct PermitShared {
     state: Mutex<PermitState>,
     wake: Condvar,
     cancel: AtomicBool,
+    #[cfg(test)]
+    after_release: Mutex<Option<mpsc::Receiver<()>>>,
 }
 struct PermitOwner {
     shared: Arc<PermitShared>,
@@ -436,6 +479,8 @@ impl PermitOwner {
             }),
             wake: Condvar::new(),
             cancel: AtomicBool::new(false),
+            #[cfg(test)]
+            after_release: Mutex::new(None),
         });
         let worker = shared.clone();
         let gate = writers.clone();
@@ -476,6 +521,8 @@ impl PermitOwner {
                     } else {
                         Phase::Held
                     };
+                    #[cfg(test)]
+                    custody_event("permit-held");
                     worker.wake.notify_all();
                     // Cancellation cannot release a held permit. G first reaps all
                     // descendants, or LM explicitly releases after its transaction.
@@ -484,9 +531,16 @@ impl PermitOwner {
                     }
                     drop(state);
                     drop(permit);
+                    #[cfg(test)]
+                    custody_event("permit-released");
                     let mut state = worker.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.phase = Phase::Released;
                     worker.wake.notify_all();
+                    drop(state);
+                    #[cfg(test)]
+                    if let Some(release) = worker.after_release.lock().unwrap().take() {
+                        let _ = release.recv();
+                    }
                 }));
                 if outcome.is_err() {
                     let mut state = worker.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -529,6 +583,8 @@ impl PermitOwner {
             owner
                 .join()
                 .map_err(|_| native("migration permit join failed"))?;
+            #[cfg(test)]
+            custody_event("permit-joined");
         }
         Ok(true)
     }
@@ -766,7 +822,7 @@ impl Bridge {
 }
 impl Actor {
     pub(crate) fn migration_request(&mut self, request: Request, cancel: &Cancellation) -> Reply {
-        Reply::from_result(self.migration_action_cancellable(request, cancel))
+        Reply::from_action_result(self.migration_action_cancellable(request, cancel))
     }
     #[cfg(test)]
     fn migration_action(&mut self, request: Request) -> Result<Snapshot> {
@@ -941,6 +997,8 @@ impl Actor {
                 draining: false,
                 progress: None,
             });
+            #[cfg(test)]
+            custody_event("target-installed");
             return Ok(self.migration.target.as_ref().unwrap().snapshot());
         }
         let Some(target) = &mut self.migration.target else {
@@ -997,6 +1055,24 @@ impl Actor {
         }
         match request.action {
             Action::AcquireTarget { .. } | Action::InspectTarget { .. } => unreachable!(),
+            Action::RecoverTarget { acquire_digest } => {
+                if target.acquire_digest != acquire_digest {
+                    return Err(invalid("migration target recovery identity changed"));
+                }
+            }
+            Action::RecoverWrite {
+                sequence,
+                kind,
+                request_digest,
+            } => {
+                if !target.attempt.as_ref().is_some_and(|attempt| {
+                    attempt.sequence == sequence
+                        && attempt.kind == kind
+                        && attempt.digest == request_digest
+                }) {
+                    return Err(invalid("migration writer recovery identity unavailable"));
+                }
+            }
             Action::Status => {}
             Action::Cancel => target.cancel(),
             Action::Progress {
@@ -1068,6 +1144,8 @@ impl Actor {
                     owner: None,
                     failure: None,
                 });
+                #[cfg(test)]
+                custody_event("write-installed");
                 let result = self.start_migration_permit(kind, lock.as_ref(), cancel);
                 let target = self.migration.target.as_mut().unwrap();
                 if let Err(failure) = result {
@@ -1089,10 +1167,23 @@ impl Actor {
                 {
                     return Err(invalid("migration release identity changed"));
                 }
-                if let Some(owner) = &mut attempt.owner {
+                let joined = if let Some(owner) = &mut attempt.owner {
                     owner.release();
-                    owner.join_ready()?;
-                }
+                    owner.join_ready()?
+                } else {
+                    true
+                };
+                // The thread can publish its internal Released state just
+                // before exiting. Only join_ready above makes that an external
+                // retirement acknowledgement; every other snapshot is pending.
+                // Failed acquisition diagnostics and the target remain retained.
+                let mut snapshot = target.snapshot();
+                snapshot.phase = if joined {
+                    Phase::Released
+                } else {
+                    Phase::Releasing
+                };
+                return Ok(snapshot);
             }
             Action::DrainOperation => {
                 target.draining = true;
@@ -1111,6 +1202,8 @@ impl Actor {
                 snapshot.phase = Phase::Drained;
                 self.migration.target.take();
                 self.migration.drained = Some(snapshot.clone());
+                #[cfg(test)]
+                custody_event("target-drained");
                 if let Some(open) = &mut self.open {
                     open.index_pending = true;
                 }
@@ -1183,7 +1276,7 @@ pub(super) fn reject_queued_authority(state: &mut super::State) {
         let message = state.control.remove(index).unwrap();
         if let Some(entry) = state.pending.remove(&message.id) {
             if let super::Delivery::Migration(tx) = entry.delivery {
-                let _ = tx.send(Reply::Error(refusal(
+                let _ = tx.send(Reply::Refused(refusal(
                     ErrorCode::Closed,
                     "desktop stopping; migration authority was not sent",
                 )));
@@ -1205,6 +1298,21 @@ impl Client {
         }
     }
     pub(crate) fn submit(&self, request: Request) -> Result<Pending> {
+        self.submit_inner(request, |_| {})
+    }
+    #[cfg(test)]
+    pub(crate) fn submit_observed(
+        &self,
+        request: Request,
+        after_enqueue: impl FnOnce(&Cancellation),
+    ) -> Result<Pending> {
+        self.submit_inner(request, after_enqueue)
+    }
+    fn submit_inner(
+        &self,
+        request: Request,
+        after_enqueue: impl FnOnce(&Cancellation),
+    ) -> Result<Pending> {
         request.validate()?;
         let shared = self
             .shared
@@ -1260,6 +1368,7 @@ impl Client {
             id,
             bytes,
         ));
+        after_enqueue(&cancel);
         shared.wake.notify_all();
         Ok(Pending { receiver, cancel })
     }

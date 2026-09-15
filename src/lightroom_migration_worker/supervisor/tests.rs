@@ -305,6 +305,12 @@ fn memory_grant_denial_and_lost_reply_keep_exact_parent_charge() -> Result<()> {
 }
 
 impl<A: Admission> State<A> {
+    fn release(&mut self) -> Result<()> {
+        while !self.retry_release()? {
+            thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
     fn accept_wait(
         &mut self,
         frame: ChildFrame,
@@ -321,6 +327,9 @@ impl<A: Admission> State<A> {
             }
             ensure!(Instant::now() < until, "test admission deadline");
             thread::sleep(Duration::from_millis(2));
+        }
+        if self.releasing {
+            self.release()?;
         }
         Ok(None)
     }
@@ -1012,5 +1021,204 @@ fn lm_supervisor_batch4_shared_retaining_grant_retries_exact_result_and_releases
     assert_eq!(pool.used(), storage as u64);
     drop(result);
     assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn lm_supervisor_release_pending_polls_without_failure_and_gates_terminal() -> Result<()> {
+    struct PendingAdmission {
+        writers: Arc<Writers>,
+        ready: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+    impl Admission for PendingAdmission {
+        fn lock(&mut self, _: &str, _: &DestinationPin, _: &FileKey) -> Result<()> {
+            Ok(())
+        }
+        fn writer(
+            &mut self,
+            _: u64,
+            _: WriteKind,
+            _: &str,
+            _: Option<&FileKey>,
+            _: &Stop,
+            _: Instant,
+        ) -> Result<Arc<Writers>> {
+            Ok(self.writers.clone())
+        }
+        fn release(&mut self, _: u64, _: WriteKind) -> Result<()> {
+            anyhow::bail!("supervisor must poll asynchronous release")
+        }
+        fn poll_release(&mut self, sequence: u64, kind: WriteKind) -> Result<ReleaseProgress> {
+            assert_eq!((sequence, kind), (1, WriteKind::Bootstrap));
+            self.polls.fetch_add(1, Ordering::AcqRel);
+            if !self.ready.load(Ordering::Acquire) {
+                return Ok(ReleaseProgress::Pending);
+            }
+            self.releases.fetch_add(1, Ordering::AcqRel);
+            Ok(ReleaseProgress::Released)
+        }
+        fn progress(&mut self, _: &str, _: u64, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+    }
+    for cancel in [false, true] {
+        let pool = crate::preview::ByteBudget::new((FAILURE_BYTES + 1024) as u64)?;
+        let budget = MemoryBudget::from_shared(pool.clone());
+        let mut memory = budget.reservation();
+        memory.grow(17)?;
+        let ready = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut state = State::new_streaming(
+            PendingAdmission {
+                writers: Arc::new(Writers::default()),
+                ready: ready.clone(),
+                polls: polls.clone(),
+                releases: releases.clone(),
+            },
+            guard(),
+            "a".repeat(64),
+            memory,
+            budget.reservation(),
+            0,
+        );
+        let stop = Arc::new(Stop::default());
+        let until = Instant::now() + Duration::from_secs(5);
+        admitted(&mut state, &stop)?;
+        assert!(matches!(
+            state.accept_wait(need(), &stop, until)?,
+            Some(ParentFrame::Grant { .. })
+        ));
+        // A real held local permit is retiring. Release receipt handling returns
+        // immediately; it must not block the supervisor or invent a failure.
+        assert!(
+            state
+                .accept(
+                    ChildFrame::ReleaseWrite {
+                        guard: guard(),
+                        sequence: U64(1),
+                        write: WriteKind::Bootstrap
+                    },
+                    &stop,
+                    until
+                )?
+                .is_none()
+        );
+        let mut running = Running {
+            owner: Some(Owned {
+                process: None,
+                broker: None,
+                state,
+                lm_drained: false,
+                broker_drained: false,
+                drain_fault: None,
+                primary_broker_failure: None,
+            }),
+            result_memory: None,
+            ended: false,
+            command: None,
+            data: None,
+            control: None,
+            stop: stop.clone(),
+            until,
+        };
+        while polls.load(Ordering::Acquire) == 0 {
+            assert!(!running.poll()?);
+            ensure!(
+                Instant::now() < until,
+                "release poll not reached after local permit join"
+            );
+            thread::yield_now();
+        }
+        for _ in 0..3 {
+            assert!(!running.poll()?);
+        }
+        let owner = running.owner.as_mut().unwrap();
+        assert_eq!(owner.state.attempted, Some((1, WriteKind::Bootstrap)));
+        assert!(owner.state.held.is_none() && owner.state.releasing);
+        assert!(owner.state.terminal.is_none() && owner.drain_fault.is_none());
+        assert_eq!(
+            pool.used(),
+            17,
+            "pending keeps operation charge without allocating failure"
+        );
+        let empty = blake3::hash(&[]).to_hex().to_string();
+        let finished = || ChildFrame::Finished {
+            guard: guard(),
+            bytes: U64(0),
+            result_blake3: empty.clone(),
+        };
+        assert!(
+            owner.state.accept(finished(), &stop, until).is_err(),
+            "queued terminal cannot overtake release"
+        );
+        let failure = if cancel {
+            stop.cancel();
+            let error = running.poll().unwrap_err();
+            assert!(
+                error.downcast_ref::<OperationCanceled>().is_some(),
+                "Stop remains observable during normal pending"
+            );
+            Some(running.failure(error))
+        } else {
+            ready.store(true, Ordering::Release);
+            let owner = running.owner.as_mut().unwrap();
+            assert!(owner.state.retry_release()?);
+            assert!(owner.state.attempted.is_none() && !owner.state.releasing);
+            assert!(matches!(
+                owner.state.accept(
+                    ChildFrame::BeginResult {
+                        guard: guard(),
+                        bytes: U64(0),
+                        blake3: empty.clone()
+                    },
+                    &stop,
+                    until
+                )?,
+                Some(ParentFrame::ResultGrant { .. })
+            ));
+            owner.state.accept(finished(), &stop, until)?;
+            None
+        };
+        let mut operation = Operation::DrainPending(running.take_pending(failure));
+        if cancel {
+            assert!(operation.retry_drain().is_none());
+            let Operation::DrainPending(pending) = &operation else {
+                unreachable!()
+            };
+            assert!(
+                !pending.retry_failed(),
+                "ordinary pending does not become a failed retry"
+            );
+            assert!(matches!(
+                pending.failure().unwrap().cause,
+                FailureCause::Canceled
+            ));
+            ready.store(true, Ordering::Release);
+        }
+        assert!(operation.retry_drain().is_some());
+        if cancel {
+            assert!(matches!(operation, Operation::Drained(Drained::Failed(_))));
+        } else {
+            assert!(matches!(
+                operation,
+                Operation::Drained(Drained::Complete(_))
+            ));
+        }
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert_eq!(
+            pool.used(),
+            if cancel {
+                0
+            } else {
+                super::super::protocol::result::retained_storage_bytes(0)?.0 as u64
+            },
+            "checked retirement releases operation charge and retains only the saved result"
+        );
+        drop(operation);
+        assert_eq!(pool.used(), 0);
+    }
     Ok(())
 }

@@ -32,6 +32,7 @@ pub(super) fn shared(cap: usize) -> Arc<Shared> {
         binary: Arc::new(AtomicUsize::new(0)),
         filesystem: None,
         metadata: Default::default(),
+        migration_stop: Mutex::new(None),
         fixture: Mutex::new(None),
     })
 }
@@ -355,5 +356,29 @@ fn config_and_wire_families_preserve_exact_native_and_decimal_authority() {
             .into_config()
             .unwrap();
         assert_eq!(native.original_roots, recovered.original_roots);
+    }
+}
+
+#[test]
+fn managed_catalog_retirement_requires_identity_reap_join_and_g_drain() {
+    let shared = shared(8);
+    let mut state = shared.state.lock().unwrap();
+    state.child_exit = None; // An abnormal exit has no success proof of its own.
+    for paired in [false, true] {
+        for ready in [false, true] {
+            for reaped in [false, true] {
+                for joined in [false, true] {
+                    for migration in [false, true] {
+                        state.ready = ready;
+                        state.reaped = reaped;
+                        state.child_finished = joined;
+                        assert_eq!(
+                            managed_catalog_retired(&state, paired, migration),
+                            paired && ready && reaped && joined && migration
+                        );
+                    }
+                }
+            }
+        }
     }
 }

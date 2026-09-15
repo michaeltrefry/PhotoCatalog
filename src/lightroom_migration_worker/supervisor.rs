@@ -27,7 +27,7 @@ const RESULT_BYTES: usize = 8 * 1024 * 1024;
 const FAILURE_BYTES: usize = 32 * 1024;
 
 #[derive(Debug)]
-struct OperationCanceled;
+pub(crate) struct OperationCanceled;
 impl std::fmt::Display for OperationCanceled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("migration operation canceled")
@@ -41,6 +41,12 @@ fn check_canceled(stop: &Stop) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseProgress {
+    Pending,
+    Released,
+}
+
 /// The coordinator implements this against immutable operation admission and
 /// the actor's cached attached identities. `writer` obtains an exact actor hold
 /// acknowledgement before returning its shared Writers registry entry. Its
@@ -49,6 +55,10 @@ fn check_canceled(stop: &Stop) -> Result<()> {
 /// once after exact ReleaseWrite or helper reap even when writer errors/panics
 /// after posting an actor hold. Release must safely retire an unacknowledged hold.
 pub(crate) trait Admission: Send + 'static {
+    #[cfg(test)]
+    fn fail_waiter_spawn(&mut self) -> bool {
+        false
+    }
     fn lock(&mut self, target: &str, destination: &DestinationPin, lock: &FileKey) -> Result<()>;
     fn writer(
         &mut self,
@@ -60,6 +70,13 @@ pub(crate) trait Admission: Send + 'static {
         until: Instant,
     ) -> Result<Arc<Writers>>;
     fn release(&mut self, sequence: u64, kind: WriteKind) -> Result<()>;
+    /// Pending retains the exact attempt and is ordinary progress, not an
+    /// uncertain acknowledgement or a failed wait/join. Existing synchronous
+    /// admissions retain their release contract through this default adapter.
+    fn poll_release(&mut self, sequence: u64, kind: WriteKind) -> Result<ReleaseProgress> {
+        self.release(sequence, kind)?;
+        Ok(ReleaseProgress::Released)
+    }
     fn progress(&mut self, phase: &str, completed: u64, total: Option<u64>) -> Result<()>;
 }
 struct Held {
@@ -85,6 +102,7 @@ struct State<A: Admission> {
     next_memory: u64,
     held: Option<Held>,
     attempted: Option<(u64, WriteKind)>,
+    releasing: bool,
     result: String,
     streamed_result: Option<StreamedResult>,
     streamed_maximum: Option<usize>,
@@ -152,6 +170,7 @@ impl<A: Admission> State<A> {
             memory,
             held: None,
             attempted: None,
+            releasing: false,
             result,
             streamed_result: None,
             streamed_maximum,
@@ -184,6 +203,10 @@ impl<A: Admission> State<A> {
             | ChildFrame::Failed { guard, .. } => guard,
         };
         ensure!(guard == &self.guard, "stale migration helper frame");
+        ensure!(
+            !self.releasing,
+            "helper frame before checked writer release"
+        );
         // Pre-parse allocation permission conveys no source/target authority.
         // It can precede Admitted so decoding does not allocate before its grant.
         if let ChildFrame::NeedMemory {
@@ -300,6 +323,9 @@ impl<A: Admission> State<A> {
                 ) {
                     Ok(pending) => self.pending = Some(pending),
                     Err(failure) => {
+                        // No waiter exists and caller code was never entered.
+                        // There is no external hold to release for this attempt.
+                        self.attempted.take();
                         self.admission = Some(failure.admission);
                         return Err(failure.error);
                     }
@@ -315,7 +341,10 @@ impl<A: Admission> State<A> {
                         .is_some_and(|h| h.sequence == sequence.0 && h.kind == write),
                     "unsolicited or stale migration writer release"
                 );
-                self.release()?;
+                // LM may already have queued its next write/result. Keep that
+                // input queued while Running polls the checked release; Stop
+                // and deadline remain observable between release polls.
+                self.releasing = true;
             }
             ChildFrame::Progress {
                 phase,
@@ -488,24 +517,23 @@ impl<A: Admission> State<A> {
             }
         }
         if let Some((sequence, kind)) = self.attempted {
-            self.admission
+            let progress = self
+                .admission
                 .as_mut()
                 .context("migration release while admission pending")?
-                .release(sequence, kind)?;
+                .poll_release(sequence, kind);
+            match progress {
+                Ok(ReleaseProgress::Released) => {}
+                Ok(ReleaseProgress::Pending) => return first.map_or(Ok(false), Err),
+                Err(error) => return Err(first.unwrap_or(error)),
+            }
             self.attempted.take();
         }
+        self.releasing = false;
         if let Some(error) = first {
             return Err(error);
         }
         Ok(true)
-    }
-    fn release(&mut self) -> Result<()> {
-        loop {
-            if self.retry_release()? {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
     }
     fn take_saved_result(&mut self, legacy_memory: Option<Reservation>) -> Result<SavedResult> {
         ensure!(
@@ -832,7 +860,7 @@ impl std::fmt::Display for Failure {
 }
 impl std::error::Error for Failure {}
 impl Failure {
-    fn from_error(
+    pub(crate) fn from_error(
         error: anyhow::Error,
         poisoned: bool,
         outcome_unknown: bool,
@@ -930,6 +958,7 @@ impl Drained {
     }
 }
 pub(crate) struct DrainPending<A: Admission> {
+    last_retry_failed: bool,
     owner: Option<Owned<A>>,
     result_memory: Option<Reservation>,
     failure: Option<Failure>,
@@ -937,6 +966,7 @@ pub(crate) struct DrainPending<A: Admission> {
 impl<A: Admission> DrainPending<A> {
     fn new(owner: Owned<A>, result_memory: Option<Reservation>, failure: Option<Failure>) -> Self {
         Self {
+            last_retry_failed: false,
             owner: Some(owner),
             result_memory,
             failure,
@@ -945,11 +975,16 @@ impl<A: Admission> DrainPending<A> {
     pub(crate) fn failure(&self) -> Option<&Failure> {
         self.failure.as_ref()
     }
+    pub(crate) fn retry_failed(&self) -> bool {
+        self.last_retry_failed
+    }
     pub(crate) fn retry_drain(&mut self) -> Option<Drained> {
+        self.last_retry_failed = false;
         let owner = self.owner.as_mut().expect("pending drain owner");
         match owner.retry_drain() {
             Ok(false) => return None,
             Err(error) => {
+                self.last_retry_failed = true;
                 if let Some(failure) = &mut self.failure {
                     failure.retain_drain_fault();
                 } else {
@@ -1031,6 +1066,29 @@ pub(crate) struct InputPart<'a> {
     pub(crate) text: &'a str,
 }
 impl<A: Admission> Operation<A> {
+    #[cfg(test)]
+    pub(crate) fn receiving_result(&self) -> bool {
+        match self {
+            Self::Running(running) => running.owner.as_ref().is_some_and(|owner| {
+                owner.state.streamed_result.is_some() && owner.state.terminal.is_none()
+            }),
+            _ => false,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_wait_failures(&mut self, count: usize) -> bool {
+        let owner = match self {
+            Self::Running(running) => running.owner.as_mut(),
+            Self::DrainPending(pending) => pending.owner.as_mut(),
+            Self::Drained(_) => None,
+        };
+        if let Some(process) = owner.and_then(|owner| owner.process.as_mut()) {
+            process.inject_wait_failures(count);
+            true
+        } else {
+            false
+        }
+    }
     /// One nonblocking execution step. Returns true once execution has left the
     /// running state; physical drain can still be pending.
     pub(crate) fn poll(&mut self) -> bool {
@@ -1503,6 +1561,9 @@ impl<A: Admission> Running<A> {
             Instant::now() < until,
             "migration operation deadline; all helpers drained before return"
         );
+        if owner.state.releasing && !owner.state.retry_release()? {
+            return Ok(false);
+        }
         if let Some(frame) = control.take() {
             *control = owner
                 .process

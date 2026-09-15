@@ -9,6 +9,7 @@ pub mod exports;
 mod hydration;
 pub mod lightroom;
 pub mod lightroom_bridge;
+pub mod lightroom_migration;
 pub mod metadata;
 pub mod organization;
 mod preview_delivery;
@@ -345,7 +346,7 @@ impl Envelope {
     fn reject(self, code: ErrorCode, message: &str) {
         match self.work {
             Work::MigrationAdmission(_, tx) => {
-                let _ = tx.send(desktop::lightroom_migration::Reply::Error(error(
+                let _ = tx.send(desktop::lightroom_migration::Reply::Refused(error(
                     code, message,
                 )));
             }
@@ -1936,6 +1937,10 @@ impl Actor {
             ));
         }
         match r {
+            Request::LightroomMigration { .. } => Err(error(
+                ErrorCode::InvalidRequest,
+                "migration requests require the managed desktop owner",
+            )),
             Request::Lightroom { .. } => unreachable!("inspection dispatched independently"),
             Request::Export { catalog, request } => self.export_request(&catalog, *request, None),
             Request::EditCopy { catalog, request } => {

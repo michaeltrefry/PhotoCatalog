@@ -22,6 +22,7 @@ pub(crate) use filesystem::roundtrip_export_stage;
 #[cfg(test)]
 mod filesystem_tests;
 pub(crate) mod lightroom_migration;
+mod migration;
 mod native;
 mod preview_metadata_admission;
 pub(crate) mod preview_metadata_capacity;
@@ -91,6 +92,8 @@ struct Shared {
     binary: Arc<AtomicUsize>,
     filesystem: Option<Arc<filesystem::Parent>>,
     metadata: preview_metadata_admission::ProcessReservation,
+    migration_stop:
+        Mutex<Option<std::sync::Weak<crate::lightroom_migration_worker::process::Stop>>>,
     #[cfg(test)]
     fixture: Mutex<Option<std::result::Result<String, String>>>,
 }
@@ -130,6 +133,7 @@ impl Shared {
         result
     }
     fn fail(&self, message: impl Into<String>) {
+        self.cancel_migration();
         let message = message.into();
         if let Some(f) = &self.filesystem {
             f.fail(&message);
@@ -147,7 +151,19 @@ impl Shared {
         s.stopping = true;
         self.wake.notify_all();
     }
+    fn cancel_migration(&self) {
+        if let Some(stop) = self
+            .migration_stop
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            stop.cancel();
+        }
+    }
     fn stop(&self) {
+        self.cancel_migration();
         if let Some(f) = &self.filesystem {
             f.closing();
         }
@@ -231,11 +247,22 @@ struct Handle {
     process: Mutex<process::Owner>,
     pid: u32,
     shutdown: Mutex<()>,
+    migration: migration::Coordinator,
+}
+/// This proof depends on process::paired_preview_route and private migration
+/// admission remaining a closed managed allowlist. Their identity-verified C
+/// uses only thread owners; native OS children belong to G, never C. Ready binds
+/// the complete implementation and the exact F binding. A legacy/unverified C
+/// cannot use this abnormal-exit proof. F.finish_after_dependents still checks
+/// G's native registry before retiring F, independently of G migration custody.
+fn managed_catalog_retired(state: &State, paired: bool, migration_drained: bool) -> bool {
+    paired && state.ready && state.reaped && state.child_finished && migration_drained
 }
 impl Handle {
     fn shutdown(&self) -> Result<()> {
         let _attempt = self.shutdown.lock().unwrap();
         // Signal both independent owners before either potentially blocking join.
+        self.migration.signal_shutdown();
         self.shared.stop();
         self.local
             .0
@@ -245,14 +272,22 @@ impl Handle {
             .unwrap_or_else(|e| e.into_inner())
             .signal_shutdown();
         let result = self.process.lock().unwrap().drain();
-        // Exit74 is the managed bootstrap R0 path: that admission forbids native
-        // descendants. Other abnormal exits do not prove descendant retirement.
-        let (reaped, exit) = {
+        let migration_drained = self.migration.drained();
+        let (retired, managed_retired, exit) = {
             let s = self.shared.state.lock().unwrap();
-            (s.child_finished, s.child_exit)
+            let managed =
+                managed_catalog_retired(&s, self.shared.filesystem.is_some(), migration_drained);
+            (
+                migration_drained
+                    && s.reaped
+                    && s.child_finished
+                    && (matches!(s.child_exit, Some(0 | 74)) || managed),
+                managed,
+                s.child_exit,
+            )
         };
         let filesystem = if let Some(f) = &self.shared.filesystem {
-            if reaped && matches!(exit, Some(0 | 74)) {
+            if retired {
                 f.finish_after_dependents(exit != Some(0))
                     .map_err(|e| error(ErrorCode::Native, e.to_string()))
             } else {
@@ -268,6 +303,14 @@ impl Handle {
             self.shared.state.lock().unwrap().filesystem_verified = true;
         }
         let local = self.shared.drain_local(|| self.local.try_shutdown());
+        // Process::drain retains an abnormal-exit diagnostic even after checked
+        // wait/join. Safe retirement does not turn that catalog outcome into a
+        // known success: Shared.message and the migration failure remain intact.
+        let result = if managed_retired && !matches!(exit, Some(0 | 74)) {
+            Ok(())
+        } else {
+            result
+        };
         result.and(filesystem).and(local)
     }
 }
@@ -375,6 +418,7 @@ impl DesktopBridge {
             binary: Arc::new(AtomicUsize::new(0)),
             filesystem,
             metadata,
+            migration_stop: Mutex::new(None),
             #[cfg(test)]
             fixture: Mutex::new(None),
         });
@@ -396,7 +440,13 @@ impl DesktopBridge {
             }
         };
         let pid = owner.pid();
+        let migration = migration::Coordinator::new(
+            &shared,
+            config.worker_executable,
+            metadata_budget.cloned(),
+        );
         let result = Self(Arc::new(Handle {
+            migration,
             local,
             shared,
             process: Mutex::new(owner),
@@ -448,6 +498,18 @@ impl DesktopBridge {
         let _ = self.try_shutdown();
     }
     pub fn submit(&self, request: Request) -> Result<Pending> {
+        if let Request::LightroomMigration { request } = request {
+            let response = self.0.migration.request(*request)?;
+            let (tx, receiver) = mpsc::sync_channel(1);
+            let _ = tx.send(Reply::Ok {
+                value: super::Response::LightroomMigration(Box::new(response)),
+            });
+            return Ok(Pending {
+                receiver,
+                cancel: Cancellation::default(),
+            });
+        }
+        self.0.migration.before_catalog_request(&request)?;
         if local_route(&request) {
             return self.0.local.submit(request);
         }
@@ -574,7 +636,8 @@ fn retire_bytes(state: &State, catalog: &str) {
 fn local_route(request: &Request) -> bool {
     match request {
         Request::Lightroom { .. } => true,
-        Request::Export { .. }
+        Request::LightroomMigration { .. }
+        | Request::Export { .. }
         | Request::EditCopy { .. }
         | Request::Relink { .. }
         | Request::OpenExisting { .. }

@@ -1704,7 +1704,9 @@ fn child_input_relay(
             Err(e) => {
                 state.early.remove(&id);
                 let m = if kind == Kind::MigrationAdmission {
-                    super::lightroom_migration::Reply::Error(e).message(id, limits.reply_bytes)
+                    // Dispatch either never entered the actor or failed to
+                    // enqueue. No action has executed on this refusal path.
+                    super::lightroom_migration::Reply::Refused(e).message(id, limits.reply_bytes)
                 } else if kind == Kind::Command {
                     checked_message(
                         Kind::Reply,
@@ -2358,6 +2360,14 @@ mod tests {
                 kind: WriteKind::Bootstrap,
                 request_digest: "b".repeat(64),
             },
+            Action::RecoverTarget {
+                acquire_digest: "b".repeat(64),
+            },
+            Action::RecoverWrite {
+                sequence: crate::application::U64(1),
+                kind: WriteKind::Bootstrap,
+                request_digest: "b".repeat(64),
+            },
             Action::Status,
             Action::Cancel,
             Action::DrainOperation,
@@ -2400,13 +2410,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(dispatched, 4);
+        assert_eq!(dispatched, 6);
         let state = shared.lock().unwrap();
-        for id in 1..=8 {
+        for id in 1..=10 {
             let ChildPending::Reply(message) = state.pending.get(&id).unwrap() else {
                 panic!()
             };
-            let MigrationReply::Error(failure) =
+            let MigrationReply::Refused(failure) =
                 serde_json::from_slice::<MigrationReply>(&message.bytes).unwrap()
             else {
                 panic!()
@@ -2418,6 +2428,34 @@ mod tests {
             });
         }
     }
+    #[test]
+    fn lm_desktop_relay_actor_disconnect_is_unknown_not_refused() -> anyhow::Result<()> {
+        use super::super::lightroom_migration::{Pending, Reply as MigrationReply};
+        let shared = child_state();
+        let (actor_tx, receiver) = mpsc::sync_channel(1);
+        drop(actor_tx);
+        shared.lock().unwrap().pending.insert(
+            1,
+            ChildPending::Migration(Pending {
+                receiver,
+                cancel: Cancellation::default(),
+            }),
+        );
+        let (ordinary, _ordinary_rx) = mpsc::sync_channel(1);
+        let (migration, migration_rx) = mpsc::sync_channel(1);
+        let (binary, _binary_rx) = mpsc::sync_channel(1);
+        collect(&shared, &ordinary, &migration, &binary, 1024);
+        let message = migration_rx.recv()?;
+        assert!(matches!(
+            serde_json::from_slice::<MigrationReply>(&message.bytes)?,
+            MigrationReply::Error(BridgeError {
+                code: ErrorCode::Closed,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
     fn migration_fixture_request(
         action: super::super::lightroom_migration::Action,
     ) -> super::super::lightroom_migration::Request {
@@ -2513,7 +2551,7 @@ mod tests {
                     serde_json::from_slice::<super::super::lightroom_migration::Reply>(
                         &reply.bytes
                     )?,
-                    super::super::lightroom_migration::Reply::Error(BridgeError {
+                    super::super::lightroom_migration::Reply::Refused(BridgeError {
                         code: ErrorCode::Closed,
                         ..
                     })

@@ -87,6 +87,16 @@ impl<A: Admission> Pending<A> {
         stop: Arc<Stop>,
         until: Instant,
     ) -> std::result::Result<Self, StartFailure<A>> {
+        #[cfg(test)]
+        let mut admission = admission;
+        #[cfg(test)]
+        if admission.fail_waiter_spawn() {
+            return Err(StartFailure {
+                admission,
+                error: std::io::Error::other("injected migration admission thread spawn failure")
+                    .into(),
+            });
+        }
         let state = Arc::new(Mutex::new(Some(admission)));
         let worker_state = state.clone();
         let ready = Arc::new(Mutex::new(None));

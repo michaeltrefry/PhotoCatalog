@@ -602,7 +602,7 @@ fn lm_desktop_relay_shutdown_rejects_queued_and_new_authority_but_keeps_recovery
     ));
     assert!(matches!(
         pending.receiver.recv_timeout(Duration::from_secs(1))?,
-        Reply::Error(BridgeError {
+        Reply::Refused(BridgeError {
             code: ErrorCode::Closed,
             ..
         })
@@ -1308,6 +1308,282 @@ fn lm_desktop_relay_inspected_pin_cannot_authorize_replaced_root() -> anyhow::Re
     std::fs::rename(&moved, &root)?;
     assert!(result.is_err());
     assert!(actor.migration.target.is_none());
+    actor.close()?;
+    Ok(())
+}
+
+#[test]
+fn lm_desktop_relay_failed_acquisition_release_ack_requires_join_and_retains_target()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_filesystem, mut actor, acquire) =
+        open_actor(&temp.path().canonicalize()?.join("catalog"))?;
+    actor.migration_action(acquire)?;
+    let writers = actor.open.as_ref().unwrap().catalog.writers.clone();
+    let hold = writers.enter(Priority::Foreground)?;
+    let attempted = write(WriteKind::Bootstrap, 1, None);
+    actor.migration_action(attempted.clone())?;
+    actor.migration_action(request(Action::Cancel))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let released = loop {
+        assert!(Instant::now() < deadline, "failed permit release deadline");
+        let snapshot = actor.migration_action(release(&attempted))?;
+        if snapshot.phase == Phase::Released {
+            break snapshot;
+        }
+        assert!(matches!(
+            snapshot.phase,
+            Phase::Attempted | Phase::Releasing | Phase::Failed
+        ));
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert!(released.failure.is_some());
+    assert!(actor.migration.held());
+    assert_eq!(
+        actor.migration_action(release(&attempted))?.phase,
+        Phase::Released
+    );
+    assert!(
+        actor
+            .migration_action(write(WriteKind::Bootstrap, 2, None))
+            .is_err()
+    );
+    drop(hold);
+    drain(&mut actor);
+    actor.close()?;
+    Ok(())
+}
+
+#[test]
+fn lm_desktop_relay_lookup_recovery_never_installs_and_preserves_exact_c_custody()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_filesystem, mut actor, acquire) =
+        open_actor(&temp.path().canonicalize()?.join("catalog"))?;
+    let acquire_digest = blake3::hash(&serde_json::to_vec(&acquire)?)
+        .to_hex()
+        .to_string();
+    let recover_target = request(Action::RecoverTarget { acquire_digest });
+    assert!(matches!(
+        actor.migration_request(recover_target.clone(), &Cancellation::default()),
+        Reply::Refused(_)
+    ));
+    assert!(
+        !actor.migration.held(),
+        "lookup cannot acquire an absent target"
+    );
+    let target_reply = actor.migration_request(acquire.clone(), &Cancellation::default());
+    assert!(actor.migration.held());
+    assert!(matches!(
+        serde_json::from_slice::<Reply>(&target_reply.message(1, 1).bytes)?,
+        Reply::Error(_)
+    ));
+    assert_eq!(
+        actor.migration_action(recover_target.clone())?.phase,
+        Phase::Target
+    );
+    let acquire_write = write(WriteKind::Bootstrap, 1, None);
+    let Action::AcquireWrite {
+        sequence,
+        kind,
+        request_digest,
+        ..
+    } = &acquire_write.action
+    else {
+        unreachable!()
+    };
+    let recover_write = request(Action::RecoverWrite {
+        sequence: *sequence,
+        kind: *kind,
+        request_digest: request_digest.clone(),
+    });
+    assert!(matches!(
+        actor.migration_request(recover_write.clone(), &Cancellation::default()),
+        Reply::Refused(_)
+    ));
+    assert!(
+        actor.migration.target.as_ref().unwrap().attempt.is_none(),
+        "lookup cannot start a missing writer"
+    );
+    let write_reply = actor.migration_request(acquire_write.clone(), &Cancellation::default());
+    assert!(actor.migration.target.as_ref().unwrap().attempt.is_some());
+    assert!(matches!(
+        serde_json::from_slice::<Reply>(&write_reply.message(1, 1).bytes)?,
+        Reply::Error(_)
+    ));
+    wait(|| actor.migration_action(recover_write.clone()).unwrap().phase == Phase::Held);
+    let owner_id = actor
+        .migration
+        .target
+        .as_ref()
+        .unwrap()
+        .attempt
+        .as_ref()
+        .unwrap()
+        .owner
+        .as_ref()
+        .unwrap()
+        .owner
+        .as_ref()
+        .unwrap()
+        .thread()
+        .id();
+    actor.migration.cancel();
+    for _ in 0..3 {
+        assert_eq!(
+            actor.migration_action(recover_target.clone())?.phase,
+            Phase::Held
+        );
+        assert_eq!(
+            actor.migration_action(recover_write.clone())?.phase,
+            Phase::Held
+        );
+        assert_eq!(
+            actor
+                .migration
+                .target
+                .as_ref()
+                .unwrap()
+                .attempt
+                .as_ref()
+                .unwrap()
+                .owner
+                .as_ref()
+                .unwrap()
+                .owner
+                .as_ref()
+                .unwrap()
+                .thread()
+                .id(),
+            owner_id
+        );
+    }
+    assert!(matches!(
+        actor.migration_request(
+            request(Action::RecoverTarget {
+                acquire_digest: "f".repeat(64)
+            }),
+            &Cancellation::default()
+        ),
+        Reply::Refused(_)
+    ));
+    assert!(matches!(
+        actor.migration_request(
+            request(Action::RecoverWrite {
+                sequence: U64(2),
+                kind: *kind,
+                request_digest: request_digest.clone()
+            }),
+            &Cancellation::default()
+        ),
+        Reply::Refused(_)
+    ));
+    wait(|| {
+        actor
+            .migration_action(release(&acquire_write))
+            .unwrap()
+            .phase
+            == Phase::Released
+    });
+    assert!(
+        actor
+            .migration
+            .target
+            .as_ref()
+            .unwrap()
+            .attempt
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap()
+            .owner
+            .is_none(),
+        "exact permit owner joined"
+    );
+    drain(&mut actor);
+    assert!(!actor.migration.held());
+    actor.close()?;
+    Ok(())
+}
+
+#[test]
+fn lm_desktop_relay_release_ack_waits_for_owner_exit_after_permit_drop() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_filesystem, mut actor, target) =
+        open_actor(&temp.path().canonicalize()?.join("catalog"))?;
+    actor.migration_action(target)?;
+    let acquire = write(WriteKind::Bootstrap, 1, None);
+    actor.migration_action(acquire.clone())?;
+    wait(|| {
+        actor
+            .migration_action(request(Action::Status))
+            .unwrap()
+            .phase
+            == Phase::Held
+    });
+    let target = actor.migration.target.as_ref().unwrap();
+    let writers = target.writers.as_ref().unwrap().clone();
+    let shared = target
+        .attempt
+        .as_ref()
+        .unwrap()
+        .owner
+        .as_ref()
+        .unwrap()
+        .shared
+        .clone();
+    let (finish, gate) = mpsc::sync_channel(1);
+    *shared.after_release.lock().unwrap() = Some(gate);
+    assert_eq!(
+        actor.migration_action(release(&acquire))?.phase,
+        Phase::Releasing
+    );
+    wait(|| shared.state.lock().unwrap().phase == Phase::Released);
+    // The real Permit is gone, but the owner is deliberately still running.
+    // No externally visible Released ACK may exist before its checked join.
+    drop(writers.enter(Priority::Foreground)?);
+    for _ in 0..3 {
+        assert_eq!(
+            actor.migration_action(release(&acquire))?.phase,
+            Phase::Releasing
+        );
+        assert!(actor.migration.held());
+        assert!(
+            actor
+                .migration
+                .target
+                .as_ref()
+                .unwrap()
+                .attempt
+                .as_ref()
+                .unwrap()
+                .owner
+                .as_ref()
+                .unwrap()
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !owner.is_finished())
+        );
+    }
+    finish.send(())?;
+    wait(|| actor.migration_action(release(&acquire)).unwrap().phase == Phase::Released);
+    assert!(
+        actor
+            .migration
+            .target
+            .as_ref()
+            .unwrap()
+            .attempt
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap()
+            .owner
+            .is_none()
+    );
+    drain(&mut actor);
     actor.close()?;
     Ok(())
 }

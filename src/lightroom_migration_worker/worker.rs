@@ -63,7 +63,7 @@ pub(crate) struct Envelope {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Operation {
+pub enum Operation {
     Run {
         approval_blake3: String,
         max_steps: U64,
