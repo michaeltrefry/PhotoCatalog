@@ -830,6 +830,15 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         fs::remove_dir(path)?;
         return Ok(Inspection::Cleaned);
     }
+    // A read-only proof remains compatible with an active Windows worker whose
+    // directory handle does not share deletion. The DELETE-capable handle is
+    // admitted only after both leases prove idle, then matched to this object.
+    #[cfg(windows)]
+    let directory_proof = crate::filesystem_worker::open_directory(path)?;
+    #[cfg(windows)]
+    let directory_parent_proof = crate::filesystem_worker::open_directory(
+        path.parent().context("export transport parent")?,
+    )?;
     #[allow(unused_mut)]
     let mut parent = match acquire_parent_lease(path)? {
         ParentLeaseInspection::Absent => None,
@@ -840,10 +849,6 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
             ));
         }
     };
-    #[cfg(windows)]
-    let directory = discard_directory(path)?;
-    #[cfg(windows)]
-    let directory_parent = discard_directory(path.parent().context("export transport parent")?)?;
     let lock = open_lease(path)?;
     if let Err(error) = lock.try_lock_exclusive() {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
@@ -894,6 +899,17 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         #[cfg(windows)]
         {
             drop(parent.take());
+            let directory = discard_directory(path)?;
+            ensure!(
+                lease_identity(&directory)? == lease_identity(&directory_proof)?,
+                "export transport directory changed before fence"
+            );
+            let directory_parent =
+                discard_directory(path.parent().context("export transport parent")?)?;
+            ensure!(
+                lease_identity(&directory_parent)? == lease_identity(&directory_parent_proof)?,
+                "export transport parent changed before fence"
+            );
             rename_directory_held(
                 &directory,
                 &directory_parent,
