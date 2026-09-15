@@ -131,6 +131,7 @@ pub enum Action {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub root: RootCapability,
+    pub executor: LeaseId,
     pub stage: LeaseId,
     pub operation: U64,
     #[serde(default)]

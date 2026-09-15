@@ -998,6 +998,7 @@ impl ExportProfileReply {
     }
 }
 
+pub mod export_executor;
 pub mod export_native;
 pub mod export_stage;
 pub mod native;
@@ -1028,6 +1029,13 @@ pub trait CatalogFilesystem: Send + Sync {
         _cancel: &AtomicBool,
     ) -> Result<export_stage::Reply> {
         anyhow::bail!("filesystem owner does not support export stage custody")
+    }
+    fn export_executor_call(
+        &self,
+        _request: &export_executor::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<export_executor::Reply> {
+        anyhow::bail!("filesystem owner does not support export executor custody")
     }
     fn preview_io_call(
         &self,
@@ -1733,6 +1741,7 @@ impl CatalogSessionAuthority {
     /// G owner must use its distinct supervisor integration for Arm/Drained.
     pub(crate) fn export_stage_call(
         &self,
+        executor: LeaseId,
         stage: LeaseId,
         operation: U64,
         binding: export_stage::Binding,
@@ -1747,6 +1756,7 @@ impl CatalogSessionAuthority {
         };
         let request = export_stage::Request {
             root: root.clone(),
+            executor,
             stage,
             operation,
             supervisor: false,
@@ -1759,6 +1769,30 @@ impl CatalogSessionAuthority {
         );
         request.validate()?;
         let reply = filesystem.export_stage_call(&request, cancel)?;
+        reply.validate(&request)?;
+        Ok(Some(reply))
+    }
+    pub(crate) fn export_executor_call(
+        &self,
+        executor: LeaseId,
+        operation: U64,
+        action: export_executor::Action,
+        cancel: &AtomicBool,
+    ) -> Result<Option<export_executor::Reply>> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let request = export_executor::Request {
+            root: root.clone(),
+            executor,
+            operation,
+            action,
+        };
+        request.validate()?;
+        let reply = filesystem.export_executor_call(&request, cancel)?;
         reply.validate(&request)?;
         Ok(Some(reply))
     }

@@ -790,7 +790,7 @@ fn owned_directory(path: &Path) -> Result<File> {
     }
 }
 #[cfg(windows)]
-fn delete_held(file: &File) -> Result<()> {
+pub(super) fn delete_held(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1082,6 +1082,7 @@ mod tests {
     ) -> Request {
         Request {
             root: root.clone(),
+            executor: stage.clone(),
             stage: stage.clone(),
             operation: U64(operation),
             supervisor,
@@ -1431,7 +1432,7 @@ mod tests {
                 &cancel,
             )?;
             let w = work(&base, None, None)?;
-            let begin = request(
+            let mut begin = request(
                 &root,
                 &LeaseId::new(),
                 1,
@@ -1442,6 +1443,14 @@ mod tests {
                     limits: limits(),
                 },
             );
+            begin.executor = crate::catalog_session::export_executor::executor_id(&root, 1)?;
+            let executor_request = crate::catalog_session::export_executor::Request {
+                root: root.clone(),
+                executor: begin.executor.clone(),
+                operation: U64(1),
+                action: crate::catalog_session::export_executor::Action::Acquire,
+            };
+            root_owner.export_executor_call(&executor_request, &cancel)?;
             let points = if point == AdmissionFault::DirectoryOpen {
                 vec![point]
             } else {
@@ -1470,6 +1479,14 @@ mod tests {
                 assert!(root_owner.release(&root).is_err());
             } else {
                 root_owner.export_stage_call(&cleanup, &cancel)?;
+                root_owner.export_executor_call(
+                    &crate::catalog_session::export_executor::Request {
+                        operation: U64(2),
+                        action: crate::catalog_session::export_executor::Action::Release,
+                        ..executor_request
+                    },
+                    &cancel,
+                )?;
                 root_owner.release(&root)?;
             }
         }

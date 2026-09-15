@@ -792,3 +792,122 @@ fn export_original_inspection_and_lease_are_bounded_bound_rechecked_and_recovera
     assert_eq!(fs::read(&path)?, b"original-bytes");
     Ok(())
 }
+
+#[test]
+fn stale_export_executor_token_returns_bound_rejection_before_stage_effects() -> Result<()> {
+    use crate::catalog_session::{export_executor, export_stage};
+    let temp = TempDir::new()?;
+    let catalog_request = request(&temp);
+    let mut owner = owner();
+    let bootstrap = owner.prepare(&catalog_request, &AtomicBool::new(false), |_| Ok(()))?;
+    owner.confirm(&confirmation(&bootstrap), &AtomicBool::new(false))?;
+    let root = bootstrap.root_capability();
+    let executor = export_executor::executor_id(&root, 1)?;
+    let acquire = export_executor::Request {
+        root: root.clone(),
+        executor: executor.clone(),
+        operation: U64(1),
+        action: export_executor::Action::Acquire,
+    };
+    owner.export_executor_call(&acquire, &AtomicBool::new(false))?;
+    let release = export_executor::Request {
+        root: root.clone(),
+        executor: executor.clone(),
+        operation: U64(2),
+        action: export_executor::Action::Release,
+    };
+    owner.export_executor_call(&release, &AtomicBool::new(false))?;
+
+    let fixture = crate::application::desktop::export_native_test_fixture()?;
+    let mut begin = fixture.begin;
+    begin.root = root.clone();
+    begin.executor = executor;
+    let manifest_root = bootstrap
+        .manifest
+        .path
+        .to_path()?
+        .parent()
+        .context("manifest root")?
+        .to_owned();
+    let stage_root = manifest_root.join("export-workers");
+    let before = if stage_root.try_exists()? {
+        fs::read_dir(&stage_root)?.count()
+    } else {
+        0
+    };
+    let failure = owner
+        .export_stage_call(&begin, &AtomicBool::new(false))
+        .unwrap_err()
+        .downcast::<Failure>()?;
+    assert_eq!(failure.kind, FailureKind::Rejected);
+    let receipt = failure
+        .object_receipt
+        .context("bound stale-token receipt")?;
+    assert_eq!(receipt.operation, begin.operation);
+    assert_eq!(receipt.step, U64(0));
+    assert_eq!(receipt.request_digest, begin.digest()?);
+    assert_eq!(
+        if stage_root.try_exists()? {
+            fs::read_dir(&stage_root)?.count()
+        } else {
+            0
+        },
+        before,
+        "stale Begin created no stage object"
+    );
+
+    let successor = export_executor::executor_id(&root, 2)?;
+    owner.export_executor_call(
+        &export_executor::Request {
+            root: root.clone(),
+            executor: successor.clone(),
+            operation: U64(1),
+            action: export_executor::Action::Acquire,
+        },
+        &AtomicBool::new(false),
+    )?;
+    let failure = owner
+        .export_stage_call(&begin, &AtomicBool::new(false))
+        .unwrap_err()
+        .downcast::<Failure>()?;
+    assert_eq!(failure.kind, FailureKind::Rejected);
+    assert_eq!(
+        failure.object_receipt.unwrap().request_digest,
+        begin.digest()?
+    );
+    let mut admitted = begin.clone();
+    admitted.executor = successor.clone();
+    owner.export_stage_call(&admitted, &AtomicBool::new(false))?;
+    let successor_release = export_executor::Request {
+        root: root.clone(),
+        executor: successor.clone(),
+        operation: U64(2),
+        action: export_executor::Action::Release,
+    };
+    assert!(
+        owner
+            .export_executor_call(&successor_release, &AtomicBool::new(false))
+            .is_err()
+    );
+    let before_late = fs::read_dir(&stage_root)?.count();
+    let mut late = admitted.clone();
+    late.stage = LeaseId::new();
+    let failure = owner
+        .export_stage_call(&late, &AtomicBool::new(false))
+        .unwrap_err()
+        .downcast::<Failure>()?;
+    assert_eq!(failure.kind, FailureKind::Rejected);
+    assert_eq!(
+        failure.object_receipt.unwrap().request_digest,
+        late.digest()?
+    );
+    assert_eq!(fs::read_dir(&stage_root)?.count(), before_late);
+    let mut abort = admitted;
+    abort.operation = U64(2);
+    abort.action = export_stage::Action::Abort;
+    owner.export_stage_call(&abort, &AtomicBool::new(false))?;
+    owner.export_executor_call(&successor_release, &AtomicBool::new(false))?;
+    owner.release(&root)?;
+    owner.shutdown()?;
+    Ok(())
+}

@@ -191,6 +191,7 @@ struct RootRecord {
     store: super::store::StoreOwner,
     objects: super::preview_io::ObjectOwner,
     stages: super::preview_stage::Owner,
+    export_executor: super::export_executor::Owner,
     export_stage: super::export_stage::Owner,
     export_profile: Option<ExportProfileTransfer>,
     export_profile_terminal: Option<ExportProfileTerminal>,
@@ -488,6 +489,7 @@ impl BootstrapOwner {
             store: super::store::StoreOwner::default(),
             objects: super::preview_io::ObjectOwner::default(),
             stages: super::preview_stage::Owner::default(),
+            export_executor: super::export_executor::Owner::default(),
             export_stage: super::export_stage::Owner::default(),
             export_profile: None,
             export_profile_terminal: None,
@@ -573,6 +575,10 @@ impl BootstrapOwner {
             ensure!(
                 record.export_stage.empty(),
                 "export stage/native/seal owner has not drained"
+            );
+            ensure!(
+                record.export_executor.empty(),
+                "export executor lock has not been released"
             );
             ensure!(
                 record.export_profile.is_none(),
@@ -667,7 +673,53 @@ impl BootstrapOwner {
                 == physical_object_id(&open_directory(manifest)?)?,
             "export stage manifest directory changed"
         );
+        if !record
+            .export_executor
+            .admits_stage(&request.root, &request.executor, request.cleanup())
+        {
+            return Err(anyhow::Error::new(super::export_executor::rejected_stage(
+                request,
+            )?));
+        }
         let result = record.export_stage.call(manifest, request, cancel);
+        record.verify_root_binding()?;
+        result
+    }
+    pub fn export_executor_call(
+        &mut self,
+        request: &crate::catalog_session::export_executor::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_executor::Reply> {
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|progress| progress.state == PreparationState::Confirmed),
+            "export executor custody requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("export executor catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "export executor session mismatch"
+        );
+        record.verify_root_binding()?;
+        let catalog = record.bootstrap.canonical_root.to_path()?;
+        let database = record.bootstrap.manifest.path.to_path()?;
+        let manifest = database.parent().context("manifest parent")?;
+        ensure!(
+            physical_object_id(&record.manifest_directory)?
+                == physical_object_id(&open_directory(manifest)?)?,
+            "export executor manifest directory changed"
+        );
+        let result = record.export_executor.call(
+            &catalog,
+            manifest,
+            request,
+            cancel,
+            record.export_stage.empty(),
+        );
         record.verify_root_binding()?;
         result
     }
@@ -1992,7 +2044,7 @@ fn open_database(path: &Path, may_create: bool, must_create: bool) -> Result<(Fi
         Err(error) => Err(error.into()),
     }
 }
-pub(super) fn open_directory(path: &Path) -> Result<File> {
+pub(crate) fn open_directory(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

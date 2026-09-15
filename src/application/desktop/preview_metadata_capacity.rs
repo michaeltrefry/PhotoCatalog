@@ -1562,6 +1562,7 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         export_stage_state,
         export_pending,
         export_completed,
+        ..,
     ] = super::export_native::owner_layouts();
     let export_owner = Layout {
         size: u64::try_from(export_owner.0)?,
@@ -1620,6 +1621,103 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             crate::catalog_session::export_stage::RECEIPT_BYTES as u64,
             c.mul(2, crate::catalog_session::export_stage::BLOB_BYTES)?,
             crate::catalog_session::export_stage::CHUNK_BYTES as u64,
+        ])?,
+    )?;
+    let export_executor_owner = crate::filesystem_worker::export_executor_owner_layout();
+    let export_executor_candidate = crate::export_worker::compact_recovery_layout();
+    a.push(
+        "retained.export_executor_f_owner_and_compact_inventory",
+        Phase::Retained,
+        1,
+        c.add(&[
+            u64::try_from(export_executor_owner.0)?,
+            c.vec_growth(
+                u64::try_from(export_executor_candidate.0)?,
+                crate::catalog_session::export_executor::MAX_DIRECTORIES,
+            )?,
+            c.mul(
+                crate::catalog_session::export_executor::MAX_DIRECTORIES,
+                c.add(&[c.vec(2, PATH_UNITS as u64)?, 128, 128, 64, LEASE_ID_BYTES])?,
+            )?,
+        ])?,
+    )?;
+    a.push(
+        "retained.export_executor_exact_g_f_replay_graphs",
+        Phase::Retained,
+        1,
+        // F: last reply, predecessor Close, and prevalidated Discard reply.
+        // G: pending request, last request+reply, predecessor request+reply.
+        // Eight complete envelopes cover these simultaneously retained graphs.
+        // F pending digest and three active root/lock/staging path allocations
+        // are separate from replay graphs. Cleanup File/progress arrays and
+        // both lifecycle high-water counters are inline in the owner layouts.
+        c.add(&[
+            c.mul(8, RELAY_BYTES)?,
+            64,
+            c.mul(3, c.vec(2, PATH_UNITS as u64)?)?,
+        ])?,
+    )?;
+    a.push(
+        "active.export_executor_frames_inventory_scan_and_request_validation",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(4, RELAY_BYTES)?,
+            // One current bounded request buffer/RawValue/work decode graph,
+            // plus checked_plan's simultaneous parsed validation graph. The
+            // decoder validates once and validate_persisted validates again;
+            // these two validation scratch graphs do not overlap each other.
+            c.parse(
+                crate::catalog_session::export_stage::REQUEST_BYTES as u64,
+                2,
+                crate::catalog_session::export_stage::PLAN_BYTES as u64,
+            )?,
+            c.parse(
+                crate::catalog_session::export_stage::PLAN_BYTES as u64,
+                1,
+                crate::catalog_session::export_stage::PLAN_BYTES as u64,
+            )?,
+            // Recovery has a full entries Vec beside the reserved candidates.
+            // Candidate path allowance above bounds the union of remaining
+            // entry paths and accumulated candidate paths. The transient term
+            // covers canonicalization/read_dir/join copies for the current
+            // entry and up to two 8-artifact inspection lists during Discard.
+            c.vec_growth(
+                std::mem::size_of::<std::path::PathBuf>() as u64,
+                crate::catalog_session::export_executor::MAX_DIRECTORIES + 1,
+            )?,
+            c.mul(32, c.vec(2, PATH_UNITS as u64)?)?,
+            // A held request digest read uses take(R+1)/read_to_end; growth is
+            // charged even though a full work/plan is no longer decoded there.
+            c.vec_growth(1, crate::export_worker::REQUEST_LIMIT + 1)?,
+            crate::catalog_session::export_executor::ERROR_BYTES as u64,
+        ])?,
+    )?;
+    let claim_record_bytes = crate::export_worker::COMPACT_CLAIM_RECORD_BYTES as u64;
+    a.push(
+        "retained.export_discard_claim_control_and_scaffolding",
+        Phase::Retained,
+        1,
+        // One serialized Discard: bounded committed record/typed copies and
+        // wrapper/claimed/source path backing. Handles, bitmap, and Record
+        // headers are included in F Owner layout. Private metadata adds no
+        // second inventory allowance and cannot accumulate across recovery.
+        c.add(&[
+            4 * claim_record_bytes,
+            c.mul(4, c.vec(2, PATH_UNITS as u64)?)?,
+        ])?,
+    )?;
+    a.push(
+        "active.export_discard_claim_journal_and_recovery",
+        Phase::Active,
+        1,
+        // JSON commit/scratch/readback and at most two claim-entry references;
+        // the bounded request digest buffer is already charged above.
+        c.add(&[
+            c.parse(claim_record_bytes, 2, claim_record_bytes)?,
+            4 * claim_record_bytes,
+            c.vec(8, 2)?,
+            c.mul(4, c.vec(2, PATH_UNITS as u64)?)?,
         ])?,
     )?;
     // Export control coexists with ordinary data: G completed replay, C

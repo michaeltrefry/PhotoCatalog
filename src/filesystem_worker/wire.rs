@@ -83,8 +83,11 @@ pub fn build_identity() -> String {
             include_str!("../catalog_session/preview_stage.rs"),
             include_str!("export_stage.rs"),
             include_str!("../catalog_session/export_stage.rs"),
+            include_str!("export_executor.rs"),
+            include_str!("../catalog_session/export_executor.rs"),
             include_str!("../export_worker.rs"),
             include_str!("../export_worker/wire.rs"),
+            include_str!("../export_worker/claim.rs"),
             include_str!("../photo_render.rs"),
             include_str!("../catalog_session/native.rs"),
             include_str!("../preview/stage_io.rs"),
@@ -122,6 +125,7 @@ pub fn build_identity() -> String {
 // confirmation inline instead of adding a separate allocation to every decode.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    ExportExecutor(crate::catalog_session::export_executor::Request),
     PreviewStore(crate::catalog_session::store::Request),
     PreviewIo(crate::catalog_session::preview_io::Request),
     PreviewStage(crate::catalog_session::preview_stage::Request),
@@ -167,6 +171,7 @@ pub enum Operation {
 impl Operation {
     pub(crate) fn is_cleanup(&self) -> bool {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
+            || matches!(self, Self::ExportExecutor(r) if r.cleanup())
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
             || matches!(self, Self::ExportPublication(r) if r.cleanup())
@@ -177,6 +182,7 @@ impl Operation {
     }
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::ExportExecutor(value) => value.validate()?,
             Self::PreviewStore(value) => value.validate()?,
             Self::PreviewIo(value) => value.validate()?,
             Self::PreviewStage(value) => value.validate()?,
@@ -287,6 +293,7 @@ impl AdmissionSnapshot {
     deny_unknown_fields
 )]
 pub enum Response {
+    ExportExecutor(crate::catalog_session::export_executor::Reply),
     PreviewStore(crate::catalog_session::store::Reply),
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
@@ -710,6 +717,94 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn maximum_export_executor_request_and_reply_round_trip() -> Result<()> {
+        use crate::catalog_session::{PhysicalObjectId, export_executor as e};
+        #[cfg(unix)]
+        let physical = |index| PhysicalObjectId::Unix {
+            device: U64(u64::MAX),
+            inode: U64(index),
+        };
+        #[cfg(windows)]
+        let physical = |index| PhysicalObjectId::Windows {
+            volume_serial: U64(u64::MAX),
+            file_index: U64(index),
+        };
+        let mut request = e::Request {
+            root: RootCapability {
+                epoch: LeaseId::new(),
+                token: LeaseId::new(),
+                session: LeaseId::new(),
+                canonical_root: NativePath::from_path(&std::path::PathBuf::from(format!(
+                    "/{}",
+                    "x".repeat(crate::catalog_session::PATH_UNITS - 1)
+                ))),
+                root_physical: physical(u64::MAX - 1),
+                catalog_physical: physical(u64::MAX),
+            },
+            executor: LeaseId::new(),
+            operation: U64(u64::MAX),
+            action: e::Action::Recover {
+                max_directories: U64(e::MAX_DIRECTORIES),
+            },
+        };
+        request.executor = e::executor_id(&request.root, u64::MAX)?;
+        let encoded = encode_operation(&Operation::ExportExecutor(request.clone()))?;
+        let Operation::ExportExecutor(decoded) = decode_operation(&encoded)? else {
+            unreachable!()
+        };
+        assert_eq!(decoded.digest()?, request.digest()?);
+        let reply = e::Reply {
+            root: request.root.clone(),
+            executor: request.executor.clone(),
+            operation: request.operation,
+            request_digest: request.digest()?,
+            value: e::Value::Recovery {
+                scanned: U64(e::MAX_DIRECTORIES),
+                cleaned: U64(e::MAX_DIRECTORIES),
+                retained: U64(0),
+                retained_example: None,
+                candidate: Some(e::Candidate {
+                    token: LeaseId::new(),
+                    attempt: e::Attempt {
+                        job: "j".repeat(128),
+                        sequence: i64::MAX,
+                        attempt: "a".repeat(128),
+                        authority: "f".repeat(64),
+                    },
+                }),
+            },
+        };
+        reply.validate(&request)?;
+        crate::application::desktop::test_export_executor_relay_admission(&request, &reply)?;
+        let encoded = encode_outcome(&Ok(Response::ExportExecutor(reply.clone())))?;
+        let Ok(Response::ExportExecutor(decoded)) = decode_outcome(&encoded)? else {
+            unreachable!()
+        };
+        assert_eq!(decoded, reply);
+        let diagnostic = e::Reply {
+            root: request.root.clone(),
+            executor: request.executor.clone(),
+            operation: request.operation,
+            request_digest: request.digest()?,
+            value: e::Value::Recovery {
+                scanned: U64(e::MAX_DIRECTORIES),
+                cleaned: U64(0),
+                retained: U64(e::MAX_DIRECTORIES),
+                retained_example: Some("é".repeat(e::ERROR_BYTES / 2)),
+                candidate: None,
+            },
+        };
+        diagnostic.validate(&request)?;
+        crate::application::desktop::test_export_executor_relay_admission(&request, &diagnostic)?;
+        let encoded = encode_outcome(&Ok(Response::ExportExecutor(diagnostic.clone())))?;
+        let Ok(Response::ExportExecutor(decoded)) = decode_outcome(&encoded)? else {
+            unreachable!()
+        };
+        assert_eq!(decoded, diagnostic);
+        Ok(())
+    }
+
     #[test]
     fn export_profile_outcome_uses_exact_bounded_binary_trailer() -> Result<()> {
         use crate::catalog_session::{

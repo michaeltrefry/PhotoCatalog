@@ -13,6 +13,13 @@ impl super::super::export_native::Stages for Stages {
     ) -> Result<export_stage::Reply> {
         self.filesystem.export_stage_call(request, cancel)
     }
+    fn executor_call(
+        &self,
+        request: &crate::catalog_session::export_executor::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_executor::Reply> {
+        self.filesystem.export_executor_call(request, cancel)
+    }
 }
 
 impl Parent {
@@ -302,6 +309,8 @@ mod tests {
                 "/{}",
                 "x".repeat(crate::catalog_session::PATH_UNITS - 1)
             )));
+        f.executor = crate::catalog_session::export_executor::executor_id(&f.root, 1)?;
+        f.begin.executor = f.executor.clone();
         f.begin.root = f.root.clone();
         let export_stage::Action::Begin { work, .. } = &mut f.begin.action else {
             unreachable!()
@@ -351,6 +360,32 @@ mod tests {
         };
         assert_eq!(work.plan.raw().len(), export_stage::PLAN_BYTES);
         assert_eq!(work.plan.raw().as_bytes(), raw.as_bytes());
+        let executor_request = crate::catalog_session::export_executor::Request {
+            root: f.root.clone(),
+            executor: f.executor.clone(),
+            operation: U64(u64::MAX),
+            action: crate::catalog_session::export_executor::Action::Recover {
+                max_directories: U64(crate::catalog_session::export_executor::MAX_DIRECTORIES),
+            },
+        };
+        let executor_decoded = super::super::roundtrip_export_executor(&executor_request)?;
+        assert_eq!(executor_decoded.digest()?, executor_request.digest()?);
+        let executor_reply = crate::catalog_session::export_executor::Reply {
+            root: f.root.clone(),
+            executor: f.executor.clone(),
+            operation: executor_request.operation,
+            request_digest: executor_request.digest()?,
+            value: crate::catalog_session::export_executor::Value::Recovery {
+                scanned: U64(crate::catalog_session::export_executor::MAX_DIRECTORIES),
+                cleaned: U64(0),
+                retained: U64(crate::catalog_session::export_executor::MAX_DIRECTORIES),
+                retained_example: Some(
+                    "é".repeat(crate::catalog_session::export_executor::ERROR_BYTES / 2),
+                ),
+                candidate: None,
+            },
+        };
+        super::super::admit_export_executor_reply(&executor_request, &executor_reply)?;
         let pool = crate::preview::ByteBudget::new(f.worker)?;
         let stages = FakeStages::new(f._temp.path().to_owned());
         stages.pause_begin();
@@ -361,6 +396,7 @@ mod tests {
             &pool,
         )?);
         owner.bind(&f.root)?;
+        crate::application::desktop::export_native::tests::acquire(&owner, &f)?;
         owner.call(&decoded)?;
         let pending_begin = {
             let owner = owner.clone();
@@ -411,6 +447,7 @@ mod tests {
             // Ordinary binary upload remains queued while reserved control is processed.
             let upload = export_stage::Request {
                 root: f.root.clone(),
+                executor: f.executor.clone(),
                 stage: f.stage.clone(),
                 operation: U64(2),
                 supervisor: false,
@@ -469,6 +506,8 @@ mod tests {
             packet,
             encoded,
             decoded,
+            executor_decoded,
+            executor_reply,
             parent_replay,
             reply,
             replay,

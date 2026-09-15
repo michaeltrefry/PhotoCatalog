@@ -898,6 +898,8 @@ fn export_relay_fixture() -> Result<(
     let mut f = super::super::export_native::tests::fixture()?;
     f.root.epoch = parent.0.binding.epoch.clone();
     f.begin.root = f.root.clone();
+    f.executor = crate::catalog_session::export_executor::executor_id(&f.root, 1)?;
+    f.begin.executor = f.executor.clone();
     let pool = crate::preview::ByteBudget::new(f.worker)?;
     let stages = super::super::export_native::tests::FakeStages::new(f._temp.path().to_owned());
     let owner = Arc::new(super::super::export_native::Owner::new(
@@ -907,6 +909,7 @@ fn export_relay_fixture() -> Result<(
         &pool,
     )?);
     owner.bind(&f.root)?;
+    super::super::export_native::tests::acquire(&owner, &f)?;
     *parent.0.export_native.lock().unwrap() = Some(owner);
     let proxy = Proxy::new(parent.0.binding.clone());
     Ok((parent, proxy, f, pool, stages))

@@ -918,6 +918,19 @@ fn read_loop(mut input: impl Read, control: bool, shared: &Shared) -> Result<()>
 }
 
 impl CatalogFilesystem for Client {
+    fn export_executor_call(
+        &self,
+        request: &crate::catalog_session::export_executor::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_executor::Reply> {
+        match self.execute(Operation::ExportExecutor(request.clone()), cancel)? {
+            Response::ExportExecutor(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected export executor reply"),
+        }
+    }
     fn export_stage_call(
         &self,
         request: &crate::catalog_session::export_stage::Request,

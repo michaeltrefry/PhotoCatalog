@@ -21,6 +21,8 @@ pub(crate) use filesystem::admit_export_stage_reply;
 pub(crate) use filesystem::roundtrip_export_stage;
 mod export_native;
 #[cfg(test)]
+pub(crate) use export_native::tests::fixture as export_native_test_fixture;
+#[cfg(test)]
 mod filesystem_tests;
 pub(crate) mod lightroom_migration;
 mod migration;
@@ -712,4 +714,13 @@ fn control_route(r: &Request) -> bool {
 /// Hidden installed/CLI worker mode. No webview initialization occurs here.
 pub fn worker_main() -> anyhow::Result<()> {
     process::worker_main()
+}
+
+#[cfg(test)]
+pub(crate) fn test_export_executor_relay_admission(
+    request: &crate::catalog_session::export_executor::Request,
+    reply: &crate::catalog_session::export_executor::Reply,
+) -> anyhow::Result<()> {
+    filesystem::roundtrip_export_executor(request)?;
+    filesystem::admit_export_executor_reply(request, reply)
 }

@@ -12,11 +12,41 @@ use crate::{
     metadata_export::{DestinationSnapshot, FileRevision},
     storage_volume::NativePath,
 };
+use fs2::FileExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+fn fake_executor_reply(
+    request: &crate::catalog_session::export_executor::Request,
+) -> Result<crate::catalog_session::export_executor::Reply> {
+    use crate::catalog_session::export_executor as e;
+    let value = match &request.action {
+        e::Action::Acquire => e::Value::Acquired,
+        e::Action::Recover { .. } => e::Value::Recovery {
+            scanned: U64(0),
+            cleaned: U64(0),
+            retained: U64(0),
+            retained_example: None,
+            candidate: None,
+        },
+        e::Action::Discard { .. } => e::Value::Discarded { candidate: None },
+        e::Action::Release => e::Value::Released,
+    };
+    let reply = e::Reply {
+        root: request.root.clone(),
+        executor: request.executor.clone(),
+        operation: request.operation,
+        request_digest: request.digest()?,
+        value,
+    };
+    reply.validate(request)?;
+    Ok(reply)
+}
 
 pub(crate) struct FakeStages {
     path: PathBuf,
     calls: Mutex<Vec<export_stage::Request>>,
+    executor_calls: Mutex<Vec<crate::catalog_session::export_executor::Request>>,
     hold_ready: AtomicBool,
     hold_begin: AtomicBool,
     hold_arm: AtomicBool,
@@ -25,6 +55,7 @@ pub(crate) struct FakeStages {
     hold: Mutex<()>,
     drain_unknown: AtomicBool,
     begin_rejected: AtomicBool,
+    executor_unknown: AtomicBool,
     seal_attempts: AtomicUsize,
 }
 impl FakeStages {
@@ -32,6 +63,7 @@ impl FakeStages {
         Arc::new(Self {
             path,
             calls: Mutex::new(Vec::new()),
+            executor_calls: Mutex::new(Vec::new()),
             hold_ready: AtomicBool::new(false),
             hold_begin: AtomicBool::new(false),
             hold_arm: AtomicBool::new(false),
@@ -40,6 +72,7 @@ impl FakeStages {
             hold: Mutex::new(()),
             drain_unknown: AtomicBool::new(false),
             begin_rejected: AtomicBool::new(false),
+            executor_unknown: AtomicBool::new(false),
             seal_attempts: AtomicUsize::new(0),
         })
     }
@@ -162,11 +195,24 @@ impl Stages for FakeStages {
             value,
         })
     }
+    fn executor_call(
+        &self,
+        request: &crate::catalog_session::export_executor::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_executor::Reply> {
+        self.executor_calls.lock().unwrap().push(request.clone());
+        let reply = fake_executor_reply(request)?;
+        if self.executor_unknown.swap(false, Ordering::AcqRel) {
+            return Err(Failure::new(FailureKind::Unknown, "lost executor reply").into());
+        }
+        Ok(reply)
+    }
 }
 
 pub(crate) struct Fixture {
     pub(crate) _temp: tempfile::TempDir,
     pub(crate) root: RootCapability,
+    pub(crate) executor: LeaseId,
     pub(crate) stage: LeaseId,
     pub(crate) binding: export_stage::Binding,
     pub(crate) begin: export_stage::Request,
@@ -253,6 +299,7 @@ pub(crate) fn fixture() -> Result<Fixture> {
         },
     };
     let stage = LeaseId::new();
+    let executor = export_executor::executor_id(&root, 1)?;
     let binding = export_stage::Binding::from_work(&work);
     let limits = crate::photo_render::PhotoRenderLimits {
         decode: crate::media::DecodeLimits {
@@ -271,6 +318,7 @@ pub(crate) fn fixture() -> Result<Fixture> {
         .max(limits.encode.render.max_live_bytes);
     let begin = export_stage::Request {
         root: root.clone(),
+        executor: executor.clone(),
         stage: stage.clone(),
         operation: U64(1),
         supervisor: false,
@@ -283,6 +331,7 @@ pub(crate) fn fixture() -> Result<Fixture> {
     Ok(Fixture {
         _temp: temp,
         root,
+        executor,
         stage,
         binding,
         begin,
@@ -308,6 +357,18 @@ pub(crate) fn register(f: &Fixture) -> Request {
         },
     )
 }
+pub(crate) fn acquire(owner: &Owner, f: &Fixture) -> Result<()> {
+    owner.executor_call(
+        &crate::catalog_session::export_executor::Request {
+            root: f.root.clone(),
+            executor: f.executor.clone(),
+            operation: U64(1),
+            action: crate::catalog_session::export_executor::Action::Acquire,
+        },
+        &AtomicBool::new(false),
+    )?;
+    Ok(())
+}
 fn owner(f: &Fixture, stages: Arc<FakeStages>, pool: &ByteBudget) -> Result<Arc<Owner>> {
     let owner = Arc::new(Owner::new(
         f._temp.path().join("missing-export-worker"),
@@ -316,6 +377,7 @@ fn owner(f: &Fixture, stages: Arc<FakeStages>, pool: &ByteBudget) -> Result<Arc<
         pool,
     )?);
     owner.bind(&f.root)?;
+    acquire(&owner, f)?;
     Ok(owner)
 }
 pub(crate) fn ordinary(
@@ -325,12 +387,801 @@ pub(crate) fn ordinary(
 ) -> export_stage::Request {
     export_stage::Request {
         root: f.root.clone(),
+        executor: f.executor.clone(),
         stage: f.stage.clone(),
         operation: U64(operation),
         supervisor: false,
         binding: f.binding.clone(),
         action,
     }
+}
+
+fn executor_request(
+    f: &Fixture,
+    executor: LeaseId,
+    operation: u64,
+    action: crate::catalog_session::export_executor::Action,
+) -> crate::catalog_session::export_executor::Request {
+    crate::catalog_session::export_executor::Request {
+        root: f.root.clone(),
+        executor,
+        operation: U64(operation),
+        action,
+    }
+}
+
+fn persisted_transport(f: &Fixture, root: &Path, name: &str) -> Result<PathBuf> {
+    let path = root.join(name);
+    std::fs::create_dir_all(&path)?;
+    std::fs::write(path.join("active.lock"), [])?;
+    let export_stage::Action::Begin { work, limits } = &f.begin.action else {
+        unreachable!()
+    };
+    let request = crate::export_worker::prepare_managed_request(work, *limits, &path)?;
+    std::fs::write(path.join("request.json"), request)?;
+    Ok(path)
+}
+
+#[test]
+fn f_executor_replays_acquire_and_close_while_excluding_local_owner() -> Result<()> {
+    use fs2::FileExt;
+    let f = fixture()?;
+    let catalog = f.root.canonical_root.to_path()?;
+    let manifest = catalog.join("manifest");
+    std::fs::create_dir_all(&manifest)?;
+    let mut owner = crate::filesystem_worker::export_executor_test_support::Owner::default();
+    let acquire = executor_request(
+        &f,
+        f.executor.clone(),
+        1,
+        crate::catalog_session::export_executor::Action::Acquire,
+    );
+    let first = owner.call(&catalog, &manifest, &acquire, &AtomicBool::new(false), true)?;
+    assert_eq!(
+        first,
+        owner.call(&catalog, &manifest, &acquire, &AtomicBool::new(false), true,)?
+    );
+    let competitor = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(catalog.join("photo-export.lock"))?;
+    assert!(competitor.try_lock_exclusive().is_err());
+    let close = executor_request(
+        &f,
+        f.executor.clone(),
+        2,
+        crate::catalog_session::export_executor::Action::Release,
+    );
+    let closed = owner.call(&catalog, &manifest, &close, &AtomicBool::new(false), true)?;
+    assert!(owner.empty());
+    competitor.try_lock_exclusive()?;
+    fs2::FileExt::unlock(&competitor)?;
+    let successor = export_executor::executor_id(&f.root, 2)?;
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            successor.clone(),
+            1,
+            crate::catalog_session::export_executor::Action::Acquire,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    assert_eq!(
+        owner.call(&catalog, &manifest, &close, &AtomicBool::new(false), true,)?,
+        closed
+    );
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            successor,
+            2,
+            crate::catalog_session::export_executor::Action::Release,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn f_failed_staging_setup_retains_lock_until_exact_release() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let f = fixture()?;
+    let catalog = f.root.canonical_root.to_path()?;
+    let manifest = catalog.join("manifest");
+    let target = catalog.join("staging-target");
+    std::fs::create_dir_all(&manifest)?;
+    std::fs::create_dir_all(&target)?;
+    symlink(&target, catalog.join("photo-export-workers"))?;
+    let mut owner = crate::filesystem_worker::export_executor_test_support::Owner::default();
+    let acquire = executor_request(
+        &f,
+        f.executor.clone(),
+        1,
+        crate::catalog_session::export_executor::Action::Acquire,
+    );
+    assert!(
+        owner
+            .call(&catalog, &manifest, &acquire, &AtomicBool::new(false), true,)
+            .is_err()
+    );
+    assert!(!owner.empty());
+    let competitor = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(catalog.join("photo-export.lock"))?;
+    assert!(fs2::FileExt::try_lock_exclusive(&competitor).is_err());
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            2,
+            crate::catalog_session::export_executor::Action::Release,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    assert!(owner.empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn f_executor_revalidates_retained_lock_and_staging_on_exact_retry() -> Result<()> {
+    let f = fixture()?;
+    let catalog = f.root.canonical_root.to_path()?;
+    let manifest = catalog.join("manifest");
+    std::fs::create_dir_all(&manifest)?;
+    let mut owner = crate::filesystem_worker::export_executor_test_support::Owner::default();
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            1,
+            crate::catalog_session::export_executor::Action::Acquire,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    let recover = executor_request(
+        &f,
+        f.executor.clone(),
+        2,
+        crate::catalog_session::export_executor::Action::Recover {
+            max_directories: U64(1024),
+        },
+    );
+    let canceled = AtomicBool::new(true);
+    assert!(
+        owner
+            .call(&catalog, &manifest, &recover, &canceled, true)
+            .is_err()
+    );
+    owner.call(&catalog, &manifest, &recover, &AtomicBool::new(false), true)?;
+
+    let lock = catalog.join("photo-export.lock");
+    let original_lock = catalog.join("photo-export.lock.retained");
+    std::fs::rename(&lock, &original_lock)?;
+    std::fs::write(&lock, [])?;
+    let recover_lock = executor_request(
+        &f,
+        f.executor.clone(),
+        3,
+        crate::catalog_session::export_executor::Action::Recover {
+            max_directories: U64(1024),
+        },
+    );
+    assert!(
+        owner
+            .call(
+                &catalog,
+                &manifest,
+                &recover_lock,
+                &AtomicBool::new(false),
+                true,
+            )
+            .is_err()
+    );
+    assert!(
+        owner
+            .call(
+                &catalog,
+                &manifest,
+                &executor_request(
+                    &f,
+                    f.executor.clone(),
+                    4,
+                    crate::catalog_session::export_executor::Action::Release,
+                ),
+                &AtomicBool::new(false),
+                true,
+            )
+            .is_err()
+    );
+    std::fs::remove_file(&lock)?;
+    std::fs::rename(&original_lock, &lock)?;
+    owner.call(
+        &catalog,
+        &manifest,
+        &recover_lock,
+        &AtomicBool::new(false),
+        true,
+    )?;
+
+    let staging = catalog.join("photo-export-workers");
+    let original_staging = catalog.join("photo-export-workers.retained");
+    std::fs::rename(&staging, &original_staging)?;
+    std::fs::create_dir(&staging)?;
+    let recover_staging = executor_request(
+        &f,
+        f.executor.clone(),
+        4,
+        crate::catalog_session::export_executor::Action::Recover {
+            max_directories: U64(1024),
+        },
+    );
+    assert!(
+        owner
+            .call(
+                &catalog,
+                &manifest,
+                &recover_staging,
+                &AtomicBool::new(false),
+                true,
+            )
+            .is_err()
+    );
+    std::fs::remove_dir(&staging)?;
+    std::fs::rename(&original_staging, &staging)?;
+    owner.call(
+        &catalog,
+        &manifest,
+        &recover_staging,
+        &AtomicBool::new(false),
+        true,
+    )?;
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            5,
+            crate::catalog_session::export_executor::Action::Release,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn f_combined_inventory_refuses_over_bound_before_first_fence() -> Result<()> {
+    let f = fixture()?;
+    let catalog = f.root.canonical_root.to_path()?;
+    let manifest = catalog.join("manifest");
+    std::fs::create_dir_all(&manifest)?;
+    let mut owner = crate::filesystem_worker::export_executor_test_support::Owner::default();
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            1,
+            crate::catalog_session::export_executor::Action::Acquire,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    let catalog_workers = catalog.join("photo-export-workers");
+    for _ in 0..1024 {
+        std::fs::create_dir(
+            catalog_workers.join(format!("photo-worker-{}", uuid::Uuid::new_v4())),
+        )?;
+    }
+    let manifest_workers = manifest.join("export-workers");
+    std::fs::create_dir_all(&manifest_workers)?;
+    let overflow = manifest_workers.join(format!("photo-worker-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&overflow)?;
+    let reply = owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            2,
+            crate::catalog_session::export_executor::Action::Recover {
+                max_directories: U64(1024),
+            },
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    let crate::catalog_session::export_executor::Value::Recovery {
+        scanned,
+        cleaned,
+        retained,
+        candidate,
+        ..
+    } = reply.value
+    else {
+        unreachable!()
+    };
+    assert_eq!((scanned, cleaned, retained), (U64(1024), U64(0), U64(1)));
+    assert!(candidate.is_none() && !overflow.join("active.lock").exists());
+    assert_eq!(
+        std::fs::read_dir(&catalog_workers)?.count(),
+        1024,
+        "no catalog entry was fenced"
+    );
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            3,
+            crate::catalog_session::export_executor::Action::Release,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn f_discard_replay_returns_the_original_next_candidate_once() -> Result<()> {
+    let f = fixture()?;
+    let catalog = f.root.canonical_root.to_path()?;
+    let manifest = catalog.join("manifest");
+    std::fs::create_dir_all(&manifest)?;
+    let mut owner = crate::filesystem_worker::export_executor_test_support::Owner::default();
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            1,
+            crate::catalog_session::export_executor::Action::Acquire,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    let catalog_workers = catalog.join("photo-export-workers");
+    let manifest_workers = manifest.join("export-workers");
+    std::fs::create_dir_all(&manifest_workers)?;
+    persisted_transport(
+        &f,
+        &catalog_workers,
+        &format!("photo-worker-{}", uuid::Uuid::new_v4()),
+    )?;
+    persisted_transport(
+        &f,
+        &manifest_workers,
+        &format!("photo-worker-{}", uuid::Uuid::new_v4()),
+    )?;
+    let recovered = owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            2,
+            crate::catalog_session::export_executor::Action::Recover {
+                max_directories: U64(1024),
+            },
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    let crate::catalog_session::export_executor::Value::Recovery {
+        candidate: Some(first),
+        retained,
+        ..
+    } = recovered.value
+    else {
+        unreachable!()
+    };
+    assert_eq!(retained, U64(0));
+    let discard = executor_request(
+        &f,
+        f.executor.clone(),
+        3,
+        crate::catalog_session::export_executor::Action::Discard { token: first.token },
+    );
+    let discarded = owner.call(&catalog, &manifest, &discard, &AtomicBool::new(false), true)?;
+    let crate::catalog_session::export_executor::Value::Discarded {
+        candidate: Some(next),
+    } = &discarded.value
+    else {
+        unreachable!()
+    };
+    let remaining = std::fs::read_dir(&catalog_workers)?.count()
+        + std::fs::read_dir(&manifest_workers)?.count();
+    assert_eq!(remaining, 1);
+    assert_eq!(
+        owner.call(&catalog, &manifest, &discard, &AtomicBool::new(false), true,)?,
+        discarded
+    );
+    assert_eq!(
+        std::fs::read_dir(&catalog_workers)?.count()
+            + std::fs::read_dir(&manifest_workers)?.count(),
+        remaining
+    );
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            4,
+            crate::catalog_session::export_executor::Action::Discard {
+                token: next.token.clone(),
+            },
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    assert_eq!(
+        std::fs::read_dir(&catalog_workers)?.count()
+            + std::fs::read_dir(&manifest_workers)?.count(),
+        0
+    );
+    owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(
+            &f,
+            f.executor.clone(),
+            5,
+            crate::catalog_session::export_executor::Action::Release,
+        ),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn g_serializes_identical_executor_calls_and_retains_one_predecessor_close() -> Result<()> {
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = Arc::new(Owner::new(
+        f._temp.path().join("missing-worker"),
+        stages.clone(),
+        1,
+        &pool,
+    )?);
+    owner.bind(&f.root)?;
+    let acquire = executor_request(
+        &f,
+        f.executor.clone(),
+        1,
+        crate::catalog_session::export_executor::Action::Acquire,
+    );
+    let mut joins = Vec::new();
+    for _ in 0..2 {
+        let owner = owner.clone();
+        let request = acquire.clone();
+        joins.push(thread::spawn(move || {
+            owner.executor_call(&request, &AtomicBool::new(false))
+        }));
+    }
+    let acquired: Vec<_> = joins
+        .into_iter()
+        .map(|join| join.join().expect("executor caller"))
+        .collect::<Result<_>>()?;
+    assert_eq!(acquired[0], acquired[1]);
+    assert_eq!(stages.executor_calls.lock().unwrap().len(), 1);
+
+    let close = executor_request(
+        &f,
+        f.executor.clone(),
+        2,
+        crate::catalog_session::export_executor::Action::Release,
+    );
+    let mut joins = Vec::new();
+    for _ in 0..2 {
+        let owner = owner.clone();
+        let request = close.clone();
+        joins.push(thread::spawn(move || {
+            owner.executor_call(&request, &AtomicBool::new(false))
+        }));
+    }
+    let closed: Vec<_> = joins
+        .into_iter()
+        .map(|join| join.join().expect("executor caller"))
+        .collect::<Result<_>>()?;
+    assert_eq!(closed[0], closed[1]);
+    assert_eq!(stages.executor_calls.lock().unwrap().len(), 2);
+
+    let successor = export_executor::executor_id(&f.root, 2)?;
+    owner.executor_call(
+        &executor_request(
+            &f,
+            successor.clone(),
+            1,
+            crate::catalog_session::export_executor::Action::Acquire,
+        ),
+        &AtomicBool::new(false),
+    )?;
+    assert_eq!(
+        owner.executor_call(&close, &AtomicBool::new(false))?,
+        closed[0]
+    );
+    assert_eq!(stages.executor_calls.lock().unwrap().len(), 3);
+    owner.executor_call(
+        &executor_request(
+            &f,
+            successor,
+            2,
+            crate::catalog_session::export_executor::Action::Release,
+        ),
+        &AtomicBool::new(false),
+    )?;
+    assert_eq!(stages.executor_calls.lock().unwrap().len(), 4);
+    Ok(())
+}
+
+#[test]
+fn g_replays_lost_stage_release_before_executor_close_and_reacquires() -> Result<()> {
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = RealStages::new(&f);
+    let owner = real_owner(&f, stages.clone(), &pool)?;
+    ready(&f, &owner)?;
+    assert_eq!(
+        owner.call(&lifecycle(&f, Action::Spawn))?.phase,
+        Phase::WaitFailed
+    );
+    stages.lose_release.store(true, Ordering::Release);
+    let close = executor_request(
+        &f,
+        f.executor.clone(),
+        2,
+        crate::catalog_session::export_executor::Action::Release,
+    );
+    assert!(
+        owner
+            .executor_call(&close, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert_eq!(pool.used(), f.worker);
+    let closed = owner.executor_call(&close, &AtomicBool::new(false))?;
+    assert_eq!(pool.used(), 0);
+    assert!(stages.owner.lock().unwrap().empty());
+    let releases: Vec<_> = stages
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| matches!(request.action, export_stage::Action::Release))
+        .cloned()
+        .collect();
+    assert_eq!(releases.len(), 2);
+    assert_eq!(releases[0].digest()?, releases[1].digest()?);
+
+    let successor = export_executor::executor_id(&f.root, 2)?;
+    owner.executor_call(
+        &executor_request(
+            &f,
+            successor.clone(),
+            1,
+            crate::catalog_session::export_executor::Action::Acquire,
+        ),
+        &AtomicBool::new(false),
+    )?;
+    assert_eq!(
+        owner.executor_call(&close, &AtomicBool::new(false))?,
+        closed
+    );
+    let successor_stage = LeaseId::new();
+    let mut successor_begin = f.begin.clone();
+    successor_begin.executor = successor.clone();
+    successor_begin.stage = successor_stage.clone();
+    let mut successor_registration = register(&f);
+    successor_registration.operation = U64(10);
+    successor_registration.stage = successor_stage;
+    let Action::Register { begin, .. } = &mut successor_registration.action else {
+        unreachable!()
+    };
+    *begin = Box::new(successor_begin.clone());
+    owner.call(&successor_registration)?;
+    owner.stage_call(&successor_begin, &AtomicBool::new(false))?;
+    owner.executor_call(
+        &executor_request(
+            &f,
+            successor,
+            2,
+            crate::catalog_session::export_executor::Action::Release,
+        ),
+        &AtomicBool::new(false),
+    )?;
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn g_close_before_begin_records_replayable_never_dispatched_without_f_receipt() -> Result<()> {
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = owner(&f, stages.clone(), &pool)?;
+    owner.call(&register(&f))?;
+    let slot = owner.slot(&f.root, U64(9), &f.stage)?;
+
+    // These three guards form deterministic scheduler barriers. Close cannot
+    // enter admission until both callers exist; after it marks the executor
+    // closing, cleanup cannot pass lifecycle and Begin cannot pass stage state.
+    let lifecycle = slot.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+    let stage = slot.stage_state.lock().unwrap_or_else(|p| p.into_inner());
+    let admission = owner.admission.lock().unwrap_or_else(|p| p.into_inner());
+    let close_request = executor_request(
+        &f,
+        f.executor.clone(),
+        2,
+        crate::catalog_session::export_executor::Action::Release,
+    );
+    let close = {
+        let owner = owner.clone();
+        thread::spawn(move || owner.executor_call(&close_request, &AtomicBool::new(false)))
+    };
+    let begin_request = f.begin.clone();
+    let begin = {
+        let owner = owner.clone();
+        thread::spawn(move || owner.stage_call(&begin_request, &AtomicBool::new(false)))
+    };
+    drop(admission);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if owner
+            .executor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active
+            .as_ref()
+            .is_some_and(|active| active.closing)
+        {
+            break;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "executor Close admission deadline"
+        );
+        thread::yield_now();
+    }
+    drop(stage);
+
+    let first = begin
+        .join()
+        .expect("Begin caller")
+        .unwrap_err()
+        .downcast::<Failure>()?;
+    assert_eq!(first.kind, FailureKind::Canceled);
+    assert!(first.object_receipt.is_none());
+    let replay = owner
+        .stage_call(&f.begin, &AtomicBool::new(false))
+        .unwrap_err()
+        .downcast::<Failure>()?;
+    assert_eq!(replay.kind, first.kind);
+    assert_eq!(replay.message, first.message);
+    assert!(replay.object_receipt.is_none());
+
+    {
+        let stage = slot.stage_state.lock().unwrap_or_else(|p| p.into_inner());
+        let completed = stage.last.as_ref().context("G-local Begin result")?;
+        assert_eq!(completed.operation, f.begin.operation.0);
+        assert_eq!(completed.digest, f.begin.digest()?);
+        assert_eq!(completed.dispatch, DispatchState::NeverDispatched);
+        assert!(
+            completed
+                .outcome
+                .as_ref()
+                .unwrap_err()
+                .object_receipt
+                .is_none()
+        );
+        assert!(stage.pending.is_none());
+    }
+    let status = slot.status();
+    assert_eq!(status.stage_high_water, U64(1));
+    assert_eq!(status.pending_dispatch, DispatchState::NeverDispatched);
+    assert_eq!(
+        stages.count(|action| matches!(action, export_stage::Action::Begin { .. })),
+        0
+    );
+
+    drop(lifecycle);
+    close.join().expect("Close caller")?;
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn catalog_root_close_dominates_executor_reacquire() -> Result<()> {
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = Owner::new(f._temp.path().join("missing-worker"), stages, 1, &pool)?;
+    owner.bind(&f.root)?;
+    acquire(&owner, &f)?;
+    owner.closing();
+    owner.retire_root(&f.root)?;
+    assert!(
+        owner
+            .executor_call(
+                &executor_request(
+                    &f,
+                    export_executor::executor_id(&f.root, 2)?,
+                    1,
+                    crate::catalog_session::export_executor::Action::Acquire,
+                ),
+                &AtomicBool::new(false),
+            )
+            .is_err()
+    );
+    owner.forget_released_root(&f.root)?;
+    Ok(())
+}
+
+#[test]
+fn catalog_root_close_replays_unresolved_executor_operation_before_release() -> Result<()> {
+    let f = fixture()?;
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = Owner::new(
+        f._temp.path().join("missing-worker"),
+        stages.clone(),
+        1,
+        &pool,
+    )?;
+    owner.bind(&f.root)?;
+    acquire(&owner, &f)?;
+    let recover = executor_request(
+        &f,
+        f.executor.clone(),
+        2,
+        crate::catalog_session::export_executor::Action::Recover {
+            max_directories: U64(1024),
+        },
+    );
+    stages.executor_unknown.store(true, Ordering::Release);
+    assert!(
+        owner
+            .executor_call(&recover, &AtomicBool::new(false))
+            .is_err()
+    );
+    owner.closing();
+    owner.retire_root(&f.root)?;
+    let calls = stages.executor_calls.lock().unwrap();
+    assert_eq!(calls.len(), 4);
+    assert!(matches!(
+        calls[0].action,
+        crate::catalog_session::export_executor::Action::Acquire
+    ));
+    assert_eq!(calls[1], recover);
+    assert_eq!(calls[2], recover);
+    assert!(matches!(
+        calls[3].action,
+        crate::catalog_session::export_executor::Action::Release
+    ));
+    drop(calls);
+    owner.forget_released_root(&f.root)?;
+    Ok(())
 }
 
 #[test]
@@ -657,6 +1508,13 @@ impl Stages for RealStages {
         }
         result
     }
+    fn executor_call(
+        &self,
+        request: &crate::catalog_session::export_executor::Request,
+        _cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_executor::Reply> {
+        fake_executor_reply(request)
+    }
 }
 fn real_owner(f: &Fixture, stages: Arc<RealStages>, pool: &ByteBudget) -> Result<Arc<Owner>> {
     let owner = Arc::new(Owner::new(
@@ -666,6 +1524,7 @@ fn real_owner(f: &Fixture, stages: Arc<RealStages>, pool: &ByteBudget) -> Result
         pool,
     )?);
     owner.bind(&f.root)?;
+    acquire(&owner, f)?;
     owner.call(&register(f))?;
     Ok(owner)
 }
@@ -842,6 +1701,7 @@ fn process_case(mode: &str) -> Result<()> {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
     let owner = Arc::new(Owner::new(executable, stages.clone(), 1, &pool)?);
     owner.bind(&f.root)?;
+    acquire(&owner, &f)?;
     owner.call(&register(&f))?;
     ready(&f, &owner)?;
     let slot = owner.slot(&f.root, U64(9), &f.stage)?;
@@ -1059,6 +1919,13 @@ fn mismatched_failure_receipt_retains_exact_pending_and_native_charge() -> Resul
         fn call(&self, _: &export_stage::Request, _: &AtomicBool) -> Result<export_stage::Reply> {
             Err(self.0.lock().unwrap().clone().into())
         }
+        fn executor_call(
+            &self,
+            request: &crate::catalog_session::export_executor::Request,
+            _cancel: &AtomicBool,
+        ) -> Result<crate::catalog_session::export_executor::Reply> {
+            fake_executor_reply(request)
+        }
     }
     let f = fixture()?;
     let pool = ByteBudget::new(f.worker)?;
@@ -1071,6 +1938,7 @@ fn mismatched_failure_receipt_retains_exact_pending_and_native_charge() -> Resul
     let stages = Arc::new(BadReceipt(Mutex::new(value)));
     let owner = Owner::new(f._temp.path().join("unused"), stages.clone(), 1, &pool)?;
     owner.bind(&f.root)?;
+    acquire(&owner, &f)?;
     owner.call(&register(&f))?;
     for changed in [false, true] {
         if changed {
@@ -1404,6 +2272,7 @@ fn real_synthetic_owner(
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
     let owner = Arc::new(Owner::new(executable, stages, 1, pool)?);
     owner.bind(&f.root)?;
+    acquire(&owner, f)?;
     owner.call(&register(f))?;
     ready(f, &owner)?;
     Ok(owner)
@@ -1528,5 +2397,566 @@ fn real_close_inflight_drain_case() -> Result<()> {
             .count(),
         1
     );
+    Ok(())
+}
+
+struct CombinedStages {
+    owner: Mutex<crate::filesystem_worker::export_bootstrap_test_support::Owner>,
+    stages: Mutex<Vec<export_stage::Request>>,
+    executors: Mutex<Vec<export_executor::Request>>,
+    lose_release: AtomicBool,
+    block_release_replay: AtomicBool,
+    lose_close: AtomicBool,
+}
+impl Stages for CombinedStages {
+    fn call(
+        &self,
+        request: &export_stage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<export_stage::Reply> {
+        self.stages.lock().unwrap().push(request.clone());
+        if matches!(request.action, export_stage::Action::Release)
+            && self.block_release_replay.load(Ordering::Acquire)
+        {
+            return Err(Failure::new(FailureKind::Unknown, "held Release reconciliation").into());
+        }
+        let reply = self.owner.lock().unwrap().stage(request, cancel)?;
+        if matches!(request.action, export_stage::Action::Release)
+            && self.lose_release.swap(false, Ordering::AcqRel)
+        {
+            self.block_release_replay.store(true, Ordering::Release);
+            return Err(
+                Failure::new(FailureKind::Unknown, "lost combined F stage Release reply").into(),
+            );
+        }
+        Ok(reply)
+    }
+    fn executor_call(
+        &self,
+        request: &export_executor::Request,
+        cancel: &AtomicBool,
+    ) -> Result<export_executor::Reply> {
+        self.executors.lock().unwrap().push(request.clone());
+        let reply = self.owner.lock().unwrap().executor(request, cancel)?;
+        if matches!(request.action, export_executor::Action::Release)
+            && self.lose_close.swap(false, Ordering::AcqRel)
+        {
+            return Err(
+                Failure::new(FailureKind::Unknown, "lost combined F executor Close reply").into(),
+            );
+        }
+        Ok(reply)
+    }
+}
+
+#[test]
+fn combined_bootstrap_lost_stage_and_executor_close_reopen_and_stale_lifecycles() -> Result<()> {
+    let mut f = fixture()?;
+    let (bootstrap, root) =
+        crate::filesystem_worker::export_bootstrap_test_support::Owner::new(f._temp.path())?;
+    f.root = root;
+    f.executor = export_executor::executor_id(&f.root, 1)?;
+    f.begin.root = f.root.clone();
+    f.begin.executor = f.executor.clone();
+    let stages = Arc::new(CombinedStages {
+        owner: Mutex::new(bootstrap),
+        stages: Mutex::new(Vec::new()),
+        executors: Mutex::new(Vec::new()),
+        lose_release: AtomicBool::new(true),
+        block_release_replay: AtomicBool::new(false),
+        lose_close: AtomicBool::new(true),
+    });
+    let pool = ByteBudget::new(f.worker)?;
+    let owner = Arc::new(Owner::new(
+        f._temp.path().join("missing"),
+        stages.clone(),
+        1,
+        &pool,
+    )?);
+    owner.bind(&f.root)?;
+    acquire(&owner, &f)?;
+    owner.call(&register(&f))?;
+    ready(&f, &owner)?;
+    // Checked spawn failure supplies the no-child terminal needed by Release.
+    assert_eq!(
+        owner.call(&lifecycle(&f, Action::Spawn))?.phase,
+        Phase::WaitFailed
+    );
+    let close = executor_request(&f, f.executor.clone(), 2, export_executor::Action::Release);
+    assert!(
+        owner
+            .executor_call(&close, &AtomicBool::new(false))
+            .is_err()
+    );
+    let acquire2 = executor_request(
+        &f,
+        export_executor::executor_id(&f.root, 2)?,
+        1,
+        export_executor::Action::Acquire,
+    );
+    assert!(
+        owner
+            .executor_call(&acquire2, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(
+        stages
+            .owner
+            .lock()
+            .unwrap()
+            .executor(&acquire2, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert_eq!(pool.used(), f.worker);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.root.canonical_root.to_path()?.join("photo-export.lock"))?;
+    assert!(lock.try_lock_exclusive().is_err());
+    // An unresolved replay still prevents G retirement and actual F unlock.
+    assert!(
+        owner
+            .executor_call(&close, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(lock.try_lock_exclusive().is_err());
+    assert_eq!(stages.executors.lock().unwrap().len(), 1);
+    stages.block_release_replay.store(false, Ordering::Release);
+    // F now replays the stage Release while the old executor is still live,
+    // G retires the reservation, and actual F Close succeeds but loses its ACK.
+    assert!(
+        owner
+            .executor_call(&close, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert_eq!(pool.used(), 0);
+    lock.try_lock_exclusive()?;
+    FileExt::unlock(&lock)?;
+    assert!(
+        owner
+            .executor_call(&acquire2, &AtomicBool::new(false))
+            .is_err()
+    );
+    let released = owner.executor_call(&close, &AtomicBool::new(false))?;
+    let calls = stages.stages.lock().unwrap();
+    let releases: Vec<_> = calls
+        .iter()
+        .filter(|request| matches!(request.action, export_stage::Action::Release))
+        .collect();
+    assert_eq!(releases.len(), 3);
+    assert!(
+        releases
+            .iter()
+            .all(|request| request.digest().unwrap() == releases[0].digest().unwrap())
+    );
+    drop(calls);
+    let count = stages.executors.lock().unwrap().len();
+    // Drop/reopen the service-side reference, preserving the root-owned G.
+    let reopened = owner.clone();
+    drop(owner);
+    reopened.bind(&f.root)?;
+    assert_eq!(
+        reopened.executor_call(&close, &AtomicBool::new(false))?,
+        released
+    );
+    assert_eq!(stages.executors.lock().unwrap().len(), count);
+    let stale_acquire =
+        executor_request(&f, f.executor.clone(), 1, export_executor::Action::Acquire);
+    assert!(
+        reopened
+            .executor_call(&stale_acquire, &AtomicBool::new(false))
+            .is_err()
+    );
+    assert!(
+        stages
+            .owner
+            .lock()
+            .unwrap()
+            .executor(&stale_acquire, &AtomicBool::new(false))
+            .is_err()
+    );
+    reopened.executor_call(&acquire2, &AtomicBool::new(false))?;
+    assert_eq!(
+        reopened.executor_call(&close, &AtomicBool::new(false))?,
+        released
+    );
+    let mut begin2 = f.begin.clone();
+    begin2.executor = acquire2.executor.clone();
+    begin2.stage = LeaseId::new();
+    let mut registration = register(&f);
+    registration.operation = U64(10);
+    registration.stage = begin2.stage.clone();
+    let Action::Register { begin, .. } = &mut registration.action else {
+        unreachable!()
+    };
+    *begin = Box::new(begin2.clone());
+    reopened.call(&registration)?;
+    reopened.stage_call(&begin2, &AtomicBool::new(false))?;
+    // The real F user cache has now changed. Stale Begin is rejected before it.
+    let failure = stages
+        .owner
+        .lock()
+        .unwrap()
+        .stage(&f.begin, &AtomicBool::new(false))
+        .unwrap_err()
+        .downcast::<Failure>()?;
+    assert_eq!(failure.kind, FailureKind::Rejected);
+    assert!(bound_failure(&failure, &f.begin));
+    let close2 = executor_request(
+        &f,
+        acquire2.executor.clone(),
+        2,
+        export_executor::Action::Release,
+    );
+    reopened.executor_call(&close2, &AtomicBool::new(false))?;
+    let acquire3 = executor_request(
+        &f,
+        export_executor::executor_id(&f.root, 3)?,
+        1,
+        export_executor::Action::Acquire,
+    );
+    reopened.executor_call(&acquire3, &AtomicBool::new(false))?;
+    for stale in [&stale_acquire, &acquire2] {
+        assert!(
+            reopened
+                .executor_call(stale, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert!(
+            stages
+                .owner
+                .lock()
+                .unwrap()
+                .executor(stale, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+    let failure = stages
+        .owner
+        .lock()
+        .unwrap()
+        .stage(&f.begin, &AtomicBool::new(false))
+        .unwrap_err()
+        .downcast::<Failure>()?;
+    assert_eq!(failure.kind, FailureKind::Rejected);
+    assert!(bound_failure(&failure, &f.begin));
+    reopened.executor_call(
+        &executor_request(&f, acquire3.executor, 2, export_executor::Action::Release),
+        &AtomicBool::new(false),
+    )?;
+    assert_eq!(pool.used(), 0);
+    // No active identity remains to reject these accidentally: both preceding
+    // receipts have advanced through Close3, so only high-water can reject 1/2.
+    for stale in [&stale_acquire, &acquire2] {
+        assert!(
+            reopened
+                .executor_call(stale, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert!(
+            stages
+                .owner
+                .lock()
+                .unwrap()
+                .executor(stale, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+    lock.try_lock_exclusive()?;
+    FileExt::unlock(&lock)?;
+    assert!(reopened.executor.lock().unwrap().active.is_none());
+    Ok(())
+}
+
+#[test]
+fn executor_generation_is_root_scoped_noncanonical_and_exhaustion_safe() -> Result<()> {
+    let f = fixture()?;
+    assert!(export_executor::executor_id(&f.root, 0).is_err());
+    let token = export_executor::executor_id(&f.root, u64::MAX)?;
+    assert_eq!(export_executor::generation(&f.root, &token)?, u64::MAX);
+    let mut foreign = f.root.clone();
+    foreign.session = LeaseId::new();
+    assert!(export_executor::generation(&foreign, &token).is_err());
+    assert!(LeaseId::parse(&token.as_str().to_uppercase()).is_err());
+    let pool = ByteBudget::new(f.worker)?;
+    let stages = FakeStages::new(f._temp.path().to_owned());
+    let owner = owner(&f, stages, &pool)?;
+    owner.executor_call(
+        &executor_request(&f, f.executor.clone(), 2, export_executor::Action::Release),
+        &AtomicBool::new(false),
+    )?;
+    owner.executor_call(
+        &executor_request(&f, token.clone(), 1, export_executor::Action::Acquire),
+        &AtomicBool::new(false),
+    )?;
+    owner.executor_call(
+        &executor_request(&f, token.clone(), 2, export_executor::Action::Release),
+        &AtomicBool::new(false),
+    )?;
+    assert!(
+        owner
+            .executor_call(
+                &executor_request(&f, token, 1, export_executor::Action::Acquire),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+    );
+    assert!(
+        owner
+            .executor_call(
+                &executor_request(
+                    &f,
+                    export_executor::executor_id(&f.root, 2)?,
+                    1,
+                    export_executor::Action::Acquire
+                ),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+    );
+    let catalog = f.root.canonical_root.to_path()?;
+    let manifest = catalog.join("manifest");
+    std::fs::create_dir_all(&manifest)?;
+    let mut f_owner = crate::filesystem_worker::export_executor_test_support::Owner::default();
+    let maximum = export_executor::executor_id(&f.root, u64::MAX)?;
+    f_owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(&f, maximum.clone(), 1, export_executor::Action::Acquire),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    f_owner.call(
+        &catalog,
+        &manifest,
+        &executor_request(&f, maximum.clone(), 2, export_executor::Action::Release),
+        &AtomicBool::new(false),
+        true,
+    )?;
+    for old in [maximum, f.executor.clone()] {
+        assert!(
+            f_owner
+                .call(
+                    &catalog,
+                    &manifest,
+                    &executor_request(&f, old, 1, export_executor::Action::Acquire),
+                    &AtomicBool::new(false),
+                    true
+                )
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn f_invalid_first_or_later_attempt_blocks_complete_inventory_admission() -> Result<()> {
+    for invalid_namespace in [0, 1] {
+        for kind in [
+            "oversized-job",
+            "near-request-job",
+            "empty-attempt",
+            "negative-sequence",
+        ] {
+            let f = fixture()?;
+            let catalog = f.root.canonical_root.to_path()?;
+            let manifest = catalog.join("manifest");
+            std::fs::create_dir_all(&manifest)?;
+            let mut owner =
+                crate::filesystem_worker::export_executor_test_support::Owner::default();
+            owner.call(
+                &catalog,
+                &manifest,
+                &executor_request(&f, f.executor.clone(), 1, export_executor::Action::Acquire),
+                &AtomicBool::new(false),
+                true,
+            )?;
+            let roots = [
+                catalog.join("photo-export-workers"),
+                manifest.join("export-workers"),
+            ];
+            for (index, root) in roots.iter().enumerate() {
+                std::fs::create_dir_all(root)?;
+                persisted_transport(&f, root, &format!("photo-worker-{}", uuid::Uuid::new_v4()))?;
+                if index == invalid_namespace {
+                    let stage = std::fs::read_dir(root)?.next().unwrap()?.path();
+                    let path = stage.join("request.json");
+                    let mut request: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path)?)?;
+                    match kind {
+                        "oversized-job" => {
+                            request["work"]["job"] = serde_json::json!("j".repeat(129))
+                        }
+                        "near-request-job" => {
+                            request["work"]["job"] = serde_json::json!("j".repeat(200_000))
+                        }
+                        "empty-attempt" => request["work"]["attempt"] = serde_json::json!(""),
+                        _ => request["work"]["sequence"] = serde_json::json!(-1),
+                    }
+                    std::fs::write(path, serde_json::to_vec(&request)?)?;
+                }
+            }
+            let recover = executor_request(
+                &f,
+                f.executor.clone(),
+                2,
+                export_executor::Action::Recover {
+                    max_directories: U64(2),
+                },
+            );
+            let reply = owner.call(&catalog, &manifest, &recover, &AtomicBool::new(false), true)?;
+            let export_executor::Value::Recovery {
+                scanned,
+                retained,
+                candidate,
+                ..
+            } = &reply.value
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (*scanned, *retained),
+                (U64(2), U64(1)),
+                "{kind} namespace {invalid_namespace}"
+            );
+            assert!(candidate.is_none());
+            assert_eq!(
+                reply,
+                owner.call(&catalog, &manifest, &recover, &AtomicBool::new(false), true)?
+            );
+            assert_eq!(
+                roots
+                    .iter()
+                    .map(|root| std::fs::read_dir(root).unwrap().count())
+                    .sum::<usize>(),
+                2
+            );
+            owner.call(
+                &catalog,
+                &manifest,
+                &executor_request(&f, f.executor.clone(), 3, export_executor::Action::Release),
+                &AtomicBool::new(false),
+                true,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn combined_root_close_finishes_each_interrupted_discard_phase() -> Result<()> {
+    for fault in [
+        "after-request",
+        "after-active",
+        "directory",
+        "after-directory",
+    ] {
+        let mut f = fixture()?;
+        let (bootstrap, root) =
+            crate::filesystem_worker::export_bootstrap_test_support::Owner::new(f._temp.path())?;
+        f.root = root;
+        f.executor = export_executor::executor_id(&f.root, 1)?;
+        f.begin.root = f.root.clone();
+        f.begin.executor = f.executor.clone();
+        let stages = Arc::new(CombinedStages {
+            owner: Mutex::new(bootstrap),
+            stages: Mutex::new(Vec::new()),
+            executors: Mutex::new(Vec::new()),
+            lose_release: AtomicBool::new(false),
+            block_release_replay: AtomicBool::new(false),
+            lose_close: AtomicBool::new(false),
+        });
+        let pool = ByteBudget::new(f.worker)?;
+        let owner = Arc::new(Owner::new(
+            f._temp.path().join("missing"),
+            stages.clone(),
+            1,
+            &pool,
+        )?);
+        owner.bind(&f.root)?;
+        acquire(&owner, &f)?;
+        let root = f
+            .root
+            .canonical_root
+            .to_path()?
+            .join("photo-export-workers");
+        for _ in 0..2 {
+            persisted_transport(&f, &root, &format!("photo-worker-{}", uuid::Uuid::new_v4()))?;
+        }
+        let recover = executor_request(
+            &f,
+            f.executor.clone(),
+            2,
+            export_executor::Action::Recover {
+                max_directories: U64(2),
+            },
+        );
+        let export_executor::Value::Recovery {
+            candidate: Some(first),
+            ..
+        } = owner
+            .executor_call(&recover, &AtomicBool::new(false))?
+            .value
+        else {
+            unreachable!()
+        };
+        let discard = executor_request(
+            &f,
+            f.executor.clone(),
+            3,
+            export_executor::Action::Discard { token: first.token },
+        );
+        let mut fired = false;
+        crate::export_worker::set_compact_discard_hook(move |phase, _| {
+            if phase == fault && !fired {
+                fired = true;
+                anyhow::bail!("deterministic {fault} interruption");
+            }
+            Ok(())
+        });
+        assert!(
+            owner
+                .executor_call(&discard, &AtomicBool::new(false))
+                .is_err(),
+            "{fault}"
+        );
+        let successor = executor_request(
+            &f,
+            export_executor::executor_id(&f.root, 2)?,
+            1,
+            export_executor::Action::Acquire,
+        );
+        assert!(
+            owner
+                .executor_call(&successor, &AtomicBool::new(false))
+                .is_err()
+        );
+        // Root close must replay the exact pending Discard before its Release.
+        owner.retire_root(&f.root)?;
+        let calls = stages.executors.lock().unwrap();
+        let discards: Vec<_> = calls
+            .iter()
+            .filter(|request| matches!(request.action, export_executor::Action::Discard { .. }))
+            .collect();
+        assert_eq!(discards.len(), 2);
+        assert_eq!(discards[0], discards[1]);
+        assert!(matches!(
+            calls.last().unwrap().action,
+            export_executor::Action::Release
+        ));
+        drop(calls);
+        assert_eq!(
+            std::fs::read_dir(&root)?.count(),
+            1,
+            "unreconciled candidate survives root Close"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(f.root.canonical_root.to_path()?.join("photo-export.lock"))?;
+        lock.try_lock_exclusive()?;
+        FileExt::unlock(&lock)?;
+    }
+    crate::export_worker::set_compact_discard_hook(|_, _| Ok(()));
     Ok(())
 }

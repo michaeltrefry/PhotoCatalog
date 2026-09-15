@@ -17,8 +17,11 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
 };
+mod claim;
 #[path = "export_worker/wire.rs"]
 mod wire;
+pub(crate) use claim::CompactDiscard;
+pub(crate) const COMPACT_CLAIM_RECORD_BYTES: usize = claim::RECORD_BYTES;
 pub(crate) const REQUEST_LIMIT: u64 = 256 * 1024;
 pub(crate) const RECEIPT_LIMIT: u64 = 64 * 1024;
 pub(crate) const BLOB_LIMIT: u64 = 16 * 1024 * 1024;
@@ -594,6 +597,31 @@ pub struct RetiredExportTransport {
     pub staging: PathBuf,
     pub work: ExportWork,
 }
+/// F-only compact custody for a fenced transport. The full plan is decoded for
+/// one directory at a time and is never retained in a combined inventory.
+#[derive(Clone)]
+pub(crate) struct CompactRetiredExportTransport {
+    pub token: crate::catalog_session::LeaseId,
+    staging: PathBuf,
+    directory_identity: (u64, u128),
+    active_identity: (u64, u128),
+    request_identity: (u64, u128),
+    request_digest: [u8; 32],
+    pub attempt: crate::catalog_session::export_executor::Attempt,
+}
+pub(crate) struct CompactExportTransportRecovery {
+    pub scanned: usize,
+    pub cleaned: usize,
+    pub retained: usize,
+    pub retained_example: Option<String>,
+    pub retired: Vec<CompactRetiredExportTransport>,
+}
+pub(crate) fn compact_recovery_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<CompactRetiredExportTransport>(),
+        std::mem::align_of::<CompactRetiredExportTransport>(),
+    )
+}
 #[derive(Debug, Serialize)]
 pub struct RetainedExportTransport {
     #[serde(with = "crate::metadata_export::wire::native_path")]
@@ -618,6 +646,22 @@ fn same_work(a: &ExportWork, b: &ExportWork) -> bool {
         && a.attempt == b.attempt
         && a.job == b.job
         && a.sequence == b.sequence
+}
+fn attempt(work: &ExportWork) -> crate::catalog_session::export_executor::Attempt {
+    crate::catalog_session::export_executor::Attempt {
+        job: work.job.clone(),
+        sequence: work.sequence,
+        attempt: work.attempt.clone(),
+        authority: work.authority.clone(),
+    }
+}
+fn compact_recovery_reason(value: impl std::fmt::Display) -> String {
+    let value = value.to_string();
+    let mut length = value.len().min(2048);
+    while !value.is_char_boundary(length) {
+        length -= 1;
+    }
+    value[..length].to_owned()
 }
 fn retired_name(path: &Path) -> bool {
     path.file_name()
@@ -904,6 +948,492 @@ pub fn recover_export_transports_with_checkpoint(
         }
     }
     Ok(result)
+}
+
+fn compact_retired(value: RetiredExportTransport) -> Result<CompactRetiredExportTransport> {
+    let RetiredExportTransport { mut staging, work } = value;
+    staging = staging.canonicalize()?;
+    crate::catalog_session::validate_path(&crate::storage_volume::NativePath::from_path(&staging))?;
+    staging.shrink_to_fit();
+    let expected_attempt = attempt(&work);
+    expected_attempt.validate()?;
+    // Drop the request returned by fencing before decoding its durable copy.
+    // Validation can overlap the persisted raw plan with its checked typed plan;
+    // neither graph is retained in the compact inventory.
+    drop(work);
+    let directory = crate::filesystem_worker::open_directory(&staging)?;
+    let active = metadata_export::open_regular(&staging.join("active.lock"))?;
+    let request_file = metadata_export::open_regular(&staging.join("request.json"))?;
+    let request_bytes = read(&staging.join("request.json"), REQUEST_LIMIT)?;
+    ensure!(
+        lease_identity(&request_file)?
+            == lease_identity(&metadata_export::open_regular(
+                &staging.join("request.json")
+            )?)?,
+        "retired export request identity changed"
+    );
+    let request: Request = serde_json::from_slice(&request_bytes)?;
+    validate_persisted(&request)?;
+    attempt(&request.work).validate()?;
+    ensure!(
+        expected_attempt == attempt(&request.work),
+        "retired export attempt changed"
+    );
+    Ok(CompactRetiredExportTransport {
+        token: crate::catalog_session::LeaseId::new(),
+        staging,
+        directory_identity: crate::storage_volume::held_object_key(&directory)?,
+        active_identity: lease_identity(&active)?,
+        request_identity: lease_identity(&request_file)?,
+        request_digest: *blake3::hash(&request_bytes).as_bytes(),
+        attempt: attempt(&request.work),
+    })
+}
+
+/// Inventory every supplied namespace under one global bound before invoking
+/// the existing mutating fence policy for the first directory.
+pub(crate) fn recover_export_transports_compact_with_checkpoint(
+    roots: &[&Path],
+    max_directories: usize,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<CompactExportTransportRecovery> {
+    checkpoint()?;
+    ensure!(
+        !roots.is_empty()
+            && roots.iter().all(|root| root.is_absolute())
+            && (1..=1024).contains(&max_directories),
+        "export recovery bounds"
+    );
+    let mut entries = Vec::new();
+    for root in roots {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => ensure!(metadata.file_type().is_dir(), "export recovery root type"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entries.len() == max_directories + 1 {
+                return Ok(CompactExportTransportRecovery {
+                    scanned: max_directories,
+                    cleaned: 0,
+                    retained: 1,
+                    retained_example: Some(
+                        "export recovery directory bound exceeded; no entry was fenced".into(),
+                    ),
+                    retired: Vec::new(),
+                });
+            }
+            entries.push(entry.path());
+        }
+    }
+    // One empty pre-move/completed wrapper is separately bounded control, not
+    // another transport. No new claim can be admitted until recovery resolves
+    // it. Unknown/multiple wrappers block every effect before normal fencing.
+    let claims: Vec<_> = entries
+        .iter()
+        .filter(|path| claim::is_claim(path))
+        .take(2)
+        .collect();
+    let admission = (|| -> Result<usize> {
+        ensure!(claims.len() <= 1, "multiple Discard claim intents retained");
+        let mut controls = 0;
+        for wrapper in &claims {
+            controls += usize::from(
+                claim::empty_control(wrapper)
+                    .with_context(|| format!("claim {}", wrapper.display()))?,
+            );
+            claim::preflight(wrapper).with_context(|| format!("claim {}", wrapper.display()))?;
+        }
+        ensure!(
+            entries.len() - controls <= max_directories,
+            "export recovery directory bound exceeded; no entry was fenced"
+        );
+        Ok(controls)
+    })();
+    let controls = match admission {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(CompactExportTransportRecovery {
+                scanned: entries.len().min(max_directories),
+                cleaned: 0,
+                retained: 1,
+                retained_example: Some(compact_recovery_reason(format_args!("{error:#}"))),
+                retired: Vec::new(),
+            });
+        }
+    };
+    // Resolve empty intent metadata first, so its original still participates
+    // in the unchanged transport scan below. This follows complete admission.
+    for wrapper in claims {
+        if claim::empty_control(wrapper)? {
+            claim::recover(wrapper)?;
+        }
+    }
+    let mut result = CompactExportTransportRecovery {
+        scanned: entries.len() - controls,
+        cleaned: 0,
+        retained: 0,
+        retained_example: None,
+        retired: Vec::new(),
+    };
+    result.retired.try_reserve(entries.len())?;
+    for staging in entries {
+        checkpoint()?;
+        if claim::is_claim(&staging) {
+            if !staging.try_exists()? {
+                continue;
+            } // admitted empty control
+            match claim::recover(&staging) {
+                Ok(true) => result.cleaned += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    result.retained += 1;
+                    if result.retained_example.is_none() {
+                        result.retained_example = Some(compact_recovery_reason(error));
+                    }
+                }
+            }
+            continue;
+        }
+        let inspected = fence_transport(&staging).and_then(|inspection| match inspection {
+            Inspection::Retired(value) => compact_retired(*value).map(Some),
+            Inspection::Cleaned => {
+                result.cleaned += 1;
+                Ok(None)
+            }
+            Inspection::Retained(reason) => {
+                result.retained += 1;
+                if result.retained_example.is_none() {
+                    result.retained_example = Some(compact_recovery_reason(format_args!(
+                        "{}: {reason}",
+                        staging.display()
+                    )));
+                }
+                Ok(None)
+            }
+        });
+        match inspected {
+            Ok(Some(value)) => result.retired.push(value),
+            Ok(None) => {}
+            Err(error) => {
+                result.retained += 1;
+                if result.retained_example.is_none() {
+                    result.retained_example = Some(compact_recovery_reason(format_args!(
+                        "{}: {error:#}",
+                        staging.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// One effectful Discard retains handles and per-artifact progress until its
+/// prevalidated terminal reply has been adopted by F. Missing proof is accepted
+/// only after this object itself successfully removed that exact proof.
+struct ClaimedCleanup {
+    directory: File,
+    parent: File,
+    files: [Option<File>; 8],
+    removed: [bool; 8],
+    directory_removed: bool,
+}
+impl Drop for ClaimedCleanup {
+    fn drop(&mut self) {
+        for index in [0, 1] {
+            if let Some(file) = &self.files[index] {
+                let _ = FileExt::unlock(file);
+            }
+        }
+    }
+}
+fn discard_directory(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            .access_mode(0x80000000 | 0x10000)
+            .share_mode(1 | 2 | 4)
+            .custom_flags(0x02000000 | 0x00200000)
+            .open(path)?;
+        ensure!(
+            file.metadata()?.is_dir() && fs::symlink_metadata(path)?.file_type().is_dir(),
+            "retired directory type"
+        );
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    crate::filesystem_worker::open_directory(path)
+}
+fn discard_file(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(0xc0000000 | 0x10000)
+            .share_mode(1 | 2 | 4)
+            .custom_flags(0x00200000)
+            .open(path)?;
+        ensure!(
+            file.metadata()?.is_file() && fs::symlink_metadata(path)?.file_type().is_file(),
+            "retired artifact type"
+        );
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    metadata_export::open_regular(path)
+}
+impl ClaimedCleanup {
+    pub(crate) fn begin(retired: &CompactRetiredExportTransport) -> Result<Self> {
+        ensure!(retired_name(&retired.staging), "transport was not fenced");
+        let directory = discard_directory(&retired.staging)?;
+        ensure!(
+            lease_identity(&directory)? == retired.directory_identity,
+            "retired export directory identity changed"
+        );
+        let parent = discard_directory(retired.staging.parent().context("retired parent")?)?;
+        let paths = transport_files(&retired.staging)?;
+        let mut cleanup = Self {
+            directory,
+            parent,
+            files: std::array::from_fn(|_| None),
+            removed: [false; 8],
+            directory_removed: false,
+        };
+        for path in paths {
+            let index = TRANSPORT_FILES
+                .iter()
+                .position(|name| path.file_name().is_some_and(|actual| actual == *name))
+                .context("retired artifact")?;
+            cleanup.files[index] = Some(discard_file(&path)?);
+        }
+        let active = cleanup.files[1]
+            .as_mut()
+            .context("retired active proof missing")?;
+        ensure!(
+            lease_identity(active)? == retired.active_identity,
+            "retired export active lease identity changed"
+        );
+        active
+            .try_lock_exclusive()
+            .context("retired export lease busy")?;
+        ensure!(
+            lease_retired(active)?,
+            "transport retirement marker missing"
+        );
+        if let Some(parent) = &cleanup.files[0] {
+            parent
+                .try_lock_exclusive()
+                .context("retired export parent lease busy")?;
+        }
+        ensure!(
+            lease_identity(
+                cleanup.files[2]
+                    .as_ref()
+                    .context("retired request proof missing")?
+            )? == retired.request_identity,
+            "retired request identity changed"
+        );
+        cleanup.verify(retired)?;
+        Ok(cleanup)
+    }
+    fn verify(&mut self, retired: &CompactRetiredExportTransport) -> Result<()> {
+        let path = &retired.staging;
+        ensure!(
+            path.canonicalize()? == *path,
+            "retired export link ancestry changed"
+        );
+        ensure!(
+            lease_identity(&crate::filesystem_worker::open_directory(path)?)?
+                == lease_identity(&self.directory)?
+                && lease_identity(&crate::filesystem_worker::open_directory(
+                    path.parent().context("retired parent")?
+                )?)? == lease_identity(&self.parent)?,
+            "retired export directory identity changed"
+        );
+        // Check the whole closed vocabulary and every still-owned identity on
+        // each continuation. A replacement is never adopted after a failure.
+        transport_files(path)?;
+        for (index, name) in TRANSPORT_FILES.iter().enumerate() {
+            let target = path.join(name);
+            if self.removed[index] || self.files[index].is_none() {
+                ensure!(
+                    matches!(fs::symlink_metadata(&target), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                    "retired export artifact appeared after removal"
+                );
+            } else {
+                let current = metadata_export::open_regular(&target)?;
+                ensure!(
+                    lease_identity(&current)?
+                        == lease_identity(self.files[index].as_ref().expect("retained file"))?,
+                    "retired export artifact identity changed"
+                );
+            }
+        }
+        if !self.removed[1] {
+            ensure!(
+                lease_retired(
+                    self.files[1]
+                        .as_mut()
+                        .context("retired active proof missing")?
+                )?,
+                "retired marker changed"
+            );
+        }
+        if !self.removed[2] {
+            let request = self.files[2]
+                .as_mut()
+                .context("retired request proof missing")?;
+            ensure!(
+                request.metadata()?.len() <= REQUEST_LIMIT,
+                "retired request bound"
+            );
+            request.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            request.take(REQUEST_LIMIT + 1).read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= REQUEST_LIMIT
+                    && *blake3::hash(&bytes).as_bytes() == retired.request_digest,
+                "retired export request changed"
+            );
+        }
+        Ok(())
+    }
+    fn resume(
+        &mut self,
+        retired: &CompactRetiredExportTransport,
+        record: &mut claim::Record,
+        wrapper: &Path,
+        original: &Path,
+    ) -> Result<()> {
+        if !self.directory_removed {
+            // Optional artifacts first, then request proof, then the tombstone.
+            for index in [3, 4, 5, 6, 7, 0, 2, 1] {
+                if self.files[index].is_none() || self.removed[index] {
+                    continue;
+                }
+                #[cfg(test)]
+                compact_discard_checkpoint(TRANSPORT_FILES[index], &retired.staging)?;
+                self.verify(retired)?;
+                record.removing |= 1 << index;
+                record.save(wrapper)?;
+                #[cfg(test)]
+                compact_discard_checkpoint(
+                    match index {
+                        2 => "verified-request",
+                        1 => "verified-active",
+                        _ => "verified-artifact",
+                    },
+                    original,
+                )?;
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    let name = std::ffi::CString::new(TRANSPORT_FILES[index])?;
+                    ensure!(
+                        unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) }
+                            == 0,
+                        "retired artifact removal: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                #[cfg(windows)]
+                {
+                    // Delete through a separately closed handle to the exact
+                    // retained object; the lease/proof handle stays in custody.
+                    let target = discard_file(&retired.staging.join(TRANSPORT_FILES[index]))?;
+                    ensure!(
+                        lease_identity(&target)?
+                            == lease_identity(self.files[index].as_ref().expect("retained file"))?,
+                        "retired deletion identity changed"
+                    );
+                    crate::filesystem_worker::delete_export_held(&target)?;
+                    drop(target);
+                }
+                self.removed[index] = true;
+                #[cfg(test)]
+                compact_discard_checkpoint(
+                    match index {
+                        2 => "after-request",
+                        1 => "after-active",
+                        _ => "after-artifact",
+                    },
+                    &retired.staging,
+                )?;
+            }
+            #[cfg(test)]
+            compact_discard_checkpoint("directory", &retired.staging)?;
+            self.verify(retired)?;
+            record.removing_directory = true;
+            record.save(wrapper)?;
+            #[cfg(test)]
+            compact_discard_checkpoint("verified-directory", original)?;
+            #[cfg(unix)]
+            {
+                use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+                let name = std::ffi::CString::new(
+                    retired
+                        .staging
+                        .file_name()
+                        .context("retired name")?
+                        .as_bytes(),
+                )?;
+                ensure!(
+                    unsafe {
+                        libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                    } == 0,
+                    "retired directory removal: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            #[cfg(windows)]
+            {
+                let target = discard_directory(&retired.staging)?;
+                ensure!(
+                    lease_identity(&target)? == lease_identity(&self.directory)?,
+                    "retired directory deletion identity changed"
+                );
+                crate::filesystem_worker::delete_export_held(&target)?;
+                drop(target);
+            }
+            self.directory_removed = true;
+            #[cfg(test)]
+            compact_discard_checkpoint("after-directory", &retired.staging)?;
+        }
+        // Retry a failed durability barrier on the held parent. The completed
+        // directory removal never reopens or deletes a newly created namesake.
+        #[cfg(unix)]
+        self.parent.sync_all()?;
+        Ok(())
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static COMPACT_DISCARD_HOOK: RefCell<Option<Box<dyn FnMut(&str, &Path) -> Result<()>>>> = RefCell::new(None);
+}
+#[cfg(test)]
+pub(crate) fn set_compact_discard_hook(hook: impl FnMut(&str, &Path) -> Result<()> + 'static) {
+    COMPACT_DISCARD_HOOK.with(|value| *value.borrow_mut() = Some(Box::new(hook)));
+}
+#[cfg(test)]
+fn compact_discard_checkpoint(phase: &str, path: &Path) -> Result<()> {
+    COMPACT_DISCARD_HOOK.with(|value| match value.borrow_mut().as_mut() {
+        Some(hook) => hook(phase, path),
+        None => Ok(()),
+    })
+}
+/// Convenience used only by isolated source fixtures. The F owner retains the
+/// same object across calls, rather than recreating it after effectful failure.
+#[cfg(test)]
+pub(crate) fn discard_compact_retired_export_transport(
+    retired: &CompactRetiredExportTransport,
+) -> Result<()> {
+    CompactDiscard::test_begin(retired)?.resume(retired)
 }
 /// Call only after the catalog has fenced/reconciled this exact retired attempt.
 /// Its durable destination seal is outside transport and is never removed here.

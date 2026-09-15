@@ -1,7 +1,7 @@
 //! G-owned managed export child and exact ordinary F-stage coordinator.
 use crate::{
     application::U64,
-    catalog_session::{LeaseId, RootCapability, export_native::*, export_stage},
+    catalog_session::{LeaseId, RootCapability, export_executor, export_native::*, export_stage},
     filesystem_worker::wire::{Failure, FailureKind},
     preview::{ByteBudget, ByteReservation},
 };
@@ -25,6 +25,11 @@ pub(super) trait Stages: Send + Sync {
         request: &export_stage::Request,
         cancel: &AtomicBool,
     ) -> Result<export_stage::Reply>;
+    fn executor_call(
+        &self,
+        request: &export_executor::Request,
+        cancel: &AtomicBool,
+    ) -> Result<export_executor::Reply>;
 }
 
 #[derive(Clone)]
@@ -86,6 +91,7 @@ struct SendState {
 }
 struct Slot {
     root: RootCapability,
+    executor: LeaseId,
     operation: U64,
     stage: LeaseId,
     binding: export_stage::Binding,
@@ -112,7 +118,29 @@ struct Slot {
     stages: Arc<dyn Stages>,
 }
 
-pub(crate) fn owner_layouts() -> [(usize, usize); 5] {
+#[derive(Clone)]
+struct CompletedExecutor {
+    request: export_executor::Request,
+    digest: String,
+    reply: export_executor::Reply,
+}
+struct ActiveExecutor {
+    root: RootCapability,
+    executor: LeaseId,
+    high_water: u64,
+    pending: Option<export_executor::Request>,
+    last: Option<CompletedExecutor>,
+    acquired: bool,
+    closing: bool,
+}
+#[derive(Default)]
+struct ExecutorState {
+    lifecycle_high_water: u64,
+    active: Option<ActiveExecutor>,
+    previous_close: Option<CompletedExecutor>,
+}
+
+pub(crate) fn owner_layouts() -> [(usize, usize); 8] {
     [
         (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>()),
         (std::mem::size_of::<Slot>(), std::mem::align_of::<Slot>()),
@@ -127,6 +155,18 @@ pub(crate) fn owner_layouts() -> [(usize, usize); 5] {
         (
             std::mem::size_of::<Completed>(),
             std::mem::align_of::<Completed>(),
+        ),
+        (
+            std::mem::size_of::<ExecutorState>(),
+            std::mem::align_of::<ExecutorState>(),
+        ),
+        (
+            std::mem::size_of::<ActiveExecutor>(),
+            std::mem::align_of::<ActiveExecutor>(),
+        ),
+        (
+            std::mem::size_of::<CompletedExecutor>(),
+            std::mem::align_of::<CompletedExecutor>(),
         ),
     ]
 }
@@ -322,6 +362,7 @@ impl Slot {
             .context("export supervisor sequence exhausted")?;
         let mut request = export_stage::Request {
             root: self.root.clone(),
+            executor: self.executor.clone(),
             stage: self.stage.clone(),
             operation: U64(stage.supervisor_next),
             supervisor: true,
@@ -627,7 +668,9 @@ impl Slot {
 
 pub(super) struct Owner {
     admission: Mutex<()>,
+    executor_call: Mutex<()>,
     root_closing: AtomicBool,
+    executor: Mutex<ExecutorState>,
     executable: PathBuf,
     stages: Arc<dyn Stages>,
     slots: Mutex<VecDeque<Arc<Slot>>>,
@@ -651,7 +694,9 @@ impl Owner {
         ensure!((1..=16).contains(&max_slots), "export native slot bound");
         Ok(Self {
             admission: Mutex::new(()),
+            executor_call: Mutex::new(()),
             root_closing: AtomicBool::new(false),
+            executor: Mutex::new(ExecutorState::default()),
             executable,
             stages,
             slots: Mutex::new(VecDeque::new()),
@@ -679,6 +724,7 @@ impl Owner {
         );
         *selected = Some(root.clone());
         *self.high_water.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+        *self.executor.lock().unwrap_or_else(|p| p.into_inner()) = ExecutorState::default();
         self.root_closing.store(false, Ordering::Release);
         self.early_stop
             .lock()
@@ -744,6 +790,174 @@ impl Owner {
             QueryAction::Retire => self.retire_slot(&slot),
         }
     }
+    pub fn executor_call(
+        &self,
+        request: &export_executor::Request,
+        cancel: &AtomicBool,
+    ) -> Result<export_executor::Reply> {
+        let _call = self.executor_call.lock().unwrap_or_else(|p| p.into_inner());
+        request.validate()?;
+        let digest = request.digest()?;
+        let (replay, close_slots) = {
+            let _guard = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+            ensure!(
+                self.selected
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    == Some(&request.root),
+                "export executor catalog is not selected/confirmed"
+            );
+            let mut state = self.executor.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(closed) = &state.previous_close
+                && closed.request.executor == request.executor
+                && closed.request.operation == request.operation
+            {
+                ensure!(
+                    closed.digest == digest,
+                    "changed export executor Close replay"
+                );
+                return Ok(closed.reply.clone());
+            }
+            if matches!(request.action, export_executor::Action::Acquire) && state.active.is_none()
+            {
+                ensure!(
+                    !self.root_closing.load(Ordering::Acquire),
+                    "export native root is closing"
+                );
+                let generation = export_executor::generation(&request.root, &request.executor)?;
+                ensure!(
+                    generation > state.lifecycle_high_water,
+                    "retired export executor generation"
+                );
+                state.lifecycle_high_water = generation;
+                state.active = Some(ActiveExecutor {
+                    root: request.root.clone(),
+                    executor: request.executor.clone(),
+                    high_water: 0,
+                    pending: Some(request.clone()),
+                    last: None,
+                    acquired: false,
+                    closing: false,
+                });
+            }
+            let active = state
+                .active
+                .as_mut()
+                .context("export executor is not retained")?;
+            ensure!(
+                active.root == request.root && active.executor == request.executor,
+                "export executor identity mismatch"
+            );
+            if let Some(last) = &active.last
+                && last.request.operation == request.operation
+            {
+                ensure!(last.digest == digest, "changed export executor replay");
+                (Some(last.reply.clone()), Vec::new())
+            } else {
+                let pending_replay = active
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending == request);
+                if let Some(pending) = &active.pending {
+                    if pending != request {
+                        ensure!(
+                            matches!(pending.action, export_executor::Action::Acquire)
+                                && matches!(request.action, export_executor::Action::Release)
+                                && request.operation.0
+                                    == pending
+                                        .operation
+                                        .0
+                                        .checked_add(1)
+                                        .context("export executor operation exhausted")?,
+                            "another export executor operation is unresolved"
+                        );
+                        active.pending = Some(request.clone());
+                    }
+                } else {
+                    ensure!(
+                        request.operation.0
+                            == active
+                                .high_water
+                                .checked_add(1)
+                                .context("export executor operation exhausted")?,
+                        "export executor operation gap"
+                    );
+                    ensure!(
+                        !self.root_closing.load(Ordering::Acquire) || request.cleanup(),
+                        "export native root is closing"
+                    );
+                    ensure!(active.acquired, "export executor Acquire is unresolved");
+                    active.pending = Some(request.clone());
+                }
+                if matches!(request.action, export_executor::Action::Release) {
+                    active.closing = true;
+                } else if !pending_replay {
+                    ensure!(!active.closing, "export executor is closing");
+                }
+                let slots = if matches!(request.action, export_executor::Action::Release) {
+                    self.slots
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .iter()
+                        .filter(|slot| {
+                            slot.root == request.root && slot.executor == request.executor
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (None, slots)
+            }
+        };
+        if let Some(reply) = replay {
+            return Ok(reply);
+        }
+        for slot in &close_slots {
+            self.cleanup_slot(slot)?;
+        }
+        for slot in &close_slots {
+            self.retire_slot(slot)?;
+        }
+        let reply = self.stages.executor_call(request, cancel)?;
+        reply.validate(request)?;
+        let _guard = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.executor.lock().unwrap_or_else(|p| p.into_inner());
+        let completed = CompletedExecutor {
+            request: request.clone(),
+            digest,
+            reply: reply.clone(),
+        };
+        if matches!(request.action, export_executor::Action::Release) {
+            ensure!(
+                state
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.pending.as_ref())
+                    == Some(request),
+                "export executor pending request changed"
+            );
+            state.active.take();
+            state.previous_close = Some(completed);
+        } else {
+            let active = state
+                .active
+                .as_mut()
+                .context("export executor owner was lost")?;
+            ensure!(
+                active.pending.as_ref() == Some(request),
+                "export executor pending request changed"
+            );
+            active.high_water = request.operation.0;
+            active.pending = None;
+            active.last = Some(completed);
+            if matches!(request.action, export_executor::Action::Acquire) {
+                active.acquired = true;
+            }
+        }
+        Ok(reply)
+    }
     fn register(&self, request: &Request) -> Result<Status> {
         let Action::Register {
             begin,
@@ -765,6 +979,21 @@ impl Owner {
         ensure!(
             !self.root_closing.load(Ordering::Acquire),
             "export native root is closing"
+        );
+        let executor = begin.executor.clone();
+        ensure!(
+            self.executor
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active
+                .as_ref()
+                .is_some_and(|active| {
+                    active.root == request.root
+                        && active.executor == executor
+                        && active.acquired
+                        && !active.closing
+                }),
+            "export executor is not open for registration"
         );
         let digest = *blake3::hash(&serde_json::to_vec(request)?).as_bytes();
         let begin_digest = begin.digest()?;
@@ -808,6 +1037,7 @@ impl Owner {
             .map_err(anyhow::Error::new)?;
         let slot = Arc::new(Slot {
             root: request.root.clone(),
+            executor,
             operation: request.operation,
             stage: request.stage.clone(),
             binding: request.binding.clone(),
@@ -1063,6 +1293,7 @@ impl Owner {
             .iter()
             .find(|slot| {
                 slot.root == request.root
+                    && slot.executor == request.executor
                     && slot.stage == request.stage
                     && slot.binding == request.binding
             })
@@ -1122,14 +1353,28 @@ impl Owner {
                         "export stage Begin has not completed"
                     );
                 }
-                ensure!(
-                    !self.root_closing.load(Ordering::Acquire) || request.cleanup(),
-                    "export stage owner is closing"
-                );
-                if cancel.load(Ordering::Acquire) && !request.cleanup() {
+                let executor_closing = !self
+                    .executor
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.root == request.root
+                            && active.executor == request.executor
+                            && active.acquired
+                            && !active.closing
+                    });
+                let admission_closed =
+                    self.root_closing.load(Ordering::Acquire) || executor_closing;
+                if (cancel.load(Ordering::Acquire) || admission_closed) && !request.cleanup() {
                     let outcome = Err(Failure::new(
                         FailureKind::Canceled,
-                        "export stage operation canceled before G dispatch",
+                        if admission_closed {
+                            "export stage admission closed before G dispatch"
+                        } else {
+                            "export stage operation canceled before G dispatch"
+                        },
                     ));
                     stage.high_water = request.operation.0;
                     stage.last = Some(Completed {
@@ -1287,6 +1532,7 @@ impl Owner {
         if !armed {
             let request = export_stage::Request {
                 root: slot.root.clone(),
+                executor: slot.executor.clone(),
                 stage: slot.stage.clone(),
                 operation: U64(next),
                 supervisor: false,
@@ -1349,6 +1595,7 @@ impl Owner {
             .context("stage sequence exhausted")?;
         let request = export_stage::Request {
             root: slot.root.clone(),
+            executor: slot.executor.clone(),
             stage: slot.stage.clone(),
             operation: U64(next),
             supervisor: false,
@@ -1447,12 +1694,52 @@ impl Owner {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        for slot in &slots {
-            self.cleanup_slot(slot)?;
+        loop {
+            let request = {
+                let state = self.executor.lock().unwrap_or_else(|p| p.into_inner());
+                state.active.as_ref().map(|active| match &active.pending {
+                    Some(pending) if matches!(pending.action, export_executor::Action::Acquire) => {
+                        export_executor::Request {
+                            root: active.root.clone(),
+                            executor: active.executor.clone(),
+                            operation: U64(pending
+                                .operation
+                                .0
+                                .checked_add(1)
+                                .expect("validated export executor sequence")),
+                            action: export_executor::Action::Release,
+                        }
+                    }
+                    Some(pending) => pending.clone(),
+                    None => export_executor::Request {
+                        root: active.root.clone(),
+                        executor: active.executor.clone(),
+                        operation: U64(active
+                            .high_water
+                            .checked_add(1)
+                            .expect("validated export executor sequence")),
+                        action: export_executor::Action::Release,
+                    },
+                })
+            };
+            let Some(request) = request else {
+                break;
+            };
+            let released = matches!(request.action, export_executor::Action::Release);
+            self.executor_call(&request, &AtomicBool::new(false))?;
+            if released {
+                break;
+            }
         }
-        for slot in &slots {
-            self.retire_slot(slot)?;
-        }
+        ensure!(
+            self.slots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .all(|slot| slot.root != *root),
+            "export native slots survived executor Close"
+        );
+        drop(slots);
         Ok(())
     }
     pub fn forget_released_root(&self, root: &RootCapability) -> Result<()> {
@@ -1466,6 +1753,14 @@ impl Owner {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty(),
             "export native slots remain"
+        );
+        ensure!(
+            self.executor
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active
+                .is_none(),
+            "export executor remains active"
         );
         let mut selected = self.selected.lock().unwrap_or_else(|p| p.into_inner());
         ensure!(
@@ -1492,6 +1787,10 @@ impl Owner {
             slot.stop();
         }
     }
+    pub fn closing(&self) {
+        self.root_closing.store(true, Ordering::Release);
+        self.stop_all();
+    }
 }
 
 impl Drop for Owner {
@@ -1507,4 +1806,4 @@ impl Drop for Owner {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;

@@ -62,6 +62,7 @@ pub(super) enum Call {
     PreviewIo(Box<crate::catalog_session::preview_io::Request>),
     PreviewStage(Box<crate::catalog_session::preview_stage::Request>),
     ExportStage(Box<crate::catalog_session::export_stage::Request>),
+    ExportExecutor(crate::catalog_session::export_executor::Request),
     ExportNative(Box<crate::catalog_session::export_native::Request>),
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
@@ -81,6 +82,7 @@ impl Call {
             || matches!(self, Self::PreviewIo(request) if request.cleanup())
             || matches!(self, Self::PreviewStage(request) if request.cleanup())
             || matches!(self, Self::ExportStage(request) if request.cleanup())
+            || matches!(self, Self::ExportExecutor(request) if request.cleanup())
             || matches!(self, Self::ExportProfile(request) if request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if request.cleanup())
             || matches!(self, Self::ExportPublication(request) if request.cleanup())
@@ -100,6 +102,7 @@ impl Call {
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
             || matches!(self, Self::ExportStage(request) if !request.cleanup())
+            || matches!(self, Self::ExportExecutor(request) if !request.cleanup())
             || matches!(self, Self::ExportProfile(request) if !request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if !request.cleanup())
             || matches!(self, Self::ExportPublication(request) if !request.cleanup())
@@ -150,6 +153,7 @@ impl Call {
                 );
                 request.validate()
             }
+            Self::ExportExecutor(request) => request.validate(),
             Self::ReadPreviewConfiguration(path) => store::path(path),
             Self::PrepareExportDirectory(request) => request.validate(),
             Self::ExportDestinationSnapshot(request) => request.validate(),
@@ -170,6 +174,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
         std::mem::size_of::<crate::catalog_session::export_stage::Request>(),
+        std::mem::size_of::<crate::catalog_session::export_executor::Request>(),
         std::mem::size_of::<crate::catalog_session::export_native::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
@@ -204,6 +209,7 @@ pub(super) enum Value {
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     ExportStage(crate::catalog_session::export_stage::Reply),
+    ExportExecutor(crate::catalog_session::export_executor::Reply),
     ExportNative(crate::catalog_session::export_native::Status),
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
@@ -806,7 +812,7 @@ impl Parent {
     }
     pub fn fail(&self, error: impl std::fmt::Display) {
         if let Ok(owner) = self.export_native_owner() {
-            owner.stop_all();
+            owner.closing();
         }
         if let Ok(native) = self.native_owner() {
             native.stop_all();
@@ -825,7 +831,7 @@ impl Parent {
     }
     pub fn closing(&self) {
         if let Ok(owner) = self.export_native_owner() {
-            owner.stop_all();
+            owner.closing();
         }
         if let Ok(native) = self.native_owner() {
             native.stop_all();
@@ -1188,6 +1194,9 @@ impl Parent {
                 Call::ExportStage(request) => {
                     Value::ExportStage(self.export_native_owner()?.stage_call(request, cancel)?)
                 }
+                Call::ExportExecutor(request) => Value::ExportExecutor(
+                    self.export_native_owner()?.executor_call(request, cancel)?,
+                ),
                 Call::PreviewIo(request) => {
                     Value::PreviewIo(self.client.preview_io_call(request, cancel)?)
                 }
@@ -1629,6 +1638,23 @@ impl Proxy {
     }
 }
 impl CatalogFilesystem for Proxy {
+    fn export_executor_call(
+        &self,
+        request: &crate::catalog_session::export_executor::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::export_executor::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch,
+            "export executor relay authority"
+        );
+        match self.call(Call::ExportExecutor(request.clone()), cancel)? {
+            Value::ExportExecutor(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected export executor relay reply"),
+        }
+    }
     fn native(&self) -> Option<&dyn crate::catalog_session::native::CatalogNative> {
         Some(self)
     }
@@ -1968,6 +1994,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::PreviewIo(request), Value::PreviewIo(reply)) => reply.validate(request)?,
         (Call::PreviewStage(request), Value::PreviewStage(reply)) => reply.validate(request)?,
         (Call::ExportStage(request), Value::ExportStage(reply)) => reply.validate(request)?,
+        (Call::ExportExecutor(request), Value::ExportExecutor(reply)) => reply.validate(request)?,
         (Call::PreviewStore(request), Value::PreviewStore(reply)) => {
             store::validate_reply(request, reply)?
         }
@@ -2094,4 +2121,59 @@ pub(crate) fn roundtrip_export_stage(
     };
     Call::ExportStage(decoded.clone()).validate()?;
     Ok(*decoded)
+}
+
+#[cfg(test)]
+pub(crate) fn roundtrip_export_executor(
+    request: &crate::catalog_session::export_executor::Request,
+) -> Result<crate::catalog_session::export_executor::Request> {
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: request.root.epoch.clone(),
+    };
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Call {
+            id: U64(u64::MAX),
+            call: Call::ExportExecutor(request.clone()),
+        },
+    };
+    let encoded = encode_packet(&packet, BYTES)?;
+    let Body::Call {
+        call: Call::ExportExecutor(decoded),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        anyhow::bail!("export executor C packet round trip");
+    };
+    Call::ExportExecutor(decoded.clone()).validate()?;
+    Ok(decoded)
+}
+
+#[cfg(test)]
+pub(crate) fn admit_export_executor_reply(
+    request: &crate::catalog_session::export_executor::Request,
+    reply: &crate::catalog_session::export_executor::Reply,
+) -> Result<()> {
+    reply.validate(request)?;
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: request.root.epoch.clone(),
+    };
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Reply {
+            id: U64(u64::MAX),
+            outcome: Ok(Value::ExportExecutor(reply.clone())),
+        },
+    };
+    let encoded = encode_packet(&packet, BYTES)?;
+    let Body::Reply {
+        outcome: Ok(Value::ExportExecutor(decoded)),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        anyhow::bail!("export executor C reply round trip");
+    };
+    decoded.validate(request)
 }

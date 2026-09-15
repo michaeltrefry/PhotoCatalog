@@ -357,6 +357,92 @@ fn recovery_bound_and_interrupted_discard_never_invent_work() {
     assert_eq!(resumed.cleaned, 2);
     assert!(resumed.retired.is_empty() && resumed.retained.is_empty());
 }
+
+#[test]
+fn compact_recovery_combines_legacy_and_current_namespaces_before_discard() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let catalog = temp.path().join("catalog-workers");
+    let manifest = temp.path().join("manifest-workers");
+    fs::create_dir(&catalog)?;
+    fs::create_dir(&manifest)?;
+    let legacy = request(temp.path());
+    let mut current = request(temp.path());
+    current.version = 2;
+    stage(&catalog, &legacy, true);
+    stage(&manifest, &current, true);
+    let mut checkpoints = 0;
+    let mut checkpoint = || {
+        checkpoints += 1;
+        Ok(())
+    };
+    let recovered = recover_export_transports_compact_with_checkpoint(
+        &[catalog.as_path(), manifest.as_path()],
+        2,
+        &mut checkpoint,
+    )?;
+    assert_eq!(
+        (recovered.scanned, recovered.cleaned, recovered.retained),
+        (2, 0, 0)
+    );
+    assert_eq!(recovered.retired.len(), 2);
+    assert!(checkpoints >= 3);
+    let versions: Vec<_> = recovered
+        .retired
+        .iter()
+        .map(|retired| retired.attempt.attempt.clone())
+        .collect();
+    assert!(versions.contains(&legacy.work.attempt));
+    assert!(versions.contains(&current.work.attempt));
+    for retired in &recovered.retired {
+        discard_compact_retired_export_transport(retired)?;
+    }
+    assert_eq!(fs::read_dir(&catalog)?.count(), 0);
+    assert_eq!(fs::read_dir(&manifest)?.count(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn compact_discard_revalidates_directory_lock_and_request_identity() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("workers");
+    fs::create_dir(&root)?;
+    let request = request(temp.path());
+    stage(&root, &request, true);
+    let recovered =
+        recover_export_transports_compact_with_checkpoint(&[root.as_path()], 1, &mut || Ok(()))?;
+    let retired = &recovered.retired[0];
+
+    let durable_request = retired.staging.join("request.json");
+    let request_bytes = fs::read(&durable_request)?;
+    fs::write(&durable_request, b"changed")?;
+    assert!(discard_compact_retired_export_transport(retired).is_err());
+    assert!(retired.staging.exists());
+    fs::write(&durable_request, &request_bytes)?;
+
+    let active = retired.staging.join("active.lock");
+    let retained_active = retired.staging.join("active.lock.retained");
+    fs::rename(&active, &retained_active)?;
+    fs::write(&active, [1])?;
+    assert!(discard_compact_retired_export_transport(retired).is_err());
+    assert!(retired.staging.exists());
+    fs::remove_file(&active)?;
+    fs::rename(&retained_active, &active)?;
+
+    let staging = retired.staging.clone();
+    let retained_staging = root.join("retained-physical-directory");
+    fs::rename(&staging, &retained_staging)?;
+    fs::create_dir(&staging)?;
+    assert!(discard_compact_retired_export_transport(retired).is_err());
+    assert!(staging.exists());
+    fs::remove_dir(&staging)?;
+    fs::rename(&retained_staging, &staging)?;
+
+    discard_compact_retired_export_transport(retired)?;
+    assert!(!staging.exists());
+    Ok(())
+}
+
 #[test]
 fn transport_read_admits_exact_length_and_rejects_excess() {
     let temp = tempfile::tempdir().unwrap();
@@ -694,5 +780,398 @@ fn native_completion_keeps_non_utf_staging_and_legacy_completion_still_reads() -
     let mut future = legacy;
     future["version"] = 77.into();
     assert!(serde_json::from_value::<CompletedExport>(future).is_err());
+    Ok(())
+}
+
+#[test]
+fn compact_inventory_retains_1024_maximum_plans_only_as_bounded_candidates() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let roots = [temp.path().join("legacy"), temp.path().join("managed")];
+    for root in &roots {
+        fs::create_dir(root)?;
+    }
+    let mut request = request(temp.path());
+    request.version = 2;
+    request.work.job = "j".repeat(128);
+    request.work.attempt = "a".repeat(128);
+    let raw = format!(
+        "{}{}",
+        " ".repeat(
+            crate::catalog_session::export_stage::PLAN_BYTES - request.work.plan.raw().len()
+        ),
+        request.work.plan.raw()
+    );
+    request.work.authority = blake3::hash(raw.as_bytes()).to_hex().to_string();
+    request.work.plan = crate::catalog_exports::checked_plan(&raw, &request.work.authority)?;
+    assert_eq!(
+        request.work.plan.raw().len(),
+        crate::catalog_session::export_stage::PLAN_BYTES
+    );
+    let durable = serde_json::to_vec(&request)?;
+    assert!(durable.len() as u64 <= REQUEST_LIMIT);
+    for index in 0..1024 {
+        stage(&roots[index % 2], &request, true);
+    }
+    let recovery = recover_export_transports_compact_with_checkpoint(
+        &[&roots[0], &roots[1]],
+        1024,
+        &mut || Ok(()),
+    )?;
+    assert_eq!(
+        (recovery.scanned, recovery.retained, recovery.retired.len()),
+        (1024, 0, 1024)
+    );
+    let mut requested =
+        recovery.retired.capacity() * std::mem::size_of::<CompactRetiredExportTransport>();
+    for candidate in &recovery.retired {
+        candidate.attempt.validate()?;
+        assert_eq!(
+            (
+                candidate.attempt.job.capacity(),
+                candidate.attempt.attempt.capacity(),
+                candidate.attempt.authority.capacity()
+            ),
+            (128, 128, 64)
+        );
+        requested += candidate.staging.capacity()
+            + candidate.attempt.job.capacity()
+            + candidate.attempt.attempt.capacity()
+            + candidate.attempt.authority.capacity()
+            + 36;
+    }
+    let path_backing = 2 * (2 * crate::catalog_session::PATH_UNITS + 8);
+    let bound = (3 * 1024 + 8) * std::mem::size_of::<CompactRetiredExportTransport>()
+        + 1024 * (path_backing + 128 + 128 + 64 + 36);
+    assert!(requested <= bound);
+    eprintln!(
+        "compact max inventory: entries=1024 plan_bytes={} requested_candidate_backing={requested} retained_bound={bound}",
+        raw.len()
+    );
+    // Every returned candidate traverses both actual production envelopes.
+    let fixture = crate::application::desktop::export_native_test_fixture()?;
+    let request = crate::catalog_session::export_executor::Request {
+        root: fixture.root.clone(),
+        executor: fixture.executor.clone(),
+        operation: crate::application::U64(2),
+        action: crate::catalog_session::export_executor::Action::Recover {
+            max_directories: crate::application::U64(1024),
+        },
+    };
+    for candidate in &recovery.retired {
+        let reply = crate::catalog_session::export_executor::Reply {
+            root: request.root.clone(),
+            executor: request.executor.clone(),
+            operation: request.operation,
+            request_digest: request.digest()?,
+            value: crate::catalog_session::export_executor::Value::Recovery {
+                scanned: crate::application::U64(1024),
+                cleaned: crate::application::U64(0),
+                retained: crate::application::U64(0),
+                retained_example: None,
+                candidate: Some(crate::catalog_session::export_executor::Candidate {
+                    token: candidate.token.clone(),
+                    attempt: candidate.attempt.clone(),
+                }),
+            },
+        };
+        reply.validate(&request)?;
+        let bytes = crate::filesystem_worker::wire::encode_outcome(&Ok(
+            crate::filesystem_worker::wire::Response::ExportExecutor(reply.clone()),
+        ))?;
+        assert!(bytes.len() <= crate::filesystem_worker::wire::MESSAGE_BYTES);
+        assert!(crate::filesystem_worker::wire::decode_outcome(&bytes)?.is_ok());
+        crate::application::desktop::test_export_executor_relay_admission(&request, &reply)?;
+    }
+    // At the maximum logical inventory, a crash preparing one serialized
+    // claim leaves 1025 physical entries but only 1024 transport directories.
+    let mut pending = CompactDiscard::test_begin(&recovery.retired[0])?;
+    let mut fired = false;
+    set_compact_discard_hook(move |phase, _| {
+        if phase == "before-claim" && !fired {
+            fired = true;
+            bail!("maximum inventory interrupted claim intent");
+        }
+        Ok(())
+    });
+    assert!(pending.resume(&recovery.retired[0]).is_err());
+    drop(pending);
+    set_compact_discard_hook(|_, _| Ok(()));
+    assert_eq!(
+        roots
+            .iter()
+            .map(|root| fs::read_dir(root).unwrap().count())
+            .sum::<usize>(),
+        1025
+    );
+    let again = recover_export_transports_compact_with_checkpoint(
+        &[&roots[0], &roots[1]],
+        1024,
+        &mut || Ok(()),
+    )?;
+    assert_eq!(
+        (again.scanned, again.retained, again.retired.len()),
+        (1024, 0, 1024)
+    );
+    drop(again);
+    // No destructive Discard is authorized by inventory alone.
+    assert_eq!(
+        roots
+            .iter()
+            .map(|root| fs::read_dir(root).unwrap().count())
+            .sum::<usize>(),
+        1024
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn compact_discard_atomic_claim_retains_post_validation_substitutions_after_crash() -> Result<()> {
+    for kind in ["directory", "active", "request-object", "request-bytes"] {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("workers");
+        fs::create_dir(&root)?;
+        stage(&root, &request(temp.path()), true);
+        let recovery =
+            recover_export_transports_compact_with_checkpoint(&[&root], 1, &mut || Ok(()))?;
+        let candidate = &recovery.retired[0];
+        let mut cleanup = CompactDiscard::test_begin(candidate)?;
+        let saved = temp.path().canonicalize()?.join("saved-original");
+        let bytes = fs::read(candidate.staging.join("request.json"))?;
+        let saved_hook = saved.clone();
+        let mut changed = false;
+        set_compact_discard_hook(move |phase, path| {
+            if phase == "before-claim" && !changed {
+                changed = true;
+                match kind {
+                    "directory" => {
+                        fs::rename(path, &saved_hook)?;
+                        fs::create_dir(path)?;
+                        fs::write(path.join("request.json"), &bytes)?;
+                        fs::write(path.join("active.lock"), [1])?;
+                    }
+                    "active" => {
+                        fs::rename(path.join("active.lock"), &saved_hook)?;
+                        fs::write(path.join("active.lock"), [1])?;
+                    }
+                    "request-object" => {
+                        fs::rename(path.join("request.json"), &saved_hook)?;
+                        fs::write(path.join("request.json"), &bytes)?;
+                    }
+                    _ => {
+                        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        value["limits"]["decode"]["max_encoded_bytes"] = serde_json::json!(512);
+                        fs::write(path.join("request.json"), serde_json::to_vec(&value)?)?;
+                    }
+                }
+            }
+            if phase == "after-claim" {
+                fs::create_dir(path)?;
+                fs::write(path.join("replacement"), b"preserve original name")?;
+            }
+            Ok(())
+        });
+        assert!(cleanup.resume(candidate).is_err(), "{kind}");
+        let claim = fs::read_dir(&root)?
+            .map(|entry| entry.unwrap().path())
+            .find(|path| claim::is_claim(path))
+            .unwrap();
+        assert!(claim.join("transport/request.json").exists());
+        assert!(claim.join("transport/active.lock").exists());
+        let claimed_before = fs::read(claim.join("transport/request.json"))?;
+        drop(cleanup); // simulate loss of all transient F claim handles
+        set_compact_discard_hook(|_, _| Ok(()));
+        let recovered =
+            recover_export_transports_compact_with_checkpoint(&[&root], 2, &mut || Ok(()))?;
+        assert_eq!((recovered.scanned, recovered.retained), (2, 1));
+        assert!(recovered.retired.is_empty());
+        let diagnostic = recovered.retained_example.unwrap();
+        assert!(diagnostic.contains("original=") && diagnostic.contains("claimed="));
+        assert_eq!(
+            fs::read(claim.join("transport/request.json"))?,
+            claimed_before
+        );
+        assert_eq!(
+            fs::read(candidate.staging.join("replacement"))?,
+            b"preserve original name"
+        );
+        if kind != "request-bytes" {
+            assert!(saved.exists());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn compact_discard_verified_private_claim_never_deletes_original_name_replacements() -> Result<()> {
+    for phase in [
+        "verified-request",
+        "verified-active",
+        "verified-directory",
+        "after-claim-control",
+    ] {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("workers");
+        fs::create_dir(&root)?;
+        stage(&root, &request(temp.path()), true);
+        let recovered =
+            recover_export_transports_compact_with_checkpoint(&[&root], 1, &mut || Ok(()))?;
+        let candidate = &recovered.retired[0];
+        let mut cleanup = CompactDiscard::test_begin(candidate)?;
+        let mut changed = false;
+        set_compact_discard_hook(move |at, original| {
+            if at == phase && !changed {
+                changed = true;
+                fs::create_dir(original)?;
+                fs::write(original.join("request.json"), b"replacement request")?;
+                fs::write(original.join("active.lock"), b"replacement lock")?;
+                if phase == "after-claim-control" {
+                    bail!("lost completed cleanup acknowledgement");
+                }
+            }
+            Ok(())
+        });
+        let result = cleanup.resume(candidate);
+        if phase == "after-claim-control" {
+            assert!(result.is_err());
+            cleanup.resume(candidate)?;
+        } else {
+            result?;
+        }
+        assert_eq!(
+            fs::read(candidate.staging.join("request.json"))?,
+            b"replacement request"
+        );
+        assert_eq!(
+            fs::read(candidate.staging.join("active.lock"))?,
+            b"replacement lock"
+        );
+        assert_eq!(fs::read_dir(&root)?.count(), 1);
+    }
+    set_compact_discard_hook(|_, _| Ok(()));
+    Ok(())
+}
+
+#[test]
+fn compact_discard_claim_crash_recovery_resolves_every_durable_phase() -> Result<()> {
+    for phase in [
+        "claim-created",
+        "claim-scratch",
+        "before-claim",
+        "after-claim",
+        "claim-verified",
+        "after-request",
+        "after-active",
+        "directory",
+        "after-directory",
+    ] {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("workers");
+        fs::create_dir(&root)?;
+        stage(&root, &request(temp.path()), true);
+        let recovery =
+            recover_export_transports_compact_with_checkpoint(&[&root], 1, &mut || Ok(()))?;
+        let candidate = &recovery.retired[0];
+        let mut cleanup = CompactDiscard::test_begin(candidate)?;
+        let mut fired = false;
+        set_compact_discard_hook(move |at, _| {
+            if at == phase && !fired {
+                fired = true;
+                bail!("simulated crash at {phase}");
+            }
+            Ok(())
+        });
+        assert!(cleanup.resume(candidate).is_err(), "{phase}");
+        drop(cleanup);
+        set_compact_discard_hook(|_, _| Ok(()));
+        let recovered =
+            recover_export_transports_compact_with_checkpoint(&[&root], 1, &mut || Ok(()))?;
+        assert_eq!(
+            recovered.retained, 0,
+            "{phase}: {:?}",
+            recovered.retained_example
+        );
+        let before_move = matches!(phase, "claim-created" | "claim-scratch" | "before-claim");
+        assert_eq!(recovered.retired.len(), usize::from(before_move), "{phase}");
+        assert_eq!(
+            fs::read_dir(&root)?.count(),
+            usize::from(before_move),
+            "{phase}"
+        );
+        assert!(fs::read_dir(&root)?.all(|entry| !claim::is_claim(&entry.unwrap().path())));
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_discard_unknown_or_extra_claim_controls_block_all_fencing() -> Result<()> {
+    for kind in [
+        "missing-record",
+        "changed-record",
+        "extra-artifact",
+        "extra-empty-intent",
+        "missing-proof",
+        "oversized-record",
+        "invalid-progress",
+    ] {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?.join("workers");
+        fs::create_dir(&root)?;
+        stage(&root, &request(temp.path()), true);
+        let recovered =
+            recover_export_transports_compact_with_checkpoint(&[&root], 1, &mut || Ok(()))?;
+        let candidate = &recovered.retired[0];
+        let mut cleanup = CompactDiscard::test_begin(candidate)?;
+        let mut fired = false;
+        set_compact_discard_hook(move |phase, _| {
+            if phase == "after-claim" && !fired {
+                fired = true;
+                bail!("interrupt selected claim before validation");
+            }
+            Ok(())
+        });
+        assert!(cleanup.resume(candidate).is_err());
+        drop(cleanup);
+        set_compact_discard_hook(|_, _| Ok(()));
+        let wrapper = fs::read_dir(&root)?.next().unwrap()?.path();
+        match kind {
+            "missing-record" => fs::remove_file(wrapper.join("claim.json"))?,
+            "changed-record" => {
+                fs::write(wrapper.join("claim.json"), b"broken durable provenance")?
+            }
+            "extra-artifact" => fs::write(wrapper.join("foreign"), b"preserve")?,
+            "oversized-record" => fs::write(
+                wrapper.join("claim.json"),
+                vec![b' '; claim::RECORD_BYTES + 1],
+            )?,
+            "invalid-progress" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(wrapper.join("claim.json"))?)?;
+                value["removing"] = serde_json::json!(256);
+                fs::write(wrapper.join("claim.json"), serde_json::to_vec(&value)?)?;
+            }
+            "extra-empty-intent" => {
+                let extra = root.join(format!(".f-{}", uuid::Uuid::new_v4()));
+                let mut builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder.create(extra)?;
+            }
+            _ => fs::remove_file(wrapper.join("transport/request.json"))?,
+        }
+        let live = stage(&root, &request(temp.path()), true);
+        let before = fs::read(wrapper.join("transport/active.lock"))?;
+        let result =
+            recover_export_transports_compact_with_checkpoint(&[&root], 4, &mut || Ok(()))?;
+        assert_eq!(result.retained, 1, "{kind}");
+        assert!(result.retired.is_empty());
+        assert!(live.exists());
+        assert_eq!(fs::read(live.join("active.lock"))?, b"");
+        assert_eq!(fs::read(wrapper.join("transport/active.lock"))?, before);
+    }
     Ok(())
 }

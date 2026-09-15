@@ -2,7 +2,9 @@
 //! It never opens SQLite or launches a decoder. Production selection is gated
 //! on the remaining managed filesystem and SQL routes.
 mod bootstrap;
+pub(crate) use bootstrap::open_directory;
 pub mod client;
+mod export_executor;
 mod export_stage;
 mod preview_io;
 mod preview_stage;
@@ -39,6 +41,9 @@ pub(crate) fn export_publication_transfer_layout() -> (usize, usize) {
 pub(crate) fn export_stage_owner_layout() -> (usize, usize) {
     export_stage::owner_layout()
 }
+pub(crate) fn export_executor_owner_layout() -> (usize, usize) {
+    export_executor::owner_layout()
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;
@@ -54,6 +59,11 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::ExportExecutor(request) => self
+                .owner
+                .export_executor_call(&request, cancel)
+                .map_err(|error| export_executor_failure(error, &request))
+                .map(Response::ExportExecutor),
             Operation::ExportStage(request) => self
                 .owner
                 .export_stage_call(&request, cancel)
@@ -226,6 +236,23 @@ fn filesystem_failure(error: anyhow::Error) -> Failure {
     failure.object_receipt = object_receipt;
     failure
 }
+fn export_executor_failure(
+    error: anyhow::Error,
+    request: &crate::catalog_session::export_executor::Request,
+) -> anyhow::Error {
+    let mut failure = error
+        .downcast_ref::<Failure>()
+        .cloned()
+        .unwrap_or_else(|| Failure::new(FailureKind::Unknown, error));
+    failure.object_receipt = Some(crate::catalog_session::preview_io::FailureReceipt {
+        operation: request.operation,
+        step: crate::application::U64(0),
+        request_digest: request
+            .receipt_digest()
+            .expect("validated export executor request digest"),
+    });
+    anyhow::Error::new(failure)
+}
 fn export_directory_failure(error: anyhow::Error) -> anyhow::Error {
     if error.downcast_ref::<Failure>().is_some() {
         error
@@ -359,5 +386,94 @@ pub(crate) mod export_stage_test_support {
     }
     pub fn captured_begin_failure() {
         super::export_stage::test_captured_begin_failure();
+    }
+}
+
+/// In-process access to the real F executor state machine for exact lifecycle
+/// and persisted-recovery tests.
+#[cfg(test)]
+pub(crate) mod export_executor_test_support {
+    use super::*;
+    #[derive(Default)]
+    pub struct Owner(super::export_executor::Owner);
+    impl Owner {
+        pub fn call(
+            &mut self,
+            catalog: &Path,
+            manifest: &Path,
+            request: &crate::catalog_session::export_executor::Request,
+            cancel: &AtomicBool,
+            export_stage_empty: bool,
+        ) -> Result<crate::catalog_session::export_executor::Reply> {
+            self.0
+                .call(catalog, manifest, request, cancel, export_stage_empty)
+        }
+        pub fn empty(&self) -> bool {
+            self.0.empty()
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn delete_export_held(file: &File) -> Result<()> {
+    export_stage::delete_held(file)
+}
+
+/// Combined Bootstrap owner, including token admission before the stage cache.
+#[cfg(test)]
+pub(crate) mod export_bootstrap_test_support {
+    use super::*;
+    pub struct Owner(BootstrapOwner);
+    impl Owner {
+        pub fn new(base: &Path) -> Result<(Self, crate::catalog_session::RootCapability)> {
+            use crate::catalog_session::{
+                BootstrapMode, ConfirmSqlAdmission, LeaseId, PrepareCatalog, SQL_ROLES, SqlRole,
+                SqlRoleObservation,
+            };
+            let mut owner = BootstrapOwner::new(LeaseId::new(), vec![]);
+            let prepared = owner.prepare(
+                &PrepareCatalog {
+                    operation: crate::application::U64(1),
+                    session: LeaseId::new(),
+                    mode: BootstrapMode::DesktopCreate,
+                    root: NativePath::from_path(&base.join("combined-catalog")),
+                    manifest_root: NativePath::from_path(&base.join("combined-manifest")),
+                    import_source: None,
+                },
+                &AtomicBool::new(false),
+                |_| Ok(()),
+            )?;
+            let root = prepared.root_capability();
+            owner.confirm(
+                &ConfirmSqlAdmission {
+                    operation: prepared.operation,
+                    root: root.clone(),
+                    roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                        role,
+                        physical: if role == SqlRole::Manifest {
+                            prepared.manifest.physical
+                        } else {
+                            prepared.catalog.physical
+                        },
+                    }),
+                },
+                &AtomicBool::new(false),
+            )?;
+            Ok((Self(owner), root))
+        }
+        pub fn stage(
+            &mut self,
+            request: &crate::catalog_session::export_stage::Request,
+            cancel: &AtomicBool,
+        ) -> Result<crate::catalog_session::export_stage::Reply> {
+            self.0.export_stage_call(request, cancel)
+        }
+        pub fn executor(
+            &mut self,
+            request: &crate::catalog_session::export_executor::Request,
+            cancel: &AtomicBool,
+        ) -> Result<crate::catalog_session::export_executor::Reply> {
+            self.0.export_executor_call(request, cancel)
+        }
     }
 }
