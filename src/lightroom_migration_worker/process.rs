@@ -8,7 +8,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -126,8 +126,39 @@ impl StartupOrderGate {
 
 #[derive(Default)]
 struct TransportHealth {
-    failed: AtomicBool,
+    state: AtomicU8,
     eof: AtomicBool,
+}
+impl TransportHealth {
+    const FAILED: u8 = 1;
+    const REVOKED: u8 = 2;
+
+    /// Linearize transport failure against explicit supervisor revocation. A
+    /// failure published first remains fatal; pipe errors after revoke begins
+    /// belong to the checked teardown which will reap and join this process.
+    fn fail(&self) {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & Self::REVOKED != 0 {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state | Self::FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => state = next,
+            }
+        }
+    }
+    fn revoke(&self) {
+        self.state.fetch_or(Self::REVOKED, Ordering::AcqRel);
+    }
+    fn failed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & Self::FAILED != 0
+    }
 }
 struct IoCompletion {
     health: Arc<TransportHealth>,
@@ -136,7 +167,7 @@ struct IoCompletion {
 impl Drop for IoCompletion {
     fn drop(&mut self) {
         if !self.completed {
-            self.health.failed.store(true, Ordering::Release);
+            self.health.fail();
         }
     }
 }
@@ -408,7 +439,7 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
                                 writes += usize::from(result.is_ok());
                             }
                             if let Err(error) = result {
-                                completion.health.failed.store(true, Ordering::Release);
+                                completion.health.fail();
                                 *errors.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(error.to_string());
                                 write_stop.admission.store(true, Ordering::Release);
@@ -431,7 +462,7 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
                         loop {
                             let frame = read_frame_optional::<T>(&mut stdout);
                             match &frame {
-                                Err(_) => completion.health.failed.store(true, Ordering::Release),
+                                Err(_) => completion.health.fail(),
                                 Ok(None) => completion.health.eof.store(true, Ordering::Release),
                                 Ok(Some(_)) => {}
                             }
@@ -560,7 +591,7 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Process<T> {
     /// Independent atomics are published before a blocking output queue send.
     /// EOF is separate because an orderly Retire may close the pipe normally.
     pub(crate) fn transport_failed(&self) -> bool {
-        self.transport.failed.load(Ordering::Acquire)
+        self.transport.failed()
     }
     pub(crate) fn output_ended(&self) -> bool {
         self.transport.eof.load(Ordering::Acquire)
@@ -583,11 +614,14 @@ impl<T> Process<T> {
     pub(crate) fn revoke(&mut self) {
         #[cfg(test)]
         if matches!(self.injected_revoke_failure, InjectedRevokeFailure::Before) {
-            self.transport.failed.store(true, Ordering::Release);
+            self.transport.fail();
         }
+        // Publish the teardown boundary before any channel close or kill can
+        // turn its expected pipe completion into a live transport failure.
+        self.transport.revoke();
         #[cfg(test)]
         if matches!(self.injected_revoke_failure, InjectedRevokeFailure::After) {
-            self.transport.failed.store(true, Ordering::Release);
+            self.transport.fail();
         }
         self.input.take();
         self.control.take();
