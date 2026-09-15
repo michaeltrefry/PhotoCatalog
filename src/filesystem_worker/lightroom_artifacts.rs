@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
+    collections::{BTreeMap, VecDeque},
     fs,
     io::Read,
     path::Path,
@@ -27,12 +28,21 @@ struct Snapshot {
     bytes: Vec<u8>,
     manifest: Manifest,
     limits: ArtifactLimits,
+    prepared: BTreeMap<usize, String>,
+}
+struct Receipt {
+    input_json: String,
+    input_blake3: String,
 }
 
 #[derive(Default)]
 pub(super) struct Owner {
     active: Option<Snapshot>,
     discarded: Option<String>,
+    receipts: BTreeMap<String, Receipt>,
+    // A bounded retry window makes explicit discard idempotent without growing
+    // custody metadata for the lifetime of F.
+    discarded_receipts: VecDeque<String>,
 }
 
 fn canceled(cancel: &AtomicBool) -> Result<()> {
@@ -133,7 +143,7 @@ impl Owner {
                         && manifest.revision_id.as_deref() == Some(capture_revision.as_str())
                         && crate::lightroom::json_digest(&manifest.artifacts)? == capture_revision
                         && !manifest.artifacts.is_empty()
-                        && manifest.artifacts.len() <= 16_384,
+                        && manifest.artifacts.len() <= 4_096,
                     "capture manifest revision or artifact roster differs"
                 );
                 for artifact in &manifest.artifacts {
@@ -163,6 +173,7 @@ impl Owner {
                         chunk_deadline_ms: 120_000,
                         chunk_bytes: 1024 * 1024,
                     },
+                    prepared: BTreeMap::new(),
                 };
                 let reply = snapshot.begun();
                 self.active = Some(snapshot);
@@ -173,40 +184,94 @@ impl Owner {
                 member_index,
             } => {
                 canceled(cancel)?;
-                let active = self
-                    .active
-                    .as_ref()
-                    .context("no artifact preparation is retained")?;
-                ensure!(
-                    active.session == session,
-                    "artifact preparation session differs"
-                );
                 let index = usize::try_from(member_index.0)?;
-                let artifact = active
-                    .manifest
-                    .artifacts
-                    .get(index)
-                    .context("artifact member absent")?;
-                let relative = NativePath::from_path(Path::new(&artifact.stored));
-                let mapping = prepare_manifest_artifact(
-                    artifact,
-                    &active.directory,
-                    &relative,
-                    active.limits,
-                    &|| cancel.load(Ordering::Acquire),
-                )?;
-                let input = ArtifactInput {
-                    capture_revision: active.capture_revision.clone(),
-                    member_index: index,
-                    mapping,
+                let input = {
+                    let active = self
+                        .active
+                        .as_ref()
+                        .context("no artifact preparation is retained")?;
+                    ensure!(
+                        active.session == session,
+                        "artifact preparation session differs"
+                    );
+                    if let Some(receipt) = active.prepared.get(&index) {
+                        return Ok(Some(LightroomArtifactPreparationReply::Prepared {
+                            session,
+                            member_index: U64(index as u64),
+                            receipt: receipt.clone(),
+                        }));
+                    }
+                    let artifact = active
+                        .manifest
+                        .artifacts
+                        .get(index)
+                        .context("artifact member absent")?;
+                    let relative = NativePath::from_path(Path::new(&artifact.stored));
+                    let mapping = prepare_manifest_artifact(
+                        artifact,
+                        &active.directory,
+                        &relative,
+                        active.limits,
+                        &|| cancel.load(Ordering::Acquire),
+                    )?;
+                    ArtifactInput {
+                        capture_revision: active.capture_revision.clone(),
+                        member_index: index,
+                        mapping,
+                    }
                 };
                 let bytes = crate::lightroom::bounded_json(&input, 65_536)?;
+                ensure!(
+                    self.receipts.len() < 4_096,
+                    "prepared artifact receipt capacity"
+                );
+                let receipt = uuid::Uuid::new_v4().to_string();
+                self.receipts.insert(
+                    receipt.clone(),
+                    Receipt {
+                        input_blake3: blake3::hash(&bytes).to_hex().to_string(),
+                        input_json: String::from_utf8(bytes)?,
+                    },
+                );
+                self.active
+                    .as_mut()
+                    .unwrap()
+                    .prepared
+                    .insert(index, receipt.clone());
                 Ok(Some(LightroomArtifactPreparationReply::Prepared {
                     session,
                     member_index: U64(index as u64),
-                    input_blake3: blake3::hash(&bytes).to_hex().to_string(),
-                    input_json: String::from_utf8(bytes)?,
+                    receipt,
                 }))
+            }
+            LightroomArtifactPreparation::Resolve { receipt } => {
+                canceled(cancel)?;
+                let value = self
+                    .receipts
+                    .get(&receipt)
+                    .context("prepared artifact receipt is absent or discarded")?;
+                Ok(Some(LightroomArtifactPreparationReply::Resolved {
+                    receipt,
+                    input_json: value.input_json.clone(),
+                    input_blake3: value.input_blake3.clone(),
+                }))
+            }
+            LightroomArtifactPreparation::DiscardReceipt { receipt } => {
+                if self.receipts.remove(&receipt).is_some() {
+                    if let Some(active) = &mut self.active {
+                        active.prepared.retain(|_, value| value != &receipt);
+                    }
+                    if self.discarded_receipts.len() == 4_096 {
+                        self.discarded_receipts.pop_front();
+                    }
+                    self.discarded_receipts.push_back(receipt);
+                } else {
+                    ensure!(
+                        self.discarded_receipts.contains(&receipt),
+                        "prepared artifact receipt is absent"
+                    );
+                }
+                Ok(None)
             }
             LightroomArtifactPreparation::Discard { session } => {
                 if let Some(active) = &self.active {
@@ -239,5 +304,81 @@ impl Snapshot {
             manifest_bytes: U64(self.bytes.len() as u64),
             members: U64(self.manifest.artifacts.len() as u64),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_receipt_replays_then_discard_is_idempotent() {
+        let receipt = uuid::Uuid::new_v4().to_string();
+        let input_json = r#"{"capture_revision":"fixture"}"#.to_string();
+        let input_blake3 = blake3::hash(input_json.as_bytes()).to_hex().to_string();
+        let mut owner = Owner::default();
+        owner.receipts.insert(
+            receipt.clone(),
+            Receipt {
+                input_json: input_json.clone(),
+                input_blake3: input_blake3.clone(),
+            },
+        );
+        let cancel = AtomicBool::new(false);
+        for _ in 0..2 {
+            let reply = owner
+                .execute(
+                    LightroomArtifactPreparation::Resolve {
+                        receipt: receipt.clone(),
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert!(
+                matches!(reply, Some(LightroomArtifactPreparationReply::Resolved { input_json: ref json, input_blake3: ref digest, .. }) if json == &input_json && digest == &input_blake3)
+            );
+        }
+        for _ in 0..2 {
+            assert!(
+                owner
+                    .execute(
+                        LightroomArtifactPreparation::DiscardReceipt {
+                            receipt: receipt.clone(),
+                        },
+                        &cancel,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            owner
+                .execute(LightroomArtifactPreparation::Resolve { receipt }, &cancel)
+                .is_err(),
+            "discarded receipt was resolved"
+        );
+    }
+
+    #[test]
+    fn altered_receipt_never_resolves() {
+        let receipt = uuid::Uuid::new_v4().to_string();
+        let mut owner = Owner::default();
+        owner.receipts.insert(
+            receipt.clone(),
+            Receipt {
+                input_json: "{}".into(),
+                input_blake3: blake3::hash(b"{}").to_hex().to_string(),
+            },
+        );
+        let altered = uuid::Uuid::new_v4().to_string();
+        assert_ne!(receipt, altered);
+        assert!(
+            owner
+                .execute(
+                    LightroomArtifactPreparation::Resolve { receipt: altered },
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
     }
 }

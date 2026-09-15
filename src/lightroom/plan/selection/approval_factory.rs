@@ -6,6 +6,22 @@ use crate::catalog_migration::{
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
+fn admit_rosters(artifacts: usize, supplements: usize) -> Result<()> {
+    ensure!(
+        artifacts <= APPROVAL_ROSTER_LIMIT && supplements <= APPROVAL_ROSTER_LIMIT,
+        "approval roster bound"
+    );
+    Ok(())
+}
+
+fn admit_required_member(current: usize) -> Result<()> {
+    ensure!(
+        current < APPROVAL_ROSTER_LIMIT,
+        "selected artifact roster exceeds importer bound"
+    );
+    Ok(())
+}
+
 impl SelectionReview {
     /// Builds canonical authority documents from a typed, explicitly reviewed
     /// draft while the exact selection snapshot is still pinned. Artifact copy
@@ -46,10 +62,7 @@ impl SelectionReview {
                 && !draft.authorization.contains('\0'),
             "explicit bounded authorization required"
         );
-        ensure!(
-            draft.artifacts.len() <= 16_384 && draft.supplements.len() <= 16_384,
-            "approval roster bound"
-        );
+        admit_rosters(draft.artifacts.len(), draft.supplements.len())?;
         let selected: BTreeSet<_> = self
             .evidence
             .captures
@@ -100,6 +113,7 @@ impl SelectionReview {
                 "selected artifact manifest changed"
             );
             for (index, artifact) in manifest.artifacts.iter().enumerate() {
+                admit_required_member(required.len())?;
                 ensure!(
                     required
                         .insert(
@@ -195,5 +209,30 @@ impl SelectionReview {
             policy_blake3: blake3::hash(&policy_bytes).to_hex().to_string(),
             policy_json: String::from_utf8(policy_bytes)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    #[test]
+    fn importer_boundary_is_enforced_before_approval_generation() {
+        assert!(admit_rosters(4_096, 4_096).is_ok());
+        assert!(admit_rosters(4_097, 0).is_err());
+        assert!(admit_rosters(0, 4_097).is_err());
+    }
+
+    #[test]
+    fn selected_members_are_bounded_across_capture_manifests() {
+        let mut aggregate = 0;
+        for capture_members in [2_048, 2_048] {
+            for _ in 0..capture_members {
+                admit_required_member(aggregate).unwrap();
+                aggregate += 1;
+            }
+        }
+        assert_eq!(aggregate, APPROVAL_ROSTER_LIMIT);
+        assert!(admit_required_member(aggregate).is_err());
     }
 }

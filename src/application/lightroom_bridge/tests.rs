@@ -1010,3 +1010,68 @@ fn quit_signals_workbench_and_preview_before_catalog_drain_wait() -> Result<()> 
     );
     Ok(())
 }
+
+fn receipt_draft(receipt: String, review_token: &str) -> ApprovalReceiptDraft {
+    ApprovalReceiptDraft {
+        protocol: 1,
+        review_token: review_token.into(),
+        destination: NativePath::from_path(std::path::Path::new("destination.sqlite3")),
+        import_source: "reviewed fixture".into(),
+        overlap: crate::catalog_migration::importer::OverlapPolicy::RequireDecision,
+        keyword_overlap: crate::catalog_migration::importer::KeywordOverlap::RequireDecision,
+        artifacts: vec![ArtifactReceipt { receipt }],
+        supplements: vec![],
+        authorization: "explicit test authority".into(),
+    }
+}
+
+#[test]
+fn approval_receipt_schema_rejects_renderer_mapping_authority() {
+    let token = "a".repeat(64);
+    let receipt = uuid::Uuid::new_v4().to_string();
+    for injected in ["root", "copy_identity", "input_json", "member_index"] {
+        let mut value = serde_json::to_value(receipt_draft(receipt.clone(), &token)).unwrap();
+        value["artifacts"][0][injected] = serde_json::json!("forged");
+        assert!(
+            resolve_approval_receipts(
+                &serde_json::to_vec(&value).unwrap(),
+                &token,
+                &std::sync::atomic::AtomicBool::new(false),
+                |_| anyhow::bail!("must reject before resolution")
+            )
+            .is_err(),
+            "renderer field {injected} was accepted"
+        );
+    }
+}
+
+#[test]
+fn approval_receipt_resolution_rejects_forged_and_stale_identity() {
+    let token = "a".repeat(64);
+    let retained = uuid::Uuid::new_v4().to_string();
+    let forged = uuid::Uuid::new_v4().to_string();
+    let bytes = serde_json::to_vec(&receipt_draft(forged, &token)).unwrap();
+    assert!(
+        resolve_approval_receipts(
+            &bytes,
+            &"b".repeat(64),
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| unreachable!()
+        )
+        .is_err(),
+        "stale selection token was accepted"
+    );
+    assert!(
+        resolve_approval_receipts(
+            &bytes,
+            &token,
+            &std::sync::atomic::AtomicBool::new(false),
+            |actual| {
+                ensure!(actual == retained, "forged receipt is absent from F");
+                unreachable!()
+            },
+        )
+        .is_err(),
+        "forged receipt was accepted"
+    );
+}

@@ -21,9 +21,9 @@ fn approval(bytes: &[u8], token: &str, limits: SelectionLimits) -> Result<Approv
         "approval import source bound"
     );
     ensure!(
-        value.policy.artifacts.len() <= 16_384
-            && value.policy.supplements.len() <= 16_384
-            && value.supplements.len() <= 16_384,
+        value.policy.artifacts.len() <= APPROVAL_ROSTER_LIMIT
+            && value.policy.supplements.len() <= APPROVAL_ROSTER_LIMIT
+            && value.supplements.len() <= APPROVAL_ROSTER_LIMIT,
         "approval artifact/supplement roster bound"
     );
     for artifact in &value.policy.artifacts {

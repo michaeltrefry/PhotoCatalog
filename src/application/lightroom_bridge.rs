@@ -3,6 +3,7 @@
 use super::{I64, U64, lightroom as lw};
 use crate::storage_volume::NativePath;
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 mod wire;
 pub use wire::*;
@@ -73,6 +74,77 @@ impl Upload {
             complete: self.sealed.is_some(),
         }
     }
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let chunks = self.sealed.as_ref().context("input is incomplete")?;
+        let mut bytes = Vec::with_capacity(self.total);
+        for chunk in chunks.iter() {
+            bytes.extend_from_slice(chunk.as_bytes());
+        }
+        ensure!(bytes.len() == self.total, "sealed input length differs");
+        ensure!(
+            self.digest.as_deref() == Some(blake3::hash(&bytes).to_hex().as_str()),
+            "sealed input digest differs"
+        );
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactReceipt {
+    receipt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalReceiptDraft {
+    protocol: u32,
+    review_token: String,
+    destination: NativePath,
+    import_source: String,
+    overlap: crate::catalog_migration::importer::OverlapPolicy,
+    keyword_overlap: crate::catalog_migration::importer::KeywordOverlap,
+    artifacts: Vec<ArtifactReceipt>,
+    supplements: Vec<crate::lightroom::selection::ExactDocument>,
+    authorization: String,
+}
+
+fn resolve_approval_receipts(
+    bytes: &[u8],
+    review_token: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut resolve: impl FnMut(&str) -> Result<crate::lightroom::selection::ExactDocument>,
+) -> Result<crate::lightroom::selection::ApprovalDraft> {
+    let public: ApprovalReceiptDraft = serde_json::from_slice(bytes)?;
+    ensure!(
+        public.protocol == 1 && public.review_token == review_token,
+        "approval receipt draft protocol or review token differs"
+    );
+    ensure!(
+        public.artifacts.len() <= crate::lightroom::selection::APPROVAL_ROSTER_LIMIT
+            && public.supplements.len() <= crate::lightroom::selection::APPROVAL_ROSTER_LIMIT,
+        "approval roster bound"
+    );
+    let mut artifacts = Vec::with_capacity(public.artifacts.len());
+    for reference in public.artifacts {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "approval receipt resolution canceled"
+        );
+        uuid::Uuid::parse_str(&reference.receipt)?;
+        artifacts.push(resolve(&reference.receipt)?);
+    }
+    Ok(crate::lightroom::selection::ApprovalDraft {
+        protocol: public.protocol,
+        review_token: public.review_token,
+        destination: public.destination,
+        import_source: public.import_source,
+        overlap: public.overlap,
+        keyword_overlap: public.keyword_overlap,
+        artifacts,
+        supplements: public.supplements,
+        authorization: public.authorization,
+    })
 }
 #[derive(Default)]
 pub(crate) struct Control {
@@ -115,6 +187,51 @@ impl Control {
             "stale inspection input"
         );
         Ok(u)
+    }
+    pub(crate) fn approval_documents(
+        &mut self,
+        g: &Guard,
+        input: &str,
+        review_token: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut resolve: impl FnMut(&str) -> Result<crate::lightroom::selection::ExactDocument>,
+    ) -> Result<Response> {
+        let w = self.checked(g)?;
+        idle(&w.status())?;
+        let upload = self.input(g, input)?;
+        ensure!(
+            upload.purpose == InputPurpose::ApprovalDraft,
+            "input purpose differs"
+        );
+        ensure!(
+            self.status()
+                .as_ref()
+                .and_then(|s| s.review_token.as_deref())
+                == Some(review_token),
+            "approval factory review token differs"
+        );
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "approval receipt resolution canceled"
+        );
+        let trusted =
+            resolve_approval_receipts(&upload.bytes()?, review_token, cancel, &mut resolve)?;
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "approval receipt resolution canceled"
+        );
+        let bytes = crate::lightroom::bounded_json(&trusted, w.status().limits.request_bytes)?;
+        let json = lw::Payload {
+            bytes: bytes.len(),
+            chunks: Arc::new(vec![String::from_utf8(bytes)?]),
+        };
+        w.bridge_deferred(
+            &g.generation,
+            &g.operation,
+            lw::DeferredAction::ApprovalDocuments { json },
+        )?;
+        self.upload = None;
+        Ok(Response::Status(self.status()))
     }
     pub(crate) fn direct(&mut self, request: Request, envelope: usize) -> Result<Response> {
         match request {
@@ -391,28 +508,12 @@ impl Coordinator {
                         )?;
                     }
                     Action::ApprovalDocuments {
-                        input,
-                        review_token,
+                        input: _,
+                        review_token: _,
                     } => {
-                        let u = c.input(&g, &input)?;
-                        ensure!(
-                            u.purpose == InputPurpose::ApprovalDraft,
-                            "input purpose differs"
-                        );
-                        ensure!(
-                            c.status().as_ref().and_then(|s| s.review_token.as_ref())
-                                == Some(&review_token),
-                            "approval factory review token differs"
-                        );
-                        let json = lw::Payload {
-                            chunks: u.sealed.clone().context("input is incomplete")?,
-                            bytes: u.total,
-                        };
-                        w.bridge_deferred(
-                            &g.generation,
-                            &g.operation,
-                            lw::DeferredAction::ApprovalDocuments { json },
-                        )?;
+                        anyhow::bail!(
+                            "approval documents require filesystem receipts resolved by the managed desktop owner"
+                        )
                     }
                     value => {
                         w.bridge_start(&g.generation, &g.operation, typed_action(value)?)?;

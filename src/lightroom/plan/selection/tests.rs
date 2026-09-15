@@ -245,6 +245,31 @@ fn any_live_source_commit_invalidates_review_including_excluded_and_unrelated_ro
 }
 
 #[test]
+fn approval_factory_rejects_a_stale_selection_before_document_generation() {
+    let case = Case::new();
+    let review = case.review();
+    let output = case.output("never-created-stale-approval");
+    let draft = ApprovalDraft {
+        protocol: 1,
+        review_token: review.summary.token.clone(),
+        destination: output.clone(),
+        import_source: "synthetic source".into(),
+        overlap: OverlapPolicy::RequireDecision,
+        keyword_overlap: KeywordOverlap::RequireDecision,
+        artifacts: vec![],
+        supplements: vec![],
+        authorization: "Explicit synthetic TEST fixture authority".into(),
+    };
+    case.edit("UPDATE family_choices SET reason='changed after review'");
+    assert!(
+        review
+            .approval_documents(&serde_json::to_vec(&draft).unwrap(), flag())
+            .is_err()
+    );
+    assert!(!output.to_path().unwrap().exists());
+}
+
+#[test]
 fn approval_digest_rejects_scope_destination_policy_authorization_and_whitespace_tamper() {
     let case = Case::new();
     let mut review = case.review();

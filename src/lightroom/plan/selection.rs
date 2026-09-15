@@ -176,6 +176,7 @@ pub struct ExactDocument {
     pub json: String,
     pub blake3: String,
 }
+pub const APPROVAL_ROSTER_LIMIT: usize = 4_096;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalDocuments {

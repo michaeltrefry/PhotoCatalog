@@ -931,6 +931,9 @@ impl Client {
                 (
                     crate::filesystem_worker::wire::LightroomArtifactPreparation::Discard {
                         ..
+                    }
+                    | crate::filesystem_worker::wire::LightroomArtifactPreparation::DiscardReceipt {
+                        ..
                     },
                     None,
                 ) => Ok(None),

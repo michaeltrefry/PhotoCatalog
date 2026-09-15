@@ -185,7 +185,10 @@ impl Operation {
             )
             || matches!(
                 self,
-                Self::LightroomArtifactPreparation(LightroomArtifactPreparation::Discard { .. })
+                Self::LightroomArtifactPreparation(
+                    LightroomArtifactPreparation::Discard { .. }
+                        | LightroomArtifactPreparation::DiscardReceipt { .. }
+                )
             )
             || matches!(self, Self::ExportExecutor(r) if r.cleanup())
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
@@ -332,6 +335,12 @@ pub enum LightroomArtifactPreparation {
         session: String,
         member_index: U64,
     },
+    Resolve {
+        receipt: String,
+    },
+    DiscardReceipt {
+        receipt: String,
+    },
     Discard {
         session: String,
     },
@@ -371,9 +380,10 @@ impl LightroomArtifactPreparation {
                 session,
                 member_index,
             } => {
-                ensure!(member_index.0 < 16_384, "artifact member index bound");
+                ensure!(member_index.0 < 4_096, "artifact member index bound");
                 session
             }
+            Self::Resolve { receipt } | Self::DiscardReceipt { receipt } => receipt,
             Self::Discard { session } => session,
         };
         uuid::Uuid::parse_str(session)?;
@@ -397,6 +407,10 @@ pub enum LightroomArtifactPreparationReply {
     Prepared {
         session: String,
         member_index: U64,
+        receipt: String,
+    },
+    Resolved {
+        receipt: String,
         input_json: String,
         input_blake3: String,
     },
@@ -431,7 +445,7 @@ impl LightroomArtifactPreparationReply {
                         && digest == manifest_blake3
                         && (1..=crate::lightroom::MANIFEST_BYTES as u64)
                             .contains(&manifest_bytes.0)
-                        && (1..=16_384).contains(&members.0),
+                        && (1..=4_096).contains(&members.0),
                     "artifact preparation admission reply differs"
                 );
             }
@@ -443,16 +457,27 @@ impl LightroomArtifactPreparationReply {
                 Self::Prepared {
                     session: actual,
                     member_index: actual_index,
-                    input_json,
-                    input_blake3,
+                    receipt,
                 },
             ) => ensure!(
                 actual == session
                     && actual_index == member_index
+                    && uuid::Uuid::parse_str(receipt).is_ok(),
+                "prepared artifact reply differs"
+            ),
+            (
+                LightroomArtifactPreparation::Resolve { receipt },
+                Self::Resolved {
+                    receipt: actual,
+                    input_json,
+                    input_blake3,
+                },
+            ) => ensure!(
+                actual == receipt
                     && !input_json.is_empty()
                     && input_json.len() <= 65_536
                     && blake3::hash(input_json.as_bytes()).to_hex().as_str() == input_blake3,
-                "prepared artifact reply differs"
+                "resolved artifact reply differs"
             ),
             _ => anyhow::bail!("artifact preparation reply kind differs"),
         }

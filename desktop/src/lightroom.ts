@@ -7,10 +7,13 @@ export type ExactDocument={json:string;blake3:string};
 export type ArtifactPreparationRequest=
  | {action:'begin';session:string;directory:NativePath;capture_revision:string;manifest_blake3:string;maximum_bytes:Decimal;open_deadline_ms:Decimal}
  | {action:'member';session:string;member_index:Decimal}
+ | {action:'resolve';receipt:string}
+ | {action:'discard_receipt';receipt:string}
  | {action:'discard';session:string};
 export type ArtifactPreparationReply=
  | {kind:'begun';session:string;directory:NativePath;manifest_path:NativePath;manifest_physical:unknown;capture_revision:string;manifest_blake3:string;manifest_bytes:Decimal;members:Decimal}
- | {kind:'prepared';session:string;member_index:Decimal;input_json:string;input_blake3:string};
+ | {kind:'prepared';session:string;member_index:Decimal;receipt:string}
+ | {kind:'resolved';receipt:string;input_json:string;input_blake3:string};
 export type Request =
  | {kind:'SealedDocument';request:SealedDocumentRequest}
  | {kind:'ArtifactPreparation';request:ArtifactPreparationRequest}

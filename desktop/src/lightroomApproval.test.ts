@@ -11,17 +11,23 @@ describe('guided Lightroom approval',()=>{
     expect(docs[0].blake3).toBe(await documentDigest('policy',docs[0].json));
   });
   it('builds an explicit typed approval draft',()=>{
-    const raw=approvalDraft({reviewToken:d('a'),destination:path,importSource:'reviewed Lightroom',overlap:'require',overlapReason:'',keywordOverlap:'reuse',keywordReason:'same hierarchy',artifacts:[{json:'{}',blake3:d('b')}],supplements:[],authorization:'approved destination and policy'});
+    const raw=approvalDraft({reviewToken:d('a'),destination:path,importSource:'reviewed Lightroom',overlap:'require',overlapReason:'',keywordOverlap:'reuse',keywordReason:'same hierarchy',artifacts:[{receipt:'1c8f4f28-8c53-4cb4-9be1-3be219d1f991'}],supplements:[],authorization:'approved destination and policy'});
     expect(JSON.parse(raw)).toMatchObject({protocol:1,review_token:d('a'),overlap:{kind:'RequireDecision'},keyword_overlap:{kind:'ReuseExactHierarchy',reason:'same hierarchy'}});
+  });
+  it('rejects unsupported approval rosters before staging',()=>{
+    const receipt={receipt:'1c8f4f28-8c53-4cb4-9be1-3be219d1f991'},base={reviewToken:d('a'),destination:path,importSource:'reviewed Lightroom',overlap:'require' as const,overlapReason:'',keywordOverlap:'require' as const,keywordReason:'',supplements:[],authorization:'approved'};
+    expect(()=>approvalDraft({...base,artifacts:Array.from({length:4096},()=>receipt)})).not.toThrow();
+    expect(()=>approvalDraft({...base,artifacts:Array.from({length:4097},()=>receipt)})).toThrow(/roster/);
+    expect(()=>approvalDraft({...base,artifacts:[{receipt:'forged'}]})).toThrow(/receipt/);
   });
   it('extracts only selected capture identities',()=>{
     const node=parseLosslessJson(`{"rows":[{"revision":"${d('a')}","manifest_blake3":"${d('b')}","selected":true},{"revision":"${d('c')}","manifest_blake3":"${d('d')}","selected":false}]}`,{bytes:4096,nodes:100,depth:8});
     expect(selectedCaptures(node)).toEqual([{revision:d('a'),manifest_blake3:d('b')}]);
   });
   it('prepares every member and always discards the retained manifest',async()=>{
-    const json='{"capture_revision":"x","member_index":0,"mapping":{}}',hash=await documentDigest('policy',json);let session='';
-    const send=vi.fn(async(request:any)=>{if(request.action==='begin'){session=request.session;return {kind:'begun',session,directory:path,manifest_path:path,manifest_physical:{},capture_revision:d('a'),manifest_blake3:d('b'),manifest_bytes:'12',members:'1'} as const;}if(request.action==='member')return {kind:'prepared',session,member_index:'0',input_json:json,input_blake3:hash} as const;return null;});
-    await expect(prepareCaptureArtifacts({revision:d('a'),manifest_blake3:d('b')},path,'100','1000',undefined,undefined,send)).resolves.toEqual([{json,blake3:hash}]);
+    const receipt='1c8f4f28-8c53-4cb4-9be1-3be219d1f991';let session='';
+    const send=vi.fn(async(request:any)=>{if(request.action==='begin'){session=request.session;return {kind:'begun',session,directory:path,manifest_path:path,manifest_physical:{},capture_revision:d('a'),manifest_blake3:d('b'),manifest_bytes:'12',members:'1'} as const;}if(request.action==='member')return {kind:'prepared',session,member_index:'0',receipt} as const;return null;});
+    await expect(prepareCaptureArtifacts({revision:d('a'),manifest_blake3:d('b')},path,'100','1000',undefined,undefined,send)).resolves.toEqual([{receipt}]);
     expect(send.mock.calls.at(-1)?.[0]).toMatchObject({action:'discard',session});
   });
 });

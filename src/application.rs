@@ -478,6 +478,22 @@ impl Bridge {
     pub fn spawn(config: Config) -> Result<Self> {
         Self::spawn_engine(config, None)
     }
+    pub(crate) fn lightroom_approval_documents(
+        &self,
+        guard: &lightroom_bridge::Guard,
+        input: &str,
+        review_token: &str,
+        cancel: &AtomicBool,
+        resolve: impl FnMut(&str) -> anyhow::Result<crate::lightroom::selection::ExactDocument>,
+    ) -> std::result::Result<lightroom_bridge::Response, BridgeError> {
+        self.0
+            .shared
+            .lightroom
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .approval_documents(guard, input, review_token, cancel, resolve)
+            .map_err(native)
+    }
     /// Unselected C-only constructor; caller must keep F independently owned and
     /// forbid any live catalog/backup/native descendant at bootstrap admission.
     #[allow(dead_code)]

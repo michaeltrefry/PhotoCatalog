@@ -519,6 +519,65 @@ impl DesktopBridge {
     }
     pub fn submit(&self, request: Request) -> Result<Pending> {
         if let Request::Lightroom { request } = &request
+            && let super::lightroom_bridge::Request::Action { guard, action } = request.as_ref()
+            && let super::lightroom_bridge::Action::ApprovalDocuments {
+                input,
+                review_token,
+            } = action
+        {
+            let filesystem = self.0.shared.filesystem.clone().ok_or_else(|| {
+                error(
+                    ErrorCode::InvalidRequest,
+                    "approval documents require the managed filesystem owner",
+                )
+            })?;
+            let local = self.0.local.clone();
+            let guard = guard.clone();
+            let input = input.clone();
+            let review_token = review_token.clone();
+            let cancel = Cancellation::default();
+            let execution_cancel = cancel.flag();
+            let (tx, receiver) = mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("lightroom-approval-receipt-resolution".into())
+                .spawn(move || {
+                    let response = local.lightroom_approval_documents(
+                        &guard,
+                        &input,
+                        &review_token,
+                        &execution_cancel,
+                        |receipt| {
+                            let request = crate::filesystem_worker::wire::LightroomArtifactPreparation::Resolve {
+                                receipt: receipt.to_string(),
+                            };
+                            match filesystem.lightroom_artifact_preparation(
+                                &request,
+                                &execution_cancel,
+                            )? {
+                                Some(crate::filesystem_worker::wire::LightroomArtifactPreparationReply::Resolved {
+                                    input_json,
+                                    input_blake3,
+                                    ..
+                                }) => Ok(crate::lightroom::selection::ExactDocument {
+                                    json: input_json,
+                                    blake3: input_blake3,
+                                }),
+                                _ => anyhow::bail!("prepared artifact receipt resolution is absent"),
+                            }
+                        },
+                    );
+                    let reply = match response {
+                        Ok(value) => Reply::Ok {
+                            value: super::Response::Lightroom(Box::new(value)),
+                        },
+                        Err(error) => Reply::Error { error },
+                    };
+                    let _ = tx.send(reply);
+                })
+                .map_err(|failure| error(ErrorCode::Native, failure.to_string()))?;
+            return Ok(Pending { receiver, cancel });
+        }
+        if let Request::Lightroom { request } = &request
             && let super::lightroom_bridge::Request::SealedDocument { request } = request.as_ref()
         {
             let filesystem = self.0.shared.filesystem.clone().ok_or_else(|| {
