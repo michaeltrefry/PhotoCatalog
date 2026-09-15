@@ -4,7 +4,9 @@ Source of truth: https://app.shortcut.com/trefry/epic/22835
 
 ## Current delivery — 2026-09-15
 
-Local production checkpoint `1be970d` adds F export admission custody
+Local production checkpoint `d8ba673` integrates G export-native ownership
+(source `7792e5f`) on the accepted `1be970d` foundation. That foundation adds
+F export admission custody
 (source `e71ede14`, integrated `967f259`), a shared native ByteBudget with
 real reservations through explicit retirement (source `3f4055a`), and the
 Lightroom dropdown type fix `8d5a6a8` preserving its 13 options.
@@ -31,19 +33,23 @@ S12 sc-22847 remains In Progress. Bug sc-23555 is In Review after verified
 local implementation, independent review and integration; publication,
 merge and normal CI remain outstanding (Shortcut comment 23566).
 
-G export native ownership and exact ordinary F stage coordination are under
-repair in `codex/sc-22847-export-owner`, based on `1be970d`. Its 13-path
-lifecycle freeze `a9a8ee5a` passes formatting and full release test-target
-compilation (`b28ab40f`, 401 unchanged source hashes, command PIDs retired).
-Independent source closure still requires five fixes: privileged terminal
-failure recovery, atomic Close/drain replay, nonblocking reserved controls,
-writer-creation pipe retirement, and overlapping duplicate control replies.
-A bounded repair batch is active (Shortcut comment 23568); no runtime gate
-has run on this rejected freeze. New feature admission is paused until this
-ownership boundary passes review and runtime validation.
+G export native ownership and exact ordinary F stage coordination are locally
+accepted. Source review `a97680ac` closes the lifecycle/control findings; the
+final test-only fixture review is `b15933b3`. The component gate passes all
+62 runnable tests (`51762017`), with independent evidence audit `4b80bbb2`.
+Earlier source rejections, compile errors and the 1/23 then 16/8 fixture-failure
+runs remain negative evidence; none is represented as a passing gate.
 
-C ExportService adaptation and paired export route admission follow G
-acceptance. Full installed, platform, UI and RSS acceptance and S13 remain
+Integrated source matches all 401 component source hashes and the 13 authored
+paths. Private `sc-22847-export-owner-integration-7l17765j` passes all 13 commands:
+frontend build, formatting, full release test-target compilation, fresh CLI,
+21 desktop runtime tests and Tauri release check. Receipt `effc73c8`, CLI
+`6b4cc4ef`, libtest `69cd7ec7` and independent integration audit `7f2c7756`
+are retained. The audits bound their cleanup claims to recorded process and
+checked-wait evidence; they do not assert host-wide native idleness or RSS.
+
+C ExportService adaptation is next; paired export route admission remains
+closed until that backend delegates all native/storage ownership correctly. Full installed, platform, UI and RSS acceptance and S13 remain
 open. No RAID/original reads, canonical migration, install replacement, push
 or Actions occurred.
 

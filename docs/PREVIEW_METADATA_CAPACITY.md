@@ -300,29 +300,34 @@ backing. No new user-visible plan, path, output, or metadata-note cap is imposed
 The 64 KiB native receipt limit is independent of the enriched F/C reply; both
 actual full reply envelopes are admitted before any durable seal creation.
 
+Export G additionally counts exact owner, configured slot and registry backing,
+complete ordinary pending/terminal and privileged replay state, and retained
+control request/reply graphs including encoded and typed copies. Its actual
+native reservations remain in the separate preview-shared native pool until
+explicit retirement; this metadata calculation does not replace that custody.
+
 These terms are summed by `requested_preview_metadata_bytes` and reserved from
 the existing shared metadata `ByteBudget`. The focused stage admission test uses
 that same `ProcessReservation`, proves one-byte-short refusal and retained-owner
 charging, then retries the same pool after release. This is requested Rust
 backing only. Native worker/codec working storage, OS handles and mappings,
 allocator overhead, and observed RSS require their own admission and evidence.
-The integrated export-stage and full Lightroom-facade gate on macOS arm64,
-Rust 1.98.0, reported the following unchanged totals at source `aeff1722`. All four
-capacity tests passed; evidence is retained in private
-`sc-22847-lm-facade-integration-2bh9gds5/capacity.log`.
+The integrated export-owner gate on macOS arm64, Rust 1.98.0, reported the
+following totals at source `d8ba673`. All six capacity tests passed; evidence is
+retained in private `sc-22847-export-owner-integration-7l17765j/capacity.log`.
 Requested is Retained + max(Active, Startup).
 
 | Configuration | Retained | Active | Startup | Requested |
 |---|---:|---:|---:|---:|
-| Minimum | 377,295,266 | 13,021,233,501 | 5,364,516,472 | 13,398,528,767 |
-| Default | 1,091,390,632 | 13,021,243,077 | 5,364,516,472 | 14,112,633,709 |
-| Maximum | 1,066,347,208,768 | 17,538,416,457 | 5,364,516,472 | 1,083,885,625,225 |
+| Minimum | 377,295,642 | 13,216,184,461 | 5,364,516,472 | 13,593,480,103 |
+| Default | 1,091,391,008 | 13,216,194,037 | 5,364,516,472 | 14,307,585,045 |
+| Maximum | 1,066,347,209,144 | 20,282,379,097 | 5,364,516,472 | 1,086,629,588,241 |
 
 These are conservative requested-allocation calculations. Reporting them does
 not reserve the aggregate, measure observed allocation, or bound native/runtime
 storage or RSS.
 
-The integrated gate passed three formula tests and 21 affected transport, codec,
+The earlier error-representation gate passed three formula tests and 21 affected transport, codec,
 cache and real-process tests. The bounded error representation preserves typed
 `anyhow` context through `Error::downcast_ref`; walking only standard error
 sources loses context markers. A regression test covers a filesystem failure
