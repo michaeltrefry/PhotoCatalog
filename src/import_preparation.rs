@@ -30,8 +30,8 @@ pub(crate) type Checkpoint = Arc<dyn Fn(&str, &AtomicBool) + Send + Sync>;
 
 pub(crate) struct Header {
     pub(crate) path: PathBuf,
-    fingerprint: String,
-    observation: VolumeLocation,
+    pub(crate) fingerprint: String,
+    pub(crate) observation: VolumeLocation,
 }
 pub(crate) enum Event {
     Header(Box<Header>),
@@ -51,12 +51,95 @@ pub(crate) struct Preparation {
     cleanup: Arc<std::sync::Mutex<Option<RemoteImport>>>,
 }
 enum Command {
-    InspectionCommitted(mpsc::SyncSender<Result<()>>),
-    Recheck(mpsc::SyncSender<Result<()>>),
-    FileCommitted(mpsc::SyncSender<Result<()>>),
+    ValidateInspection(mpsc::SyncSender<Result<crate::catalog_session::LeaseId>>),
+    ReleaseInspection {
+        grant: crate::catalog_session::LeaseId,
+        reply: mpsc::SyncSender<Result<()>>,
+    },
+    ValidateFile(mpsc::SyncSender<Result<crate::catalog_session::LeaseId>>),
+    ReleaseFile {
+        grant: crate::catalog_session::LeaseId,
+        reply: mpsc::SyncSender<Result<()>>,
+    },
     Retire(mpsc::SyncSender<Result<()>>),
 }
+#[cfg(test)]
+pub(crate) enum TestPublication {
+    RejectInspection,
+    RejectFile,
+    LoseFileRelease,
+}
 impl Preparation {
+    #[cfg(test)]
+    pub(crate) fn publication_test(
+        catalog: &Catalog,
+        event: Event,
+        behavior: TestPublication,
+    ) -> Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let (command_sender, command_receiver) = mpsc::sync_channel(0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = thread::Builder::new()
+            .name("catalog-publication-test".into())
+            .spawn(move || {
+                let run = (|| -> Result<()> {
+                    sender
+                        .send(event)
+                        .map_err(|_| anyhow::anyhow!("publication test receiver closed"))?;
+                    match behavior {
+                        TestPublication::RejectInspection => {
+                            let Command::ValidateInspection(reply) = command_receiver.recv()?
+                            else {
+                                anyhow::bail!("expected inspection validation")
+                            };
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "sidecar changed before catalog commit"
+                            )));
+                        }
+                        TestPublication::RejectFile => {
+                            let Command::ValidateFile(reply) = command_receiver.recv()? else {
+                                anyhow::bail!("expected file validation")
+                            };
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "original changed before catalog commit"
+                            )));
+                        }
+                        TestPublication::LoseFileRelease => {
+                            let grant = crate::catalog_session::LeaseId::new();
+                            let Command::ValidateFile(reply) = command_receiver.recv()? else {
+                                anyhow::bail!("expected file validation")
+                            };
+                            reply
+                                .send(Ok(grant.clone()))
+                                .map_err(|_| anyhow::anyhow!("validation receiver closed"))?;
+                            let Command::ReleaseFile {
+                                grant: actual,
+                                reply,
+                            } = command_receiver.recv()?
+                            else {
+                                anyhow::bail!("expected file release")
+                            };
+                            ensure!(actual == grant, "release grant changed");
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("lost release acknowledgement")));
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = run {
+                    panic!("publication test worker failed: {error:#}");
+                }
+            })?;
+        Ok(Self {
+            session: catalog.session.clone(),
+            receiver: Some(receiver),
+            cancel,
+            thread: Some(worker),
+            commands: Some(command_sender),
+            managed: true,
+            cleanup: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
     pub(crate) fn spawn(
         catalog: &Catalog,
         source: &Path,
@@ -156,7 +239,7 @@ impl Preparation {
     pub(crate) fn finish(&mut self) -> Result<()> {
         if self.managed
             && self.thread.is_some()
-            && let Err(error) = self.command(CommandKind::Retire)
+            && let Err(error) = self.unit_command(Command::Retire)
         {
             self.request_cancel();
             self.join_thread()?;
@@ -172,45 +255,64 @@ impl Preparation {
         self.join_thread()?;
         self.retry_cleanup()
     }
-    fn command(&self, kind: CommandKind) -> Result<()> {
+    fn send_command(&self, command: Command) -> Result<()> {
         ensure!(
             self.managed,
             "managed import command used by legacy preparation"
         );
-        let (tx, rx) = mpsc::sync_channel(0);
-        let command = match kind {
-            CommandKind::InspectionCommitted => Command::InspectionCommitted(tx),
-            CommandKind::Recheck => Command::Recheck(tx),
-            CommandKind::FileCommitted => Command::FileCommitted(tx),
-            CommandKind::Retire => Command::Retire(tx),
-        };
         self.commands
             .as_ref()
             .context("managed import commands stopped")?
             .send(command)
-            .map_err(|_| anyhow::anyhow!("managed import owner stopped"))?;
+            .map_err(|_| anyhow::anyhow!("managed import owner stopped"))
+    }
+    fn unit_command(
+        &self,
+        command: impl FnOnce(mpsc::SyncSender<Result<()>>) -> Command,
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.send_command(command(tx))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("managed import acknowledgement lost"))?
     }
-    pub(crate) fn inspection_committed(&self) -> Result<()> {
+    pub(crate) fn validate_inspection(&self) -> Result<Option<crate::catalog_session::LeaseId>> {
         if self.managed {
-            self.command(CommandKind::InspectionCommitted)
+            let (tx, rx) = mpsc::sync_channel(0);
+            self.send_command(Command::ValidateInspection(tx))?;
+            Ok(Some(rx.recv().map_err(|_| {
+                anyhow::anyhow!("managed import validation acknowledgement lost")
+            })??))
         } else {
-            Ok(())
+            Ok(None)
         }
     }
-    pub(crate) fn recheck_current(&self) -> Result<()> {
-        if self.managed {
-            self.command(CommandKind::Recheck)
-        } else {
-            Ok(())
+    pub(crate) fn release_inspection(
+        &self,
+        grant: Option<crate::catalog_session::LeaseId>,
+    ) -> Result<()> {
+        match grant {
+            Some(grant) => self.unit_command(|reply| Command::ReleaseInspection { grant, reply }),
+            None => Ok(()),
         }
     }
-    pub(crate) fn file_committed(&self) -> Result<()> {
+    pub(crate) fn validate_file(&self) -> Result<Option<crate::catalog_session::LeaseId>> {
         if self.managed {
-            self.command(CommandKind::FileCommitted)
+            let (tx, rx) = mpsc::sync_channel(0);
+            self.send_command(Command::ValidateFile(tx))?;
+            Ok(Some(rx.recv().map_err(|_| {
+                anyhow::anyhow!("managed import validation acknowledgement lost")
+            })??))
         } else {
-            Ok(())
+            Ok(None)
+        }
+    }
+    pub(crate) fn release_file(
+        &self,
+        grant: Option<crate::catalog_session::LeaseId>,
+    ) -> Result<()> {
+        match grant {
+            Some(grant) => self.unit_command(|reply| Command::ReleaseFile { grant, reply }),
+            None => Ok(()),
         }
     }
     pub(crate) fn request_cancel(&mut self) {
@@ -521,7 +623,8 @@ impl Reference {
         &mut self,
         catalog: &mut Catalog,
         source: &PreparedImportSource,
-    ) -> Result<()> {
+        preparation: &Preparation,
+    ) -> Result<Option<crate::catalog_session::LeaseId>> {
         let _write = catalog
             .writers
             .enter(crate::catalog_writer::Priority::Background)?;
@@ -534,21 +637,36 @@ impl Reference {
                 source.source.locator == location_bytes(&self.path),
                 "embedded source path differs"
             );
-        } else {
+        }
+        let grant = preparation.validate_inspection()?;
+        let (changed, warning) = catalog_metadata::apply_import_source(&tx, &self.asset, source)?;
+        persist_import_receipt(
+            &tx,
+            &self.asset,
+            "metadata",
+            grant.as_ref(),
+            &source.source.locator,
+        )?;
+        tx.commit()?;
+        if source.source.kind != "embedded" {
             self.seen.insert(source.source.locator.clone());
         }
-        let (changed, warning) = catalog_metadata::apply_import_source(&tx, &self.asset, source)?;
-        tx.commit()?;
         self.changed |= changed;
         self.warnings += u64::from(warning);
-        Ok(())
+        Ok(grant)
     }
     pub(crate) fn finish(
         mut self,
         catalog: &mut Catalog,
         service: &mut PreviewService,
-    ) -> Result<(Option<preview::Consumer>, bool, u64)> {
-        {
+        preparation: &Preparation,
+    ) -> Result<(
+        Option<preview::Consumer>,
+        bool,
+        u64,
+        Option<crate::catalog_session::LeaseId>,
+    )> {
+        let grant = {
             let _write = catalog
                 .writers
                 .enter(crate::catalog_writer::Priority::Background)?;
@@ -556,9 +674,18 @@ impl Reference {
                 .db
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             self.check(&tx)?;
+            let grant = preparation.validate_file()?;
             self.changed |= catalog_metadata::finish_import_sources(&tx, &self.asset, &self.seen)?;
+            persist_import_receipt(
+                &tx,
+                &self.asset,
+                "file",
+                grant.as_ref(),
+                &location_bytes(&self.path),
+            )?;
             tx.commit()?;
-        }
+            grant
+        };
         let consumer = if self.ready {
             let key = VariantKey::master(&self.asset);
             if service
@@ -577,7 +704,7 @@ impl Reference {
         } else {
             Some(service.submit_import(catalog, &self.asset, &self.path, &self.fingerprint)?)
         };
-        Ok((consumer, self.changed, self.warnings))
+        Ok((consumer, self.changed, self.warnings, grant))
     }
     pub(crate) fn fail(&self, catalog: &mut Catalog, reason: &str) -> Result<()> {
         if !self.ready {
@@ -586,6 +713,32 @@ impl Reference {
         }
         Ok(())
     }
+}
+
+fn persist_import_receipt(
+    tx: &rusqlite::Transaction<'_>,
+    asset: &str,
+    phase: &str,
+    grant: Option<&crate::catalog_session::LeaseId>,
+    source_locator: &[u8],
+) -> Result<()> {
+    let Some(grant) = grant else { return Ok(()) };
+    let revision = catalog_metadata::revision(tx, asset)?;
+    tx.execute(
+        "INSERT INTO metadata_history(asset_id,revision,action,detail) VALUES(?1,?2,'import_filesystem_receipt',?3)",
+        params![
+            asset,
+            revision,
+            serde_json::json!({
+                "version": 1,
+                "phase": phase,
+                "grant": grant.as_str(),
+                "source_locator_digest": blake3::hash(source_locator).to_hex().to_string(),
+            })
+            .to_string()
+        ],
+    )?;
+    Ok(())
 }
 
 /// One selected-file read slot, independent of the folder walk. No directory
@@ -677,14 +830,6 @@ impl SinglePreparation {
         Ok(None)
     }
 }
-#[derive(Clone, Copy)]
-enum CommandKind {
-    InspectionCommitted,
-    Recheck,
-    FileCommitted,
-    Retire,
-}
-
 struct RemoteImport {
     session: Arc<crate::catalog_session::CatalogSessionAuthority>,
     root: crate::catalog_session::RootCapability,
@@ -803,6 +948,28 @@ impl RemoteImport {
             .context("managed import step exhausted")?;
         self.observe(&reply.value);
         Ok(Some(reply.value))
+    }
+    /// A committed C receipt may only be followed by exact replay of its release.
+    /// Recover one lost reply here so callers never mistake an acknowledged
+    /// catalog commit for a fresh, fallible filesystem validation.
+    fn release(
+        &mut self,
+        action: crate::catalog_session::import::Action,
+    ) -> Result<crate::catalog_session::import::Value> {
+        match self.call(action, &AtomicBool::new(false)) {
+            Ok(value) => Ok(value),
+            Err(first) if self.pending.is_some() => match self.reconcile() {
+                Ok(Some(crate::catalog_session::import::Value::Failed(failure))) => {
+                    Err(anyhow::Error::new(failure))
+                }
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => Err(first),
+                Err(error) => Err(error).context(format!(
+                    "reconcile committed import release after lost reply: {first:#}"
+                )),
+            },
+            Err(error) => Err(error),
+        }
     }
     fn abort(&mut self) -> Result<()> {
         if self.pending.is_none() && !self.active {
@@ -1013,80 +1180,104 @@ fn prepare_managed(
                             _ => anyhow::bail!("managed inspection begin reply mismatch"),
                         };
                         send(sender, cancel, Event::Source(Box::new(prepared)))?;
-                        let Command::InspectionCommitted(reply) =
-                            commands.recv().map_err(|_| {
-                                anyhow::anyhow!(
-                                    "managed import inspection acknowledgement channel closed"
-                                )
-                            })?
+                        let Command::ValidateInspection(reply) = commands.recv().map_err(|_| {
+                            anyhow::anyhow!("managed import inspection validation channel closed")
+                        })?
                         else {
                             anyhow::bail!("managed import command ordering mismatch")
                         };
                         let result = remote
                             .call(
-                                crate::catalog_session::import::Action::CommitInspection,
+                                crate::catalog_session::import::Action::ValidateInspection,
                                 &AtomicBool::new(false),
                             )
+                            .and_then(|value| {
+                                let crate::catalog_session::import::Value::InspectionValidated {
+                                    grant,
+                                } = value
+                                else {
+                                    anyhow::bail!("managed inspection validation reply mismatch")
+                                };
+                                Ok(grant)
+                            });
+                        let failed = result.is_err();
+                        let _ = reply.send(result);
+                        ensure!(!failed, "managed inspection validation failed");
+                        let Command::ReleaseInspection { grant, reply } =
+                            commands.recv().map_err(|_| {
+                                anyhow::anyhow!("managed import inspection release channel closed")
+                            })?
+                        else {
+                            anyhow::bail!("managed import command ordering mismatch")
+                        };
+                        let result = remote
+                            .release(crate::catalog_session::import::Action::ReleaseInspection {
+                                grant: grant.clone(),
+                            })
                             .and_then(|value| {
                                 ensure!(
                                     matches!(
                                         value,
-                                        crate::catalog_session::import::Value::InspectionCommitted
+                                        crate::catalog_session::import::Value::InspectionReleased {
+                                            grant: actual
+                                        } if actual == grant
                                     ),
-                                    "managed inspection commit reply mismatch"
+                                    "managed inspection release reply mismatch"
                                 );
                                 Ok(())
                             });
                         let failed = result.is_err();
                         let _ = reply.send(result);
-                        ensure!(!failed, "managed inspection commit failed");
+                        ensure!(!failed, "managed inspection release failed");
                     }
                     send(sender, cancel, Event::End)?;
-                    let Command::Recheck(reply) = commands
+                    let Command::ValidateFile(reply) = commands
                         .recv()
-                        .map_err(|_| anyhow::anyhow!("managed import recheck channel closed"))?
+                        .map_err(|_| anyhow::anyhow!("managed import validation channel closed"))?
                     else {
                         anyhow::bail!("managed import command ordering mismatch")
                     };
                     let result = remote
                         .call(
-                            crate::catalog_session::import::Action::Recheck,
+                            crate::catalog_session::import::Action::ValidateFile,
                             &AtomicBool::new(false),
                         )
                         .and_then(|value| {
-                            ensure!(
-                                matches!(value, crate::catalog_session::import::Value::Rechecked),
-                                "managed import recheck reply mismatch"
-                            );
-                            Ok(())
+                            let crate::catalog_session::import::Value::FileValidated { grant } =
+                                value
+                            else {
+                                anyhow::bail!("managed import validation reply mismatch")
+                            };
+                            Ok(grant)
                         });
                     let failed = result.is_err();
                     let _ = reply.send(result);
-                    ensure!(!failed, "managed import recheck failed");
-                    let Command::FileCommitted(reply) = commands
+                    ensure!(!failed, "managed import validation failed");
+                    let Command::ReleaseFile { grant, reply } = commands
                         .recv()
-                        .map_err(|_| anyhow::anyhow!("managed import commit channel closed"))?
+                        .map_err(|_| anyhow::anyhow!("managed import release channel closed"))?
                     else {
                         anyhow::bail!("managed import command ordering mismatch")
                     };
                     let result = remote
-                        .call(
-                            crate::catalog_session::import::Action::CommitFile,
-                            &AtomicBool::new(false),
-                        )
+                        .release(crate::catalog_session::import::Action::ReleaseFile {
+                            grant: grant.clone(),
+                        })
                         .and_then(|value| {
                             ensure!(
                                 matches!(
                                     value,
-                                    crate::catalog_session::import::Value::FileCommitted
+                                    crate::catalog_session::import::Value::FileReleased {
+                                        grant: actual
+                                    } if actual == grant
                                 ),
-                                "managed import commit reply mismatch"
+                                "managed import release reply mismatch"
                             );
                             Ok(())
                         });
                     let failed = result.is_err();
                     let _ = reply.send(result);
-                    ensure!(!failed, "managed import commit failed");
+                    ensure!(!failed, "managed import release failed");
                 }
                 crate::catalog_session::import::Value::WalkFinished => {
                     send(sender, cancel, Event::Finished)?;

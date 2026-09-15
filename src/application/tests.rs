@@ -817,6 +817,186 @@ fn checked_shutdown_returns_failed_drain_and_retries_same_actor() -> Result<()> 
     Ok(())
 }
 
+fn publication_actor(
+    base: &std::path::Path,
+    event: crate::import_preparation::Event,
+    behavior: crate::import_preparation::TestPublication,
+    reference: crate::import_preparation::Reference,
+) -> Result<(Bridge, Actor)> {
+    let bridge = disconnected();
+    let mut actor = Actor::new(
+        Config {
+            worker_executable: std::env::current_exe()?,
+            cache_root: None,
+            original_roots: vec![base.join("originals")],
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        },
+        bridge.0.shared.clone(),
+    );
+    actor.command(
+        Request::OpenExisting {
+            path: NativePath::from_path(&base.join("catalog")),
+        },
+        &Cancellation::default(),
+    )?;
+    let open = actor.open.as_mut().unwrap();
+    let preparation =
+        crate::import_preparation::Preparation::publication_test(&open.catalog, event, behavior)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    open.import = Some(ImportTask {
+        import_lock: None,
+        preparation: Some(preparation),
+        reference: Some(reference),
+        status: ImportStatus {
+            id: id.clone(),
+            source: NativePath::from_path(&base.join("originals")),
+            phase: ImportPhase::Discovering,
+            imported: U64(0),
+            unchanged: U64(0),
+            failed: U64(0),
+            skipped: U64(0),
+            metadata_updated: U64(0),
+            metadata_warnings: U64(0),
+            awaiting_resources: U64(0),
+            pending_previews: 0,
+            error: None,
+            error_source: None,
+        },
+        consumers: Vec::new(),
+        cancel: Cancellation::default(),
+        discovery_finished: false,
+        failure: false,
+    });
+    Ok((bridge, actor))
+}
+
+fn publication_fixture(
+    base: &std::path::Path,
+) -> Result<(crate::import_preparation::Reference, PathBuf, String)> {
+    let originals = base.join("originals");
+    std::fs::create_dir(&originals)?;
+    let originals = originals.canonicalize()?;
+    let path = originals.join("source.png");
+    image::RgbImage::from_pixel(16, 12, image::Rgb([20u8, 40, 70])).save(&path)?;
+    let mut catalog = Catalog::open(base.join("catalog"))?;
+    let mut volumes = crate::import_storage::ImportVolumes::new();
+    let observation = volumes.observe(&path)?;
+    let reference = crate::import_preparation::Reference::begin(
+        &mut catalog,
+        crate::import_preparation::Header {
+            path: path.clone(),
+            fingerprint: crate::fingerprint(&path)?,
+            observation,
+        },
+    )?;
+    let asset = catalog.db.query_row(
+        "SELECT id FROM assets WHERE location=?1",
+        [crate::location_bytes(&path)],
+        |row| row.get(0),
+    )?;
+    Ok((reference, path, asset))
+}
+
+fn publication_counts(catalog: &Catalog, asset: &str) -> Result<(i64, i64, i64, i64)> {
+    Ok((
+        catalog.db.query_row(
+            "SELECT count(*) FROM metadata_sources WHERE asset_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+        catalog.db.query_row(
+            "SELECT count(*) FROM metadata_image_observations WHERE image_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+        catalog.db.query_row(
+            "SELECT count(*) FROM edit_variants WHERE asset_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+        catalog.db.query_row(
+            "SELECT count(*) FROM metadata_history WHERE asset_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+    ))
+}
+
+#[test]
+fn actor_rejects_stale_sidecar_and_original_before_publication() -> Result<()> {
+    for sidecar in [true, false] {
+        let root = tempfile::tempdir()?;
+        let (reference, path, asset) = publication_fixture(root.path())?;
+        let catalog = Catalog::open(root.path().join("catalog"))?;
+        let before = publication_counts(&catalog, &asset)?;
+        drop(catalog);
+        let (event, behavior) = if sidecar {
+            let sidecar_path = path.with_extension("xmp");
+            let prepared = crate::catalog_metadata::prepare_import_failure(
+                crate::catalog_metadata::Source {
+                    kind: "sidecar".into(),
+                    locator: crate::location_bytes(&sidecar_path),
+                    display: sidecar_path.to_string_lossy().into_owned(),
+                    ambiguous: false,
+                    provenance: serde_json::json!({"fixture":"stale-before-commit"}),
+                },
+                "unreadable fixture".into(),
+                &AtomicBool::new(false),
+            )?;
+            (
+                crate::import_preparation::Event::Source(Box::new(prepared)),
+                crate::import_preparation::TestPublication::RejectInspection,
+            )
+        } else {
+            (
+                crate::import_preparation::Event::End,
+                crate::import_preparation::TestPublication::RejectFile,
+            )
+        };
+        let (_bridge, mut actor) = publication_actor(root.path(), event, behavior, reference)?;
+        actor.maintain();
+        let open = actor.open.as_ref().unwrap();
+        let import = open.import.as_ref().unwrap();
+        assert!(import.failure && import.consumers.is_empty());
+        assert_eq!(publication_counts(&open.catalog, &asset)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn actor_lost_postcommit_release_cancels_consumer_and_keeps_receipt() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (reference, _path, asset) = publication_fixture(root.path())?;
+    let (_bridge, mut actor) = publication_actor(
+        root.path(),
+        crate::import_preparation::Event::End,
+        crate::import_preparation::TestPublication::LoseFileRelease,
+        reference,
+    )?;
+    actor.maintain();
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert!(import.failure && import.consumers.is_empty());
+    let receipts: i64 = open.catalog.db.query_row(
+        "SELECT count(*) FROM metadata_history WHERE asset_id=?1 AND action='import_filesystem_receipt'",
+        [&asset],
+        |row| row.get(0),
+    )?;
+    assert_eq!(receipts, 1);
+    let state: String =
+        open.catalog
+            .db
+            .query_row("SELECT state FROM assets WHERE id=?1", [&asset], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(state, "pending");
+    assert_eq!(open.service.scheduler_usage().reserved_bytes, 0);
+    Ok(())
+}
+
 #[test]
 fn checked_shutdown_reports_owner_panic_on_every_retry() {
     let bridge = disconnected();

@@ -34,9 +34,10 @@ pub enum Action {
     Inspect { source: Source },
     Read { offset: U64 },
     FinishInspection,
-    CommitInspection,
-    Recheck,
-    CommitFile,
+    ValidateInspection,
+    ReleaseInspection { grant: LeaseId },
+    ValidateFile,
+    ReleaseFile { grant: LeaseId },
     Finish,
     Abort,
 }
@@ -143,9 +144,18 @@ pub enum Value {
         bytes: Vec<u8>,
     },
     InspectionFinished,
-    InspectionCommitted,
-    Rechecked,
-    FileCommitted,
+    InspectionValidated {
+        grant: LeaseId,
+    },
+    InspectionReleased {
+        grant: LeaseId,
+    },
+    FileValidated {
+        grant: LeaseId,
+    },
+    FileReleased {
+        grant: LeaseId,
+    },
     WalkFinished,
     Finished,
     Aborted,
@@ -209,9 +219,10 @@ impl Reply {
             | (Action::Inspect { .. }, Value::Inspection { .. } | Value::InspectionFailed { .. })
             | (Action::Read { .. }, Value::Chunk { .. })
             | (Action::FinishInspection, Value::InspectionFinished)
-            | (Action::CommitInspection, Value::InspectionCommitted)
-            | (Action::Recheck, Value::Rechecked)
-            | (Action::CommitFile, Value::FileCommitted)
+            | (Action::ValidateInspection, Value::InspectionValidated { .. })
+            | (Action::ReleaseInspection { .. }, Value::InspectionReleased { .. })
+            | (Action::ValidateFile, Value::FileValidated { .. })
+            | (Action::ReleaseFile { .. }, Value::FileReleased { .. })
             | (Action::Finish, Value::Finished)
             | (Action::Abort, Value::Aborted) => {}
             _ => anyhow::bail!("unexpected import reply"),
@@ -297,6 +308,16 @@ impl Reply {
                 blake3::hash(bytes).to_hex().as_str() == checksum,
                 "inspection chunk checksum"
             );
+        }
+        match (&request.action, &self.value) {
+            (
+                Action::ReleaseInspection { grant: expected },
+                Value::InspectionReleased { grant },
+            )
+            | (Action::ReleaseFile { grant: expected }, Value::FileReleased { grant }) => {
+                ensure!(grant == expected, "import release grant mismatch");
+            }
+            _ => {}
         }
         crate::filesystem_worker::wire::encode(
             self,

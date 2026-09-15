@@ -65,6 +65,7 @@ struct Current {
     directory_path: PathBuf,
     directory_guard: File,
     directory_identity: DirectoryIdentity,
+    grant: Option<LeaseId>,
 }
 struct Inspection {
     path: PathBuf,
@@ -73,6 +74,7 @@ struct Inspection {
     checksum: String,
     offset: usize,
     delivered: bool,
+    grant: Option<LeaseId>,
 }
 struct Directory {
     path: PathBuf,
@@ -174,6 +176,7 @@ impl Owner {
         request.validate()?;
         let digest = request.digest()?;
         if let Some(active) = &self.active
+            && active.transfer == request.transfer
             && let Some((step, previous, reply)) = &active.last
             && *step == request.step.0
         {
@@ -276,7 +279,12 @@ impl Owner {
                     "managed import transfer mismatch"
                 );
                 let result = (|| -> Result<protocol::Value> {
-                    if !matches!(action, protocol::Action::Abort) {
+                    if !matches!(
+                        action,
+                        protocol::Action::Abort
+                            | protocol::Action::ReleaseInspection { .. }
+                            | protocol::Action::ReleaseFile { .. }
+                    ) {
                         recheck_directory(
                             &active.source,
                             &active.source_directory,
@@ -288,21 +296,27 @@ impl Owner {
                         protocol::Action::Inspect { source } => inspect(active, source, cancel)?,
                         protocol::Action::Read { offset } => read(active, offset.0, cancel)?,
                         protocol::Action::FinishInspection => finish_inspection(active, cancel)?,
-                        protocol::Action::CommitInspection => commit_inspection(active)?,
-                        protocol::Action::Recheck => {
+                        protocol::Action::ValidateInspection => validate_inspection(active)?,
+                        protocol::Action::ReleaseInspection { grant } => {
+                            release_inspection(active, grant)?
+                        }
+                        protocol::Action::ValidateFile => {
                             let current = active
                                 .current
-                                .as_ref()
+                                .as_mut()
                                 .context("no current import source")?;
+                            ensure!(current.grant.is_none(), "file already has a commit grant");
                             recheck(&current.path, &current.file, &current.stamp)?;
                             recheck_directory(
                                 &current.directory_path,
                                 &current.directory_guard,
                                 current.directory_identity,
                             )?;
-                            protocol::Value::Rechecked
+                            let grant = LeaseId::new();
+                            current.grant = Some(grant.clone());
+                            protocol::Value::FileValidated { grant }
                         }
-                        protocol::Action::CommitFile => {
+                        protocol::Action::ReleaseFile { grant } => {
                             ensure!(
                                 active.inspection.is_none(),
                                 "metadata inspection remains uncommitted"
@@ -311,14 +325,13 @@ impl Owner {
                                 .current
                                 .as_ref()
                                 .context("no current import source")?;
-                            recheck(&current.path, &current.file, &current.stamp)?;
-                            recheck_directory(
-                                &current.directory_path,
-                                &current.directory_guard,
-                                current.directory_identity,
-                            )?;
+                            ensure!(
+                                current.grant.as_ref() == Some(grant),
+                                "file commit grant mismatch"
+                            );
+                            let grant = grant.clone();
                             active.current = None;
-                            protocol::Value::FileCommitted
+                            protocol::Value::FileReleased { grant }
                         }
                         protocol::Action::Finish => {
                             ensure!(
@@ -577,6 +590,7 @@ fn header(active: &mut Active, path: PathBuf, cancel: &AtomicBool) -> Result<pro
         directory_path,
         directory_guard,
         directory_identity,
+        grant: None,
     });
     Ok(protocol::Value::Header {
         path: NativePath::from_path(&path),
@@ -636,6 +650,7 @@ fn inspect(
                 checksum: String::new(),
                 offset: 0,
                 delivered: true,
+                grant: None,
             });
             return Ok(protocol::Value::InspectionFailed {
                 source: source.clone(),
@@ -660,6 +675,7 @@ fn inspect(
                 checksum: String::new(),
                 offset: 0,
                 delivered: true,
+                grant: None,
             });
             return Ok(protocol::Value::InspectionFailed {
                 source: source.clone(),
@@ -679,6 +695,7 @@ fn inspect(
         checksum: checksum.clone(),
         offset: 0,
         delivered: false,
+        grant: None,
     });
     Ok(protocol::Value::Inspection {
         source: source.clone(),
@@ -730,14 +747,18 @@ fn finish_inspection(active: &mut Active, cancel: &AtomicBool) -> Result<protoco
     inspection.delivered = true;
     Ok(protocol::Value::InspectionFinished)
 }
-fn commit_inspection(active: &mut Active) -> Result<protocol::Value> {
+fn validate_inspection(active: &mut Active) -> Result<protocol::Value> {
     let inspection = active
         .inspection
-        .as_ref()
+        .as_mut()
         .context("metadata inspection is not retained")?;
     ensure!(
         inspection.delivered,
         "metadata inspection was not delivered"
+    );
+    ensure!(
+        inspection.grant.is_none(),
+        "metadata inspection already has a commit grant"
     );
     if let Some((guard, stamp)) = &inspection.guard {
         recheck(&inspection.path, guard, stamp)?;
@@ -747,8 +768,22 @@ fn commit_inspection(active: &mut Active) -> Result<protocol::Value> {
             "unavailable sidecar became readable before catalog acknowledgement"
         );
     }
+    let grant = LeaseId::new();
+    inspection.grant = Some(grant.clone());
+    Ok(protocol::Value::InspectionValidated { grant })
+}
+fn release_inspection(active: &mut Active, grant: &LeaseId) -> Result<protocol::Value> {
+    let inspection = active
+        .inspection
+        .as_ref()
+        .context("metadata inspection is not retained")?;
+    ensure!(
+        inspection.grant.as_ref() == Some(grant),
+        "metadata inspection commit grant mismatch"
+    );
+    let grant = grant.clone();
     active.inspection = None;
-    Ok(protocol::Value::InspectionCommitted)
+    Ok(protocol::Value::InspectionReleased { grant })
 }
 
 #[cfg(test)]
@@ -770,6 +805,8 @@ mod tests {
             let originals = temp.path().join("originals");
             fs::create_dir(&catalog)?;
             fs::create_dir(&originals)?;
+            let catalog = catalog.canonicalize()?;
+            let originals = originals.canonicalize()?;
             let database = catalog.join("catalog.sqlite3");
             fs::write(&database, b"fixture")?;
             let root_file = super::super::bootstrap::open_directory(&catalog)?;
@@ -1088,18 +1125,8 @@ mod tests {
             next_header(&mut owner, &fixture, &transfer, &mut step)?,
             original
         );
-        ensure!(matches!(
-            call(
-                &mut owner,
-                &fixture,
-                &transfer,
-                &mut step,
-                protocol::Action::Recheck
-            )?,
-            protocol::Value::Rechecked
-        ));
         fs::write(&original, b"changed revision")?;
-        let commit = fixture.request(&transfer, step, protocol::Action::CommitFile);
+        let commit = fixture.request(&transfer, step, protocol::Action::ValidateFile);
         assert!(matches!(
             owner
                 .call(
@@ -1123,6 +1150,76 @@ mod tests {
             protocol::Value::Aborted
         ));
         assert!(owner.empty());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_file_release_is_exact_replay_without_new_source_validation() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let original = fixture.originals.join("image.jpg");
+        fs::write(&original, b"validated revision")?;
+        let mut owner = Owner::default();
+        let transfer = LeaseId::new();
+        let mut step = 0;
+        begin(&mut owner, &fixture, &transfer, &mut step)?;
+        assert_eq!(
+            next_header(&mut owner, &fixture, &transfer, &mut step)?,
+            original
+        );
+        let grant = match call(
+            &mut owner,
+            &fixture,
+            &transfer,
+            &mut step,
+            protocol::Action::ValidateFile,
+        )? {
+            protocol::Value::FileValidated { grant } => grant,
+            value => anyhow::bail!("unexpected file validation: {value:?}"),
+        };
+
+        // C has committed the durable grant receipt. The release cannot turn
+        // later external mutation into a rejection of that committed snapshot.
+        fs::write(&original, b"mutation after grant")?;
+        let request = fixture.request(
+            &transfer,
+            step,
+            protocol::Action::ReleaseFile {
+                grant: grant.clone(),
+            },
+        );
+        let first = owner.call(
+            &fixture.catalog,
+            &fixture.originals(),
+            &request,
+            &AtomicBool::new(false),
+        )?;
+        assert!(matches!(
+            &first.value,
+            protocol::Value::FileReleased { grant: actual } if actual == &grant
+        ));
+        assert!(owner.active.as_ref().unwrap().current.is_none());
+        let replay = owner.call(
+            &fixture.catalog,
+            &fixture.originals(),
+            &request,
+            &AtomicBool::new(false),
+        )?;
+        assert_eq!(first.request_digest, replay.request_digest);
+        assert!(matches!(
+            replay.value,
+            protocol::Value::FileReleased { grant: actual } if actual == grant
+        ));
+        step += 1;
+        ensure!(matches!(
+            call(
+                &mut owner,
+                &fixture,
+                &transfer,
+                &mut step,
+                protocol::Action::Abort
+            )?,
+            protocol::Value::Aborted
+        ));
         Ok(())
     }
 
@@ -1224,16 +1321,83 @@ mod tests {
             )?,
             protocol::Value::InspectionFailed { .. }
         ));
+        let grant = match call(
+            &mut owner,
+            &fixture,
+            &transfer,
+            &mut step,
+            protocol::Action::ValidateInspection,
+        )? {
+            protocol::Value::InspectionValidated { grant } => grant,
+            value => anyhow::bail!("unexpected inspection validation: {value:?}"),
+        };
         ensure!(matches!(
             call(
                 &mut owner,
                 &fixture,
                 &transfer,
                 &mut step,
-                protocol::Action::CommitInspection
+                protocol::Action::ReleaseInspection { grant }
             )?,
-            protocol::Value::InspectionCommitted
+            protocol::Value::InspectionReleased { .. }
         ));
+        ensure!(matches!(
+            call(
+                &mut owner,
+                &fixture,
+                &transfer,
+                &mut step,
+                protocol::Action::Abort
+            )?,
+            protocol::Value::Aborted
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn sidecar_replacement_before_validation_rejects_without_releasing_custody() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let original = fixture.originals.join("image.jpg");
+        let sidecar = fixture.originals.join("image.xmp");
+        fs::write(&original, b"original")?;
+        fs::write(&sidecar, b"malformed but retained revision")?;
+        let mut owner = Owner::default();
+        let transfer = LeaseId::new();
+        let mut step = 0;
+        begin(&mut owner, &fixture, &transfer, &mut step)?;
+        next_header(&mut owner, &fixture, &transfer, &mut step)?;
+        let source = crate::catalog_metadata::Source {
+            kind: "sidecar".into(),
+            locator: crate::location_bytes(&sidecar),
+            display: sidecar.to_string_lossy().into_owned(),
+            ambiguous: false,
+            provenance: serde_json::json!({"fixture":true}),
+        };
+        ensure!(matches!(
+            call(
+                &mut owner,
+                &fixture,
+                &transfer,
+                &mut step,
+                protocol::Action::Inspect { source }
+            )?,
+            protocol::Value::InspectionFailed { .. }
+        ));
+        fs::write(&sidecar, b"replacement revision")?;
+        let validation = fixture.request(&transfer, step, protocol::Action::ValidateInspection);
+        assert!(matches!(
+            owner
+                .call(
+                    &fixture.catalog,
+                    &fixture.originals(),
+                    &validation,
+                    &AtomicBool::new(false)
+                )?
+                .value,
+            protocol::Value::Failed(_)
+        ));
+        assert!(owner.active.as_ref().unwrap().inspection.is_some());
+        step += 1;
         ensure!(matches!(
             call(
                 &mut owner,

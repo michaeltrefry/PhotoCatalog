@@ -3096,35 +3096,34 @@ impl Actor {
                             )?);
                         }
                         Event::Source(source) => {
-                            import
+                            let preparation = import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?;
+                            let grant = import
                                 .reference
                                 .as_mut()
                                 .context("metadata without import reference")?
-                                .source(&mut o.catalog, &source)?;
-                            import
-                                .preparation
-                                .as_ref()
-                                .context("missing source preparation")?
-                                .inspection_committed()?;
+                                .source(&mut o.catalog, &source, preparation)?;
+                            if let Err(error) = preparation.release_inspection(grant) {
+                                // The transaction contains the exact receipt. Do
+                                // not relabel that committed snapshot as rejected.
+                                import.reference = None;
+                                return Err(error);
+                            }
                         }
                         Event::End => {
-                            import
+                            let preparation = import
                                 .preparation
                                 .as_ref()
-                                .context("missing source preparation")?
-                                .recheck_current()?;
+                                .context("missing source preparation")?;
                             let reference = import
                                 .reference
                                 .take()
                                 .context("missing import reference")?;
                             let path = reference.source_path();
-                            let (consumer, changed, warnings) =
-                                reference.finish(&mut o.catalog, &mut o.service)?;
-                            import
-                                .preparation
-                                .as_ref()
-                                .context("missing source preparation")?
-                                .file_committed()?;
+                            let (consumer, changed, warnings, grant) =
+                                reference.finish(&mut o.catalog, &mut o.service, preparation)?;
                             import.status.metadata_updated.0 += u64::from(changed);
                             import.status.metadata_warnings.0 += warnings;
                             if let Some(consumer) = consumer {
@@ -3132,6 +3131,7 @@ impl Actor {
                             } else {
                                 import.status.unchanged.0 += 1;
                             }
+                            preparation.release_file(grant)?;
                             if import.status.error.is_none() {
                                 import.status.error_source = None;
                             }
