@@ -10,6 +10,7 @@ mod hydration;
 pub mod lightroom;
 pub mod lightroom_bridge;
 pub mod lightroom_migration;
+pub mod lightroom_process;
 pub mod metadata;
 pub mod metadata_write;
 pub mod organization;
