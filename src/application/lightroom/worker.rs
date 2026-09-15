@@ -91,7 +91,7 @@ pub(super) fn run(
     shared: Arc<Mutex<Shared>>,
     closing: Arc<AtomicBool>,
     managed: Option<Arc<dyn ManagedIo>>,
-) {
+) -> Result<()> {
     let (initial, initial_generation, control) = {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -103,14 +103,15 @@ pub(super) fn run(
     let opened = (|| -> Result<Owner> {
         control.check()?;
         let (root, pin, root_identity, plan) = if let Some(io) = &managed {
+            let opening_workbench = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .status
+                .workbench
+                .clone();
             let request = LightroomWorkbenchIo::RootBegin {
                 operation: initial.clone(),
-                workbench: shared
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .status
-                    .workbench
-                    .clone(),
+                workbench: opening_workbench.clone(),
                 generation: initial_generation.clone(),
                 root: config.root.clone(),
                 create: matches!(config.mode, OpenMode::Create),
@@ -120,13 +121,32 @@ pub(super) fn run(
             let LightroomWorkbenchIoReply::Root { root, physical, .. } = reply else {
                 anyhow::bail!("Workbench root reply kind")
             };
-            let local = native(&root, config.limits.native_path_units)?;
-            let mut plan = if matches!(config.mode, OpenMode::Create) {
-                Plan::create_managed(&local, &physical)?
-            } else {
-                Plan::open_managed(&local, &physical)?
+            let setup = (|| -> Result<Plan> {
+                let local = native(&root, config.limits.native_path_units)?;
+                let mut plan = if matches!(config.mode, OpenMode::Create) {
+                    Plan::create_managed(&local, &physical)?
+                } else {
+                    Plan::open_managed(&local, &physical)?
+                };
+                plan.set_execution(Some(control.clone()));
+                Ok(plan)
+            })();
+            let plan = match setup {
+                Ok(plan) => plan,
+                Err(primary) => {
+                    let release = LightroomWorkbenchIo::RootRelease {
+                        operation: initial.clone(),
+                        workbench: opening_workbench,
+                        generation: initial_generation.clone(),
+                    };
+                    return match io.filesystem(release, &AtomicBool::new(false)) {
+                        Ok(_) => Err(primary),
+                        Err(cleanup) => Err(primary.context(format!(
+                            "managed root startup cleanup also failed: {cleanup:#}"
+                        ))),
+                    };
+                }
             };
-            plan.set_execution(Some(control.clone()));
             (root, None, Some(physical), plan)
         } else {
             let root = native(&config.root, config.limits.native_path_units)?;
@@ -181,15 +201,16 @@ pub(super) fn run(
             owner
         }
         Err(error) => {
+            let detail = error_text(&error);
             finish(
                 &shared,
                 &initial,
                 &initial_generation,
-                Err(error),
+                Err(anyhow::anyhow!(detail.clone())),
                 None,
                 &closing,
             );
-            return;
+            return Err(anyhow::anyhow!(detail));
         }
     };
     while !closing.load(Ordering::Acquire) {
@@ -251,7 +272,7 @@ pub(super) fn run(
         let review = owner.review.as_ref().map(|r| r.summary().token.clone());
         finish(&shared, &operation, &generation, result, review, &closing);
     }
-    owner.close();
+    owner.close()
     // Owner drops Plan/Review first, then identity pin. Any capture subprocess
     // has already dropped/reaped inside action before this point.
 }
@@ -652,12 +673,12 @@ impl Owner {
         }
         Ok(())
     }
-    fn close(&mut self) {
+    fn close(&mut self) -> Result<()> {
         if let Some(review) = self.review.take() {
-            let _ = review.close_checked();
+            review.close_checked()?;
         }
         if let Some(plan) = self.plan.take() {
-            let _ = plan.close_checked();
+            plan.close_checked()?;
         }
         if let Some(io) = &self.managed {
             let request = LightroomWorkbenchIo::RootRelease {
@@ -665,8 +686,14 @@ impl Owner {
                 workbench: self.workbench.clone(),
                 generation: self.generation.clone(),
             };
-            let _ = io.filesystem(request, &AtomicBool::new(false));
+            let reply = io.filesystem(request.clone(), &AtomicBool::new(false))?;
+            reply.validate_for(&request)?;
+            ensure!(
+                matches!(reply, LightroomWorkbenchIoReply::Released { .. }),
+                "Workbench root release reply kind"
+            );
         }
+        Ok(())
     }
     fn plan(&mut self, control: &Control) -> Result<&mut Plan> {
         ensure!(

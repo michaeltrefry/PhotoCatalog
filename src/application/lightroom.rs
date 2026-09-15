@@ -559,11 +559,15 @@ impl Workbench {
                 s.status.closed = true;
                 s.status.capture_pid = None;
                 s.status.review_token = None;
-                if outcome.is_err() {
-                    s.status.error = Some(
-                        "inspection worker panicked; retained artifacts require explicit review"
-                            .into(),
-                    );
+                if !matches!(outcome, Ok(Ok(()))) {
+                    s.status.error = Some(match outcome {
+                        Ok(Err(error)) => format!("{error:#}").chars().take(4096).collect(),
+                        Err(_) => {
+                            "inspection worker panicked; retained artifacts require explicit review"
+                                .into()
+                        }
+                        Ok(Ok(())) => unreachable!(),
+                    });
                     s.status.phase = Phase::Failed;
                 } else {
                     s.status.phase = Phase::Closed;

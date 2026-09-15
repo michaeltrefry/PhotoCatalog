@@ -580,12 +580,24 @@ struct Owner {
     drained: bool,
 }
 impl Owner {
-    fn fail_closed(&mut self) {
-        if let Some(transport) = self.transport.take() {
-            std::mem::forget(transport);
+    fn revoke(&mut self) -> Result<()> {
+        drop(self.transport.take());
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            child.wait()?;
+            self.child.take();
         }
-        if let Some(child) = self.child.take() {
-            std::mem::forget(child);
+        self.drained = true;
+        Ok(())
+    }
+}
+
+struct StartingChild(Option<Child>);
+impl Drop for StartingChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -613,12 +625,17 @@ impl Client {
     ) -> Result<Self> {
         let startup = Startup::new(managed.is_some());
         startup.validate()?;
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg("--lightroom-workbench-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
+        let mut starting = StartingChild(Some(child));
+        let child = starting
+            .0
+            .as_mut()
+            .context("Workbench startup child missing")?;
         let mut input = child.stdin.take().context("Workbench stdin missing")?;
         let mut output = child.stdout.take().context("Workbench stdout missing")?;
         write_packet(&mut input, &startup)?;
@@ -631,6 +648,7 @@ impl Client {
             ),
             "Workbench Ready binding mismatch"
         );
+        let child = starting.0.take().context("Workbench startup owner lost")?;
         Ok(Self {
             instance: startup.instance,
             managed,
@@ -810,10 +828,16 @@ impl Client {
             owner.drained = true;
             Ok(())
         })();
-        if result.is_err() {
-            owner.fail_closed();
+        match result {
+            Ok(()) => Ok(()),
+            Err(primary) => {
+                match owner.revoke() {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(primary
+                        .context(format!("Workbench checked revoke also failed: {cleanup:#}"))),
+                }
+            }
         }
-        result
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -828,10 +852,19 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if self.shutdown().is_err() {
-            self.owner
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .fail_closed();
+            let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+            if owner.revoke().is_err()
+                && let Some(mut child) = owner.child.take()
+            {
+                // Preserve ownership after Client drop; this reaper is the last
+                // resort when a synchronous checked wait itself failed.
+                let _ = std::thread::Builder::new()
+                    .name("workbench-reaper".into())
+                    .spawn(move || {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    });
+            }
         }
     }
 }
