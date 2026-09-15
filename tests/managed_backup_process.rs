@@ -6,13 +6,16 @@ use photocatalog::{
     application::U64,
     catalog_backup::{
         CancellationToken, Limits, Phase,
-        managed::{self, Receipt, Request},
+        managed::{self, ProcessEvent, ProcessTestFault, Receipt, Request},
     },
     catalog_session::PhysicalObjectId,
     storage_volume::NativePath,
 };
 use rusqlite::Connection;
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 fn executable() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_photocatalog"))
@@ -44,6 +47,48 @@ fn actual(db: &Connection) -> Result<PhysicalObjectId> {
         device: U64(identity[0]),
         inode: U64(identity[1]),
     })
+}
+
+fn assert_reaped(pid: u32) {
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+fn process_probe() -> (
+    Arc<Mutex<Vec<ProcessEvent>>>,
+    impl FnMut(ProcessEvent) + Send + 'static,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    (events, move |event| observed.lock().unwrap().push(event))
+}
+
+fn assert_siblings_reaped(events: &[ProcessEvent]) -> (u32, u32) {
+    let (backup, filesystem) = events
+        .iter()
+        .find_map(|event| match event {
+            ProcessEvent::Spawned { backup, filesystem } => Some((*backup, *filesystem)),
+            _ => None,
+        })
+        .expect("spawned process identities");
+    assert!(
+        events
+            .iter()
+            .any(|event| *event == ProcessEvent::BackupReaped { backup }),
+        "backup checked reap"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| *event == ProcessEvent::FilesystemReaped { filesystem }),
+        "filesystem checked reap"
+    );
+    assert_reaped(backup);
+    assert_reaped(filesystem);
+    (backup, filesystem)
 }
 
 #[test]
@@ -245,5 +290,150 @@ fn managed_restore_refuses_overwrite_and_preserves_existing_destination() -> Res
     .unwrap_err();
     assert!(format!("{error:#}").contains("new directory"));
     assert_eq!(std::fs::read(destination.join("keep"))?, b"unchanged");
+    Ok(())
+}
+
+#[test]
+fn parent_progress_failure_reaps_sql_then_active_filesystem_sibling() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("source");
+    drop(Catalog::open(&source)?);
+    let db = Connection::open(source.join("catalog.sqlite3"))?;
+    let expected = actual(&db)?;
+    drop(db);
+    let bundle = temp.path().join("progress-failed");
+    let (events, probe) = process_probe();
+    let error = managed::run_process_with_probe(
+        executable(),
+        uuid::Uuid::new_v4().to_string(),
+        Request::Create {
+            source: NativePath::from_path(&source),
+            bundle: NativePath::from_path(&bundle),
+            expected_source: expected,
+        },
+        limits(),
+        &CancellationToken::default(),
+        |progress| {
+            if progress.phase == Phase::Snapshot {
+                anyhow::bail!("injected parent progress failure")
+            }
+            Ok(())
+        },
+        ProcessTestFault::None,
+        probe,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("injected parent progress failure"));
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProcessEvent::FilesystemActive { .. }))
+    );
+    let (backup, filesystem) = assert_siblings_reaped(&events);
+    let b = events
+        .iter()
+        .position(|event| *event == ProcessEvent::BackupReaped { backup })
+        .unwrap();
+    let f = events
+        .iter()
+        .position(|event| *event == ProcessEvent::FilesystemReaped { filesystem })
+        .unwrap();
+    assert!(b < f, "forced retirement must end SQL before raw custody");
+    assert!(bundle.join(".photocatalog-pending.json").is_file());
+    assert!(!bundle.join("photocatalog-backup.json").exists());
+    Ok(())
+}
+
+#[test]
+fn protocol_loss_and_wait_retry_keep_both_exact_owners_until_reap() -> Result<()> {
+    for fault in [
+        ProcessTestFault::ParentProtocolAfterFilesystemRequest,
+        ProcessTestFault::LoseTerminal,
+        ProcessTestFault::FailBackupWaitOnce,
+    ] {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        drop(Catalog::open(&source)?);
+        let db = Connection::open(source.join("catalog.sqlite3"))?;
+        let expected = actual(&db)?;
+        drop(db);
+        let bundle = temp.path().join("faulted");
+        let (events, probe) = process_probe();
+        let error = managed::run_process_with_probe(
+            executable(),
+            uuid::Uuid::new_v4().to_string(),
+            Request::Create {
+                source: NativePath::from_path(&source),
+                bundle: NativePath::from_path(&bundle),
+                expected_source: expected,
+            },
+            limits(),
+            &CancellationToken::default(),
+            |_| Ok(()),
+            fault,
+            probe,
+        )
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        match fault {
+            ProcessTestFault::ParentProtocolAfterFilesystemRequest => {
+                assert!(detail.contains("injected malformed managed backup reply"));
+            }
+            ProcessTestFault::LoseTerminal => {
+                assert!(detail.contains("injected lost managed backup terminal reply"));
+            }
+            ProcessTestFault::FailBackupWaitOnce => {
+                assert!(detail.contains("retained exact child for retry"));
+            }
+            ProcessTestFault::None => unreachable!(),
+        }
+        let events = events.lock().unwrap();
+        let (backup, filesystem) = assert_siblings_reaped(&events);
+        let b = events
+            .iter()
+            .position(|event| *event == ProcessEvent::BackupReaped { backup })
+            .unwrap();
+        let f = events
+            .iter()
+            .position(|event| *event == ProcessEvent::FilesystemReaped { filesystem })
+            .unwrap();
+        if fault == ProcessTestFault::ParentProtocolAfterFilesystemRequest {
+            assert!(b < f, "forced retirement must end SQL before raw custody");
+        } else {
+            assert!(f < b, "normal F drain must precede B terminal reap");
+        }
+        if fault == ProcessTestFault::FailBackupWaitOnce {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ProcessEvent::BackupWaitRetry { .. }))
+            );
+        }
+    }
+
+    // A failed generation cannot clear early: this fresh operation is admitted
+    // only after the preceding calls returned with both ESRCH proofs.
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("source");
+    drop(Catalog::open(&source)?);
+    let db = Connection::open(source.join("catalog.sqlite3"))?;
+    let expected = actual(&db)?;
+    drop(db);
+    let Receipt::Backup(_) = managed::run_process(
+        executable(),
+        uuid::Uuid::new_v4().to_string(),
+        Request::Create {
+            source: NativePath::from_path(&source),
+            bundle: NativePath::from_path(&temp.path().join("fresh")),
+            expected_source: expected,
+        },
+        limits(),
+        &CancellationToken::default(),
+        |_| Ok(()),
+    )?
+    else {
+        anyhow::bail!("fresh create returned restore receipt")
+    };
     Ok(())
 }

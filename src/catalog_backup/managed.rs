@@ -1,5 +1,5 @@
 //! Dedicated managed backup SQL owner. B opens only SQLite connections; every
-//! regular-file operation is sent to its separately spawned F process.
+//! regular-file operation is relayed to its G-owned sibling F process.
 use super::{BackupReceipt, CancellationToken, Limits, Phase, Progress, RestoreReceipt};
 use crate::{
     CURRENT_SCHEMA_VERSION,
@@ -18,9 +18,9 @@ use std::{
     io::{Read, Write},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child as OsChild, ChildStdin, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -82,6 +82,14 @@ struct Startup {
 )]
 enum Parent {
     Cancel,
+    Filesystem {
+        sequence: U64,
+        reply: std::result::Result<FsReply, String>,
+    },
+    FilesystemDrained {
+        sequence: U64,
+        result: std::result::Result<(), String>,
+    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(
@@ -97,6 +105,16 @@ enum Child {
         nonce: String,
     },
     Progress(Progress),
+    Filesystem {
+        sequence: U64,
+        request: FsRequest,
+    },
+    FilesystemShutdown {
+        sequence: U64,
+    },
+    Failed {
+        detail: String,
+    },
     Terminal(std::result::Result<Receipt, String>),
 }
 #[derive(Serialize, Deserialize)]
@@ -157,163 +175,532 @@ fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<Option<T>> 
     )?))
 }
 
-/// Run one B child. Success is returned only after its SQL connections, nested
-/// F process, OS child, and output pipe have all been checked and retired.
+/// Test-only observability for the real managed B/F process boundary. The
+/// release build keeps the normal entry point and never selects a fault.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessTestFault {
+    None,
+    ParentProtocolAfterFilesystemRequest,
+    LoseTerminal,
+    FailBackupWaitOnce,
+}
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessEvent {
+    Spawned { backup: u32, filesystem: u32 },
+    FilesystemActive { backup: u32, filesystem: u32 },
+    BackupWaitRetry { backup: u32 },
+    BackupReaped { backup: u32 },
+    FilesystemReaped { filesystem: u32 },
+}
+
+/// Run one B child and one sibling F child. This supervisor returns only after
+/// both exact process owners and all pipe owners have been checked and retired.
 pub fn run_process(
     executable: &Path,
     operation: String,
     request: Request,
     limits: Limits,
     cancel: &CancellationToken,
+    progress: impl FnMut(Progress) -> Result<()>,
+) -> Result<Receipt> {
+    run_process_inner(
+        executable,
+        operation,
+        request,
+        limits,
+        cancel,
+        progress,
+        ProcessTestFault::None,
+        |_| {},
+    )
+}
+
+/// Real-process fault hook used only by integration qualification. It does not
+/// alter the installed worker protocol or production factory selection.
+#[doc(hidden)]
+pub fn run_process_with_probe(
+    executable: &Path,
+    operation: String,
+    request: Request,
+    limits: Limits,
+    cancel: &CancellationToken,
+    progress: impl FnMut(Progress) -> Result<()>,
+    fault: ProcessTestFault,
+    probe: impl FnMut(ProcessEvent),
+) -> Result<Receipt> {
+    run_process_inner(
+        executable,
+        executable_canonical_operation(operation)?,
+        request,
+        limits,
+        cancel,
+        progress,
+        fault,
+        probe,
+    )
+}
+
+fn executable_canonical_operation(operation: String) -> Result<String> {
+    ensure!(
+        uuid::Uuid::parse_str(&operation)?.to_string() == operation,
+        "managed backup operation identity"
+    );
+    Ok(operation)
+}
+
+fn run_process_inner(
+    executable: &Path,
+    operation: String,
+    request: Request,
+    limits: Limits,
+    cancel: &CancellationToken,
     mut progress: impl FnMut(Progress) -> Result<()>,
+    fault: ProcessTestFault,
+    mut probe: impl FnMut(ProcessEvent),
 ) -> Result<Receipt> {
     limits.validate()?;
+    let operation = executable_canonical_operation(operation)?;
+    let filesystem = crate::filesystem_worker::client::Client::spawn(executable, vec![])
+        .context("start managed backup filesystem owner")?;
+    let filesystem_pid = filesystem.pid();
     let nonce = uuid::Uuid::new_v4().to_string();
     let startup = Startup {
         protocol: PROTOCOL,
         build: build_identity(),
         nonce: nonce.clone(),
-        operation,
+        operation: operation.clone(),
         request,
         limits,
     };
-    let mut child = Command::new(executable)
+    let mut child = match Command::new(executable)
         .arg("--catalog-backup-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("start managed backup SQL owner")?;
-    let mut input = match child.stdin.take().context("managed backup input") {
-        Ok(input) => input,
+        .context("start managed backup SQL owner")
+    {
+        Ok(child) => Some(child),
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
+            let mut ignored = |_| {};
+            let retirement =
+                retire_filesystem_after_backup(&filesystem, &operation, false, &mut ignored);
+            return if retirement.is_empty() {
+                Err(error)
+            } else {
+                Err(error.context(format!(
+                    "filesystem sibling retirement required recovery: {}",
+                    retirement.join("; ")
+                )))
+            };
         }
     };
-    let output = match child.stdout.take().context("managed backup output") {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    if let Err(error) = write_frame(&mut input, &startup) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    let (tx, rx) = mpsc::sync_channel(4);
-    let reader = std::thread::Builder::new()
-        .name("backup-owner-output".into())
-        .spawn(move || {
-            let mut output = output;
-            loop {
-                match read_frame::<Envelope<Child>>(&mut output) {
-                    Ok(Some(value)) => {
-                        if tx.send(Ok(value)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = tx.send(Err(error));
-                        break;
-                    }
-                }
-            }
-        });
-    let mut reader = match reader {
-        Ok(reader) => Some(reader),
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error.into());
-        }
-    };
-    let result = (|| -> Result<Receipt> {
-        let mut ready = false;
-        let mut canceled = false;
-        let terminal = loop {
-            if cancel.is_cancelled() && !canceled {
-                write_frame(
-                    &mut input,
-                    &Envelope {
-                        protocol: PROTOCOL,
-                        nonce: nonce.clone(),
-                        body: Parent::Cancel,
-                    },
-                )?;
-                canceled = true;
-            }
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(Ok(envelope)) => {
-                    ensure!(
-                        envelope.protocol == PROTOCOL && envelope.nonce == nonce,
-                        "managed backup reply identity"
-                    );
-                    match envelope.body {
-                        Child::Ready {
-                            protocol,
-                            build,
-                            nonce: echoed,
-                        } => {
-                            ensure!(
-                                !ready
-                                    && protocol == PROTOCOL
-                                    && build == build_identity()
-                                    && echoed == nonce,
-                                "managed backup handshake identity"
-                            );
-                            ready = true;
-                        }
-                        Child::Progress(value) => {
-                            ensure!(ready, "managed backup progress before handshake");
-                            progress(value)?;
-                        }
-                        Child::Terminal(value) => {
-                            ensure!(ready, "managed backup result before handshake");
-                            break value;
-                        }
-                    }
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(status) = child.try_wait()? {
-                        bail!(
-                            "managed backup owner exited {status} before terminal acknowledgement"
-                        );
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("managed backup output ended before terminal acknowledgement")
-                }
-            }
-        };
-        drop(input);
-        let status = child.wait()?;
-        ensure!(status.success(), "managed backup owner exited {status}");
-        reader
-            .take()
+    let backup_pid = child.as_ref().unwrap().id();
+    probe(ProcessEvent::Spawned {
+        backup: backup_pid,
+        filesystem: filesystem_pid,
+    });
+    let mut input: Option<ChildStdin> = None;
+    let mut reader = None;
+    let setup = (|| -> Result<Receipt> {
+        input = Some(
+            child
+                .as_mut()
+                .unwrap()
+                .stdin
+                .take()
+                .context("managed backup input")?,
+        );
+        let output = child
+            .as_mut()
             .unwrap()
-            .join()
-            .map_err(|_| anyhow::anyhow!("managed backup output owner panicked"))?;
-        terminal.map_err(anyhow::Error::msg)
+            .stdout
+            .take()
+            .context("managed backup output")?;
+        write_frame(input.as_mut().unwrap(), &startup)?;
+        let (tx, rx) = mpsc::sync_channel(4);
+        reader = Some(
+            std::thread::Builder::new()
+                .name("backup-owner-output".into())
+                .spawn(move || {
+                    let mut output = output;
+                    loop {
+                        match read_frame::<Envelope<Child>>(&mut output) {
+                            Ok(Some(value)) => {
+                                if tx.send(Ok(value)).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                let _ = tx.send(Err(error));
+                                break;
+                            }
+                        }
+                    }
+                })?,
+        );
+        let wire_outcome = supervise(
+            child.as_mut().unwrap(),
+            input.as_mut().unwrap(),
+            &rx,
+            &filesystem,
+            filesystem_pid,
+            backup_pid,
+            &nonce,
+            cancel,
+            &mut progress,
+            fault,
+            &mut probe,
+        );
+        let forced = wire_outcome.is_err();
+        // Stop the output owner from blocking on a full result channel while
+        // forced retirement is joining it after B has stopped.
+        drop(rx);
+        let mut retirement_errors = retire_backup(
+            &mut child,
+            &mut input,
+            &mut reader,
+            forced,
+            fault == ProcessTestFault::FailBackupWaitOnce,
+            &nonce,
+            &mut probe,
+        );
+        if forced && filesystem.status().phase != crate::filesystem_worker::wire::Phase::Stopped {
+            retirement_errors.extend(retire_filesystem_after_backup(
+                &filesystem,
+                &operation,
+                true,
+                &mut probe,
+            ));
+        } else if filesystem.status().phase != crate::filesystem_worker::wire::Phase::Stopped {
+            retirement_errors.extend(retire_filesystem_after_backup(
+                &filesystem,
+                &operation,
+                false,
+                &mut probe,
+            ));
+        }
+        let outcome = wire_outcome.and_then(|terminal| terminal.map_err(anyhow::Error::msg));
+        if retirement_errors.is_empty() {
+            outcome
+        } else {
+            let detail = retirement_errors.join("; ");
+            match outcome {
+                Ok(_) => bail!("managed backup retirement failed: {detail}"),
+                Err(error) => Err(error.context(format!(
+                    "managed backup retirement required recovery: {detail}"
+                ))),
+            }
+        }
     })();
-    if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        if let Some(reader) = reader.take() {
-            let _ = reader.join();
+    match setup {
+        Ok(value) => Ok(value),
+        Err(error) if child.is_none() => Err(error),
+        Err(error) => {
+            // Setup failed after one or both siblings were spawned. Retain the
+            // same owners locally and retry checked retirement before returning.
+            let mut errors = retire_backup(
+                &mut child,
+                &mut input,
+                &mut reader,
+                true,
+                fault == ProcessTestFault::FailBackupWaitOnce,
+                &nonce,
+                &mut probe,
+            );
+            errors.extend(retire_filesystem_after_backup(
+                &filesystem,
+                &operation,
+                true,
+                &mut probe,
+            ));
+            if errors.is_empty() {
+                Err(error)
+            } else {
+                Err(error.context(format!(
+                    "managed backup setup retirement required recovery: {}",
+                    errors.join("; ")
+                )))
+            }
         }
     }
-    result
 }
 
-/// Hidden configured-binary entry point. This process performs no raw opens;
-/// its nested F child owns all regular-file work.
+#[allow(clippy::too_many_arguments)]
+fn supervise(
+    child: &mut OsChild,
+    input: &mut ChildStdin,
+    rx: &mpsc::Receiver<Result<Envelope<Child>>>,
+    filesystem: &crate::filesystem_worker::client::Client,
+    filesystem_pid: u32,
+    backup_pid: u32,
+    nonce: &str,
+    cancel: &CancellationToken,
+    progress: &mut impl FnMut(Progress) -> Result<()>,
+    fault: ProcessTestFault,
+    probe: &mut impl FnMut(ProcessEvent),
+) -> Result<std::result::Result<Receipt, String>> {
+    let mut ready = false;
+    let mut canceled = false;
+    let mut next_filesystem = 1u64;
+    let mut filesystem_drained = false;
+    loop {
+        if cancel.is_cancelled() && !canceled {
+            write_frame(
+                input,
+                &Envelope {
+                    protocol: PROTOCOL,
+                    nonce: nonce.to_owned(),
+                    body: Parent::Cancel,
+                },
+            )?;
+            canceled = true;
+        }
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(Ok(envelope)) => {
+                ensure!(
+                    envelope.protocol == PROTOCOL && envelope.nonce == nonce,
+                    "managed backup reply identity"
+                );
+                match envelope.body {
+                    Child::Ready {
+                        protocol,
+                        build,
+                        nonce: echoed,
+                    } => {
+                        ensure!(
+                            !ready
+                                && protocol == PROTOCOL
+                                && build == build_identity()
+                                && echoed == nonce,
+                            "managed backup handshake identity"
+                        );
+                        ready = true;
+                    }
+                    Child::Progress(value) => {
+                        ensure!(ready, "managed backup progress before handshake");
+                        progress(value)?;
+                    }
+                    Child::Filesystem { sequence, request } => {
+                        ensure!(ready, "managed backup filesystem request before handshake");
+                        ensure!(
+                            !filesystem_drained && sequence.0 == next_filesystem,
+                            "managed backup filesystem request sequence"
+                        );
+                        next_filesystem = next_filesystem
+                            .checked_add(1)
+                            .context("managed backup filesystem sequence exhausted")?;
+                        probe(ProcessEvent::FilesystemActive {
+                            backup: backup_pid,
+                            filesystem: filesystem_pid,
+                        });
+                        let reply =
+                            CatalogFilesystem::backup_call(filesystem, &request, cancel.0.as_ref())
+                                .map_err(|error| bounded_error(&error));
+                        ensure!(
+                            fault != ProcessTestFault::ParentProtocolAfterFilesystemRequest,
+                            "injected malformed managed backup reply"
+                        );
+                        write_frame(
+                            input,
+                            &Envelope {
+                                protocol: PROTOCOL,
+                                nonce: nonce.to_owned(),
+                                body: Parent::Filesystem { sequence, reply },
+                            },
+                        )?;
+                    }
+                    Child::FilesystemShutdown { sequence } => {
+                        ensure!(ready, "managed backup filesystem shutdown before handshake");
+                        ensure!(
+                            !filesystem_drained && sequence.0 == next_filesystem,
+                            "managed backup filesystem shutdown sequence"
+                        );
+                        next_filesystem = next_filesystem
+                            .checked_add(1)
+                            .context("managed backup filesystem sequence exhausted")?;
+                        let result = filesystem
+                            .try_shutdown()
+                            .map_err(|error| bounded_error(&error));
+                        filesystem_drained = result.is_ok();
+                        if filesystem_drained {
+                            probe(ProcessEvent::FilesystemReaped {
+                                filesystem: filesystem_pid,
+                            });
+                        }
+                        write_frame(
+                            input,
+                            &Envelope {
+                                protocol: PROTOCOL,
+                                nonce: nonce.to_owned(),
+                                body: Parent::FilesystemDrained { sequence, result },
+                            },
+                        )?;
+                    }
+                    Child::Failed { detail } => {
+                        ensure!(ready, "managed backup failure before handshake");
+                        bail!("managed backup SQL owner failed before F drain: {detail}")
+                    }
+                    Child::Terminal(value) => {
+                        ensure!(ready, "managed backup result before handshake");
+                        ensure!(
+                            filesystem_drained,
+                            "managed backup terminal preceded filesystem checked reap"
+                        );
+                        ensure!(
+                            fault != ProcessTestFault::LoseTerminal,
+                            "injected lost managed backup terminal reply"
+                        );
+                        return Ok(value);
+                    }
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(status) = child.try_wait()? {
+                    bail!("managed backup owner exited {status} before terminal acknowledgement");
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("managed backup output ended before terminal acknowledgement")
+            }
+        }
+    }
+}
+
+fn retire_backup(
+    child: &mut Option<OsChild>,
+    input: &mut Option<ChildStdin>,
+    reader: &mut Option<std::thread::JoinHandle<()>>,
+    forced: bool,
+    mut fail_wait_once: bool,
+    nonce: &str,
+    probe: &mut impl FnMut(ProcessEvent),
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if forced {
+        if let Some(input) = input.as_mut() {
+            let _ = write_frame(
+                input,
+                &Envelope {
+                    protocol: PROTOCOL,
+                    nonce: nonce.to_owned(),
+                    body: Parent::Cancel,
+                },
+            );
+        }
+    }
+    drop(input.take());
+    if let Some(owned) = child.as_mut() {
+        let pid = owned.id();
+        let mut wait_failure_reported = false;
+        if forced && let Err(error) = owned.kill() {
+            errors.push(format!("backup kill failed before checked wait: {error}"));
+        }
+        loop {
+            if fail_wait_once {
+                fail_wait_once = false;
+                probe(ProcessEvent::BackupWaitRetry { backup: pid });
+                errors.push("injected backup wait failure; retained exact child for retry".into());
+                continue;
+            }
+            match owned.wait() {
+                Ok(status) => {
+                    if !forced && !status.success() {
+                        errors.push(format!(
+                            "managed backup owner exited {status} after terminal acknowledgement"
+                        ));
+                    }
+                    child.take();
+                    probe(ProcessEvent::BackupReaped { backup: pid });
+                    break;
+                }
+                Err(error) => {
+                    if !wait_failure_reported {
+                        errors.push(format!(
+                            "backup wait failed; retained exact child for retry: {error}"
+                        ));
+                        wait_failure_reported = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+    if let Some(owner) = reader.take()
+        && owner.join().is_err()
+    {
+        errors.push("managed backup output owner panicked after process reap".into());
+    }
+    errors
+}
+
+fn retire_filesystem_after_backup(
+    filesystem: &crate::filesystem_worker::client::Client,
+    operation: &str,
+    forced: bool,
+    probe: &mut impl FnMut(ProcessEvent),
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if filesystem.status().phase == crate::filesystem_worker::wire::Phase::Stopped {
+        probe(ProcessEvent::FilesystemReaped {
+            filesystem: filesystem.pid(),
+        });
+        return errors;
+    }
+    if forced {
+        let cancel = AtomicBool::new(false);
+        if let Err(error) = CatalogFilesystem::backup_call(
+            filesystem,
+            &FsRequest::Abort {
+                operation: operation.to_owned(),
+            },
+            &cancel,
+        ) {
+            errors.push(format!("filesystem backup abort unavailable: {error:#}"));
+        }
+    }
+    match filesystem.try_shutdown() {
+        Ok(()) => {}
+        Err(error) => {
+            errors.push(format!("filesystem clean drain failed: {error:#}"));
+            let mut wait_failure_reported = false;
+            loop {
+                match filesystem.terminate_after_dependents_drained() {
+                    Ok(()) => break,
+                    Err(error) => {
+                        if !wait_failure_reported {
+                            errors.push(format!(
+                                "filesystem checked wait failed; retained exact child for retry: {error:#}"
+                            ));
+                            wait_failure_reported = true;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        }
+    }
+    probe(ProcessEvent::FilesystemReaped {
+        filesystem: filesystem.pid(),
+    });
+    errors
+}
+
+fn bounded_error(error: &anyhow::Error) -> String {
+    let value = format!("{error:#}");
+    let mut end = value.len().min(16 * 1024);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+/// Hidden configured-binary entry point. This process owns SQLite only; its
+/// G-owned sibling F is reached through the closed backup relay below.
 pub fn worker_main() -> Result<()> {
     std::panic::set_hook(Box::new(|_| {}));
     let mut input = std::io::stdin();
@@ -334,7 +721,8 @@ pub fn worker_main() -> Result<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     let reader_cancel = cancel.clone();
     let nonce = startup.nonce.clone();
-    std::thread::Builder::new()
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    let control = std::thread::Builder::new()
         .name("backup-owner-control".into())
         .spawn(move || {
             let mut input = input;
@@ -344,10 +732,16 @@ pub fn worker_main() -> Result<()> {
                 }
                 match envelope.body {
                     Parent::Cancel => reader_cancel.store(true, Ordering::Release),
+                    reply @ (Parent::Filesystem { .. } | Parent::FilesystemDrained { .. }) => {
+                        if reply_tx.send(reply).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
+            reader_cancel.store(true, Ordering::Release);
         })?;
-    let output = Arc::new(std::sync::Mutex::new(std::io::stdout()));
+    let output = Arc::new(Mutex::new(std::io::stdout()));
     emit(
         &output,
         &startup.nonce,
@@ -357,18 +751,11 @@ pub fn worker_main() -> Result<()> {
             nonce: startup.nonce.clone(),
         },
     )?;
-    let executable = std::env::current_exe().context("resolve configured backup executable")?;
-    let filesystem = match crate::filesystem_worker::client::Client::spawn(&executable, vec![])
-        .context("start managed backup filesystem owner")
-    {
-        Ok(filesystem) => filesystem,
-        Err(error) => {
-            return emit(
-                &output,
-                &startup.nonce,
-                Child::Terminal(Err(format!("{error:#}"))),
-            );
-        }
+    let filesystem = RemoteFilesystem {
+        output: output.clone(),
+        nonce: startup.nonce.clone(),
+        replies: Mutex::new(reply_rx),
+        sequence: AtomicU64::new(0),
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_sql(
@@ -381,44 +768,113 @@ pub fn worker_main() -> Result<()> {
         )
     }))
     .unwrap_or_else(|_| Err(anyhow::anyhow!("managed backup SQL owner panicked")));
-    if result.is_err() {
-        let _ = filesystem.backup_call(
-            &FsRequest::Abort {
-                operation: startup.operation.clone(),
-            },
-            &AtomicBool::new(false),
-        );
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            // A failed SQLite close deliberately retains its connection until
+            // this process exits. G must reap B before it aborts or retires F.
+            emit(
+                &output,
+                &startup.nonce,
+                Child::Failed {
+                    detail: bounded_error(&error),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = filesystem.shutdown() {
+        let detail = bounded_error(&error.context("filesystem owner failed to drain after backup"));
+        emit(&output, &startup.nonce, Child::Failed { detail })?;
+        return Ok(());
     }
-    let clean =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filesystem.try_shutdown()))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("filesystem owner clean shutdown panicked")));
-    let drained = match clean {
-        Ok(()) => Ok(()),
-        Err(clean) => match filesystem.terminate_after_dependents_drained() {
-            Ok(()) => Err(anyhow::anyhow!(
-                "filesystem owner required forced checked retirement after backup: {clean:#}"
-            )),
-            Err(forced) => {
-                return Err(anyhow::anyhow!(
-                    "filesystem owner could not be reaped after backup: {clean:#}; forced retirement failed: {forced:#}"
-                ));
-            }
-        },
-    };
-    let terminal = match (result, drained) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(format!("{error:#}")),
-        (Ok(_), Err(error)) => Err(format!(
-            "filesystem owner failed to drain after backup: {error:#}"
-        )),
-        (Err(error), Err(drain)) => Err(format!(
-            "{error:#}; filesystem owner drain failed: {drain:#}"
-        )),
-    };
-    emit(&output, &startup.nonce, Child::Terminal(terminal))
+    emit(&output, &startup.nonce, Child::Terminal(Ok(value)))?;
+    drop(output);
+    drop(control);
+    Ok(())
 }
 
-fn emit(output: &std::sync::Mutex<impl Write>, nonce: &str, body: Child) -> Result<()> {
+struct RemoteFilesystem {
+    output: Arc<Mutex<std::io::Stdout>>,
+    nonce: String,
+    replies: Mutex<mpsc::Receiver<Parent>>,
+    sequence: AtomicU64,
+}
+impl RemoteFilesystem {
+    fn next(&self) -> Result<U64> {
+        let value = self
+            .sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("managed backup filesystem sequence exhausted"))?
+            .checked_add(1)
+            .context("managed backup filesystem sequence exhausted")?;
+        Ok(U64(value))
+    }
+    fn shutdown(&self) -> Result<()> {
+        let sequence = self.next()?;
+        emit(
+            &self.output,
+            &self.nonce,
+            Child::FilesystemShutdown { sequence },
+        )?;
+        match self.replies.lock().unwrap().recv()? {
+            Parent::FilesystemDrained {
+                sequence: returned,
+                result,
+            } => {
+                ensure!(
+                    returned.0 == sequence.0,
+                    "filesystem drain sequence mismatch"
+                );
+                result.map_err(anyhow::Error::msg)
+            }
+            _ => bail!("unexpected filesystem drain response"),
+        }
+    }
+}
+
+trait BackupFilesystem {
+    fn backup_call(&self, request: &FsRequest, cancel: &AtomicBool) -> Result<FsReply>;
+}
+impl BackupFilesystem for RemoteFilesystem {
+    fn backup_call(&self, request: &FsRequest, cancel: &AtomicBool) -> Result<FsReply> {
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "backup filesystem relay cancelled"
+        );
+        let sequence = self.next()?;
+        emit(
+            &self.output,
+            &self.nonce,
+            Child::Filesystem {
+                sequence,
+                request: request.clone(),
+            },
+        )?;
+        match self.replies.lock().unwrap().recv()? {
+            Parent::Filesystem {
+                sequence: returned,
+                reply,
+            } => {
+                ensure!(
+                    returned.0 == sequence.0,
+                    "filesystem reply sequence mismatch"
+                );
+                reply.map_err(anyhow::Error::msg)
+            }
+            _ => bail!("unexpected filesystem response"),
+        }
+    }
+}
+impl BackupFilesystem for crate::filesystem_worker::client::Client {
+    fn backup_call(&self, request: &FsRequest, cancel: &AtomicBool) -> Result<FsReply> {
+        CatalogFilesystem::backup_call(self, request, cancel)
+    }
+}
+
+fn emit(output: &Mutex<impl Write>, nonce: &str, body: Child) -> Result<()> {
     write_frame(
         &mut *output.lock().unwrap(),
         &Envelope {
@@ -428,9 +884,8 @@ fn emit(output: &std::sync::Mutex<impl Write>, nonce: &str, body: Child) -> Resu
         },
     )
 }
-
 fn fs_call(
-    filesystem: &dyn CatalogFilesystem,
+    filesystem: &dyn BackupFilesystem,
     request: FsRequest,
     cancel: &Arc<AtomicBool>,
 ) -> Result<FsReply> {
@@ -438,7 +893,7 @@ fn fs_call(
 }
 
 fn run_sql(
-    filesystem: &dyn CatalogFilesystem,
+    filesystem: &dyn BackupFilesystem,
     operation: &str,
     request: Request,
     limits: &Limits,
@@ -732,7 +1187,7 @@ fn run_sql(
 }
 
 fn prepare_inspect(
-    filesystem: &dyn CatalogFilesystem,
+    filesystem: &dyn BackupFilesystem,
     operation: &str,
     bundle: NativePath,
     limits: &Limits,
