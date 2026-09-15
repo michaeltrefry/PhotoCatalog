@@ -191,6 +191,7 @@ fn managed_cancel_and_post_open_swap_retain_incomplete_destinations() -> Result<
     let canceled = temp.path().join("canceled");
     let cancel = CancellationToken::default();
     let callback_cancel = cancel.clone();
+    let mut copied_before_cancel = None;
     let result = managed::run_process(
         executable(),
         uuid::Uuid::new_v4().to_string(),
@@ -201,8 +202,9 @@ fn managed_cancel_and_post_open_swap_retain_incomplete_destinations() -> Result<
         },
         limits(),
         &cancel,
-        move |progress| {
-            if progress.phase == Phase::Copy {
+        |progress| {
+            if progress.phase == Phase::Copy && progress.pages_copied > 0 {
+                copied_before_cancel = Some((progress.pages_copied, progress.total_pages));
                 callback_cancel.cancel();
             }
             Ok(())
@@ -210,7 +212,11 @@ fn managed_cancel_and_post_open_swap_retain_incomplete_destinations() -> Result<
     );
     assert!(result.unwrap_err().to_string().contains("cancel"));
     assert!(canceled.join(".photocatalog-pending.json").is_file());
-    assert!(std::fs::metadata(canceled.join("catalog.sqlite3"))?.len() > 0);
+    let (copied, total) = copied_before_cancel.expect("cancel after actual SQLite copy progress");
+    assert!(copied > 0 && copied < total);
+    // SQLite may roll its incomplete backup transaction back to an empty file.
+    // Retain that destination and its pending marker; never publish it as valid.
+    assert!(std::fs::metadata(canceled.join("catalog.sqlite3"))?.is_file());
     assert!(!canceled.join("photocatalog-backup.json").exists());
 
     let replacement_root = temp.path().join("replacement");
