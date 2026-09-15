@@ -43,6 +43,7 @@ struct Evidence {
     directory: NativePath,
     manifest: Manifest,
     manifest_blake3: String,
+    manifest_source: Source,
     logical: Source,
     raw: Vec<Source>,
     authority: CaptureSqlAuthority,
@@ -52,6 +53,37 @@ pub(super) struct Owner {
     root: Option<Root>,
     capture: Option<Capture>,
     evidence: Option<Evidence>,
+    released_root: Option<ReleaseReceipt>,
+    released_capture: Option<ReleaseReceipt>,
+    released_evidence: Option<ReleaseReceipt>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ReleaseReceipt {
+    operation: String,
+    workbench: String,
+    generation: String,
+    resource_generation: Option<String>,
+}
+impl ReleaseReceipt {
+    fn new(
+        operation: &str,
+        workbench: &str,
+        generation: &str,
+        resource_generation: Option<&str>,
+    ) -> Self {
+        Self {
+            operation: operation.into(),
+            workbench: workbench.into(),
+            generation: generation.into(),
+            resource_generation: resource_generation.map(Into::into),
+        }
+    }
+    fn reply(&self) -> LightroomWorkbenchIoReply {
+        LightroomWorkbenchIoReply::Released {
+            operation: self.operation.clone(),
+        }
+    }
 }
 
 fn id(value: &str) -> Result<()> {
@@ -75,7 +107,7 @@ fn same(expected: (&str, &str, &str), actual: (&str, &str, &str)) -> Result<()> 
     );
     Ok(())
 }
-fn manifest(path: &Path, cancel: &AtomicBool) -> Result<(Manifest, String)> {
+fn manifest(path: &Path, cancel: &AtomicBool) -> Result<(Manifest, String, Source)> {
     canceled(cancel)?;
     let mut source = Source::open(path, crate::lightroom::MANIFEST_BYTES as u64)?;
     let mut bytes = vec![0; usize::try_from(source.before.bytes)?];
@@ -88,7 +120,7 @@ fn manifest(path: &Path, cancel: &AtomicBool) -> Result<(Manifest, String)> {
     source.verify()?;
     let digest = crate::lightroom::digest(&bytes);
     let value: Manifest = serde_json::from_slice(&bytes)?;
-    Ok((value, digest))
+    Ok((value, digest, source))
 }
 fn companion_free(path: &Path) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -128,6 +160,7 @@ impl Owner {
                     )?;
                     return Ok(active.reply());
                 }
+                self.released_root = None;
                 crate::catalog_session::validate_path(&root)?;
                 let requested = root.to_path()?;
                 if create {
@@ -177,6 +210,10 @@ impl Owner {
                 workbench,
                 generation,
             } => {
+                let receipt = ReleaseReceipt::new(&operation, &workbench, &generation, None);
+                if self.released_root.as_ref() == Some(&receipt) {
+                    return Ok(receipt.reply());
+                }
                 let value = self.root.as_mut().context("no Workbench root retained")?;
                 same(
                     (&value.operation, &value.workbench, &value.generation),
@@ -185,7 +222,8 @@ impl Owner {
                 value.database =
                     Source::open(&value.path.to_path()?.join("inspection.sqlite3"), u64::MAX)?;
                 self.root.take();
-                Ok(LightroomWorkbenchIoReply::Released { operation })
+                self.released_root = Some(receipt.clone());
+                Ok(receipt.reply())
             }
             LightroomWorkbenchIo::CaptureStart {
                 operation,
@@ -199,6 +237,7 @@ impl Owner {
                     id(v)?
                 }
                 ensure!(self.capture.is_none(), "capture already retained");
+                self.released_capture = None;
                 canceled(cancel)?;
                 let child =
                     CaptureProcess::spawn(&executable.to_path()?, &staging.to_path()?, &request)?;
@@ -261,6 +300,10 @@ impl Owner {
                 workbench,
                 generation,
             } => {
+                let receipt = ReleaseReceipt::new(&operation, &workbench, &generation, None);
+                if self.released_capture.as_ref() == Some(&receipt) {
+                    return Ok(receipt.reply());
+                }
                 let mut value = self.capture.take().context("no capture retained")?;
                 same(
                     (&value.operation, &value.workbench, &value.generation),
@@ -269,13 +312,18 @@ impl Owner {
                 if let Some(child) = &mut value.child {
                     child.cancel_and_wait()?;
                 }
-                Ok(LightroomWorkbenchIoReply::Released { operation })
+                self.released_capture = Some(receipt.clone());
+                Ok(receipt.reply())
             }
             LightroomWorkbenchIo::CaptureRetire {
                 operation,
                 workbench,
                 generation,
             } => {
+                let receipt = ReleaseReceipt::new(&operation, &workbench, &generation, None);
+                if self.released_capture.as_ref() == Some(&receipt) {
+                    return Ok(receipt.reply());
+                }
                 let value = self.capture.as_ref().context("no capture retained")?;
                 same(
                     (&value.operation, &value.workbench, &value.generation),
@@ -283,7 +331,8 @@ impl Owner {
                 )?;
                 ensure!(value.result.is_some(), "capture child is not terminal");
                 self.capture.take();
-                Ok(LightroomWorkbenchIoReply::Released { operation })
+                self.released_capture = Some(receipt.clone());
+                Ok(receipt.reply())
             }
             LightroomWorkbenchIo::EvidenceBegin {
                 operation,
@@ -305,10 +354,12 @@ impl Owner {
                     id(v)?
                 }
                 ensure!(self.evidence.is_none(), "capture evidence already retained");
+                self.released_evidence = None;
                 canceled(cancel)?;
                 crate::catalog_session::validate_path(&directory)?;
                 let root = fs::canonicalize(directory.to_path()?)?;
-                let (manifest, manifest_blake3) = manifest(&root.join("manifest.json"), cancel)?;
+                let (manifest, manifest_blake3, manifest_source) =
+                    manifest(&root.join("manifest.json"), cancel)?;
                 ensure!(
                     manifest.state == "captured"
                         && manifest.sqlite_consistency == "consistent_default_sqlite",
@@ -421,6 +472,7 @@ impl Owner {
                     directory: NativePath::from_path(&root),
                     manifest,
                     manifest_blake3,
+                    manifest_source,
                     logical,
                     raw,
                     authority,
@@ -456,6 +508,15 @@ impl Owner {
                 generation,
                 capture_generation,
             } => {
+                let receipt = ReleaseReceipt::new(
+                    &operation,
+                    &workbench,
+                    &generation,
+                    Some(&capture_generation),
+                );
+                if self.released_evidence.as_ref() == Some(&receipt) {
+                    return Ok(receipt.reply());
+                }
                 let value = self
                     .evidence
                     .as_mut()
@@ -470,7 +531,8 @@ impl Owner {
                 );
                 value.verify(cancel)?;
                 self.evidence.take();
-                Ok(LightroomWorkbenchIoReply::Released { operation })
+                self.released_evidence = Some(receipt.clone());
+                Ok(receipt.reply())
             }
         }
     }
@@ -488,7 +550,9 @@ impl Root {
 impl Evidence {
     fn verify(&mut self, cancel: &AtomicBool) -> Result<()> {
         canceled(cancel)?;
+        self.manifest_source.verify()?;
         self.logical.verify()?;
+        companion_free(&self.logical.path)?;
         for source in &self.raw {
             source.verify()?
         }

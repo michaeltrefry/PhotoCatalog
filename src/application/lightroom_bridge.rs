@@ -342,6 +342,7 @@ pub(crate) struct Coordinator {
     owner: Option<lw::Workbench>,
     lease: Option<OwnerLease>,
     control: Arc<Mutex<Control>>,
+    managed: Option<Arc<dyn lw::ManagedIo>>,
 }
 impl Coordinator {
     pub(crate) fn new(control: Arc<Mutex<Control>>) -> Self {
@@ -349,6 +350,18 @@ impl Coordinator {
             owner: None,
             lease: None,
             control,
+            managed: None,
+        }
+    }
+    pub(crate) fn new_managed(
+        control: Arc<Mutex<Control>>,
+        managed: Arc<dyn lw::ManagedIo>,
+    ) -> Self {
+        Self {
+            owner: None,
+            lease: None,
+            control,
+            managed: Some(managed),
         }
     }
     pub(crate) fn maintain(&mut self) {
@@ -424,13 +437,18 @@ impl Coordinator {
                 "another desktop inspection owner is active in this process"
             );
             let lease = OwnerLease;
-            let w = lw::Workbench::spawn(lw::Config {
+            let config = lw::Config {
                 root,
                 mode,
                 capture_executable: NativePath::from_path(executable),
                 capture_staging,
                 limits: limits.try_into()?,
-            })?;
+            };
+            let w = if let Some(managed) = &self.managed {
+                lw::Workbench::spawn_managed(config, managed.clone())?
+            } else {
+                lw::Workbench::spawn(config)?
+            };
             c.attempt = Some(attempt);
             c.workbench = Some(w.control());
             c.upload = None;

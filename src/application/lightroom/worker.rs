@@ -4,6 +4,13 @@ use crate::lightroom::{
     capture::CaptureProcess,
     plan::{Plan, desktop::InspectionPin},
 };
+use crate::{
+    filesystem_worker::wire::{LightroomWorkbenchIo, LightroomWorkbenchIoReply},
+    lightroom_migration_worker::{
+        identity::FileKey,
+        source_reader::capture_wire::{self, TableValue},
+    },
+};
 use std::time::Duration;
 
 // Rust drops these fields in declaration order: all SQLite/source handles
@@ -11,7 +18,13 @@ use std::time::Duration;
 struct Owner {
     plan: Option<Plan>,
     review: Option<selection::SelectionReview>,
-    pin: InspectionPin,
+    pin: Option<InspectionPin>,
+    managed: Option<Arc<dyn ManagedIo>>,
+    root_operation: String,
+    workbench: String,
+    generation: String,
+    root: NativePath,
+    root_identity: Option<FileKey>,
     version: i64,
     config: Config,
 }
@@ -77,6 +90,7 @@ pub(super) fn run(
     receiver: mpsc::Receiver<Message>,
     shared: Arc<Mutex<Shared>>,
     closing: Arc<AtomicBool>,
+    managed: Option<Arc<dyn ManagedIo>>,
 ) {
     let (initial, initial_generation, control) = {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -88,25 +102,66 @@ pub(super) fn run(
     };
     let opened = (|| -> Result<Owner> {
         control.check()?;
-        let root = native(&config.root, config.limits.native_path_units)?;
-        if matches!(config.mode, OpenMode::Create) {
-            drop(Plan::create(&root)?);
-        }
-        control.check()?;
-        let pin = InspectionPin::open(&root)?;
-        let plan = pin.open_plan(control.clone())?;
+        let (root, pin, root_identity, plan) = if let Some(io) = &managed {
+            let request = LightroomWorkbenchIo::RootBegin {
+                operation: initial.clone(),
+                workbench: shared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .status
+                    .workbench
+                    .clone(),
+                generation: initial_generation.clone(),
+                root: config.root.clone(),
+                create: matches!(config.mode, OpenMode::Create),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::Root { root, physical, .. } = reply else {
+                anyhow::bail!("Workbench root reply kind")
+            };
+            let local = native(&root, config.limits.native_path_units)?;
+            let mut plan = if matches!(config.mode, OpenMode::Create) {
+                Plan::create_managed(&local, &physical)?
+            } else {
+                Plan::open_managed(&local, &physical)?
+            };
+            plan.set_execution(Some(control.clone()));
+            (root, None, Some(physical), plan)
+        } else {
+            let root = native(&config.root, config.limits.native_path_units)?;
+            if matches!(config.mode, OpenMode::Create) {
+                drop(Plan::create(&root)?);
+            }
+            control.check()?;
+            let pin = InspectionPin::open(&root)?;
+            let plan = pin.open_plan(control.clone())?;
+            (NativePath::from_path(pin.root()), Some(pin), None, plan)
+        };
         let version = plan.data_version()?;
+        let workbench = shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status
+            .workbench
+            .clone();
         Ok(Owner {
             plan: Some(plan),
             review: None,
             pin,
+            managed,
+            root_operation: initial.clone(),
+            workbench,
+            generation: initial_generation.clone(),
+            root,
+            root_identity,
             version,
             config,
         })
     })();
     let mut owner = match opened {
         Ok(owner) => {
-            let root = NativePath::from_path(owner.pin.root());
+            let root = owner.root.clone();
             {
                 let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                 s.status.initialized = true;
@@ -169,10 +224,14 @@ pub(super) fn run(
         }
         let result = (|| -> Result<String> {
             control.check()?;
-            owner.pin.verify()?;
+            owner.verify_root(&control)?;
             if let Some(plan) = &mut owner.plan {
                 plan.set_execution(Some(control.clone()));
-                owner.pin.verify_plan(plan)?;
+                if let Some(pin) = &owner.pin {
+                    pin.verify_plan(plan)?;
+                } else if let Some(identity) = &owner.root_identity {
+                    plan.verify_managed_identity(identity)?;
+                }
                 let observed = plan.data_version()?;
                 if observed != owner.version {
                     owner.version = observed;
@@ -186,29 +245,351 @@ pub(super) fn run(
             }
             match request {
                 Ok(action) => owner.action(action.decode(&control)?, &control, &shared),
-                Err(query) => owner.query(query, &control),
+                Err(query) => owner.query(query, &control, &operation),
             }
         })();
         let review = owner.review.as_ref().map(|r| r.summary().token.clone());
         finish(&shared, &operation, &generation, result, review, &closing);
     }
+    owner.close();
     // Owner drops Plan/Review first, then identity pin. Any capture subprocess
     // has already dropped/reaped inside action before this point.
 }
 impl Owner {
+    fn current_operation(&self, shared: &Arc<Mutex<Shared>>) -> String {
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status
+            .operation
+            .clone()
+    }
+    fn capture_limits(&self) -> capture_wire::Limits {
+        capture_wire::Limits {
+            open_deadline_ms: U64(self.config.limits.deadline_ms.min(120_000).max(1)),
+            total_deadline_ms: U64(self.config.limits.deadline_ms.max(1)),
+            vm_steps: U64(self.config.limits.vm_steps.max(1)),
+            schema_objects: U64(capture_wire::MAX_SCHEMA_OBJECTS as u64),
+            schema_bytes: U64(core::PAGE_BYTES as u64),
+            page_bytes: U64(self.config.limits.page_bytes.min(core::PAGE_BYTES) as u64),
+            max_cell_bytes: U64(self.config.limits.row_bytes.min(64 * 1024 * 1024) as u64),
+            result_bytes: U64(self.config.limits.result_bytes.min(
+                crate::lightroom_migration_worker::source_reader::capture_wire::MAX_RESULT_BYTES,
+            ) as u64),
+            inline_bytes: U64(self.config.limits.page_bytes.min(core::PAGE_BYTES) as u64),
+            chunk_bytes: U64(
+                crate::lightroom_migration_worker::source_reader::capture_wire::MAX_CHUNK_BYTES
+                    as u64,
+            ),
+            max_rows: U64(capture_wire::MAX_ROWS as u64),
+        }
+    }
+    fn begin_evidence(
+        &self,
+        operation: &str,
+        directory: NativePath,
+        control: &Control,
+    ) -> Result<(
+        String,
+        NativePath,
+        core::capture::Manifest,
+        crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    )> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed filesystem owner absent")?;
+        let capture_generation = token();
+        let mut protected = Vec::new();
+        if let Some(identity) = &self.root_identity {
+            protected.push(identity.clone());
+        }
+        let request = LightroomWorkbenchIo::EvidenceBegin {
+            operation: operation.into(),
+            workbench: self.workbench.clone(),
+            generation: self.generation.clone(),
+            capture_generation: capture_generation.clone(),
+            directory,
+            source_generation: token(),
+            protected,
+            limits: self.capture_limits(),
+        };
+        let reply = io.filesystem(request.clone(), &control.cancel)?;
+        reply.validate_for(&request)?;
+        let LightroomWorkbenchIoReply::Evidence {
+            capture_generation: actual,
+            directory,
+            manifest,
+            authority,
+            ..
+        } = reply
+        else {
+            anyhow::bail!("capture evidence reply kind")
+        };
+        ensure!(
+            actual == capture_generation,
+            "capture evidence generation differs"
+        );
+        Ok((capture_generation, directory, manifest, authority))
+    }
+    fn evidence_current(
+        &self,
+        operation: &str,
+        capture_generation: &str,
+        control: &Control,
+    ) -> Result<()> {
+        let io = self.managed.as_ref().context("managed owner absent")?;
+        let request = LightroomWorkbenchIo::EvidenceCurrent {
+            operation: operation.into(),
+            workbench: self.workbench.clone(),
+            generation: self.generation.clone(),
+            capture_generation: capture_generation.into(),
+        };
+        let reply = io.filesystem(request.clone(), &control.cancel)?;
+        reply.validate_for(&request)?;
+        ensure!(
+            matches!(reply, LightroomWorkbenchIoReply::Evidence { .. }),
+            "capture evidence current reply kind"
+        );
+        Ok(())
+    }
+    fn release_evidence(&self, operation: &str, capture_generation: &str) -> Result<()> {
+        let io = self.managed.as_ref().context("managed owner absent")?;
+        let request = LightroomWorkbenchIo::EvidenceRelease {
+            operation: operation.into(),
+            workbench: self.workbench.clone(),
+            generation: self.generation.clone(),
+            capture_generation: capture_generation.into(),
+        };
+        let reply = io.filesystem(request.clone(), &AtomicBool::new(false))?;
+        reply.validate_for(&request)?;
+        ensure!(
+            matches!(reply, LightroomWorkbenchIoReply::Released { .. }),
+            "capture evidence release reply kind"
+        );
+        Ok(())
+    }
+    fn add_capture_managed(
+        &mut self,
+        operation: &str,
+        directory: NativePath,
+        control: &Control,
+    ) -> Result<String> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let (capture_generation, directory, manifest, authority) =
+            self.begin_evidence(operation, directory, control)?;
+        let binding = authority.binding_blake3.clone();
+        let source = io.source_open(authority, control.cancel.clone())?;
+        let source_result = (|| -> Result<capture_wire::SchemaObjects> {
+            let schema = io.source_schema(&source)?;
+            ensure!(
+                schema.authority_binding == binding,
+                "CaptureSql schema authority differs"
+            );
+            let current = io.source_current(&source)?;
+            ensure!(
+                current.authority_binding == binding
+                    && current.schema_roster_blake3 == schema.schema_roster_blake3,
+                "CaptureSql current binding differs"
+            );
+            Ok(schema)
+        })();
+        let retired = io.source_retire(&source);
+        let schema = source_result?;
+        retired.context("CaptureSql did not drain")?;
+        // This is the final fallible filesystem observation before the short
+        // plan transaction. The evidence lease remains retained through commit.
+        self.evidence_current(operation, &capture_generation, control)?;
+        self.verify_root(control)?;
+        let revision = self
+            .plan(control)?
+            .add_capture_managed(&directory, &manifest, &schema)?;
+        self.release_evidence(operation, &capture_generation)?;
+        Ok(revision)
+    }
+    fn resume_managed(
+        &mut self,
+        operation: &str,
+        revision: &str,
+        maximum: usize,
+        control: &Control,
+    ) -> Result<core::plan::Progress> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let directory = self.plan(control)?.managed_capture(revision)?.0;
+        let (capture_generation, _, manifest, authority) =
+            self.begin_evidence(operation, directory, control)?;
+        ensure!(
+            manifest.revision_id.as_deref() == Some(revision),
+            "capture revision differs"
+        );
+        let binding = authority.binding_blake3.clone();
+        let source = io.source_open(authority, control.cancel.clone())?;
+        let source_result = (|| -> Result<usize> {
+            let schema = io.source_schema(&source)?;
+            ensure!(
+                schema.authority_binding == binding,
+                "CaptureSql schema authority differs"
+            );
+            let (stable_digest, pending) = self.plan(control)?.managed_resume_roster(revision)?;
+            ensure!(
+                schema.schema_roster_blake3 == stable_digest,
+                "captured schema roster changed"
+            );
+            let mut retained = 0usize;
+            for mut stable in pending {
+                if retained >= maximum {
+                    break;
+                }
+                control.check()?;
+                let fresh = schema
+                    .tables
+                    .get(usize::try_from(stable.descriptor.ordinal.0)?)
+                    .context("fresh CaptureSql table ordinal missing")?;
+                let mut comparable = fresh.clone();
+                let handle = std::mem::take(&mut comparable.table_handle);
+                ensure!(
+                    comparable == stable.descriptor,
+                    "captured stable table descriptor changed"
+                );
+                let mut cursor = stable.cursor.clone();
+                loop {
+                    let request_rows = (maximum - retained).min(capture_wire::MAX_ROWS);
+                    if request_rows == 0 {
+                        break;
+                    }
+                    let value =
+                        io.source_rows(&source, handle.clone(), cursor.clone(), request_rows)?;
+                    let next_cursor = match &value {
+                        TableValue::Batch(batch) => {
+                            ensure!(
+                                batch.authority_binding == binding
+                                    && batch.schema_roster_blake3 == stable_digest
+                                    && batch.table_handle == handle,
+                                "CaptureSql batch binding differs"
+                            );
+                            batch.next_cursor.clone()
+                        }
+                        TableValue::Failure(failure) => {
+                            ensure!(
+                                failure.authority_binding == binding
+                                    && failure.schema_roster_blake3 == stable_digest
+                                    && failure.table_handle == handle,
+                                "CaptureSql failure binding differs"
+                            );
+                            failure.cursor.clone()
+                        }
+                    };
+                    self.verify_root(control)?;
+                    let added = self
+                        .plan(control)?
+                        .apply_managed_table(revision, &stable, value)?;
+                    cursor = next_cursor;
+                    stable.cursor.clone_from(&cursor);
+                    retained = retained.checked_add(added).context("retained row count")?;
+                    control.progress(retained as u64);
+                    if added == 0 || retained >= maximum {
+                        break;
+                    }
+                }
+            }
+            let current = io.source_current(&source)?;
+            ensure!(
+                current.authority_binding == binding
+                    && current.schema_roster_blake3 == stable_digest,
+                "CaptureSql terminal current binding differs"
+            );
+            Ok(retained)
+        })();
+        let retired = io.source_retire(&source);
+        let retained = source_result?;
+        retired.context("CaptureSql did not drain")?;
+        self.evidence_current(operation, &capture_generation, control)?;
+        self.verify_root(control)?;
+        let stage = self.plan(control)?.finish_managed_resume(revision)?;
+        self.release_evidence(operation, &capture_generation)?;
+        Ok(core::plan::Progress {
+            revision_id: revision.into(),
+            retained_this_call: retained,
+            stage,
+        })
+    }
+    fn verify_root(&mut self, control: &Control) -> Result<()> {
+        if let Some(io) = &self.managed {
+            let request = LightroomWorkbenchIo::RootCurrent {
+                operation: self.root_operation.clone(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::Root { physical, root, .. } = reply else {
+                anyhow::bail!("Workbench root current reply kind")
+            };
+            ensure!(root == self.root, "Workbench root changed");
+            ensure!(
+                self.root_identity.as_ref() == Some(&physical),
+                "Workbench inspection object changed"
+            );
+            if let Some(plan) = &self.plan {
+                plan.verify_managed_identity(&physical)?;
+            }
+        } else {
+            self.pin
+                .as_ref()
+                .context("inspection pin absent")?
+                .verify()?;
+        }
+        Ok(())
+    }
+    fn close(&mut self) {
+        if let Some(review) = self.review.take() {
+            let _ = review.close_checked();
+        }
+        if let Some(plan) = self.plan.take() {
+            let _ = plan.close_checked();
+        }
+        if let Some(io) = &self.managed {
+            let request = LightroomWorkbenchIo::RootRelease {
+                operation: self.root_operation.clone(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+            };
+            let _ = io.filesystem(request, &AtomicBool::new(false));
+        }
+    }
     fn plan(&mut self, control: &Control) -> Result<&mut Plan> {
         ensure!(
             self.review.is_none(),
             "ReleaseReview required before opening inspection writer"
         );
         if self.plan.is_none() {
-            let plan = self.pin.open_plan(control.clone())?;
+            let mut plan = if let Some(identity) = &self.root_identity {
+                Plan::open_managed(&self.root.to_path()?, identity)?
+            } else {
+                self.pin
+                    .as_ref()
+                    .context("inspection pin absent")?
+                    .open_plan(control.clone())?
+            };
+            plan.set_execution(Some(control.clone()));
             self.version = plan.data_version()?;
             self.plan = Some(plan);
         }
         let plan = self.plan.as_mut().context("inspection owner unavailable")?;
         plan.set_execution(Some(control.clone()));
-        self.pin.verify_plan(plan)?;
+        if let Some(pin) = &self.pin {
+            pin.verify_plan(plan)?;
+        } else if let Some(identity) = &self.root_identity {
+            plan.verify_managed_identity(identity)?;
+        }
         Ok(plan)
     }
     fn action(
@@ -233,6 +614,55 @@ impl Owner {
             Action::Capture { request } => {
                 native(&request.source, path_limit)?;
                 native(&request.output, path_limit)?;
+                if let Some(io) = &self.managed {
+                    let request_f = LightroomWorkbenchIo::CaptureStart {
+                        operation: self.current_operation(shared),
+                        workbench: self.workbench.clone(),
+                        generation: self.generation.clone(),
+                        executable: self.config.capture_executable.clone(),
+                        staging: self.config.capture_staging.clone(),
+                        request,
+                    };
+                    let mut reply = io.filesystem(request_f.clone(), &control.cancel)?;
+                    reply.validate_for(&request_f)?;
+                    loop {
+                        match reply {
+                            LightroomWorkbenchIoReply::CaptureRunning { pid, staging, .. } => {
+                                let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+                                state.status.capture_pid = Some(u32::try_from(pid.0)?);
+                                state.status.capture_staging = Some(staging);
+                            }
+                            LightroomWorkbenchIoReply::CaptureComplete { manifest, .. } => {
+                                let retire = LightroomWorkbenchIo::CaptureRetire {
+                                    operation: self.current_operation(shared),
+                                    workbench: self.workbench.clone(),
+                                    generation: self.generation.clone(),
+                                };
+                                let retired = io.filesystem(retire.clone(), &control.cancel)?;
+                                retired.validate_for(&retire)?;
+                                return encode(&manifest, limit);
+                            }
+                            _ => anyhow::bail!("capture filesystem reply kind"),
+                        }
+                        if let Err(error) = control.check() {
+                            let cancel = LightroomWorkbenchIo::CaptureCancel {
+                                operation: self.current_operation(shared),
+                                workbench: self.workbench.clone(),
+                                generation: self.generation.clone(),
+                            };
+                            let _ = io.filesystem(cancel, &AtomicBool::new(false));
+                            return Err(error);
+                        }
+                        let poll = LightroomWorkbenchIo::CapturePoll {
+                            operation: self.current_operation(shared),
+                            workbench: self.workbench.clone(),
+                            generation: self.generation.clone(),
+                        };
+                        thread::sleep(Duration::from_millis(10));
+                        reply = io.filesystem(poll.clone(), &control.cancel)?;
+                        reply.validate_for(&poll)?;
+                    }
+                }
                 let executable = native(&self.config.capture_executable, path_limit)?;
                 let staging = native(&self.config.capture_staging, path_limit)?;
                 let mut child = CaptureProcess::spawn(&executable, &staging, &request)?;
@@ -267,13 +697,21 @@ impl Owner {
                 encode(&serde_json::json!({"inventory_digest":digest}), limit)
             }
             Action::AddCapture { directory } => {
-                let directory = native(&directory, path_limit)?;
-                let revision = self.plan(control)?.add_capture(&directory)?;
+                let revision = if self.managed.is_some() {
+                    self.add_capture_managed(&self.current_operation(shared), directory, control)?
+                } else {
+                    let directory = native(&directory, path_limit)?;
+                    self.plan(control)?.add_capture(&directory)?
+                };
                 encode(&serde_json::json!({"revision":revision}), limit)
             }
             Action::Resume { revision, max_rows } => {
                 let rows = count(max_rows, 100_000)?;
-                let progress = self.plan(control)?.resume(&revision, rows)?;
+                let progress = if self.managed.is_some() {
+                    self.resume_managed(&self.current_operation(shared), &revision, rows, control)?
+                } else {
+                    self.plan(control)?.resume(&revision, rows)?
+                };
                 encode(&progress, limit)
             }
             Action::InspectOriginals {
@@ -322,20 +760,35 @@ impl Owner {
                 );
                 let requested = native(&request.inspection, path_limit)?;
                 ensure!(
-                    requested == self.pin.root().join("inspection.sqlite3"),
+                    requested == self.root.to_path()?.join("inspection.sqlite3"),
                     "selection inspection differs from pinned workbench"
                 );
-                drop(self.plan.take());
+                if let Some(plan) = self.plan.take() {
+                    plan.close_checked()?;
+                }
+                self.verify_root(control)?;
                 let progress = control.processed.clone();
-                let review = selection::SelectionReview::open(
-                    request,
-                    limits,
-                    control.cancel.clone(),
-                    move |p| {
-                        progress.store(p.completed, Ordering::Release);
-                    },
-                )?;
-                self.pin.verify_review(&review)?;
+                let review = if let Some(identity) = &self.root_identity {
+                    selection::SelectionReview::open_managed(
+                        request,
+                        limits,
+                        control.cancel.clone(),
+                        identity,
+                        move |p| progress.store(p.completed, Ordering::Release),
+                    )?
+                } else {
+                    let review = selection::SelectionReview::open(
+                        request,
+                        limits,
+                        control.cancel.clone(),
+                        move |p| progress.store(p.completed, Ordering::Release),
+                    )?;
+                    self.pin
+                        .as_ref()
+                        .context("inspection pin absent")?
+                        .verify_review(&review)?;
+                    review
+                };
                 let encoded = encode(review.summary(), limit)?;
                 self.review = Some(review);
                 Ok(encoded)
@@ -396,18 +849,28 @@ impl Owner {
                 )
             }
             Action::ReleaseReview => {
-                drop(self.review.take());
+                if let Some(review) = self.review.take() {
+                    review.close_checked()?;
+                }
+                self.verify_root(control)?;
                 self.plan(control)?;
                 encode(&serde_json::json!({"review_released":true}), limit)
             }
         }
     }
-    fn query(&mut self, query: Query, control: &Control) -> Result<String> {
+    fn query(&mut self, query: Query, control: &Control, operation: &str) -> Result<String> {
         let maximum = self.config.limits.result_bytes;
         match query {
             Query::CaptureManifest { directory } => {
-                let directory = native(&directory, self.config.limits.native_path_units)?;
-                encode(&core::capture::read_manifest(&directory)?, maximum)
+                if self.managed.is_some() {
+                    let (capture_generation, _, manifest, _) =
+                        self.begin_evidence(operation, directory, control)?;
+                    self.release_evidence(operation, &capture_generation)?;
+                    encode(&manifest, maximum)
+                } else {
+                    let directory = native(&directory, self.config.limits.native_path_units)?;
+                    encode(&core::capture::read_manifest(&directory)?, maximum)
+                }
             }
             Query::SelectionSummary => encode(
                 self.review

@@ -10,7 +10,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Condvar, Mutex, atomic::AtomicBool},
 };
 
 pub const ENVELOPE_BYTES: usize = 128 * 1024;
@@ -18,6 +18,8 @@ const HEADER_BYTES: usize = 48;
 const PROTOCOL: u8 = 1;
 const MAGIC: &[u8; 4] = b"PCWB";
 const ERROR_BYTES: usize = 4096;
+const CALLBACK_BYTES: usize = 64 * 1024 * 1024;
+const CALLBACK_CHUNK_BYTES: usize = (ENVELOPE_BYTES - 16 * 1024) / 6;
 
 pub fn build_identity() -> String {
     blake3::hash(
@@ -48,14 +50,16 @@ struct Startup {
     build: String,
     instance: crate::catalog_session::LeaseId,
     envelope_bytes: crate::application::U64,
+    managed: bool,
 }
 impl Startup {
-    fn new() -> Self {
+    fn new(managed: bool) -> Self {
         Self {
             protocol: PROTOCOL,
             build: build_identity(),
             instance: crate::catalog_session::LeaseId::new(),
             envelope_bytes: crate::application::U64(ENVELOPE_BYTES as u64),
+            managed,
         }
     }
     fn validate(&self) -> Result<()> {
@@ -81,6 +85,53 @@ enum Work {
     Shutdown {
         sequence: crate::application::U64,
     },
+    CallbackBegin {
+        sequence: crate::application::U64,
+        bytes: crate::application::U64,
+        blake3: String,
+    },
+    CallbackChunk {
+        sequence: crate::application::U64,
+        offset: crate::application::U64,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CallbackRequest {
+    Filesystem {
+        request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
+    },
+    SourceOpen {
+        authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    },
+    SourceSchema {
+        source: String,
+    },
+    SourceRows {
+        source: String,
+        handle: String,
+        cursor: Option<Vec<crate::lightroom::plan::Cell>>,
+        limit: crate::application::U64,
+    },
+    SourceCurrent {
+        source: String,
+    },
+    SourceRetire {
+        source: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CallbackValue {
+    Filesystem(crate::filesystem_worker::wire::LightroomWorkbenchIoReply),
+    Source(String),
+    Schema(crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects),
+    Table(crate::lightroom_migration_worker::source_reader::capture_wire::TableValue),
+    Current(crate::lightroom_migration_worker::source_reader::capture_wire::Current),
+    Retired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,16 +170,23 @@ enum Outcome {
         sequence: crate::application::U64,
         instance: crate::catalog_session::LeaseId,
     },
+    Callback {
+        sequence: crate::application::U64,
+        request: CallbackRequest,
+    },
 }
 
-fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
-    struct Count(usize);
+fn encode_limit(value: &impl Serialize, maximum: usize) -> Result<Vec<u8>> {
+    struct Count {
+        bytes: usize,
+        maximum: usize,
+    }
     impl Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
+            self.bytes = self
+                .bytes
                 .checked_add(bytes.len())
-                .filter(|bytes| *bytes <= ENVELOPE_BYTES)
+                .filter(|bytes| *bytes <= self.maximum)
                 .ok_or_else(|| std::io::Error::other("Workbench envelope byte limit"))?;
             Ok(bytes.len())
         }
@@ -136,21 +194,28 @@ fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
             Ok(())
         }
     }
-    let mut count = Count(0);
+    let mut count = Count { bytes: 0, maximum };
     serde_json::to_writer(&mut count, value)?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(count.0)?;
+    bytes.try_reserve_exact(count.bytes)?;
     serde_json::to_writer(&mut bytes, value)?;
-    ensure!(bytes.len() == count.0, "Workbench encoding length changed");
+    ensure!(
+        bytes.len() == count.bytes,
+        "Workbench encoding length changed"
+    );
     Ok(bytes)
 }
 
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    ensure!(
-        bytes.len() <= ENVELOPE_BYTES,
-        "Workbench decoded envelope byte limit"
-    );
+fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
+    encode_limit(value, ENVELOPE_BYTES)
+}
+
+fn decode_limit<T: DeserializeOwned>(bytes: &[u8], maximum: usize) -> Result<T> {
+    ensure!(bytes.len() <= maximum, "Workbench decoded byte limit");
     Ok(serde_json::from_slice(bytes)?)
+}
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    decode_limit(bytes, ENVELOPE_BYTES)
 }
 
 fn write_packet(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
@@ -204,15 +269,227 @@ fn request_digest(request: &Request) -> Result<String> {
     Ok(blake3::hash(&encode(request)?).to_hex().to_string())
 }
 
+#[derive(Default)]
+struct CallbackState {
+    next: u64,
+    assembly: Option<CallbackAssembly>,
+    waiting: Option<(u64, std::result::Result<CallbackValue, Failure>)>,
+    closed: bool,
+}
+struct CallbackAssembly {
+    sequence: u64,
+    length: usize,
+    blake3: String,
+    bytes: Vec<u8>,
+}
+struct CallbackProxy {
+    output: Arc<Mutex<std::io::Stdout>>,
+    state: Mutex<CallbackState>,
+    wake: Condvar,
+}
+impl CallbackProxy {
+    fn call(&self, request: CallbackRequest, cancel: &AtomicBool) -> Result<CallbackValue> {
+        let sequence = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            ensure!(!state.closed, "Workbench supervisor callback is closed");
+            state.next = state
+                .next
+                .checked_add(1)
+                .context("callback sequence exhausted")?;
+            state.next
+        };
+        write_packet(
+            &mut *self.output.lock().unwrap_or_else(|e| e.into_inner()),
+            &Outcome::Callback {
+                sequence: crate::application::U64(sequence),
+                request,
+            },
+        )?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Acquire),
+                "Workbench callback canceled"
+            );
+            ensure!(!state.closed, "Workbench supervisor callback closed");
+            if state
+                .waiting
+                .as_ref()
+                .is_some_and(|value| value.0 == sequence)
+            {
+                let (_, result) = state.waiting.take().unwrap();
+                return result.map_err(|failure| anyhow::anyhow!(failure.detail));
+            }
+            let (next, _) = self
+                .wake
+                .wait_timeout(state, std::time::Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+        }
+    }
+    fn reply(
+        &self,
+        sequence: crate::application::U64,
+        length: crate::application::U64,
+        blake3: String,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            sequence.0 > 0
+                && sequence.0 <= state.next
+                && state.waiting.is_none()
+                && state.assembly.is_none(),
+            "Workbench callback result sequence"
+        );
+        let length = usize::try_from(length.0)?;
+        ensure!(
+            (1..=CALLBACK_BYTES).contains(&length),
+            "Workbench callback result length"
+        );
+        ensure!(
+            blake3.len() == 64
+                && blake3
+                    .bytes()
+                    .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()),
+            "Workbench callback result digest"
+        );
+        state.assembly = Some(CallbackAssembly {
+            sequence: sequence.0,
+            length,
+            blake3,
+            bytes: Vec::with_capacity(length),
+        });
+        Ok(())
+    }
+    fn chunk(
+        &self,
+        sequence: crate::application::U64,
+        offset: crate::application::U64,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let assembly = state
+            .assembly
+            .as_mut()
+            .context("Workbench callback result has no begin")?;
+        ensure!(
+            assembly.sequence == sequence.0
+                && offset.0 == assembly.bytes.len() as u64
+                && !bytes.is_empty()
+                && bytes.len() <= CALLBACK_CHUNK_BYTES
+                && bytes.len() <= assembly.length - assembly.bytes.len(),
+            "Workbench callback result continuity"
+        );
+        assembly.bytes.extend_from_slice(&bytes);
+        if assembly.bytes.len() == assembly.length {
+            let assembly = state.assembly.take().unwrap();
+            ensure!(
+                crate::lightroom::digest(&assembly.bytes) == assembly.blake3,
+                "Workbench callback result changed"
+            );
+            let result = decode_limit(&assembly.bytes, CALLBACK_BYTES)?;
+            state.waiting = Some((assembly.sequence, result));
+            self.wake.notify_all();
+        }
+        Ok(())
+    }
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        self.wake.notify_all();
+    }
+}
+impl super::lightroom::ManagedIo for CallbackProxy {
+    fn filesystem(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
+        cancel: &AtomicBool,
+    ) -> Result<crate::filesystem_worker::wire::LightroomWorkbenchIoReply> {
+        match self.call(CallbackRequest::Filesystem { request }, cancel)? {
+            CallbackValue::Filesystem(value) => Ok(value),
+            _ => anyhow::bail!("Workbench filesystem callback result kind"),
+        }
+    }
+    fn source_open(
+        &self,
+        authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String> {
+        match self.call(CallbackRequest::SourceOpen { authority }, &cancel)? {
+            CallbackValue::Source(value) => Ok(value),
+            _ => anyhow::bail!("Workbench source-open callback result kind"),
+        }
+    }
+    fn source_schema(
+        &self,
+        source: &str,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects> {
+        match self.call(
+            CallbackRequest::SourceSchema {
+                source: source.into(),
+            },
+            &AtomicBool::new(false),
+        )? {
+            CallbackValue::Schema(value) => Ok(value),
+            _ => anyhow::bail!("Workbench source-schema callback result kind"),
+        }
+    }
+    fn source_rows(
+        &self,
+        source: &str,
+        handle: String,
+        cursor: Option<Vec<crate::lightroom::plan::Cell>>,
+        limit: usize,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::TableValue> {
+        match self.call(
+            CallbackRequest::SourceRows {
+                source: source.into(),
+                handle,
+                cursor,
+                limit: crate::application::U64(limit.try_into()?),
+            },
+            &AtomicBool::new(false),
+        )? {
+            CallbackValue::Table(value) => Ok(value),
+            _ => anyhow::bail!("Workbench source-rows callback result kind"),
+        }
+    }
+    fn source_current(
+        &self,
+        source: &str,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::Current> {
+        match self.call(
+            CallbackRequest::SourceCurrent {
+                source: source.into(),
+            },
+            &AtomicBool::new(false),
+        )? {
+            CallbackValue::Current(value) => Ok(value),
+            _ => anyhow::bail!("Workbench source-current callback result kind"),
+        }
+    }
+    fn source_retire(&self, source: &str) -> Result<()> {
+        match self.call(
+            CallbackRequest::SourceRetire {
+                source: source.into(),
+            },
+            &AtomicBool::new(false),
+        )? {
+            CallbackValue::Retired => Ok(()),
+            _ => anyhow::bail!("Workbench source-retire callback result kind"),
+        }
+    }
+}
+
 /// Hidden W entrypoint. stdout is the only response stream; stderr remains
 /// unused so an unframed diagnostic can never be mistaken for protocol data.
 pub fn worker_main() -> Result<()> {
     let mut input = std::io::stdin().lock();
-    let mut output = std::io::stdout().lock();
     let startup: Startup = read_packet(&mut input)?.context("missing Workbench bootstrap")?;
     startup.validate()?;
+    let output = Arc::new(Mutex::new(std::io::stdout()));
     write_packet(
-        &mut output,
+        &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
         &Outcome::Ready {
             instance: startup.instance.clone(),
             build: build_identity(),
@@ -220,7 +497,16 @@ pub fn worker_main() -> Result<()> {
     )?;
     let executable = std::env::current_exe()?;
     let control = std::sync::Arc::new(Mutex::new(super::lightroom_bridge::Control::default()));
-    let mut coordinator = Coordinator::new(control);
+    let callback = Arc::new(CallbackProxy {
+        output: output.clone(),
+        state: Mutex::new(CallbackState::default()),
+        wake: Condvar::new(),
+    });
+    let mut coordinator = if startup.managed {
+        Coordinator::new_managed(control, callback.clone())
+    } else {
+        Coordinator::new(control)
+    };
     loop {
         let work: Work = read_packet(&mut input)?.context("Workbench control stream ended")?;
         match work {
@@ -241,7 +527,7 @@ pub fn worker_main() -> Result<()> {
                     error.validate()?;
                 }
                 write_packet(
-                    &mut output,
+                    &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
                     &Outcome::Reply {
                         sequence,
                         request_digest: expected,
@@ -251,15 +537,32 @@ pub fn worker_main() -> Result<()> {
             }
             Work::Shutdown { sequence } => {
                 ensure!(sequence.0 > 0, "Workbench shutdown sequence");
+                callback.close();
                 coordinator.shutdown();
                 write_packet(
-                    &mut output,
+                    &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
                     &Outcome::Drained {
                         sequence,
                         instance: startup.instance,
                     },
                 )?;
                 return Ok(());
+            }
+            Work::CallbackBegin {
+                sequence,
+                bytes,
+                blake3,
+            } => {
+                ensure!(startup.managed, "callback reply for unmanaged Workbench");
+                callback.reply(sequence, bytes, blake3)?;
+            }
+            Work::CallbackChunk {
+                sequence,
+                offset,
+                bytes,
+            } => {
+                ensure!(startup.managed, "callback reply for unmanaged Workbench");
+                callback.chunk(sequence, offset, bytes)?;
             }
         }
     }
@@ -292,10 +595,23 @@ impl Owner {
 pub struct Client {
     instance: crate::catalog_session::LeaseId,
     owner: Mutex<Owner>,
+    managed: Option<Arc<dyn super::lightroom::ManagedIo>>,
 }
 impl Client {
     pub fn spawn(executable: &Path) -> Result<Self> {
-        let startup = Startup::new();
+        Self::spawn_inner(executable, None)
+    }
+    pub(crate) fn spawn_managed(
+        executable: &Path,
+        managed: Arc<dyn super::lightroom::ManagedIo>,
+    ) -> Result<Self> {
+        Self::spawn_inner(executable, Some(managed))
+    }
+    fn spawn_inner(
+        executable: &Path,
+        managed: Option<Arc<dyn super::lightroom::ManagedIo>>,
+    ) -> Result<Self> {
+        let startup = Startup::new(managed.is_some());
         startup.validate()?;
         let mut child = Command::new(executable)
             .arg("--lightroom-workbench-worker")
@@ -317,6 +633,7 @@ impl Client {
         );
         Ok(Self {
             instance: startup.instance,
+            managed,
             owner: Mutex::new(Owner {
                 child: Some(child),
                 transport: Some(Transport {
@@ -327,6 +644,78 @@ impl Client {
                 drained: false,
             }),
         })
+    }
+
+    fn callback(
+        managed: &dyn super::lightroom::ManagedIo,
+        request: CallbackRequest,
+    ) -> Result<CallbackValue> {
+        let cancel = AtomicBool::new(false);
+        match request {
+            CallbackRequest::Filesystem { request } => Ok(CallbackValue::Filesystem(
+                managed.filesystem(request, &cancel)?,
+            )),
+            CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source(
+                managed.source_open(authority, Arc::new(cancel))?,
+            )),
+            CallbackRequest::SourceSchema { source } => {
+                Ok(CallbackValue::Schema(managed.source_schema(&source)?))
+            }
+            CallbackRequest::SourceRows {
+                source,
+                handle,
+                cursor,
+                limit,
+            } => Ok(CallbackValue::Table(managed.source_rows(
+                &source,
+                handle,
+                cursor,
+                usize::try_from(limit.0)?,
+            )?)),
+            CallbackRequest::SourceCurrent { source } => {
+                Ok(CallbackValue::Current(managed.source_current(&source)?))
+            }
+            CallbackRequest::SourceRetire { source } => {
+                managed.source_retire(&source)?;
+                Ok(CallbackValue::Retired)
+            }
+        }
+    }
+
+    fn reply_callback(
+        transport: &mut Transport,
+        sequence: crate::application::U64,
+        request: CallbackRequest,
+        managed: Option<&Arc<dyn super::lightroom::ManagedIo>>,
+    ) -> Result<()> {
+        let result = managed
+            .context("unmanaged Workbench requested a supervisor callback")
+            .and_then(|managed| Self::callback(managed.as_ref(), request))
+            .map_err(Failure::new);
+        if let Err(error) = &result {
+            error.validate()?;
+        }
+        let encoded = encode_limit(&result, CALLBACK_BYTES)?;
+        let digest = crate::lightroom::digest(&encoded);
+        write_packet(
+            &mut transport.input,
+            &Work::CallbackBegin {
+                sequence,
+                bytes: crate::application::U64(encoded.len().try_into()?),
+                blake3: digest,
+            },
+        )?;
+        for (index, bytes) in encoded.chunks(CALLBACK_CHUNK_BYTES).enumerate() {
+            write_packet(
+                &mut transport.input,
+                &Work::CallbackChunk {
+                    sequence,
+                    offset: crate::application::U64((index * CALLBACK_CHUNK_BYTES) as u64),
+                    bytes: bytes.to_vec(),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     pub fn call(&self, request: Request) -> Result<Response> {
@@ -350,20 +739,27 @@ impl Client {
                 request,
             },
         )?;
-        let outcome: Outcome = read_packet(&mut transport.output)?
-            .context("Workbench reply lost; child remains owned for checked drain")?;
-        let Outcome::Reply {
-            sequence: actual,
-            request_digest: actual_digest,
-            result,
-        } = outcome
-        else {
-            anyhow::bail!("unexpected Workbench outcome")
+        let result = loop {
+            let outcome: Outcome = read_packet(&mut transport.output)?
+                .context("Workbench reply lost; child remains owned for checked drain")?;
+            match outcome {
+                Outcome::Callback { sequence, request } => {
+                    Self::reply_callback(transport, sequence, request, self.managed.as_ref())?;
+                }
+                Outcome::Reply {
+                    sequence: actual,
+                    request_digest: actual_digest,
+                    result,
+                } => {
+                    ensure!(
+                        actual == sequence && actual_digest == digest,
+                        "Workbench reply binding mismatch"
+                    );
+                    break result;
+                }
+                _ => anyhow::bail!("unexpected Workbench outcome"),
+            }
         };
-        ensure!(
-            actual == sequence && actual_digest == digest,
-            "Workbench reply binding mismatch"
-        );
         result.map_err(|failure| anyhow::anyhow!(failure.detail))
     }
 
@@ -383,16 +779,26 @@ impl Client {
                 .context("Workbench sequence exhausted")?;
             let sequence = crate::application::U64(transport.sequence);
             write_packet(&mut transport.input, &Work::Shutdown { sequence })?;
-            let outcome: Outcome = read_packet(&mut transport.output)?
-                .context("Workbench drain acknowledgement lost")?;
-            ensure!(
-                matches!(
-                    outcome,
-                    Outcome::Drained { sequence: actual, ref instance }
-                        if actual == sequence && instance == &self.instance
-                ),
-                "Workbench drain binding mismatch"
-            );
+            loop {
+                let outcome: Outcome = read_packet(&mut transport.output)?
+                    .context("Workbench drain acknowledgement lost")?;
+                match outcome {
+                    Outcome::Callback { sequence, request } => {
+                        Self::reply_callback(transport, sequence, request, self.managed.as_ref())?
+                    }
+                    Outcome::Drained {
+                        sequence: actual,
+                        ref instance,
+                    } => {
+                        ensure!(
+                            actual == sequence && instance == &self.instance,
+                            "Workbench drain binding mismatch"
+                        );
+                        break;
+                    }
+                    _ => anyhow::bail!("unexpected Workbench drain outcome"),
+                }
+            }
             drop(owner.transport.take());
             let status = owner
                 .child
@@ -436,7 +842,7 @@ mod tests {
 
     #[test]
     fn frame_round_trip_rejects_corruption_and_oversize() -> Result<()> {
-        let startup = Startup::new();
+        let startup = Startup::new(false);
         let mut bytes = Vec::new();
         write_packet(&mut bytes, &startup)?;
         let decoded: Startup = read_packet(&mut bytes.as_slice())?.context("frame")?;

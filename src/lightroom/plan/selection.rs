@@ -268,7 +268,8 @@ pub use preparation::{
 pub struct SelectionReview {
     // Close SQLite before the source descriptor. No writable Plan escapes.
     plan: Plan,
-    guard: Source,
+    guard: Option<Source>,
+    managed_identity: Option<crate::catalog_session::PhysicalObjectId>,
     version: i64,
     companion_objects: Vec<String>,
     summary: ReviewSummary,
@@ -523,12 +524,19 @@ fn preadmit(db: &Connection, limits: SelectionLimits) -> Result<()> {
 }
 
 impl SelectionReview {
+    pub(crate) fn close_checked(self) -> Result<()> {
+        self.plan.close_checked()
+    }
     /// Bind both this review's held source and SQLite's actually opened object
     /// to the workbench's existing descriptor. No incidental same-inode FD is
     /// opened/closed here (important for POSIX process-scoped SQLite locks).
     pub(crate) fn verify_inspection_owner(&self, expected: &Source) -> Result<()> {
+        let guard = self
+            .guard
+            .as_ref()
+            .context("managed selection has no local source guard")?;
         ensure!(
-            self.guard.before.object == expected.before.object,
+            guard.before.object == expected.before.object,
             "selection opened a different inspection object; reopen workbench explicitly"
         );
         crate::catalog_storage::verify_database_object(&self.plan.db, &expected.file)
@@ -539,6 +547,30 @@ impl SelectionReview {
         cancel: Arc<AtomicBool>,
         mut progress: impl FnMut(SelectionProgress),
     ) -> Result<Self> {
+        Self::open_inner(request, limits, cancel, &mut progress, None)
+    }
+    pub(crate) fn open_managed(
+        request: SelectionRequest,
+        limits: SelectionLimits,
+        cancel: Arc<AtomicBool>,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+        mut progress: impl FnMut(SelectionProgress),
+    ) -> Result<Self> {
+        Self::open_inner(
+            request,
+            limits,
+            cancel,
+            &mut progress,
+            Some(super::physical(expected)),
+        )
+    }
+    fn open_inner(
+        request: SelectionRequest,
+        limits: SelectionLimits,
+        cancel: Arc<AtomicBool>,
+        progress: &mut impl FnMut(SelectionProgress),
+        managed_identity: Option<crate::catalog_session::PhysicalObjectId>,
+    ) -> Result<Self> {
         limits.validate()?;
         let until = Instant::now() + Duration::from_millis(limits.deadline_ms);
         check(&cancel, until)?;
@@ -548,9 +580,21 @@ impl SelectionReview {
         );
         bounded_json(&request, limits.review_bytes)?;
         let path = local(&request.inspection, limits.native_path_units)?;
-        let guard = Source::open(&path, limits.snapshot_bytes)?;
-        let read_mode = companions(&path)?;
-        let initial_companions = companion_objects(&path, read_mode)?;
+        let guard = if managed_identity.is_none() {
+            Some(Source::open(&path, limits.snapshot_bytes)?)
+        } else {
+            None
+        };
+        let read_mode = if managed_identity.is_some() {
+            InspectionReadMode::ClosedMain
+        } else {
+            companions(&path)?
+        };
+        let initial_companions = if managed_identity.is_some() {
+            vec![]
+        } else {
+            companion_objects(&path, read_mode)?
+        };
         // immutable is safe only for fenced main-only custody, never live WAL.
         // Genuine RO SQLite may otherwise create companions for a closed file
         // whose header retains WAL mode, which review must not do.
@@ -561,7 +605,16 @@ impl SelectionReview {
             }
             InspectionReadMode::LiveWal => Connection::open_with_flags(&path, flags)?,
         };
-        crate::catalog_storage::verify_database_object(&db, &guard.file)?;
+        if let Some(guard) = &guard {
+            crate::catalog_storage::verify_database_object(&db, &guard.file)?;
+        } else {
+            crate::catalog_storage::verify_database_identity(
+                &db,
+                managed_identity
+                    .as_ref()
+                    .context("managed review identity")?,
+            )?;
+        }
         db.busy_timeout(Duration::ZERO)?;
         db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;")?;
         let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -672,15 +725,24 @@ impl SelectionReview {
             version(&plan.db)? == baseline,
             "inspection committed changes during review; review again"
         );
-        guard.verify()?;
-        ensure!(
-            companions(&path)? == read_mode,
-            "inspection companion mode changed during review"
-        );
-        ensure!(
-            companion_objects(&path, read_mode)? == initial_companions,
-            "inspection companion object changed during review"
-        );
+        if let Some(guard) = &guard {
+            guard.verify()?;
+            ensure!(
+                companions(&path)? == read_mode,
+                "inspection companion mode changed during review"
+            );
+            ensure!(
+                companion_objects(&path, read_mode)? == initial_companions,
+                "inspection companion object changed during review"
+            );
+        } else {
+            crate::catalog_storage::verify_database_identity(
+                &plan.db,
+                managed_identity
+                    .as_ref()
+                    .context("managed review identity")?,
+            )?;
+        }
         let summary = ReviewSummary {
             protocol: 1,
             token,
@@ -698,6 +760,7 @@ impl SelectionReview {
         Ok(Self {
             plan,
             guard,
+            managed_identity,
             version: baseline,
             companion_objects: initial_companions,
             summary,
@@ -768,18 +831,27 @@ impl SelectionReview {
             expected == self.summary.token,
             "selection review token differs"
         );
-        self.guard
-            .verify()
-            .context("inspection identity changed; review again")?;
-        crate::catalog_storage::verify_database_object(&self.plan.db, &self.guard.file)?;
-        ensure!(
-            companions(&self.guard.path)? == self.summary.read_mode,
-            "inspection companion mode changed; review again"
-        );
-        ensure!(
-            companion_objects(&self.guard.path, self.summary.read_mode)? == self.companion_objects,
-            "inspection companion object changed; review again"
-        );
+        if let Some(guard) = &self.guard {
+            guard
+                .verify()
+                .context("inspection identity changed; review again")?;
+            crate::catalog_storage::verify_database_object(&self.plan.db, &guard.file)?;
+            ensure!(
+                companions(&guard.path)? == self.summary.read_mode,
+                "inspection companion mode changed; review again"
+            );
+            ensure!(
+                companion_objects(&guard.path, self.summary.read_mode)? == self.companion_objects,
+                "inspection companion object changed; review again"
+            );
+        } else {
+            crate::catalog_storage::verify_database_identity(
+                &self.plan.db,
+                self.managed_identity
+                    .as_ref()
+                    .context("managed review identity")?,
+            )?;
+        }
         ensure!(
             version(&self.plan.db)? == self.version,
             "inspection committed changes; review again"

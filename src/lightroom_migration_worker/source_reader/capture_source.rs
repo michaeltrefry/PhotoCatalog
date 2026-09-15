@@ -135,7 +135,8 @@ impl CaptureSource {
             "CaptureSql physical identity differs"
         );
         let digest = guard.copy_and_hash_controlled(None, || {
-            ensure!(!cancel.load(Ordering::Acquire), "CaptureSql canceled")
+            ensure!(!cancel.load(Ordering::Acquire), "CaptureSql canceled");
+            Ok(())
         })?;
         ensure!(
             digest == authority.logical_blake3,
@@ -271,14 +272,7 @@ impl CaptureSource {
         }
         drop(rows);
         drop(statement);
-        let stable = crate::lightroom::digest(&crate::lightroom::bounded_json(
-            &objects,
-            max_bytes
-                .checked_mul(6)
-                .context("schema encoding bound")?
-                .max(1024),
-        )?);
-        let mut tables = BTreeMap::new();
+        let mut admitted = Vec::new();
         let mut descriptors = Vec::new();
         for object in objects
             .iter()
@@ -286,8 +280,9 @@ impl CaptureSource {
         {
             let ordinal = descriptors.len();
             let Some(name) = std::str::from_utf8(&object.name).ok().map(str::to_owned) else {
+                admitted.push(None);
                 descriptors.push(wire::TableDescriptor {
-                    table_handle: Self::handle(authority, &stable, ordinal, object)?,
+                    table_handle: String::new(),
                     ordinal: U64(ordinal as u64),
                     columns: vec![],
                     value_columns: vec![],
@@ -300,7 +295,23 @@ impl CaptureSource {
             };
             let mut columns = Vec::new();
             let mut names = Vec::new();
-            let mut info = db.prepare(&format!("PRAGMA table_xinfo({})", quote(&name)))?;
+            let mut info = match db.prepare(&format!("PRAGMA table_xinfo({})", quote(&name))) {
+                Ok(value) => value,
+                Err(_) => {
+                    admitted.push(None);
+                    descriptors.push(wire::TableDescriptor {
+                        table_handle: String::new(),
+                        ordinal: U64(ordinal as u64),
+                        columns: vec![],
+                        value_columns: vec![],
+                        cursor: None,
+                        category: category(&name),
+                        expected_count: None,
+                        retained_only: Some(wire::RetainedOnlyReason::SchemaReadFailed),
+                    });
+                    continue;
+                }
+            };
             let mut info_rows = info.query([])?;
             while let Some(row) = info_rows.next()? {
                 let raw_name = bytes(row.get_ref(1)?)?;
@@ -368,7 +379,7 @@ impl CaptureSource {
                 None
             };
             let descriptor = wire::TableDescriptor {
-                table_handle: Self::handle(authority, &stable, ordinal, object)?,
+                table_handle: String::new(),
                 ordinal: U64(ordinal as u64),
                 value_columns: (0..columns.len()).map(|v| U64(v as u64)).collect(),
                 cursor,
@@ -377,7 +388,7 @@ impl CaptureSource {
                 retained_only: reason,
                 columns,
             };
-            if descriptor.retained_only.is_none() {
+            let admitted_table = if descriptor.retained_only.is_none() {
                 let keys = match descriptor.cursor.as_ref().unwrap() {
                     wire::PhysicalCursor::PrimaryKey(indexes) => indexes
                         .iter()
@@ -387,16 +398,40 @@ impl CaptureSource {
                         vec![String::from_utf8(v.clone()).unwrap()]
                     }
                 };
-                tables.insert(
-                    descriptor.table_handle.clone(),
-                    AdmittedTable {
-                        name,
-                        columns: names,
-                        keys,
-                    },
-                );
-            }
+                Some(AdmittedTable {
+                    name,
+                    columns: names,
+                    keys,
+                })
+            } else {
+                None
+            };
+            admitted.push(admitted_table);
             descriptors.push(descriptor);
+        }
+        // A persisted roster must bind every stable table descriptor, not only
+        // sqlite_schema. Handles are generation-bound and therefore excluded
+        // from this digest, then derived from the completed stable roster.
+        let stable = crate::lightroom::digest(&crate::lightroom::bounded_json(
+            &(&objects, &descriptors),
+            max_bytes
+                .checked_mul(12)
+                .context("schema encoding bound")?
+                .max(1024),
+        )?);
+        let table_objects: Vec<_> = objects
+            .iter()
+            .filter(|value| matches!(value.kind, wire::ObjectKind::Table))
+            .collect();
+        let mut tables = BTreeMap::new();
+        for (ordinal, descriptor) in descriptors.iter_mut().enumerate() {
+            let object = table_objects
+                .get(ordinal)
+                .context("CaptureSql table/schema ordinal")?;
+            descriptor.table_handle = Self::handle(authority, &stable, ordinal, object)?;
+            if let Some(table) = admitted.get_mut(ordinal).and_then(Option::take) {
+                tables.insert(descriptor.table_handle.clone(), table);
+            }
         }
         let variables = Self::variables(db, &objects)?;
         Ok((
@@ -437,9 +472,11 @@ impl CaptureSource {
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             if let (ValueRef::Text(k), ValueRef::Text(v)) = (row.get_ref(0)?, row.get_ref(1)?) {
-                if let (Ok(k), Ok(v)) = (std::str::from_utf8(k), std::str::from_utf8(v)) {
-                    out.insert(k.into(), v.into());
-                }
+                let k = std::str::from_utf8(k)
+                    .context("CaptureSql variable name is not valid UTF-8")?;
+                let v = std::str::from_utf8(v)
+                    .context("CaptureSql variable value is not valid UTF-8")?;
+                out.insert(k.into(), v.into());
             }
         }
         Ok(out)
@@ -513,33 +550,64 @@ impl CaptureSource {
             "SELECT {select} FROM {}{predicate} ORDER BY {order} LIMIT {limit}",
             quote(&table.name)
         );
-        let result = (|| -> Result<Vec<wire::TableRow>> {
-            let mut statement = self.db.prepare(&sql)?;
-            let mut rows = statement.query(params_from_iter(values.iter()))?;
+        let result = (|| -> std::result::Result<
+            Vec<wire::TableRow>,
+            (wire::TableFailureClass, anyhow::Error),
+        > {
+            let mut statement = self
+                .db
+                .prepare(&sql)
+                .map_err(|error| (wire::TableFailureClass::Statement, error.into()))?;
+            let mut rows = statement
+                .query(params_from_iter(values.iter()))
+                .map_err(|error| (wire::TableFailureClass::Statement, error.into()))?;
             let mut out = Vec::new();
             let mut total = 0usize;
-            let max_cell = usize::try_from(self.authority.limits.max_cell_bytes.0)?;
-            let page = usize::try_from(self.authority.limits.page_bytes.0)?;
-            while let Some(row) = rows.next()? {
+            let max_cell = usize::try_from(self.authority.limits.max_cell_bytes.0)
+                .map_err(|error| (wire::TableFailureClass::CellBytes, error.into()))?;
+            let page = usize::try_from(self.authority.limits.page_bytes.0)
+                .map_err(|error| (wire::TableFailureClass::RowBytes, error.into()))?;
+            loop {
+                let row = rows
+                    .next()
+                    .map_err(|error| (wire::TableFailureClass::Step, error.into()))?;
+                let Some(row) = row else { break };
                 let mut all = Vec::with_capacity(table.keys.len() + table.columns.len());
                 let mut size = 0usize;
                 for index in 0..table.keys.len() + table.columns.len() {
-                    let v = cell(row.get_ref(index)?, max_cell)?;
+                    let raw = row
+                        .get_ref(index)
+                        .map_err(|error| (wire::TableFailureClass::Conversion, error.into()))?;
+                    let v = cell(raw, max_cell)
+                        .map_err(|error| (wire::TableFailureClass::CellBytes, error))?;
                     size = size
                         .checked_add(match &v {
                             Cell::Text(v) | Cell::Blob(v) => v
                                 .len()
                                 .checked_mul(2)
-                                .context("CaptureSql cell bytes")?
+                                .context("CaptureSql cell bytes")
+                                .map_err(|error| (wire::TableFailureClass::CellBytes, error))?
                                 .checked_add(64)
-                                .context("CaptureSql cell bytes")?,
+                                .context("CaptureSql cell bytes")
+                                .map_err(|error| (wire::TableFailureClass::CellBytes, error))?,
                             _ => 64,
                         })
-                        .context("CaptureSql row bytes")?;
+                        .context("CaptureSql row bytes")
+                        .map_err(|error| (wire::TableFailureClass::RowBytes, error))?;
                     all.push(v);
                 }
-                ensure!(size <= page, "CaptureSql row bytes");
-                if total.checked_add(size).context("CaptureSql page bytes")? > page {
+                if size > page {
+                    return Err((
+                        wire::TableFailureClass::RowBytes,
+                        anyhow::anyhow!("CaptureSql row bytes"),
+                    ));
+                }
+                if total
+                    .checked_add(size)
+                    .context("CaptureSql page bytes")
+                    .map_err(|error| (wire::TableFailureClass::RowBytes, error))?
+                    > page
+                {
                     break;
                 }
                 total += size;
@@ -552,14 +620,14 @@ impl CaptureSource {
         })();
         let rows = match result {
             Ok(v) => v,
-            Err(error) => {
+            Err((class, error)) => {
                 self.verify()?;
                 return Ok(Err(wire::TableFailure {
                     authority_binding: self.authority.binding_blake3.clone(),
                     schema_roster_blake3: self.schema.schema_roster_blake3.clone(),
                     table_handle: handle,
                     cursor,
-                    class: wire::TableFailureClass::Statement,
+                    class,
                     detail: format!("{error:#}").chars().take(4096).collect(),
                 }));
             }

@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Inspection-plan storage version; independent of the application catalog.
-pub const PLAN_SCHEMA_VERSION: i64 = 3;
+pub const PLAN_SCHEMA_VERSION: i64 = 4;
 pub(crate) mod desktop;
 pub mod selection;
 const PAGING_INDEXES: &str = "CREATE INDEX rows_revision_sequence ON rows(revision,sequence);
@@ -203,6 +203,12 @@ pub struct Progress {
     pub retained_this_call: usize,
     pub stage: String,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedTable {
+    pub name: String,
+    pub descriptor: crate::lightroom_migration_worker::source_reader::capture_wire::TableDescriptor,
+    pub cursor: Option<Vec<Cell>>,
+}
 pub struct Plan {
     db: Connection,
     root: PathBuf,
@@ -354,38 +360,68 @@ pub(super) fn recover_private(source: &Path, destination: &Path, limits: &Limits
         .sync_all()?;
     Ok(())
 }
+fn initialize_plan(db: &Connection) -> Result<()> {
+    let transaction = db.unchecked_transaction()?;
+    transaction.execute_batch("PRAGMA application_id=0x50434c49;
+    CREATE TABLE captures(revision TEXT PRIMARY KEY,lineage TEXT NOT NULL,path TEXT NOT NULL,manifest TEXT NOT NULL,stage TEXT NOT NULL,schema_version TEXT,provider TEXT,evidence_revision INTEGER NOT NULL DEFAULT 0,schema_roster TEXT);
+    CREATE TABLE schema_objects(revision TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,table_name TEXT NOT NULL,sql_text TEXT NOT NULL,PRIMARY KEY(revision,kind,name));
+    CREATE TABLE tables(revision TEXT NOT NULL,name TEXT NOT NULL,columns_json TEXT NOT NULL,key_json TEXT NOT NULL,schema_json TEXT NOT NULL,category TEXT NOT NULL,expected INTEGER,retained INTEGER NOT NULL DEFAULT 0,cursor TEXT,state TEXT NOT NULL,issue TEXT,PRIMARY KEY(revision,name));
+    CREATE TABLE rows(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,key_json TEXT NOT NULL,cells_json TEXT NOT NULL,UNIQUE(revision,table_name,key_json));
+    CREATE INDEX source_rows ON rows(revision,table_name,sequence);
+    CREATE INDEX source_ids ON rows(revision,source_id);
+    CREATE TABLE entities(revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,local_key TEXT,global_key TEXT,fields_json TEXT NOT NULL,PRIMARY KEY(revision,source_id));
+    CREATE INDEX entity_local ON entities(revision,table_name,local_key);
+    CREATE INDEX entity_global ON entities(revision,table_name,global_key);
+    CREATE TABLE issues(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT,code TEXT NOT NULL,detail TEXT NOT NULL,UNIQUE(revision,source_id,code,detail));
+    CREATE TABLE packets(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,origin TEXT NOT NULL,raw_digest TEXT NOT NULL,raw BLOB NOT NULL,decoded BLOB,detail TEXT NOT NULL,UNIQUE(revision,source_id,origin,raw_digest));
+    CREATE TABLE metadata_facts(revision TEXT NOT NULL,source_id TEXT NOT NULL,file_source_id TEXT,origin TEXT NOT NULL,packet_digest TEXT NOT NULL,field TEXT NOT NULL,value_json TEXT NOT NULL,PRIMARY KEY(revision,source_id,origin,packet_digest,field));
+    CREATE INDEX facts_by_file ON metadata_facts(revision,file_source_id,field);
+    CREATE TABLE references_out(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,field TEXT NOT NULL,target_table TEXT NOT NULL,target_key TEXT NOT NULL,UNIQUE(revision,source_id,field,target_table,target_key));
+    CREATE TABLE paths(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,original TEXT NOT NULL,inspection_path TEXT,state TEXT NOT NULL,evidence TEXT,UNIQUE(revision,source_id));
+    CREATE INDEX path_locator ON paths(revision,inspection_path,sequence);
+    CREATE TABLE inventories(digest TEXT PRIMARY KEY,json TEXT NOT NULL);
+    CREATE TABLE family_assignments(revision TEXT PRIMARY KEY,family TEXT NOT NULL,reason TEXT NOT NULL);
+    CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evidence_digest TEXT NOT NULL,reason TEXT NOT NULL);
+    ")?;
+    transaction.execute_batch(PAGING_INDEXES)?;
+    transaction.pragma_update(None, "user_version", PLAN_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+pub(crate) fn physical(
+    key: &crate::lightroom_migration_worker::identity::FileKey,
+) -> crate::catalog_session::PhysicalObjectId {
+    #[cfg(unix)]
+    {
+        crate::catalog_session::PhysicalObjectId::Unix {
+            device: key.volume,
+            inode: key.index,
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::catalog_session::PhysicalObjectId::Windows {
+            volume_serial: key.volume,
+            file_index: key.index,
+        }
+    }
+}
+fn hex(value: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value {
+        write!(out, "{byte:02x}").unwrap();
+    }
+    out
+}
 impl Plan {
     pub fn create(root: &Path) -> Result<Self> {
         ensure!(!root.exists(), "inspection output must be a new directory");
         fs::create_dir(root)?;
         let db = Connection::open(root.join("inspection.sqlite3"))?;
         crate::configure_catalog_connection(&db)?;
-        let transaction = db.unchecked_transaction()?;
-        transaction.execute_batch("PRAGMA application_id=0x50434c49;
-CREATE TABLE captures(revision TEXT PRIMARY KEY,lineage TEXT NOT NULL,path TEXT NOT NULL,manifest TEXT NOT NULL,stage TEXT NOT NULL,schema_version TEXT,provider TEXT,evidence_revision INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE schema_objects(revision TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,table_name TEXT NOT NULL,sql_text TEXT NOT NULL,PRIMARY KEY(revision,kind,name));
-CREATE TABLE tables(revision TEXT NOT NULL,name TEXT NOT NULL,columns_json TEXT NOT NULL,key_json TEXT NOT NULL,schema_json TEXT NOT NULL,category TEXT NOT NULL,expected INTEGER,retained INTEGER NOT NULL DEFAULT 0,cursor TEXT,state TEXT NOT NULL,issue TEXT,PRIMARY KEY(revision,name));
-CREATE TABLE rows(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,key_json TEXT NOT NULL,cells_json TEXT NOT NULL,UNIQUE(revision,table_name,key_json));
-CREATE INDEX source_rows ON rows(revision,table_name,sequence);
-CREATE INDEX source_ids ON rows(revision,source_id);
-CREATE TABLE entities(revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,local_key TEXT,global_key TEXT,fields_json TEXT NOT NULL,PRIMARY KEY(revision,source_id));
-CREATE INDEX entity_local ON entities(revision,table_name,local_key);
-CREATE INDEX entity_global ON entities(revision,table_name,global_key);
-CREATE TABLE issues(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT,code TEXT NOT NULL,detail TEXT NOT NULL,UNIQUE(revision,source_id,code,detail));
-CREATE TABLE packets(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,origin TEXT NOT NULL,raw_digest TEXT NOT NULL,raw BLOB NOT NULL,decoded BLOB,detail TEXT NOT NULL,UNIQUE(revision,source_id,origin,raw_digest));
-CREATE TABLE metadata_facts(revision TEXT NOT NULL,source_id TEXT NOT NULL,file_source_id TEXT,origin TEXT NOT NULL,packet_digest TEXT NOT NULL,field TEXT NOT NULL,value_json TEXT NOT NULL,PRIMARY KEY(revision,source_id,origin,packet_digest,field));
-CREATE INDEX facts_by_file ON metadata_facts(revision,file_source_id,field);
-CREATE TABLE references_out(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,field TEXT NOT NULL,target_table TEXT NOT NULL,target_key TEXT NOT NULL,UNIQUE(revision,source_id,field,target_table,target_key));
-CREATE TABLE paths(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,original TEXT NOT NULL,inspection_path TEXT,state TEXT NOT NULL,evidence TEXT,UNIQUE(revision,source_id));
-CREATE INDEX path_locator ON paths(revision,inspection_path,sequence);
-CREATE TABLE inventories(digest TEXT PRIMARY KEY,json TEXT NOT NULL);
-CREATE TABLE family_assignments(revision TEXT PRIMARY KEY,family TEXT NOT NULL,reason TEXT NOT NULL);
-CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evidence_digest TEXT NOT NULL,reason TEXT NOT NULL);
-")?;
-        transaction.execute_batch(PAGING_INDEXES)?;
-        transaction.pragma_update(None, "user_version", PLAN_SCHEMA_VERSION)?;
-        transaction.commit()?;
-        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        initialize_plan(&db)?;
         Ok(Self {
             db,
             root: fs::canonicalize(root)?,
@@ -447,6 +483,71 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             root,
             execution: None,
         })
+    }
+    pub(crate) fn create_managed(
+        root: &Path,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+    ) -> Result<Self> {
+        let root = fs::canonicalize(root)?;
+        let path = root.join("inspection.sqlite3");
+        ensure!(
+            fs::symlink_metadata(&path)?.len() == 0,
+            "managed inspection database must be empty"
+        );
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
+            .context("managed inspection create identity")?;
+        crate::configure_catalog_connection(&db)?;
+        initialize_plan(&db)?;
+        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
+            .context("managed inspection initialized identity")?;
+        Ok(Self {
+            db,
+            root,
+            execution: None,
+        })
+    }
+    pub(crate) fn open_managed(
+        root: &Path,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+    ) -> Result<Self> {
+        let root = fs::canonicalize(root)?;
+        let path = root.join("inspection.sqlite3");
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
+            .context("managed inspection open identity")?;
+        let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        ensure!(
+            app == 0x50434c49,
+            "not a supported Lightroom inspection plan"
+        );
+        require_current_plan(version)?;
+        validate_paging_indexes(&db)?;
+        crate::configure_catalog_connection(&db)?;
+        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
+            .context("managed inspection configured identity")?;
+        Ok(Self {
+            db,
+            root,
+            execution: None,
+        })
+    }
+    pub(crate) fn close_checked(self) -> Result<()> {
+        self.db.close().map_err(|(_, e)| e.into())
+    }
+    pub(crate) fn verify_managed_identity(
+        &self,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+    ) -> Result<()> {
+        crate::catalog_storage::verify_database_identity(&self.db, &physical(expected))
+            .context("managed inspection identity")
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -757,6 +858,255 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             serde_json::from_str::<NativePath>(&path)?.to_path()?,
             serde_json::from_str(&manifest)?,
         ))
+    }
+    pub(crate) fn managed_capture(&self, revision: &str) -> Result<(NativePath, Manifest)> {
+        let (path, manifest): (String, String) = self.db.query_row(
+            "SELECT path,manifest FROM captures WHERE revision=?",
+            [revision],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            serde_json::from_str(&path)?,
+            serde_json::from_str(&manifest)?,
+        ))
+    }
+    pub(crate) fn add_capture_managed(
+        &mut self,
+        directory: &NativePath,
+        manifest: &Manifest,
+        schema: &crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects,
+    ) -> Result<String> {
+        use crate::lightroom_migration_worker::source_reader::capture_wire::{
+            ObjectKind, PhysicalCursor,
+        };
+        let revision = manifest
+            .revision_id
+            .clone()
+            .context("capture revision missing")?;
+        ensure!(
+            manifest.state == "captured"
+                && manifest.sqlite_consistency == "consistent_default_sqlite"
+                && json_digest(&manifest.artifacts)? == revision,
+            "capture manifest identity/state differs"
+        );
+        ensure!(
+            schema.authority_binding.len() == 64 && schema.schema_roster_blake3.len() == 64,
+            "managed schema binding"
+        );
+        if let Some((stored, roster)) = self
+            .db
+            .query_row(
+                "SELECT manifest,schema_roster FROM captures WHERE revision=?",
+                [&revision],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+        {
+            ensure!(
+                stored == serde_json::to_string(manifest)?
+                    && roster.as_deref() == Some(&schema.schema_roster_blake3),
+                "existing capture evidence differs"
+            );
+            return Ok(revision);
+        }
+        let version = schema.variables.get("Adobe_DBVersion").cloned();
+        let provider = schema.variables.get("Adobe_storeProviderID").cloned();
+        let lineage = uuid::Uuid::new_v4().to_string();
+        let transaction = self.db.transaction()?;
+        transaction.execute("INSERT INTO captures(revision,lineage,path,manifest,stage,schema_version,provider,schema_roster) VALUES(?,?,?,?,?,?,?,?)",params![revision,lineage,serde_json::to_string(directory)?,serde_json::to_string(manifest)?,"pending",version,provider,schema.schema_roster_blake3])?;
+        for object in &schema.objects {
+            let kind = match object.kind {
+                ObjectKind::Table => "table",
+                ObjectKind::Index => "index",
+                ObjectKind::View => "view",
+                ObjectKind::Trigger => "trigger",
+            };
+            let text = |v: &[u8]| {
+                String::from_utf8(v.to_vec()).unwrap_or_else(|_| format!("hex:{}", hex(v)))
+            };
+            transaction.execute(
+                "INSERT INTO schema_objects VALUES(?,?,?,?,?)",
+                params![
+                    revision,
+                    kind,
+                    text(&object.name),
+                    text(&object.table),
+                    text(&object.sql)
+                ],
+            )?;
+        }
+        let table_objects: Vec<_> = schema
+            .objects
+            .iter()
+            .filter(|v| matches!(v.kind, ObjectKind::Table))
+            .collect();
+        for table in &schema.tables {
+            let object = table_objects
+                .get(usize::try_from(table.ordinal.0)?)
+                .context("managed table schema object")?;
+            let name = String::from_utf8(object.name.clone())
+                .unwrap_or_else(|_| format!("hex:{}", hex(&object.name)));
+            let columns: Vec<String> = table
+                .columns
+                .iter()
+                .map(|v| String::from_utf8(v.name.clone()))
+                .collect::<std::result::Result<_, _>>()
+                .unwrap_or_default();
+            let keys: Vec<String> = match &table.cursor {
+                Some(PhysicalCursor::PrimaryKey(indexes)) => indexes
+                    .iter()
+                    .map(|v| {
+                        columns
+                            .get(v.0 as usize)
+                            .cloned()
+                            .context("managed key ordinal")
+                    })
+                    .collect::<Result<_>>()?,
+                Some(PhysicalCursor::RowIdAlias(v)) => vec![String::from_utf8(v.clone())?],
+                None => vec![],
+            };
+            let mut stable = table.clone();
+            stable.table_handle.clear();
+            let issue = table.retained_only.as_ref().map(|v| format!("{v:?}"));
+            transaction.execute("INSERT INTO tables(revision,name,columns_json,key_json,schema_json,category,expected,state,issue) VALUES(?,?,?,?,?,?,?,?,?)",params![revision,name,serde_json::to_string(&columns)?,serde_json::to_string(&keys)?,serde_json::to_string(&stable)?,&table.category,table.expected_count.map(|v|v.0),if issue.is_some(){"retained_snapshot_only"}else{"pending"},issue])?;
+        }
+        transaction.commit()?;
+        Ok(revision)
+    }
+    pub(crate) fn managed_resume_roster(
+        &self,
+        revision: &str,
+    ) -> Result<(String, Vec<ManagedTable>)> {
+        let digest: String = self.db.query_row(
+            "SELECT schema_roster FROM captures WHERE revision=?",
+            [revision],
+            |r| r.get(0),
+        )?;
+        let mut statement=self.db.prepare("SELECT name,schema_json,cursor FROM tables WHERE revision=? AND state='pending' ORDER BY name")?;
+        let values = statement
+            .query_map([revision], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .map(|row| -> Result<ManagedTable> {
+                let (name, json, cursor) = row?;
+                Ok(ManagedTable {
+                    name,
+                    descriptor: serde_json::from_str(&json)?,
+                    cursor: cursor.map(|v| serde_json::from_str(&v)).transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((digest, values))
+    }
+    pub(crate) fn apply_managed_table(
+        &mut self,
+        revision: &str,
+        stable: &ManagedTable,
+        value: crate::lightroom_migration_worker::source_reader::capture_wire::TableValue,
+    ) -> Result<usize> {
+        use crate::lightroom_migration_worker::source_reader::capture_wire::TableValue;
+        let (_, manifest) = self.capture(revision)?;
+        let transaction = self.db.transaction()?;
+        let retained = match value {
+            TableValue::Failure(failure) => {
+                ensure!(
+                    failure.cursor == stable.cursor,
+                    "managed failure cursor differs"
+                );
+                transaction.execute(
+                    "UPDATE tables SET state='failed',issue=? WHERE revision=? AND name=?",
+                    params![failure.detail, revision, stable.name],
+                )?;
+                0
+            }
+            TableValue::Batch(batch) => {
+                ensure!(
+                    batch.observed.0 == batch.rows.len() as u64
+                        && batch.next_cursor
+                            == batch
+                                .rows
+                                .last()
+                                .map(|v| v.key.clone())
+                                .or(stable.cursor.clone()),
+                    "managed batch cursor/count differs"
+                );
+                let columns: Vec<String> = stable
+                    .descriptor
+                    .columns
+                    .iter()
+                    .map(|v| {
+                        String::from_utf8(v.name.clone())
+                            .context("managed selected column encoding")
+                    })
+                    .collect::<Result<_>>()?;
+                if batch.rows.is_empty() {
+                    ensure!(batch.eof, "empty managed batch must prove EOF");
+                    transaction.execute("UPDATE tables SET state=CASE WHEN expected=retained THEN 'complete' ELSE 'count_mismatch' END WHERE revision=? AND name=?",params![revision,stable.name])?;
+                } else {
+                    ensure!(!batch.eof, "nonempty managed batch cannot be EOF");
+                }
+                for row in &batch.rows {
+                    let identity = source_identity(&stable.name, &columns, &row.values, &row.key)?;
+                    let lineage: String = transaction.query_row(
+                        "SELECT lineage FROM captures WHERE revision=?",
+                        [revision],
+                        |r| r.get(0),
+                    )?;
+                    let source_id = format!("{lineage}:{}", digest(identity.as_bytes()));
+                    let key = serde_json::to_string(&row.key)?;
+                    transaction.execute("INSERT INTO rows(revision,source_id,table_name,key_json,cells_json) VALUES(?,?,?,?,?)",params![revision,source_id,stable.name,key,serde_json::to_string(&row.values)?])?;
+                    retain_xmp(
+                        &transaction,
+                        revision,
+                        &source_id,
+                        &stable.name,
+                        &columns,
+                        &row.values,
+                        manifest.request.limits.max_cell_bytes,
+                    )?;
+                    retain_references(
+                        &transaction,
+                        revision,
+                        &source_id,
+                        &stable.name,
+                        &columns,
+                        &row.values,
+                    )?;
+                    retain_entity(
+                        &transaction,
+                        revision,
+                        &source_id,
+                        &stable.name,
+                        &columns,
+                        &row.values,
+                    )?;
+                    transaction.execute("UPDATE tables SET retained=retained+1,cursor=? WHERE revision=? AND name=?",params![key,revision,stable.name])?;
+                }
+                batch.rows.len()
+            }
+        };
+        transaction.execute(
+            "UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",
+            [revision],
+        )?;
+        transaction.commit()?;
+        Ok(retained)
+    }
+    pub(crate) fn finish_managed_resume(&mut self, revision: &str) -> Result<String> {
+        let pending: i64 = self.db.query_row(
+            "SELECT count(*) FROM tables WHERE revision=? AND state='pending'",
+            [revision],
+            |r| r.get(0),
+        )?;
+        if pending == 0 {
+            self.reconcile(revision)
+        } else {
+            Ok("pending".into())
+        }
     }
     pub fn rows(
         &self,

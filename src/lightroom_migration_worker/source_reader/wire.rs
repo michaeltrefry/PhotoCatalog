@@ -317,10 +317,10 @@ impl Value {
                 let Budget::Capture(limits) = expected.budget else {
                     anyhow::bail!("source authority/method mismatch")
                 };
-                add(
+                Ok(add(
                     mul(6, usize::try_from(limits.result_bytes.0)?)?,
                     FRAME_BYTES,
-                )?
+                )?)
             }
             super::transport::Read::Sql(query) => {
                 let Budget::Sql(limits) = expected.budget else {

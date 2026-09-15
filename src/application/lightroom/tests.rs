@@ -78,9 +78,13 @@ fn held_initialization_has_queue_bypass_cancel_close_and_no_replay() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("plan");
     let (release, held) = mpsc::channel();
-    let mut w = Workbench::spawn_inner(config(&root, OpenMode::Create), move || {
-        held.recv().unwrap();
-    })
+    let mut w = Workbench::spawn_inner(
+        config(&root, OpenMode::Create),
+        move || {
+            held.recv().unwrap();
+        },
+        None,
+    )
     .unwrap();
     let initial = w.status();
     assert_eq!(initial.phase, Phase::Opening);

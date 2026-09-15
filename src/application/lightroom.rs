@@ -20,6 +20,35 @@ use std::{
 };
 mod worker;
 
+pub(crate) trait ManagedIo: Send + Sync + 'static {
+    fn filesystem(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
+        cancel: &AtomicBool,
+    ) -> Result<crate::filesystem_worker::wire::LightroomWorkbenchIoReply>;
+    fn source_open(
+        &self,
+        authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String>;
+    fn source_schema(
+        &self,
+        source: &str,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects>;
+    fn source_rows(
+        &self,
+        source: &str,
+        handle: String,
+        cursor: Option<Vec<crate::lightroom::plan::Cell>>,
+        limit: usize,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::TableValue>;
+    fn source_current(
+        &self,
+        source: &str,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::Current>;
+    fn source_retire(&self, source: &str) -> Result<()>;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -466,16 +495,23 @@ fn native(path: &NativePath, maximum: usize) -> Result<std::path::PathBuf> {
 }
 impl Workbench {
     pub fn spawn(config: Config) -> Result<Self> {
-        Self::spawn_inner(config, || {})
+        Self::spawn_inner(config, || {}, None)
+    }
+    pub(crate) fn spawn_managed(config: Config, io: Arc<dyn ManagedIo>) -> Result<Self> {
+        Self::spawn_inner(config, || {}, Some(io))
     }
     #[cfg(test)]
     pub(crate) fn spawn_held(
         config: Config,
         before: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
-        Self::spawn_inner(config, before)
+        Self::spawn_inner(config, before, None)
     }
-    fn spawn_inner(config: Config, before: impl FnOnce() + Send + 'static) -> Result<Self> {
+    fn spawn_inner(
+        config: Config,
+        before: impl FnOnce() + Send + 'static,
+        managed: Option<Arc<dyn ManagedIo>>,
+    ) -> Result<Self> {
         config.limits.validate()?;
         core::bounded_json(&config, config.limits.request_bytes)?;
         for path in [
@@ -517,7 +553,7 @@ impl Workbench {
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     before();
-                    worker::run(config, receiver, state.clone(), stop)
+                    worker::run(config, receiver, state.clone(), stop, managed)
                 }));
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                 s.status.closed = true;

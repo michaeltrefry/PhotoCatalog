@@ -6,13 +6,15 @@ use crate::{
     lightroom_migration_worker::identity::FileKey,
     storage_volume::NativePath,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MEMBER: &str = "logical.sqlite3";
 pub const MAX_SCHEMA_OBJECTS: usize = 4096;
 pub const MAX_ROWS: usize = 100;
+pub const MAX_RESULT_BYTES: usize = super::transport::RESULT_BYTES;
+pub const MAX_CHUNK_BYTES: usize = super::transport::CHUNK_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,7 +43,7 @@ impl PartialEq<Revision> for FileRevision {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     pub open_deadline_ms: U64,
@@ -106,7 +108,7 @@ impl Limits {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Authority {
     pub protocol: u8,
@@ -133,31 +135,9 @@ pub struct Authority {
 }
 impl Authority {
     fn payload(&self) -> Result<Vec<u8>> {
-        crate::lightroom::bounded_json(
-            &(
-                self.protocol,
-                &self.build,
-                &self.workbench_instance,
-                &self.workbench_generation,
-                &self.filesystem_lease,
-                &self.operation,
-                &self.capture_generation,
-                self.expires_unix_ms,
-                &self.capture_root,
-                &self.member,
-                &self.manifest_blake3,
-                &self.revision_id,
-                &self.logical_revision,
-                &self.logical_blake3,
-                self.maximum_bytes,
-                &self.physical,
-                &self.companion_generation,
-                &self.raw_roster_blake3,
-                self.limits,
-                &self.protected,
-            ),
-            super::transport::AUTHORITY_BYTES,
-        )
+        let mut value = self.clone();
+        value.binding_blake3.clear();
+        crate::lightroom::bounded_json(&value, super::transport::AUTHORITY_BYTES)
     }
     pub fn computed_binding(&self) -> Result<String> {
         Ok(crate::lightroom::digest(&self.payload()?))
@@ -236,7 +216,7 @@ pub enum ObjectKind {
     Trigger,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaObject {
     pub kind: ObjectKind,
@@ -250,7 +230,7 @@ pub struct SchemaObject {
     pub without_rowid: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Column {
     pub cid: I64,
@@ -265,7 +245,7 @@ pub struct Column {
     pub hidden: I64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     content = "columns",
@@ -277,17 +257,18 @@ pub enum PhysicalCursor {
     RowIdAlias(#[serde(with = "hex_bytes")] Vec<u8>),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetainedOnlyReason {
     RootPageZero,
     HiddenColumn,
     NoSafeCursor,
     InvalidIdentifier,
+    SchemaReadFailed,
     CountFailed,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableDescriptor {
     pub table_handle: String,
@@ -300,7 +281,7 @@ pub struct TableDescriptor {
     pub retained_only: Option<RetainedOnlyReason>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaObjects {
     pub authority_binding: String,
@@ -310,14 +291,14 @@ pub struct SchemaObjects {
     pub variables: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableRow {
     pub key: Vec<Cell>,
     pub values: Vec<Cell>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableBatch {
     pub authority_binding: String,
@@ -330,7 +311,7 @@ pub struct TableBatch {
     pub observed: U64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TableFailureClass {
     RowBytes,
@@ -341,7 +322,7 @@ pub enum TableFailureClass {
     Count,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableFailure {
     pub authority_binding: String,
@@ -352,7 +333,7 @@ pub struct TableFailure {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Current {
     pub authority_binding: String,
@@ -402,7 +383,7 @@ mod hex_bytes {
     }
 }
 mod option_hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     pub fn serialize<S: Serializer>(value: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         value
             .as_ref()

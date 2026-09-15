@@ -422,7 +422,7 @@ impl Owner {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        self.slots = [None, None];
+        self.slots = std::array::from_fn(|_| None);
         if let Some(error) = first {
             return Err(error);
         }

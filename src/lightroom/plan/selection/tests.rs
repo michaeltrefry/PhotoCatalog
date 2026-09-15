@@ -95,6 +95,8 @@ fn document(review: &SelectionReview, scope: ApprovalScope) -> Vec<u8> {
         destination: NativePath::from_path(
             &review
                 .guard
+                .as_ref()
+                .unwrap()
                 .path
                 .with_file_name("destination-never-opened.sqlite3"),
         ),
@@ -445,7 +447,7 @@ fn old_schema_limits_native_paths_and_sql_cancel_fail_without_source_mutation() 
         .is_err()
     );
     assert_eq!(hash(&case.fixture.path), before);
-    case.edit("PRAGMA user_version=3;");
+    case.edit("PRAGMA user_version=4;");
     let mut request = case.request.clone();
     request.inspection = NativePath::UnixBytes(vec![b'a'; 32769]);
     assert!(SelectionReview::open(request, SelectionLimits::default(), flag(), |_| {}).is_err());
