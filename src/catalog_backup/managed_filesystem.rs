@@ -2,10 +2,12 @@
 //! The owner is stateful so immutable bundle files remain pinned across hashing
 //! and SQL verification. It never opens SQLite.
 use super::{
-    APPLICATION_ID, BackupReceipt, COMPLETED, DB, FileStamp, Limits, MANIFEST, PENDING, RESTORE,
-    RestoreReceipt, check_catalog_root, exclusive_root, exists, file_stamp, manifest, no_journal,
-    publish, regular, root, write_document,
+    APPLICATION_ID, BackupReceipt, DB, FileStamp, Limits, MANIFEST, RESTORE, RestoreReceipt,
+    check_catalog_root, exclusive_root, exists, file_stamp, manifest, no_journal, publish, regular,
+    root, write_document,
 };
+#[cfg(test)]
+use super::{COMPLETED, PENDING};
 use crate::{
     CURRENT_SCHEMA_VERSION,
     application::{I64, U64},
@@ -298,6 +300,7 @@ impl Owner {
         }
         check_cancel(cancel)?;
         match request {
+            Request::Abort { .. } => unreachable!("abort handled before cancellation"),
             Request::PrepareCreate {
                 operation,
                 source,

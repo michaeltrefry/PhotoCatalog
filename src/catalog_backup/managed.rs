@@ -475,7 +475,7 @@ fn run_sql(
                 source_physical != target_physical,
                 "managed backup source and target identities are the same object"
             );
-            let mut source = open_verified(
+            let source = open_verified(
                 &source.to_path()?,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 source_physical,

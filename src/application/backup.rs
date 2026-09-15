@@ -200,7 +200,7 @@ impl Coordinator {
         let worker = thread::Builder::new()
             .name("catalog-backup".into())
             .spawn(move || {
-                let callback = move |p: core::Progress| -> Result<()> {
+                let mut callback = move |p: core::Progress| -> Result<()> {
                     let p = Progress::from(p);
                     *worker_progress
                         .lock()
@@ -216,7 +216,7 @@ impl Coordinator {
                         request,
                         limits,
                         &worker_cancel,
-                        |p| callback(p),
+                        &mut callback,
                     )
                     .map(|receipt| match receipt {
                         core::managed::Receipt::Backup(value) => Receipt::Backup(value.into()),
