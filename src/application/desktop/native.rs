@@ -1,6 +1,7 @@
 //! G owns each actual N Child and stdin writer independently of C lifetime.
 use crate::application::U64;
 use crate::catalog_session::{LeaseId, RootCapability, native::*};
+use crate::preview::{ByteBudget, ByteReservation};
 use anyhow::{Context, Result, ensure};
 use std::{
     path::PathBuf,
@@ -50,8 +51,14 @@ struct Slot {
     stages: Arc<dyn Stages>,
     grant: Mutex<Option<[u8; 32]>>,
     no_child_terminal: AtomicBool,
-    charged: std::sync::atomic::AtomicU64,
+    reservation: Mutex<Option<ByteReservation>>,
     work: Work,
+}
+pub(crate) fn owner_layouts() -> [(usize, usize); 2] {
+    [
+        (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>()),
+        (std::mem::size_of::<Slot>(), std::mem::align_of::<Slot>()),
+    ]
 }
 fn bounded(error: impl std::fmt::Display) -> String {
     struct Prefix(String);
@@ -70,6 +77,24 @@ fn bounded(error: impl std::fmt::Display) -> String {
     output.0
 }
 impl Slot {
+    fn resize_reservation(&self, required: u64) -> Result<()> {
+        let mut retained = self
+            .reservation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reservation = retained
+            .as_mut()
+            .context("native byte reservation was retired")?;
+        let current = reservation.bytes();
+        if required > current {
+            reservation
+                .grow_exact(required - current)
+                .map_err(anyhow::Error::new)?;
+        } else if required < current {
+            reservation.shrink(required)?;
+        }
+        Ok(())
+    }
     fn status(&self) -> Status {
         let mut value = self
             .status
@@ -251,8 +276,9 @@ impl Slot {
         Ok(())
     }
 }
-/// Slots are bounded by configured workers. Retired IDs are rejected by the
-/// high-water fence; active exact identities retain their original child.
+/// Slots are bounded by configured workers and one caller-supplied native byte
+/// pool. Retired IDs are rejected by the high-water fence; active exact
+/// identities retain their original child and reservation.
 pub(super) struct Owner {
     #[cfg(all(test, unix))]
     hold_encode: AtomicBool,
@@ -266,6 +292,7 @@ pub(super) struct Owner {
     slots: Mutex<Vec<Arc<Slot>>>,
     high_water: Mutex<u64>,
     limits: crate::preview::ServiceLimits,
+    budget: ByteBudget,
     selected: Mutex<Option<RootCapability>>,
 }
 impl Owner {
@@ -273,8 +300,14 @@ impl Owner {
         executable: PathBuf,
         stages: Arc<dyn Stages>,
         limits: crate::preview::ServiceLimits,
-    ) -> Self {
-        Self {
+        budget: &ByteBudget,
+    ) -> Result<Self> {
+        let (capacity, _) = budget.snapshot();
+        ensure!(
+            capacity == limits.working_bytes,
+            "native budget does not match configured working allowance"
+        );
+        Ok(Self {
             #[cfg(all(test, unix))]
             hold_encode: AtomicBool::new(false),
             #[cfg(test)]
@@ -287,8 +320,9 @@ impl Owner {
             slots: Mutex::new(Vec::new()),
             high_water: Mutex::new(0),
             limits,
+            budget: budget.clone(),
             selected: Mutex::new(None),
-        }
+        })
     }
     /// Deterministic fixture boundary: C may grant Encode, but each independent
     /// writer waits before sending E. Production Stop still bypasses the hold.
@@ -526,16 +560,6 @@ impl Owner {
                 "native configured admission mismatch"
             );
             let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
-            let held = slots.iter().try_fold(0u64, |n, s| {
-                n.checked_add(s.charged.load(Ordering::Acquire))
-                    .context("native aggregate overflow")
-            })?;
-            ensure!(
-                required <= self.limits.working_bytes.saturating_sub(held),
-                crate::catalog_session::store::ResourceLimit(
-                    "Native working allowance remains owned; drain and retry"
-                )
-            );
             ensure!(
                 slots.len() < usize::from(*workers),
                 crate::catalog_session::store::ResourceLimit(
@@ -545,6 +569,10 @@ impl Owner {
             let mut high = self.high_water.lock().unwrap_or_else(|p| p.into_inner());
             ensure!(r.operation.0 > *high, "stale native spawn identity");
             slots.try_reserve(1).context("native slot allocation")?;
+            let reservation = self
+                .budget
+                .reserve_exact(required)
+                .map_err(anyhow::Error::new)?;
             #[cfg(test)]
             if let Some(hook) = self.before_register.lock().unwrap().as_ref() {
                 hook();
@@ -588,7 +616,7 @@ impl Owner {
                 stages: self.stages.clone(),
                 grant: Mutex::new(None),
                 no_child_terminal: AtomicBool::new(false),
-                charged: std::sync::atomic::AtomicU64::new(required),
+                reservation: Mutex::new(Some(reservation)),
                 work: work.clone(),
             });
             *high = r.operation.0;
@@ -728,23 +756,6 @@ impl Owner {
                     working_bytes.0 == required,
                     "native working upgrade mismatch"
                 );
-                let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
-                let other =
-                    slots
-                        .iter()
-                        .filter(|s| !Arc::ptr_eq(s, &slot))
-                        .try_fold(0u64, |n, s| {
-                            n.checked_add(s.charged.load(Ordering::Acquire))
-                                .context("native aggregate overflow")
-                        })?;
-                ensure!(
-                    required <= self.limits.working_bytes.saturating_sub(other),
-                    crate::catalog_session::store::ResourceLimit(
-                        "Native upgrade is temporarily occupied; stop/drain header owner and retry at full cost"
-                    )
-                );
-                slot.charged.store(required, Ordering::Release);
-                drop(slots);
                 let digest = *blake3::hash(&serde_json::to_vec(&r.action)?).as_bytes();
                 let mut grant = slot.grant.lock().unwrap_or_else(|p| p.into_inner());
                 ensure!(
@@ -756,6 +767,7 @@ impl Owner {
                     s.start && !s.stop,
                     "native encode before start or after stop"
                 );
+                slot.resize_reservation(required)?;
                 *grant = Some(digest);
                 s.encode = true;
                 slot.wake.notify_all();
@@ -778,6 +790,14 @@ impl Owner {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .retain(|s| !Arc::ptr_eq(s, &slot));
+                ensure!(
+                    slot.reservation
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .is_some(),
+                    "native byte reservation already retired"
+                );
             }
             Action::Spawn { .. } => unreachable!(),
         }
@@ -834,10 +854,12 @@ impl Drop for Owner {
                 }
             } else {
                 let _ = slot.start_reaper();
-                // Checked callers retain Owner and retry. Unwind must not drop
-                // a Child or unjoined fallback owner after failed thread start.
-                std::mem::forget(slot);
             }
+            // Every slot still registered at Owner teardown is unretired, even
+            // after checked drain. Preserve its exact identity and reservation;
+            // only an explicit successful Retire may return native capacity.
+            // Unwind must likewise not drop a Child or fallback reaper owner.
+            std::mem::forget(slot);
         }
     }
 }

@@ -37,7 +37,8 @@ the existing decoded-live byte admission.
 The active phase adds four live-length `RenderWork` graphs beyond each retained
 service original, one managed-read work graph, exact
 `Arc<Mutex<Option<Job>>>` and `Box<ManagedRead>` roots with their nested
-metadata, ready-batch and publication metadata, the sole actor 64 KiB
+metadata, the exact preview-G `Owner` and configured `Slot` allocation roots,
+slot-registry growth, ready-batch and publication metadata, the sole actor 64 KiB
 saved-job/record parser, up to `W+1` simultaneous 192 KiB receipt parsers, and
 the filesystem relay owners. The saved-job query peak includes all 1000 raw
 ID/descriptor rows and the separately accumulated 1000-element `JobView`
@@ -256,11 +257,14 @@ second C cannot replace an existing parent's admission guard. A lost/panicked
 wait owner deliberately retains the charge. Configuration failure before guard
 installation and an attempted spawn releases normally.
 
-The private managed route has this admission contract; selecting that route in
-the desktop app and choosing the production shared-pool policy remain open.
-There is no automatically manufactured allowance equal to the request in
-production and no deduction from existing small native working limits. Tests
-explicitly supply synthetic allowances. This accounting does not establish the
+The private managed route has this metadata-admission contract and separately
+requires an explicit native `ByteBudget` whose capacity exactly equals the
+configured `working_bytes`. Preview G retains real reservations from that same
+native pool through checked retirement; future native owners must receive the
+same Arc-backed handle rather than manufacture equivalent pools. Selecting the
+route in the desktop app remains open. Tests explicitly supply both synthetic
+allowances. This accounting includes the Rust G owner roots but does not charge
+their native working-byte reservations to metadata and does not establish the
 4 GiB browse RSS requirement or include opaque native/runtime storage.
 
 Fixed control backing includes each Calls root's three root-capability IDs and

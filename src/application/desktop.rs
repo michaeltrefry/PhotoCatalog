@@ -329,19 +329,31 @@ impl DesktopBridge {
     pub fn spawn(config: Config) -> anyhow::Result<Self> {
         Self::spawn_inner(config, None, None)
     }
-    /// Unselected paired transport. Managed actor use remains blocked on FS6.
+    /// Unselected paired transport. Metadata and native work use distinct
+    /// caller-owned pools; G keeps this exact native pool for every native owner.
+    /// Managed actor use remains blocked on FS6.
     #[allow(dead_code)]
     pub(crate) fn spawn_with_filesystem(
         config: Config,
         client: Arc<crate::filesystem_worker::client::Client>,
         metadata: &crate::preview::ByteBudget,
+        native: &crate::preview::ByteBudget,
     ) -> anyhow::Result<Self> {
         config.validate()?;
+        anyhow::ensure!(
+            !metadata.same_pool(native),
+            "managed metadata and native allowances must use distinct pools"
+        );
+        anyhow::ensure!(
+            native.snapshot().0 == config.preview_limits.working_bytes,
+            "native budget does not match configured working allowance"
+        );
         {
             let parent = filesystem::Parent::new(client);
             parent.configure_native(
                 config.worker_executable.clone(),
                 config.preview_limits.clone(),
+                native,
             )?;
             Self::spawn_inner(config, Some(parent), Some(metadata))
         }

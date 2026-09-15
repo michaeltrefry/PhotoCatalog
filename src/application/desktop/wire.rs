@@ -283,6 +283,7 @@ pub(super) fn build_identity() -> String {
             include_str!("../../import_preparation.rs"),
             include_str!("../../preview/service.rs"),
             include_str!("../../preview/read_queue.rs"),
+            include_str!("../../preview/mod.rs"),
             include_str!("../../preview/memory.rs"),
             include_str!("../../preview/scheduler.rs"),
             include_str!("../../preview/codec.rs"),

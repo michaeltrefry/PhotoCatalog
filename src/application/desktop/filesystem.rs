@@ -227,7 +227,9 @@ impl Fault {
     fn from_error(error: anyhow::Error, unknown: bool) -> Self {
         let kind = if let Some(failure) = error.downcast_ref::<Failure>() {
             failure.kind
-        } else if error.downcast_ref::<store::ResourceLimit>().is_some() {
+        } else if error.downcast_ref::<store::ResourceLimit>().is_some()
+            || error.downcast_ref::<crate::preview::ByteLimit>().is_some()
+        {
             FailureKind::ResourceLimit
         } else if unknown {
             FailureKind::Unknown

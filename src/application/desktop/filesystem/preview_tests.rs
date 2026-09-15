@@ -143,7 +143,8 @@ impl Running {
             limits: Limits::default(),
             import_checkpoint: None,
         };
-        parent.configure_native(executable.to_owned(), limits)?;
+        let native = crate::preview::ByteBudget::new(limits.working_bytes)?;
+        parent.configure_native(executable.to_owned(), limits, &native)?;
         let observed: Arc<Mutex<Vec<Observation>>> = Default::default();
         let weak = Arc::downgrade(&parent);
         let observations = observed.clone();

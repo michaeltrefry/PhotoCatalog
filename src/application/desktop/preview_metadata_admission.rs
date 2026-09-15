@@ -170,12 +170,13 @@ mod tests {
             .into();
         let required = config.requested_preview_metadata_bytes()?;
         let pool = ByteBudget::new(required)?;
+        let native = ByteBudget::new(config.preview_limits.working_bytes)?;
         let caller = pool.try_reserve(1).unwrap();
         let client = Arc::new(crate::filesystem_worker::client::Client::spawn(
             &config.worker_executable,
             vec![],
         )?);
-        let denied = DesktopBridge::spawn_with_filesystem(config.clone(), client, &pool)
+        let denied = DesktopBridge::spawn_with_filesystem(config.clone(), client, &pool, &native)
             .err()
             .ok_or_else(|| anyhow::anyhow!("undersized startup unexpectedly succeeded"))?;
         let retained = denied
@@ -213,7 +214,7 @@ mod tests {
             &config.worker_executable,
             vec![],
         )?);
-        let second = DesktopBridge::spawn_with_filesystem(config, client, &pool)?;
+        let second = DesktopBridge::spawn_with_filesystem(config, client, &pool, &native)?;
         anyhow::ensure!(pool.used() == required, "new C startup was not charged");
         second.try_shutdown()?;
         drop(second);

@@ -11,11 +11,11 @@ mod memory;
 mod scheduler;
 mod store;
 pub use identity::renderer_identity;
-pub(crate) use memory::budget_state_layout;
 pub use memory::{
     ByteBudget, ByteReservation, DecodedBudgetExceeded, DecodedCache, EncodedBudgetExceeded,
     RetainedPixels,
 };
+pub(crate) use memory::{ByteLimit, budget_state_layout};
 pub use scheduler::{
     Completion, Consumer, PreviewScheduler, Priority, SchedulerLimits, SchedulerUsage, WorkLease,
     WorkerOutcome,

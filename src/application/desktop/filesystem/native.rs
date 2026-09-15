@@ -73,6 +73,7 @@ impl Parent {
         &self,
         executable: std::path::PathBuf,
         limits: crate::preview::ServiceLimits,
+        budget: &crate::preview::ByteBudget,
     ) -> Result<()> {
         let mut native = self.native.lock().unwrap_or_else(|p| p.into_inner());
         ensure!(native.is_none(), "native owner already configured");
@@ -83,7 +84,8 @@ impl Parent {
                 selected: Mutex::new(None),
             }),
             limits,
-        )));
+            budget,
+        )?));
         Ok(())
     }
     pub(super) fn native_owner(&self) -> Result<Arc<super::super::native::Owner>> {

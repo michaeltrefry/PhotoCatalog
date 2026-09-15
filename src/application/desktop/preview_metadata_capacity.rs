@@ -1529,6 +1529,33 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         active_fs,
         c.arc(stage_root)?,
     )?;
+    let [native_owner, native_slot] = super::native::owner_layouts();
+    let native_owner = Layout {
+        size: u64::try_from(native_owner.0)?,
+        align: u64::try_from(native_owner.1)?,
+    };
+    let native_slot = Layout {
+        size: u64::try_from(native_slot.0)?,
+        align: u64::try_from(native_slot.1)?,
+    };
+    a.push(
+        "fixed.native_g_owner_arc_backing",
+        Phase::Retained,
+        1,
+        c.arc(native_owner)?,
+    )?;
+    a.push(
+        "fixed.native_g_slot_arc_backings",
+        Phase::Active,
+        w,
+        c.arc(native_slot)?,
+    )?;
+    a.push(
+        "fixed.native_g_slot_registry_backing",
+        Phase::Active,
+        1,
+        c.vec_growth(Layout::of::<Arc<()>>().size, w)?,
+    )?;
     let [calls, calls_state] = crate::preview::stage_io::metadata_layouts();
     let calls_root = Layout {
         size: u64::try_from(calls.0)?,
@@ -1931,6 +1958,54 @@ mod tests {
             mutate(&mut changed.preview_limits);
             assert_eq!(report(&changed)?.requested, expected);
         }
+        Ok(())
+    }
+    #[test]
+    fn native_g_owner_and_slot_roots_follow_exact_source_layouts() -> Result<()> {
+        let config = config();
+        let report = report(&config)?;
+        let [owner, slot] = super::super::native::owner_layouts();
+        let owner = Layout {
+            size: u64::try_from(owner.0)?,
+            align: u64::try_from(owner.1)?,
+        };
+        let slot = Layout {
+            size: u64::try_from(slot.0)?,
+            align: u64::try_from(slot.1)?,
+        };
+        let owner_entry = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.native_g_owner_arc_backing")
+            .context("native G owner layout contribution")?;
+        assert_eq!(
+            (owner_entry.count, owner_entry.each),
+            (1, Checked.arc(owner)?)
+        );
+        let slot_entry = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.native_g_slot_arc_backings")
+            .context("native G slot layout contribution")?;
+        assert_eq!(
+            (slot_entry.count, slot_entry.each),
+            (config.preview_limits.workers as u64, Checked.arc(slot)?)
+        );
+        let registry = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.native_g_slot_registry_backing")
+            .context("native G registry layout contribution")?;
+        assert_eq!(
+            (registry.count, registry.each),
+            (
+                1,
+                Checked.vec_growth(
+                    Layout::of::<Arc<()>>().size,
+                    config.preview_limits.workers as u64,
+                )?
+            )
+        );
         Ok(())
     }
     #[test]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     catalog_session::PhysicalObjectId,
-    preview::{Codec, CodecSettings, PreviewKey, RenderWork, Tier},
+    preview::{ByteBudget, Codec, CodecSettings, PreviewKey, RenderWork, Tier},
     storage_volume::NativePath,
 };
 fn root() -> RootCapability {
@@ -89,12 +89,34 @@ fn errors_stream_into_fixed_capacity_without_materializing_display() {
     assert!(error.is_char_boundary(error.len()));
 }
 #[test]
+fn configured_native_allowance_must_match_the_supplied_pool() -> Result<()> {
+    let limits = crate::preview::ServiceLimits::default();
+    let budget = ByteBudget::new(limits.working_bytes - 1)?;
+    let error = Owner::new(
+        PathBuf::from("never-spawned"),
+        Arc::new(NoSpawn),
+        limits,
+        &budget,
+    )
+    .err()
+    .context("mismatched native allowance unexpectedly configured")?;
+    assert!(
+        error
+            .to_string()
+            .contains("native budget does not match configured working allowance")
+    );
+    Ok(())
+}
+#[test]
 fn root_switch_cannot_pass_registered_or_registering_native_owner() -> Result<()> {
+    let limits = crate::preview::ServiceLimits::default();
+    let budget = ByteBudget::new(limits.working_bytes)?;
     let owner = Arc::new(Owner::new(
         PathBuf::from("never-spawned"),
         Arc::new(NoSpawn),
-        crate::preview::ServiceLimits::default(),
-    ));
+        limits,
+        &budget,
+    )?);
     let root = root();
     owner.bind(&root)?;
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -151,6 +173,326 @@ fn root_switch_cannot_pass_registered_or_registering_native_owner() -> Result<()
 }
 
 #[test]
+fn same_pool_refuses_spawn_retains_unknown_and_reuses_only_after_retirement() -> Result<()> {
+    let mut limits = crate::preview::ServiceLimits::default();
+    limits.workers = 1;
+    let work = render();
+    let cost = render_cost(
+        &work,
+        limits.per_worker_bytes,
+        limits.cache_codec_scratch_bytes,
+    )?;
+    limits.working_bytes = cost.checked_add(64).context("fixture budget overflow")?;
+    let budget = ByteBudget::new(limits.working_bytes)?;
+    let owner = Owner::new(
+        PathBuf::from("never-spawned"),
+        Arc::new(NoSpawn),
+        limits.clone(),
+        &budget,
+    )?;
+    let root = root();
+    owner.bind(&root)?;
+    let request = Request {
+        root: root.clone(),
+        operation: U64(1),
+        action: Action::Spawn {
+            stage: LeaseId::new(),
+            work: Work::Render(Box::new(work)),
+            workers: 1,
+            working_bytes: U64(cost),
+        },
+    };
+    let competitor = budget.reserve_exact(65).unwrap();
+    let error = owner.call(&request).unwrap_err();
+    let limit = error
+        .downcast_ref::<crate::preview::ByteLimit>()
+        .context("native admission did not preserve typed allowance refusal")?;
+    assert_eq!((limit.required, limit.available), (cost, cost - 1));
+    assert!(owner.slots.lock().unwrap().is_empty());
+    assert_eq!(budget.used(), 65);
+    drop(competitor);
+
+    let status = owner.call(&request)?;
+    assert_eq!(status.phase, Phase::WaitFailed);
+    assert_eq!(budget.used(), cost);
+    assert!(budget.reserve_exact(65).is_err());
+    owner.call(&Request {
+        action: Action::Drain,
+        ..request.clone()
+    })?;
+    while owner.status(&root, U64(1))?.phase != Phase::Drained {
+        std::thread::yield_now();
+    }
+    assert_eq!(budget.used(), cost, "checked drain is not retirement");
+    owner.call(&Request {
+        action: Action::Retire,
+        ..request
+    })?;
+    assert_eq!(budget.used(), 0);
+    let reused = budget.reserve_exact(limits.working_bytes).unwrap();
+    assert_eq!(budget.used(), limits.working_bytes);
+    drop(reused);
+    assert_eq!(budget.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn dropping_drained_unretired_owner_keeps_the_exact_pool_charge() -> Result<()> {
+    let mut limits = crate::preview::ServiceLimits::default();
+    limits.workers = 1;
+    let work = render();
+    let cost = render_cost(
+        &work,
+        limits.per_worker_bytes,
+        limits.cache_codec_scratch_bytes,
+    )?;
+    limits.working_bytes = cost;
+    let budget = ByteBudget::new(cost)?;
+    let owner = Owner::new(
+        PathBuf::from("never-spawned"),
+        Arc::new(NoSpawn),
+        limits,
+        &budget,
+    )?;
+    let root = root();
+    owner.bind(&root)?;
+    let request = Request {
+        root: root.clone(),
+        operation: U64(1),
+        action: Action::Spawn {
+            stage: LeaseId::new(),
+            work: Work::Render(Box::new(work)),
+            workers: 1,
+            working_bytes: U64(cost),
+        },
+    };
+    assert_eq!(owner.call(&request)?.phase, Phase::WaitFailed);
+    owner.call(&Request {
+        action: Action::Drain,
+        ..request
+    })?;
+    while owner.status(&root, U64(1))?.phase != Phase::Drained {
+        std::thread::yield_now();
+    }
+    assert_eq!(budget.used(), cost);
+    drop(owner);
+    assert_eq!(budget.used(), cost);
+    let error = budget.reserve_exact(1).err().expect("pool remains charged");
+    assert_eq!((error.required, error.available), (1, 0));
+    Ok(())
+}
+
+#[test]
+fn same_pool_growth_refusal_keeps_the_old_slot_charge() -> Result<()> {
+    let budget = ByteBudget::new(100)?;
+    let root = root();
+    let stage = LeaseId::new();
+    let slot = Slot {
+        root: root.clone(),
+        operation: U64(1),
+        stage: stage.clone(),
+        digest: [0; 32],
+        child: Mutex::new(None),
+        send: Mutex::new(SendState {
+            input: None,
+            start: false,
+            encode: false,
+            stop: false,
+            initial_sent: false,
+            encode_sent: false,
+            #[cfg(all(test, unix))]
+            hold_encode: false,
+            done: true,
+            error: None,
+        }),
+        wake: Condvar::new(),
+        writer: Mutex::new(None),
+        reaper: Mutex::new(None),
+        status: Mutex::new(Status {
+            epoch: root.epoch,
+            session: root.session,
+            operation: U64(1),
+            stage,
+            pid: None,
+            phase: Phase::Preparing,
+            initial_sent: false,
+            encode_sent: false,
+            exit_code: None,
+            success: None,
+            error: None,
+        }),
+        retry: AtomicBool::new(false),
+        stop: AtomicBool::new(false),
+        stages: Arc::new(NoSpawn),
+        grant: Mutex::new(None),
+        no_child_terminal: AtomicBool::new(true),
+        reservation: Mutex::new(Some(budget.reserve_exact(40).unwrap())),
+        work: Work::Render(Box::new(render())),
+    };
+    let competitor = budget.reserve_exact(50).unwrap();
+    let error = slot.resize_reservation(60).unwrap_err();
+    let limit = error
+        .downcast_ref::<crate::preview::ByteLimit>()
+        .context("native upgrade did not preserve typed allowance refusal")?;
+    assert_eq!((limit.required, limit.available), (20, 10));
+    assert_eq!(budget.used(), 90);
+    assert_eq!(
+        slot.reservation.lock().unwrap().as_ref().unwrap().bytes(),
+        40
+    );
+    drop(competitor);
+    slot.resize_reservation(60)?;
+    assert_eq!(budget.used(), 60);
+    slot.resize_reservation(20)?;
+    assert_eq!(budget.used(), 20);
+    drop(slot);
+    assert_eq!(budget.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn encode_growth_refusal_preserves_grant_and_send_state_for_exact_retry() -> Result<()> {
+    #[derive(Clone)]
+    struct HeaderStages(Header);
+    impl Stages for HeaderStages {
+        fn arm(&self, _: &RootCapability, _: &LeaseId, _: U64) -> Result<PathBuf> {
+            anyhow::bail!("unused arm")
+        }
+        fn drained(&self, _: &RootCapability, _: &LeaseId, _: U64) -> Result<()> {
+            Ok(())
+        }
+        fn header(&self, _: &RootCapability, _: &LeaseId, _: U64) -> Result<Header> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let mut limits = crate::preview::ServiceLimits::default();
+    limits.workers = 1;
+    limits.working_bytes = 100;
+    limits.cache_header_scratch_bytes = 10;
+    limits.cache_codec_scratch_bytes = 10;
+    let budget = ByteBudget::new(limits.working_bytes)?;
+    let root = root();
+    let stage = LeaseId::new();
+    let header = Header {
+        operation: U64(1),
+        stage: stage.clone(),
+        input_digest: "a".repeat(64),
+        input_bytes: U64(10),
+        codec: Codec::Jpeg,
+        width: 2,
+        height: 2,
+    };
+    let stages = Arc::new(HeaderStages(header.clone()));
+    let owner = Owner::new(
+        PathBuf::from("never-spawned"),
+        stages.clone(),
+        limits.clone(),
+        &budget,
+    )?;
+    owner.bind(&root)?;
+    let initial = header_cost(10, limits.cache_header_scratch_bytes)?;
+    let required = decode_cost(
+        Codec::Jpeg,
+        2,
+        2,
+        10,
+        limits.cache_header_scratch_bytes,
+        limits.cache_codec_scratch_bytes,
+    )?;
+    let slot = Arc::new(Slot {
+        root: root.clone(),
+        operation: U64(1),
+        stage: stage.clone(),
+        digest: [0; 32],
+        child: Mutex::new(None),
+        send: Mutex::new(SendState {
+            input: None,
+            start: true,
+            encode: false,
+            stop: false,
+            initial_sent: true,
+            encode_sent: false,
+            #[cfg(all(test, unix))]
+            hold_encode: false,
+            done: false,
+            error: None,
+        }),
+        wake: Condvar::new(),
+        writer: Mutex::new(None),
+        reaper: Mutex::new(None),
+        status: Mutex::new(Status {
+            epoch: root.epoch.clone(),
+            session: root.session.clone(),
+            operation: U64(1),
+            stage,
+            pid: None,
+            phase: Phase::Running,
+            initial_sent: true,
+            encode_sent: false,
+            exit_code: None,
+            success: None,
+            error: None,
+        }),
+        retry: AtomicBool::new(false),
+        stop: AtomicBool::new(false),
+        stages,
+        grant: Mutex::new(None),
+        no_child_terminal: AtomicBool::new(true),
+        reservation: Mutex::new(Some(budget.reserve_exact(initial).unwrap())),
+        work: Work::DecodeEncoded {
+            codec: Codec::Jpeg,
+            encoded_bytes: U64(10),
+            encoded_digest: "a".repeat(64),
+            expected_dimensions: None,
+        },
+    });
+    owner.slots.lock().unwrap().push(slot.clone());
+    let competitor = budget.reserve_exact(70).unwrap();
+    let request = Request {
+        root: root.clone(),
+        operation: U64(1),
+        action: Action::Encode {
+            header: Some(header),
+            working_bytes: U64(required),
+            rgb_bytes: U64(rgb_bytes(2, 2)?),
+        },
+    };
+    let error = owner.call(&request).unwrap_err();
+    let limit = error
+        .downcast_ref::<crate::preview::ByteLimit>()
+        .context("integrated Encode did not retain typed growth refusal")?;
+    assert_eq!(
+        (limit.required, limit.available),
+        (required - initial, 100 - initial - 70)
+    );
+    assert_eq!(budget.used(), initial + 70);
+    assert!(slot.grant.lock().unwrap().is_none());
+    assert!(!slot.send.lock().unwrap().encode);
+    assert_eq!(
+        slot.reservation.lock().unwrap().as_ref().unwrap().bytes(),
+        initial
+    );
+
+    drop(competitor);
+    owner.call(&request)?;
+    assert!(slot.grant.lock().unwrap().is_some());
+    assert!(slot.send.lock().unwrap().encode);
+    assert_eq!(
+        slot.reservation.lock().unwrap().as_ref().unwrap().bytes(),
+        required
+    );
+    slot.status.lock().unwrap().phase = Phase::Drained;
+    owner.call(&Request {
+        root,
+        operation: U64(1),
+        action: Action::Retire,
+    })?;
+    assert_eq!(budget.used(), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "inert native custody subprocess entrypoint"]
 fn held_stdin_entrypoint() {
     assert_eq!(
@@ -179,6 +521,7 @@ fn actual_live_child_with_blocked_stdin_stops_and_joins_before_stage_drain() -> 
     let input = child.stdin.take().context("fixture child stdin")?;
     let root = root();
     let stage = LeaseId::new();
+    let budget = ByteBudget::new(1)?;
     let slot = Arc::new(Slot {
         root: root.clone(),
         operation: U64(1),
@@ -218,7 +561,7 @@ fn actual_live_child_with_blocked_stdin_stops_and_joins_before_stage_drain() -> 
         stages: Arc::new(NoSpawn),
         grant: Mutex::new(None),
         no_child_terminal: AtomicBool::new(false),
-        charged: std::sync::atomic::AtomicU64::new(1),
+        reservation: Mutex::new(Some(budget.reserve_exact(1).unwrap())),
         work: Work::Render(Box::new(render())),
     });
     struct Cleanup(Option<Arc<Slot>>);
@@ -290,11 +633,9 @@ fn failed_f_release_retains_exact_root_for_supervisor_cleanup() -> Result<()> {
         }
     }
     let stages = Arc::new(Retained(std::sync::atomic::AtomicUsize::new(0)));
-    let owner = Owner::new(
-        std::env::current_exe()?,
-        stages.clone(),
-        crate::preview::ServiceLimits::default(),
-    );
+    let limits = crate::preview::ServiceLimits::default();
+    let budget = ByteBudget::new(limits.working_bytes)?;
+    let owner = Owner::new(std::env::current_exe()?, stages.clone(), limits, &budget)?;
     let first = root();
     let next = root();
     owner.bind(&first)?;
@@ -395,11 +736,14 @@ fn reserved_stop_overtaking_spawn_prevents_os_child_and_stays_root_bound() -> Re
         drains: std::sync::atomic::AtomicUsize::new(0),
     });
     // Intentionally absent executable: a regression must never launch a helper.
+    let limits = crate::preview::ServiceLimits::default();
+    let budget = ByteBudget::new(limits.working_bytes)?;
     let owner = Owner::new(
         directory.path().join("absent-native"),
         stages.clone(),
-        crate::preview::ServiceLimits::default(),
-    );
+        limits,
+        &budget,
+    )?;
     let selected = root();
     owner.bind(&selected)?;
     let request = cancel_request(&owner, &selected)?;
@@ -438,11 +782,14 @@ fn reserved_stop_and_status_progress_while_stage_arm_is_held() -> Result<()> {
         arms: std::sync::atomic::AtomicUsize::new(0),
         drains: std::sync::atomic::AtomicUsize::new(0),
     });
+    let limits = crate::preview::ServiceLimits::default();
+    let budget = ByteBudget::new(limits.working_bytes)?;
     let owner = Arc::new(Owner::new(
         directory.path().join("absent-native"),
         stages.clone(),
-        crate::preview::ServiceLimits::default(),
-    ));
+        limits,
+        &budget,
+    )?);
     let selected = root();
     owner.bind(&selected)?;
     let request = cancel_request(&owner, &selected)?;

@@ -73,8 +73,14 @@ impl ByteBudget {
         let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         (state.limit, state.used)
     }
+    pub(crate) fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 impl ByteReservation {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
     pub(crate) fn grow_exact(&mut self, bytes: u64) -> std::result::Result<(), ByteLimit> {
         let mut state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
         let available = state.limit - state.used;
@@ -322,6 +328,14 @@ impl DecodedCache {
 mod tests {
     use super::*;
     use crate::preview::{CodecSettings, encode};
+    #[test]
+    fn pool_identity_distinguishes_cloned_handles_from_equal_limits() {
+        let pool = ByteBudget::new(100).unwrap();
+        let same = pool.clone();
+        let equal = ByteBudget::new(100).unwrap();
+        assert!(pool.same_pool(&same));
+        assert!(!pool.same_pool(&equal));
+    }
     #[test]
     fn lm_supervisor_batch2_typed_reservation_denies_atomically_and_retries_same_pool() {
         let pool = ByteBudget::new(100).unwrap();

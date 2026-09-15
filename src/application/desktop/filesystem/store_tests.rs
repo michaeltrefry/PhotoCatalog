@@ -341,6 +341,16 @@ fn delivered_failure_categories_survive_relay_even_after_owner_uncertainty() -> 
     let fault = Fault::from_error(store::ResourceLimit("local admission limit").into(), false);
     assert_eq!(fault.kind, FailureKind::ResourceLimit);
     assert!(!fault.unknown);
+    let fault = Fault::from_error(
+        crate::preview::ByteLimit {
+            required: 7,
+            available: 3,
+        }
+        .into(),
+        false,
+    );
+    assert_eq!(fault.kind, FailureKind::ResourceLimit);
+    assert!(!fault.unknown);
     Ok(())
 }
 

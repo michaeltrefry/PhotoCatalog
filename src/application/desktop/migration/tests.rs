@@ -793,8 +793,8 @@ mod actual {
                 limits: Limits::default(),
                 import_checkpoint: None,
             };
-            // This is the one configured test pool, shared by C/F admission and G
-            // operation/result owners. It is a requested-storage allowance.
+            // This metadata pool is shared by C/F admission and migration G
+            // operation/result owners. Native preview work has a separate pool.
             use crate::lightroom_migration_worker::memory::{core, layout::add};
             let operation_allowance = add(
                 add(4 * 1024 * 1024 * 1024, core::worker_repair_execution()?)?,
@@ -813,11 +813,14 @@ mod actual {
                 .checked_add(operation_allowance as u64)
                 .context("managed fixture pool overflow")?;
             let pool = ByteBudget::new(allowance)?;
+            // Future export G receives this same native pool; never fold it into
+            // the requested-storage allowance above.
+            let native = ByteBudget::new(config.preview_limits.working_bytes)?;
             println!(
                 "LM_FACADE_POOL configured={allowance} requested_operation={operation_allowance}"
             );
             let desktop = super::super::super::DesktopBridge::spawn_with_filesystem(
-                config, filesystem, &pool,
+                config, filesystem, &pool, &native,
             )?;
             ensure!(
                 desktop.status().phase == super::super::super::TransportPhase::Ready,
