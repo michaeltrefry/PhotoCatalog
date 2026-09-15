@@ -27,12 +27,25 @@ changed or earlier tests were rerun to correct that bookkeeping error.
 CLI `0acc74ff`, libtest `98827aa1`, composition review `30d333fb` are retained.
 Final integrated evidence audit `0c755b64` passes.
 
-S12 sc-22847 and bug sc-23555 remain In Progress. The next source lane is
-G export native ownership and exact ordinary F stage coordination in
-`codex/sc-22847-export-owner`, based on `1be970d`; C ExportService adaptation
-and paired export route admission follow its acceptance. Full installed,
-platform, UI and RSS acceptance and S13 remain open. No RAID/original reads,
-canonical migration, install replacement, push or Actions occurred.
+S12 sc-22847 remains In Progress. Bug sc-23555 is In Review after verified
+local implementation, independent review and integration; publication,
+merge and normal CI remain outstanding (Shortcut comment 23566).
+
+G export native ownership and exact ordinary F stage coordination are under
+repair in `codex/sc-22847-export-owner`, based on `1be970d`. Its 13-path
+lifecycle freeze `a9a8ee5a` passes formatting and full release test-target
+compilation (`b28ab40f`, 401 unchanged source hashes, command PIDs retired).
+Independent source closure still requires five fixes: privileged terminal
+failure recovery, atomic Close/drain replay, nonblocking reserved controls,
+writer-creation pipe retirement, and overlapping duplicate control replies.
+A bounded repair batch is active (Shortcut comment 23568); no runtime gate
+has run on this rejected freeze. New feature admission is paused until this
+ownership boundary passes review and runtime validation.
+
+C ExportService adaptation and paired export route admission follow G
+acceptance. Full installed, platform, UI and RSS acceptance and S13 remain
+open. No RAID/original reads, canonical migration, install replacement, push
+or Actions occurred.
 
 ## Current delivery — 2026-09-14
 
