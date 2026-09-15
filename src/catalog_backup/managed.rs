@@ -220,6 +220,10 @@ pub fn run_process(
 /// Real-process fault hook used only by integration qualification. It does not
 /// alter the installed worker protocol or production factory selection.
 #[doc(hidden)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep process configuration, cancellation, and independent fault/progress/reap probes explicit at the supervision boundary"
+)]
 pub fn run_process_with_probe(
     executable: &Path,
     operation: String,
@@ -250,6 +254,10 @@ fn executable_canonical_operation(operation: String) -> Result<String> {
     Ok(operation)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep process configuration, cancellation, and independent fault/progress/reap probes explicit at the supervision boundary"
+)]
 fn run_process_inner(
     executable: &Path,
     operation: String,
@@ -581,17 +589,15 @@ fn retire_backup(
     probe: &mut impl FnMut(ProcessEvent),
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    if forced {
-        if let Some(input) = input.as_mut() {
-            let _ = write_frame(
-                input,
-                &Envelope {
-                    protocol: PROTOCOL,
-                    nonce: nonce.to_owned(),
-                    body: Parent::Cancel,
-                },
-            );
-        }
+    if forced && let Some(input) = input.as_mut() {
+        let _ = write_frame(
+            input,
+            &Envelope {
+                protocol: PROTOCOL,
+                nonce: nonce.to_owned(),
+                body: Parent::Cancel,
+            },
+        );
     }
     drop(input.take());
     if let Some(owned) = child.as_mut() {

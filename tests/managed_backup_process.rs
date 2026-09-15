@@ -75,15 +75,11 @@ fn assert_siblings_reaped(events: &[ProcessEvent]) -> (u32, u32) {
         })
         .expect("spawned process identities");
     assert!(
-        events
-            .iter()
-            .any(|event| *event == ProcessEvent::BackupReaped { backup }),
+        events.contains(&ProcessEvent::BackupReaped { backup }),
         "backup checked reap"
     );
     assert!(
-        events
-            .iter()
-            .any(|event| *event == ProcessEvent::FilesystemReaped { filesystem }),
+        events.contains(&ProcessEvent::FilesystemReaped { filesystem }),
         "filesystem checked reap"
     );
     assert_reaped(backup);
