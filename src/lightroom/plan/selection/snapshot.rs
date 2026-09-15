@@ -225,10 +225,10 @@ impl SelectionReview {
         )?;
         target.pragma_update(None, "journal_mode", "DELETE")?;
         close_managed_destination(&mut self.managed_destination)?;
-        self.plan.db.execute_batch("COMMIT")?;
         budget.check()?;
         drop(budget);
         self.current(expected_review_token)?;
+        self.plan.db.execute_batch("COMMIT")?;
         Ok(())
     }
 

@@ -586,3 +586,44 @@ fn sqlite_progress_hook_honors_atomic_cancel_during_vm_execution() {
 }
 
 mod preparation_tests;
+
+#[test]
+fn managed_backup_cancel_at_last_page_retains_source_snapshot() -> Result<()> {
+    let case = Case::new();
+    let mut review = case.review();
+    let destination = case
+        .fixture
+        .path
+        .parent()
+        .unwrap()
+        .join("managed-canceled.sqlite3");
+    let file = std::fs::File::create(&destination)?;
+    let physical = crate::lightroom_migration_worker::identity::FileKey::of(&file)?;
+    drop(file);
+    let cancel = flag();
+    let request_cancel = cancel.clone();
+    let token = review.summary().token.clone();
+    let result = review.backup_managed(
+        &token,
+        &NativePath::from_path(&destination),
+        &physical,
+        cancel,
+        |progress| {
+            if progress.total == Some(progress.completed) {
+                request_cancel.store(true, Ordering::Release);
+            }
+        },
+    );
+    ensure!(
+        request_cancel.load(Ordering::Acquire),
+        "final page was not reached"
+    );
+    ensure!(result.is_err(), "late cancellation was not reported");
+    ensure!(
+        !review.plan.db.is_autocommit(),
+        "failed backup released source snapshot"
+    );
+    review.close_managed_destination()?;
+    review.plan.db.execute_batch("ROLLBACK")?;
+    Ok(())
+}
