@@ -81,6 +81,10 @@ impl FilesystemHandler {
                 .owner
                 .import_call(&request, cancel)
                 .map(Response::Import),
+            Operation::RestoreOriginalRoot(request) => self
+                .owner
+                .restore_original_root(&request, cancel)
+                .map(Response::RestoredOriginalRoot),
             Operation::ExportExecutor(request) => self
                 .owner
                 .export_executor_call(&request, cancel)

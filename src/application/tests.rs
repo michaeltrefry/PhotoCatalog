@@ -821,7 +821,8 @@ fn publication_actor(
     base: &std::path::Path,
     event: crate::import_preparation::Event,
     behavior: crate::import_preparation::TestPublication,
-    reference: crate::import_preparation::Reference,
+    reference: Option<crate::import_preparation::Reference>,
+    source_registered: bool,
 ) -> Result<(Bridge, Actor)> {
     let bridge = disconnected();
     let mut actor = Actor::new(
@@ -849,7 +850,7 @@ fn publication_actor(
     open.import = Some(ImportTask {
         import_lock: None,
         preparation: Some(preparation),
-        reference: Some(reference),
+        reference,
         status: ImportStatus {
             id: id.clone(),
             source: NativePath::from_path(&base.join("originals")),
@@ -867,7 +868,7 @@ fn publication_actor(
         },
         consumers: Vec::new(),
         cancel: Cancellation::default(),
-        source_registered: true,
+        source_registered,
         discovery_finished: false,
         failure: false,
     });
@@ -927,6 +928,74 @@ fn publication_counts(catalog: &Catalog, asset: &str) -> Result<(i64, i64, i64, 
 }
 
 #[test]
+fn actor_commits_observed_root_before_acknowledging_managed_walk() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    drop(Catalog::open(root.path().join("catalog"))?);
+    let base = root.path().canonicalize()?;
+    let configured = base.join("originals");
+    let selected = base.join("selected-now-offline");
+    let (_bridge, mut actor) = publication_actor(
+        &base,
+        crate::import_preparation::Event::Begun {
+            source: NativePath::from_path(&selected),
+        },
+        crate::import_preparation::TestPublication::AcceptRoot,
+        None,
+        false,
+    )?;
+    actor
+        .open
+        .as_mut()
+        .unwrap()
+        .service
+        .replace_original_root_review(std::slice::from_ref(&configured), 17)?;
+
+    actor.maintain();
+
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert!(import.source_registered && !import.failure);
+    assert_eq!(import.status.source, NativePath::from_path(&selected));
+    let review = open.service.original_root_review()?;
+    assert_eq!(review.roots, vec![configured, selected]);
+    assert_eq!(review.storage_epoch, None);
+    Ok(())
+}
+
+#[test]
+fn actor_rejects_cache_root_before_managed_walk_acknowledgement() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    drop(Catalog::open(root.path().join("catalog"))?);
+    let cache = root
+        .path()
+        .canonicalize()?
+        .join("catalog/application-previews/thumbnail/inside");
+    let (_bridge, mut actor) = publication_actor(
+        root.path(),
+        crate::import_preparation::Event::Begun {
+            source: NativePath::from_path(&cache),
+        },
+        crate::import_preparation::TestPublication::RejectRoot,
+        None,
+        false,
+    )?;
+
+    actor.maintain();
+
+    let import = actor.open.as_ref().unwrap().import.as_ref().unwrap();
+    assert!(import.failure && !import.source_registered);
+    assert!(import.preparation.is_none());
+    assert!(
+        import
+            .status
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("overlaps preview storage"))
+    );
+    Ok(())
+}
+
+#[test]
 fn actor_rejects_stale_sidecar_and_original_before_publication() -> Result<()> {
     for sidecar in [true, false] {
         let root = tempfile::tempdir()?;
@@ -957,7 +1026,8 @@ fn actor_rejects_stale_sidecar_and_original_before_publication() -> Result<()> {
                 crate::import_preparation::TestPublication::RejectFile,
             )
         };
-        let (_bridge, mut actor) = publication_actor(root.path(), event, behavior, reference)?;
+        let (_bridge, mut actor) =
+            publication_actor(root.path(), event, behavior, Some(reference), true)?;
         actor.maintain();
         let open = actor.open.as_ref().unwrap();
         let import = open.import.as_ref().unwrap();
@@ -975,7 +1045,8 @@ fn actor_lost_postcommit_release_cancels_consumer_and_keeps_receipt() -> Result<
         root.path(),
         crate::import_preparation::Event::End,
         crate::import_preparation::TestPublication::LoseFileRelease,
-        reference,
+        Some(reference),
+        true,
     )?;
     actor.maintain();
     let open = actor.open.as_ref().unwrap();

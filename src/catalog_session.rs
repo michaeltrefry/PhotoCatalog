@@ -262,6 +262,53 @@ impl ConfirmSqlAdmission {
 /// A health response, stale cached Prepare, EOF or lost reply is not this proof.
 pub type SqlAdmissionConfirmed = ConfirmSqlAdmission;
 
+/// One bounded original-root fact read by C from the exact admitted preview
+/// manifest. F validates it against the retained catalog/cache namespace before
+/// restoring authority; the path may be offline and therefore is not reopened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreOriginalRootRequest {
+    pub root: RootCapability,
+    pub manifest_physical: PhysicalObjectId,
+    pub original: NativePath,
+}
+impl RestoreOriginalRootRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_root(&self.root)?;
+        self.manifest_physical.validate()?;
+        validate_path(&self.original)?;
+        let path = self.original.to_path()?;
+        ensure!(
+            path.is_absolute(),
+            "restored original root must be absolute"
+        );
+        ensure!(
+            path.components().all(|component| !matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )),
+            "restored original root must be lexically resolved"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreOriginalRootReply {
+    pub request: RestoreOriginalRootRequest,
+}
+impl RestoreOriginalRootReply {
+    pub fn validate_for(&self, request: &RestoreOriginalRootRequest) -> Result<()> {
+        request.validate()?;
+        ensure!(
+            &self.request == request,
+            "restored original root reply mismatch"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareExportDirectory {
@@ -1036,6 +1083,13 @@ pub trait CatalogFilesystem: Send + Sync {
     ) -> Result<crate::catalog_backup::managed_filesystem::Reply> {
         anyhow::bail!("filesystem owner does not support backup custody")
     }
+    fn restore_original_root(
+        &self,
+        _request: &RestoreOriginalRootRequest,
+        _cancel: &AtomicBool,
+    ) -> Result<RestoreOriginalRootReply> {
+        anyhow::bail!("filesystem owner does not support original-root restoration")
+    }
     fn storage_call(
         &self,
         _request: &storage::Request,
@@ -1228,7 +1282,7 @@ use std::{
     fs::File,
     io::{self, Write},
     mem::ManuallyDrop,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::Ordering},
 };
 
@@ -1887,6 +1941,24 @@ impl CatalogSessionAuthority {
             AuthorityMode::Managed { root, .. } => Some(root.clone()),
             AuthorityMode::Legacy(_) => None,
         }
+    }
+    fn restore_original_root(
+        &self,
+        request: &RestoreOriginalRootRequest,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        let AuthorityMode::Managed {
+            filesystem, root, ..
+        } = &self.mode
+        else {
+            anyhow::bail!("legacy catalog cannot restore managed original roots")
+        };
+        ensure!(
+            &request.root == root,
+            "restored original root belongs to another catalog session"
+        );
+        let reply = filesystem.restore_original_root(request, cancel)?;
+        reply.validate_for(request)
     }
     pub(crate) fn prepare_export_directory(
         &self,
@@ -3011,6 +3083,26 @@ impl ManagedSession {
         cancel: &AtomicBool,
     ) -> std::result::Result<Self, AdmissionFailure> {
         Self::admit_observed(filesystem, request, cancel, |_| {})
+    }
+    pub(crate) fn restore_original_roots(
+        &self,
+        roots: &[PathBuf],
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        for original in roots {
+            ensure!(
+                !cancel.load(Ordering::Acquire),
+                "original-root restoration canceled"
+            );
+            let request = RestoreOriginalRootRequest {
+                root: self.bootstrap.root_capability(),
+                manifest_physical: self.bootstrap.manifest.physical,
+                original: NativePath::from_path(original),
+            };
+            request.validate()?;
+            self.authority.restore_original_root(&request, cancel)?;
+        }
+        Ok(())
     }
     #[allow(
         clippy::result_large_err,

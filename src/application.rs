@@ -1849,6 +1849,10 @@ impl Actor {
                 self.config.preview_policy.clone(),
                 self.config.preview_limits.clone(),
             )?;
+            // C reads only bounded manifest facts. F revalidates each offline-
+            // capable path against this exact admitted catalog/cache session
+            // before the catalog can become externally available.
+            managed.restore_original_roots(&service.original_root_review()?.roots, &cancel.0)?;
             Ok((service, jobs_held))
         })();
         match built {
@@ -3103,6 +3107,11 @@ impl Actor {
                             );
                             let path = source.to_path()?;
                             o.service.register_observed_original_root(&path)?;
+                            import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?
+                                .accept_root(&source)?;
                             import.status.source = source;
                             import.source_registered = true;
                         }

@@ -915,6 +915,86 @@ impl BootstrapOwner {
         record.verify_root_binding()?;
         result
     }
+
+    pub fn restore_original_root(
+        &mut self,
+        request: &crate::catalog_session::RestoreOriginalRootRequest,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::RestoreOriginalRootReply> {
+        request.validate()?;
+        check_cancel(cancel)?;
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|progress| progress.state == PreparationState::Confirmed),
+            "original-root restoration requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("catalog filesystem root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability()
+                && request.manifest_physical == record.bootstrap.manifest.physical,
+            "original-root restoration belongs to another catalog manifest"
+        );
+        let catalog = record.verify_root_binding()?;
+        let original = request.original.to_path()?;
+        ensure!(
+            !original.starts_with(&catalog) && !catalog.starts_with(&original),
+            "catalog and originals must be separate directories"
+        );
+        let mut cache_roots = record.store.protected_roots()?;
+        cache_roots.push(
+            record
+                .bootstrap
+                .manifest
+                .path
+                .to_path()?
+                .parent()
+                .context("preview manifest parent")?
+                .to_path_buf(),
+        );
+        for cache in cache_roots {
+            ensure!(
+                !original.starts_with(&cache) && !cache.starts_with(&original),
+                "original root overlaps preview storage"
+            );
+        }
+        let duplicate = record
+            .original_roots
+            .iter()
+            .map(NativePath::to_path)
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|existing| existing == &original);
+        let mut roots = record.original_roots.clone();
+        if !duplicate {
+            ensure!(
+                roots.len() < crate::catalog_session::import::ORIGINAL_ROOTS,
+                "admitted original root count exceeds bound"
+            );
+            roots.push(request.original.clone());
+        }
+        let bytes = roots.iter().try_fold(0usize, |total, root| {
+            total.checked_add(match root {
+                NativePath::UnixBytes(value) => value.len(),
+                NativePath::WindowsWide(value) => value.len() * std::mem::size_of::<u16>(),
+            })
+        });
+        ensure!(
+            bytes.is_some_and(|bytes| {
+                bytes <= crate::catalog_session::import::ORIGINAL_ROOT_BYTES
+            }),
+            "admitted original root bytes exceed bound"
+        );
+        check_cancel(cancel)?;
+        record.original_roots = roots;
+        record.verify_root_binding()?;
+        Ok(crate::catalog_session::RestoreOriginalRootReply {
+            request: request.clone(),
+        })
+    }
     pub fn prepare_export_directory(
         &self,
         request: &PrepareExportDirectory,

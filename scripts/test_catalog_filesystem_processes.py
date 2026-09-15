@@ -32,6 +32,7 @@ def main():
         "filesystem_tests::actual_f_and_eight_sql_roles_preserve_wal_write_lock_through_marker_and_close",
         "filesystem_tests::actual_confirm_loss_reaps_c74_before_f_retirement",
         "filesystem_tests::actual_lost_prepare_inspects_original_record_and_abandons_without_replay",
+        "filesystem_tests::actual_empty_config_import_root_survives_close_reopen_for_export",
     ]
     if os.name == "posix":
         tests.append("filesystem_tests::actual_f_binary_shm_alias_read_does_not_release_c_posix_lock")

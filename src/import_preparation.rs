@@ -52,6 +52,10 @@ pub(crate) struct Preparation {
     cleanup: Arc<std::sync::Mutex<Option<RemoteImport>>>,
 }
 enum Command {
+    AcceptRoot {
+        source: NativePath,
+        reply: mpsc::SyncSender<Result<()>>,
+    },
     ValidateInspection(mpsc::SyncSender<Result<crate::catalog_session::LeaseId>>),
     ReleaseInspection {
         grant: crate::catalog_session::LeaseId,
@@ -66,6 +70,8 @@ enum Command {
 }
 #[cfg(test)]
 pub(crate) enum TestPublication {
+    AcceptRoot,
+    RejectRoot,
     RejectInspection,
     RejectFile,
     LoseFileRelease,
@@ -84,10 +90,31 @@ impl Preparation {
             .name("catalog-publication-test".into())
             .spawn(move || {
                 let run = (|| -> Result<()> {
+                    let expected_root = match &event {
+                        Event::Begun { source } => Some(source.clone()),
+                        _ => None,
+                    };
                     sender
                         .send(event)
                         .map_err(|_| anyhow::anyhow!("publication test receiver closed"))?;
                     match behavior {
+                        TestPublication::AcceptRoot => {
+                            let Command::AcceptRoot { source, reply } = command_receiver.recv()?
+                            else {
+                                anyhow::bail!("expected original-root acknowledgement")
+                            };
+                            ensure!(
+                                Some(source) == expected_root,
+                                "accepted original root changed"
+                            );
+                            let _ = reply.send(Ok(()));
+                        }
+                        TestPublication::RejectRoot => {
+                            ensure!(
+                                command_receiver.recv().is_err(),
+                                "rejected root was acknowledged"
+                            );
+                        }
                         TestPublication::RejectInspection => {
                             let Command::ValidateInspection(reply) = command_receiver.recv()?
                             else {
@@ -275,6 +302,12 @@ impl Preparation {
         self.send_command(command(tx))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("managed import acknowledgement lost"))?
+    }
+    pub(crate) fn accept_root(&self, source: &NativePath) -> Result<()> {
+        self.unit_command(|reply| Command::AcceptRoot {
+            source: source.clone(),
+            reply,
+        })
     }
     pub(crate) fn validate_inspection(&self) -> Result<Option<crate::catalog_session::LeaseId>> {
         if self.managed {
@@ -1068,8 +1101,28 @@ fn prepare_managed(
             _ => anyhow::bail!("managed import begin reply mismatch"),
         };
         // Rendezvous delivery blocks F before its first walk step until C has
-        // durably registered the exact canonical root returned by F.
-        send(sender, cancel, Event::Begun { source })?;
+        // received the exact canonical root returned by F. The separate command
+        // acknowledgement below is sent only after C's manifest transaction.
+        send(
+            sender,
+            cancel,
+            Event::Begun {
+                source: source.clone(),
+            },
+        )?;
+        let Command::AcceptRoot {
+            source: accepted,
+            reply,
+        } = commands
+            .recv()
+            .map_err(|_| anyhow::anyhow!("managed root acknowledgement channel closed"))?
+        else {
+            anyhow::bail!("managed root acknowledgement was not first")
+        };
+        ensure!(accepted == source, "managed root acknowledgement changed");
+        reply
+            .send(Ok(()))
+            .map_err(|_| anyhow::anyhow!("managed root acknowledgement receiver closed"))?;
         loop {
             match remote.call(crate::catalog_session::import::Action::Next, cancel)? {
                 crate::catalog_session::import::Value::DirectoryStart { directory } => {

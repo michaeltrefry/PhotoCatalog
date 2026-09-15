@@ -5,7 +5,7 @@ use crate::{
         BootstrapMode, ConfirmSqlAdmission, EXPORT_PROFILE_BYTES, ExportOriginalAction,
         ExportOriginalRequest, ExportOriginalValue, ExportProfileAction, ExportProfileRequest,
         ExportProfileValue, InspectExportOriginal, LeaseId, PrepareCatalog, PrepareExportDirectory,
-        RootCapability, SQL_ROLES, SqlRole, SqlRoleObservation,
+        RestoreOriginalRootRequest, RootCapability, SQL_ROLES, SqlRole, SqlRoleObservation,
     },
 };
 use std::{io::Write, sync::atomic::AtomicBool};
@@ -790,6 +790,78 @@ fn export_original_inspection_and_lease_are_bounded_bound_rechecked_and_recovera
     owner.release(&root)?;
     owner.shutdown()?;
     assert_eq!(fs::read(&path)?, b"original-bytes");
+    Ok(())
+}
+
+#[test]
+fn restored_manifest_root_authority_accepts_offline_path_and_rejects_wrong_namespace() -> Result<()>
+{
+    let temp = TempDir::new()?;
+    let mut owner = owner();
+    let bootstrap = owner.prepare(&request(&temp), &AtomicBool::new(false), |_| Ok(()))?;
+    owner.confirm(&confirmation(&bootstrap), &AtomicBool::new(false))?;
+    let root = bootstrap.root_capability();
+    let offline = temp.path().join("offline-originals");
+    let restore = RestoreOriginalRootRequest {
+        root: root.clone(),
+        manifest_physical: bootstrap.manifest.physical,
+        original: NativePath::from_path(&offline),
+    };
+    owner.restore_original_root(&restore, &AtomicBool::new(false))?;
+    owner.restore_original_root(&restore, &AtomicBool::new(false))?;
+
+    fs::create_dir(&offline)?;
+    let photo = offline.join("asset.raw");
+    fs::write(&photo, b"restored-offline-root")?;
+    owner.inspect_export_original(
+        &InspectExportOriginal {
+            root: root.clone(),
+            requested: NativePath::from_path(&photo),
+            allowance: U64(fs::metadata(&photo)?.len()),
+        },
+        &AtomicBool::new(false),
+    )?;
+
+    let mut wrong_manifest = restore.clone();
+    wrong_manifest.manifest_physical = bootstrap.catalog.physical;
+    assert!(
+        owner
+            .restore_original_root(&wrong_manifest, &AtomicBool::new(false))
+            .is_err()
+    );
+    let mut cache_overlap = restore.clone();
+    cache_overlap.original =
+        NativePath::from_path(&bootstrap.manifest.path.to_path()?.parent().unwrap());
+    assert!(
+        owner
+            .restore_original_root(&cache_overlap, &AtomicBool::new(false))
+            .is_err()
+    );
+    let canceled = temp.path().join("canceled-originals");
+    let mut canceled_restore = restore;
+    canceled_restore.original = NativePath::from_path(&canceled);
+    assert!(
+        owner
+            .restore_original_root(&canceled_restore, &AtomicBool::new(true))
+            .is_err()
+    );
+    fs::create_dir(&canceled)?;
+    let canceled_photo = canceled.join("asset.raw");
+    fs::write(&canceled_photo, b"not-admitted")?;
+    assert!(
+        owner
+            .inspect_export_original(
+                &InspectExportOriginal {
+                    root: root.clone(),
+                    requested: NativePath::from_path(&canceled_photo),
+                    allowance: U64(fs::metadata(&canceled_photo)?.len()),
+                },
+                &AtomicBool::new(false),
+            )
+            .is_err()
+    );
+    owner.release(&root)?;
+    owner.shutdown()?;
     Ok(())
 }
 

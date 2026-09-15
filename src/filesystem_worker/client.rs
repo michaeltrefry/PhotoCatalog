@@ -9,8 +9,8 @@ use crate::{
         ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
         ExportPublicationReply, ExportPublicationRequest, InspectExportOriginal,
         InspectedExportOriginal, LeaseId, MigrationIdentityReply, MigrationIdentityRequest,
-        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
-        SqlAdmissionConfirmed,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RestoreOriginalRootReply,
+        RestoreOriginalRootRequest, RootCapability, SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
 };
@@ -1003,6 +1003,19 @@ impl CatalogFilesystem for Client {
         match self.execute(Operation::Backup(Box::new(request.clone())), cancel)? {
             Response::Backup(reply) => Ok(reply),
             _ => anyhow::bail!("unexpected backup custody response"),
+        }
+    }
+    fn restore_original_root(
+        &self,
+        request: &RestoreOriginalRootRequest,
+        cancel: &AtomicBool,
+    ) -> Result<RestoreOriginalRootReply> {
+        match self.execute(Operation::RestoreOriginalRoot(request.clone()), cancel)? {
+            Response::RestoredOriginalRoot(reply) => {
+                reply.validate_for(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected restored original-root reply"),
         }
     }
     fn export_executor_call(
