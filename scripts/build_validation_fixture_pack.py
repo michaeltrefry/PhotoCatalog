@@ -28,6 +28,8 @@ SCRIPT = Path(__file__).resolve()
 REPOSITORY = SCRIPT.parents[1]
 PACK_VERSION = 1
 PACK_MARKER = ".lensworks-validation-fixture-pack"
+WORKING_MARKER = ".lensworks-validation-working-copy"
+PORTABLE_ROOT_BINDING = "__LENSWORKS_WORKING_ORIGINALS_ROOT__/"
 MAX_RAW_BYTES = 64 * 1024 * 1024
 TRACKED_FIXTURES = {
     "generated-linear-mask.dng": (
@@ -235,7 +237,7 @@ CREATE VIEW Unexecuted AS SELECT load_extension('never-run');
 
 def create_lightroom_catalog(
     path: Path,
-    originals: Path,
+    original_root: str,
     family: str,
     files: list[tuple[str, str]],
     virtual_file_index: int | None,
@@ -255,8 +257,10 @@ def create_lightroom_catalog(
                 (2, "Adobe_DBVersion", "1300000"),
             ],
         )
-        root_text = str(originals.resolve()) + os.sep
-        db.execute("INSERT INTO AgLibraryRootFolder VALUES(1,?,?)", (f"root-{family}", root_text))
+        db.execute(
+            "INSERT INTO AgLibraryRootFolder VALUES(1,?,?)",
+            (f"root-{family}", original_root),
+        )
         folders: dict[str, int] = {}
         for relative, _ in files:
             folder = str(Path(relative).parent).replace("\\", "/") + "/"
@@ -360,18 +364,20 @@ def set_tree_mtime(path: Path, timestamp: int) -> None:
     os.utime(path, (timestamp, timestamp))
 
 
-def ensure_destination(destination: Path, replace: bool) -> None:
+def ensure_owned_destination(
+    destination: Path, replace: bool, marker_name: str, marker_value: str
+) -> None:
     if not destination.exists():
         destination.mkdir(parents=True)
         return
     entries = list(destination.iterdir())
     if not entries:
         return
-    marker = destination / PACK_MARKER
+    marker = destination / marker_name
     if not replace:
         raise RuntimeError(f"destination is not empty; pass --replace for an owned pack: {destination}")
-    if not marker.is_file() or marker.read_text().strip() != str(PACK_VERSION):
-        raise RuntimeError("refusing to replace a directory without the validation-pack marker")
+    if not marker.is_file() or marker.read_text().strip() != marker_value:
+        raise RuntimeError("refusing to replace a directory without the expected ownership marker")
     shutil.rmtree(destination)
     destination.mkdir(parents=True)
 
@@ -402,7 +408,7 @@ def git_head() -> str:
 
 def build(args) -> Path:
     destination = args.destination.resolve()
-    ensure_destination(destination, args.replace)
+    ensure_owned_destination(destination, args.replace, PACK_MARKER, str(PACK_VERSION))
     marker = destination / PACK_MARKER
     marker.write_text(f"{PACK_VERSION}\n")
     roles: dict[str, dict] = {
@@ -494,7 +500,7 @@ def build(args) -> Path:
     current_2015 = catalogs / "2015-v13.lrcat"
     counts_2014 = create_lightroom_catalog(
         current_2014,
-        originals,
+        PORTABLE_ROOT_BINDING,
         "2014-current",
         [(relative[key], key) for key in ["cr2", "dng", "jpeg", "png"]],
         1,
@@ -505,7 +511,7 @@ def build(args) -> Path:
     )
     counts_2015 = create_lightroom_catalog(
         current_2015,
-        originals,
+        PORTABLE_ROOT_BINDING,
         "2015-current",
         [(relative[key], key) for key in ["cr2", "avif", "webp", "bmp", "tiff"]],
         5,
@@ -518,7 +524,7 @@ def build(args) -> Path:
     old_2015 = catalogs / "2015-v13-3.lrcat"
     old_counts_2014 = create_lightroom_catalog(
         old_2014,
-        originals,
+        PORTABLE_ROOT_BINDING,
         "2014-excluded",
         [("2014/January/2014-01-02/excluded-only-2014.jpg", "excluded-2014")],
         None,
@@ -529,7 +535,7 @@ def build(args) -> Path:
     )
     old_counts_2015 = create_lightroom_catalog(
         old_2015,
-        originals,
+        PORTABLE_ROOT_BINDING,
         "2015-excluded",
         [("2015/February/2015-02-03/excluded-only-2015.jpg", "excluded-2015")],
         None,
@@ -559,11 +565,10 @@ def build(args) -> Path:
             "license": "CC0-1.0",
         }
 
-    expected = {
+    source_reconciliation = {
         "version": PACK_VERSION,
-        "direct_import": {
-            "unique_assets": 8,
-            "master_variants": 8,
+        "source_inventory": {
+            "unique_original_paths": 8,
             "sidecar_xmp_packets": 2,
             "formats": {name: 1 for name in ["CR2", "DNG", "JPEG", "PNG", "AVIF", "WebP", "BMP", "TIFF"]},
         },
@@ -580,42 +585,41 @@ def build(args) -> Path:
         "excluded_source_totals": {
             key: old_counts_2014[key] + old_counts_2015[key] for key in old_counts_2014
         },
-        "post_migration": {
-            "unique_assets_after_shared_original_reconciliation": 8,
-            "source_file_rows_accounted": 9,
-            "source_variants_accounted": 11,
+        "selected_source_reconciliation": {
+            "unique_original_paths_referenced": 8,
+            "file_rows": 9,
+            "image_variant_rows": 11,
             "shared_original_paths": 1,
-            "catalog_xmp_packets_retained": 4,
-            "sidecar_xmp_packets_retained": 2,
-            "logical_xmp_conflict_groups": 2,
-            "excluded_catalog_file_rows_imported": 0,
+            "catalog_xmp_packets": 4,
+            "sidecar_xmp_packets_available": 2,
+            "potential_logical_xmp_conflict_groups": 2,
+        },
+        "target_qualification": {
+            "status": "pending_root_native_import_and_migration_qualification",
+            "destination_assets": None,
+            "destination_variants": None,
+            "destination_xmp_sources": None,
+            "excluded_catalog_rows_imported": None,
+            "evidence": None,
         },
     }
     expected_path = destination / "expected-reconciliation.json"
-    expected_path.write_text(json.dumps(expected, indent=2, sort_keys=True) + "\n")
+    expected_path.write_text(json.dumps(source_reconciliation, indent=2, sort_keys=True) + "\n")
     roles[expected_path.relative_to(destination).as_posix()] = {
         "role": "machine-readable expected counts and reconciliation",
         "license": "CC0-1.0",
     }
 
-    for directory in [
-        destination / "destinations/export",
-        destination / "destinations/backup",
-        destination / "destinations/restore",
-        destination / "destinations/relink",
-        destination / "recovery/unwritable-destination",
-    ]:
-        directory.mkdir(parents=True)
-    sentinel = destination / "recovery/existing-export.jpg"
-    sentinel.write_bytes(b"fixture no-clobber sentinel\n")
-    roles[sentinel.relative_to(destination).as_posix()] = {
-        "role": "no-clobber recovery sentinel; not an image",
-        "license": "CC0-1.0",
-    }
     readme = destination / "README.md"
     shutil.copyfile(REPOSITORY / "docs/VALIDATION_FIXTURE_ITINERARY.md", readme)
     roles[readme.relative_to(destination).as_posix()] = {
         "role": "portable installed-workflow itinerary",
+        "license": "CC0-1.0",
+    }
+    qualification = destination / "target-qualification.template.json"
+    shutil.copyfile(REPOSITORY / "docs/VALIDATION_TARGET_QUALIFICATION.template.json", qualification)
+    roles[qualification.relative_to(destination).as_posix()] = {
+        "role": "pending destination-count qualification schema",
         "license": "CC0-1.0",
     }
 
@@ -631,7 +635,7 @@ def build(args) -> Path:
             "ffmpeg": ffmpeg_version(args.ffmpeg),
             "cwebp": cwebp_version(args.cwebp),
             "python": os.sys.version.split()[0],
-            "absolute_paths_are_generated_for_this_pack": True,
+            "absolute_paths_are_generated_for_this_pack": False,
         },
         "counts": {
             "original_assets": 8,
@@ -640,12 +644,15 @@ def build(args) -> Path:
             "selected_lightroom_catalogs": 2,
             "source_files_hashed": len(records),
         },
-        "expected_reconciliation": expected,
+        "source_reconciliation": source_reconciliation,
         "files": records,
         "readiness": {
             "fixture_pack_built": True,
             "all_source_sha256_recorded": True,
             "public_cr2_checksum_verified": True,
+            "portable_catalog_roots_unbound": True,
+            "destination_working_copy_prepared": False,
+            "target_destination_counts_qualified": False,
             "final_installer_supplied": False,
             "installer_sha256_verified": False,
             "installed_native_workflows_completed": False,
@@ -690,9 +697,9 @@ def verify(destination: Path) -> dict:
     if manifest["counts"]["source_files_hashed"] != len(seen):
         raise RuntimeError("fixture manifest source-file count mismatch")
     expected = json.loads((destination / "expected-reconciliation.json").read_text())
-    if expected != manifest["expected_reconciliation"]:
+    if expected != manifest["source_reconciliation"]:
         raise RuntimeError("expected reconciliation differs from manifest")
-    formats = expected["direct_import"]["formats"]
+    formats = expected["source_inventory"]["formats"]
     observed = {key: 0 for key in formats}
     for record in manifest["files"]:
         image_format = record.get("format")
@@ -703,10 +710,205 @@ def verify(destination: Path) -> dict:
     cr2 = [record for record in manifest["files"] if record.get("format") == "CR2"]
     if len(cr2) != 1 or cr2[0]["sha256"] != manifest["public_fixture_provenance"]["sha256"]:
         raise RuntimeError("public CR2 provenance/checksum differs from file manifest")
+    for catalog in (destination / "lightroom-catalogs").glob("*.lrcat"):
+        with sqlite3.connect(catalog.resolve().as_uri() + "?mode=ro", uri=True) as db:
+            roots = [row[0] for row in db.execute("SELECT absolutePath FROM AgLibraryRootFolder")]
+        if roots != [PORTABLE_ROOT_BINDING]:
+            raise RuntimeError(f"baseline Lightroom catalog is not portable: {catalog.name}")
     checksum_line = (destination / "fixture-manifest.sha256").read_text().split()
     if checksum_line != [sha256(manifest_path), "fixture-manifest.json"]:
         raise RuntimeError("fixture manifest checksum mismatch")
     return manifest
+
+
+def rebind_catalog(catalog: Path, root_binding: str) -> None:
+    with sqlite3.connect(str(catalog)) as db:
+        roots = [row[0] for row in db.execute("SELECT absolutePath FROM AgLibraryRootFolder")]
+        if roots != [PORTABLE_ROOT_BINDING]:
+            raise RuntimeError(f"working catalog portable root mismatch: {catalog.name}")
+        changed = db.execute(
+            "UPDATE AgLibraryRootFolder SET absolutePath=? WHERE absolutePath=?",
+            (root_binding, PORTABLE_ROOT_BINDING),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"working catalog root binding count differs: {catalog.name}")
+        db.commit()
+        db.execute("VACUUM")
+
+
+def prepare_working_copy(source: Path, destination: Path, replace: bool) -> Path:
+    source = source.resolve()
+    destination = destination.resolve()
+    baseline = verify(source)
+    if destination == source or source in destination.parents or destination in source.parents:
+        raise RuntimeError("working copy must be outside the immutable baseline pack")
+    ensure_owned_destination(destination, replace, WORKING_MARKER, str(PACK_VERSION))
+    (destination / WORKING_MARKER).write_text(f"{PACK_VERSION}\n")
+    inputs = destination / "inputs"
+    shutil.copytree(source / "originals", inputs / "originals")
+    shutil.copytree(source / "lightroom-catalogs", inputs / "lightroom-catalogs")
+    for name in ["README.md", "expected-reconciliation.json", "target-qualification.template.json"]:
+        shutil.copyfile(source / name, destination / name)
+
+    root_binding = str((inputs / "originals").resolve()) + os.sep
+    for catalog in sorted((inputs / "lightroom-catalogs").glob("*.lrcat")):
+        rebind_catalog(catalog, root_binding)
+
+    baseline_roles = {record["path"]: record for record in baseline["files"]}
+    def role(record):
+        return {
+            key: value
+            for key, value in record.items()
+            if key not in {"path", "bytes", "sha256"}
+        }
+    roles = {
+        WORKING_MARKER: {"role": "working-copy ownership marker", "license": "CC0-1.0"},
+        "README.md": role(baseline_roles["README.md"]),
+        "expected-reconciliation.json": role(baseline_roles["expected-reconciliation.json"]),
+        "target-qualification.template.json": role(baseline_roles["target-qualification.template.json"]),
+    }
+    for record in baseline["files"]:
+        if record["path"].startswith("originals/"):
+            roles["inputs/" + record["path"]] = role(record)
+        elif record["path"].startswith("lightroom-catalogs/"):
+            roles["inputs/" + record["path"]] = role(record)
+    records = file_records(destination, roles)
+    authorized_sidecars = sorted(
+        record["path"]
+        for record in records
+        if record["path"].startswith("inputs/originals/") and record.get("format") == "XMP"
+    )
+    working_manifest = {
+        "format_version": PACK_VERSION,
+        "working_set_id": "lensworks-cross-platform-working-v1",
+        "builder_source_commit": git_head(),
+        "baseline": {
+            "pack_id": baseline["pack_id"],
+            "manifest_sha256": sha256(source / "fixture-manifest.json"),
+        },
+        "bound_originals_root": root_binding,
+        "current_originals_relative_at_freeze": "inputs/originals",
+        "source_reconciliation": baseline["source_reconciliation"],
+        "authorized_mutations": [
+            {
+                "path": path,
+                "scope": "explicit user-approved metadata publication only",
+                "baseline_sha256": next(record["sha256"] for record in records if record["path"] == path),
+            }
+            for path in authorized_sidecars
+        ],
+        "files_at_freeze": records,
+        "readiness": {
+            **baseline["readiness"],
+            "portable_catalog_roots_unbound": False,
+            "destination_working_copy_prepared": True,
+            "target_destination_counts_qualified": False,
+            "final_installer_supplied": False,
+            "installer_sha256_verified": False,
+            "installed_native_workflows_completed": False,
+            "windows_sc_23641_complete": False,
+            "linux_sc_23642_complete": False,
+            "ready_for_release_handoff": False,
+        },
+    }
+    manifest_path = destination / "working-manifest.json"
+    manifest_path.write_text(json.dumps(working_manifest, indent=2, sort_keys=True) + "\n")
+    (destination / "working-manifest.sha256").write_text(
+        f"{sha256(manifest_path)}  working-manifest.json\n"
+    )
+    for directory in [
+        destination / "outputs/export",
+        destination / "outputs/backup",
+        destination / "outputs/restore",
+        destination / "outputs/relink",
+        destination / "outputs/previews",
+        destination / "outputs/recovery/unwritable-destination",
+    ]:
+        directory.mkdir(parents=True)
+    (destination / "outputs/export/existing-export.jpg").write_bytes(
+        b"fixture no-clobber sentinel; not an image\n"
+    )
+    verify_working_copy(destination, inputs / "originals", False)
+    return manifest_path
+
+
+def verify_working_copy(
+    destination: Path, current_originals: Path | None, allow_sidecar_changes: bool
+) -> dict:
+    destination = destination.resolve()
+    manifest_path = destination / "working-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    checksum_line = (destination / "working-manifest.sha256").read_text().split()
+    if checksum_line != [sha256(manifest_path), "working-manifest.json"]:
+        raise RuntimeError("working manifest checksum mismatch")
+    current_originals = (
+        current_originals.resolve()
+        if current_originals is not None
+        else destination / manifest["current_originals_relative_at_freeze"]
+    )
+    authorized = {entry["path"]: entry for entry in manifest["authorized_mutations"]}
+    changed_sidecars = []
+    expected_originals = set()
+    for record in manifest["files_at_freeze"]:
+        relative = record["path"]
+        if relative.startswith("inputs/originals/"):
+            source_relative = relative.removeprefix("inputs/originals/")
+            expected_originals.add(source_relative)
+            path = current_originals / source_relative
+        else:
+            path = destination / relative
+        if not path.is_file() or path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
+            if relative in authorized and allow_sidecar_changes and path.is_file():
+                changed_sidecars.append(
+                    {
+                        "path": relative,
+                        "baseline_sha256": record["sha256"],
+                        "current_sha256": sha256(path),
+                        "current_bytes": path.stat().st_size,
+                    }
+                )
+                continue
+            raise RuntimeError(f"working input checksum/size mismatch: {relative}")
+    actual_originals = {
+        path.relative_to(current_originals).as_posix()
+        for path in current_originals.rglob("*")
+        if path.is_file()
+    }
+    if actual_originals != expected_originals:
+        raise RuntimeError(
+            f"working originals set differs: missing={sorted(expected_originals - actual_originals)} "
+            f"extra={sorted(actual_originals - expected_originals)}"
+        )
+    expected_catalog_files = {
+        record["path"].removeprefix("inputs/lightroom-catalogs/")
+        for record in manifest["files_at_freeze"]
+        if record["path"].startswith("inputs/lightroom-catalogs/")
+    }
+    catalog_root = destination / "inputs/lightroom-catalogs"
+    actual_catalog_files = {
+        path.relative_to(catalog_root).as_posix()
+        for path in catalog_root.rglob("*")
+        if path.is_file()
+    }
+    if actual_catalog_files != expected_catalog_files:
+        raise RuntimeError(
+            f"working Lightroom source set differs: missing={sorted(expected_catalog_files - actual_catalog_files)} "
+            f"extra={sorted(actual_catalog_files - expected_catalog_files)}"
+        )
+    for catalog in sorted(catalog_root.glob("*.lrcat")):
+        with sqlite3.connect(catalog.resolve().as_uri() + "?mode=ro", uri=True) as db:
+            roots = [row[0] for row in db.execute("SELECT absolutePath FROM AgLibraryRootFolder")]
+        if roots != [manifest["bound_originals_root"]]:
+            raise RuntimeError(f"working Lightroom root binding changed: {catalog.name}")
+    return {
+        "verified": True,
+        "working_set_id": manifest["working_set_id"],
+        "current_originals_root": str(current_originals),
+        "authorized_sidecar_changes": changed_sidecars,
+        "target_destination_counts_qualified": manifest["readiness"][
+            "target_destination_counts_qualified"
+        ],
+    }
 
 
 def main() -> None:
@@ -714,19 +916,54 @@ def main() -> None:
     parser.add_argument(
         "--destination",
         type=Path,
-        default=REPOSITORY / ".deps/validation-fixtures/lensworks-cross-platform-v1",
+        help="baseline or working output; defaults beneath .deps/validation-fixtures",
     )
     parser.add_argument("--raw-cache", type=Path, default=REPOSITORY / ".deps/raw-fixtures")
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--cwebp", default="cwebp")
     parser.add_argument("--offline", action="store_true", help="refuse network download of missing CR2")
     parser.add_argument("--replace", action="store_true", help="replace only a marker-owned existing pack")
-    parser.add_argument("--verify-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--verify-only", action="store_true", help="verify an immutable baseline pack")
+    mode.add_argument(
+        "--prepare-working-copy",
+        type=Path,
+        metavar="BASELINE",
+        help="materialize and bind a destination-host working set from a verified baseline",
+    )
+    mode.add_argument("--verify-working-copy", action="store_true")
+    parser.add_argument(
+        "--current-originals-root",
+        type=Path,
+        help="current working originals location after an offline/relink move",
+    )
+    parser.add_argument(
+        "--allow-authorized-sidecar-changes",
+        action="store_true",
+        help="report changed declared XMP sidecars while enforcing every other input hash",
+    )
     args = parser.parse_args()
+    baseline_default = REPOSITORY / ".deps/validation-fixtures/lensworks-cross-platform-v1"
+    working_default = REPOSITORY / ".deps/validation-fixtures/lensworks-working-v1"
     if args.verify_only:
-        manifest = verify(args.destination.resolve())
+        manifest = verify((args.destination or baseline_default).resolve())
         print(json.dumps({"verified": True, "pack_id": manifest["pack_id"], "files": len(manifest["files"])}))
+    elif args.prepare_working_copy:
+        manifest = prepare_working_copy(
+            args.prepare_working_copy,
+            args.destination or working_default,
+            args.replace,
+        )
+        print(manifest)
+    elif args.verify_working_copy:
+        result = verify_working_copy(
+            (args.destination or working_default).resolve(),
+            args.current_originals_root,
+            args.allow_authorized_sidecar_changes,
+        )
+        print(json.dumps(result, sort_keys=True))
     else:
+        args.destination = args.destination or baseline_default
         manifest = build(args)
         print(manifest)
 

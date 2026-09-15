@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "status": "pending_root_native_import_and_migration_qualification",
+  "fixture_builder_commit": "<exact reviewed builder commit>",
+  "baseline_manifest_sha256": "<verified baseline manifest SHA-256>",
+  "working_manifest_sha256": "<verified destination-host working manifest SHA-256>",
+  "tested_product_commit": "<exact product commit>",
+  "qualification_environment": "<OS, architecture, and native binary identity>",
+  "workflow": "direct import followed by selected Lightroom migration into the same new catalog",
+  "destination_counts": {
+    "assets": null,
+    "variants": null,
+    "xmp_sources": null,
+    "virtual_copies": null,
+    "collections": null,
+    "excluded_catalog_rows_imported": null
+  },
+  "reconciliation": {
+    "source_original_paths": 8,
+    "selected_lightroom_file_rows": 9,
+    "selected_lightroom_image_variant_rows": 11,
+    "shared_original_paths": 1,
+    "selected_catalog_xmp_packets": 4,
+    "sidecar_xmp_packets": 2
+  },
+  "evidence_paths": [],
+  "approved_for_platform_handoff": false
+}
