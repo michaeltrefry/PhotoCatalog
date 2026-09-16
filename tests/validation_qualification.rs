@@ -810,6 +810,174 @@ fn create_new_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn inspection_path(value: &Value) -> Result<PathBuf> {
+    Ok(serde_json::from_value::<NativePath>(value.clone())?.to_path()?)
+}
+
+fn validate_path_evidence(
+    catalog: &str,
+    row: &Value,
+    originals: &Path,
+    observed_sidecars: &mut BTreeSet<String>,
+) -> Result<()> {
+    let state = row["state"].as_str().context("inspection path state")?;
+    let path = inspection_path(&row["inspection_path"])?;
+    let relative = path
+        .strip_prefix(originals)
+        .with_context(|| {
+            format!(
+                "inspection path escaped fixture originals: {}",
+                path.display()
+            )
+        })?
+        .to_string_lossy();
+    let evidence = &row["evidence"];
+    if !SELECTED.contains(&catalog) {
+        let expected = match catalog {
+            "2014-v13.lrcat" => "2014/January/2014-01-02/excluded-only-2014.jpg",
+            "2015-v13-3.lrcat" => "2015/February/2015-02-03/excluded-only-2015.jpg",
+            _ => bail!("unexpected excluded fixture catalog: {catalog}"),
+        };
+        ensure!(
+            state == "missing"
+                && relative == expected
+                && evidence["packet_gaps"] == false
+                && evidence["metadata"]["missing"] == true
+                && evidence["inspections"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty),
+            "excluded fixture path evidence differs for {catalog}: {relative} {state}"
+        );
+        return Ok(());
+    }
+
+    let inspections = evidence["inspections"]
+        .as_array()
+        .context("original inspection evidence")?;
+    let origins = inspections
+        .iter()
+        .map(|inspection| {
+            inspection["origin"]
+                .as_str()
+                .context("original inspection origin")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let expected_origins = [
+        "embedded",
+        "sidecar_xmp",
+        "sidecar_XMP",
+        "sidecar_appended_xmp",
+        "sidecar_appended_XMP",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    ensure!(
+        inspections.len() == expected_origins.len() && origins == expected_origins,
+        "original inspection origin roster differs for {relative}"
+    );
+    match state {
+        "available_packets_retained" => {
+            ensure!(
+                evidence["packet_gaps"] == false,
+                "retained path reports packet gaps for {relative}"
+            );
+            for inspection in inspections {
+                let status = inspection["status"].as_str();
+                let inspected = inspection["state"] == "inspected";
+                let absent = inspection["state"] == "absent";
+                ensure!(
+                    inspection["error"].is_null(),
+                    "path inspection error for {relative}"
+                );
+                ensure!(
+                    (inspected
+                        && matches!(status, Some("Complete" | "Absent"))
+                        && inspection["issues"].as_array().is_some_and(Vec::is_empty))
+                        || (absent
+                            && status.is_none()
+                            && inspection["issues"].is_null()
+                            && inspection["packets"] == 0
+                            && inspection["parse_inputs"] == 0),
+                    "unexpected retained inspection status for {relative}: {}",
+                    inspection["status"]
+                );
+            }
+        }
+        "available_packet_gaps" => {
+            ensure!(
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("bmp"))
+                    && evidence["packet_gaps"] == true
+                    && inspections.len() == 5,
+                "unexpected packet gap for {relative}"
+            );
+            let mut unsupported = 0usize;
+            let mut absent_sidecars = 0usize;
+            for inspection in inspections {
+                if inspection["origin"] == "embedded" {
+                    let issues = inspection["issues"]
+                        .as_array()
+                        .context("BMP Unsupported issue roster")?;
+                    ensure!(
+                        inspection["state"] == "inspected"
+                            && inspection["error"].is_null()
+                            && inspection["status"] == "Unsupported"
+                            && inspection["packets"] == 0
+                            && inspection["parse_inputs"] == 0
+                            && !issues.is_empty()
+                            && issues.iter().all(|issue| issue["status"] == "Unsupported"),
+                        "BMP gap evidence differs"
+                    );
+                    unsupported += 1;
+                } else {
+                    ensure!(
+                        inspection["origin"]
+                            .as_str()
+                            .is_some_and(|origin| origin.starts_with("sidecar"))
+                            && inspection["state"] == "absent"
+                            && inspection["error"].is_null()
+                            && inspection["status"].is_null()
+                            && inspection["packets"] == 0
+                            && inspection["parse_inputs"] == 0,
+                        "BMP sidecar evidence differs"
+                    );
+                    absent_sidecars += 1;
+                }
+            }
+            ensure!(
+                unsupported == 1 && absent_sidecars == 4,
+                "BMP gap roster differs"
+            );
+        }
+        _ => bail!("unexpected selected original path state for {catalog}: {state}"),
+    }
+    for inspection in inspections {
+        if inspection["origin"]
+            .as_str()
+            .is_some_and(|origin| origin.starts_with("sidecar"))
+            && inspection["state"] == "inspected"
+            && inspection["error"].is_null()
+            && inspection["status"] == "Complete"
+            && inspection["packets"]
+                .as_u64()
+                .is_some_and(|packets| packets > 0)
+        {
+            let sidecar = inspection_path(&inspection["path"])?;
+            ensure!(
+                sidecar.starts_with(originals)
+                    && sidecar
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("xmp")),
+                "inspected sidecar escaped fixture originals"
+            );
+            observed_sidecars.insert(sidecar.to_string_lossy().to_ascii_lowercase());
+        }
+    }
+    Ok(())
+}
+
 impl Harness {
     fn new(executable: PathBuf, working: PathBuf, output: PathBuf) -> Result<Self> {
         let catalog = output.join("catalog");
@@ -929,7 +1097,10 @@ impl Harness {
         Ok(token)
     }
 
-    fn inspect_and_seal(&mut self) -> Result<(Vec<ExactPart>, Vec<String>, Value)> {
+    fn inspect_and_seal(
+        &mut self,
+        expected_sidecars: usize,
+    ) -> Result<(Vec<ExactPart>, Vec<String>, Value)> {
         let inspection = self.output.join("inspection");
         let wb::Response::Status(_) = wb_call(
             &self.bridge,
@@ -952,6 +1123,8 @@ impl Harness {
         let mut revisions = HashMap::new();
         let mut reports = HashMap::new();
         let captures = self.output.join("captures");
+        let originals = self.working.join("inputs/originals");
+        let mut observed_sidecars = BTreeSet::new();
         fs::create_dir(&captures)?;
         for name in SELECTED.into_iter().chain(EXCLUDED) {
             let source = catalogs.join(name);
@@ -1056,14 +1229,7 @@ impl Harness {
                 )?;
                 let rows = page["rows"].as_array().context("inspection path rows")?;
                 for row in rows {
-                    let state = row["state"].as_str().context("inspection path state")?;
-                    ensure!(
-                        matches!(
-                            state,
-                            "available_packets_retained" | "available_packet_gaps"
-                        ),
-                        "unexpected original path state for {name}: {state}"
-                    );
+                    validate_path_evidence(name, row, &originals, &mut observed_sidecars)?;
                     paths.push(row.clone());
                 }
                 if page["next"].is_null() {
@@ -1087,9 +1253,13 @@ impl Harness {
                 .filter(|(name, _)| name.starts_with("paths_"))
                 .map(|(_, count)| *count)
                 .sum::<i64>();
+            let files = *report
+                .counts
+                .get("files")
+                .context("inspection report file count")?;
             ensure!(
-                reported_paths > 0 && paths.len() as i64 == reported_paths,
-                "inspection path roster differs for {name}: paged {}, reported {reported_paths}",
+                files > 0 && reported_paths == files && paths.len() as i64 == files,
+                "inspection path roster differs for {name}: paged {}, reported {reported_paths}, files {files}",
                 paths.len()
             );
             self.record(
@@ -1108,6 +1278,11 @@ impl Harness {
             revisions.insert(name.to_owned(), revision.clone());
             reports.insert(revision, report);
         }
+        ensure!(
+            observed_sidecars.len() == expected_sidecars,
+            "inspected sidecar roster differs: observed {}, expected {expected_sidecars}",
+            observed_sidecars.len()
+        );
         let family_report: FamilyReport =
             serde_json::from_value(wb_query(&self.bridge, wb::Query::Families {})?)?;
         ensure!(
@@ -1550,7 +1725,14 @@ fn root_native_fixture_import_migration_qualification() -> Result<()> {
     let mut harness = Harness::new(executable, working, output)?;
     let result = (|| -> Result<()> {
         let mut token = harness.import()?;
-        let (parts, excluded_revisions, family_evidence) = harness.inspect_and_seal()?;
+        let expected_sidecars = usize::try_from(
+            manifest.source_reconciliation["selected_source_reconciliation"]
+                ["sidecar_xmp_packets_available"]
+                .as_u64()
+                .context("verified fixture sidecar packet count")?,
+        )?;
+        let (parts, excluded_revisions, family_evidence) =
+            harness.inspect_and_seal(expected_sidecars)?;
         let first = run_migration(&harness.bridge, &token, &harness.catalog, &parts)?;
         ensure!(
             first["status"] == "complete" && first["progress"]["complete"] == true,
