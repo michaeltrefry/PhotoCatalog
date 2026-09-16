@@ -62,31 +62,43 @@ impl Default for SelectionLimits {
     }
 }
 impl SelectionLimits {
+    pub(crate) fn metadata_maximum() -> Self {
+        Self {
+            review_bytes: 256 * 1024 * 1024,
+            row_bytes: MANIFEST_BYTES,
+            page_bytes: PAGE_BYTES,
+            native_path_units: 1024 * 1024,
+            snapshot_bytes: i64::MAX as u64,
+            vm_steps: 100_000_000_000,
+            deadline_ms: 3_600_000,
+        }
+    }
     fn validate(self) -> Result<()> {
+        let maximum = Self::metadata_maximum();
         ensure!(
-            (1024..=256 * 1024 * 1024).contains(&self.review_bytes),
+            (1024..=maximum.review_bytes).contains(&self.review_bytes),
             "selection review byte limit"
         );
         ensure!(
-            (1024..=MANIFEST_BYTES).contains(&self.row_bytes)
+            (1024..=maximum.row_bytes).contains(&self.row_bytes)
                 && self.row_bytes <= self.review_bytes,
             "selection row byte limit"
         );
         ensure!(
-            (1024..=PAGE_BYTES).contains(&self.page_bytes),
+            (1024..=maximum.page_bytes).contains(&self.page_bytes),
             "selection page byte limit"
         );
         ensure!(
-            (1..=1024 * 1024).contains(&self.native_path_units),
+            (1..=maximum.native_path_units).contains(&self.native_path_units),
             "selection native-path limit"
         );
         ensure!(
-            self.snapshot_bytes > 0 && self.snapshot_bytes <= i64::MAX as u64,
+            self.snapshot_bytes > 0 && self.snapshot_bytes <= maximum.snapshot_bytes,
             "selection snapshot byte limit"
         );
         ensure!(
-            (1000..=100_000_000_000).contains(&self.vm_steps)
-                && (1..=3_600_000).contains(&self.deadline_ms),
+            (1000..=maximum.vm_steps).contains(&self.vm_steps)
+                && (1..=maximum.deadline_ms).contains(&self.deadline_ms),
             "selection execution limits"
         );
         Ok(())
@@ -276,6 +288,16 @@ pub struct SelectionReview {
     companion_objects: Vec<String>,
     summary: ReviewSummary,
     evidence: ReviewEvidence,
+}
+
+pub(crate) fn metadata_layouts() -> (usize, usize, usize, usize, usize) {
+    (
+        std::mem::size_of::<SelectionReview>(),
+        std::mem::size_of::<SelectionRequest>(),
+        std::mem::size_of::<ApprovalDocument>(),
+        std::mem::size_of::<ApprovalDraft>(),
+        std::mem::size_of::<ApprovalDocuments>(),
+    )
 }
 
 pub(crate) struct ManagedReviewOpenError {

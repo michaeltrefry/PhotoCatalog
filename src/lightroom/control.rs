@@ -95,6 +95,12 @@ pub(crate) struct SqlControl<'a> {
     _control: Box<Control>,
     previous_length: i32,
 }
+pub(crate) fn metadata_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Control>(),
+        std::mem::size_of::<SqlControl<'static>>(),
+    )
+}
 impl<'a> SqlControl<'a> {
     pub fn new(db: &'a Connection, control: Control) -> Self {
         let control = Box::new(control);

@@ -95,12 +95,33 @@ struct Seal {
     state: LightroomWorkbenchSealState,
 }
 
-pub(super) fn retained_seal_metadata_layout() -> (usize, usize) {
-    // `requested`, canonical directory, database, seal, approval and review.
-    // The fixed Seal layout includes the retained directory File handle and
-    // both upload owners; path vector backing is accounted separately by C's
-    // checked cross-process metadata reservation.
-    (std::mem::size_of::<Seal>(), 6)
+pub(crate) struct RetainedMetadataLayouts {
+    pub owner: usize,
+    pub root: usize,
+    pub capture: usize,
+    pub evidence: usize,
+    pub original: usize,
+    pub seal: usize,
+    pub source: usize,
+    pub capture_process: usize,
+    pub release_receipt: usize,
+    pub seal_paths: usize,
+}
+
+pub(super) fn retained_metadata_layouts() -> RetainedMetadataLayouts {
+    RetainedMetadataLayouts {
+        owner: std::mem::size_of::<Owner>(),
+        root: std::mem::size_of::<Root>(),
+        capture: std::mem::size_of::<Capture>(),
+        evidence: std::mem::size_of::<Evidence>(),
+        original: std::mem::size_of::<Original>(),
+        seal: std::mem::size_of::<Seal>(),
+        source: std::mem::size_of::<Source>(),
+        capture_process: std::mem::size_of::<CaptureProcess>(),
+        release_receipt: std::mem::size_of::<ReleaseReceipt>(),
+        // `requested`, canonical directory, database, seal, approval and review.
+        seal_paths: 6,
+    }
 }
 #[derive(Default)]
 pub(super) struct Owner {

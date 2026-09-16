@@ -38,7 +38,7 @@ mod wire;
 pub(crate) mod workbench;
 use wire::{BytesRequest, Kind, Message};
 type Result<T> = std::result::Result<T, BridgeError>;
-const CONTROL_SLOTS: usize = 16;
+pub(super) const CONTROL_SLOTS: usize = 16;
 
 fn validate_public_request(request: &Request, limit: usize) -> Result<()> {
     struct Count {

@@ -56,8 +56,9 @@ pub(crate) fn export_executor_owner_layout() -> (usize, usize) {
 pub(crate) fn import_owner_layout() -> (usize, usize) {
     import::owner_layout()
 }
-pub(crate) fn lightroom_workbench_retained_seal_layout() -> (usize, usize) {
-    lightroom_workbench::retained_seal_metadata_layout()
+pub(crate) fn lightroom_workbench_retained_metadata_layouts()
+-> lightroom_workbench::RetainedMetadataLayouts {
+    lightroom_workbench::retained_metadata_layouts()
 }
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {

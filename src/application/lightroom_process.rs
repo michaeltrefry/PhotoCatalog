@@ -21,7 +21,7 @@ const HEADER_BYTES: usize = 48;
 const PROTOCOL: u8 = 1;
 const MAGIC: &[u8; 4] = b"PCWB";
 const ERROR_BYTES: usize = 4096;
-const CALLBACK_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const CALLBACK_BYTES: usize = 64 * 1024 * 1024;
 const CALLBACK_CHUNK_BYTES: usize = (ENVELOPE_BYTES - 16 * 1024) / 6;
 
 pub fn build_identity() -> String {

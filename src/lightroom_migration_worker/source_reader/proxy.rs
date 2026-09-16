@@ -476,6 +476,12 @@ pub(crate) struct SqlReader {
     binding: String,
     chunk_bytes: usize,
 }
+pub(crate) fn reader_metadata_layouts() -> (usize, usize) {
+    (
+        std::mem::size_of::<SqlReader>(),
+        std::mem::size_of::<CaptureSqlReader>(),
+    )
+}
 impl SqlReader {
     pub(crate) fn open(
         relay: Arc<Client>,

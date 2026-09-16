@@ -99,14 +99,26 @@ impl Default for Limits {
     }
 }
 impl Limits {
+    pub(super) fn metadata_maximum() -> Self {
+        Self {
+            request_bytes: core::MANIFEST_BYTES,
+            result_bytes: 256 * 1024 * 1024,
+            page_bytes: core::PAGE_BYTES,
+            row_bytes: 128 * 1024 * 1024,
+            native_path_units: 1024 * 1024,
+            vm_steps: 100_000_000_000,
+            deadline_ms: 3_600_000,
+        }
+    }
     fn validate(&self) -> Result<()> {
+        let maximum = Self::metadata_maximum();
         ensure!(
-            (1024..=core::MANIFEST_BYTES).contains(&self.request_bytes)
-                && (1024..=core::PAGE_BYTES).contains(&self.page_bytes),
+            (1024..=maximum.request_bytes).contains(&self.request_bytes)
+                && (1024..=maximum.page_bytes).contains(&self.page_bytes),
             "workbench request/page byte limit"
         );
         ensure!(
-            (1..=1024 * 1024).contains(&self.native_path_units),
+            (1..=maximum.native_path_units).contains(&self.native_path_units),
             "workbench native path limit"
         );
         self.control(Arc::new(AtomicBool::new(false)))?;
@@ -373,6 +385,28 @@ struct Shared {
     control: Control,
     result: Option<Arc<Cached>>,
     fatal: bool,
+}
+
+pub(super) struct MetadataLayouts {
+    pub status: usize,
+    pub cached: usize,
+    pub shared: usize,
+    pub message: usize,
+    pub control: usize,
+    pub workbench: usize,
+    pub worker_owner: usize,
+}
+
+pub(super) fn metadata_layouts() -> MetadataLayouts {
+    MetadataLayouts {
+        status: std::mem::size_of::<Status>(),
+        cached: std::mem::size_of::<Cached>(),
+        shared: std::mem::size_of::<Shared>(),
+        message: std::mem::size_of::<Message>(),
+        control: std::mem::size_of::<WorkbenchControl>(),
+        workbench: std::mem::size_of::<Workbench>(),
+        worker_owner: worker::owner_layout(),
+    }
 }
 enum Message {
     Action {

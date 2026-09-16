@@ -60,6 +60,11 @@ struct Upload {
     hash: blake3::Hasher,
     sealed: Option<Arc<Vec<String>>>,
 }
+pub(super) struct MetadataLayouts {
+    pub upload: usize,
+    pub control: usize,
+    pub coordinator: usize,
+}
 impl Upload {
     fn status(&self, attempt: &str) -> InputStatus {
         InputStatus {
@@ -343,6 +348,13 @@ pub(crate) struct Coordinator {
     lease: Option<OwnerLease>,
     control: Arc<Mutex<Control>>,
     managed: Option<Arc<dyn lw::ManagedIo>>,
+}
+pub(super) fn metadata_layouts() -> MetadataLayouts {
+    MetadataLayouts {
+        upload: std::mem::size_of::<Upload>(),
+        control: std::mem::size_of::<Control>(),
+        coordinator: std::mem::size_of::<Coordinator>(),
+    }
 }
 impl Coordinator {
     pub(crate) fn fatal(&self) -> bool {

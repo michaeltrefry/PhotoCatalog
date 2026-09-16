@@ -31,7 +31,6 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::BTreeMap,
     path::Path,
     sync::{
         Arc, Mutex, Weak,
@@ -41,10 +40,11 @@ use std::{
     time::Duration,
 };
 
-/// One generation retains a fixed owner/router/monitor assembly, at most one
-/// reader map node, and bounded clones of five F custody identities/tokens.
-/// Payload buffers remain charged by their existing Source/F reservations.
-pub(crate) const RETAINED_METADATA_BYTES: u64 = 64 * 1024;
+pub(crate) const FAILURE_CHARS: usize = 4096;
+
+fn bounded_failure(value: impl std::fmt::Display) -> String {
+    value.to_string().chars().take(FAILURE_CHARS).collect()
+}
 
 struct SourceRouter {
     guard: Guard,
@@ -54,6 +54,36 @@ struct SourceRouter {
     pump: Mutex<Option<JoinHandle<Result<()>>>>,
     stopping: AtomicBool,
     failure: Mutex<Option<String>>,
+}
+
+pub(super) struct MetadataLayouts {
+    pub owner: usize,
+    pub generation: usize,
+    pub router: usize,
+    pub reader: usize,
+    pub retained_reader: usize,
+    pub sql_reader_backing: usize,
+    pub capture_reader_backing: usize,
+    pub custody: usize,
+    pub identity: usize,
+    pub resource: usize,
+}
+
+pub(super) fn metadata_layouts() -> MetadataLayouts {
+    let (sql_reader_backing, capture_reader_backing) =
+        crate::lightroom_migration_worker::source_reader::reader_metadata_layouts();
+    MetadataLayouts {
+        owner: std::mem::size_of::<Owner>(),
+        generation: std::mem::size_of::<Generation>(),
+        router: std::mem::size_of::<SourceRouter>(),
+        reader: std::mem::size_of::<Reader>(),
+        retained_reader: std::mem::size_of::<RetainedReader>(),
+        sql_reader_backing,
+        capture_reader_backing,
+        custody: std::mem::size_of::<Custody>(),
+        identity: std::mem::size_of::<FIdentity>(),
+        resource: std::mem::size_of::<FResource>(),
+    }
 }
 
 impl SourceRouter {
@@ -113,7 +143,7 @@ impl SourceRouter {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if failure.is_none() {
-            *failure = Some(detail.into());
+            *failure = Some(bounded_failure(detail.into()));
         }
         self.stopping.store(true, Ordering::Release);
         self.stop.cancel();
@@ -249,6 +279,10 @@ enum Reader {
         owner: Box<SqlReader>,
         cancel: Arc<AtomicBool>,
     },
+}
+struct RetainedReader {
+    id: String,
+    reader: Reader,
 }
 impl Reader {
     fn retire(self) -> Result<()> {
@@ -387,12 +421,12 @@ impl Custody {
 /// shared allocation pool if construction fails, so startup can be retried or
 /// explicitly drained without losing an active owner.
 pub(crate) struct Owner {
-    _metadata: crate::preview::ByteReservation,
+    _metadata: super::lightroom_capacity::Admission,
     filesystem: Arc<FilesystemClient>,
     router: Arc<SourceRouter>,
     relay: Arc<RelayClient>,
     guard: Guard,
-    readers: Mutex<BTreeMap<String, Reader>>,
+    reader: Mutex<Option<RetainedReader>>,
     next_reader: AtomicU64,
     custody: Mutex<Custody>,
     failed: AtomicBool,
@@ -482,7 +516,7 @@ impl Owner {
     pub(crate) fn start(
         filesystem: &Arc<FilesystemClient>,
         source_executable: &Path,
-        allocation: crate::preview::ByteBudget,
+        allocation: super::lightroom_capacity::Allocation,
     ) -> Result<Arc<Self>> {
         ensure!(
             source_executable.is_absolute(),
@@ -498,10 +532,8 @@ impl Owner {
             operation: "workbench-sources".into(),
         };
         guard.validate()?;
-        let metadata = allocation
-            .reserve_exact(RETAINED_METADATA_BYTES)
-            .context("reserve retained Workbench generation metadata")?;
-        let budget = MemoryBudget::from_shared(allocation);
+        let (metadata, source_payloads) = allocation.into_parts();
+        let budget = MemoryBudget::from_shared(source_payloads);
         let (router, relay) = SourceRouter::start(source_executable, guard.clone(), budget)?;
         let owner = Arc::new(Self {
             _metadata: metadata,
@@ -509,7 +541,7 @@ impl Owner {
             router,
             relay,
             guard,
-            readers: Mutex::new(BTreeMap::new()),
+            reader: Mutex::new(None),
             next_reader: AtomicU64::new(1),
             custody: Mutex::new(Custody::default()),
             failed: AtomicBool::new(false),
@@ -634,7 +666,7 @@ impl Owner {
         macro_rules! call {
             ($request:expr) => {
                 if let Err(error) = self.cleanup_call($request, &cancel) {
-                    failures.push(error);
+                    failures.push(bounded_failure(error));
                 }
             };
         }
@@ -689,7 +721,7 @@ impl Owner {
                 }
                 Ok(reply) => {
                     if let Err(error) = reply.validate_for(&status) {
-                        failures.push(format!("F seal status receipt: {error:#}"));
+                        failures.push(bounded_failure(format!("F seal status receipt: {error:#}")));
                     } else {
                         call!(LightroomWorkbenchIo::SealAbort {
                             operation: resource.identity.operation,
@@ -699,9 +731,9 @@ impl Owner {
                         });
                     }
                 }
-                Err(error) => {
-                    failures.push(format!("F seal status unknown and retained: {error:#}"))
-                }
+                Err(error) => failures.push(bounded_failure(format!(
+                    "F seal status unknown and retained: {error:#}"
+                ))),
             }
         }
         let subordinates_drained = {
@@ -751,7 +783,7 @@ impl Owner {
                     .after(&request, &reply);
                 Ok(())
             }
-            Err(error) => Err(format!("F cleanup retained: {error:#}")),
+            Err(error) => Err(bounded_failure(format!("F cleanup retained: {error:#}"))),
         }
     }
 
@@ -778,19 +810,22 @@ impl Owner {
                 {
                     failures.push("filesystem monitor panicked".into());
                 }
-                let readers = std::mem::take(
+                let reader = std::mem::take(
                     &mut *self
-                        .readers
+                        .reader
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()),
                 );
-                for (reader, owner) in readers {
-                    if let Err(error) = owner.retire() {
-                        failures.push(format!("Source {reader} retirement: {error:#}"));
-                    }
+                if let Some(reader) = reader
+                    && let Err(error) = reader.reader.retire()
+                {
+                    failures.push(bounded_failure(format!(
+                        "Source {} retirement: {error:#}",
+                        reader.id
+                    )));
                 }
                 if let Err(error) = self.router.finish(&self.relay) {
-                    failures.push(format!("Source checked drain: {error:#}"));
+                    failures.push(bounded_failure(format!("Source checked drain: {error:#}")));
                 }
                 *state = Some(if failures.is_empty() {
                     None
@@ -906,22 +941,21 @@ impl ManagedIo for Owner {
         );
         match owner {
             Ok(owner) => {
-                let mut readers = self
-                    .readers
+                let mut retained = self
+                    .reader
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 ensure!(
-                    readers.is_empty(),
+                    retained.is_none(),
                     "previous Source generation remains retained"
                 );
-                let replaced = readers.insert(
-                    reader.clone(),
-                    Reader::Capture {
+                *retained = Some(RetainedReader {
+                    id: reader.clone(),
+                    reader: Reader::Capture {
                         owner: Box::new(owner),
                         cancel,
                     },
-                );
-                ensure!(replaced.is_none(), "Source generation collision");
+                });
                 Ok(reader)
             }
             Err(error) => {
@@ -953,22 +987,21 @@ impl ManagedIo for Owner {
         );
         match owner {
             Ok(owner) => {
-                let mut readers = self
-                    .readers
+                let mut retained = self
+                    .reader
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 ensure!(
-                    readers.is_empty(),
+                    retained.is_none(),
                     "previous Source generation remains retained"
                 );
-                let replaced = readers.insert(
-                    reader.clone(),
-                    Reader::Sql {
+                *retained = Some(RetainedReader {
+                    id: reader.clone(),
+                    reader: Reader::Sql {
                         owner: Box::new(owner),
                         cancel,
                     },
-                );
-                ensure!(replaced.is_none(), "Source generation collision");
+                });
                 Ok(reader)
             }
             Err(error) => {
@@ -982,13 +1015,18 @@ impl ManagedIo for Owner {
 
     fn source_schema(&self, source: &str) -> Result<SchemaObjects> {
         self.check_source()?;
-        let readers = self
-            .readers
+        let reader = self
+            .reader
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(Reader::Capture { owner, cancel }) = readers.get(source) else {
+        let Some(RetainedReader {
+            id,
+            reader: Reader::Capture { owner, cancel },
+        }) = reader.as_ref()
+        else {
             anyhow::bail!("CaptureSql source generation differs")
         };
+        ensure!(id == source, "CaptureSql source generation differs");
         owner.schema_objects().inspect_err(|_| {
             if !cancel.load(Ordering::Acquire) {
                 self.fail_sources();
@@ -1004,13 +1042,18 @@ impl ManagedIo for Owner {
         limit: usize,
     ) -> Result<TableValue> {
         self.check_source()?;
-        let readers = self
-            .readers
+        let reader = self
+            .reader
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(Reader::Capture { owner, cancel }) = readers.get(source) else {
+        let Some(RetainedReader {
+            id,
+            reader: Reader::Capture { owner, cancel },
+        }) = reader.as_ref()
+        else {
             anyhow::bail!("CaptureSql source generation differs")
         };
+        ensure!(id == source, "CaptureSql source generation differs");
         owner.table_rows(handle, cursor, limit).inspect_err(|_| {
             if !cancel.load(Ordering::Acquire) {
                 self.fail_sources();
@@ -1020,13 +1063,18 @@ impl ManagedIo for Owner {
 
     fn source_current(&self, source: &str) -> Result<Current> {
         self.check_source()?;
-        let readers = self
-            .readers
+        let reader = self
+            .reader
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(Reader::Capture { owner, cancel }) = readers.get(source) else {
+        let Some(RetainedReader {
+            id,
+            reader: Reader::Capture { owner, cancel },
+        }) = reader.as_ref()
+        else {
             anyhow::bail!("CaptureSql source generation differs")
         };
+        ensure!(id == source, "CaptureSql source generation differs");
         owner.current().inspect_err(|_| {
             if !cancel.load(Ordering::Acquire) {
                 self.fail_sources();
@@ -1035,13 +1083,19 @@ impl ManagedIo for Owner {
     }
 
     fn source_retire(&self, source: &str) -> Result<()> {
-        let reader = self
-            .readers
+        let mut retained = self
+            .reader
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(source)
+            .unwrap_or_else(|error| error.into_inner());
+        ensure!(
+            retained.as_ref().is_some_and(|reader| reader.id == source),
+            "Source generation is not retained"
+        );
+        let reader = retained
+            .take()
             .context("Source generation is not retained")?;
-        reader.retire().inspect_err(|_| self.fail_sources())
+        drop(retained);
+        reader.reader.retire().inspect_err(|_| self.fail_sources())
     }
 
     fn drain_sources(&self) -> Result<()> {
@@ -1077,21 +1131,30 @@ mod tests {
     }
     impl ManagedFixture {
         fn start(temp: &Path) -> Result<Self> {
-            let temp = std::fs::canonicalize(temp)?;
-            let filesystem = Arc::new(crate::filesystem_worker::client::migration_fixture(&temp)?);
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while filesystem.status().phase == FilesystemPhase::Starting {
-                ensure!(
-                    Instant::now() < deadline,
-                    "filesystem fixture did not become ready"
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            let owner = Owner::start(
-                &filesystem,
-                &std::env::current_exe()?,
+            let config = super::super::Config {
+                worker_executable: std::env::current_exe()?,
+                cache_root: None,
+                original_roots: Vec::new(),
+                preview_policy: Default::default(),
+                preview_limits: Default::default(),
+                limits: Default::default(),
+                import_checkpoint: None,
+            };
+            let requirement = super::super::lightroom_capacity::Requirement::from_config(
+                &config,
+                super::super::desktop::CONTROL_SLOTS,
+            )?;
+            let metadata = crate::preview::ByteBudget::new(requirement.bytes())?;
+            let reservation = metadata.reserve_exact(requirement.bytes())?;
+            let allocation = super::super::lightroom_capacity::Allocation::from_subgrant(
+                requirement,
+                reservation,
                 crate::preview::ByteBudget::new(1024 * 1024 * 1024)?,
             )?;
+            let temp = std::fs::canonicalize(temp)?;
+            let filesystem = Arc::new(crate::filesystem_worker::client::migration_fixture(&temp)?);
+            filesystem.wait_ready(Duration::from_secs(20))?;
+            let owner = Owner::start(&filesystem, &std::env::current_exe()?, allocation)?;
             Ok(Self { filesystem, owner })
         }
         fn drain(&self) -> Result<()> {

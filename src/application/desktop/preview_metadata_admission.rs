@@ -27,6 +27,7 @@ impl std::error::Error for MetadataAllowanceExceeded {}
 #[derive(Default)]
 struct State {
     held: Option<ByteReservation>,
+    workbench_granted: bool,
     awaiting_wait: bool,
 }
 #[derive(Default)]
@@ -44,6 +45,7 @@ impl ProcessReservation {
             .ok_or(MetadataAllowanceExceeded { required })?;
         Ok(Self(Some(Arc::new(Owned(Mutex::new(State {
             held: Some(held),
+            workbench_granted: false,
             awaiting_wait: false,
         }))))))
     }
@@ -55,6 +57,33 @@ impl ProcessReservation {
                 .unwrap_or_else(|e| e.into_inner())
                 .awaiting_wait = true;
         }
+    }
+    /// Transfer the already-charged Workbench generation portion to the
+    /// independent G owner. The aggregate C admission includes this exact
+    /// amount as retained backing, so the shared pool is not charged again.
+    #[allow(dead_code)] // Consumed by the final managed Workbench factory.
+    pub(super) fn split_workbench(&self, config: &Config) -> Result<ByteReservation> {
+        let required = crate::application::lightroom_capacity::Requirement::from_config(
+            config,
+            super::CONTROL_SLOTS,
+        )?;
+        let owned = self
+            .0
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("managed Workbench requires process metadata"))?;
+        let mut state = owned.0.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            !state.workbench_granted,
+            "Workbench metadata already granted"
+        );
+        let grant = state
+            .held
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("process metadata reservation is unavailable"))?
+            .split_exact(required.bytes())
+            .map_err(anyhow::Error::new)?;
+        state.workbench_granted = true;
+        Ok(grant)
     }
     /// Caller proves either OS spawn returned no child, or Child::wait succeeded
     /// and every transport thread has been joined. EOF and drain replies alone
@@ -138,6 +167,26 @@ mod tests {
         drop(retry); // Simulated lost wait owner: the allowance stays charged.
         assert_eq!(pool.used(), required);
         assert!(ProcessReservation::reserve(&config, &pool).is_err());
+        Ok(())
+    }
+    #[test]
+    fn workbench_subgrant_transfers_the_aggregate_charge_once() -> Result<()> {
+        let config = config();
+        let required = config.requested_preview_metadata_bytes()?;
+        let workbench = crate::application::lightroom_capacity::Requirement::from_config(
+            &config,
+            super::CONTROL_SLOTS,
+        )?;
+        let pool = ByteBudget::new(required)?;
+        let reservation = ProcessReservation::reserve(&config, &pool)?;
+        let grant = reservation.split_workbench(&config)?;
+        assert_eq!(grant.bytes(), workbench.bytes());
+        assert_eq!(pool.used(), required);
+        assert!(reservation.split_workbench(&config).is_err());
+        drop(grant);
+        assert_eq!(pool.used(), required - workbench.bytes());
+        drop(reservation);
+        assert_eq!(pool.used(), 0);
         Ok(())
     }
     #[cfg(unix)]

@@ -2261,25 +2261,12 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         1,
         LEASE_ID_BYTES,
     )?;
-    let (workbench_seal_fixed, workbench_seal_paths) =
-        crate::filesystem_worker::lightroom_workbench_retained_seal_layout();
+    let workbench = crate::application::lightroom_capacity::report(config, super::CONTROL_SLOTS)?;
     a.push(
-        "filesystem.workbench_retained_seal",
+        "workbench.metadata_generation_subgrant",
         Phase::Retained,
         1,
-        c.add(&[
-            u64::try_from(workbench_seal_fixed)?,
-            c.mul(
-                u64::try_from(workbench_seal_paths)?,
-                c.vec(2, PATH_UNITS as u64)?,
-            )?,
-        ])?,
-    )?;
-    a.push(
-        "workbench.generation_owner",
-        Phase::Retained,
-        1,
-        crate::application::lightroom_managed::RETAINED_METADATA_BYTES,
+        workbench.required,
     )?;
     a.push(
         "fixed.proxy_packet_type_roots",
@@ -2503,31 +2490,16 @@ mod tests {
             active_roots.each,
             Checked.add(&[registry, Checked.vec(2, PATH_UNITS as u64)?])?
         );
-        let workbench_seal = default_report
-            .contributions
-            .iter()
-            .find(|entry| entry.name == "filesystem.workbench_retained_seal")
-            .unwrap();
-        let (fixed, paths) = crate::filesystem_worker::lightroom_workbench_retained_seal_layout();
-        assert_eq!(paths, 6);
-        assert_eq!(workbench_seal.phase, Phase::Retained);
-        assert_eq!(
-            workbench_seal.each,
-            Checked.add(&[
-                u64::try_from(fixed)?,
-                Checked.mul(u64::try_from(paths)?, Checked.vec(2, PATH_UNITS as u64)?,)?,
-            ])?
-        );
         let workbench_generation = default_report
             .contributions
             .iter()
-            .find(|entry| entry.name == "workbench.generation_owner")
+            .find(|entry| entry.name == "workbench.metadata_generation_subgrant")
             .unwrap();
+        let workbench =
+            crate::application::lightroom_capacity::report(&default, super::CONTROL_SLOTS)?;
         assert_eq!(workbench_generation.phase, Phase::Retained);
-        assert_eq!(
-            workbench_generation.each,
-            crate::application::lightroom_managed::RETAINED_METADATA_BYTES
-        );
+        assert_eq!(workbench_generation.each, workbench.required);
+        assert_eq!(workbench.required, workbench.retained + workbench.active);
         let export_caller = default_report
             .contributions
             .iter()

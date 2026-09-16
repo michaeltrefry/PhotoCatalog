@@ -14,6 +14,7 @@ mod wire;
 pub(crate) use artifact_factory::RemoteArtifacts;
 pub use capture_wire::{Authority as CaptureSqlAuthority, MEMBER as CAPTURE_SQL_MEMBER};
 pub(crate) use commit::CommitHealth;
+pub(crate) use proxy::reader_metadata_layouts;
 #[allow(unused_imports)]
 pub(crate) use proxy::{CaptureSqlReader, Health, RawReader, SqlReader};
 

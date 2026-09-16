@@ -21,6 +21,7 @@ pub const CONFIG_BYTES: usize = 4 * 1024 * 1024;
 pub const MESSAGE_BYTES: usize = 1024 * 1024;
 pub const ERROR_BYTES: usize = 4096;
 pub const CHUNK_BYTES: usize = 16 * 1024;
+pub(crate) const LIGHTROOM_ORIGINAL_BYTES: u64 = 64 * 1024 * 1024;
 const HEADER_BYTES: usize = 48;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -782,7 +783,7 @@ impl LightroomWorkbenchIo {
                 ensure!(
                     !candidate.token.is_empty()
                         && candidate.token.len() <= 128
-                        && (1..=64 * 1024 * 1024).contains(&maximum_result_bytes.0),
+                        && (1..=LIGHTROOM_ORIGINAL_BYTES).contains(&maximum_result_bytes.0),
                     "original inspection admission"
                 );
             }
@@ -1020,7 +1021,7 @@ impl LightroomWorkbenchIoReply {
                     !token.is_empty()
                         && token.len() <= 128
                         && bytes.0 > 0
-                        && bytes.0 <= 64 * 1024 * 1024
+                        && bytes.0 <= LIGHTROOM_ORIGINAL_BYTES
                         && blake3.len() == 64,
                     "original ready reply"
                 );

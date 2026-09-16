@@ -81,6 +81,28 @@ impl ByteReservation {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
+    /// Transfer part of an already-held allowance without charging the shared
+    /// pool a second time. Process supervisors use this after one aggregate
+    /// admission succeeds to give an independently retained owner its subgrant.
+    pub(crate) fn split_exact(
+        &mut self,
+        bytes: u64,
+    ) -> std::result::Result<ByteReservation, ByteLimit> {
+        if bytes > self.bytes {
+            return Err(ByteLimit {
+                required: bytes,
+                available: self.bytes,
+            });
+        }
+        self.bytes -= bytes;
+        Ok(ByteReservation {
+            budget: self.budget.clone(),
+            bytes,
+        })
+    }
+    pub(crate) fn same_pool(&self, budget: &ByteBudget) -> bool {
+        self.budget.same_pool(budget)
+    }
     pub(crate) fn grow_exact(&mut self, bytes: u64) -> std::result::Result<(), ByteLimit> {
         let mut state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
         let available = state.limit - state.used;
@@ -335,6 +357,23 @@ mod tests {
         let equal = ByteBudget::new(100).unwrap();
         assert!(pool.same_pool(&same));
         assert!(!pool.same_pool(&equal));
+    }
+    #[test]
+    fn split_transfers_an_existing_charge_without_double_reservation() -> Result<()> {
+        let pool = ByteBudget::new(100)?;
+        let mut parent = pool.reserve_exact(100)?;
+        let child = parent.split_exact(37)?;
+        assert_eq!(pool.used(), 100);
+        assert_eq!(parent.bytes(), 63);
+        assert_eq!(child.bytes(), 37);
+        assert!(child.same_pool(&pool));
+        assert!(parent.split_exact(64).is_err());
+        assert_eq!(parent.bytes(), 63);
+        drop(child);
+        assert_eq!(pool.used(), 63);
+        drop(parent);
+        assert_eq!(pool.used(), 0);
+        Ok(())
     }
     #[test]
     fn lm_supervisor_batch2_typed_reservation_denies_atomically_and_retries_same_pool() {

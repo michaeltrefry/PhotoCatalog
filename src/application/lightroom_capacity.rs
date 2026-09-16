@@ -1,0 +1,585 @@
+//! Checked Rust-backing admission for one managed Workbench generation.
+//!
+//! The Source reader payload allocator remains a different pool. This module
+//! accounts the G/W/F metadata graph and transfers a subgrant from C's single
+//! process reservation without charging that process reservation twice.
+
+use super::{Config, lightroom_process};
+use crate::preview::{ByteBudget, ByteReservation};
+use anyhow::{Context, Result, ensure};
+
+const FAILURE_BYTES: u64 = 4 * super::lightroom_managed::FAILURE_CHARS as u64;
+const IDENTITY_BYTES: u64 = 128;
+const DIGEST_BYTES: u64 = 64;
+const ROSTER_LIMIT: u64 = crate::lightroom::selection::APPROVAL_ROSTER_LIMIT as u64;
+pub(crate) const SOURCE_PAYLOAD_POOL_CONTRACT: &str =
+    "distinct growable Source payload pool; charged by MemoryBudget reservations";
+
+// Layout-only mirrors of the stationary dispatcher fields. The integration
+// commit verifies these against desktop::workbench::metadata_layouts(); no
+// routing or queue behavior lives here.
+struct DispatcherLayout {
+    _shared: std::sync::Arc<SharedLayout>,
+    _generation: std::sync::Arc<super::lightroom_managed::Generation>,
+    _worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    _shutdown: std::sync::Mutex<()>,
+}
+struct QueueLayout {
+    _data: std::collections::VecDeque<EntryLayout>,
+    _control: std::collections::VecDeque<EntryLayout>,
+    _stopping: bool,
+}
+struct SharedLayout {
+    _queue: std::sync::Mutex<QueueLayout>,
+    _wake: std::sync::Condvar,
+    _limits: super::Limits,
+}
+struct EntryLayout {
+    _request: super::lightroom_bridge::Request,
+    _reply: std::sync::mpsc::SyncSender<super::Reply>,
+    _cancel: super::Cancellation,
+}
+
+pub(crate) fn dispatcher_layouts() -> [(usize, usize); 3] {
+    [
+        (
+            std::mem::size_of::<DispatcherLayout>(),
+            std::mem::align_of::<DispatcherLayout>(),
+        ),
+        (
+            std::mem::size_of::<SharedLayout>(),
+            std::mem::align_of::<SharedLayout>(),
+        ),
+        (
+            std::mem::size_of::<EntryLayout>(),
+            std::mem::align_of::<EntryLayout>(),
+        ),
+    ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Retained,
+    Active,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Contribution {
+    pub name: &'static str,
+    pub phase: Phase,
+    pub group: &'static str,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Report {
+    pub retained: u64,
+    pub active: u64,
+    pub required: u64,
+    pub contributions: Vec<Contribution>,
+}
+
+#[derive(Clone, Copy)]
+struct Checked;
+
+impl Checked {
+    fn value(self, value: u128) -> Result<u64> {
+        ensure!(
+            value <= isize::MAX as u128 && value <= u64::MAX as u128,
+            "Workbench metadata capacity exceeds target isize"
+        );
+        Ok(value as u64)
+    }
+
+    fn add(self, values: &[u64]) -> Result<u64> {
+        self.value(values.iter().try_fold(0u128, |sum, value| {
+            sum.checked_add(u128::from(*value))
+                .context("Workbench metadata addition overflow")
+        })?)
+    }
+
+    fn mul(self, left: u64, right: u64) -> Result<u64> {
+        self.value(
+            u128::from(left)
+                .checked_mul(u128::from(right))
+                .context("Workbench metadata multiplication overflow")?,
+        )
+    }
+
+    // Capacity growth may retain an old and a replacement allocation. This is
+    // deliberately the same conservative vector rule as preview admission.
+    fn vec(self, element: u64, potential: u64) -> Result<u64> {
+        self.mul(self.add(&[self.mul(3, potential)?, 8])?, element)
+    }
+
+    fn string(self, bytes: u64) -> Result<u64> {
+        self.vec(1, bytes)
+    }
+
+    fn native_path(self, units: u64) -> Result<u64> {
+        self.vec(2, units)
+    }
+
+    fn json(self, raw: u64) -> Result<u64> {
+        // serde Content has at most one node per two bytes for valid JSON. The
+        // byte/string backing and node backing can overlap while materializing
+        // a typed request/result.
+        let nodes = self.add(&[raw, 1])? / 2;
+        self.add(&[
+            self.vec(1, raw)?,
+            self.vec(
+                std::mem::size_of::<serde::__private229::de::Content<'static>>() as u64,
+                nodes,
+            )?,
+        ])
+    }
+}
+
+struct Assembly {
+    checked: Checked,
+    contributions: Vec<Contribution>,
+}
+
+impl Assembly {
+    fn new() -> Self {
+        Self {
+            checked: Checked,
+            contributions: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, name: &'static str, phase: Phase, group: &'static str, bytes: u64) {
+        self.contributions.push(Contribution {
+            name,
+            phase,
+            group,
+            bytes,
+        });
+    }
+
+    fn finish(self) -> Result<Report> {
+        // F retains failed subordinate custody independently, so every retained
+        // contribution must fit together until checked reconciliation.
+        let retained = self.checked.add(
+            &self
+                .contributions
+                .iter()
+                .filter(|value| value.phase == Phase::Retained)
+                .map(|value| value.bytes)
+                .collect::<Vec<_>>(),
+        )?;
+        // W's long operation thread can retain its request/selection documents
+        // while the input loop serves control, result and F/S callbacks. Sum
+        // those lifetimes; the single G dispatcher does not make them exclusive.
+        let active = self.checked.add(
+            &self
+                .contributions
+                .iter()
+                .filter(|value| value.phase == Phase::Active)
+                .map(|value| value.bytes)
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(Report {
+            retained,
+            active,
+            required: self.checked.add(&[retained, active])?,
+            contributions: self.contributions,
+        })
+    }
+}
+
+/// Return the full configured G/W/F backing. The dispatcher is one worker, but
+/// every configured data queue slot and reserved control slot can retain both
+/// an encoded envelope and its typed graph until delivery.
+pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
+    let c = Checked;
+    let mut a = Assembly::new();
+    let queue = u64::try_from(config.limits.queued)?;
+    let controls = u64::try_from(control_slots)?;
+    let slots = c.add(&[queue, controls, 1])?;
+    ensure!(queue > 0 && controls > 0, "Workbench dispatcher slot bound");
+
+    let w = super::lightroom::metadata_layouts();
+    let bridge = super::lightroom_bridge::metadata_layouts();
+    let managed = super::lightroom_managed::metadata_layouts();
+    let f = crate::filesystem_worker::lightroom_workbench_retained_metadata_layouts();
+    let (sql_control, sql_execution) = crate::lightroom::control::metadata_layout();
+    let workbench_limits = super::lightroom::Limits::metadata_maximum();
+    let selection_limits = crate::lightroom::selection::SelectionLimits::metadata_maximum();
+    let (
+        selection_review,
+        selection_request,
+        approval_document,
+        approval_draft,
+        approval_documents,
+    ) = crate::lightroom::selection::metadata_layouts();
+    let path = c.native_path(workbench_limits.native_path_units as u64)?;
+    let manifest = workbench_limits.request_bytes as u64;
+    let page = workbench_limits.page_bytes as u64;
+    let result = workbench_limits.result_bytes as u64;
+    let review = selection_limits.review_bytes as u64;
+    let original = crate::filesystem_worker::wire::LIGHTROOM_ORIGINAL_BYTES;
+    let callback = lightroom_process::CALLBACK_BYTES as u64;
+    let artifacts = c.add(&[manifest, 1])? / 2;
+    let envelope = lightroom_process::ENVELOPE_BYTES as u64;
+    let [dispatcher_layout, shared_layout, entry_layout] = dispatcher_layouts();
+    let source = c.add(&[f.source as u64, path, c.mul(2, c.string(IDENTITY_BYTES)?)?])?;
+
+    a.push(
+        "g.dispatcher.fixed_owner_and_shared_layouts",
+        Phase::Retained,
+        "base",
+        c.add(&[dispatcher_layout.0 as u64, shared_layout.0 as u64])?,
+    );
+    a.push(
+        "g.dispatcher.queued_and_active_typed_requests",
+        Phase::Retained,
+        "base",
+        c.mul(slots, c.add(&[entry_layout.0 as u64, c.json(envelope)?])?)?,
+    );
+    a.push(
+        "g.owner_generation_router_reader_custody",
+        Phase::Retained,
+        "base",
+        c.add(&[
+            managed.owner as u64,
+            managed.generation as u64,
+            managed.router as u64,
+            managed.reader as u64,
+            managed.retained_reader as u64,
+            managed
+                .sql_reader_backing
+                .max(managed.capture_reader_backing) as u64,
+            managed.custody as u64,
+            managed.identity as u64,
+            managed.resource as u64,
+            FAILURE_BYTES,
+            // Owner guard + router guard + one retained reader id + every
+            // simultaneously retainable custody identity/resource string.
+            c.mul(25, c.string(IDENTITY_BYTES)?)?,
+        ])?,
+    );
+    a.push(
+        "w.control_status_worker_and_bridge",
+        Phase::Retained,
+        "base",
+        c.add(&[
+            w.status as u64,
+            w.cached as u64,
+            w.shared as u64,
+            w.message as u64,
+            w.control as u64,
+            w.workbench as u64,
+            w.worker_owner as u64,
+            bridge.control as u64,
+            bridge.coordinator as u64,
+            sql_control as u64,
+            sql_execution as u64,
+            FAILURE_BYTES,
+            c.mul(8, c.string(IDENTITY_BYTES)?)?,
+            c.mul(3, path)?,
+        ])?,
+    );
+    a.push(
+        "w.upload_single_staged_input",
+        Phase::Retained,
+        "base",
+        c.add(&[
+            bridge.upload as u64,
+            c.mul(3, manifest)?,
+            c.json(manifest)?,
+            c.mul(8, c.string(IDENTITY_BYTES)?)?,
+        ])?,
+    );
+    a.push(
+        "w.cached_result_and_review",
+        Phase::Retained,
+        "base",
+        c.add(&[
+            c.vec(1, result)?,
+            selection_review as u64,
+            c.vec(1, review)?,
+            c.mul(ROSTER_LIMIT, approval_document as u64)?,
+        ])?,
+    );
+    a.push(
+        "f.owner_root",
+        Phase::Retained,
+        "root",
+        c.add(&[
+            f.owner as u64,
+            f.root as u64,
+            c.mul(4, f.release_receipt as u64)?,
+            source,
+            path,
+            c.mul(19, c.string(IDENTITY_BYTES)?)?,
+        ])?,
+    );
+    a.push(
+        "f.capture_process_and_manifest",
+        Phase::Retained,
+        "capture",
+        c.add(&[
+            f.capture as u64,
+            f.capture_process as u64,
+            c.mul(4, path)?,
+            c.mul(3, c.string(IDENTITY_BYTES)?)?,
+            c.string(DIGEST_BYTES)?,
+            c.vec(1, manifest)?,
+            c.json(manifest)?,
+        ])?,
+    );
+    a.push(
+        "f.evidence_manifest_source_roster",
+        Phase::Retained,
+        "evidence",
+        c.add(&[
+            f.evidence as u64,
+            c.mul(2, source)?,
+            c.mul(16, c.string(IDENTITY_BYTES)?)?,
+            c.mul(4, c.string(DIGEST_BYTES)?)?,
+            c.mul(
+                artifacts,
+                c.add(&[
+                    source,
+                    c.string(DIGEST_BYTES)?,
+                    std::mem::size_of::<crate::lightroom_migration_worker::identity::FileKey>()
+                        as u64,
+                ])?,
+            )?,
+            c.vec(1, manifest)?,
+            c.json(manifest)?,
+        ])?,
+    );
+    a.push(
+        "f.original_candidate_and_encoded_result",
+        Phase::Retained,
+        "original",
+        c.add(&[
+            f.original as u64,
+            path,
+            c.vec(1, original)?,
+            c.mul(7, c.string(IDENTITY_BYTES)?)?,
+            c.string(DIGEST_BYTES)?,
+        ])?,
+    );
+    a.push(
+        "f.seal_paths_uploads_and_digests",
+        Phase::Retained,
+        "seal",
+        c.add(&[
+            f.seal as u64,
+            c.mul(f.seal_paths as u64, path)?,
+            c.mul(10, c.string(IDENTITY_BYTES)?)?,
+            c.mul(5, c.string(DIGEST_BYTES)?)?,
+        ])?,
+    );
+    a.push(
+        "transient.request_decode_and_typed_action",
+        Phase::Active,
+        "request",
+        c.add(&[
+            c.vec(1, manifest)?,
+            c.json(manifest)?,
+            selection_request as u64,
+            path,
+        ])?,
+    );
+    a.push(
+        "transient.result_build_encode_and_page",
+        Phase::Active,
+        "result",
+        c.add(&[c.vec(1, result)?, c.json(result)?, c.vec(1, page)?])?,
+    );
+    a.push(
+        "transient.selection_documents_and_rosters",
+        Phase::Active,
+        "selection",
+        c.add(&[
+            approval_draft as u64,
+            approval_documents as u64,
+            c.mul(2 * ROSTER_LIMIT, approval_document as u64)?,
+            c.mul(2, c.vec(1, manifest)?)?,
+            c.mul(2, c.json(manifest)?)?,
+        ])?,
+    );
+    a.push(
+        "transient.source_callback_frame_and_typed_payload",
+        Phase::Active,
+        "callback",
+        c.add(&[c.vec(1, callback)?, c.json(callback)?, c.vec(1, page)?])?,
+    );
+    a.push(
+        "transient.seal_documents_and_preparation",
+        Phase::Active,
+        "seal",
+        c.add(&[
+            c.vec(1, manifest)?,
+            c.json(manifest)?,
+            c.vec(1, review)?,
+            c.json(review)?,
+            c.mul(ROSTER_LIMIT, approval_document as u64)?,
+            path,
+        ])?,
+    );
+    a.finish()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Requirement {
+    bytes: u64,
+}
+
+impl Requirement {
+    pub(crate) fn from_config(config: &Config, control_slots: usize) -> Result<Self> {
+        Ok(Self {
+            bytes: report(config, control_slots)?.required,
+        })
+    }
+
+    pub(crate) fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
+pub(crate) struct Admission {
+    _held: ByteReservation,
+}
+
+pub(crate) struct Allocation {
+    metadata: Admission,
+    source_payloads: ByteBudget,
+}
+
+impl Allocation {
+    pub(crate) fn from_subgrant(
+        requirement: Requirement,
+        reservation: ByteReservation,
+        source_payloads: ByteBudget,
+    ) -> Result<Self> {
+        ensure!(
+            reservation.bytes() == requirement.bytes,
+            "Workbench metadata subgrant differs from checked requirement"
+        );
+        ensure!(
+            !reservation.same_pool(&source_payloads),
+            "Workbench metadata and Source payload pools must be distinct"
+        );
+        Ok(Self {
+            metadata: Admission { _held: reservation },
+            source_payloads,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (Admission, ByteBudget) {
+        (self.metadata, self.source_payloads)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            worker_executable: "/fixture/worker".into(),
+            cache_root: None,
+            original_roots: Vec::new(),
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        }
+    }
+
+    #[test]
+    fn complete_report_names_every_owner_and_preserves_configured_queue() -> Result<()> {
+        let config = config();
+        let report = report(&config, 16)?;
+        for name in [
+            "g.dispatcher.fixed_owner_and_shared_layouts",
+            "g.dispatcher.queued_and_active_typed_requests",
+            "g.owner_generation_router_reader_custody",
+            "w.control_status_worker_and_bridge",
+            "w.upload_single_staged_input",
+            "w.cached_result_and_review",
+            "f.owner_root",
+            "f.capture_process_and_manifest",
+            "f.evidence_manifest_source_roster",
+            "f.original_candidate_and_encoded_result",
+            "f.seal_paths_uploads_and_digests",
+            "transient.request_decode_and_typed_action",
+            "transient.result_build_encode_and_page",
+            "transient.selection_documents_and_rosters",
+            "transient.source_callback_frame_and_typed_payload",
+            "transient.seal_documents_and_preparation",
+        ] {
+            assert!(
+                report.contributions.iter().any(|value| value.name == name),
+                "missing {name}"
+            );
+        }
+        assert_eq!(
+            report.retained,
+            report
+                .contributions
+                .iter()
+                .filter(|value| value.phase == Phase::Retained)
+                .map(|value| value.bytes)
+                .sum()
+        );
+        assert_eq!(
+            report.active,
+            report
+                .contributions
+                .iter()
+                .filter(|value| value.phase == Phase::Active)
+                .map(|value| value.bytes)
+                .sum()
+        );
+        assert!(
+            dispatcher_layouts()
+                .into_iter()
+                .all(|(size, align)| size > 0 && align.is_power_of_two())
+        );
+        let queued = report
+            .contributions
+            .iter()
+            .find(|value| value.name.starts_with("g.dispatcher"))
+            .unwrap()
+            .bytes;
+        let mut wider = config.clone();
+        wider.limits.queued += 1;
+        let wider = report(&wider, 16)?;
+        let wider_queued = wider
+            .contributions
+            .iter()
+            .find(|value| value.name.starts_with("g.dispatcher"))
+            .unwrap()
+            .bytes;
+        assert!(wider_queued > queued);
+        assert_eq!(report.required, report.retained + report.active);
+        assert!(SOURCE_PAYLOAD_POOL_CONTRACT.starts_with("distinct"));
+        Ok(())
+    }
+
+    #[test]
+    fn subgrant_is_exact_once_and_source_pool_is_separate() -> Result<()> {
+        let requirement = Requirement::from_config(&config(), 16)?;
+        let metadata = ByteBudget::new(requirement.bytes())?;
+        let source = ByteBudget::new(1024 * 1024)?;
+        let mut process = metadata.reserve_exact(requirement.bytes())?;
+        let grant = process.split_exact(requirement.bytes())?;
+        assert_eq!(metadata.used(), requirement.bytes());
+        let _allocation = Allocation::from_subgrant(requirement, grant, source)?;
+        assert_eq!(metadata.used(), requirement.bytes());
+
+        let metadata = ByteBudget::new(requirement.bytes())?;
+        let same = metadata.reserve_exact(requirement.bytes())?;
+        assert!(Allocation::from_subgrant(requirement, same, metadata.clone()).is_err());
+        let short = ByteBudget::new(requirement.bytes() - 1)?;
+        let short = short.reserve_exact(requirement.bytes() - 1)?;
+        assert!(Allocation::from_subgrant(requirement, short, ByteBudget::new(1)?).is_err());
+        Ok(())
+    }
+}

@@ -32,6 +32,9 @@ struct Owner {
     version: i64,
     config: Config,
 }
+pub(super) fn owner_layout() -> usize {
+    std::mem::size_of::<Owner>()
+}
 fn encode(value: &impl Serialize, limit: usize) -> Result<String> {
     Ok(String::from_utf8(core::bounded_json(value, limit)?)?)
 }
