@@ -1494,6 +1494,133 @@ impl Drop for Client {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, Debug)]
+    enum PendingCallbackFault {
+        MalformedFrame,
+        Eof,
+    }
+
+    fn pending_artifact_callback_fault(fault: PendingCallbackFault) -> Result<()> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "application::lightroom_process::tests::owned_workbench_entrypoint",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let child = command.spawn()?;
+        let mut child = StartingChild(Some(child));
+        let owned = child.0.as_mut().context("raw Workbench child missing")?;
+        #[cfg(unix)]
+        let pid = owned.id();
+        let mut input = owned.stdin.take().context("raw Workbench stdin missing")?;
+        let output = owned
+            .stdout
+            .take()
+            .context("raw Workbench stdout missing")?;
+        let mut output = HarnessOutput {
+            inner: output,
+            prefix: Vec::with_capacity(512),
+            ready: false,
+            copied: 0,
+        };
+
+        let startup = Startup::new(true);
+        write_packet(&mut input, &startup)?;
+        let ready: Outcome = read_packet(&mut output)?.context("Workbench Ready missing")?;
+        ensure!(
+            matches!(ready, Outcome::Ready { instance, build } if instance == startup.instance && build == startup.build),
+            "raw Workbench Ready binding mismatch"
+        );
+
+        let request = Request::ArtifactPreparation {
+            request: crate::filesystem_worker::wire::LightroomArtifactPreparation::Discard {
+                session: uuid::Uuid::new_v4().to_string(),
+            },
+        };
+        let digest = request_digest(&request)?;
+        write_packet(
+            &mut input,
+            &Work::Request {
+                sequence: crate::application::U64(1),
+                request_digest: digest,
+                request,
+            },
+        )?;
+        let callback: Outcome =
+            read_packet(&mut output)?.context("pending artifact callback missing")?;
+        ensure!(
+            matches!(
+                callback,
+                Outcome::Callback {
+                    request: CallbackRequest::ArtifactPreparation { .. },
+                    ..
+                }
+            ),
+            "Workbench did not stop at the artifact callback boundary"
+        );
+
+        match fault {
+            PendingCallbackFault::MalformedFrame => {
+                let mut malformed = [0u8; HEADER_BYTES];
+                malformed[..4].copy_from_slice(MAGIC);
+                malformed[4] = PROTOCOL.wrapping_add(1);
+                input.write_all(&malformed)?;
+                input.flush()?;
+                drop(input);
+            }
+            PendingCallbackFault::Eof => drop(input),
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            let owned = child.0.as_mut().context("raw Workbench owner lost")?;
+            if let Some(status) = owned.try_wait()? {
+                break status;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "raw Workbench did not exit after {fault:?}"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        };
+        ensure!(
+            !status.success(),
+            "raw Workbench reported success after {fault:?}"
+        );
+
+        while let Some(outcome) = read_packet::<Outcome>(&mut output)? {
+            ensure!(
+                !matches!(outcome, Outcome::Drained { .. }),
+                "raw Workbench emitted false Drained after {fault:?}"
+            );
+        }
+        ensure!(
+            child
+                .0
+                .as_mut()
+                .context("raw Workbench owner lost after wait")?
+                .try_wait()?
+                .is_some(),
+            "exact raw Workbench child was not reaped"
+        );
+        #[cfg(unix)]
+        {
+            ensure!(
+                unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+                "raw Workbench PID {pid} remains live after {fault:?}"
+            );
+        }
+        child.0.take();
+        Ok(())
+    }
+
     #[test]
     #[ignore = "owned Workbench fixture subprocess entrypoint"]
     fn owned_workbench_entrypoint() {
@@ -1522,6 +1649,17 @@ mod tests {
         oversized.extend_from_slice(&u32::MAX.to_le_bytes());
         oversized.extend_from_slice(&[0; 36]);
         assert!(read_packet::<Startup>(&mut oversized.as_slice()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_artifact_callback_malformed_or_eof_never_reports_drained() -> Result<()> {
+        for fault in [
+            PendingCallbackFault::MalformedFrame,
+            PendingCallbackFault::Eof,
+        ] {
+            pending_artifact_callback_fault(fault)?;
+        }
         Ok(())
     }
 }
