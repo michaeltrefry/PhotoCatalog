@@ -42,6 +42,7 @@ const BUILDER_COMMIT: &str = "f8e11c7ff597884e2c0d6a8642f9ef5cee65c9fe";
 const SELECTED: [&str; 2] = ["2014-v13-2.lrcat", "2015-v13.lrcat"];
 const EXCLUDED: [&str; 2] = ["2014-v13.lrcat", "2015-v13-3.lrcat"];
 const DEADLINE: Duration = Duration::from_secs(300);
+const INSPECTION_COMPLETE: &str = "inspection_complete_with_reported_gaps";
 
 #[derive(Deserialize)]
 struct WorkingManifest {
@@ -988,7 +989,7 @@ impl Harness {
                     },
                 )?;
                 let stage = progress["stage"].as_str().context("inspection row stage")?;
-                if matches!(stage, "complete" | "rows_reconciled_paths_pending") {
+                if stage == INSPECTION_COMPLETE || stage == "rows_reconciled_paths_pending" {
                     row_stage = Some(stage.to_owned());
                     break;
                 }
@@ -999,7 +1000,7 @@ impl Harness {
             }
             let row_stage = row_stage.context("inspection rows did not finish within 100 pages")?;
             let mut original_pages = Vec::new();
-            if row_stage != "complete" {
+            if row_stage != INSPECTION_COMPLETE {
                 for _ in 0..100 {
                     let page = wb_action(
                         &self.bridge,
@@ -1020,7 +1021,7 @@ impl Harness {
                             revision: revision.clone(),
                         },
                     )?)?;
-                    if interim.stage == "complete" {
+                    if interim.stage == INSPECTION_COMPLETE {
                         break;
                     }
                     ensure!(
@@ -1037,7 +1038,7 @@ impl Harness {
                 },
             )?)?;
             ensure!(
-                report.stage == "complete",
+                report.stage == INSPECTION_COMPLETE,
                 "inspection incomplete for {name}: {}",
                 report.stage
             );
