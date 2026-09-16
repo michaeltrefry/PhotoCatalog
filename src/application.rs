@@ -185,6 +185,10 @@ impl Cancellation {
 pub struct Pending {
     receiver: mpsc::Receiver<Reply>,
     cancel: Cancellation,
+    // Dispatcher admission survives completed-but-unreceived replies. Dropped
+    // after the receiver so buffered data disappears before its grant releases.
+    #[allow(dead_code)]
+    completion: Option<Box<dyn Send>>,
 }
 impl Pending {
     pub fn cancellation(&self) -> Cancellation {
@@ -632,7 +636,11 @@ impl Bridge {
             };
             let _ = tx.send(out);
             self.0.shared.wake.notify_one();
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if let Request::Export { catalog, request } = &request
             && matches!(
@@ -687,7 +695,11 @@ impl Bridge {
                 };
                 let _ = tx.send(out);
                 self.0.shared.wake.notify_one();
-                return Ok(Pending { receiver, cancel });
+                return Ok(Pending {
+                    completion: None,
+                    receiver,
+                    cancel,
+                });
             }
         }
         if let Request::EditCopy { catalog, request } = &request
@@ -733,7 +745,11 @@ impl Bridge {
                 };
                 let _ = tx.send(out);
                 self.0.shared.wake.notify_one();
-                return Ok(Pending { receiver, cancel });
+                return Ok(Pending {
+                    completion: None,
+                    receiver,
+                    cancel,
+                });
             }
         }
         if let Request::Relink { catalog, request } = &request {
@@ -767,7 +783,11 @@ impl Bridge {
                 };
                 let _ = tx.send(out);
                 self.0.shared.wake.notify_one();
-                return Ok(Pending { receiver, cancel });
+                return Ok(Pending {
+                    completion: None,
+                    receiver,
+                    cancel,
+                });
             }
         }
         if let Request::ImportStatus { catalog } | Request::ImportCancel { catalog, .. } = &request
@@ -790,7 +810,11 @@ impl Bridge {
                 value: Response::Import(q.import_status.clone()),
             });
             self.0.shared.wake.notify_one();
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if matches!(
             &request,
@@ -816,7 +840,11 @@ impl Bridge {
                 _ => failure(ErrorCode::ResourceLimit, "response byte limit"),
             };
             let _ = tx.send(response);
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if let Request::ReleaseViewport {
             catalog,
@@ -1001,7 +1029,11 @@ impl Bridge {
             });
             self.0.shared.wake.notify_one();
         }
-        Ok(Pending { receiver, cancel })
+        Ok(Pending {
+            completion: None,
+            receiver,
+            cancel,
+        })
     }
     pub fn preview_bytes(
         &self,

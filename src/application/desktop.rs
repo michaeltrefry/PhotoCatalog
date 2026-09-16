@@ -873,7 +873,11 @@ impl DesktopBridge {
                     let _ = tx.send(reply);
                 })
                 .map_err(|failure| error(ErrorCode::Native, failure.to_string()))?;
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if let Request::Lightroom { request } = &request
             && let super::lightroom_bridge::Request::SealedDocument { request } = request.as_ref()
@@ -902,7 +906,11 @@ impl DesktopBridge {
                     let _ = tx.send(result);
                 })
                 .map_err(|failure| error(ErrorCode::Native, failure.to_string()))?;
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if let Request::Lightroom { request } = &request
             && let super::lightroom_bridge::Request::ArtifactPreparation { request } =
@@ -932,7 +940,11 @@ impl DesktopBridge {
                     let _ = tx.send(result);
                 })
                 .map_err(|failure| error(ErrorCode::Native, failure.to_string()))?;
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if let Request::LightroomMigration { request } = request {
             let response = self.0.migration.request(*request)?;
@@ -941,6 +953,7 @@ impl DesktopBridge {
                 value: super::Response::LightroomMigration(Box::new(response)),
             });
             return Ok(Pending {
+                completion: None,
                 receiver,
                 cancel: Cancellation::default(),
             });
@@ -1019,7 +1032,11 @@ impl DesktopBridge {
             control,
             retiring,
         )?;
-        Ok(Pending { receiver, cancel })
+        Ok(Pending {
+            completion: None,
+            receiver,
+            cancel,
+        })
     }
     fn submit_close_shared(shared: &Arc<Shared>, catalog: String) -> Result<Pending> {
         let retiring = catalog.clone();
@@ -1038,7 +1055,11 @@ impl DesktopBridge {
             true,
             Some(retiring.as_str()),
         )?;
-        Ok(Pending { receiver, cancel })
+        Ok(Pending {
+            completion: None,
+            receiver,
+            cancel,
+        })
     }
     fn backup_owner(&self) -> Result<&Arc<Mutex<super::backup::Coordinator>>> {
         self.0.shared.backup.as_ref().ok_or_else(|| {
@@ -1069,6 +1090,7 @@ impl DesktopBridge {
         let (tx, receiver) = mpsc::sync_channel(1);
         let _ = tx.send(self.backup_reply(Some(snapshot)));
         Ok(Pending {
+            completion: None,
             receiver,
             cancel: Cancellation::default(),
         })
@@ -1117,6 +1139,7 @@ impl DesktopBridge {
         let (tx, receiver) = mpsc::sync_channel(1);
         let _ = tx.send(self.backup_reply(snapshot));
         Ok(Pending {
+            completion: None,
             receiver,
             cancel: Cancellation::default(),
         })
@@ -1251,7 +1274,11 @@ impl DesktopBridge {
                 }
                 error(ErrorCode::Native, e.to_string())
             })?;
-        Ok(Pending { receiver, cancel })
+        Ok(Pending {
+            completion: None,
+            receiver,
+            cancel,
+        })
     }
     fn submit_managed_close(&self, catalog: String) -> Result<Pending> {
         let backup = self.backup_owner()?.clone();
@@ -1395,7 +1422,11 @@ impl DesktopBridge {
                 }
                 error(ErrorCode::Native, e.to_string())
             })?;
-        Ok(Pending { receiver, cancel })
+        Ok(Pending {
+            completion: None,
+            receiver,
+            cancel,
+        })
     }
     pub fn preview_bytes(
         &self,

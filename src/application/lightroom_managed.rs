@@ -466,7 +466,7 @@ impl Generation {
     }
 
     #[cfg(test)]
-    fn start_fixture(dependencies: &Arc<Owner>, executable: &Path) -> Result<Self> {
+    pub(crate) fn start_fixture(dependencies: &Arc<Owner>, executable: &Path) -> Result<Self> {
         dependencies.admit()?;
         let managed = dependencies.as_io();
         let workbench = lightroom_process::Client::spawn_managed_fixture(executable, &managed)?;
@@ -501,6 +501,10 @@ impl Generation {
             };
         }
         self.workbench.call(request)
+    }
+
+    pub(crate) fn interrupt(&self) -> Result<()> {
+        self.workbench.interrupt()
     }
 
     pub(crate) fn shutdown_checked(&self) -> Result<()> {
@@ -1115,7 +1119,7 @@ impl Drop for Owner {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage_volume::NativePath;
     use std::{
@@ -1125,12 +1129,12 @@ mod tests {
 
     static PROCESS_SERIAL: Mutex<()> = Mutex::new(());
 
-    struct ManagedFixture {
-        filesystem: Arc<FilesystemClient>,
-        owner: Arc<Owner>,
+    pub(crate) struct ManagedFixture {
+        pub(crate) filesystem: Arc<FilesystemClient>,
+        pub(crate) owner: Arc<Owner>,
     }
     impl ManagedFixture {
-        fn start(temp: &Path) -> Result<Self> {
+        pub(crate) fn start(temp: &Path) -> Result<Self> {
             let config = super::super::Config {
                 worker_executable: std::env::current_exe()?,
                 cache_root: None,

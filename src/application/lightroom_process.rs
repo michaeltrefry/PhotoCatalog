@@ -595,6 +595,18 @@ pub fn worker_main() -> Result<()> {
                     sequence.0 > 0 && request_digest(&request)? == expected,
                     "Workbench request binding mismatch"
                 );
+                #[cfg(test)]
+                if let Request::Status {
+                    attempt: Some(marker),
+                    ..
+                } = &request
+                    && let Some(marker) = marker.strip_prefix("fixture-stall:")
+                {
+                    std::fs::write(marker, b"entered Workbench request")?;
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 coordinator.maintain()?;
                 let result = coordinator
                     .request(request, &executable, ENVELOPE_BYTES)
@@ -750,20 +762,20 @@ impl Read for HarnessOutput {
 }
 
 struct Owner {
-    child: Option<Child>,
     transport: Option<Transport>,
     drained: bool,
     poisoned: Option<String>,
 }
 impl Owner {
-    fn revoke(&mut self) -> Result<()> {
+    fn revoke(&mut self, child_owner: &Mutex<Option<Child>>) -> Result<()> {
         drop(self.transport.take());
-        if let Some(child) = self.child.as_mut() {
+        let mut slot = child_owner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = slot.as_mut() {
             if child.try_wait()?.is_none() {
                 child.kill().context("revoke Workbench child")?;
             }
             child.wait()?;
-            self.child.take();
+            slot.take();
         }
         Ok(())
     }
@@ -798,6 +810,8 @@ impl Drop for StartingChild {
 pub struct Client {
     instance: crate::catalog_session::LeaseId,
     owner: Mutex<Owner>,
+    child: Mutex<Option<Child>>,
+    interrupted: AtomicBool,
     managed: Option<Arc<dyn super::lightroom::ManagedIo>>,
 }
 impl Client {
@@ -903,8 +917,9 @@ impl Client {
         Ok(Self {
             instance: startup.instance,
             managed,
+            child: Mutex::new(Some(child)),
+            interrupted: AtomicBool::new(false),
             owner: Mutex::new(Owner {
-                child: Some(child),
                 transport: Some(Transport {
                     input,
                     output,
@@ -1034,7 +1049,32 @@ impl Client {
         }
     }
 
+    /// Interrupt the exact retained process without waiting for a blocked
+    /// transport lock. Reaping and filesystem reconciliation remain in shutdown.
+    pub(crate) fn interrupt(&self) -> Result<()> {
+        self.interrupted
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(managed) = &self.managed {
+            managed.revoke_generation();
+        }
+        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = slot.as_mut() {
+            // Do not wait here: Source owners must be checked-drained first.
+            // An already exited child is reconciled by the same shutdown path.
+            if let Err(error) = child.kill() {
+                if error.kind() != std::io::ErrorKind::InvalidInput {
+                    return Err(error).context("interrupt Workbench child");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn call(&self, request: Request) -> Result<Response> {
+        ensure!(
+            !self.interrupted.load(std::sync::atomic::Ordering::Acquire),
+            "Workbench generation was interrupted"
+        );
         if let Some(managed) = &self.managed
             && let Err(error) = managed.admit()
         {
@@ -1122,10 +1162,16 @@ impl Client {
         }
         let graceful = (|| -> Result<()> {
             ensure!(
-                owner.poisoned.is_none(),
-                "poisoned Workbench requires checked revoke"
+                owner.poisoned.is_none()
+                    && !self.interrupted.load(std::sync::atomic::Ordering::Acquire),
+                "poisoned or interrupted Workbench requires checked revoke"
             );
-            if owner.child.is_none() {
+            if self
+                .child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+            {
                 return Ok(());
             }
             let transport = owner
@@ -1159,21 +1205,26 @@ impl Client {
                 }
             }
             drop(owner.transport.take());
-            let status = owner
-                .child
+            let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+            let status = child
                 .as_mut()
                 .context("Workbench child missing before reap")?
                 .wait()?;
             ensure!(status.success(), "Workbench child exited {status}");
-            owner.child.take();
+            child.take();
             Ok(())
         })();
         let revoke = if graceful.is_err() {
-            owner.revoke()
+            owner.revoke(&self.child)
         } else {
             Ok(())
         };
-        let reaped = owner.child.is_none() && owner.transport.is_none();
+        let reaped = self
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+            && owner.transport.is_none();
         if reaped && let Some(managed) = &self.managed {
             managed.workbench_reaped();
         }
@@ -1209,10 +1260,9 @@ impl Client {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.owner
+        self.child
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .child
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(Child::id)
     }
@@ -1226,8 +1276,8 @@ impl Client {
 
     #[cfg(test)]
     pub(crate) fn terminate_for_test(&self) -> Result<()> {
-        let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
-        let child = owner.child.as_mut().context("Workbench child missing")?;
+        let mut slot = self.child.lock().unwrap_or_else(|error| error.into_inner());
+        let child = slot.as_mut().context("Workbench child missing")?;
         child.kill().context("terminate Workbench fixture")
     }
 
@@ -1244,9 +1294,19 @@ impl Drop for Client {
         if self.shutdown().is_err() {
             {
                 let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
-                while owner.child.is_some() {
-                    let _ = owner.revoke();
-                    if owner.child.is_some() {
+                while self
+                    .child
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+                {
+                    let _ = owner.revoke(&self.child);
+                    if self
+                        .child
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some()
+                    {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                 }
