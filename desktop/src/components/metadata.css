@@ -1,7 +1,4 @@
-dialog:has(.metadata-panel) { width: min(880px, calc(100vw - 60px)); }
-dialog[open]:has(.metadata-panel) { display: flex; flex-direction: column; }
-dialog:has(.metadata-panel) .dialog-title { flex-shrink: 0; }
-dialog:has(.metadata-panel) .dialog-body { min-height: 0; }
+dialog:has(.metadata-panel) { width: min(880px, calc(100vw - 32px)); }
 .metadata-panel { width: 100%; }
 .metadata-panel nav { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .metadata-panel article { padding: 12px 0; border-bottom: 1px solid var(--border, #444); }
