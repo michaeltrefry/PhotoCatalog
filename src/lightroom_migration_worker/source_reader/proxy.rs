@@ -686,10 +686,7 @@ impl CaptureSqlReader {
     ) -> Result<Self> {
         authority.validate()?;
         let limits = authority.limits;
-        let opening = usize::try_from(limits.schema_bytes.0)?
-            .checked_mul(8)
-            .and_then(|n| n.checked_add(usize::try_from(limits.result_bytes.0).ok()?))
-            .context("CaptureSql opening allocation")?;
+        let opening = super::capture_source::graph_allocation(limits)?;
         relay.admit_opening(Kind::CaptureSql, opening)?;
         relay.admit_producer(
             Kind::CaptureSql,

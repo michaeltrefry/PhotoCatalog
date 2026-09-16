@@ -229,10 +229,7 @@ impl Roster {
                 admit,
             )?)),
             Authority::CaptureSql { value } => {
-                let opening = usize::try_from(value.limits.schema_bytes.0)?
-                    .checked_mul(8)
-                    .and_then(|v| v.checked_add(usize::try_from(value.limits.result_bytes.0).ok()?))
-                    .context("CaptureSql opening allocation")?;
+                let opening = super::capture_source::opening_allocation(value.limits)?;
                 admit(opening)?;
                 Ok(Self::CaptureSql(
                     super::capture_source::CaptureSource::open(value, cancel)?,

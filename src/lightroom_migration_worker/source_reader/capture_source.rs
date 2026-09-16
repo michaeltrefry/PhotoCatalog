@@ -30,6 +30,55 @@ struct VmProgress {
     steps: AtomicU64,
     exhausted: AtomicBool,
 }
+
+struct Progress {
+    cancel: Arc<AtomicBool>,
+    deadline: Instant,
+    vm: VmProgress,
+    maximum_steps: u64,
+}
+
+impl Progress {
+    fn interrupted(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+            || Instant::now() >= self.deadline
+            || self.vm.interrupt(self.maximum_steps)
+    }
+
+    fn check(&self) -> Result<()> {
+        ensure!(!self.cancel.load(Ordering::Acquire), "CaptureSql canceled");
+        ensure!(Instant::now() < self.deadline, "CaptureSql deadline");
+        self.vm.check()
+    }
+}
+
+pub(super) fn progress_allocation_backing() -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    use std::alloc::Layout;
+
+    // rusqlite boxes the concrete closure. It captures exactly one Arc<Progress>;
+    // Progress owns the shared cancel pointer and the VM/deadline state inline.
+    add(
+        channels::arc(Layout::new::<Progress>())?,
+        std::mem::size_of::<Arc<Progress>>(),
+    )
+}
+
+pub(super) fn graph_allocation(limits: wire::Limits) -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::layout::{add, mul};
+
+    add(
+        mul(usize::try_from(limits.schema_bytes.0)?, 8)?,
+        usize::try_from(limits.result_bytes.0)?,
+    )
+}
+
+pub(super) fn opening_allocation(limits: wire::Limits) -> Result<usize> {
+    crate::lightroom_migration_worker::memory::layout::add(
+        graph_allocation(limits)?,
+        progress_allocation_backing()?,
+    )
+}
 impl VmProgress {
     fn interrupt(&self, maximum: u64) -> bool {
         if self.steps.fetch_add(1000, Ordering::AcqRel) >= maximum {
@@ -55,9 +104,7 @@ pub(super) struct CaptureSource {
     schema: wire::SchemaObjects,
     tables: BTreeMap<String, AdmittedTable>,
     initial_data_version: i64,
-    cancel: Arc<AtomicBool>,
-    deadline: Instant,
-    vm: Arc<VmProgress>,
+    progress: Arc<Progress>,
     #[cfg(test)]
     exhaust_vm_after_initial_verify: AtomicBool,
 }
@@ -194,20 +241,14 @@ impl CaptureSource {
                 || no_companions(&path),
             )?;
         let (db, guard, initial_data_version) = roster.into_parts();
-        let deadline = Instant::now() + Duration::from_millis(authority.limits.total_deadline_ms.0);
-        let progress_cancel = cancel.clone();
-        let progress_deadline = deadline;
-        let vm = Arc::new(VmProgress::default());
-        let progress = vm.clone();
-        let maximum_steps = authority.limits.vm_steps.0;
-        db.progress_handler(
-            1000,
-            Some(move || {
-                progress_cancel.load(Ordering::Acquire)
-                    || Instant::now() >= progress_deadline
-                    || progress.interrupt(maximum_steps)
-            }),
-        )?;
+        let progress = Arc::new(Progress {
+            cancel,
+            deadline: Instant::now() + Duration::from_millis(authority.limits.total_deadline_ms.0),
+            vm: VmProgress::default(),
+            maximum_steps: authority.limits.vm_steps.0,
+        });
+        let callback = progress.clone();
+        db.progress_handler(1000, Some(move || callback.interrupted()))?;
         let (schema, tables) = Self::admit_schema(&db, &authority)?;
         let value = Self {
             db,
@@ -216,9 +257,7 @@ impl CaptureSource {
             schema,
             tables,
             initial_data_version,
-            cancel,
-            deadline,
-            vm,
+            progress,
             #[cfg(test)]
             exhaust_vm_after_initial_verify: AtomicBool::new(false),
         };
@@ -227,9 +266,7 @@ impl CaptureSource {
     }
 
     fn verify(&self) -> Result<()> {
-        ensure!(!self.cancel.load(Ordering::Acquire), "CaptureSql canceled");
-        ensure!(Instant::now() < self.deadline, "CaptureSql deadline");
-        self.vm.check()?;
+        self.progress.check()?;
         self.guard.verify()?;
         no_companions(&self.guard.path)?;
         crate::catalog_storage::verify_database_object(&self.db, &self.guard.file)?;
@@ -547,8 +584,9 @@ impl CaptureSource {
             .exhaust_vm_after_initial_verify
             .swap(false, Ordering::AcqRel)
         {
-            let vm = self.vm.clone();
-            self.db.progress_handler(1, Some(move || vm.interrupt(0)))?;
+            let progress = self.progress.clone();
+            self.db
+                .progress_handler(1, Some(move || progress.vm.interrupt(0)))?;
         }
         ensure!(
             (1..=usize::try_from(self.authority.limits.max_rows.0)?).contains(&limit),
@@ -779,7 +817,7 @@ mod tests {
             .store(true, Ordering::Release);
         let failure = source.table_rows(handle, None, 1, 2).unwrap_err();
         assert!(format!("{failure:#}").contains("CaptureSql VM step limit"));
-        assert!(source.vm.exhausted.load(Ordering::Acquire));
+        assert!(source.progress.vm.exhausted.load(Ordering::Acquire));
         Ok(())
     }
 
@@ -789,6 +827,39 @@ mod tests {
         assert!(!progress.interrupt(1000));
         assert!(progress.interrupt(1000));
         assert!(progress.check().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn capture_opening_reserves_progress_backing_exactly() -> Result<()> {
+        let limits = wire::Limits {
+            open_deadline_ms: U64(1),
+            total_deadline_ms: U64(1),
+            vm_steps: U64(1),
+            schema_objects: U64(1),
+            schema_bytes: U64(1),
+            page_bytes: U64(1),
+            max_cell_bytes: U64(1),
+            result_bytes: U64(1),
+            inline_bytes: U64(1),
+            chunk_bytes: U64(1),
+            max_rows: U64(1),
+        };
+        let required = opening_allocation(limits)?;
+        assert_eq!(
+            required,
+            graph_allocation(limits)? + progress_allocation_backing()?
+        );
+
+        let required_u64 = u64::try_from(required)?;
+        let exact = crate::preview::ByteBudget::new(required_u64)?;
+        let held = exact.reserve_exact(required_u64)?;
+        assert_eq!(exact.used(), required_u64);
+        drop(held);
+        assert_eq!(exact.used(), 0);
+
+        let short = crate::preview::ByteBudget::new(required_u64 - 1)?;
+        assert!(short.reserve_exact(required_u64).is_err());
         Ok(())
     }
 }

@@ -95,11 +95,52 @@ pub(crate) struct SqlControl<'a> {
     _control: Box<Control>,
     previous_length: i32,
 }
-pub(crate) fn metadata_layout() -> (usize, usize) {
-    (
-        std::mem::size_of::<Control>(),
-        std::mem::size_of::<SqlControl<'static>>(),
-    )
+
+pub(crate) struct MetadataAllocation {
+    pub(crate) boxed_control: usize,
+    pub(crate) sql_control: usize,
+    pub(crate) retained_arcs: usize,
+    pub(crate) replacement_arcs: usize,
+}
+
+impl MetadataAllocation {
+    pub(crate) fn active(&self) -> Result<usize> {
+        Ok(self.replacement_arcs.max(
+            self.boxed_control
+                .checked_add(self.sql_control)
+                .ok_or_else(|| anyhow::anyhow!("progress control metadata overflow"))?,
+        ))
+    }
+
+    #[cfg(test)]
+    fn required(&self) -> Result<usize> {
+        self.retained_arcs
+            .checked_add(self.active()?)
+            .ok_or_else(|| anyhow::anyhow!("progress control high-water overflow"))
+    }
+}
+
+pub(crate) fn metadata_allocation() -> Result<MetadataAllocation> {
+    use crate::lightroom_migration_worker::memory::{
+        channels,
+        layout::{add, mul},
+    };
+    use std::alloc::Layout;
+
+    // Control::new owns one cancellation flag and two independent counters.
+    // Submission constructs the replacement before replacing Shared::control,
+    // so both complete Arc graphs can coexist. Clones in Message/SqlControl
+    // share those allocations and add only their inline/boxed Control roots.
+    let arcs = add(
+        channels::arc(Layout::new::<AtomicBool>())?,
+        mul(2, channels::arc(Layout::new::<AtomicU64>())?)?,
+    )?;
+    Ok(MetadataAllocation {
+        boxed_control: std::mem::size_of::<Control>(),
+        sql_control: std::mem::size_of::<SqlControl<'static>>(),
+        retained_arcs: arcs,
+        replacement_arcs: arcs,
+    })
 }
 impl<'a> SqlControl<'a> {
     pub fn new(db: &'a Connection, control: Control) -> Self {
@@ -129,5 +170,26 @@ impl Drop for SqlControl<'_> {
                 self.previous_length,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn exact_progress_control_backing_admits_and_one_byte_less_refuses() -> Result<()> {
+        let allocation = metadata_allocation()?;
+        let required = allocation.required()?;
+        let required_u64 = u64::try_from(required)?;
+        let exact = crate::preview::ByteBudget::new(required_u64)?;
+        let held = exact.reserve_exact(required_u64)?;
+        assert_eq!(exact.used(), required_u64);
+        drop(held);
+        assert_eq!(exact.used(), 0);
+
+        let short = crate::preview::ByteBudget::new(required_u64 - 1)?;
+        assert!(short.reserve_exact(required_u64).is_err());
+        Ok(())
     }
 }

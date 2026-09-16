@@ -78,7 +78,7 @@ fn managed_requirement(core: usize, include_broker: bool) -> anyhow::Result<usiz
         add(seal_dynamic()?, seal_validation()?)?,
     )?;
     let raw_opening_graph = mul(3, 64 * 1024)?;
-    let capture_opening_graph = add(mul(8, PAGE_BYTES)?, RESULT_BYTES)?;
+    let capture_opening_graph = capture_source::graph_allocation(capture_limits)?;
     let authority_copies = mul(3, AUTHORITY_BYTES)?;
     let mut opening = [0usize; COUNT];
     opening[Kind::Sql.index()] = add(sql_opening_graph, authority_copies)?;
@@ -198,10 +198,13 @@ fn managed_requirement(core: usize, include_broker: bool) -> anyhow::Result<usiz
 
     // Each child retains its own checked opening grant in addition to the
     // parent-side authority/result graph. Sql and Raw use the shared
-    // closed-roster path bound; CaptureSql requests its exact schema/result
-    // opening allowance.
+    // closed-roster path bound; CaptureSql requests its exact schema/result and
+    // installed progress-callback opening allowance.
     let path_opening = crate::lightroom::source::managed_opening_reservation_maximum()?;
-    let child_opening = add(mul(2, path_opening)?, capture_opening_graph)?;
+    let child_opening = add(
+        mul(2, path_opening)?,
+        capture_source::opening_allocation(capture_limits)?,
+    )?;
     let client =
         relay::client::managed_allocation_requirement(opening, producer, transient, graph, core)?;
     let owners = add(client, child_opening)?;
@@ -221,6 +224,7 @@ pub(crate) fn managed_workbench_requirement() -> anyhow::Result<usize> {
 /// child opening grants, including the operation's largest core-owned phase.
 pub(crate) fn managed_migration_requirement(core: usize) -> anyhow::Result<usize> {
     managed_requirement(core, false)
+
 }
 
 /// Private worker mode on the configured installed executable. Do not initialize

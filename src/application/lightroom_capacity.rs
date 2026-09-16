@@ -176,7 +176,7 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
     let bridge = super::lightroom_bridge::metadata_layouts();
     let managed = super::lightroom_managed::metadata_layouts();
     let f = crate::filesystem_worker::lightroom_workbench_retained_metadata_layouts();
-    let (sql_control, sql_execution) = crate::lightroom::control::metadata_layout();
+    let progress_control = crate::lightroom::control::metadata_allocation()?;
     let workbench_limits = super::lightroom::Limits::metadata_maximum();
     let selection_limits = crate::lightroom::selection::SelectionLimits::metadata_maximum();
     let (
@@ -350,14 +350,19 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
             w_receiver as u64,
             coordinator_channel,
             c.mul(2, c.json(lightroom_process::ENVELOPE_BYTES as u64)?)?,
+            progress_control.retained_arcs as u64,
             bridge.control as u64,
             bridge.coordinator as u64,
-            sql_control as u64,
-            sql_execution as u64,
             FAILURE_BYTES,
             c.mul(8, c.string(IDENTITY_BYTES)?)?,
             c.mul(3, path)?,
         ])?,
+    );
+    a.push(
+        "transient.w_progress_control_installation",
+        Phase::Active,
+        "callback",
+        progress_control.active()? as u64,
     );
     a.push(
         "w.upload_single_staged_input",
@@ -631,6 +636,7 @@ mod tests {
             "g.owner_generation_router_reader_custody",
             "g.capability_pending_sessions_and_receipts",
             "w.control_status_worker_and_bridge",
+            "transient.w_progress_control_installation",
             "w.upload_single_staged_input",
             "w.cached_result_and_review",
             "f.owner_root",
@@ -793,6 +799,63 @@ mod tests {
         assert_eq!(source.used(), source_required);
         assert!(metadata.reserve_exact(1).is_err());
         assert!(source.reserve_exact(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn actual_failed_drain_retains_exact_pools_until_w_s_f_reconcile() -> Result<()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            worker_executable: std::env::current_exe()?,
+            cache_root: None,
+            original_roots: Vec::new(),
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        };
+        let requirement = Requirement::from_config(&config, super::desktop::CONTROL_SLOTS)?;
+        let source_required = source_requirement()?;
+        let metadata = ByteBudget::new(requirement.bytes())?;
+        let source = ByteBudget::new(source_required)?;
+        let allocation = Allocation::from_subgrant(
+            requirement,
+            metadata.reserve_exact(requirement.bytes())?,
+            source.clone(),
+        )?;
+        let root = std::fs::canonicalize(temp.path())?;
+        let filesystem =
+            std::sync::Arc::new(crate::filesystem_worker::client::migration_fixture(&root)?);
+        filesystem.wait_ready(std::time::Duration::from_secs(20))?;
+        let owner = super::lightroom_managed::Owner::start(
+            &filesystem,
+            &std::env::current_exe()?,
+            allocation,
+        )?;
+        let generation =
+            super::lightroom_managed::Generation::start_fixture(&owner, &std::env::current_exe()?)?;
+
+        assert_eq!(metadata.used(), requirement.bytes());
+        assert_eq!(source.used(), source_required);
+        generation.interrupt()?;
+        let failure = owner.drain_checked().unwrap_err();
+        assert!(format!("{failure:#}").contains("W is checked-reaped"));
+        assert_eq!(metadata.used(), requirement.bytes());
+        assert_eq!(source.used(), source_required);
+
+        let shutdown = generation.shutdown_checked().unwrap_err();
+        assert!(format!("{shutdown:#}").contains("interrupted Workbench"));
+        assert!(generation.pid().is_none());
+        owner.drain_checked()?;
+        assert_eq!(metadata.used(), requirement.bytes());
+        assert_eq!(source.used(), source_required);
+        drop(generation);
+        drop(owner);
+        assert_eq!(metadata.used(), 0);
+        assert_eq!(source.used(), 0);
+        filesystem.try_shutdown()?;
         Ok(())
     }
 }
