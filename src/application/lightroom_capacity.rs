@@ -715,7 +715,7 @@ mod tests {
             .find(|value| value.name == "g.capability_pending_sessions_and_receipts")
             .context("capability custody contribution")?;
         let c = Checked;
-        let managed = super::crate::application::lightroom_managed::metadata_layouts();
+        let managed = crate::application::lightroom_managed::metadata_layouts();
         let limits = super::super::lightroom::Limits::metadata_maximum();
         let path = c.native_path(limits.native_path_units as u64)?;
         let expected = c.add(&[
@@ -725,10 +725,10 @@ mod tests {
             c.mul(4, c.string(DIGEST_BYTES)?)?,
             c.vec(
                 managed.receipt as u64,
-                super::crate::application::lightroom_managed::CAPABILITY_RECEIPTS as u64,
+                crate::application::lightroom_managed::CAPABILITY_RECEIPTS as u64,
             )?,
             c.mul(
-                super::crate::application::lightroom_managed::CAPABILITY_RECEIPTS as u64 + 1,
+                crate::application::lightroom_managed::CAPABILITY_RECEIPTS as u64 + 1,
                 c.string(IDENTITY_BYTES)?,
             )?,
         ])?;
