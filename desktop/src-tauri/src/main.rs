@@ -41,9 +41,6 @@ fn main() {
         Some(arg) if arg == "--lightroom-workbench-worker" => {
             std::process::exit(if application::lightroom_process::worker_main().is_ok() { 0 } else { 1 });
         }
-        Some(arg) if arg == "--catalog-backup-worker" => {
-            std::process::exit(if photocatalog::catalog_backup::managed::worker_main().is_ok() { 0 } else { 1 });
-        }
         Some(arg) if arg == "--catalog-desktop-worker" => {
             if let Err(error) = application::desktop::worker_main() {
                 eprintln!("{error:#}");
