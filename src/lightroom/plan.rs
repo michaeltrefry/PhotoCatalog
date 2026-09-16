@@ -3208,6 +3208,26 @@ mod bounded_plan_tests {
     }
 
     #[test]
+    fn managed_identity_failure_retains_the_open_plan_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plan");
+        let plan = Plan::create(&root).unwrap();
+        assert!(plan.close_checked().is_ok());
+        let file = fs::File::open(root.join("inspection.sqlite3")).unwrap();
+        let mut wrong = crate::lightroom_migration_worker::identity::FileKey::of(&file).unwrap();
+        wrong.index.0 = wrong.index.0.checked_add(1).unwrap();
+        drop(file);
+
+        let failure = match Plan::open_managed(&root, &wrong) {
+            Ok(_) => panic!("wrong managed identity was admitted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("identity"));
+        assert!(failure.plan.is_some());
+        assert!(failure.plan.unwrap().close_checked().is_ok());
+    }
+
+    #[test]
     fn global_id_conflict_query_uses_global_indexes_instead_of_nested_revision_scans() {
         use rusqlite::StatementStatus;
         let temp = tempfile::tempdir().unwrap();
