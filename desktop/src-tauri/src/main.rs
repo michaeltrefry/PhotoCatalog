@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod measurement;
 
 use photocatalog::{application, preview};
 use std::sync::atomic::Ordering;
@@ -91,18 +92,30 @@ fn main() {
         }
         _ => {}
     }
+    let measurement_run_id = match measurement::run_id() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
+            let cache_root = app.path().app_cache_dir()?;
             let bridge = application::desktop::DesktopBridge::spawn(application::Config {
                 worker_executable: std::env::current_exe()?,
-                cache_root: Some(app.path().app_cache_dir()?),
+                cache_root: Some(cache_root.clone()),
                 original_roots: Vec::new(),
                 preview_policy: preview::PreviewPolicy::default(),
                 preview_limits: preview::ServiceLimits::default(),
                 limits: application::Limits::default(),
             })?;
             app.manage(commands::State::new(bridge));
+            app.manage(measurement::State::new(
+                measurement_run_id.clone(),
+                cache_root,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -112,6 +125,8 @@ fn main() {
             commands::catalog_choose_location,
             commands::catalog_preview_bytes,
             commands::catalog_preview_release,
+            measurement::catalog_measurement_config,
+            measurement::catalog_measurement_finish,
             commands::catalog_frontend_ready,
             commands::catalog_quit,
         ])

@@ -44,6 +44,9 @@ p { line-height: 1.6; }
 .app-header nav { display: flex; gap: 4px; }
 .app-header nav button { text-transform: uppercase; letter-spacing: .065em; font-size: 12px; background: transparent; border-color: transparent; padding: 8px 13px; }
 .app-header nav button[aria-current] { color: var(--accent); background: #272421; }
+.measurement-banner { display: flex; flex: none; align-items: center; gap: 12px; min-height: 36px; padding: 5px 12px; color: #e8c79a; background: #27251f; border-bottom: 1px solid #4b4132; font-size: 12px; }
+.measurement-banner > span:first-child { font-weight: 600; }
+.measurement-banner > span:not(:first-child) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .welcome { max-width: 630px; margin: auto; padding: 32px; }
 .welcome-mark { color: var(--accent); font-size: 38px; margin-bottom: 24px; }
 .welcome h1 { font-size: clamp(32px, 4vw, 48px); line-height: 1.13; font-weight: 500; letter-spacing: -.03em; margin-bottom: 24px; }
