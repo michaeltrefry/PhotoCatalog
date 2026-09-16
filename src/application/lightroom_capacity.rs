@@ -511,6 +511,9 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
+    pub(crate) fn arm(&self) {
+        self.checked_drained.store(false, Ordering::Release);
+    }
     pub(crate) fn checked_drained(&self) {
         self.checked_drained.store(true, Ordering::Release);
     }
@@ -556,7 +559,7 @@ impl Allocation {
         Ok(Self {
             metadata: Admission {
                 held: Some((reservation, source_held)),
-                checked_drained: AtomicBool::new(false),
+                checked_drained: AtomicBool::new(true),
             },
             // Dynamic Source reservations use a private counter exactly equal
             // to the retained parent grant, so later phases cannot race another
@@ -700,6 +703,21 @@ mod tests {
     }
 
     #[test]
+    fn unstarted_allocation_releases_both_grants() -> Result<()> {
+        let requirement = Requirement::from_config(&config(), 16)?;
+        let metadata = ByteBudget::new(requirement.bytes())?;
+        let source = ByteBudget::new(source_requirement()?)?;
+        let allocation = Allocation::from_subgrant(
+            requirement,
+            metadata.reserve_exact(requirement.bytes())?,
+            source.clone(),
+        )?;
+        drop(allocation);
+        assert_eq!(metadata.used(), 0);
+        assert_eq!(source.used(), 0);
+        Ok(())
+    }
+    #[test]
     fn unverified_drain_retains_both_physical_grants() -> Result<()> {
         let requirement = Requirement::from_config(&config(), 16)?;
         let source_required = source_requirement()?;
@@ -707,7 +725,9 @@ mod tests {
         let source = ByteBudget::new(source_required)?;
         let grant = metadata.reserve_exact(requirement.bytes())?;
         let allocation = Allocation::from_subgrant(requirement, grant, source.clone())?;
-        drop(allocation);
+        let (admission, _) = allocation.into_parts();
+        admission.arm();
+        drop(admission);
         assert_eq!(metadata.used(), requirement.bytes());
         assert_eq!(source.used(), source_required);
         assert!(metadata.reserve_exact(1).is_err());

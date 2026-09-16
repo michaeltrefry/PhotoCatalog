@@ -539,6 +539,7 @@ impl Owner {
         let (metadata, source_payloads) = allocation.into_parts();
         let budget = MemoryBudget::from_shared(source_payloads);
         let (router, relay) = SourceRouter::start(source_executable, guard.clone(), budget)?;
+        metadata.arm();
         let owner = Arc::new(Self {
             metadata,
             filesystem: filesystem.clone(),
