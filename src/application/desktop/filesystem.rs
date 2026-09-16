@@ -1615,14 +1615,29 @@ impl Proxy {
             crate::catalog_session::overlap_tests::before_release()?;
         }
         let mut s = self.state.lock().unwrap();
-        if let Some(fault) = &s.fault {
-            return Err(fault.clone().into_error());
+        loop {
+            if let Some(fault) = &s.fault {
+                return Err(fault.clone().into_error());
+            }
+            ensure!(!s.closing || call.cleanup(), "filesystem relay closing");
+            if s.calls.len() < 2 {
+                break;
+            }
+            // One managed import preparation exists per open catalog. Keep its
+            // exact request with that owner until one of the two relay slots
+            // drains; ordinary callers still receive Busy rather than creating
+            // an unbounded queue here. The wait releases the relay mutex, while
+            // fail/closing and completed-call retirement wake it.
+            ensure!(
+                matches!(call, Call::Import(_)),
+                crate::preview::stage_io::Busy("filesystem relay busy")
+            );
+            s = self
+                .wake
+                .wait_timeout(s, Duration::from_millis(20))
+                .unwrap()
+                .0;
         }
-        ensure!(!s.closing || call.cleanup(), "filesystem relay closing");
-        ensure!(
-            s.calls.len() < 2,
-            crate::preview::stage_io::Busy("filesystem relay busy")
-        );
         let id = s.next;
         let next = id.checked_add(1).context("relay ID exhausted")?;
         s.output.push(
@@ -1645,6 +1660,7 @@ impl Proxy {
             let index = s.calls.iter().position(|c| c.id == id).unwrap();
             if let Some(outcome) = s.calls[index].outcome.take() {
                 s.calls.remove(index);
+                self.wake.notify_all();
                 return outcome.map_err(Fault::into_error);
             }
             if let Some(fault) = &s.fault {
