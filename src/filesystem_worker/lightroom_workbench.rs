@@ -1802,6 +1802,19 @@ mod tests {
             Some(fs::canonicalize(temp.path())?.join("replace-target"));
         let mut owner = Owner::default();
         assert!(call(&mut owner, begin.clone()).is_err());
+        #[cfg(windows)]
+        {
+            // Windows cannot rename a directory with an open child file. Close
+            // only the test upload so the replacement attack can run; retain
+            // the directory handle whose identity the retry must still check.
+            let upload = owner
+                .seal
+                .as_mut()
+                .context("retained seal operation")?
+                .approval
+                .upload()?;
+            drop(upload.file.take().context("retained approval upload file")?);
+        }
         fs::rename(&output, &retained)?;
         fs::create_dir(&output)?;
 

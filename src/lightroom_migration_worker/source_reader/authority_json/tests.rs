@@ -130,6 +130,8 @@ fn capture_sql_authority_is_distinct_and_binding_complete() -> Result<()> {
         lightroom_migration_worker::source_reader::capture_wire,
         storage_volume::NativePath,
     };
+    let temp = tempfile::tempdir()?;
+    let capture_root = temp.path().canonicalize()?.join("capture");
     let mut value = capture_wire::Authority {
         protocol: 1,
         build: crate::lightroom_migration_worker::worker::build_identity().into(),
@@ -139,7 +141,7 @@ fn capture_sql_authority_is_distinct_and_binding_complete() -> Result<()> {
         operation: "o".into(),
         capture_generation: "c".into(),
         expires_unix_ms: U64(u64::MAX),
-        capture_root: NativePath::from_path(std::path::Path::new("/capture")),
+        capture_root: NativePath::from_path(&capture_root),
         member: capture_wire::MEMBER.into(),
         manifest_blake3: "1".repeat(64),
         revision_id: "2".repeat(64),
