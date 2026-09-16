@@ -650,8 +650,7 @@ impl Catalog {
             match storage_volume::match_mounts(&logical, snapshot) {
                 MountMatch::Unique(mount) => {
                     result.state = "online_unverified".into();
-                    result.detail =
-                        "Volume found. The current path has not been verified.".into();
+                    result.detail = "Volume found. The current path has not been verified.".into();
                     if let Some(relative) = b.relative {
                         match storage_volume::candidate_path(&mount, &relative) {
                             Ok(p) => {

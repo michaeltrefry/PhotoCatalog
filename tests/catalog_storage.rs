@@ -379,9 +379,7 @@ fn offline_browsing_known_volume_reconnect_and_unregistered_distinction() -> Res
     fs::rename(&path, &temporarily_missing)?;
     let missing = cat.storage_status(&asset.id, &snapshot)?;
     ensure!(missing.state == "missing");
-    ensure!(
-        missing.detail == "Volume found. The original is missing from its recorded location."
-    );
+    ensure!(missing.detail == "Volume found. The original is missing from its recorded location.");
     fs::rename(temporarily_missing, &path)?;
     ensure!(
         cat.reconnect_storage_asset(&path, &observation, "wrong", &snapshot)
