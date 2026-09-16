@@ -479,11 +479,12 @@ impl Coordinator {
             let bytes = self
                 .bookkeeping_bytes(&operation, shared.limits.reply_bytes)
                 .map_err(bridge)?;
-            ensure!(
-                bytes <= funding.metadata.bytes,
-                "migration bookkeeping exceeds its checked subgrant"
-            )
-            .map_err(bridge)?;
+            if bytes > funding.metadata.bytes {
+                return Err(application::error(
+                    ErrorCode::ResourceLimit,
+                    "migration bookkeeping exceeds its checked subgrant",
+                ));
+            }
             let bookkeeping = funding.metadata.clone();
             #[cfg(test)]
             {
@@ -622,7 +623,7 @@ impl Coordinator {
                     budget,
                     _memory: memory,
                 }),
-                _bookkeeping: Arc::new(bookkeeping),
+                _bookkeeping: bookkeeping,
             });
             return self
                 .snapshot(slot.as_ref().unwrap(), shared.limits.reply_bytes)

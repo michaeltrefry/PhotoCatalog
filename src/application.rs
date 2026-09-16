@@ -620,7 +620,7 @@ impl Bridge {
                 .lightroom
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .direct((**request).clone(), budget)
+                .direct((**request).clone(), budget, None)
                 .map_err(native)?;
             let out = Reply::Ok {
                 value: Response::Lightroom(Box::new(response)),
