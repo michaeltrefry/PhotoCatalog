@@ -146,13 +146,14 @@ a fresh SQLite opener against quiescent existing SHM (deadman lock),
 missing/changed companions, contended auxiliary locks, symlink and special-node
 races, cancellation/restart, output overlap and exact source preservation.
 
-A fatal managed transport failure revokes and checked-drains the Workbench,
-Source, and filesystem owners. That cleanup cannot manufacture a reply from the
-reaped Workbench proving its logical inspection status is Closed, so the desktop
-keeps Close pending. Retry status/Close explicitly; if closure still cannot be
-confirmed, quit and reopen LensWorks before opening another inspection. Normal
-application shutdown uses the same checked cleanup path rather than abandoning
-the retained generation.
+A fatal managed transport failure revokes the generation and attempts checked
+cleanup of its Workbench, Source, and filesystem owners. When that cleanup is
+confirmed successfully checked-drained, it still cannot manufacture a reply from
+the reaped Workbench proving its logical inspection status is Closed, so the
+desktop keeps Close pending. Unconfirmed cleanup retains ownership. Retry
+status/Close explicitly; if closure still cannot be confirmed, quit and reopen
+LensWorks before opening another inspection. Normal application shutdown uses
+the same checked cleanup path rather than abandoning the retained generation.
 
 Private selected-current dry runs use newly captured copies after this protocol
 and implementation are reviewed. Earlier 2013/2019 compatibility samples do not
