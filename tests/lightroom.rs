@@ -76,6 +76,25 @@ fn request(source: &Path, output: &Path) -> Request {
 fn capture_file(source: &Path, output: &Path) -> capture::Manifest {
     capture::spawn(&worker(), &request(source, output)).unwrap()
 }
+
+#[test]
+fn photocatalog_executable_dispatches_capture_worker() {
+    let temp = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals).unwrap();
+    let source = originals.join("source.lrcat");
+    drop(fixture(&source, "1300000", 100.0));
+    let output = temp.path().join("capture");
+
+    let manifest = capture::spawn(
+        Path::new(env!("CARGO_BIN_EXE_photocatalog")),
+        &request(&source, &output),
+    )
+    .unwrap();
+
+    assert_eq!(manifest.state, "captured");
+    assert!(output.join("manifest.json").is_file());
+}
 fn finish(plan: &mut Plan, revision: &str) {
     for _ in 0..1000 {
         let result = plan.resume(revision, 7).unwrap();
