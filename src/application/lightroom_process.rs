@@ -623,12 +623,15 @@ pub fn worker_main() -> Result<()> {
                 let drain = thread::Builder::new()
                     .name("workbench-checked-drain".into())
                     .spawn(move || {
+                        let Some(mut coordinator) = drain_owner
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take()
+                        else {
+                            drain_callback.close();
+                            std::process::exit(1);
+                        };
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let mut coordinator = drain_owner
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .take()
-                                .context("Workbench checked-drain owner missing")?;
                             coordinator.shutdown()
                         }));
                         if !matches!(result, Ok(Ok(()))) {

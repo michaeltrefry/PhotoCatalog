@@ -1080,6 +1080,14 @@ mod tests {
     impl ManagedFixture {
         fn start(temp: &Path) -> Result<Self> {
             let filesystem = Arc::new(crate::filesystem_worker::client::migration_fixture(temp)?);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while filesystem.status().phase == FilesystemPhase::Starting {
+                ensure!(
+                    Instant::now() < deadline,
+                    "filesystem fixture did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
             let owner = Owner::start(
                 &filesystem,
                 &std::env::current_exe()?,
