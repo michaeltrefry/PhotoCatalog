@@ -1,15 +1,11 @@
-use super::{CONTROL_SLOTS, workbench::Dispatcher};
+use super::workbench::Dispatcher;
 use crate::{
     application::{
-        Config, Limits, Reply, U64, lightroom as lw, lightroom_bridge as bridge,
-        lightroom_capacity, lightroom_managed,
+        Config, Limits, Reply, U64, lightroom as lw, lightroom_bridge as bridge, lightroom_managed,
     },
-    filesystem_worker::{
-        client::Client as FilesystemClient,
-        wire::{
-            LightroomArtifactPreparation, LightroomArtifactPreparationReply,
-            LightroomSealedDocument, LightroomSealedRead,
-        },
+    filesystem_worker::wire::{
+        LightroomArtifactPreparation, LightroomArtifactPreparationReply, LightroomSealedDocument,
+        LightroomSealedRead,
     },
     lightroom::{
         capture,
@@ -17,7 +13,6 @@ use crate::{
         selection::{FamilyDecision, SelectionRequest},
         source::Source,
     },
-    preview::ByteBudget,
     storage_volume::NativePath,
 };
 use anyhow::{Context, Result, ensure};
@@ -214,27 +209,17 @@ fn write_capture(directory: &Path) -> Result<(String, String, String)> {
 fn managed_dispatcher_preserves_sealed_artifact_and_approval_capabilities() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let config = config();
-    let requirement = lightroom_capacity::Requirement::from_config(&config, CONTROL_SLOTS)?;
-    let metadata = ByteBudget::new(requirement.bytes())?;
-    let allocation = lightroom_capacity::Allocation::from_subgrant(
-        requirement,
-        metadata.reserve_exact(requirement.bytes())?,
-        ByteBudget::new(lightroom_capacity::source_requirement()?)?,
-    )?;
-    let filesystem = Arc::new(FilesystemClient::spawn(
-        &config.worker_executable,
-        vec![NativePath::from_path(temp.path())],
-    )?);
-    filesystem.wait_ready(Duration::from_secs(20))?;
-    let owner =
-        lightroom_managed::Owner::start(&filesystem, &config.worker_executable, allocation)?;
+    let directory = std::fs::canonicalize(temp.path())?;
+    let fixture = lightroom_managed::tests::ManagedFixture::start(&directory)?;
+    let filesystem = fixture.filesystem.clone();
+    let owner = fixture.owner.clone();
     let generation = Arc::new(lightroom_managed::Generation::start_fixture(
         &owner,
         &config.worker_executable,
     )?);
     let dispatcher = Dispatcher::start(&generation, config.limits.clone())?;
 
-    let sealed = temp.path().join("sealed");
+    let sealed = directory.as_path().join("sealed");
     std::fs::create_dir(&sealed)?;
     std::fs::write(sealed.join("approval.json"), b"{\"approved\":true}")?;
     let sealed_session = uuid::Uuid::new_v4().to_string();
@@ -281,7 +266,7 @@ fn managed_dispatcher_preserves_sealed_artifact_and_approval_capabilities() -> R
         bridge::Response::SealedDocument(None)
     ));
 
-    let capture = temp.path().join("capture");
+    let capture = directory.as_path().join("capture");
     let (capture_revision, manifest_blake3, manifest_json) = write_capture(&capture)?;
     let artifact_session = uuid::Uuid::new_v4().to_string();
     ensure!(matches!(
@@ -341,7 +326,7 @@ fn managed_dispatcher_preserves_sealed_artifact_and_approval_capabilities() -> R
             attempt,
             root: NativePath::from_path(inspection_root),
             mode: lw::OpenMode::OpenExisting,
-            capture_staging: NativePath::from_path(temp.path()),
+            capture_staging: NativePath::from_path(directory.as_path()),
             limits: lw::Limits::default().into(),
         },
     )?;
@@ -424,7 +409,7 @@ fn managed_dispatcher_preserves_sealed_artifact_and_approval_capabilities() -> R
     let draft = serde_json::to_string(&serde_json::json!({
         "protocol": 1,
         "review_token": review_token,
-        "destination": NativePath::from_path(&temp.path().join("destination.sqlite3")),
+        "destination": NativePath::from_path(&directory.as_path().join("destination.sqlite3")),
         "import_source": "managed callback fixture",
         "overlap": crate::catalog_migration::importer::OverlapPolicy::RequireDecision,
         "keyword_overlap": crate::catalog_migration::importer::KeywordOverlap::RequireDecision,
