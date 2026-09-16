@@ -2828,3 +2828,12 @@ mod actual {
         early_admission(EarlyAdmission::WriterEnqueued)
     }
 }
+
+#[test]
+fn upload_channel_is_included_in_metadata_grant() -> anyhow::Result<()> {
+    let channel = super::upload_channel_backing()?;
+    assert!(channel > std::mem::size_of::<super::Upload>());
+    let grant = super::bookkeeping_bytes(std::path::Path::new("lensworks"), 0, 0)?;
+    assert!(grant >= u64::try_from(channel)?);
+    Ok(())
+}

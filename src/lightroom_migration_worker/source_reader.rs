@@ -224,7 +224,6 @@ pub(crate) fn managed_workbench_requirement() -> anyhow::Result<usize> {
 /// child opening grants, including the operation's largest core-owned phase.
 pub(crate) fn managed_migration_requirement(core: usize) -> anyhow::Result<usize> {
     managed_requirement(core, false)
-
 }
 
 /// Private worker mode on the configured installed executable. Do not initialize

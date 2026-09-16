@@ -155,6 +155,14 @@ struct MetadataAdmission {
     _held: super::preview_metadata_admission::ProcessSubgrant,
 }
 
+fn upload_channel_backing() -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    add(
+        channels::bounded(1, std::alloc::Layout::new::<Upload>())?,
+        channels::pthread_mutexes(2)?,
+    )
+}
+
 fn bookkeeping_bytes(executable: &std::path::Path, operation: usize, reply: usize) -> Result<u64> {
     use crate::lightroom_migration_worker::memory::{
         channels,
@@ -170,6 +178,7 @@ fn bookkeeping_bytes(executable: &std::path::Path, operation: usize, reply: usiz
         // owns its clone through checked LM/Source drain.
         mul(2, executable_backing)?,
         size_of::<Entry>(),
+        upload_channel_backing()?,
         arc(Layout::new::<Job>())?,
         arc(Layout::new::<Stop>())?,
         size_of::<Report>(),
