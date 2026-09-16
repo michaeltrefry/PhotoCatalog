@@ -46,7 +46,12 @@ export type Family={id:string;evidence:string;members:{revision:string;source:Js
 export function families(node:JsonNode):Family[] {return array(field(node,'families')).map(value=>({id:scalar(field(value,'id')),evidence:scalar(field(value,'evidence_digest')),members:array(field(value,'members')).map(member=>({revision:scalar(field(member,'revision_id')),source:field(member,'source')!,details:member})),details:value}));}
 export function selectionDocument(root:NativePath,rows:Family[],decisions:Record<string,string>):string {
   if(!rows.length)throw new Error('Read the complete family report first.');
-  return JSON.stringify({inspection:root,families:rows.map(f=>{const decision=decisions[f.id];if(!decision)throw new Error(`Explicitly select or exclude family ${f.id}.`);if(decision==='exclude')return {kind:'Exclude',family:f.id,expected_evidence_digest:f.evidence};if(!f.members.some(m=>m.revision===decision))throw new Error('Selected revision is no longer a member of its family.');return {kind:'Select',family:f.id,revision:decision,expected_evidence_digest:f.evidence};})});
+  // Preserve opaque native units; the selection protocol names the database, not its directory.
+  const separator=root.encoding==='WindowsWide'?92:47;
+  const last=root.units[root.units.length-1];
+  const terminated=last===separator||(root.encoding==='WindowsWide'&&last===47);
+  const inspection:NativePath={encoding:root.encoding,units:[...root.units,...(terminated?[]:[separator]),...Array.from('inspection.sqlite3',c=>c.charCodeAt(0))]};
+  return JSON.stringify({inspection,families:rows.map(f=>{const decision=decisions[f.id];if(!decision)throw new Error(`Explicitly select or exclude family ${f.id}.`);if(decision==='exclude')return {kind:'Exclude',family:f.id,expected_evidence_digest:f.evidence};if(!f.members.some(m=>m.revision===decision))throw new Error('Selected revision is no longer a member of its family.');return {kind:'Select',family:f.id,revision:decision,expected_evidence_digest:f.evidence};})});
 }
 /** A short or empty sparse page is not exhaustion when the server supplies a cursor. */
 export function nextQuery(query:Query,node:JsonNode):Query|null {

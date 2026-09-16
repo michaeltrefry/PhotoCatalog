@@ -11,6 +11,17 @@ describe('Lightroom inspection authority',()=>{
  it('encodes a maximum-size document once and never rescans prefixes during chunking',()=>{const encode=vi.spyOn(TextEncoder.prototype,'encode');try{const bytes=encodeInput('a'.repeat(16777216));expect(encode).toHaveBeenCalledTimes(1);let offset='0',count=0;while(BigInt(offset)<BigInt(bytes.length)){const part=inputChunk(bytes,offset,'16384');expect(part.fragment.length).toBe(16384);offset=part.next;count++;}expect(count).toBe(1024);expect(encode).toHaveBeenCalledTimes(1);}finally{encode.mockRestore();}});
  it('retains duplicate fields but rejects ambiguous control extraction',()=>expect(()=>field(parse('{"id":1,"id":2}'),'id')).toThrow());
  it('requires all-family decisions and preserves exact evidence',()=>{const rows=[{id:'f',evidence:'digest',members:[{revision:'9007199254740993',source:parse('{}'),details:parse('{}')}],details:parse('{}')}];expect(()=>selectionDocument({encoding:'UnixBytes',units:[47]},rows,{})).toThrow();expect(selectionDocument({encoding:'UnixBytes',units:[47]},rows,{f:'9007199254740993'})).toContain('"revision":"9007199254740993"');});
+ it('targets the pinned database while preserving opaque native directory units',()=>{
+  const rows=[{id:'f',evidence:'digest',members:[],details:parse('{}')}];
+  const cases:[import('./bridge').NativePath,number[]][]=[
+   [{encoding:'UnixBytes',units:[47,255]},[47,255,47]],
+   [{encoding:'UnixBytes',units:[47]},[47]],
+   [{encoding:'WindowsWide',units:[67,58,92,0xd800]},[67,58,92,0xd800,92]],
+   [{encoding:'WindowsWide',units:[67,58,92]},[67,58,92]],
+   [{encoding:'WindowsWide',units:[67,58,47]},[67,58,47]],
+  ];
+  for(const [root,prefix] of cases){const before=[...root.units];const document=JSON.parse(selectionDocument(root,rows,{f:'exclude'}));expect(document.inspection).toEqual({encoding:root.encoding,units:[...prefix,...Array.from('inspection.sqlite3',c=>c.charCodeAt(0))]});expect(root.units).toEqual(before);}
+ });
  it('uses authoritative cursors rather than row count or draft',()=>{expect(nextQuery({kind:'Rows',revision:'r',table:null,after:'0',limit:'20'},parse('{"rows":[],"next":"9007199254740993"}'))).toMatchObject({after:'9007199254740993'});expect(nextQuery({kind:'PathCollisions',left:'l',right:'r',after_left:'0',after_right:'0',limit:'20'},parse('{"next":["9007199254740993","4"]}'))).toMatchObject({after_left:'9007199254740993',after_right:'4'});});
  it('preserves object-shaped global ID cursors independently from collision tuples',()=>{expect(nextQuery({kind:'GlobalIdConflicts',left:'a',right:'b',after_left:'',after_right:'',limit:'20'},parse('{"next":{"left":"9007199254740993","right":"provider:opaque/id"},"rows":[]}'))).toEqual({kind:'GlobalIdConflicts',left:'a',right:'b',after_left:'9007199254740993',after_right:'provider:opaque/id',limit:'20'});});
  it('does not mistake unchanged upload progress for append settlement',()=>{const status={input:'i',received_bytes:'0'} as never;expect(inputObserved({kind:'append',input:'i',next:'4096'},status)).toBe(false);expect(inputObserved({kind:'discard',input:'i'},null)).toBe(true);});
