@@ -871,6 +871,280 @@ impl LightroomWorkbenchIo {
     }
 }
 
+// Serde buffers tagged-enum contents in an internal representation that has no
+// u128 variant. Capture manifests keep their public/on-disk numeric grammar,
+// while this tagged wire representation uses canonical decimal strings for the
+// three revision timestamp positions. Remote derives construct the public types
+// directly, without a second retained manifest graph. Each wire decimal is at
+// most 39 bytes plus JSON quotes; it remains inside the existing message/parse
+// allowance, and the buffered string is consumed into the final u128.
+mod capture_manifest_wire {
+    use crate::{
+        lightroom::{Issue, capture, source::Revision, wal::WalReport},
+        storage_volume::NativePath,
+    };
+    use serde::{
+        Deserialize, Deserializer, Serialize, Serializer,
+        de::{SeqAccess, Visitor},
+        ser::SerializeSeq,
+    };
+
+    mod option_u128_decimal {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+        use std::borrow::Cow;
+
+        struct Decimal(u128);
+        impl Serialize for Decimal {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(&self.0)
+            }
+        }
+
+        pub fn serialize<S: Serializer>(
+            value: &Option<u128>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match value {
+                Some(value) => serializer.serialize_some(&Decimal(*value)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<u128>, D::Error> {
+            Option::<Cow<'de, str>>::deserialize(deserializer)?
+                .map(|value| {
+                    let parsed = value.parse::<u128>().map_err(serde::de::Error::custom)?;
+                    if value.is_empty()
+                        || !value.bytes().all(|byte| byte.is_ascii_digit())
+                        || (value.len() > 1 && value.starts_with('0'))
+                    {
+                        return Err(serde::de::Error::custom(
+                            "canonical unsigned decimal required",
+                        ));
+                    }
+                    Ok(parsed)
+                })
+                .transpose()
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "Revision")]
+    struct RevisionDef {
+        object: String,
+        bytes: u64,
+        #[serde(with = "option_u128_decimal")]
+        modified_ns: Option<u128>,
+        changed: String,
+    }
+
+    pub(super) mod revision {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            value: &Revision,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            RevisionDef::serialize(value, serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Revision, D::Error> {
+            RevisionDef::deserialize(deserializer)
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "capture::Artifact")]
+    struct ArtifactDef {
+        source: NativePath,
+        role: String,
+        relative: NativePath,
+        stored: String,
+        #[serde(with = "revision")]
+        revision: Revision,
+        blake3: String,
+    }
+
+    #[derive(Serialize)]
+    struct ArtifactRef<'a>(#[serde(with = "ArtifactDef")] &'a capture::Artifact);
+
+    struct ArtifactOwned(capture::Artifact);
+    impl<'de> Deserialize<'de> for ArtifactOwned {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            ArtifactDef::deserialize(deserializer).map(Self)
+        }
+    }
+
+    mod artifacts {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            values: &[capture::Artifact],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+            for value in values {
+                sequence.serialize_element(&ArtifactRef(value))?;
+            }
+            sequence.end()
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<capture::Artifact>, D::Error> {
+            struct ArtifactVisitor;
+            impl<'de> Visitor<'de> for ArtifactVisitor {
+                type Value = Vec<capture::Artifact>;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a capture artifact sequence")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                    while let Some(ArtifactOwned(value)) = sequence.next_element()? {
+                        values.push(value);
+                    }
+                    Ok(values)
+                }
+            }
+            deserializer.deserialize_seq(ArtifactVisitor)
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "capture::Entry")]
+    struct EntryDef {
+        path: NativePath,
+        role: String,
+        relative: NativePath,
+        directory: bool,
+        #[serde(with = "option_u128_decimal")]
+        modified_ns: Option<u128>,
+        changed: String,
+    }
+
+    #[derive(Serialize)]
+    struct EntryRef<'a>(#[serde(with = "EntryDef")] &'a capture::Entry);
+
+    struct EntryOwned(capture::Entry);
+    impl<'de> Deserialize<'de> for EntryOwned {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            EntryDef::deserialize(deserializer).map(Self)
+        }
+    }
+
+    mod entries {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            values: &[capture::Entry],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+            for value in values {
+                sequence.serialize_element(&EntryRef(value))?;
+            }
+            sequence.end()
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<capture::Entry>, D::Error> {
+            struct EntryVisitor;
+            impl<'de> Visitor<'de> for EntryVisitor {
+                type Value = Vec<capture::Entry>;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a capture inventory sequence")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                    while let Some(EntryOwned(value)) = sequence.next_element()? {
+                        values.push(value);
+                    }
+                    Ok(values)
+                }
+            }
+            deserializer.deserialize_seq(EntryVisitor)
+        }
+    }
+
+    mod optional_revision {
+        use super::*;
+
+        #[derive(Serialize)]
+        struct RevisionRef<'a>(#[serde(with = "RevisionDef")] &'a Revision);
+
+        struct RevisionOwned(Revision);
+        impl<'de> Deserialize<'de> for RevisionOwned {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                RevisionDef::deserialize(deserializer).map(Self)
+            }
+        }
+
+        pub fn serialize<S: Serializer>(
+            value: &Option<Revision>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            value.as_ref().map(RevisionRef).serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Revision>, D::Error> {
+            Ok(Option::<RevisionOwned>::deserialize(deserializer)?.map(|value| value.0))
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "capture::Manifest")]
+    struct ManifestDef {
+        protocol: u32,
+        request: capture::Request,
+        state: String,
+        raw_byte_retention: String,
+        sqlite_consistency: String,
+        application_consistency: String,
+        cooperative_lock_protocol: String,
+        #[serde(with = "artifacts")]
+        artifacts: Vec<capture::Artifact>,
+        #[serde(with = "entries")]
+        companion_inventory: Vec<capture::Entry>,
+        absent_companions: Vec<NativePath>,
+        issues: Vec<Issue>,
+        wal: Option<WalReport>,
+        logical_blake3: Option<String>,
+        #[serde(with = "optional_revision")]
+        logical_revision: Option<Revision>,
+        revision_id: Option<String>,
+    }
+
+    pub fn serialize<S: Serializer>(
+        value: &capture::Manifest,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        ManifestDef::serialize(value, serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<capture::Manifest, D::Error> {
+        ManifestDef::deserialize(deserializer)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -889,12 +1163,14 @@ pub enum LightroomWorkbenchIoReply {
     },
     CaptureComplete {
         operation: String,
+        #[serde(with = "capture_manifest_wire")]
         manifest: crate::lightroom::capture::Manifest,
     },
     Evidence {
         operation: String,
         capture_generation: String,
         directory: NativePath,
+        #[serde(with = "capture_manifest_wire")]
         manifest: crate::lightroom::capture::Manifest,
         manifest_blake3: String,
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
@@ -927,6 +1203,7 @@ pub enum LightroomWorkbenchIoReply {
     SealHashed {
         operation: String,
         token: String,
+        #[serde(with = "capture_manifest_wire::revision")]
         identity: crate::lightroom::source::Revision,
         blake3: String,
         directory: NativePath,
@@ -1853,6 +2130,120 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lightroom_capture_manifest_wire_preserves_numeric_disk_grammar_and_full_u128() -> Result<()>
+    {
+        use crate::lightroom::{
+            PROTOCOL,
+            capture::{Artifact, Entry, Manifest, Request},
+            source::Revision,
+        };
+        let root = std::env::temp_dir();
+        let revision = |modified_ns| Revision {
+            object: "object".into(),
+            bytes: 1,
+            modified_ns,
+            changed: "changed".into(),
+        };
+        let manifest = Manifest {
+            protocol: PROTOCOL,
+            request: Request {
+                source: NativePath::from_path(&root.join("source.lrcat")),
+                output: NativePath::from_path(&root.join("capture")),
+                include_auxiliary: true,
+                closed_application_evidence: Some("closed fixture".into()),
+                limits: crate::lightroom::Limits::default(),
+            },
+            state: "captured".into(),
+            raw_byte_retention: "complete".into(),
+            sqlite_consistency: "verified".into(),
+            application_consistency: "closed".into(),
+            cooperative_lock_protocol: "verified".into(),
+            artifacts: vec![Artifact {
+                source: NativePath::from_path(&root.join("source.lrcat")),
+                role: "main".into(),
+                relative: NativePath::from_path(std::path::Path::new("source.lrcat")),
+                stored: "raw/000000.bin".into(),
+                revision: revision(Some(u128::MAX)),
+                blake3: "f".repeat(64),
+            }],
+            companion_inventory: vec![Entry {
+                path: NativePath::from_path(&root.join("source.lrcat")),
+                role: "main".into(),
+                relative: NativePath::from_path(std::path::Path::new("source.lrcat")),
+                directory: false,
+                modified_ns: Some(u64::MAX as u128),
+                changed: "changed".into(),
+            }],
+            absent_companions: vec![],
+            issues: vec![],
+            wal: None,
+            logical_blake3: Some("e".repeat(64)),
+            logical_revision: Some(revision(Some(0))),
+            revision_id: Some("revision".into()),
+        };
+
+        let disk = serde_json::to_vec(&manifest)?;
+        assert!(
+            std::str::from_utf8(&disk)?.contains(&format!(r#""modified_ns":{}"#, u128::MAX)),
+            "public manifest timestamp grammar changed"
+        );
+        let disk_roundtrip: Manifest = serde_json::from_slice(&disk)?;
+        assert_eq!(
+            disk_roundtrip.artifacts[0].revision.modified_ns,
+            Some(u128::MAX)
+        );
+
+        let encoded = encode_outcome(&Ok(Response::LightroomWorkbenchIo(
+            LightroomWorkbenchIoReply::CaptureComplete {
+                operation: "operation".into(),
+                manifest,
+            },
+        )))?;
+        let Ok(Response::LightroomWorkbenchIo(LightroomWorkbenchIoReply::CaptureComplete {
+            manifest,
+            ..
+        })) = decode_outcome(&encoded)?
+        else {
+            anyhow::bail!("capture manifest reply shape")
+        };
+        assert_eq!(manifest.artifacts[0].revision.modified_ns, Some(u128::MAX));
+        assert_eq!(
+            manifest.companion_inventory[0].modified_ns,
+            Some(u64::MAX as u128)
+        );
+        assert_eq!(
+            manifest.logical_revision.as_ref().unwrap().modified_ns,
+            Some(0)
+        );
+        assert_eq!(
+            serde_json::to_vec(&manifest)?,
+            disk,
+            "wire roundtrip changed the public manifest"
+        );
+
+        let encoded = encode_outcome(&Ok(Response::LightroomWorkbenchIo(
+            LightroomWorkbenchIoReply::SealHashed {
+                operation: "operation".into(),
+                token: "token".into(),
+                identity: revision(Some(u128::MAX)),
+                blake3: "f".repeat(64),
+                directory: NativePath::from_path(&root),
+                database: NativePath::from_path(&root.join("logical.sqlite3")),
+            },
+        )))?;
+        let Ok(Response::LightroomWorkbenchIo(LightroomWorkbenchIoReply::SealHashed {
+            identity,
+            ..
+        })) = decode_outcome(&encoded)?
+        else {
+            anyhow::bail!("seal revision reply shape")
+        };
+        assert_eq!(identity.modified_ns, Some(u128::MAX));
+        Ok(())
+    }
+
     fn seal_chunk(bytes: Vec<u8>) -> LightroomWorkbenchIo {
         LightroomWorkbenchIo::SealChunk {
             operation: "operation".into(),
