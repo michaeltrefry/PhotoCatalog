@@ -503,7 +503,7 @@ fn write_encoded_callback_request(
     encoded: &[u8],
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let digest = crate::lightroom::digest(&encoded);
+    let digest = crate::lightroom::digest(encoded);
     write_packet(
         writer,
         &Outcome::CallbackBegin {
