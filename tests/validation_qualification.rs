@@ -978,6 +978,7 @@ impl Harness {
                 .as_str()
                 .context("capture revision")?
                 .to_owned();
+            let mut row_stage = None;
             for _ in 0..100 {
                 let progress = wb_action(
                     &self.bridge,
@@ -986,8 +987,47 @@ impl Harness {
                         max_rows: U64(100_000),
                     },
                 )?;
-                if progress["stage"].as_str() == Some("complete") {
+                let stage = progress["stage"].as_str().context("inspection row stage")?;
+                if matches!(stage, "complete" | "rows_reconciled_paths_pending") {
+                    row_stage = Some(stage.to_owned());
                     break;
+                }
+                ensure!(
+                    stage == "pending",
+                    "unexpected inspection row stage: {stage}"
+                );
+            }
+            let row_stage = row_stage.context("inspection rows did not finish within 100 pages")?;
+            let mut original_pages = Vec::new();
+            if row_stage != "complete" {
+                for _ in 0..100 {
+                    let page = wb_action(
+                        &self.bridge,
+                        wb::Action::InspectOriginals {
+                            revision: revision.clone(),
+                            limit: U64(1_000),
+                            inspection: app_lightroom::OriginalInspection::Packets,
+                        },
+                    )?;
+                    let processed = page["processed"]
+                        .as_str()
+                        .context("original inspection processed count")?
+                        .parse::<u64>()?;
+                    original_pages.push(page);
+                    let interim: InspectionReport = serde_json::from_value(wb_query(
+                        &self.bridge,
+                        wb::Query::Report {
+                            revision: revision.clone(),
+                        },
+                    )?)?;
+                    if interim.stage == "complete" {
+                        break;
+                    }
+                    ensure!(
+                        interim.stage == "rows_reconciled_paths_pending" && processed > 0,
+                        "original inspection stalled for {name}: {}",
+                        interim.stage
+                    );
                 }
             }
             let report: InspectionReport = serde_json::from_value(wb_query(
@@ -1001,6 +1041,49 @@ impl Harness {
                 "inspection incomplete for {name}: {}",
                 report.stage
             );
+            let mut paths = Vec::new();
+            let mut after = 0i64;
+            let mut paths_exhausted = false;
+            for _ in 0..100 {
+                let page = wb_query(
+                    &self.bridge,
+                    wb::Query::Paths {
+                        revision: revision.clone(),
+                        after: photocatalog::application::I64(after),
+                        limit: U64(1_000),
+                    },
+                )?;
+                let rows = page["rows"].as_array().context("inspection path rows")?;
+                for row in rows {
+                    let state = row["state"].as_str().context("inspection path state")?;
+                    ensure!(
+                        matches!(
+                            state,
+                            "available_packets_retained" | "available_packet_gaps"
+                        ),
+                        "unexpected original path state for {name}: {state}"
+                    );
+                    paths.push(row.clone());
+                }
+                if page["next"].is_null() {
+                    paths_exhausted = true;
+                    break;
+                }
+                let next = page["next"]
+                    .as_str()
+                    .context("inspection path cursor")?
+                    .parse()?;
+                ensure!(next > after, "inspection path cursor did not advance");
+                after = next;
+            }
+            ensure!(
+                paths_exhausted,
+                "inspection paths exceed qualification bound"
+            );
+            self.record(
+                &format!("inspection-{name}.json"),
+                &json!({"row_stage": row_stage, "original_pages": original_pages, "paths": paths, "report": &report}),
+            )?;
             let year = &name[..4];
             wb_action(
                 &self.bridge,
