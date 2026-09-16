@@ -200,6 +200,19 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         )?;
     let envelope = lightroom_process::ENVELOPE_BYTES as u64;
     let [dispatcher_layout, shared_layout, entry_layout] = dispatcher_layouts();
+    let arc = |layout: (usize, usize)| -> Result<u64> {
+        Ok(crate::lightroom_migration_worker::memory::channels::arc(
+            std::alloc::Layout::from_size_align(layout.0, layout.1)?,
+        )? as u64)
+    };
+    let [completion_layout, cancellation_layout] =
+        super::desktop::workbench::completion_metadata_layouts();
+    let cancellation_flag = arc((
+        std::mem::size_of::<AtomicBool>(),
+        std::mem::align_of::<AtomicBool>(),
+    ))?;
+    let completion_channel = super::desktop::workbench::completion_channel_backing()? as u64;
+    let callback_layouts = lightroom_process::callback_metadata_layouts();
     let source = c.add(&[f.source as u64, path, c.mul(2, c.string(IDENTITY_BYTES)?)?])?;
     let source_budget = crate::preview::budget_state_layout();
     let source_budget = crate::lightroom_migration_worker::memory::channels::arc(
@@ -211,13 +224,60 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         "g.dispatcher.fixed_owner_and_shared_layouts",
         Phase::Retained,
         "base",
-        c.add(&[dispatcher_layout.0 as u64, shared_layout.0 as u64])?,
+        c.add(&[
+            dispatcher_layout.0 as u64,
+            arc(shared_layout)?,
+            cancellation_flag,
+        ])?,
     );
     a.push(
         "g.dispatcher.queued_and_active_typed_requests",
         Phase::Retained,
         "base",
-        c.mul(slots, c.add(&[entry_layout.0 as u64, c.json(envelope)?])?)?,
+        c.add(&[
+            c.vec(entry_layout.0 as u64, queue)?,
+            c.vec(entry_layout.0 as u64, controls)?,
+            entry_layout.0 as u64,
+            c.mul(slots, c.mul(2, c.json(envelope)?)?)?,
+        ])?,
+    );
+    a.push(
+        "g.dispatcher.completion_permits_channels_and_cancellation",
+        Phase::Retained,
+        "base",
+        c.mul(
+            slots,
+            c.add(&[
+                arc(completion_layout)?,
+                std::mem::size_of::<std::sync::Arc<()>>() as u64,
+                cancellation_flag,
+                arc(cancellation_layout)?,
+                completion_channel,
+            ])?,
+        )?,
+    );
+    a.push(
+        "transient.managed_document_callback_roots",
+        Phase::Active,
+        "callback",
+        c.add(&[
+            callback_layouts.proxy as u64,
+            callback_layouts.state as u64,
+            callback_layouts.assembly as u64,
+            callback_layouts.request as u64,
+            callback_layouts.value as u64,
+            callback_layouts.outcome as u64,
+            c.add(&[
+                callback_layouts.sealed_request as u64,
+                callback_layouts.sealed_reply as u64,
+            ])?
+            .max(c.add(&[
+                callback_layouts.artifact_request as u64,
+                callback_layouts.artifact_reply as u64,
+            ])?),
+            c.json(callback)?,
+            c.json(envelope)?,
+        ])?,
     );
     a.push(
         "g.source_parent_and_private_budget_counters",
@@ -533,6 +593,8 @@ mod tests {
         for name in [
             "g.dispatcher.fixed_owner_and_shared_layouts",
             "g.dispatcher.queued_and_active_typed_requests",
+            "g.dispatcher.completion_permits_channels_and_cancellation",
+            "transient.managed_document_callback_roots",
             "g.source_parent_and_private_budget_counters",
             "g.owner_generation_router_reader_custody",
             "w.control_status_worker_and_bridge",
