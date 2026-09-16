@@ -381,8 +381,24 @@ impl Running {
                 eprintln!("{error:#}");
             }
         }
-        let mut filesystem_retired = false;
-        if c_reaped {
+        // DesktopBridge may already have checked native dependents, reaped F,
+        // and joined the relay. In particular, forced retirement preserves an
+        // Unknown operation diagnostic; invoking normal F work again is invalid.
+        let mut filesystem_retired = self
+            .bridge
+            .0
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .filesystem_verified;
+        if filesystem_retired {
+            ensure!(
+                self.parent.threads.lock().unwrap().is_empty(),
+                "F retirement proof retained relay threads"
+            );
+        }
+        if c_reaped && !filesystem_retired {
             // This fixture admits only the preview helper allowlist. Once C is
             // reaped, forced F cleanup cannot race an untracked descendant.
             match self.parent.finish_after_dependents(false) {
