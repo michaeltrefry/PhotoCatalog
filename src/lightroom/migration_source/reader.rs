@@ -312,7 +312,7 @@ impl InputSeal {
             crate::lightroom::MANIFEST_BYTES,
         )?))
     }
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         #[cfg(all(test, feature = "internal-capacity-probes"))]
         let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::SEAL_SETS);
         ensure!(self.protocol == 1, "unsupported migration-source seal");

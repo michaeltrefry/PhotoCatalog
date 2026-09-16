@@ -261,10 +261,15 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         "transient.managed_document_callback_roots",
         Phase::Active,
         "callback",
+        // W retains the typed callback request clone while streaming its full
+        // encoded request and one bounded envelope frame. json(callback)
+        // conservatively funds the encoded Vec plus a worst-case graph for
+        // the typed request; the fixed roots name both directional assemblies.
         c.add(&[
             callback_layouts.proxy as u64,
             callback_layouts.state as u64,
             callback_layouts.assembly as u64,
+            callback_layouts.request_assembly as u64,
             callback_layouts.request as u64,
             callback_layouts.value as u64,
             callback_layouts.outcome as u64,
@@ -501,9 +506,16 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         ])?,
     );
     a.push(
-        "transient.source_callback_frame_and_typed_payload",
+        "transient.source_callback_request_assembly_and_reply",
         Phase::Active,
         "callback",
+        // G retains the full encoded W request while its Content-backed typed
+        // CallbackRequest is dispatched, and callback reply generation may
+        // then retain another full encoded payload. The first vec funds that
+        // reply; json funds the request assembly plus worst-case decoder graph.
+        // W's request clone and encoded bytes are independently funded by
+        // managed_document_callback_roots above, while the long-lived seal and
+        // selection graphs remain charged by their own active contributions.
         c.add(&[c.vec(1, callback)?, c.json(callback)?, c.vec(1, page)?])?,
     );
     a.push(
@@ -657,7 +669,7 @@ mod tests {
             "transient.request_decode_and_typed_action",
             "transient.result_build_encode_and_page",
             "transient.selection_documents_and_rosters",
-            "transient.source_callback_frame_and_typed_payload",
+            "transient.source_callback_request_assembly_and_reply",
             "transient.w_exact_manifest_assembly",
             "transient.seal_documents_and_preparation",
         ] {

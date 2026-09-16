@@ -297,6 +297,7 @@ pub(super) struct CallbackMetadataLayouts {
     pub proxy: usize,
     pub state: usize,
     pub assembly: usize,
+    pub request_assembly: usize,
     pub request: usize,
     pub value: usize,
     pub outcome: usize,
@@ -312,6 +313,7 @@ pub(super) fn callback_metadata_layouts() -> CallbackMetadataLayouts {
         proxy: std::mem::size_of::<CallbackProxy>(),
         state: std::mem::size_of::<CallbackState>(),
         assembly: std::mem::size_of::<CallbackAssembly>(),
+        request_assembly: std::mem::size_of::<CallbackRequestReceiver>(),
         request: std::mem::size_of::<CallbackRequest>(),
         value: std::mem::size_of::<CallbackValue>(),
         outcome: std::mem::size_of::<Outcome>(),
@@ -373,9 +375,15 @@ enum Outcome {
         sequence: crate::application::U64,
         instance: crate::catalog_session::LeaseId,
     },
-    Callback {
+    CallbackBegin {
         sequence: crate::application::U64,
-        request: CallbackRequest,
+        bytes: crate::application::U64,
+        blake3: String,
+    },
+    CallbackChunk {
+        sequence: crate::application::U64,
+        offset: crate::application::U64,
+        bytes: Vec<u8>,
     },
 }
 
@@ -476,6 +484,51 @@ fn request_digest(request: &Request) -> Result<String> {
     Ok(blake3::hash(&encode(request)?).to_hex().to_string())
 }
 
+fn encode_callback_request(request: &CallbackRequest, cancel: &AtomicBool) -> Result<Vec<u8>> {
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "Workbench callback canceled"
+    );
+    let encoded = encode_limit(request, CALLBACK_BYTES)?;
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "Workbench callback canceled"
+    );
+    Ok(encoded)
+}
+
+fn write_encoded_callback_request(
+    writer: &mut impl Write,
+    sequence: crate::application::U64,
+    encoded: &[u8],
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let digest = crate::lightroom::digest(&encoded);
+    write_packet(
+        writer,
+        &Outcome::CallbackBegin {
+            sequence,
+            bytes: crate::application::U64(encoded.len().try_into()?),
+            blake3: digest,
+        },
+    )?;
+    for (index, bytes) in encoded.chunks(CALLBACK_CHUNK_BYTES).enumerate() {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "Workbench callback canceled"
+        );
+        write_packet(
+            writer,
+            &Outcome::CallbackChunk {
+                sequence,
+                offset: crate::application::U64((index * CALLBACK_CHUNK_BYTES) as u64),
+                bytes: bytes.to_vec(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct CallbackState {
     next: u64,
@@ -489,6 +542,130 @@ struct CallbackAssembly {
     blake3: String,
     bytes: Vec<u8>,
 }
+struct CallbackRequestAssembly {
+    sequence: u64,
+    length: usize,
+    blake3: String,
+    bytes: Vec<u8>,
+}
+#[derive(Default)]
+struct CallbackRequestReceiver {
+    sequence: u64,
+    assembly: Option<CallbackRequestAssembly>,
+}
+impl CallbackRequestReceiver {
+    fn begin(
+        &mut self,
+        sequence: crate::application::U64,
+        length: crate::application::U64,
+        blake3: String,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "Workbench callback request canceled"
+        );
+        ensure!(self.assembly.is_none(), "Workbench callback interleaved");
+        ensure!(
+            sequence.0
+                == self
+                    .sequence
+                    .checked_add(1)
+                    .context("Workbench callback sequence exhausted")?,
+            "Workbench callback request sequence"
+        );
+        let length = usize::try_from(length.0)?;
+        ensure!(
+            (1..=CALLBACK_BYTES).contains(&length),
+            "Workbench callback request length"
+        );
+        ensure!(
+            blake3.len() == 64
+                && blake3
+                    .bytes()
+                    .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()),
+            "Workbench callback request digest"
+        );
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length)?;
+        self.assembly = Some(CallbackRequestAssembly {
+            sequence: sequence.0,
+            length,
+            blake3,
+            bytes,
+        });
+        Ok(())
+    }
+
+    fn push(
+        &mut self,
+        sequence: crate::application::U64,
+        offset: crate::application::U64,
+        bytes: Vec<u8>,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "Workbench callback request canceled"
+        );
+        let assembly = self
+            .assembly
+            .as_mut()
+            .context("Workbench callback request has no begin")?;
+        let remaining = assembly
+            .length
+            .checked_sub(assembly.bytes.len())
+            .context("Workbench callback request overrun")?;
+        ensure!(
+            assembly.sequence == sequence.0
+                && offset.0 == assembly.bytes.len() as u64
+                && !bytes.is_empty()
+                && bytes.len() <= CALLBACK_CHUNK_BYTES
+                && bytes.len() <= remaining,
+            "Workbench callback request continuity"
+        );
+        assembly.bytes.extend_from_slice(&bytes);
+        Ok(assembly.bytes.len() == assembly.length)
+    }
+
+    fn request(&self) -> Result<CallbackRequest> {
+        let assembly = self
+            .assembly
+            .as_ref()
+            .context("Workbench callback request is incomplete")?;
+        ensure!(
+            assembly.bytes.len() == assembly.length
+                && crate::lightroom::digest(&assembly.bytes) == assembly.blake3,
+            "Workbench callback request changed"
+        );
+        decode_limit(&assembly.bytes, CALLBACK_BYTES)
+    }
+
+    fn finish(&mut self, sequence: crate::application::U64) -> Result<()> {
+        let assembly = self
+            .assembly
+            .take()
+            .context("Workbench callback request completion missing")?;
+        ensure!(
+            assembly.sequence == sequence.0 && assembly.bytes.len() == assembly.length,
+            "Workbench callback request completion sequence"
+        );
+        self.sequence = sequence.0;
+        Ok(())
+    }
+
+    fn is_pending(&self) -> bool {
+        self.assembly.is_some()
+    }
+
+    fn ensure_idle(&self) -> Result<()> {
+        ensure!(
+            !self.is_pending(),
+            "Workbench callback request ended before completion"
+        );
+        Ok(())
+    }
+}
 struct CallbackProxy {
     output: Arc<Mutex<std::io::Stdout>>,
     state: Mutex<CallbackState>,
@@ -496,6 +673,15 @@ struct CallbackProxy {
 }
 impl CallbackProxy {
     fn call(&self, request: CallbackRequest, cancel: &AtomicBool) -> Result<CallbackValue> {
+        let encoded = encode_callback_request(&request, cancel)?;
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        // A preexisting cancellation consumes no sequence. Once a sequence is
+        // allocated, Begin is unconditional; cancellation while streaming
+        // leaves an explicit partial request for G's checked revoke path.
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "Workbench callback canceled"
+        );
         let sequence = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             ensure!(!state.closed, "Workbench supervisor callback is closed");
@@ -505,13 +691,9 @@ impl CallbackProxy {
                 .context("callback sequence exhausted")?;
             state.next
         };
-        write_packet(
-            &mut *self.output.lock().unwrap_or_else(|e| e.into_inner()),
-            &Outcome::Callback {
-                sequence: crate::application::U64(sequence),
-                request,
-            },
-        )?;
+        let sequence = crate::application::U64(sequence);
+        write_encoded_callback_request(&mut *output, sequence, &encoded, cancel)?;
+        drop(output);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             ensure!(
@@ -522,7 +704,7 @@ impl CallbackProxy {
             if state
                 .waiting
                 .as_ref()
-                .is_some_and(|value| value.0 == sequence)
+                .is_some_and(|value| value.0 == sequence.0)
             {
                 let (_, result) = state.waiting.take().unwrap();
                 return result.map_err(|failure| anyhow::anyhow!(failure.detail));
@@ -1002,6 +1184,7 @@ struct Transport {
     input: ChildStdin,
     output: Box<dyn Read + Send>,
     sequence: u64,
+    callback: CallbackRequestReceiver,
 }
 
 #[cfg(test)]
@@ -1204,6 +1387,7 @@ impl Client {
                     input,
                     output,
                     sequence: 0,
+                    callback: CallbackRequestReceiver::default(),
                 }),
                 drained: false,
                 poisoned: None,
@@ -1268,6 +1452,43 @@ impl Client {
                 Ok(CallbackValue::Retired)
             }
         }
+    }
+
+    fn begin_callback_request(
+        transport: &mut Transport,
+        sequence: crate::application::U64,
+        length: crate::application::U64,
+        blake3: String,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        transport.callback.begin(sequence, length, blake3, cancel)
+    }
+
+    fn push_callback_request(
+        transport: &mut Transport,
+        sequence: crate::application::U64,
+        offset: crate::application::U64,
+        bytes: Vec<u8>,
+        managed: Option<&Arc<dyn super::lightroom::ManagedIo>>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "Workbench callback request canceled"
+        );
+        let complete = transport
+            .callback
+            .push(sequence, offset, bytes, cancel.as_ref())?;
+        if complete {
+            let request = transport.callback.request()?;
+            // Retain the exact encoded request until its checked callback reply
+            // has been written. This preserves failure evidence and makes the
+            // encoded request, decoded graph, and reply-generation overlap
+            // explicit to Workbench capacity admission.
+            Self::reply_callback(transport, sequence, request, managed, cancel)?;
+            transport.callback.finish(sequence)?;
+        }
+        Ok(())
     }
 
     fn reply_callback(
@@ -1396,11 +1617,27 @@ impl Client {
                 let outcome: Outcome = read_packet(&mut transport.output)?
                     .context("Workbench reply lost; child remains owned for checked drain")?;
                 match outcome {
-                    Outcome::Callback { sequence, request } => {
-                        Self::reply_callback(
+                    Outcome::CallbackBegin {
+                        sequence,
+                        bytes,
+                        blake3,
+                    } => Self::begin_callback_request(
+                        transport,
+                        sequence,
+                        bytes,
+                        blake3,
+                        &self.interrupted,
+                    )?,
+                    Outcome::CallbackChunk {
+                        sequence,
+                        offset,
+                        bytes,
+                    } => {
+                        Self::push_callback_request(
                             transport,
                             sequence,
-                            request,
+                            offset,
+                            bytes,
                             self.managed.as_ref(),
                             &self.interrupted,
                         )?;
@@ -1410,6 +1647,7 @@ impl Client {
                         request_digest: actual_digest,
                         result,
                     } => {
+                        transport.callback.ensure_idle()?;
                         ensure!(
                             actual == sequence && actual_digest == digest,
                             "Workbench reply binding mismatch"
@@ -1483,10 +1721,26 @@ impl Client {
                 let outcome: Outcome = read_packet(&mut transport.output)?
                     .context("Workbench drain acknowledgement lost")?;
                 match outcome {
-                    Outcome::Callback { sequence, request } => Self::reply_callback(
+                    Outcome::CallbackBegin {
+                        sequence,
+                        bytes,
+                        blake3,
+                    } => Self::begin_callback_request(
                         transport,
                         sequence,
-                        request,
+                        bytes,
+                        blake3,
+                        &self.interrupted,
+                    )?,
+                    Outcome::CallbackChunk {
+                        sequence,
+                        offset,
+                        bytes,
+                    } => Self::push_callback_request(
+                        transport,
+                        sequence,
+                        offset,
+                        bytes,
                         self.managed.as_ref(),
                         &self.interrupted,
                     )?,
@@ -1494,6 +1748,7 @@ impl Client {
                         sequence: actual,
                         ref instance,
                     } => {
+                        transport.callback.ensure_idle()?;
                         ensure!(
                             actual == sequence && instance == &self.instance,
                             "Workbench drain binding mismatch"
@@ -1627,6 +1882,56 @@ impl Drop for Client {
 mod tests {
     use super::*;
 
+    struct CancelAfterFrame<'a> {
+        bytes: Vec<u8>,
+        cancel: &'a AtomicBool,
+        frames: usize,
+    }
+    impl Write for CancelAfterFrame<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.frames += 1;
+            if self.frames == 1 {
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Ok(())
+        }
+    }
+
+    fn read_callback_request(reader: &mut impl Read) -> Result<(u64, CallbackRequest, usize)> {
+        let cancel = AtomicBool::new(false);
+        let mut receiver = CallbackRequestReceiver::default();
+        let mut frames = 0;
+        loop {
+            let outcome: Outcome =
+                read_packet(reader)?.context("callback request frame missing")?;
+            frames += 1;
+            match outcome {
+                Outcome::CallbackBegin {
+                    sequence,
+                    bytes,
+                    blake3,
+                } => receiver.begin(sequence, bytes, blake3, &cancel)?,
+                Outcome::CallbackChunk {
+                    sequence,
+                    offset,
+                    bytes,
+                } => {
+                    if receiver.push(sequence, offset, bytes, &cancel)? {
+                        let request = receiver.request()?;
+                        receiver.finish(sequence)?;
+                        return Ok((sequence.0, request, frames));
+                    }
+                }
+                _ => anyhow::bail!("unexpected callback request frame"),
+            }
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum PendingCallbackFault {
         MalformedFrame,
@@ -1685,16 +1990,9 @@ mod tests {
                 request,
             },
         )?;
-        let callback: Outcome =
-            read_packet(&mut output)?.context("pending artifact callback missing")?;
+        let (_, callback, _) = read_callback_request(&mut output)?;
         ensure!(
-            matches!(
-                callback,
-                Outcome::Callback {
-                    request: CallbackRequest::ArtifactPreparation { .. },
-                    ..
-                }
-            ),
+            matches!(callback, CallbackRequest::ArtifactPreparation { .. }),
             "Workbench did not stop at the artifact callback boundary"
         );
 
@@ -1894,25 +2192,314 @@ mod tests {
                 limits: crate::lightroom::migration_source::ReadLimits::default(),
                 protected: vec![],
             };
-            let outcome = Outcome::Callback {
-                sequence: crate::application::U64(1),
-                request,
-            };
-            let bytes = encode(&outcome).context("encode source SQL callback outcome")?;
-            let decoded: Outcome = decode(&bytes).context("decode source SQL callback outcome")?;
-            let Outcome::Callback {
-                request: CallbackRequest::SourceSqlOpen { seal, .. },
-                ..
-            } = decoded
-            else {
+            let mut wire = Vec::new();
+            let cancel = AtomicBool::new(false);
+            let encoded = encode_callback_request(&request, &cancel)?;
+            write_encoded_callback_request(
+                &mut wire,
+                crate::application::U64(1),
+                &encoded,
+                &cancel,
+            )?;
+            let (sequence, decoded, _) = read_callback_request(&mut wire.as_slice())?;
+            let CallbackRequest::SourceSqlOpen { seal, .. } = decoded else {
                 anyhow::bail!("source SQL callback kind changed")
             };
+            assert_eq!(sequence, 1);
             assert_eq!(seal.identity.modified_ns, Some(modified_ns));
             assert_eq!(
                 seal.supplements[0].source_revision.modified_unix_ns,
                 Some(u128::MAX)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_sql_callback_chunks_the_full_supplement_contract() -> Result<()> {
+        let mut seal: crate::lightroom::migration_source::InputSeal = serde_json::from_str(
+            r#"[1,{"encoding":"UnixBytes","units":[47,116,109,112]},["object",1,1789566682669866761,"changed"],"",["","",""],[],[]]"#,
+        )?;
+        let selected_revision = "a".repeat(64);
+        seal.blake3 = "b".repeat(64);
+        seal.approval.document_blake3 = "c".repeat(64);
+        seal.approval.scope = "selected_migration_test".into();
+        seal.selected = vec![crate::lightroom::migration_source::SelectedCapture {
+            revision: selected_revision.clone(),
+            family: "fixture-family".into(),
+            family_evidence_digest: "d".repeat(64),
+            manifest_blake3: "e".repeat(64),
+            evidence_revision: 1,
+        }];
+        seal.supplements = (0..4_096)
+            .map(|index| crate::lightroom::migration_source::SupplementPin {
+                revision: selected_revision.clone(),
+                source_id: format!("fixture-source-{index:04}"),
+                origin: "embedded".into(),
+                source_revision: crate::xmp_packets::SourceRevision {
+                    length: 1,
+                    blake3: "f".repeat(64),
+                    modified_unix_ns: Some(u128::MAX),
+                },
+                historical_status: crate::xmp_packets::Status::Complete,
+                proof_blake3: "0".repeat(64),
+            })
+            .collect();
+        seal.approval.roster_blake3 = seal.roster_blake3()?;
+        seal.validate()?;
+        let request = CallbackRequest::SourceSqlOpen {
+            seal,
+            limits: crate::lightroom::migration_source::ReadLimits::default(),
+            protected: vec![],
+        };
+        let encoded = encode_limit(&request, CALLBACK_BYTES)?;
+        assert!(encoded.len() > ENVELOPE_BYTES);
+        let mut wire = Vec::new();
+        write_encoded_callback_request(
+            &mut wire,
+            crate::application::U64(1),
+            &encoded,
+            &AtomicBool::new(false),
+        )?;
+        let (sequence, decoded, frames) = read_callback_request(&mut wire.as_slice())?;
+        let CallbackRequest::SourceSqlOpen { seal, .. } = decoded else {
+            anyhow::bail!("source SQL callback kind changed")
+        };
+        assert_eq!(sequence, 1);
+        assert!(frames > 2);
+        assert_eq!(seal.supplements.len(), 4_096);
+        assert_eq!(
+            seal.supplements
+                .last()
+                .unwrap()
+                .source_revision
+                .modified_unix_ns,
+            Some(u128::MAX)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_request_receiver_rejects_invalid_or_canceled_streams() -> Result<()> {
+        let cancel = AtomicBool::new(false);
+        let request = encode_limit(&CallbackRequest::Admit, CALLBACK_BYTES)?;
+        let digest = crate::lightroom::digest(&request);
+
+        for (length, digest) in [
+            (0, digest.clone()),
+            ((CALLBACK_BYTES as u64) + 1, digest.clone()),
+            (request.len() as u64, "BAD".into()),
+        ] {
+            assert!(
+                CallbackRequestReceiver::default()
+                    .begin(
+                        crate::application::U64(1),
+                        crate::application::U64(length),
+                        digest,
+                        &cancel,
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            CallbackRequestReceiver::default()
+                .begin(
+                    crate::application::U64(2),
+                    crate::application::U64(request.len() as u64),
+                    digest.clone(),
+                    &cancel,
+                )
+                .is_err()
+        );
+        assert!(
+            CallbackRequestReceiver::default()
+                .push(
+                    crate::application::U64(1),
+                    crate::application::U64(0),
+                    request.clone(),
+                    &cancel,
+                )
+                .is_err()
+        );
+
+        let mut receiver = CallbackRequestReceiver::default();
+        receiver.begin(
+            crate::application::U64(1),
+            crate::application::U64(request.len() as u64),
+            digest.clone(),
+            &cancel,
+        )?;
+        assert!(
+            receiver
+                .begin(
+                    crate::application::U64(1),
+                    crate::application::U64(request.len() as u64),
+                    digest.clone(),
+                    &cancel,
+                )
+                .is_err()
+        );
+        for (sequence, offset, bytes) in [
+            (2, 0, request.clone()),
+            (1, 1, request.clone()),
+            (1, 0, Vec::new()),
+        ] {
+            assert!(
+                receiver
+                    .push(
+                        crate::application::U64(sequence),
+                        crate::application::U64(offset),
+                        bytes,
+                        &cancel,
+                    )
+                    .is_err()
+            );
+        }
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            receiver
+                .push(
+                    crate::application::U64(1),
+                    crate::application::U64(0),
+                    request.clone(),
+                    &cancel,
+                )
+                .is_err()
+        );
+        assert!(receiver.is_pending());
+        assert_eq!(receiver.sequence, 0);
+
+        let cancel = AtomicBool::new(false);
+        let mut oversized = CallbackRequestReceiver::default();
+        oversized.begin(
+            crate::application::U64(1),
+            crate::application::U64((CALLBACK_CHUNK_BYTES + 1) as u64),
+            "0".repeat(64),
+            &cancel,
+        )?;
+        assert!(
+            oversized
+                .push(
+                    crate::application::U64(1),
+                    crate::application::U64(0),
+                    vec![0; CALLBACK_CHUNK_BYTES + 1],
+                    &cancel,
+                )
+                .is_err()
+        );
+        let mut overrun = CallbackRequestReceiver::default();
+        overrun.begin(
+            crate::application::U64(1),
+            crate::application::U64(1),
+            "0".repeat(64),
+            &cancel,
+        )?;
+        assert!(
+            overrun
+                .push(
+                    crate::application::U64(1),
+                    crate::application::U64(0),
+                    vec![0, 1],
+                    &cancel,
+                )
+                .is_err()
+        );
+        let mut changed = CallbackRequestReceiver::default();
+        changed.begin(
+            crate::application::U64(1),
+            crate::application::U64(request.len() as u64),
+            "0".repeat(64),
+            &cancel,
+        )?;
+        assert!(changed.push(
+            crate::application::U64(1),
+            crate::application::U64(0),
+            request.clone(),
+            &cancel,
+        )?);
+        assert!(changed.request().is_err());
+        assert!(changed.is_pending());
+
+        let mut completed = CallbackRequestReceiver::default();
+        completed.begin(
+            crate::application::U64(1),
+            crate::application::U64(request.len() as u64),
+            digest,
+            &cancel,
+        )?;
+        assert!(completed.push(
+            crate::application::U64(1),
+            crate::application::U64(0),
+            request,
+            &cancel,
+        )?);
+        assert!(matches!(completed.request()?, CallbackRequest::Admit));
+        assert!(completed.ensure_idle().is_err());
+        completed.finish(crate::application::U64(1))?;
+        completed.ensure_idle()?;
+        assert_eq!(completed.sequence, 1);
+        assert!(
+            completed
+                .begin(
+                    crate::application::U64(1),
+                    crate::application::U64(1),
+                    "0".repeat(64),
+                    &cancel,
+                )
+                .is_err()
+        );
+        assert!(
+            completed
+                .begin(
+                    crate::application::U64(3),
+                    crate::application::U64(1),
+                    "0".repeat(64),
+                    &cancel,
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_request_send_cancellation_keeps_sequence_and_partial_state_explicit() -> Result<()>
+    {
+        let request = CallbackRequest::Admit;
+        let canceled = AtomicBool::new(true);
+        assert!(encode_callback_request(&request, &canceled).is_err());
+
+        let cancel = AtomicBool::new(false);
+        let encoded = encode_callback_request(&request, &cancel)?;
+        let mut writer = CancelAfterFrame {
+            bytes: Vec::new(),
+            cancel: &cancel,
+            frames: 0,
+        };
+        assert!(
+            write_encoded_callback_request(
+                &mut writer,
+                crate::application::U64(1),
+                &encoded,
+                &cancel,
+            )
+            .is_err()
+        );
+        assert_eq!(writer.frames, 1);
+        let mut bytes = writer.bytes.as_slice();
+        let begin: Outcome = read_packet(&mut bytes)?.context("callback Begin missing")?;
+        let mut receiver = CallbackRequestReceiver::default();
+        let Outcome::CallbackBegin {
+            sequence,
+            bytes: length,
+            blake3,
+        } = begin
+        else {
+            anyhow::bail!("canceled callback did not publish Begin")
+        };
+        receiver.begin(sequence, length, blake3, &AtomicBool::new(false))?;
+        assert!(read_packet::<Outcome>(&mut bytes)?.is_none());
+        assert!(receiver.is_pending());
+        assert_eq!(receiver.sequence, 0);
         Ok(())
     }
 
