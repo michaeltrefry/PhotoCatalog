@@ -460,34 +460,54 @@ fn reopen_claimed_files(
     path: &Path,
     identities: &[Option<Key>; 8],
 ) -> Result<()> {
+    if inner.directory_removed {
+        ensure!(
+            inner.files.iter().all(Option::is_none),
+            "removed claimed directory retains artifact handles"
+        );
+        return Ok(());
+    }
     ensure!(
         lease_identity(&crate::filesystem_worker::open_directory(path)?)?
             == lease_identity(&inner.directory)?,
         "claimed export directory identity changed during move"
     );
-    if inner
-        .files
-        .iter()
-        .zip(identities)
-        .all(|(file, identity)| file.is_some() == identity.is_some())
-    {
-        return Ok(());
-    }
-    let mut files: [Option<File>; 8] = std::array::from_fn(|_| None);
     for (index, name) in TRANSPORT_FILES.iter().enumerate() {
-        if let Some(identity) = identities[index] {
-            let file = discard_file(&path.join(name))?;
+        let Some(identity) = identities[index] else {
+            ensure!(
+                inner.files[index].is_none(),
+                "claimed absent artifact retains a handle"
+            );
+            continue;
+        };
+        if inner.removed[index] {
+            ensure!(
+                inner.files[index].is_none()
+                    && matches!(
+                        fs::symlink_metadata(path.join(name)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    ),
+                "removed claimed artifact remains reachable"
+            );
+            continue;
+        }
+        if let Some(file) = &inner.files[index] {
             ensure!(
                 lease_identity(&file)? == identity,
                 "claimed export artifact identity changed during move"
             );
-            if index < 2 {
-                file.try_lock_exclusive().context("claimed lease busy")?;
-            }
-            files[index] = Some(file);
+            continue;
         }
+        let file = discard_file(&path.join(name))?;
+        ensure!(
+            lease_identity(&file)? == identity,
+            "claimed export artifact identity changed during move"
+        );
+        if index < 2 {
+            file.try_lock_exclusive().context("claimed lease busy")?;
+        }
+        inner.files[index] = Some(file);
     }
-    inner.files = files;
     Ok(())
 }
 fn remove_control(wrapper: &Path) -> Result<()> {
