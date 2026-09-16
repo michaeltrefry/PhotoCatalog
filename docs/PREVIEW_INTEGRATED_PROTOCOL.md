@@ -1,4 +1,4 @@
-# Integrated retained previews at 10 million assets — version 3
+# Integrated retained previews at 10 million assets — version 4
 
 Status: source preparation, **UNRUN**. This fixed extension closes the integrated
 catalog-plus-preview resident-memory measurement left open by the 10k navigation
@@ -7,40 +7,43 @@ Execution requires independent source review, a clean release build bound to the
 whole source archive, and the parent's explicit serialized Mac lane. Existing
 codec, worker-reservation, quality, and headless page targets do not change.
 
-This source revision adapts the existing workload to S8 schema 6. Version-2
-schema-5 measurements and frozen binaries remain historical evidence; this is
-not a rerun, replacement result, or a new performance claim.
+This source revision admits the current schema 13 catalog. Earlier schema-5 and
+schema-6 preparations, measurements, and frozen binaries remain historical
+evidence; this is not a rerun, replacement result, or a new performance claim.
 
-The donor is a separately, explicitly migrated schema-6 copy of the pristine
+The donor is a separately, explicitly migrated schema-13 copy of the pristine
 schema-5 S7 synthetic 10M catalog. Original schema-4-to-5 migration ancestry must
 remain byte-identical. The historical schema-5 main SHA256 is
 0ac57eefbfbfeee46e83c17b8116c48ae3cb0dedae01605c1016981a536e91db;
-it is an ancestor, **not** the new schema-6 donor hash. Never use a transition or
+it is an ancestor, **not** the new schema-13 donor hash. Never use a transition or
 mixed-workload-mutated copy. A later 5-to-5 verification can accompany the old
 proof but cannot substitute for either migration.
 
 Private paths remain outside Git. The source binding contains `source_catalog`,
-`source_revision`, `catalog_count` (10000000), `schema_version` (6), and `files`
+`source_revision`, `catalog_count` (10000000), `schema_version` (13), and `files`
 (keys `""`, `-wal`, `-shm`, `-journal`, each with `present` and, if present,
 `bytes`/`sha256`). Its `receipts` retain `build_reference`, `preparation`, and
 `source_verification` path/SHA256 pairs. `migration_ancestry` still contains the
 original `proof`/`native` pairs (native protocol 1, 4-to-5) and optional separately
-labeled 5-to-5 `verification`. New `schema6_migration` contains distinct
-`proof`/`native` pairs (native protocol 2, 5-to-6, catalog_schema=6).
+labeled 5-to-5 `verification`. `schema13_migration` contains distinct
+`proof`/`native` pairs (native protocol 2, either direct 5-to-13 or 6-to-13,
+catalog_schema=13). `schema6_migration` is present only when genuine retained
+5-to-6 proof/native bytes exist; it is never synthesized to create ancestry.
 
-The new proof binds the old schema-5 main to the actual schema-6 donor hash,
+The current proof binds the actual predecessor main to the schema-13 donor hash,
 requires successful native/observer results, and compares every pre-existing
-typed table/row identity with the original ancestry. `identity_scope` must be
-`pre_existing_tables`. `added_tables` separately lists the nine initially empty
-edit/export tables and four alias tables. Alias directories/paths start empty;
-alias state has one row and dirty membership contains every existing binding.
-`alias_initial_state` separately reports unbound assets and dirty count, checked
-against pre-existing asset/binding counts. No whole-schema hash equivalence is
-claimed, and no alias reconciliation runs during timed reads. The lens/capture
-index remains exact. Copy both generations' original receipt bytes into the new
-bundle, named `proof`/`native` and `schema6_proof`/`schema6_native`; never rewrite
-historical paths or migrate the preserved source. The current overlay and page
-probe refuse schema 5 before opening through `Catalog`.
+typed table/row identity with that predecessor. `identity_scope` must be
+`pre_existing_tables`. `added_tables` is the exact versioned table roster, with
+57 additions for direct 5-to-13 and 44 for 6-to-13. It includes
+frozen initial alias, image/shared-state, mapping-epoch, collection-zero,
+repair/review, and receipt counts. `alias_initial_state`, `image_initial_state`,
+and `original_columns_preserved` are independently checked. No whole-schema hash
+equivalence is claimed. The lens/capture index remains exact. Copy original
+4-to-5 bytes as `proof`/`native`, optional genuine 5-to-6 bytes as
+`schema6_proof`/`schema6_native`, and current bytes as
+`schema13_proof`/`schema13_native`; never rewrite historical paths or migrate the
+preserved source. The current overlay and page probe refuse old schemas before
+opening through `Catalog`.
 
 ## Source-preserving setup
 
@@ -57,8 +60,8 @@ and failure receipts are retained; retries use a new directory.
 
 Only after a complete raw-copy receipt does the Rust `preview_navigation_probe
 overlay` command open the new copied catalog. It requires application ID
-1346913089, schema exactly 5 with the exact `organization_lens_capture` index, and
-exactly 10M assets. Both overlay and measured preflight reject schema 4 before
+1346913089, schema exactly 13 with the exact `organization_lens_capture` index, and
+exactly 10M assets. Both overlay and measured preflight reject older schemas before
 Catalog::open; there is no implicit measurement-time migration. It republishes the selected
 512/JPEG80 cache under the existing first-10k `fixture-{sequence:012}` IDs. It
 reuses the reviewed layout's 30 seed payload identities and identical 37-byte
@@ -123,13 +126,15 @@ frame-time award. Both profiles, all 208 page observations, zero native jobs,
 actual offline path proof, exact schema/count and source invariance are required
 for a complete evidence receipt; completion is distinct from passing budgets.
 
-Each command's binding has version3, catalog_schema=6, clean=true, exact 40-character source revision,
+Each command's binding has version4, catalog_schema=13, clean=true, exact 40-character source revision,
 kind `prepare` or `run`, and SHA256 fields for every declared input. Prepare binds
-binary/archive/storage/source_binding/dataset/protocol/coordinator and
+binary/archive/storage/source_binding/dataset/protocol/coordinator/schema_contract and
 `minimum_free_bytes`. Run binds binary/worker/archive/storage/fixture/source_binding,
-dataset/overlay/copy/preparation/protocol/coordinator/navigation_coordinator,
+dataset/overlay/copy/preparation/protocol/coordinator/schema_contract/navigation_coordinator,
 ancestry_proof/ancestry_native (plus ancestry_verification when present), and
-planned_measured_children=2/planned_verifiers=2. The whole archive and exact
+schema13_proof/schema13_native (plus schema6_proof/schema6_native only for a
+genuine intermediate hop), with planned_measured_children=2/planned_verifiers=2.
+The whole archive and exact
 compiled binary identities bind shared Rust/native code; a script digest alone
 is insufficient. Raw donor files and immutable bound receipts are rechecked at
 campaign end. Actual cache/catalog files are owned mutable experimental copies.
@@ -138,8 +143,8 @@ children. Preserve timeout/failure logs and all partial artifacts without retrie
 
 ## Focused correctness validation
 
-Tests are source-ready and **UNRUN for this extension** until a native lane is
-granted. Tiny real current-schema test catalogs check only-three-field success,
+Focused Python contract tests cover this extension; native correctness remains
+unrun until a native lane is granted. Tiny real current-schema test catalogs check only-three-field success,
 unchanged tail/organization dirty rows, wrong count/schema/key rejection,
 extra-row and remaining-column mutation rollback, and actual path/absence checks.
 Python byte fixtures check main/companion preservation, wrong source binding,

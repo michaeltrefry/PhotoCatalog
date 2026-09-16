@@ -1,9 +1,10 @@
 # Preview Stage B execution protocol 1
 
-S8 source compatibility note: current retained-navigation producer/verifier and
-its reviewed binding use version **2**, `catalog_schema: 6`, and require explicit
-untimed migration before reading an older prepared catalog. The fixture JSON
-shape remains version 1; the actual database schema is independently preflighted.
+Current source compatibility note: retained-navigation producer/verifier receipts
+remain native version **2**, while the coordinator binding is version **3** with
+`catalog_schema: 13` and a hash of the shared schema campaign contract. Explicit
+untimed migration is required before reading an older prepared catalog. The
+fixture JSON shape remains version 1; the actual database schema is independently preflighted.
 The frozen version-1/schema-5 navigation results and all codec/layout evidence
 remain unchanged. This compatibility patch makes no new measurement claim.
 
@@ -257,11 +258,11 @@ There are no native grandchildren in this campaign, retries or replacement trial
 Before admitting a measured child, the coordinator requires the six-pass 10k
 layout prerequisite with 10k independently verified distinct payloads per pass,
 bound to the exact dataset digest. It also requires an externally prepared,
-reviewed JSON binding with `version: 2`, `catalog_schema: 6`, `clean: true`, a 40-character
+reviewed JSON binding with `version: 3`, `catalog_schema: 13`, `clean: true`, a 40-character
 `source_revision`, `planned_measured_children: 44`, `planned_verifiers: 44`, and
 SHA-256 fields named `binary_sha256`, `worker_sha256`, `archive_sha256`,
 `storage_sha256`, `fixture_sha256`, `dataset_sha256`, `layout_receipt_sha256`,
-`protocol_sha256`, and `coordinator_sha256`. The archive is the complete clean
+`protocol_sha256`, `coordinator_sha256`, and `schema_contract_sha256`. The archive is the complete clean
 build source; the storage artifact preserves actual APFS Data/path attribution.
 All bound files are rechecked at campaign end. Neither this mechanical binding
 nor its lane token substitutes for independent review and the parent's explicit

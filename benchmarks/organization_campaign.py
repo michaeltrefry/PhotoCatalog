@@ -18,28 +18,23 @@ import datetime
 import psutil
 import os
 import stat
+import sys
 
-PROTOCOL = 2  # Current native receipt; synthetic fixture row marker stays 1.
+SCHEMA_CONTRACT_SOURCE = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "schema_campaign_contract.py"
+sys.path.insert(0, str(SCHEMA_CONTRACT_SOURCE.parent))
+from schema_campaign_contract import (  # noqa: E402
+    CURRENT_SCHEMA, INDEX_SQL, NATIVE_PROTOCOL, SCHEMA6_TABLES,
+    alias_initial_state, expected_added_rows, image_initial_rows, proof_fields,
+    schema6_initial_rows, validate_migration_receipt,
+)
+
+PROTOCOL = NATIVE_PROTOCOL  # Synthetic fixture row marker stays 1.
 FIXTURE_PROTOCOL = 1
-DRIVER_PROTOCOL = 5
-CURRENT_SCHEMA = 6
-SCHEMA6_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "export_alias_directories", "export_alias_dirty", "export_alias_paths", "export_alias_state", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
+DRIVER_PROTOCOL = 6
 
 
-def schema6_initial_rows(tables):
-    """Derived migration rows; no filesystem projection runs in preparation."""
-    counts = dict(tables)
-    assets, bound = counts.get("assets"), counts.get("storage_bindings")
-    if type(assets) is not int or type(bound) is not int or not 0 <= bound <= assets:
-        raise ValueError("binding cardinality required for schema6 alias initialization")
-    return [[name, 1 if name == "export_alias_state" else bound if name == "export_alias_dirty" else 0]
-            for name in SCHEMA6_TABLES]
-
-
-def schema6_alias_state(tables):
-    schema6_initial_rows(tables)
-    counts = dict(tables)
-    return {"unbound": counts["assets"] - counts["storage_bindings"], "dirty": counts["storage_bindings"]}
+# Kept as a public alias for frozen tests and external receipt tooling.
+schema6_alias_state = alias_initial_state
 
 TEXT_LIMITS = {"document_bytes": 1024**2, "page_bytes": 8 * 1024**2}
 LOCAL_TEXT_CASES = {"filename-reverse", "mixed", "text-capture"}
@@ -441,10 +436,10 @@ def preserve_schema5_ancestry(args, old_manifest_path, fixture):
             "logical_identity": logical, "table_counts": tables, "index_sql": native["index_sql"]}
 
 
-def preserve_current_ancestry(args, old_manifest_path, fixture):
-    """Keep the immediate schema6 predecessor proof; its frozen manifest retains older links."""
+def preserve_bound_migration(args, old_manifest_path, fixture, target_schema):
+    """Keep one exact predecessor proof without relabeling its schema boundary."""
     if "migration_proof" not in fixture:
-        return None  # Freshly generated current-schema fixture, not a migration claim.
+        return None
     def read(path):
         path=pathlib.Path(path)
         assert path.resolve().is_relative_to(old_manifest_path.parent.resolve())
@@ -455,19 +450,26 @@ def preserve_current_ancestry(args, old_manifest_path, fixture):
     proof_bytes,proof=read(fixture["migration_proof"])
     native_bytes,native=read(proof["native_receipt"])
     assert hashlib.sha256(native_bytes).hexdigest() == proof["native_receipt_sha256"]
-    validate_current_migration(native,fixture["count"],proof["schema_before"])
-    assert proof["owned_copy_after_sha256"] == fixture["main_sha256"] and proof["schema_after"] == CURRENT_SCHEMA
+    if target_schema == 6:
+        assert proof["schema_before"] == 5, "schema6 ancestry must remain explicitly 5-to-6"
+    validate_migration_receipt(native, fixture["count"], proof["schema_before"], target_schema)
+    assert proof["owned_copy_after_sha256"] == fixture["main_sha256"] and proof["schema_after"] == target_schema
     assert proof["owned_copy_before_sha256"] == fixture["source_main_sha256"]
-    assert (proof["owned_copy_before_sha256"] == proof["owned_copy_after_sha256"]) == (proof["schema_before"] == CURRENT_SCHEMA)
+    assert (proof["owned_copy_before_sha256"] == proof["owned_copy_after_sha256"]) == (proof["schema_before"] == target_schema)
     assert proof["observer"]["exit_code"] == 0 and proof["observer"]["error"] is None
-    for field in ("logical_before","logical_after","table_counts_before","table_counts_after","identity_scope","added_tables","alias_initial_state","index_sql"):
+    for field in proof_fields(target_schema):
         assert proof[field] == native[field]
-    directory=args.root/f"schema6-ancestry-{fixture['count']}";directory.mkdir()
+    directory=args.root/f"schema{target_schema}-ancestry-{fixture['count']}";directory.mkdir()
     for name,payload in (("proof",proof_bytes),("native",native_bytes)):
         with (directory/(name+".json")).open("xb") as output:
             output.write(payload);output.flush();os.fsync(output.fileno())
     return {"proof":str(directory/"proof.json"),"proof_sha256":hashlib.sha256(proof_bytes).hexdigest(),
             "native":str(directory/"native.json"),"native_sha256":hashlib.sha256(native_bytes).hexdigest(),
+            "schema_before":proof["schema_before"],"schema_after":target_schema,
+            "owned_copy_before_sha256":proof["owned_copy_before_sha256"],
+            "owned_copy_after_sha256":proof["owned_copy_after_sha256"],
+            "logical_identity":native["logical_after"],"table_counts":native["table_counts_after"],
+            "added_tables":native["added_tables"],
             "predecessor_manifest":str(old_manifest_path),"predecessor_manifest_sha256":sha(old_manifest_path)}
 
 
@@ -483,18 +485,25 @@ def copied_fixture(args, old_manifest_path, fixture):
         header = stream.read(100)
     assert header[:16] == b"SQLite format 3\0"
     source_schema = int.from_bytes(header[60:64], "big")
-    assert source_schema in (4, 5, CURRENT_SCHEMA), "unsupported source schema"
+    assert source_schema in (4, 5, 6, CURRENT_SCHEMA), "unsupported source schema"
     assert int.from_bytes(header[68:72], "big") == 0x50484341, "source is not PhotoCatalog"
     ancestry = preserve_schema5_ancestry(args, old_manifest_path, fixture) if source_schema == 5 else fixture.get("prior_migration")
-    current_ancestry = preserve_current_ancestry(args, old_manifest_path, fixture) if source_schema == CURRENT_SCHEMA else None
+    predecessor = preserve_bound_migration(args, old_manifest_path, fixture, source_schema) if source_schema >= 6 else None
+    if source_schema == 6:
+        assert isinstance(ancestry, dict) and predecessor is not None, "schema6 fixture requires explicit 4-to-5 and 5-to-6 ancestry"
+        assert ancestry["schema5_main_sha256"] == predecessor["owned_copy_before_sha256"], "schema5-to-6 physical continuity differs"
+        for name in ("proof", "native"):
+            path=pathlib.Path(ancestry[name])
+            assert path.resolve().is_relative_to(old_manifest_path.parent.resolve())
+            assert sha(path) == ancestry[name+"_sha256"], "schema4-to-5 ancestry bytes changed"
     before_hash = sha(source)
     assert before_hash == fixture["main_sha256"], "source main changed"
     prepare = old_manifest_path.parent / f"prepare-{fixture['count']}.json"
     assert sha(prepare) == fixture["prepare_receipt_sha256"]
     data = json.loads(prepare.read_text())
     assert data["protocol"] in (1, PROTOCOL) and data["complete"] is True and data["mode"] == "prepare" and data["count"] == fixture["count"]
-    if source_schema == CURRENT_SCHEMA and current_ancestry is None:
-        assert data["protocol"] == PROTOCOL and data.get("catalog_schema") == CURRENT_SCHEMA, "current fixture has no current producer/migration proof"
+    if source_schema >= 6 and predecessor is None:
+        assert data["protocol"] == PROTOCOL and data.get("catalog_schema") == source_schema, "fixture has no matching producer/migration proof"
     expected_counts = {name: fixture["count"] * multiplier for name, multiplier in
                        (("assets",1),("organization_assets",1),("organization_keyword_members",4),("organization_folder_members",2),("organization_text",1))}
     assert len(data["counts"]) == 5 and dict(data["counts"]) == expected_counts
@@ -522,30 +531,14 @@ def copied_fixture(args, old_manifest_path, fixture):
              "prepare_receipt_sha256": fixture["prepare_receipt_sha256"]}
     save(args.root / f"reuse-{fixture['count']}.json", proof)
     return {**fixture, "catalog": str(catalog.resolve()), "source_schema": source_schema,
-            "prior_migration": ancestry, "prior_schema6_migration": current_ancestry, "reuse_proof": str(args.root / f"reuse-{fixture['count']}.json")}
+            "prior_migration": ancestry,
+            "prior_schema6_migration": predecessor if source_schema == 6 else fixture.get("prior_schema6_migration"),
+            "prior_schema_migration": predecessor,
+            "reuse_proof": str(args.root / f"reuse-{fixture['count']}.json")}
 
 
 def validate_current_migration(native, count, source_schema):
-    assert native["protocol"] == PROTOCOL and native["catalog_schema"] == CURRENT_SCHEMA
-    assert native["complete"] is True and native["mode"] == "migrate_fixture" and native["count"] == count
-    assert native["schema_before"] == source_schema and native["schema_after"] == CURRENT_SCHEMA
-    assert native["identity_scope"] == "pre_existing_tables"
-    logical = native["logical_before"]
-    assert logical == native["logical_after"] and isinstance(logical, str) and len(logical) == 64 and all(c in "0123456789abcdef" for c in logical)
-    tables = native["table_counts_before"]
-    assert tables and tables == native["table_counts_after"] and len(dict(tables)) == len(tables)
-    assert all(isinstance(name, str) and type(n) is int and n >= 0 for name,n in tables)
-    assert all(dict(tables).get(name) == count for name in ("assets", "organization_assets", "organization_text"))
-    expected_added = schema6_initial_rows(tables) if source_schema < CURRENT_SCHEMA else []
-    assert native["added_tables"] == expected_added
-    assert all(type(n) is int for _,n in native["added_tables"])
-    assert all(type(native["alias_initial_state"].get(key)) is int for key in ("unbound", "dirty"))
-    assert native["alias_initial_state"] == schema6_alias_state(tables)
-    if source_schema < CURRENT_SCHEMA:
-        assert not set(SCHEMA6_TABLES).intersection(dict(tables))
-    else:
-        assert all(dict(tables).get(name) == n for name,n in schema6_initial_rows(tables)), "reused fixture has non-initial edit/export/alias state"
-    assert native["index_sql"] == "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
+    return validate_migration_receipt(native, count, source_schema, CURRENT_SCHEMA)
 
 
 def migrate_reused_fixture(args, fixture):
@@ -560,19 +553,24 @@ def migrate_reused_fixture(args, fixture):
     validate_current_migration(native, fixture["count"], fixture["source_schema"])
     assert native["engine_version"] == "3.51.1"
     after = sha(main)
+    if native["schema_before"] < CURRENT_SCHEMA:
+        assert before != after, "old-schema migration did not change physical bytes"
     if native["schema_before"] == 5:
         ancestor = fixture["prior_migration"]
-        assert before == ancestor["schema5_main_sha256"] and before != after, "schema5-to-6 physical migration proof missing"
+        assert before == ancestor["schema5_main_sha256"], "schema5-to-13 physical migration proof missing"
         assert native["logical_before"] == ancestor["logical_identity"] and native["table_counts_before"] == ancestor["table_counts"], "schema5 content differs from ancestor"
+    if native["schema_before"] >= 6 and native["schema_before"] < CURRENT_SCHEMA and fixture.get("prior_schema_migration"):
+        ancestor = fixture["prior_schema_migration"]
+        assert before == ancestor["owned_copy_after_sha256"], "predecessor-to-13 physical continuity missing"
+        expected_tables = sorted(ancestor["table_counts"] + ancestor["added_tables"])
+        assert native["table_counts_before"] == expected_tables, "predecessor table identity differs"
     if native["schema_before"] == CURRENT_SCHEMA:
         assert before == after, "current-schema verification changed physical bytes"
-    proof = {"identity_scope":native["identity_scope"],"added_tables":native["added_tables"],"alias_initial_state":native["alias_initial_state"],"owned_copy_before_sha256":before,"owned_copy_after_sha256":after,
-             "kind":"schema6_verification" if native["schema_before"] == CURRENT_SCHEMA else f"schema{native['schema_before']}_to_6_migration",
+    proof = {field:native[field] for field in proof_fields(CURRENT_SCHEMA)}
+    proof.update({"owned_copy_before_sha256":before,"owned_copy_after_sha256":after,
+             "kind":"schema13_verification" if native["schema_before"] == CURRENT_SCHEMA else f"schema{native['schema_before']}_to_13_migration",
              "schema_before":native["schema_before"],"schema_after":CURRENT_SCHEMA,"native_receipt":str(receipt),
-             "native_receipt_sha256":sha(receipt),"observer":observer,
-             "logical_before":native["logical_before"],"logical_after":native["logical_after"],
-             "table_counts_before":native["table_counts_before"],"table_counts_after":native["table_counts_after"],
-             "index_sql":native["index_sql"]}
+             "native_receipt_sha256":sha(receipt),"observer":observer})
     proof_path=args.root/f"migration-proof-{fixture['count']}.json"
     save(proof_path,proof)
     return {**fixture,"source_main_sha256":before,"main_sha256":after,"main_bytes":main.stat().st_size,
@@ -670,7 +668,11 @@ def main():
                 assert target != preserved and not target.is_relative_to(preserved) and not preserved.is_relative_to(target), "new root overlaps preserved campaign/catalog"
         args.root.mkdir()  # Refuse an existing root, including partial/failed runs.
         save(args.root / "build-reference.json", build)
-        save(args.root / "driver-source.json", {"sha256": sha(__file__), "source": pathlib.Path(__file__).read_text()})
+        save(args.root / "driver-source.json", {
+            "sha256": sha(__file__), "source": pathlib.Path(__file__).read_text(),
+            "schema_contract_sha256": sha(SCHEMA_CONTRACT_SOURCE),
+            "schema_contract_source": SCHEMA_CONTRACT_SOURCE.read_text(),
+        })
         if args.reuse_prepared is not None:
             prepare_reuse(args, counts)
             return
@@ -699,7 +701,8 @@ def main():
     manifest = json.loads((args.root / "manifest.json").read_text())
     assert manifest["complete"] and manifest["scales"] == counts and manifest["smoke"] == args.smoke
     assert json.loads((args.root / "build-reference.json").read_text()) == build
-    assert json.loads((args.root / "driver-source.json").read_text())["sha256"] == sha(__file__), "driver changed since preparation"
+    driver = json.loads((args.root / "driver-source.json").read_text())
+    assert driver["sha256"] == sha(__file__) and driver["schema_contract_sha256"] == sha(SCHEMA_CONTRACT_SOURCE), "driver changed since preparation"
     assert manifest["protocol"] == PROTOCOL and manifest["driver_protocol"] == DRIVER_PROTOCOL
     assert all(f.get("schema") == CURRENT_SCHEMA for f in manifest["fixtures"]), "explicit current-schema preparation required"
     assert [f["count"] for f in manifest["fixtures"]] == counts
