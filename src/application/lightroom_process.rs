@@ -148,8 +148,12 @@ enum CallbackRequest {
 enum CallbackValue {
     Admitted,
     Filesystem(crate::filesystem_worker::wire::LightroomWorkbenchIoReply),
-    SealedDocument(Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>),
-    ArtifactPreparation(Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>),
+    SealedDocument {
+        value: Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>,
+    },
+    ArtifactPreparation {
+        value: Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>,
+    },
     Source(String),
     Schema(crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects),
     Table(crate::lightroom_migration_worker::source_reader::capture_wire::TableValue),
@@ -515,7 +519,7 @@ impl super::lightroom::ManagedIo for CallbackProxy {
             },
             cancel,
         )? {
-            CallbackValue::SealedDocument(value) => match (&request, value) {
+            CallbackValue::SealedDocument { value } => match (&request, value) {
                 (crate::filesystem_worker::wire::LightroomSealedRead::Discard { .. }, None) => {
                     Ok(None)
                 }
@@ -539,7 +543,7 @@ impl super::lightroom::ManagedIo for CallbackProxy {
             },
             cancel,
         )? {
-            CallbackValue::ArtifactPreparation(value) => match (&request, value) {
+            CallbackValue::ArtifactPreparation { value } => match (&request, value) {
                 (
                     crate::filesystem_worker::wire::LightroomArtifactPreparation::Discard {
                         ..
@@ -1046,13 +1050,13 @@ impl Client {
             CallbackRequest::Filesystem { request } => Ok(CallbackValue::Filesystem(
                 managed.filesystem(request, cancel.as_ref())?,
             )),
-            CallbackRequest::SealedDocument { request } => Ok(CallbackValue::SealedDocument(
-                managed.sealed_document(request, cancel.as_ref())?,
-            )),
+            CallbackRequest::SealedDocument { request } => Ok(CallbackValue::SealedDocument {
+                value: managed.sealed_document(request, cancel.as_ref())?,
+            }),
             CallbackRequest::ArtifactPreparation { request } => {
-                Ok(CallbackValue::ArtifactPreparation(
-                    managed.artifact_preparation(request, cancel.as_ref())?,
-                ))
+                Ok(CallbackValue::ArtifactPreparation {
+                    value: managed.artifact_preparation(request, cancel.as_ref())?,
+                })
             }
             CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source(
                 managed.source_open(authority, cancel.clone())?,
