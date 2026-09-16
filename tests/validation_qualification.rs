@@ -552,7 +552,7 @@ fn sealed_document(
             request: LightroomSealedRead::Begin {
                 session: session.clone(),
                 directory: NativePath::from_path(directory),
-                document: document.clone(),
+                document,
             },
         },
     )?
