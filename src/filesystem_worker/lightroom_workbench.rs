@@ -1813,7 +1813,12 @@ mod tests {
                 .context("retained seal operation")?
                 .approval
                 .upload()?;
-            drop(upload.file.take().context("retained approval upload file")?);
+            drop(
+                upload
+                    .file
+                    .take()
+                    .context("retained approval upload file")?,
+            );
         }
         fs::rename(&output, &retained)?;
         fs::create_dir(&output)?;
