@@ -62,8 +62,19 @@ fn managed_backup_routes_share_pre_effect_public_byte_boundary() {
         Request::Close {
             catalog: "catalog".into(),
         },
+        Request::Close {
+            catalog: "雪\"".into(),
+        },
     ];
     for request in requests {
+        let encoded_bytes = serde_json::to_vec(&request).unwrap().len();
+        assert!(validate_public_request(&request, encoded_bytes).is_ok());
+        assert!(matches!(
+            validate_public_request(&request, encoded_bytes - 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        ));
         assert!(matches!(
             validate_public_request(&request, 0).unwrap_err().code,
             ErrorCode::ResourceLimit
