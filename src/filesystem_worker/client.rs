@@ -366,6 +366,26 @@ impl Client {
         }
         value
     }
+    /// Wait for the identity-checked startup acknowledgement before admitting
+    /// another managed owner. A timeout leaves this exact client available for
+    /// checked cleanup; it never substitutes a new filesystem generation.
+    pub(crate) fn wait_ready(&self, timeout: Duration) -> Result<()> {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, _) = self
+            .shared
+            .wake
+            .wait_timeout_while(state, timeout, |state| {
+                state.status.phase == Phase::Starting && state.failure.is_none() && !state.closing
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            state.status.phase == Phase::Ready && state.failure.is_none() && !state.closing,
+            "filesystem startup did not become ready: {:?}, {:?}",
+            state.status.phase,
+            state.failure
+        );
+        Ok(())
+    }
     pub fn refresh_status(&self) {
         self.shared.state.lock().unwrap().outgoing.status = Some(0);
         self.shared.wake.notify_all();
