@@ -659,6 +659,9 @@ impl super::lightroom::ManagedIo for CallbackProxy {
     }
 }
 
+// Keep the typed request inline in the admitted fixed-capacity channel.
+// Boxing adds a separate allocation without reducing the reserved slot backing.
+#[allow(clippy::large_enum_variant)]
 enum CoordinatorCommand {
     Request {
         sequence: crate::application::U64,

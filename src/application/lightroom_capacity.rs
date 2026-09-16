@@ -715,7 +715,7 @@ mod tests {
             .find(|value| value.name == "g.capability_pending_sessions_and_receipts")
             .context("capability custody contribution")?;
         let c = Checked;
-        let managed = super::super::lightroom_managed::metadata_layouts();
+        let managed = super::crate::application::lightroom_managed::metadata_layouts();
         let limits = super::super::lightroom::Limits::metadata_maximum();
         let path = c.native_path(limits.native_path_units as u64)?;
         let expected = c.add(&[
@@ -725,10 +725,10 @@ mod tests {
             c.mul(4, c.string(DIGEST_BYTES)?)?,
             c.vec(
                 managed.receipt as u64,
-                super::super::lightroom_managed::CAPABILITY_RECEIPTS as u64,
+                super::crate::application::lightroom_managed::CAPABILITY_RECEIPTS as u64,
             )?,
             c.mul(
-                super::super::lightroom_managed::CAPABILITY_RECEIPTS as u64 + 1,
+                super::crate::application::lightroom_managed::CAPABILITY_RECEIPTS as u64 + 1,
                 c.string(IDENTITY_BYTES)?,
             )?,
         ])?;
@@ -816,7 +816,8 @@ mod tests {
             limits: Default::default(),
             import_checkpoint: None,
         };
-        let requirement = Requirement::from_config(&config, super::desktop::CONTROL_SLOTS)?;
+        let requirement =
+            Requirement::from_config(&config, crate::application::desktop::CONTROL_SLOTS)?;
         let source_required = source_requirement()?;
         let metadata = ByteBudget::new(requirement.bytes())?;
         let source = ByteBudget::new(source_required)?;
@@ -829,13 +830,15 @@ mod tests {
         let filesystem =
             std::sync::Arc::new(crate::filesystem_worker::client::migration_fixture(&root)?);
         filesystem.wait_ready(std::time::Duration::from_secs(20))?;
-        let owner = super::lightroom_managed::Owner::start(
+        let owner = crate::application::lightroom_managed::Owner::start(
             &filesystem,
             &std::env::current_exe()?,
             allocation,
         )?;
-        let generation =
-            super::lightroom_managed::Generation::start_fixture(&owner, &std::env::current_exe()?)?;
+        let generation = crate::application::lightroom_managed::Generation::start_fixture(
+            &owner,
+            &std::env::current_exe()?,
+        )?;
 
         assert_eq!(metadata.used(), requirement.bytes());
         assert_eq!(source.used(), source_required);
