@@ -306,7 +306,7 @@ enum ControlTaskKind {
     BackupAdmission,
     Close,
 }
-/// This proof depends on process::paired_preview_route and private migration
+/// This proof depends on process::paired_catalog_route and private migration
 /// admission remaining a closed managed allowlist. Their identity-verified C
 /// uses only thread owners; native OS children belong to G, never C. Ready binds
 /// the complete implementation and the exact F binding. A legacy/unverified C

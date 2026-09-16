@@ -1469,7 +1469,7 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
             &mut |kind, bytes| {
                 if proxy.is_some()
                     && !matches!(kind, Kind::MigrationAdmission | Kind::BackupAdmission)
-                    && !paired_preview_route(kind, bytes)?
+                    && !paired_catalog_route(kind, bytes)?
                 {
                     return Ok(Err(error(
                         ErrorCode::InvalidRequest,
@@ -1516,29 +1516,57 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
 }
 // Explicit paired admission covers the qualified preview surface. The default
 // desktop constructor stays legacy until the remaining custody routes qualify.
-fn paired_preview_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
+fn paired_catalog_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
     if kind == Kind::Bytes {
         return Ok(true);
     }
     if kind != Kind::Command {
         return Ok(false);
     }
-    Ok(matches!(
-        serde_json::from_slice::<Request>(bytes)?,
+    // Catalog commands execute in C. Independent G owners have no public
+    // fallback into C; a new request variant requires an explicit owner.
+    Ok(match serde_json::from_slice::<Request>(bytes)? {
+        Request::Lightroom { .. }
+        | Request::LightroomMigration { .. }
+        | Request::BackupCreate { .. }
+        | Request::BackupInspect { .. }
+        | Request::BackupRestore { .. }
+        | Request::BackupStatus
+        | Request::BackupCancel { .. } => false,
         Request::OpenExisting { .. }
-            | Request::Create { .. }
-            | Request::Status
-            | Request::Close { .. }
-            | Request::ImportStart { .. }
-            | Request::ImportResume { .. }
-            | Request::ImportStatus { .. }
-            | Request::ImportCancel { .. }
-            | Request::Preview { .. }
-            | Request::PreviewStatus { .. }
-            | Request::CancelPreview { .. }
-            | Request::ReleaseViewport { .. }
-            | Request::Export { .. }
-    ))
+        | Request::Create { .. }
+        | Request::Status
+        | Request::Close { .. }
+        | Request::ImportStart { .. }
+        | Request::ImportResume { .. }
+        | Request::ImportStatus { .. }
+        | Request::ImportCancel { .. }
+        | Request::RestoreStatus { .. }
+        | Request::ResumeRestoredJobs { .. }
+        | Request::Folders { .. }
+        | Request::Images { .. }
+        | Request::Search { .. }
+        | Request::Image { .. }
+        | Request::Variant { .. }
+        | Request::Variants { .. }
+        | Request::CreateVariant { .. }
+        | Request::SaveRecipe { .. }
+        | Request::Undo { .. }
+        | Request::Redo { .. }
+        | Request::History { .. }
+        | Request::Cull { .. }
+        | Request::Preview { .. }
+        | Request::PreviewStatus { .. }
+        | Request::CancelPreview { .. }
+        | Request::ReleaseViewport { .. }
+        | Request::PreviewSettings { .. }
+        | Request::Metadata { .. }
+        | Request::MetadataWrite { .. }
+        | Request::Organization { .. }
+        | Request::EditCopy { .. }
+        | Request::Relink { .. }
+        | Request::Export { .. } => true,
+    })
 }
 fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<ChildPending>> {
     if kind == Kind::BackupAdmission {
@@ -1824,7 +1852,7 @@ fn child_input(
 mod tests {
     use super::*;
     #[test]
-    fn paired_preview_route_admits_preview_import_and_export_lifecycle() {
+    fn paired_catalog_route_admits_preview_import_and_export_lifecycle() {
         let path = crate::storage_volume::NativePath::from_path(std::path::Path::new("/fixture"));
         let catalog = "catalog".to_owned();
         for request in [
@@ -1881,12 +1909,12 @@ mod tests {
             },
         ] {
             assert!(
-                paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
+                paired_catalog_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
                     .unwrap()
             );
         }
-        assert!(paired_preview_route(Kind::Bytes, b"{}").unwrap());
-        assert!(!paired_preview_route(Kind::Hello, b"{}").unwrap());
+        assert!(paired_catalog_route(Kind::Bytes, b"{}").unwrap());
+        assert!(!paired_catalog_route(Kind::Hello, b"{}").unwrap());
     }
 
     #[test]
@@ -2043,7 +2071,7 @@ mod tests {
                 request: Box::new(request),
             };
             assert!(
-                paired_preview_route(Kind::Command, &serde_json::to_vec(&outer).unwrap()).unwrap()
+                paired_catalog_route(Kind::Command, &serde_json::to_vec(&outer).unwrap()).unwrap()
             );
         }
     }
