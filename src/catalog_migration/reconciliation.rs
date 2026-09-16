@@ -1,11 +1,9 @@
 //! Capture-level reconciliation is a separate durable stage. It compares the
 //! sealed source roster with completed destination custody and every native walk.
 use super::importer::{self, Progress, Stage, Step};
-use crate::{
-    Catalog,
-    catalog_writer::Priority,
-    lightroom::migration_source::{Collection, MigrationSource},
-};
+use crate::catalog_migration::repair_memory;
+use crate::lightroom::migration_source::MigrationRead;
+use crate::{Catalog, catalog_writer::Priority, lightroom::migration_source::Collection};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -50,7 +48,7 @@ const CLASSIFICATIONS: &str = "WITH classes AS MATERIALIZED (
 /// reported projection state. Unprojected evidence is explicit, never omitted.
 pub(crate) fn supplement_reports(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     policy: &importer::Policy,
     revision: &str,
@@ -66,7 +64,7 @@ pub(crate) fn supplement_reports(
         .query_row(
             "SELECT count(*) FROM migration_run_supplements WHERE run=?1 AND revision=?2",
             params![before.id, revision],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )
         .context("count supplemental custody receipts")?;
     ensure!(
@@ -85,7 +83,7 @@ pub(crate) fn supplement_reports(
                     && s.origin == super::file_metadata::Origin::Embedded
             })
             .context("supplement policy member missing at reconciliation")?;
-        let (hash,evidence,semantic):(String,String,String)=catalog.db.query_row("SELECT proof,evidence,semantic FROM migration_run_supplements WHERE run=?1 AND revision=?2 AND source_id=?3 AND origin=?4",params![before.id,revision,pin.source_id,pin.origin],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
+        let (hash,evidence,semantic):(String,String,String)=catalog.db.query_row("SELECT proof,evidence,semantic FROM migration_run_supplements WHERE run=?1 AND revision=?2 AND source_id=?3 AND origin=?4",params![before.id,revision,pin.source_id,pin.origin],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?)))
             .with_context(|| format!("read supplemental custody receipt source_id={} origin={}", pin.source_id, pin.origin))?;
         ensure!(
             hash == pin.proof_blake3 && evidence == member.evidence,
@@ -119,7 +117,7 @@ pub(crate) fn supplement_reports(
             );
             let result: super::file_metadata::ProjectionResult = serde_json::from_slice(bytes)?;
             ensure!(
-                result.input_digest == row.get::<_, String>(0)?
+                result.input_digest == repair_memory::get::<_, String>(row, 0)?
                     && result.historical_status == Some(pin.historical_status),
                 "supplement projection receipt association differs"
             );
@@ -208,9 +206,11 @@ fn validate_retained_roster(
         let mut observed = 0;
         loop {
             let revision: Option<String> = match &previous {
-                None => first.query_row([input], |r| r.get(0)).optional()?,
+                None => first
+                    .query_row([input], |r| repair_memory::get(r, 0))
+                    .optional()?,
                 Some(previous) => next
-                    .query_row(params![input, previous], |r| r.get(0))
+                    .query_row(params![input, previous], |r| repair_memory::get(r, 0))
                     .optional()?,
             };
             let Some(revision) = revision else { break };
@@ -231,14 +231,14 @@ fn validate_retained_roster(
 
 pub(crate) fn step(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
 ) -> Result<Step> {
     step_owned(catalog, source, before, None)
 }
 pub(crate) fn step_keyword(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     owner: &str,
 ) -> Result<Step> {
@@ -246,11 +246,11 @@ pub(crate) fn step_keyword(
 }
 fn step_owned(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     owner: Option<&str>,
 ) -> Result<Step> {
-    crate::catalog_backup::require_jobs_released(&catalog.root)?;
+    catalog.require_jobs_released()?;
     super::keyword_repair::require_owner(&catalog.db, &before.id, owner)?;
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(30);
@@ -288,12 +288,12 @@ fn epoch(db: &Connection) -> Result<i64> {
     Ok(db.query_row(
         "SELECT epoch FROM migration_mapping_epoch WHERE id=1",
         [],
-        |r| r.get(0),
+        |r| repair_memory::get(r, 0),
     )?)
 }
 fn step_inner(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     owner: Option<&str>,
 ) -> Result<Step> {
@@ -303,7 +303,7 @@ fn step_inner(
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM migration_reconciliation WHERE run=?1 AND epoch<>?2)",
             params![before.id, snapshot_epoch],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )
         .context("check stale reconciliation reports")?;
     if stale {
@@ -357,7 +357,7 @@ fn step_inner(
             .query_row(
                 "SELECT count(*) FROM migration_reconciliation WHERE run=?",
                 [&before.id],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )
             .context("count final reconciliation reports")?;
         ensure!(
@@ -383,7 +383,7 @@ fn step_inner(
             .query_row(
                 "SELECT count(*) FROM migration_run_supplements WHERE run=?",
                 [&before.id],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )
             .context("count final supplemental custody roster")?;
         ensure!(
@@ -463,7 +463,7 @@ fn step_inner(
             .query_row(
                 RETAINED_COMPLETE_COUNT,
                 params![before.input, capture.revision, ordinal],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )
             .with_context(|| format!("destination retained {collection:?} count"))?;
         ensure!(
@@ -501,13 +501,13 @@ fn step_inner(
         let table = stage
             .table()
             .context("reconciliation walk stage has no table")?;
-        let expected:i64=catalog.db.query_row("SELECT count(*) FROM migration_record_lookup WHERE input=?1 AND revision=?2 AND collection=3 AND table_name=?3",params![before.input,capture.revision,table],|r|r.get(0))
+        let expected:i64=catalog.db.query_row("SELECT count(*) FROM migration_record_lookup WHERE input=?1 AND revision=?2 AND collection=3 AND table_name=?3",params![before.input,capture.revision,table],|r|repair_memory::get(r, 0))
             .with_context(|| format!("destination {stage:?} expected lookup count"))?;
         let key = serde_json::to_string(&stage)?;
         let actual: i64 = catalog.db.query_row(
             "SELECT count(*) FROM migration_run_items WHERE run=?1 AND stage=?2 AND revision=?3",
             params![before.id, key, capture.revision],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         ).with_context(|| format!("destination {stage:?} actual walk count"))?;
         ensure!(expected == actual, "source walk {stage:?} count differs");
         report
@@ -549,7 +549,7 @@ fn step_inner(
             );
             report
                 .classifications
-                .insert(key, u64::try_from(row.get::<_, i64>(1)?)?);
+                .insert(key, u64::try_from(repair_memory::get::<_, i64>(row, 1)?)?);
         }
     }
     let (_, policy) =
@@ -557,11 +557,11 @@ fn step_inner(
     report.native_images = u64::try_from(catalog.db.query_row(
         "SELECT count(*) FROM image_import_map WHERE import_source=?1 AND capture_revision=?2",
         params![policy.import_source, capture.revision],
-        |r| r.get::<_, i64>(0),
+        |r| repair_memory::get::<_, i64>(r, 0),
     ).context("count native image mappings")?)?;
-    report.native_original_mappings=u64::try_from(catalog.db.query_row("SELECT count(*) FROM migration_originals WHERE import_source=?1 AND json_extract(source_json,'$.capture_revision')=?2",params![policy.import_source,capture.revision],|r|r.get::<_,i64>(0)).context("count native original mappings")?)?;
-    let expected_images:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage IN ('\"Masters\"','\"VirtualCopies\"') AND json_extract(outcome,'$.Image.kind')='Image'",params![before.id,capture.revision],|r|r.get(0)).context("count expected native image mappings")?;
-    let expected_files:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage='\"Files\"' AND json_type(outcome,'$.Original')='object'",params![before.id,capture.revision],|r|r.get(0)).context("count expected native original mappings")?;
+    report.native_original_mappings=u64::try_from(catalog.db.query_row("SELECT count(*) FROM migration_originals WHERE import_source=?1 AND json_extract(source_json,'$.capture_revision')=?2",params![policy.import_source,capture.revision],|r|repair_memory::get::<_,i64>(r, 0)).context("count native original mappings")?)?;
+    let expected_images:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage IN ('\"Masters\"','\"VirtualCopies\"') AND json_extract(outcome,'$.Image.kind')='Image'",params![before.id,capture.revision],|r|repair_memory::get(r, 0)).context("count expected native image mappings")?;
+    let expected_files:i64=catalog.db.query_row("SELECT count(*) FROM migration_run_items WHERE run=?1 AND revision=?2 AND stage='\"Files\"' AND json_type(outcome,'$.Original')='object'",params![before.id,capture.revision],|r|repair_memory::get(r, 0)).context("count expected native original mappings")?;
     ensure!(
         report.native_images == u64::try_from(expected_images)?
             && report.native_original_mappings == u64::try_from(expected_files)?,
@@ -653,7 +653,7 @@ impl Catalog {
         let bytes: Vec<u8> = self.db.query_row(
             "SELECT report FROM migration_reconciliation WHERE run=?1 AND revision=?2",
             params![id, revision],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )?;
         ensure!(
             bytes.len() <= 8 * 1024 * 1024,

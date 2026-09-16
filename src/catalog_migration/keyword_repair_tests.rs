@@ -166,6 +166,27 @@ fn request(c: &Catalog, s: &MigrationSource, run: &str, current: &str) -> Result
         reason: "Synthetic source-bound old keyword prefix".into(),
     })
 }
+
+#[cfg(unix)]
+pub(crate) struct ManagedFixture {
+    pub(crate) fixture: ImportFixture,
+    pub(crate) request: Request,
+    pub(crate) approval: String,
+}
+
+#[cfg(unix)]
+pub(crate) fn managed_fixture() -> Result<ManagedFixture> {
+    let fixture = fixture()?;
+    let (catalog, source, run, current) = completed(&fixture)?;
+    let request = request(&catalog, &source, &run, &current)?;
+    drop(source);
+    drop(catalog);
+    Ok(ManagedFixture {
+        fixture,
+        request,
+        approval: std::str::from_utf8(APPROVAL)?.into(),
+    })
+}
 fn until(c: &mut Catalog, s: &MigrationSource, id: &str, phase: Phase) -> Result<()> {
     for _ in 0..150 {
         if c.keyword_repair_progress(id)?.phase == phase {

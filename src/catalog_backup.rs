@@ -190,6 +190,13 @@ impl<'a, F: FnMut(Progress) -> Result<()>> Operation<'a, F> {
         Ok(())
     }
     fn guard(&self, db: &Connection) -> Result<()> {
+        self.guard_observed(db, || {})
+    }
+    fn guard_observed(
+        &self,
+        db: &Connection,
+        mut observed: impl FnMut() + Send + 'static,
+    ) -> Result<()> {
         let cancel = self.cancel.clone();
         let vm = Arc::clone(&self.vm);
         let limit = self.limits.verification_vm_steps;
@@ -198,6 +205,7 @@ impl<'a, F: FnMut(Progress) -> Result<()>> Operation<'a, F> {
         db.progress_handler(
             1000,
             Some(move || {
+                observed();
                 cancel.is_cancelled()
                     || vm.fetch_add(1000, Ordering::Relaxed) >= limit
                     || started.elapsed() >= Duration::from_secs(seconds)
@@ -267,7 +275,7 @@ fn read_document<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         regular(path)?.len() <= DOCUMENT_BYTES,
         "backup control document exceeds 64 KiB"
     );
-    let mut b = Vec::new();
+    let mut b = Vec::with_capacity((DOCUMENT_BYTES + 1) as usize);
     File::open(path)?
         .take(DOCUMENT_BYTES + 1)
         .read_to_end(&mut b)?;
@@ -287,20 +295,35 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 fn write_document(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_document_controlled(path, value, &mut || Ok(()))
+}
+fn write_document_controlled(
+    path: &Path,
+    value: &impl Serialize,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    checkpoint()?;
     let bytes = serde_json::to_vec(value)?;
     ensure!(
         bytes.len() as u64 <= DOCUMENT_BYTES,
         "control document exceeds limit"
     );
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    checkpoint()?;
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)?;
+    checkpoint()?;
     f.write_all(&bytes)?;
+    checkpoint()?;
     crate::metadata_export::sync_file(&f)?;
     drop(f);
+    checkpoint()?;
     crate::metadata_export::move_to_private(&temporary, path)?;
+    // Publication has won. Any subsequent failure is uncertain; retain the
+    // published marker for status reconciliation, never infer rollback.
+    checkpoint()?;
     sync_directory(path.parent().context("control document parent")?)
 }
 /// Called before Catalog::open creates directories or touches SQLite.
@@ -358,7 +381,7 @@ fn identity(db: &Connection) -> Result<i64> {
     let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
         app == APPLICATION_ID && (1..=CURRENT_SCHEMA_VERSION).contains(&schema),
-        "not a supported PhotoCatalog backup schema (application={app}, schema={schema})"
+        "not a supported LensWorks backup schema (application={app}, schema={schema})"
     );
     Ok(schema)
 }
@@ -744,11 +767,24 @@ pub fn resume_restored_jobs(
     restore_id: &str,
     acknowledge_pending_jobs: bool,
 ) -> Result<RestoreStatus> {
+    resume_restored_jobs_controlled(
+        root.as_ref(),
+        restore_id,
+        acknowledge_pending_jobs,
+        &mut || Ok(()),
+    )
+}
+pub(crate) fn resume_restored_jobs_controlled(
+    root: &Path,
+    restore_id: &str,
+    acknowledge_pending_jobs: bool,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+) -> Result<RestoreStatus> {
+    checkpoint()?;
     ensure!(
         acknowledge_pending_jobs,
         "explicit acknowledgment of preexisting jobs is required"
     );
-    let root = root.as_ref();
     let mut status = restore_status(root)?.context("catalog is not a restored instance")?;
     ensure!(
         status.receipt.restore_id == restore_id,
@@ -763,7 +799,7 @@ pub fn resume_restored_jobs(
                 .to_string(),
             acknowledge_pending_jobs,
         };
-        write_document(&root.join(RESUMED), &r)?;
+        write_document_controlled(&root.join(RESUMED), &r, checkpoint)?;
         status.jobs_held = false;
     }
     Ok(status)

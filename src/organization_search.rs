@@ -8,7 +8,8 @@ use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqlValue
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -156,6 +157,7 @@ const RESET_TEXT: &str = "INSERT INTO temp.organization_candidate_text(organizat
 pub struct SearchSession {
     sender: Option<mpsc::SyncSender<SessionRequest>>,
     worker: Option<thread::JoinHandle<()>>,
+    managed: Option<Arc<ManagedSearch>>,
 }
 struct SessionRequest {
     limit: usize,
@@ -250,6 +252,25 @@ fn fts_query(text: &str) -> String {
         .join(" AND ")
 }
 fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result<Sql> {
+    sql_projection(query, cursor, high, scan, false)
+}
+fn sql_projection(
+    query: &Query,
+    cursor: Option<&Cursor>,
+    high: i64,
+    scan: usize,
+    compact: bool,
+) -> Result<Sql> {
+    sql_selection(query, cursor, high, scan, compact, None)
+}
+fn sql_selection(
+    query: &Query,
+    cursor: Option<&Cursor>,
+    high: i64,
+    scan: usize,
+    compact: bool,
+    sequence: Option<i64>,
+) -> Result<Sql> {
     validate(query)?;
     let mut params = Vec::new();
     let mut predicates = Vec::new();
@@ -306,6 +327,9 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     }
     let mut source = "organization_assets a".to_string();
     let mut driving = Vec::new();
+    if let Some(sequence) = sequence {
+        driving.push(format!("a.sequence={}", bind(&mut params, sequence)));
+    }
     let mut capture_bounds = Vec::new();
     let mut split_cursor = None;
     let mut local_text = query.text.is_some();
@@ -448,8 +472,11 @@ fn sql(query: &Query, cursor: Option<&Cursor>, high: i64, scan: usize) -> Result
     };
     let text_column = if local_text { "a.search_text" } else { "NULL" };
     let limit = bind(&mut params, scan as i64);
+    // Compact grids never fetch or parse arbitrary stored provenance. Preserve
+    // the ordering key fields even when they are not shown by the grid.
+    let provenance = if compact { "'null'" } else { "a.provenance" };
     let projection = format!(
-        "a.sequence,ci.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,a.provenance,({matched}) AS matched,{text_column},a.asset_id,ci.variant_id,(ci.applied_shared_epoch!=ss.epoch OR di.sequence IS NOT NULL OR se.asset_id IS NOT NULL)"
+        "a.sequence,ci.asset_id,a.state,a.metadata_revision,a.folder,a.filename,a.capture,a.camera_make,a.camera,a.lens,a.format,a.rating,a.flag,a.label,a.conflicts,{provenance},({matched}) AS matched,{text_column},a.asset_id,ci.variant_id,(ci.applied_shared_epoch!=ss.epoch OR di.sequence IS NOT NULL OR se.asset_id IS NOT NULL)"
     );
     let source = format!(
         "{source} CROSS JOIN catalog_images ci ON ci.id=a.asset_id CROSS JOIN image_shared_state ss ON ss.asset_id=ci.asset_id LEFT JOIN organization_dirty di ON di.sequence=a.sequence LEFT JOIN image_storage_events se ON se.asset_id=ci.asset_id AND ci.sequence>se.cursor AND ci.sequence<=se.high_water"
@@ -548,6 +575,17 @@ fn page(
     scan: usize,
     text_limits: TextLimits,
 ) -> Result<Page> {
+    page_projection(db, query, cursor, limit, scan, text_limits, None)
+}
+fn page_projection(
+    db: &Connection,
+    query: &Query,
+    cursor: Option<&Cursor>,
+    limit: usize,
+    scan: usize,
+    text_limits: TextLimits,
+    compact_bytes: Option<usize>,
+) -> Result<Page> {
     organization::page_limit(limit)?;
     text_limits.validate()?;
     ensure!(
@@ -569,7 +607,8 @@ fn page(
         ensure!(c.high_water <= max, "cursor high-water exceeds catalog");
     }
     let high = cursor.map(|c| c.high_water).unwrap_or(max);
-    let query_sql = sql(query, cursor, high, scan)?;
+    let query_sql = sql_projection(query, cursor, high, scan, compact_bytes.is_some())?;
+    let mut returned_bytes = 0usize;
     let mut text_work = TextWork::default();
     let local_query = query
         .text
@@ -608,6 +647,27 @@ fn page(
             };
             text_work.candidate_rows_read += 1;
             let matched = r.get::<_, bool>(16)?;
+            if let Some(allowance) = compact_bytes {
+                // Borrow SQLite values before allocating String/JSON. Include
+                // ordering fields for unmatched candidates too; no huge cursor.
+                let mut bytes = 0usize;
+                for column in [1, 2, 5, 6, 7, 8, 9, 10, 12, 13, 14, 18, 19] {
+                    bytes = bytes
+                        .checked_add(r.get_ref(column)?.as_str()?.len())
+                        .context("compact search byte overflow")?;
+                }
+                ensure!(
+                    bytes <= allowance.min(16 * 1024),
+                    "compact search row exceeds byte admission"
+                );
+                returned_bytes = returned_bytes
+                    .checked_add(bytes)
+                    .context("compact search byte overflow")?;
+                ensure!(
+                    returned_bytes <= allowance,
+                    "compact search page exceeds byte admission"
+                );
+            }
             if matched && local_query.is_some() {
                 let text = r.get_ref(17)?.as_str()?;
                 ensure!(
@@ -714,6 +774,73 @@ impl Catalog {
         tx.commit()?;
         Ok(result)
     }
+    /// Compact bounded grid projection. Predicates/cursors/order match search;
+    /// provenance is deliberately null. The byte bound covers scanned display
+    /// fields before allocation, independently of candidate-local text admission.
+    pub fn search_grid(
+        &mut self,
+        query: &Query,
+        cursor: Option<&Cursor>,
+        limit: usize,
+        scan: usize,
+        page_bytes: usize,
+    ) -> Result<Page> {
+        ensure!(
+            (1..=1024 * 1024).contains(&page_bytes),
+            "compact search byte bounds"
+        );
+        let tx = self.db.transaction()?;
+        let result = page_projection(
+            &tx,
+            query,
+            cursor,
+            limit,
+            scan,
+            TextLimits::default(),
+            Some(page_bytes),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+    /// Exact logical image for a selected variant, independent of a grid page.
+    pub fn grid_image(
+        &self,
+        key: &crate::catalog_edits::VariantKey,
+        bytes: usize,
+    ) -> Result<SearchRow> {
+        ensure!(
+            (1..=16 * 1024).contains(&bytes),
+            "compact image byte bounds"
+        );
+        let tx = self.db.unchecked_transaction()?;
+        let sequence: i64 = tx.query_row(
+            "SELECT sequence FROM catalog_images WHERE asset_id=?1 AND variant_id=?2",
+            rusqlite::params![key.asset_id, key.variant_id],
+            |r| r.get(0),
+        )?;
+        let q = Query {
+            include_variants: true,
+            ..Query::default()
+        };
+        let sql = sql_selection(&q, None, i64::MAX, 1, true, Some(sequence))?;
+        let result = {
+            let mut statement = tx.prepare(&sql.text)?;
+            let mut rows = statement.query(params_from_iter(sql.params))?;
+            let row = rows
+                .next()?
+                .context("logical image organization index is pending")?;
+            let mut total = 0usize;
+            for column in [1, 2, 5, 6, 7, 8, 9, 10, 12, 13, 14, 18, 19] {
+                total = total
+                    .checked_add(row.get_ref(column)?.as_str()?.len())
+                    .context("compact image byte overflow")?;
+            }
+            ensure!(total <= bytes, "compact image row exceeds byte admission");
+            result_row(row)?
+        };
+        tx.commit()?;
+        Ok(result)
+    }
     pub fn search_session(&self, query: Query, lifetime_seconds: u64) -> Result<SearchSession> {
         self.search_session_with_text_limits(query, lifetime_seconds, TextLimits::default())
     }
@@ -739,6 +866,9 @@ impl Catalog {
                 )
             })?;
         let permit = SnapshotPermit;
+        if self.session.pool().is_some() {
+            return managed_search(self, query, lifetime_seconds, text_limits, permit);
+        }
         let path = self.root.join("catalog.sqlite3");
         let (sender, receiver) = mpsc::sync_channel::<SessionRequest>(1);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
@@ -807,6 +937,7 @@ impl Catalog {
         Ok(SearchSession {
             sender: Some(sender),
             worker: Some(worker),
+            managed: None,
         })
     }
     pub fn explain_search(
@@ -837,6 +968,9 @@ impl SearchSession {
     }
     pub fn close(mut self) -> Result<()> {
         self.sender.take();
+        if let Some(owner) = self.managed.take() {
+            return crate::catalog_session::SessionTask::join(owner.as_ref());
+        }
         if let Some(worker) = self.worker.take() {
             worker
                 .join()
@@ -848,5 +982,285 @@ impl SearchSession {
 impl Drop for SearchSession {
     fn drop(&mut self) {
         self.sender.take();
+        if let Some(owner) = &self.managed {
+            crate::catalog_session::SessionTask::request_cancel(owner.as_ref());
+        }
+    }
+}
+
+struct ManagedSearch {
+    state: Mutex<ManagedSearchState>,
+    cancel: Arc<AtomicBool>,
+    interrupt: rusqlite::InterruptHandle,
+    sender: mpsc::SyncSender<SessionRequest>,
+    pool: Arc<crate::catalog_session::RolePool>,
+    role: usize,
+}
+struct ManagedSearchState {
+    worker: Option<thread::JoinHandle<()>>,
+    joined: bool,
+}
+impl crate::catalog_session::SessionTask for ManagedSearch {
+    fn request_cancel(&self) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.joined {
+            return;
+        } // A late callback cannot interrupt a reused role.
+        self.cancel.store(true, Ordering::Release);
+        self.interrupt.interrupt();
+        let (reply, _) = mpsc::sync_channel(1);
+        let _ = self.sender.try_send(SessionRequest {
+            limit: 0,
+            scan: 0,
+            reply,
+        });
+    }
+    fn is_finished(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .worker
+            .as_ref()
+            .is_none_or(|w| w.is_finished())
+    }
+    fn join(&self) -> Result<()> {
+        self.request_cancel();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.joined {
+            return Ok(());
+        }
+        let healthy = state.worker.take().is_none_or(|w| w.join().is_ok());
+        // Keep the owner lock through return admission. Any old cancel waits
+        // until joined=true and therefore cannot affect the next lease.
+        let result = self.pool.joined(self.role, healthy);
+        state.joined = true;
+        result
+    }
+}
+struct QueryCancellation<'a> {
+    db: &'a crate::catalog_session::SqlConnection,
+    armed: bool,
+}
+impl<'a> QueryCancellation<'a> {
+    fn new(db: &'a crate::catalog_session::SqlConnection, cancel: Arc<AtomicBool>) -> Result<Self> {
+        db.install_cancel_progress(cancel)?;
+        Ok(Self { db, armed: true })
+    }
+    fn finish(mut self) -> Result<()> {
+        self.armed = false;
+        self.db.remove_progress_handler()?;
+        Ok(())
+    }
+}
+impl Drop for QueryCancellation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // During unwinding this records quarantine on failure; it never
+            // permits rollback/reuse with an unverified retained callback.
+            let _ = self.db.remove_progress_handler();
+        }
+    }
+}
+fn cancellable_query<T>(
+    db: &crate::catalog_session::SqlConnection,
+    cancel: Arc<AtomicBool>,
+    query: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let hook = QueryCancellation::new(db, cancel)?;
+    let result = query();
+    hook.finish()?;
+    result
+}
+fn managed_search(
+    catalog: &Catalog,
+    query: Query,
+    lifetime_seconds: u64,
+    text_limits: TextLimits,
+    permit: SnapshotPermit,
+) -> Result<SearchSession> {
+    use crate::catalog_session::SessionTask;
+    catalog.session.reap_finished_searches()?;
+    let pool = catalog.session.pool().unwrap().clone();
+    let (role, db) = pool.lease_search()?;
+    let interrupt = db.get_interrupt_handle();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop = cancel.clone();
+    let (sender, receiver) = mpsc::sync_channel::<SessionRequest>(1);
+    let (start_tx, start_rx) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("catalog-search-snapshot".into())
+        .spawn(move || {
+            let _permit = permit;
+            let opened = cancellable_query(&db, stop.clone(), || -> Result<()> {
+                ensure!(!stop.load(Ordering::Acquire), "search snapshot canceled");
+                db.execute_batch("BEGIN")?;
+                ready(&db)?;
+                Ok(())
+            });
+            let healthy_start = opened.is_ok();
+            let _ = start_tx.send(opened);
+            let started = Instant::now();
+            let ttl = Duration::from_secs(lifetime_seconds);
+            let mut next = None;
+            if healthy_start {
+                while !stop.load(Ordering::Acquire) && started.elapsed() < ttl {
+                    let Ok(request) = receiver.recv_timeout(ttl.saturating_sub(started.elapsed()))
+                    else {
+                        break;
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if started.elapsed() >= ttl {
+                        let _ = request
+                            .reply
+                            .send(Err(anyhow::anyhow!("search snapshot expired")));
+                        break;
+                    }
+                    let result = cancellable_query(&db, stop.clone(), || -> Result<Page> {
+                        ensure!(!stop.load(Ordering::Acquire), "search snapshot canceled");
+                        page(
+                            &db,
+                            &query,
+                            next.as_ref(),
+                            request.limit,
+                            request.scan,
+                            text_limits,
+                        )
+                    });
+                    let exhausted = result.as_ref().is_ok_and(|p| p.exhausted);
+                    if let Ok(page) = &result {
+                        next = page.next.clone();
+                    }
+                    if request.reply.send(result).is_err()
+                        || exhausted
+                        || db.hook_owner_unverifiable()
+                    {
+                        break;
+                    }
+                }
+            }
+            // The canceled progress hook is gone before rollback; no poisoned flag
+            // or stale interrupt callback is retained by the next role borrower.
+            if !db.hook_owner_unverifiable() {
+                let _ = db.execute_batch("ROLLBACK");
+            }
+        });
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(error) => {
+            let _ = pool.joined(role, false);
+            return Err(error.into());
+        }
+    };
+    let owner = Arc::new(ManagedSearch {
+        state: Mutex::new(ManagedSearchState {
+            worker: Some(worker),
+            joined: false,
+        }),
+        cancel,
+        interrupt,
+        sender: sender.clone(),
+        pool,
+        role,
+    });
+    if let Err(error) = catalog.session.register_search(owner.clone()) {
+        owner.join()?;
+        return Err(error);
+    }
+    match start_rx.recv() {
+        Ok(Ok(())) => Ok(SearchSession {
+            sender: Some(sender),
+            worker: None,
+            managed: Some(owner),
+        }),
+        Ok(Err(error)) => {
+            owner.join()?;
+            Err(error)
+        }
+        Err(error) => {
+            owner.join()?;
+            Err(error.into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_cancellation_tests {
+    use super::*;
+    #[test]
+    fn progress_registration_closes_interrupt_before_sql_entry_gap_and_clears_for_reuse()
+    -> Result<()> {
+        let db: crate::catalog_session::SqlConnection = Connection::open_in_memory()?.into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let hook = QueryCancellation::new(&db, cancel.clone())?;
+            assert!(!cancel.load(Ordering::Acquire));
+            // Interrupt alone while SQLite is idle has no effect. The scoped
+            // flag hook must catch cancellation after the precheck, at entry.
+            db.get_interrupt_handle().interrupt();
+            cancel.store(true, Ordering::Release);
+            let error=db.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0)).unwrap_err();
+            assert!(
+                matches!(error,rusqlite::Error::SqliteFailure(e,_) if e.code==rusqlite::ErrorCode::OperationInterrupted)
+            );
+            hook.finish()?;
+        }
+        db.execute_batch("BEGIN; SELECT 1; ROLLBACK;")?;
+        assert_eq!(db.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0))?,12_502_500);
+        Ok(())
+    }
+    #[test]
+    fn progress_setup_rejects_unowned_wrapper_before_query() -> Result<()> {
+        let owner = Connection::open_in_memory()?;
+        // A deliberately borrowed wrapper exercises rusqlite check_owned.
+        // Managed roster constructors only use owned open_with_flags handles.
+        let borrowed: crate::catalog_session::SqlConnection =
+            unsafe { Connection::from_handle(owner.handle())? }.into();
+        let called = AtomicBool::new(false);
+        assert!(
+            cancellable_query(&borrowed, Arc::new(AtomicBool::new(false)), || {
+                called.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!called.load(Ordering::Acquire));
+        drop(borrowed);
+        owner.execute_batch("SELECT 1")?;
+        Ok(())
+    }
+    #[test]
+    fn active_query_observes_external_cancel_before_worker_join() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let interrupt = db.get_interrupt_handle();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || -> Result<()> {
+            let sent = AtomicBool::new(false);
+            db.progress_handler(
+                1000,
+                Some(move || {
+                    if !sent.swap(true, Ordering::AcqRel) {
+                        let _ = entered.try_send(());
+                    }
+                    stop.load(Ordering::Acquire)
+                }),
+            )?;
+            let result=db.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0));
+            db.progress_handler(0, None::<fn() -> bool>)?;
+            ensure!(
+                matches!(result,Err(rusqlite::Error::SqliteFailure(e,_)) if e.code==rusqlite::ErrorCode::OperationInterrupted)
+            );
+            db.execute_batch("BEGIN; SELECT 1; ROLLBACK;")?;
+            Ok(())
+        });
+        let entered = observed.recv_timeout(Duration::from_secs(5));
+        cancel.store(true, Ordering::Release);
+        interrupt.interrupt();
+        worker.join().unwrap()?;
+        entered?;
+        Ok(())
     }
 }

@@ -19,9 +19,9 @@ fn store_drop_releases_retained_manifest_and_tier_descriptions() -> Result<()> {
     let config = config(root.path());
     let store = PreviewStore::open(config.clone(), &[])?;
     let retained = [
-        store._lock.0.try_clone()?,
-        store._tier_locks[0].0.try_clone()?,
-        store._tier_locks[1].0.try_clone()?,
+        store._lock.as_ref().unwrap().0.try_clone()?,
+        store._tier_locks[0].as_ref().unwrap().0.try_clone()?,
+        store._tier_locks[1].as_ref().unwrap().0.try_clone()?,
     ];
     assert!(PreviewStore::open(config.clone(), &[]).is_err());
     assert!(PreviewStore::open(config.clone(), &[]).is_err());
@@ -109,7 +109,7 @@ fn relocation_lock_moves_through_cleanup_and_releases_retained_descriptions() ->
     let mut store = PreviewStore::open(config.clone(), &[])?;
     let identity = store.identity.clone();
     let target = root.path().join("relocated");
-    let old_duplicate = store._tier_locks[0].0.try_clone()?;
+    let old_duplicate = store._tier_locks[0].as_ref().unwrap().0.try_clone()?;
     store.begin_relocation(Tier::Thumbnail, &target, &[])?;
     let target_duplicate = store._relocation_lock.as_ref().unwrap().0.try_clone()?;
     assert!(relocation::lock_root(&target, &identity, Tier::Thumbnail, Layout::Flat).is_err());

@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 #[path = "catalog_edits/copy.rs"]
 mod copy;
-pub use copy::{CopyItem, CopyJob, EditTarget};
+pub use copy::{CopyDescription, CopyItem, CopyJob, EditTarget};
 #[cfg(test)]
 #[path = "catalog_edits/tests.rs"]
 mod tests;
@@ -149,7 +149,7 @@ fn stored(db: &Connection, key: &VariantKey) -> Result<Option<StoredVariant>> {
             params![key.asset_id, key.variant_id],
             |r| {
                 Ok(StoredVariant {
-                    label: r.get(0)?,
+                    label: crate::catalog_row::owned_text(r, 0, 1024)?,
                     revision: r.get(1)?,
                     cursor: r.get(2)?,
                     redo: r.get(3)?,
@@ -207,16 +207,21 @@ fn view(db: &Connection, key: &VariantKey) -> Result<VariantView> {
             can_redo: false,
         });
     };
-    let (parent, bytes, digest): (Option<i64>, Vec<u8>, String) = db.query_row(
+    let mut statement = db.prepare(
         "SELECT parent,recipe,digest FROM edit_recipe_nodes WHERE id=?1 AND asset_id=?2 AND variant_id=?3",
-        params![value.cursor, key.asset_id, key.variant_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let mut rows = statement.query(params![value.cursor, key.asset_id, key.variant_id])?;
+    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let parent: Option<i64> = row.get(0)?;
+    let bytes = crate::catalog_row::blob(row, 1, MAX_RECIPE_BYTES)?;
+    let digest = crate::catalog_row::text(row, 2, 64)?;
+    let recipe = read_recipe(bytes, digest)?;
     Ok(VariantView {
         key: key.clone(),
         label: value.label,
         revision: value.revision,
-        recipe: read_recipe(&bytes, &digest)?,
-        recipe_digest: digest,
+        recipe,
+        recipe_digest: digest.to_owned(),
         can_undo: parent.is_some(),
         can_redo: value.redo.is_some(),
     })
@@ -562,8 +567,8 @@ impl Catalog {
                 Ok(RenderIdentity {
                     asset_id: key.asset_id.clone(),
                     generation: r.get(0)?,
-                    fingerprint: r.get(1)?,
-                    state: r.get(2)?,
+                    fingerprint: crate::catalog_row::optional_text(r, 1, 64)?,
+                    state: crate::catalog_row::owned_text(r, 2, 7)?,
                     metadata_revision: image.metadata_revision,
                 })
             },
@@ -610,7 +615,13 @@ impl Catalog {
             let physical: (i64, Option<String>, String) = tx.query_row(
                 "SELECT physical_generation,fingerprint,state FROM assets WHERE id=?",
                 [&expected.key.asset_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        crate::catalog_row::optional_text(r, 1, 64)?,
+                        crate::catalog_row::owned_text(r, 2, 7)?,
+                    ))
+                },
             )?;
             let current = view(&tx, &expected.key)?;
             if physical.0 != expected.source.generation

@@ -57,19 +57,32 @@ fn link(
     db.execute("INSERT INTO references_out(revision,source_id,field,target_table,target_key) VALUES(?1,?2,?3,?4,?5)",params![revision,source_id(table,key),field,target,serde_json::to_string(&id(target_key))?])?;
     Ok(())
 }
-struct ImportFixture {
+pub(crate) struct ImportFixture {
     _root: tempfile::TempDir,
-    inspection: Fixture,
-    destination: PathBuf,
-    policy: Policy,
+    pub(crate) inspection: Fixture,
+    pub(crate) destination: PathBuf,
+    pub(crate) policy: Policy,
     paths: Vec<NativePath>,
     raw: Vec<Vec<u8>>,
 }
 impl ImportFixture {
-    fn new(oversized: bool) -> Result<Self> {
+    pub(crate) fn new(oversized: bool) -> Result<Self> {
         Self::with_wrapper(oversized, false)
     }
     fn with_wrapper(oversized: bool, wrapped: bool) -> Result<Self> {
+        Self::with_settings(oversized, wrapped, None)
+    }
+    #[cfg(unix)]
+    pub(crate) fn with_adobe_expansion() -> Result<(Self, usize)> {
+        let children = (0..256).map(|n| format!("p{n}=1,")).collect::<String>();
+        let payload = format!(
+            "s = {{['{}']={{{children}}},ProcessVersion='11.0',Exposure2012=1.0}}",
+            "ancestor".repeat(512)
+        );
+        let fixture = Self::with_settings(false, true, Some(&payload))?;
+        Ok((fixture, payload.len()))
+    }
+    fn with_settings(oversized: bool, wrapped: bool, settings_text: Option<&str>) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let absolute = fs::canonicalize(root.path())?;
         let mut paths = Vec::new();
@@ -167,7 +180,7 @@ impl ImportFixture {
                     for (key,file,master,ev) in [(20,10,0,1.0),(21,10,20,-1.0),(22,11,0,2.0)] {
                         let settings = key+10;
                         row(db,revision,"Adobe_images",key,vec![id(key),id(file),id(master),cell("JPEG"),id(settings),cell(if master==0 {"Original"} else {"Virtual"}),id(if key==21 {2}else{4}),id(1),cell("Green")])?;
-                        row(db,revision,"Adobe_imageDevelopSettings",settings,vec![id(settings),cell(&format!("{}{{ProcessVersion='11.0',Exposure2012={},UnknownPlugin={{opaque='keep'}}}}",if wrapped {"s = "} else {""},ev+index as f64*0.25))])?;
+                        row(db,revision,"Adobe_imageDevelopSettings",settings,vec![id(settings),cell(&settings_text.map(str::to_owned).unwrap_or_else(||format!("{}{{ProcessVersion='11.0',Exposure2012={},UnknownPlugin={{opaque='keep'}}}}",if wrapped {"s = "} else {""},ev+index as f64*0.25)))])?;
                         link(db,revision,"Adobe_images",key,"rootFile","AgLibraryFile",file)?;
                         link(db,revision,"Adobe_images",key,"developSettingsIDCache","Adobe_imageDevelopSettings",settings)?;
                         if master!=0 { link(db,revision,"Adobe_images",key,"masterImage","Adobe_images",master)?; }
@@ -216,20 +229,24 @@ impl ImportFixture {
             raw,
         })
     }
-    fn open(&self) -> Result<Catalog> {
+    pub(crate) fn open(&self) -> Result<Catalog> {
         let catalog = Catalog::open(&self.destination)?;
         // Temporary module registration is separate from this test-only file.
         super::importer::install(&catalog.db)?;
         super::reconciliation::install(&catalog.db)?;
         Ok(catalog)
     }
-    fn limits() -> ArtifactLimits {
+    pub(crate) fn limits() -> ArtifactLimits {
         ArtifactLimits {
             maximum_bytes: 1024 * 1024,
             open_deadline_ms: 30000,
             chunk_deadline_ms: 10000,
             chunk_bytes: 512,
         }
+    }
+    #[cfg(unix)]
+    pub(crate) fn raw(&self) -> &[Vec<u8>] {
+        &self.raw
     }
     fn key(&self, catalog: &Catalog, index: usize, key: i64) -> Result<VariantKey> {
         super::images::mapped_image(
@@ -735,10 +752,10 @@ fn wrapped_current_settings_cross_worker_render_and_reopen() -> Result<()> {
 }
 
 #[path = "current_repair_tests.rs"]
-mod current_repair_tests;
+pub(crate) mod current_repair_tests;
 
 #[path = "keyword_repair_tests.rs"]
-mod keyword_repair_tests;
+pub(crate) mod keyword_repair_tests;
 
 #[path = "../../tests/support/backup_snapshot.rs"]
 mod backup_snapshot;

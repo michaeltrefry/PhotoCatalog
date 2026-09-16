@@ -56,7 +56,7 @@ def expected_metadata(selected,width,height,spec):
             (EXIF,'PixelXDimension'):width,(EXIF,'PixelYDimension'):height,
             (EXIF,'ColorSpace'):1 if profile=='srgb' else 65535,
             (PHOTOSHOP,'ICCProfile'):profile_name,(DC,'format'):'image/'+fmt['format'],
-            (XMP,'CreatorTool'):'PhotoCatalog'}
+            (XMP,'CreatorTool'):'LensWorks'}
     for (namespace,name),value in values.items():
         ET.SubElement(description,'{'+namespace+'}'+name).text=str(value)
     sequence=ET.SubElement(ET.SubElement(description,'{'+TIFF+'}BitsPerSample'),'{'+RDF+'}Seq')

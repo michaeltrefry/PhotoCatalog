@@ -9,6 +9,8 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+pub(crate) mod closed_path;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision {
     pub object: String,
@@ -67,17 +69,94 @@ pub(crate) fn reject_links(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(windows)]
+struct PreparedPaths {
+    checks: Vec<PathBuf>,
+    target: PathBuf,
+}
+#[cfg(windows)]
+type PreparePath = for<'a> fn(&'a Path, &'a mut dyn FnMut(usize) -> Result<()>) -> Result<PathBuf>;
+#[cfg(windows)]
+impl PreparedPaths {
+    fn admit(
+        path: &Path,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        prepare: PreparePath,
+    ) -> Result<Self> {
+        let count = path.components().count();
+        let current_bytes = path
+            .as_os_str()
+            .len()
+            .checked_add(count)
+            .context("source prefix capacity overflow")?;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<PathBuf>())
+            .and_then(|n| n.checked_add(current_bytes))
+            .and_then(|n| n.checked_add(path.as_os_str().len()))
+            .context("source prefix roster allocation overflow")?;
+        admit(bytes)?;
+        let mut checks = Vec::with_capacity(count);
+        let mut current = std::ffi::OsString::with_capacity(current_bytes);
+        for component in path.components() {
+            // PathBuf::push rebuilds verbatim paths through a temporary component
+            // Vec. Append the borrowed native spelling into our precharged
+            // OsString instead; never collapse an original parent component.
+            if matches!(component, Component::Prefix(_) | Component::RootDir) {
+                current.push(component.as_os_str());
+                continue;
+            }
+            if !current.is_empty() && !current.as_encoded_bytes().ends_with(b"\\") {
+                current.push("\\");
+            }
+            current.push(component.as_os_str());
+            debug_assert!(current.len() <= current_bytes);
+            let prepared = prepare(Path::new(&current), admit)?;
+            PreparedPaths::check(&prepared)?;
+            checks.push(prepared);
+        }
+        let target = prepare(path, admit)?;
+        Ok(Self { checks, target })
+    }
+    fn check(path: &Path) -> Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path)?;
+        ensure!(
+            !meta.file_type().is_symlink() && meta.file_attributes() & 0x400 == 0,
+            "source path contains a link or reparse point"
+        );
+        Ok(())
+    }
+    fn verify(&self) -> Result<()> {
+        for path in &self.checks {
+            Self::check(path)?;
+        }
+        Ok(())
+    }
+}
 pub(crate) struct Source {
     pub path: PathBuf,
     pub file: File,
     pub before: Revision,
     locks: Vec<(u64, u64)>,
+    _migration_role: Option<crate::lightroom_migration_worker::identity::RoleLease>,
+    #[cfg(windows)]
+    prepared: Option<PreparedPaths>,
 }
 impl Source {
     pub fn open(path: &Path, maximum: u64) -> Result<Self> {
+        Self::open_impl(path, maximum, true)
+    }
+    fn open_impl(path: &Path, maximum: u64, audit: bool) -> Result<Self> {
+        if audit {
+            crate::lightroom_migration_worker::identity::before_source_open()?;
+        }
         reject_links(path)?;
         let metadata = fs::symlink_metadata(path)?;
         ensure!(metadata.is_file(), "source is not a regular file");
+        let file = Self::open_file(path)?;
+        Self::from_opened(path, maximum, audit, metadata, file)
+    }
+    fn open_file(path: &Path) -> Result<File> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -93,8 +172,23 @@ impl Source {
             // byte lock prevents SHM truncation, not winShmPurge's deletion.
             options.custom_flags(0x0020_0000).share_mode(0x1 | 0x2);
         }
-        let file = options.open(path)?;
+        Ok(options.open(path)?)
+    }
+    fn from_opened(
+        path: &Path,
+        maximum: u64,
+        audit: bool,
+        metadata: fs::Metadata,
+        file: File,
+    ) -> Result<Self> {
+        let migration_role = if audit {
+            crate::lightroom_migration_worker::identity::source_open(&file)?
+        } else {
+            None
+        };
         let before = revision(&file)?;
+        #[cfg(windows)]
+        let _ = metadata;
         ensure!(
             before.bytes <= maximum,
             "source file exceeds declared byte limit"
@@ -112,7 +206,45 @@ impl Source {
             file,
             before,
             locks: vec![],
+            _migration_role: migration_role,
+            #[cfg(windows)]
+            prepared: None,
         })
+    }
+    /// Dedicated closed-roster admission. Each original prefix is checked before
+    /// proceeding to the next, so a later parent component cannot hide a link.
+    #[cfg(windows)]
+    pub(crate) fn open_prepared(
+        path: &Path,
+        maximum: u64,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        prepare: PreparePath,
+    ) -> Result<Self> {
+        crate::lightroom_migration_worker::identity::before_source_open()?;
+        let prepared = PreparedPaths::admit(path, admit, prepare)?;
+        let target = &prepared.target;
+        let metadata = fs::symlink_metadata(target)?;
+        ensure!(metadata.is_file(), "source is not a regular file");
+        let file = Self::open_file(target)?;
+        let mut value = Self::from_opened(path, maximum, true, metadata, file)?;
+        value.prepared = Some(prepared);
+        Ok(value)
+    }
+    #[cfg(windows)]
+    pub(crate) fn check_prepared_directory(
+        path: &Path,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        let prepared = PreparedPaths::admit(path, admit, closed_path::file_path)?;
+        ensure!(
+            fs::symlink_metadata(&prepared.target)?.is_dir(),
+            "artifact sealed root is not a directory"
+        );
+        Ok(())
+    }
+    #[cfg(windows)]
+    pub(crate) fn prepared_path(&self) -> &Path {
+        self.prepared.as_ref().map_or(&self.path, |p| &p.target)
     }
     pub fn lock(&mut self, start: u64, length: u64) -> Result<()> {
         set_lock(&self.file, start, length, true)
@@ -121,12 +253,25 @@ impl Source {
         Ok(())
     }
     pub fn verify(&self) -> Result<()> {
+        crate::lightroom_migration_worker::identity::check_source()?;
         ensure!(
             revision(&self.file)? == self.before,
             "source handle revision changed"
         );
-        reject_links(&self.path)?;
-        let metadata = fs::symlink_metadata(&self.path)?;
+        #[cfg(windows)]
+        let checked = if let Some(prepared) = &self.prepared {
+            prepared.verify()?;
+            &prepared.target
+        } else {
+            reject_links(&self.path)?;
+            &self.path
+        };
+        #[cfg(not(windows))]
+        let checked = {
+            reject_links(&self.path)?;
+            &self.path
+        };
+        let metadata = fs::symlink_metadata(checked)?;
         ensure!(metadata.is_file(), "source path became non-regular");
         #[cfg(unix)]
         {
@@ -146,17 +291,39 @@ impl Source {
         {
             // Windows locks are handle scoped, so closing this additional identity
             // handle cannot release the capture handle's byte-range locks.
-            let path_handle = Source::open(&self.path, self.before.bytes)?;
-            ensure!(path_handle.before == self.before, "source path replaced");
+            // This private verifier takes no byte lock. Windows locks are
+            // handle-scoped, so its close cannot release the held Source lock.
+            // Unix never uses this verifier or suppresses role admission.
+            if self.prepared.is_some() {
+                // Same Windows handle-scoped identity check, using the already
+                // admitted verbatim spelling and its reserved conversion buffer.
+                let path_handle = Self::open_file(checked)?;
+                ensure!(
+                    revision(&path_handle)? == self.before,
+                    "source path replaced"
+                );
+            } else {
+                let path_handle = Self::open_impl(&self.path, self.before.bytes, false)?;
+                ensure!(path_handle.before == self.before, "source path replaced");
+            }
         }
         Ok(())
     }
-    pub fn copy_and_hash(&mut self, mut output: Option<&mut File>) -> Result<String> {
+    pub fn copy_and_hash(&mut self, output: Option<&mut File>) -> Result<String> {
+        self.copy_and_hash_controlled(output, || Ok(()))
+    }
+    pub fn copy_and_hash_controlled(
+        &mut self,
+        mut output: Option<&mut File>,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<String> {
+        check()?;
         self.file.seek(SeekFrom::Start(0))?;
         let mut remaining = self.before.bytes;
         let mut hash = blake3::Hasher::new();
         let mut bytes = [0u8; 128 * 1024];
         while remaining > 0 {
+            check()?;
             let count = remaining.min(bytes.len() as u64) as usize;
             self.file
                 .read_exact(&mut bytes[..count])
@@ -168,6 +335,7 @@ impl Source {
             remaining -= count as u64;
         }
         self.verify()?;
+        check()?;
         Ok(hash.finalize().to_hex().to_string())
     }
 }

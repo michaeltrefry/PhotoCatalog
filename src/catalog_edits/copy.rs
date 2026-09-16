@@ -8,6 +8,56 @@ pub struct EditTarget {
     pub expected_revision: i64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyDescription {
+    pub source: EditTarget,
+    pub digest: String,
+    pub recipe: Recipe,
+    pub groups: Vec<AdjustmentGroup>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenSource {
+    key: VariantKey,
+    revision: i64,
+    digest: String,
+}
+
+fn description(db: &Connection, id: &str) -> Result<CopyDescription> {
+    // CASE admits byte lengths inside SQLite before copying any retained blob.
+    let (source, bytes, digest, groups): (Option<String>, Option<Vec<u8>>, Option<String>, Option<String>) = db.query_row(
+        "SELECT CASE WHEN length(CAST(source AS BLOB))<=2048 THEN source END,CASE WHEN length(recipe)<=65536 THEN recipe END,CASE WHEN length(CAST(digest AS BLOB))=64 THEN digest END,CASE WHEN length(CAST(groups_json AS BLOB))<=1024 THEN groups_json END FROM edit_copy_jobs WHERE id=?1",
+        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    let source: FrozenSource =
+        serde_json::from_str(&source.context("copy source exceeds bounded description")?)?;
+    source.key.validate()?;
+    ensure!(source.revision >= 0, "invalid frozen source revision");
+    let digest = digest.context("invalid frozen recipe digest length")?;
+    ensure!(
+        source.digest == digest,
+        "copy source digest differs from frozen recipe"
+    );
+    let recipe = read_recipe(
+        &bytes.context("copy recipe exceeds bounded description")?,
+        &digest,
+    )?;
+    let groups: Vec<AdjustmentGroup> =
+        serde_json::from_str(&groups.context("copy groups exceed bounded description")?)?;
+    ensure!(
+        !groups.is_empty() && groups.len() <= 7,
+        "copy adjustment group count"
+    );
+    Ok(CopyDescription {
+        source: EditTarget {
+            key: source.key,
+            expected_revision: source.revision,
+        },
+        digest,
+        recipe,
+        groups,
+    })
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyJob {
     pub sequence: i64,
     pub id: String,
@@ -41,6 +91,10 @@ fn job(db: &Connection, id: &str) -> Result<CopyJob> {
 }
 
 impl Catalog {
+    /// The immutable source and groups chosen at Begin, independent of later edits.
+    pub fn edit_copy_description(&self, id: &str) -> Result<CopyDescription> {
+        description(&self.db, id)
+    }
     /// Freeze source settings now, then append bounded target pages and seal.
     /// No asset-count ceiling is imposed on a job; no full-library Vec is needed.
     pub fn begin_edit_copy(
@@ -188,14 +242,10 @@ impl Catalog {
             return Ok(current);
         }
         ensure!(current.state == "queued", "copy job is not sealed");
-        let (source, bytes, digest, groups): (String, Vec<u8>, String, String) =
-            self.db.query_row(
-                "SELECT source,recipe,digest,groups_json FROM edit_copy_jobs WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
-        let recipe = read_recipe(&bytes, &digest)?;
-        let groups: Vec<AdjustmentGroup> = serde_json::from_str(&groups)?;
+        let frozen = description(&self.db, id)?;
+        let source = serde_json::json!({"key":frozen.source.key,"revision":frozen.source.expected_revision,"digest":frozen.digest});
+        let recipe = frozen.recipe;
+        let groups = frozen.groups;
         let sequences=self.db.prepare("SELECT sequence FROM edit_copy_items WHERE job=?1 AND state='pending' ORDER BY sequence LIMIT ?2")?.query_map(params![id,limit as i64],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for sequence in sequences {
             let item = self
@@ -273,7 +323,7 @@ impl Catalog {
                             &bytes,
                             &digest,
                             "copy",
-                            &serde_json::json!({"copy_job":id,"source":serde_json::from_str::<serde_json::Value>(&source)?}),
+                            &serde_json::json!({"copy_job":id,"source":source}),
                         )?;
                         Ok(value.revision)
                     }

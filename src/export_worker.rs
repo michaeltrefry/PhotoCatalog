@@ -1,33 +1,37 @@
 //! One owned export process. Small IPC carries only admission; selected packets
 //! and ICC profiles use bounded, hash-bound files. EOF revokes native ownership.
 use crate::{
-    catalog_exports::{ExportWork, StoredProfile},
+    catalog_exports::{ExportWork, StoredOutput, StoredProfile},
     image_export::{OutputProfile, OutputSpec},
-    metadata_export::{self, SealedPhotoExport},
+    metadata_export::{self, FileRevision, SealedPhotoExport, VerifiedFile},
     photo_render::{self, PhotoRenderLimits, PhotoRenderRequest, StagedPhoto},
 };
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
 };
-const REQUEST_LIMIT: u64 = 256 * 1024;
-const RECEIPT_LIMIT: u64 = 64 * 1024;
-const BLOB_LIMIT: u64 = 16 * 1024 * 1024;
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+mod claim;
+#[path = "export_worker/wire.rs"]
+mod wire;
+pub(crate) use claim::CompactDiscard;
+pub(crate) const COMPACT_CLAIM_RECORD_BYTES: usize = claim::RECORD_BYTES;
+pub(crate) const REQUEST_LIMIT: u64 = 256 * 1024;
+pub(crate) const RECEIPT_LIMIT: u64 = 64 * 1024;
+pub(crate) const BLOB_LIMIT: u64 = 16 * 1024 * 1024;
 struct Request {
     version: u32,
     work: ExportWork,
     limits: PhotoRenderLimits,
 }
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "wire::Completion")]
 pub struct CompletedExport {
     pub authority: String,
     pub attempt: String,
@@ -37,14 +41,37 @@ pub struct CompletedExport {
     pub peak_resident_bytes: Option<u64>,
     pub peak_method: String,
 }
-fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
+/// Bounded facts emitted by the native renderer. Destination sealing is a
+/// separate parent operation after the exact child has exited.
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "wire::RenderingCompletion")]
+pub struct ExportRenderingFacts {
+    pub job: String,
+    pub sequence: i64,
+    pub authority: String,
+    pub attempt: String,
+    pub output: StoredOutput,
+    pub output_revision: FileRevision,
+    pub rendered: StagedPhoto,
+    pub peak_resident_bytes: Option<u64>,
+    pub peak_method: String,
+}
+pub(crate) fn admit_output_path(work: &ExportWork, path: &Path) -> Result<()> {
+    // Reserve half the established receipt limit for fixed encoder reports,
+    // notes and timing fields; path arrays and the snapshot share the remainder.
+    let paths = serde_json::to_vec(&crate::storage_volume::NativePath::from_path(path))?.len()
+        + serde_json::to_vec(&work.plan.destination)?.len();
     ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= limit,
-        "worker artifact size/type"
+        paths as u64 <= RECEIPT_LIMIT / 2,
+        "export native paths exceed worker result budget"
     );
+    Ok(())
+}
+fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let mut file = metadata_export::open_regular(path)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.len() <= limit, "worker artifact size/type");
     let mut bytes = vec![0; usize::try_from(metadata.len())?];
-    let mut file = File::open(path)?;
     file.read_exact(&mut bytes)?;
     let mut extra = [0];
     ensure!(
@@ -76,25 +103,12 @@ fn validate(request: &Request) -> Result<()> {
     Ok(())
 }
 fn validate_persisted(request: &Request) -> Result<()> {
+    ensure!(matches!(request.version, 1 | 2), "export worker protocol");
     ensure!(
-        request.version == 1
-            && ((request.work.plan.version == 1
-                && request.work.plan.identity.image_identity.is_none())
-                || (request.work.plan.version == 2
-                    && request
-                        .work
-                        .plan
-                        .identity
-                        .image_identity
-                        .as_ref()
-                        .is_some_and(|image| image.key == request.work.plan.identity.key))),
-        "export worker protocol"
+        request.version != 1 || matches!(request.work.plan.version, 1 | 2),
+        "legacy worker requires legacy plan"
     );
-    let encoded = serde_json::to_vec(&request.work.plan)?;
-    ensure!(
-        blake3::hash(&encoded).to_hex().as_str() == request.work.authority,
-        "export worker plan binding"
-    );
+    crate::catalog_exports::checked_plan(request.work.plan.raw(), &request.work.authority)?;
     ensure!(
         request.work.plan.recipe.validate()?.digest() == request.work.plan.identity.recipe_digest,
         "export worker recipe binding"
@@ -114,14 +128,80 @@ fn validate_persisted(request: &Request) -> Result<()> {
     );
     Ok(())
 }
+
+/// Produces the exact request consumed by the render-only native worker. The
+/// managed filesystem owner calls this before creating any stage effects.
+pub(crate) fn prepare_managed_request(
+    work: &ExportWork,
+    limits: PhotoRenderLimits,
+    staging: &Path,
+) -> Result<Vec<u8>> {
+    let request = Request {
+        version: 2,
+        work: work.clone(),
+        limits,
+    };
+    validate(&request)?;
+    admit_output_path(work, &staging.join("output"))?;
+    let bytes = serde_json::to_vec(&request)?;
+    ensure!(
+        bytes.len() as u64 <= REQUEST_LIMIT,
+        "export worker request limit"
+    );
+    Ok(bytes)
+}
+
+/// Reads only render facts and performs the same strict post-exit sealing and
+/// durable readback as the standalone parent. Callers must first prove that the
+/// exact native operation has drained.
+pub(crate) fn complete_managed_rendering(
+    work: &ExportWork,
+    staging: &Path,
+    canceled: &AtomicBool,
+    admit: impl FnOnce(CompletedExport) -> Result<()>,
+) -> Result<CompletedExport> {
+    let facts = match wire::decode_completion(&read(&staging.join("result.json"), RECEIPT_LIMIT)?)?
+    {
+        wire::DecodedCompletion::Rendering(facts) => facts,
+        wire::DecodedCompletion::Legacy(_) => {
+            bail!("managed export requires render-only native facts")
+        }
+    };
+    validate_rendering(work, staging, &facts)?;
+    // The 64 KiB allowance belongs to N's receipt. Admit the enriched result
+    // through the actual F/C envelopes before creating any durable seal. Only
+    // payload filesystem identity/mtime and elapsed seal timing can change;
+    // maximal-width scalar representatives bound their serialized backing.
+    let mut payload = facts.output_revision.clone();
+    payload.modified_ns = u128::MAX;
+    payload.identity = (u64::MAX, u64::MAX);
+    admit(CompletedExport {
+        authority: facts.authority.clone(),
+        attempt: facts.attempt.clone(),
+        sealed: SealedPhotoExport {
+            version: work.plan.destination.version,
+            snapshot: work.plan.destination.clone(),
+            authority_digest: work.authority.clone(),
+            max_payload_bytes: work.plan.max_payload_bytes,
+            payload,
+        },
+        rendered: facts.rendered.clone(),
+        seal_ms: -1.2345678901234567e-123,
+        peak_resident_bytes: facts.peak_resident_bytes,
+        peak_method: facts.peak_method.clone(),
+    })?;
+    complete_rendering(work, facts, canceled)
+}
 /// Application supplies the executable, work authority and explicit limits. It
 /// owns the global native reservation until poll/stop has reaped this child.
 pub struct ExportWorkerProcess {
     child: Child,
     lease: Option<ChildStdin>,
+    parent_lease: RefCell<Option<File>>,
     staging: PathBuf,
     request: Request,
     exited: bool,
+    consumed: bool,
 }
 impl ExportWorkerProcess {
     pub fn spawn(
@@ -137,7 +217,7 @@ impl ExportWorkerProcess {
             "absolute export executable/staging paths required"
         );
         let request = Request {
-            version: 1,
+            version: 2,
             work,
             limits,
         };
@@ -181,6 +261,15 @@ impl ExportWorkerProcess {
             .prefix("photo-worker-")
             .tempdir_in(&staging_root)?
             .keep();
+        admit_output_path(&request.work, &staging.join("output"))?;
+        // This distinct parent lease protects the stage after child wait while
+        // poll validates the receipt and seals/reads back the rendered output.
+        write(&staging.join("parent.lock"), b"")?;
+        let parent_lease = metadata_export::open_regular(&staging.join("parent.lock"))?;
+        parent_lease
+            .try_lock_exclusive()
+            .context("acquire export parent lease")?;
+        check_parent_lease(&staging, &parent_lease)?;
         // The owner creates the lease before a child can be canceled or delayed
         // before startup. Children open it; they never recreate a retired lease.
         write(&staging.join("active.lock"), b"")?;
@@ -205,9 +294,11 @@ impl ExportWorkerProcess {
         let mut value = Self {
             child,
             lease: Some(lease),
+            parent_lease: RefCell::new(Some(parent_lease)),
             staging,
             request,
             exited: false,
+            consumed: false,
         };
         let lease = value.lease.as_mut().unwrap();
         lease.write_all(b"!")?;
@@ -224,60 +315,79 @@ impl ExportWorkerProcess {
         &self.request.work
     }
     pub fn poll(&mut self, canceled: &AtomicBool) -> Result<Option<CompletedExport>> {
-        ensure!(!self.exited, "export worker already consumed");
-        if canceled.load(Ordering::Acquire) {
-            self.stop()?;
-            bail!("export worker canceled");
+        ensure!(!self.consumed, "export worker already consumed");
+        if let Some(parent_lease) = self.parent_lease.borrow().as_ref() {
+            check_parent_lease(&self.staging, parent_lease)?;
         }
-        let Some(status) = self.child.try_wait()? else {
-            return Ok(None);
+        if !self.exited {
+            if canceled.load(Ordering::Acquire) {
+                self.stop()?;
+                self.consumed = true;
+                bail!("export worker canceled");
+            }
+            let Some(status) = self.child.try_wait()? else {
+                return Ok(None);
+            };
+            self.exited = true;
+            self.lease.take();
+            if !status.success() {
+                self.consumed = true;
+                let detail = read(&self.staging.join("error.json"), RECEIPT_LIMIT)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<String>(&b).ok())
+                    .unwrap_or_else(|| format!("export worker failed ({status})"));
+                bail!("{detail}");
+            }
+        }
+        self.consumed = true;
+        let result =
+            wire::decode_completion(&read(&self.staging.join("result.json"), RECEIPT_LIMIT)?)?;
+        let work = &self.request.work;
+        let result = match result {
+            wire::DecodedCompletion::Legacy(result) => {
+                validate_completed(work, &self.staging, &result)?;
+                // Old children sealed before exit. Preserve their strict parent
+                // readback so an existing version-1/2 receipt remains usable.
+                ensure!(
+                    read_seal_checked(work, canceled)? == result.sealed,
+                    "export worker seal changed"
+                );
+                result
+            }
+            wire::DecodedCompletion::Rendering(facts) => {
+                validate_rendering(work, &self.staging, &facts)?;
+                complete_rendering(work, facts, canceled)?
+            }
         };
+        Ok(Some(result))
+    }
+    pub fn stop(&mut self) -> Result<()> {
+        // Stop permanently revokes result consumption, including when wait must retry.
+        self.consumed = true;
+        if !self.exited {
+            self.lease.take();
+            if self.child.try_wait()?.is_none() {
+                // Kill can race natural exit; wait remains authoritative. A
+                // kill error must not release native ownership without reaping.
+                let _ = self.child.kill();
+            }
+            self.child.wait()?;
+            self.exited = true;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    fn wait_for_rendering_exit_for_test(&mut self) -> Result<()> {
+        ensure!(!self.exited, "export worker already exited");
+        let status = self.child.wait()?;
         self.exited = true;
         self.lease.take();
         if !status.success() {
             let detail = read(&self.staging.join("error.json"), RECEIPT_LIMIT)
                 .ok()
-                .and_then(|b| serde_json::from_slice::<String>(&b).ok())
-                .unwrap_or_else(|| format!("export worker failed ({status})"));
-            bail!("{detail}");
-        }
-        let result: CompletedExport =
-            serde_json::from_slice(&read(&self.staging.join("result.json"), RECEIPT_LIMIT)?)?;
-        let work = &self.request.work;
-        ensure!(
-            result.authority == work.authority
-                && result.attempt == work.attempt
-                && result.sealed.authority_digest == work.authority
-                && result.sealed.snapshot == work.plan.destination
-                && result.sealed.max_payload_bytes == work.plan.max_payload_bytes
-                && result.rendered.renderer_identity == work.plan.renderer_identity
-                && result.rendered.staging == self.staging.join("output")
-                && result.rendered.encoding.source_fingerprint
-                    == work.plan.original_revision.digest
-                && result.rendered.encoding.recipe_digest == work.plan.identity.recipe_digest
-                && result.rendered.encoding.encoded_extent == result.sealed.payload.bytes,
-            "export worker result binding mismatch"
-        );
-        // Verify the complete staged object under the durable seal, never an
-        // untrusted worker pathname or encoded whole-image transport.
-        ensure!(
-            metadata_export::read_photo_seal(&work.plan.destination, &work.authority)?
-                == result.sealed,
-            "export worker seal changed"
-        );
-        Ok(Some(result))
-    }
-    pub fn stop(&mut self) -> Result<()> {
-        if !self.exited {
-            self.lease.take();
-            if self.child.try_wait()?.is_none() {
-                let killed = self.child.kill();
-                if self.child.try_wait()?.is_none() {
-                    killed?;
-                }
-            }
-            self.child.wait()?;
-            self.exited = true;
+                .and_then(|bytes| serde_json::from_slice::<String>(&bytes).ok())
+                .unwrap_or_else(|| "no bounded worker error receipt".into());
+            bail!("export worker failed ({status}): {detail}");
         }
         Ok(())
     }
@@ -285,6 +395,11 @@ impl ExportWorkerProcess {
     /// publication/restore evidence resides in its separately sealed directory.
     pub fn retire_transport(&self) -> Result<()> {
         ensure!(self.exited, "cannot retire a live export worker");
+        if let Some(parent_lease) = self.parent_lease.borrow_mut().take() {
+            check_parent_lease(&self.staging, &parent_lease)?;
+            FileExt::unlock(&parent_lease)?;
+            drop(parent_lease);
+        }
         match fence_transport(&self.staging)? {
             Inspection::Retired(retired) => {
                 ensure!(
@@ -298,6 +413,167 @@ impl ExportWorkerProcess {
         }
     }
 }
+
+fn cancellation_checkpoint(canceled: &AtomicBool, operation: &str) -> std::io::Result<()> {
+    if canceled.load(Ordering::Acquire) {
+        Err(std::io::Error::other(format!(
+            "export cancellation requested during {operation}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn verified_checkpoint(
+    output: &VerifiedFile,
+    canceled: &AtomicBool,
+    operation: &str,
+) -> std::io::Result<()> {
+    let rechecked = output
+        .recheck()
+        .map_err(|error| std::io::Error::other(format!("{error:#}")));
+    let cancellation = cancellation_checkpoint(canceled, operation);
+    rechecked?;
+    cancellation
+}
+
+fn validate_rendered(work: &ExportWork, staging: &Path, rendered: &StagedPhoto) -> Result<()> {
+    ensure!(
+        rendered.renderer_identity == work.plan.renderer_identity
+            && rendered.staging == staging.join("output")
+            && rendered.encoding.source_fingerprint == work.plan.original_revision.digest
+            && rendered.encoding.recipe_digest == work.plan.identity.recipe_digest
+            && rendered.encoding.encoded_extent > 0
+            && rendered.encoding.encoded_extent <= work.plan.max_payload_bytes,
+        "export worker result binding mismatch"
+    );
+    Ok(())
+}
+
+fn validate_rendering(
+    work: &ExportWork,
+    staging: &Path,
+    facts: &ExportRenderingFacts,
+) -> Result<()> {
+    let output_matches = facts.output.size == work.plan.output.size
+        && facts.output.format == work.plan.output.format
+        && facts.output.alpha == work.plan.output.alpha
+        && match (&facts.output.profile, &work.plan.output.profile) {
+            (StoredProfile::Srgb, StoredProfile::Srgb)
+            | (StoredProfile::LinearSrgb, StoredProfile::LinearSrgb) => true,
+            (StoredProfile::Icc { blob: actual }, StoredProfile::Icc { blob: expected }) => {
+                actual == expected
+            }
+            _ => false,
+        };
+    ensure!(
+        facts.job == work.job
+            && facts.sequence == work.sequence
+            && facts.authority == work.authority
+            && facts.attempt == work.attempt
+            && output_matches
+            && facts.output_revision.bytes == facts.rendered.encoding.encoded_extent,
+        "export worker result binding mismatch"
+    );
+    validate_rendered(work, staging, &facts.rendered)
+}
+
+fn validate_completed(work: &ExportWork, staging: &Path, result: &CompletedExport) -> Result<()> {
+    ensure!(
+        result.authority == work.authority
+            && result.attempt == work.attempt
+            && result.sealed.authority_digest == work.authority
+            && result.sealed.snapshot == work.plan.destination
+            && result.sealed.max_payload_bytes == work.plan.max_payload_bytes
+            && result.rendered.encoding.encoded_extent == result.sealed.payload.bytes,
+        "export worker result binding mismatch"
+    );
+    validate_rendered(work, staging, &result.rendered)
+}
+
+fn read_seal_checked(work: &ExportWork, canceled: &AtomicBool) -> Result<SealedPhotoExport> {
+    metadata_export::read_photo_seal_with_checkpoint(
+        &work.plan.destination,
+        &work.authority,
+        &mut |_| cancellation_checkpoint(canceled, "seal verification"),
+    )
+}
+
+fn complete_rendering(
+    work: &ExportWork,
+    facts: ExportRenderingFacts,
+    canceled: &AtomicBool,
+) -> Result<CompletedExport> {
+    let started = std::time::Instant::now();
+    let verified = VerifiedFile::read_with_checkpoint(
+        &facts.rendered.staging,
+        work.plan.max_payload_bytes,
+        &mut |_| cancellation_checkpoint(canceled, "fresh-output verification"),
+    )?;
+    ensure!(
+        verified.revision() == &facts.output_revision,
+        "native output changed before parent sealing"
+    );
+    let prior_directory = work
+        .plan
+        .destination
+        .destination
+        .parent()
+        .context("export destination parent")?
+        .join(format!(
+            ".photocatalog-photo-export-{}",
+            work.plan.destination.operation
+        ));
+    let sealed = if prior_directory.try_exists()? {
+        // A fenced retry independently rendered again. Reuse is allowed only
+        // after strict verification of both durable and fresh complete bytes.
+        let prior = metadata_export::read_photo_seal_with_checkpoint(
+            &work.plan.destination,
+            &work.authority,
+            &mut |_| verified_checkpoint(&verified, canceled, "seal verification"),
+        )?;
+        ensure!(
+            facts.output_revision.bytes == prior.payload.bytes
+                && facts.output_revision.digest == prior.payload.digest,
+            "orphan seal differs from fresh render; prepare a new export plan"
+        );
+        prior
+    } else {
+        metadata_export::seal_photo_export(
+            &work.plan.destination,
+            &facts.rendered.staging,
+            work.plan.max_payload_bytes,
+            &work.authority,
+            |_| verified_checkpoint(&verified, canceled, "seal creation"),
+        )?
+    };
+    ensure!(
+        sealed.payload.bytes == facts.output_revision.bytes
+            && sealed.payload.digest == facts.output_revision.digest,
+        "export worker result binding mismatch"
+    );
+    // Always reread the installed durable evidence before exposing the same
+    // CompletedExport value that standalone callers already consume.
+    ensure!(
+        metadata_export::read_photo_seal_with_checkpoint(
+            &work.plan.destination,
+            &work.authority,
+            &mut |_| verified_checkpoint(&verified, canceled, "seal verification"),
+        )? == sealed,
+        "export worker seal changed"
+    );
+    Ok(CompletedExport {
+        authority: facts.authority,
+        attempt: facts.attempt,
+        sealed,
+        rendered: facts.rendered,
+        // This interval now explicitly belongs to the local parent and includes
+        // fresh/orphan comparison or creation plus strict durable readback.
+        seal_ms: started.elapsed().as_secs_f64() * 1000.,
+        peak_resident_bytes: facts.peak_resident_bytes,
+        peak_method: facts.peak_method,
+    })
+}
 impl Drop for ExportWorkerProcess {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -306,6 +582,7 @@ impl Drop for ExportWorkerProcess {
 
 const RETIRED_PREFIX: &str = "photo-retired-";
 const TRANSPORT_FILES: &[&str] = &[
+    "parent.lock",
     "active.lock",
     "request.json",
     "profile.icc",
@@ -316,11 +593,38 @@ const TRANSPORT_FILES: &[&str] = &[
 ];
 #[derive(Debug, Serialize)]
 pub struct RetiredExportTransport {
+    #[serde(with = "crate::metadata_export::wire::native_path")]
     pub staging: PathBuf,
     pub work: ExportWork,
 }
+/// F-only compact custody for a fenced transport. The full plan is decoded for
+/// one directory at a time and is never retained in a combined inventory.
+#[derive(Clone)]
+pub(crate) struct CompactRetiredExportTransport {
+    pub token: crate::catalog_session::LeaseId,
+    staging: PathBuf,
+    directory_identity: (u64, u128),
+    active_identity: (u64, u128),
+    request_identity: (u64, u128),
+    request_digest: [u8; 32],
+    pub attempt: crate::catalog_session::export_executor::Attempt,
+}
+pub(crate) struct CompactExportTransportRecovery {
+    pub scanned: usize,
+    pub cleaned: usize,
+    pub retained: usize,
+    pub retained_example: Option<String>,
+    pub retired: Vec<CompactRetiredExportTransport>,
+}
+pub(crate) fn compact_recovery_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<CompactRetiredExportTransport>(),
+        std::mem::align_of::<CompactRetiredExportTransport>(),
+    )
+}
 #[derive(Debug, Serialize)]
 pub struct RetainedExportTransport {
+    #[serde(with = "crate::metadata_export::wire::native_path")]
     pub staging: PathBuf,
     pub reason: String,
 }
@@ -342,6 +646,22 @@ fn same_work(a: &ExportWork, b: &ExportWork) -> bool {
         && a.attempt == b.attempt
         && a.job == b.job
         && a.sequence == b.sequence
+}
+fn attempt(work: &ExportWork) -> crate::catalog_session::export_executor::Attempt {
+    crate::catalog_session::export_executor::Attempt {
+        job: work.job.clone(),
+        sequence: work.sequence,
+        attempt: work.attempt.clone(),
+        authority: work.authority.clone(),
+    }
+}
+fn compact_recovery_reason(value: impl std::fmt::Display) -> String {
+    let value = value.to_string();
+    let mut length = value.len().min(2048);
+    while !value.is_char_boundary(length) {
+        length -= 1;
+    }
+    value[..length].to_owned()
 }
 fn retired_name(path: &Path) -> bool {
     path.file_name()
@@ -383,6 +703,33 @@ fn open_lease(path: &Path) -> Result<File> {
         .truncate(false)
         .open(target)?)
 }
+enum ParentLeaseInspection {
+    Absent,
+    Acquired(AcquiredLease),
+    Busy,
+}
+fn acquire_parent_lease(path: &Path) -> Result<ParentLeaseInspection> {
+    let target = path.join("parent.lock");
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "invalid export parent lease type"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ParentLeaseInspection::Absent);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let file = metadata_export::open_regular(&target)?;
+    if let Err(error) = file.try_lock_exclusive() {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            return Ok(ParentLeaseInspection::Busy);
+        }
+        return Err(error.into());
+    }
+    check_parent_lease(path, &file)?;
+    Ok(ParentLeaseInspection::Acquired(AcquiredLease(file)))
+}
 // Construct only after successful acquisition. Closing one descriptor does not
 // release flock while a concurrent fork/dup retains its open-file description.
 // Explicit unlock ends this authority on every return/error before file close.
@@ -408,6 +755,24 @@ fn mark_retired(lock: &mut File) -> Result<()> {
 }
 fn lease_identity(file: &File) -> std::io::Result<(u64, u128)> {
     crate::storage_volume::held_object_key(file)
+}
+fn check_parent_lease(path: &Path, lock: &File) -> Result<()> {
+    ensure!(
+        lock.metadata()?.len() == 0,
+        "invalid export parent lease marker"
+    );
+    ensure!(
+        fs::symlink_metadata(path.join("parent.lock"))?
+            .file_type()
+            .is_file(),
+        "export parent lease type changed"
+    );
+    ensure!(
+        lease_identity(lock)?
+            == lease_identity(&metadata_export::open_regular(&path.join("parent.lock"))?)?,
+        "export parent lease identity changed"
+    );
+    Ok(())
 }
 fn check_live_lease(path: &Path, lock: &File) -> Result<()> {
     ensure!(
@@ -465,6 +830,25 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         fs::remove_dir(path)?;
         return Ok(Inspection::Cleaned);
     }
+    // A read-only proof remains compatible with an active Windows worker whose
+    // directory handle does not share deletion. The DELETE-capable handle is
+    // admitted only after both leases prove idle, then matched to this object.
+    #[cfg(windows)]
+    let directory_proof = crate::filesystem_worker::open_directory(path)?;
+    #[cfg(windows)]
+    let directory_parent_proof = crate::filesystem_worker::open_directory(
+        path.parent().context("export transport parent")?,
+    )?;
+    #[allow(unused_mut)]
+    let mut parent = match acquire_parent_lease(path)? {
+        ParentLeaseInspection::Absent => None,
+        ParentLeaseInspection::Acquired(parent) => Some(parent),
+        ParentLeaseInspection::Busy => {
+            return Ok(Inspection::Retained(
+                "parent lease is busy; stage remains owned".into(),
+            ));
+        }
+    };
     let lock = open_lease(path)?;
     if let Err(error) = lock.try_lock_exclusive() {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
@@ -488,6 +872,7 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         if retired {
             // Only discard removes request.json, after the catalog owner has
             // reconciled the returned retirement proof. No work is fabricated.
+            drop(parent);
             discard_files(path, lock, paths)?;
             return Ok(Inspection::Cleaned);
         }
@@ -506,11 +891,41 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
             .parent()
             .context("export transport parent")?
             .join(format!("{RETIRED_PREFIX}{}", uuid::Uuid::new_v4()));
-        // A delayed Windows child may hold its current directory open. Failure
-        // leaves the tombstoned original plus request intact for a later pass.
+        // The active marker is durable and both worker leases have proved idle.
+        // Windows can reject a pathname rename while descendant lock handles
+        // remain open. Release those locks and rename the already
+        // admitted directory handle into the already admitted parent instead,
+        // so a path substitution cannot redirect the fence to another object.
+        #[cfg(windows)]
+        {
+            drop(parent.take());
+            let directory = discard_directory(path)?;
+            ensure!(
+                lease_identity(&directory)? == lease_identity(&directory_proof)?,
+                "export transport directory changed before fence"
+            );
+            let directory_parent =
+                discard_directory(path.parent().context("export transport parent")?)?;
+            ensure!(
+                lease_identity(&directory_parent)? == lease_identity(&directory_parent_proof)?,
+                "export transport parent changed before fence"
+            );
+            rename_directory_held(
+                &directory,
+                &directory_parent,
+                claimed.file_name().context("retired export name")?,
+            )?;
+            ensure!(
+                lease_identity(&crate::filesystem_worker::open_directory(&claimed)?)?
+                    == lease_identity(&directory)?,
+                "retired export directory identity changed during fence"
+            );
+        }
+        #[cfg(not(windows))]
         fs::rename(path, &claimed)?;
         claimed
     };
+    drop(parent);
     Ok(Inspection::Retired(Box::new(RetiredExportTransport {
         staging,
         work: request.work,
@@ -524,6 +939,14 @@ pub fn recover_export_transports(
     root: &Path,
     max_directories: usize,
 ) -> Result<ExportTransportRecovery> {
+    recover_export_transports_with_checkpoint(root, max_directories, &mut || Ok(()))
+}
+pub fn recover_export_transports_with_checkpoint(
+    root: &Path,
+    max_directories: usize,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<ExportTransportRecovery> {
+    checkpoint()?;
     ensure!(
         root.is_absolute() && (1..=1024).contains(&max_directories),
         "export recovery bounds"
@@ -549,6 +972,7 @@ pub fn recover_export_transports(
         ..Default::default()
     };
     for entry in entries {
+        checkpoint()?;
         let staging = entry.path();
         match fence_transport(&staging) {
             Ok(Inspection::Retired(value)) => result.retired.push(*value),
@@ -564,11 +988,580 @@ pub fn recover_export_transports(
     }
     Ok(result)
 }
+
+fn compact_retired(value: RetiredExportTransport) -> Result<CompactRetiredExportTransport> {
+    let RetiredExportTransport { mut staging, work } = value;
+    staging = staging.canonicalize()?;
+    crate::catalog_session::validate_path(&crate::storage_volume::NativePath::from_path(&staging))?;
+    staging.shrink_to_fit();
+    let expected_attempt = attempt(&work);
+    expected_attempt.validate()?;
+    // Drop the request returned by fencing before decoding its durable copy.
+    // Validation can overlap the persisted raw plan with its checked typed plan;
+    // neither graph is retained in the compact inventory.
+    drop(work);
+    let directory = crate::filesystem_worker::open_directory(&staging)?;
+    let active = metadata_export::open_regular(&staging.join("active.lock"))?;
+    let request_file = metadata_export::open_regular(&staging.join("request.json"))?;
+    let request_bytes = read(&staging.join("request.json"), REQUEST_LIMIT)?;
+    ensure!(
+        lease_identity(&request_file)?
+            == lease_identity(&metadata_export::open_regular(
+                &staging.join("request.json")
+            )?)?,
+        "retired export request identity changed"
+    );
+    let request: Request = serde_json::from_slice(&request_bytes)?;
+    validate_persisted(&request)?;
+    attempt(&request.work).validate()?;
+    ensure!(
+        expected_attempt == attempt(&request.work),
+        "retired export attempt changed"
+    );
+    Ok(CompactRetiredExportTransport {
+        token: crate::catalog_session::LeaseId::new(),
+        staging,
+        directory_identity: crate::storage_volume::held_object_key(&directory)?,
+        active_identity: lease_identity(&active)?,
+        request_identity: lease_identity(&request_file)?,
+        request_digest: *blake3::hash(&request_bytes).as_bytes(),
+        attempt: attempt(&request.work),
+    })
+}
+
+/// Inventory every supplied namespace under one global bound before invoking
+/// the existing mutating fence policy for the first directory.
+pub(crate) fn recover_export_transports_compact_with_checkpoint(
+    roots: &[&Path],
+    max_directories: usize,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<CompactExportTransportRecovery> {
+    checkpoint()?;
+    ensure!(
+        !roots.is_empty()
+            && roots.iter().all(|root| root.is_absolute())
+            && (1..=1024).contains(&max_directories),
+        "export recovery bounds"
+    );
+    let mut entries = Vec::new();
+    for root in roots {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => ensure!(metadata.file_type().is_dir(), "export recovery root type"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entries.len() == max_directories + 1 {
+                return Ok(CompactExportTransportRecovery {
+                    scanned: max_directories,
+                    cleaned: 0,
+                    retained: 1,
+                    retained_example: Some(
+                        "export recovery directory bound exceeded; no entry was fenced".into(),
+                    ),
+                    retired: Vec::new(),
+                });
+            }
+            entries.push(entry.path());
+        }
+    }
+    // One empty pre-move/completed wrapper is separately bounded control, not
+    // another transport. No new claim can be admitted until recovery resolves
+    // it. Unknown/multiple wrappers block every effect before normal fencing.
+    let claims: Vec<_> = entries
+        .iter()
+        .filter(|path| claim::is_claim(path))
+        .take(2)
+        .collect();
+    let admission = (|| -> Result<usize> {
+        ensure!(claims.len() <= 1, "multiple Discard claim intents retained");
+        let mut controls = 0;
+        for wrapper in &claims {
+            controls += usize::from(
+                claim::empty_control(wrapper)
+                    .with_context(|| format!("claim {}", wrapper.display()))?,
+            );
+            claim::preflight(wrapper).with_context(|| format!("claim {}", wrapper.display()))?;
+        }
+        ensure!(
+            entries.len() - controls <= max_directories,
+            "export recovery directory bound exceeded; no entry was fenced"
+        );
+        Ok(controls)
+    })();
+    let controls = match admission {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(CompactExportTransportRecovery {
+                scanned: entries.len().min(max_directories),
+                cleaned: 0,
+                retained: 1,
+                retained_example: Some(compact_recovery_reason(format_args!("{error:#}"))),
+                retired: Vec::new(),
+            });
+        }
+    };
+    // Resolve empty intent metadata first, so its original still participates
+    // in the unchanged transport scan below. This follows complete admission.
+    for wrapper in claims {
+        if claim::empty_control(wrapper)? {
+            claim::recover(wrapper)?;
+        }
+    }
+    let mut result = CompactExportTransportRecovery {
+        scanned: entries.len() - controls,
+        cleaned: 0,
+        retained: 0,
+        retained_example: None,
+        retired: Vec::new(),
+    };
+    result.retired.try_reserve(entries.len())?;
+    for staging in entries {
+        checkpoint()?;
+        if claim::is_claim(&staging) {
+            if !staging.try_exists()? {
+                continue;
+            } // admitted empty control
+            match claim::recover(&staging) {
+                Ok(true) => result.cleaned += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    result.retained += 1;
+                    if result.retained_example.is_none() {
+                        result.retained_example = Some(compact_recovery_reason(error));
+                    }
+                }
+            }
+            continue;
+        }
+        let inspected = fence_transport(&staging).and_then(|inspection| match inspection {
+            Inspection::Retired(value) => compact_retired(*value).map(Some),
+            Inspection::Cleaned => {
+                result.cleaned += 1;
+                Ok(None)
+            }
+            Inspection::Retained(reason) => {
+                result.retained += 1;
+                if result.retained_example.is_none() {
+                    result.retained_example = Some(compact_recovery_reason(format_args!(
+                        "{}: {reason}",
+                        staging.display()
+                    )));
+                }
+                Ok(None)
+            }
+        });
+        match inspected {
+            Ok(Some(value)) => result.retired.push(value),
+            Ok(None) => {}
+            Err(error) => {
+                result.retained += 1;
+                if result.retained_example.is_none() {
+                    result.retained_example = Some(compact_recovery_reason(format_args!(
+                        "{}: {error:#}",
+                        staging.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// One effectful Discard retains handles and per-artifact progress until its
+/// prevalidated terminal reply has been adopted by F. Missing proof is accepted
+/// only after this object itself successfully removed that exact proof.
+struct ClaimedCleanup {
+    directory: File,
+    parent: File,
+    files: [Option<File>; 8],
+    removed: [bool; 8],
+    directory_removed: bool,
+}
+impl Drop for ClaimedCleanup {
+    fn drop(&mut self) {
+        for index in [0, 1] {
+            if let Some(file) = &self.files[index] {
+                let _ = FileExt::unlock(file);
+            }
+        }
+    }
+}
+fn discard_directory(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            // GENERIC_READ | DELETE keeps the exact directory removable;
+            // FILE_TRAVERSE lets this same held handle serve as RootDirectory
+            // for a relative FILE_RENAME_INFO target.
+            .access_mode(0x80000000 | 0x10000 | 0x20)
+            .share_mode(1 | 2 | 4)
+            .custom_flags(0x02000000 | 0x00200000)
+            .open(path)?;
+        ensure!(
+            file.metadata()?.is_dir() && fs::symlink_metadata(path)?.file_type().is_dir(),
+            "retired directory type"
+        );
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    crate::filesystem_worker::open_directory(path)
+}
+fn discard_file(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(0xc0000000 | 0x10000)
+            .share_mode(1 | 2 | 4)
+            .custom_flags(0x00200000)
+            .open(path)?;
+        ensure!(
+            file.metadata()?.is_file() && fs::symlink_metadata(path)?.file_type().is_file(),
+            "retired artifact type"
+        );
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    metadata_export::open_regular(path)
+}
+
+#[cfg(windows)]
+fn rename_directory_held(source: &File, parent: &File, name: &std::ffi::OsStr) -> Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    #[repr(C)]
+    struct RenameInfo<const N: usize> {
+        replace_if_exists: u32,
+        root_directory: *mut std::ffi::c_void,
+        file_name_length: u32,
+        file_name: [u16; N],
+    }
+    #[repr(C)]
+    struct IoStatus {
+        status: usize,
+        information: usize,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(
+            handle: *mut std::ffi::c_void,
+            status: *mut IoStatus,
+            info: *const std::ffi::c_void,
+            bytes: u32,
+            class: i32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    let encoded: Vec<u16> = name.encode_wide().collect();
+    ensure!(
+        !encoded.is_empty() && encoded.len() <= 128 && !encoded.contains(&0),
+        "invalid retired export name"
+    );
+    // FILE_RENAME_INFORMATION declares FileName[1]; include the declared
+    // structure size plus the named UTF-16 bytes.
+    // Keep one extra code unit in the backing object so that formula is valid
+    // on both 32- and 64-bit Windows, including the maximum accepted name.
+    let mut info = RenameInfo::<129> {
+        replace_if_exists: 0,
+        root_directory: parent.as_raw_handle(),
+        file_name_length: u32::try_from(encoded.len() * std::mem::size_of::<u16>())?,
+        file_name: [0; 129],
+    };
+    info.file_name[..encoded.len()].copy_from_slice(&encoded);
+    let bytes = std::mem::size_of::<RenameInfo<1>>()
+        .checked_add(encoded.len() * std::mem::size_of::<u16>())
+        .context("retired export rename buffer")?;
+    ensure!(
+        bytes <= std::mem::size_of_val(&info),
+        "retired export name overflow"
+    );
+    let mut completion = IoStatus {
+        status: 0,
+        information: 0,
+    };
+    // discard_directory creates synchronous handles (no FILE_FLAG_OVERLAPPED).
+    // The kernel completes this request before these stack buffers are released.
+    // The native API resolves the leaf against the held parent; the Win32
+    // wrapper rejects this relative-root request with ERROR_INVALID_PARAMETER.
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle(),
+            &mut completion,
+            std::ptr::from_ref(&info).cast(),
+            u32::try_from(bytes)?,
+            10, // FileRenameInformation; flags == 0 prohibits replacement.
+        )
+    };
+    for status in [status, completion.status as i32] {
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32,
+            ))
+            .context("handle-bound export directory rename failed");
+        }
+    }
+    Ok(())
+}
+impl ClaimedCleanup {
+    pub(crate) fn begin(retired: &CompactRetiredExportTransport) -> Result<Self> {
+        ensure!(retired_name(&retired.staging), "transport was not fenced");
+        let directory = discard_directory(&retired.staging)?;
+        ensure!(
+            lease_identity(&directory)? == retired.directory_identity,
+            "retired export directory identity changed"
+        );
+        let parent = discard_directory(retired.staging.parent().context("retired parent")?)?;
+        let paths = transport_files(&retired.staging)?;
+        let mut cleanup = Self {
+            directory,
+            parent,
+            files: std::array::from_fn(|_| None),
+            removed: [false; 8],
+            directory_removed: false,
+        };
+        for path in paths {
+            let index = TRANSPORT_FILES
+                .iter()
+                .position(|name| path.file_name().is_some_and(|actual| actual == *name))
+                .context("retired artifact")?;
+            cleanup.files[index] = Some(discard_file(&path)?);
+        }
+        let active = cleanup.files[1]
+            .as_mut()
+            .context("retired active proof missing")?;
+        ensure!(
+            lease_identity(active)? == retired.active_identity,
+            "retired export active lease identity changed"
+        );
+        active
+            .try_lock_exclusive()
+            .context("retired export lease busy")?;
+        ensure!(
+            lease_retired(active)?,
+            "transport retirement marker missing"
+        );
+        if let Some(parent) = &cleanup.files[0] {
+            parent
+                .try_lock_exclusive()
+                .context("retired export parent lease busy")?;
+        }
+        ensure!(
+            lease_identity(
+                cleanup.files[2]
+                    .as_ref()
+                    .context("retired request proof missing")?
+            )? == retired.request_identity,
+            "retired request identity changed"
+        );
+        cleanup.verify(retired)?;
+        Ok(cleanup)
+    }
+    fn verify(&mut self, retired: &CompactRetiredExportTransport) -> Result<()> {
+        let path = &retired.staging;
+        ensure!(
+            path.canonicalize()? == *path,
+            "retired export link ancestry changed"
+        );
+        ensure!(
+            lease_identity(&crate::filesystem_worker::open_directory(path)?)?
+                == lease_identity(&self.directory)?
+                && lease_identity(&crate::filesystem_worker::open_directory(
+                    path.parent().context("retired parent")?
+                )?)? == lease_identity(&self.parent)?,
+            "retired export directory identity changed"
+        );
+        // Check the whole closed vocabulary and every still-owned identity on
+        // each continuation. A replacement is never adopted after a failure.
+        transport_files(path)?;
+        for (index, name) in TRANSPORT_FILES.iter().enumerate() {
+            let target = path.join(name);
+            if self.removed[index] || self.files[index].is_none() {
+                ensure!(
+                    matches!(fs::symlink_metadata(&target), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                    "retired export artifact appeared after removal"
+                );
+            } else {
+                let current = metadata_export::open_regular(&target)?;
+                ensure!(
+                    lease_identity(&current)?
+                        == lease_identity(self.files[index].as_ref().expect("retained file"))?,
+                    "retired export artifact identity changed"
+                );
+            }
+        }
+        if !self.removed[1] {
+            ensure!(
+                lease_retired(
+                    self.files[1]
+                        .as_mut()
+                        .context("retired active proof missing")?
+                )?,
+                "retired marker changed"
+            );
+        }
+        if !self.removed[2] {
+            let request = self.files[2]
+                .as_mut()
+                .context("retired request proof missing")?;
+            ensure!(
+                request.metadata()?.len() <= REQUEST_LIMIT,
+                "retired request bound"
+            );
+            request.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            request.take(REQUEST_LIMIT + 1).read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= REQUEST_LIMIT
+                    && *blake3::hash(&bytes).as_bytes() == retired.request_digest,
+                "retired export request changed"
+            );
+        }
+        Ok(())
+    }
+    fn resume(
+        &mut self,
+        retired: &CompactRetiredExportTransport,
+        record: &mut claim::Record,
+        wrapper: &Path,
+        _original: &Path,
+    ) -> Result<()> {
+        if !self.directory_removed {
+            // Optional artifacts first, then request proof, then the tombstone.
+            for index in [3, 4, 5, 6, 7, 0, 2, 1] {
+                if self.files[index].is_none() || self.removed[index] {
+                    continue;
+                }
+                #[cfg(test)]
+                compact_discard_checkpoint(TRANSPORT_FILES[index], &retired.staging)?;
+                self.verify(retired)?;
+                record.removing |= 1 << index;
+                record.save(wrapper)?;
+                #[cfg(test)]
+                compact_discard_checkpoint(
+                    match index {
+                        2 => "verified-request",
+                        1 => "verified-active",
+                        _ => "verified-artifact",
+                    },
+                    _original,
+                )?;
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    let name = std::ffi::CString::new(TRANSPORT_FILES[index])?;
+                    ensure!(
+                        unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) }
+                            == 0,
+                        "retired artifact removal: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                #[cfg(windows)]
+                {
+                    // Delete through the already admitted object handle. Closing
+                    // it after the durable intent releases Windows locks and
+                    // makes removal visible before the directory is retired.
+                    let target = self.files[index].as_ref().expect("retained file");
+                    crate::filesystem_worker::delete_export_held(target)?;
+                    drop(self.files[index].take());
+                }
+                self.removed[index] = true;
+                #[cfg(test)]
+                compact_discard_checkpoint(
+                    match index {
+                        2 => "after-request",
+                        1 => "after-active",
+                        _ => "after-artifact",
+                    },
+                    &retired.staging,
+                )?;
+            }
+            #[cfg(test)]
+            compact_discard_checkpoint("directory", &retired.staging)?;
+            self.verify(retired)?;
+            record.removing_directory = true;
+            record.save(wrapper)?;
+            #[cfg(test)]
+            compact_discard_checkpoint("verified-directory", _original)?;
+            #[cfg(unix)]
+            {
+                use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+                let name = std::ffi::CString::new(
+                    retired
+                        .staging
+                        .file_name()
+                        .context("retired name")?
+                        .as_bytes(),
+                )?;
+                ensure!(
+                    unsafe {
+                        libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                    } == 0,
+                    "retired directory removal: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            #[cfg(windows)]
+            {
+                let target = discard_directory(&retired.staging)?;
+                ensure!(
+                    lease_identity(&target)? == lease_identity(&self.directory)?,
+                    "retired directory deletion identity changed"
+                );
+                crate::filesystem_worker::delete_export_held(&target)?;
+                drop(target);
+            }
+            self.directory_removed = true;
+            #[cfg(test)]
+            compact_discard_checkpoint("after-directory", &retired.staging)?;
+        }
+        // Retry a failed durability barrier on the held parent. The completed
+        // directory removal never reopens or deletes a newly created namesake.
+        #[cfg(unix)]
+        self.parent.sync_all()?;
+        Ok(())
+    }
+}
+#[cfg(test)]
+type CompactDiscardHook = Box<dyn FnMut(&str, &Path) -> Result<()>>;
+#[cfg(test)]
+thread_local! {
+    static COMPACT_DISCARD_HOOK: RefCell<Option<CompactDiscardHook>> = RefCell::new(None);
+}
+#[cfg(test)]
+pub(crate) fn set_compact_discard_hook(hook: impl FnMut(&str, &Path) -> Result<()> + 'static) {
+    COMPACT_DISCARD_HOOK.with(|value| *value.borrow_mut() = Some(Box::new(hook)));
+}
+#[cfg(test)]
+fn compact_discard_checkpoint(phase: &str, path: &Path) -> Result<()> {
+    COMPACT_DISCARD_HOOK.with(|value| match value.borrow_mut().as_mut() {
+        Some(hook) => hook(phase, path),
+        None => Ok(()),
+    })
+}
+/// Convenience used only by isolated source fixtures. The F owner retains the
+/// same object across calls, rather than recreating it after effectful failure.
+#[cfg(test)]
+pub(crate) fn discard_compact_retired_export_transport(
+    retired: &CompactRetiredExportTransport,
+) -> Result<()> {
+    CompactDiscard::test_begin(retired)?.resume(retired)
+}
 /// Call only after the catalog has fenced/reconciled this exact retired attempt.
 /// Its durable destination seal is outside transport and is never removed here.
 pub fn discard_retired_export_transport(retired: &RetiredExportTransport) -> Result<()> {
     ensure!(retired_name(&retired.staging), "transport was not fenced");
     let paths = transport_files(&retired.staging)?;
+    let parent = match acquire_parent_lease(&retired.staging)? {
+        ParentLeaseInspection::Absent => None,
+        ParentLeaseInspection::Acquired(parent) => Some(parent),
+        ParentLeaseInspection::Busy => bail!("retired export parent lease busy"),
+    };
     let lock = open_lease(&retired.staging)?;
     lock.try_lock_exclusive()
         .context("retired export lease busy")?;
@@ -584,6 +1577,7 @@ pub fn discard_retired_export_transport(retired: &RetiredExportTransport) -> Res
         same_work(&retired.work, &request.work),
         "retired export attempt changed"
     );
+    drop(parent);
     discard_files(&retired.staging, lock, paths)
 }
 
@@ -617,6 +1611,7 @@ pub fn export_worker_main() -> Result<()> {
         let request: Request =
             serde_json::from_slice(&read(&current.join("request.json"), REQUEST_LIMIT)?)?;
         validate(&request)?;
+        admit_output_path(&request.work, &current.join("output"))?;
         let plan = &request.work.plan;
         let profile = match &plan.output.profile {
             StoredProfile::Srgb => OutputProfile::Srgb,
@@ -649,44 +1644,23 @@ pub fn export_worker_main() -> Result<()> {
             request.limits,
             &(),
         )?;
-        let seal_started = std::time::Instant::now();
-        let prior_directory = plan
-            .destination
-            .destination
-            .parent()
-            .context("export destination parent")?
-            .join(format!(
-                ".photocatalog-photo-export-{}",
-                plan.destination.operation
-            ));
-        let sealed = if prior_directory.try_exists()? {
-            // A fenced retry must independently render again. It may reuse old
-            // sealed bytes only after a complete fresh-byte equality check.
-            let prior =
-                metadata_export::read_photo_seal(&plan.destination, &request.work.authority)?;
-            let fresh =
-                metadata_export::inspect_file_revision(&rendered.staging, plan.max_payload_bytes)?;
-            ensure!(
-                fresh.bytes == prior.payload.bytes && fresh.digest == prior.payload.digest,
-                "orphan seal differs from fresh render; prepare a new export plan"
-            );
-            prior
-        } else {
-            metadata_export::seal_photo_export(
-                &plan.destination,
-                &rendered.staging,
-                plan.max_payload_bytes,
-                &request.work.authority,
-                |_| Ok(()),
-            )?
-        };
+        let native_output = VerifiedFile::read_with_checkpoint(
+            &rendered.staging,
+            plan.max_payload_bytes,
+            &mut |_| Ok(()),
+        )?;
+        let output_revision = native_output.revision().clone();
+        native_output.recheck()?;
+        let output = plan.output.clone();
         let (peak_resident_bytes, peak_method) = crate::preview::peak_resident_memory();
-        let receipt = CompletedExport {
+        let receipt = ExportRenderingFacts {
+            job: request.work.job,
+            sequence: request.work.sequence,
             authority: request.work.authority,
             attempt: request.work.attempt,
-            sealed,
+            output,
+            output_revision,
             rendered,
-            seal_ms: seal_started.elapsed().as_secs_f64() * 1000.,
             peak_resident_bytes,
             peak_method,
         };

@@ -5,6 +5,16 @@ use anyhow::{Context, Result, bail, ensure};
 use roxmltree::{Document, Node};
 use std::collections::BTreeMap;
 
+use crate::lightroom_migration_worker::memory::{
+    layout::{add, mul, tree_node},
+    requested::{Requested, Scope},
+};
+
+#[cfg(test)]
+mod derivative_tests;
+#[cfg(test)]
+mod tests;
+
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML: &str = "http://www.w3.org/XML/1998/namespace";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -32,20 +42,33 @@ struct Model {
 /// compare ASCII case-insensitively; duplicate normalized alternatives are errors.
 /// Sequence order,
 /// duplicates, literal whitespace, unknown qualifiers, and subjects are retained.
+#[cfg(test)]
 pub fn assert_equivalent(source_xml: &str, serialized_xml: &str) -> Result<()> {
-    let source = model(source_xml).context("original RDF semantics")?;
-    let serialized = model(serialized_xml).context("serialized RDF semantics")?;
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    assert_equivalent_admitted(source_xml, serialized_xml, &requested)
+}
+
+pub(crate) fn assert_equivalent_admitted<'a>(
+    source_xml: &str,
+    serialized_xml: &str,
+    requested: &'a Requested<'a>,
+) -> Result<()> {
+    // Tuple field order is deliberate: each Model drops before its guard.
+    let source = model_admitted(source_xml, requested).context("original RDF semantics")?;
+    let serialized =
+        model_admitted(serialized_xml, requested).context("serialized RDF semantics")?;
     ensure!(
-        source.subject == serialized.subject,
+        source.0.subject == serialized.0.subject,
         "XMP serialization changed RDF subject"
     );
     ensure!(
-        source.properties.len() == serialized.properties.len(),
+        source.0.properties.len() == serialized.0.properties.len(),
         "XMP serialization changed property count"
     );
-    for (name, value) in source.properties {
+    for (name, value) in source.0.properties {
         ensure!(
-            serialized.properties.get(&name) == Some(&value),
+            serialized.0.properties.get(&name) == Some(&value),
             "XMP serialization changed property {{{}}}{}",
             name.0,
             name.1
@@ -70,8 +93,10 @@ fn insert(properties: &mut Properties, key: Name, value: Value) -> Result<()> {
     Ok(())
 }
 
-fn model(text: &str) -> Result<Model> {
+fn model_admitted<'a>(text: &str, requested: &'a Requested<'a>) -> Result<(Model, Scope<'a>)> {
     ensure!(text.len() <= MAX_BYTES, "RDF comparison exceeds byte limit");
+    let _document_scope =
+        requested.scope(crate::lightroom_migration_worker::memory::core::xml_document(text)?)?;
     let doc = Document::parse_with_options(
         text,
         roxmltree::ParsingOptions {
@@ -93,6 +118,8 @@ fn model(text: &str) -> Result<Model> {
             );
         }
     }
+    let model_bytes = rdf_model_storage(&doc)?;
+    let model_scope = requested.scope(model_bytes)?;
     let mut roots = doc.descendants().filter(|n| n.has_tag_name((RDF, "RDF")));
     let root = roots.next().context("missing RDF model")?;
     ensure!(roots.next().is_none(), "multiple RDF models");
@@ -125,10 +152,71 @@ fn model(text: &str) -> Result<Model> {
             insert(&mut properties, key, value)?;
         }
     }
-    Ok(Model {
-        subject: subject.unwrap_or_default().to_owned(),
-        properties,
-    })
+    Ok((
+        Model {
+            subject: subject.unwrap_or_default().to_owned(),
+            properties,
+        },
+        model_scope,
+    ))
+}
+
+/// Borrowed scan of the admitted document before RDF strings/maps/vectors are
+/// constructed. Every copied namespace, local name, attribute/text payload and
+/// typed-node URI is counted at its actual decoded length. Tree backing uses a
+/// node per possible settled entry/map root plus one insertion cascade per
+/// simultaneously active nesting level; arrays use the pinned RawVec envelope.
+fn rdf_model_storage(document: &Document<'_>) -> Result<usize> {
+    let mut strings = 0usize;
+    let mut entries = 0usize;
+    let mut elements = 0usize;
+    let mut arrays = 0usize;
+    let mut boxes = 0usize;
+    let mut maximum_depth = 0usize;
+    for node in document.descendants().filter(Node::is_element) {
+        elements = add(elements, 1)?;
+        maximum_depth = maximum_depth.max(node.ancestors().take(66).count());
+        let tag = node.tag_name();
+        strings = add(strings, tag.namespace().unwrap_or_default().len())?;
+        strings = add(strings, tag.name().len())?;
+        if tag.namespace() == Some(RDF) && matches!(tag.name(), "Bag" | "Seq" | "Alt") {
+            arrays = add(arrays, 1)?;
+        }
+        for attribute in node.attributes() {
+            entries = add(entries, 1)?;
+            strings = add(strings, attribute.namespace().unwrap_or_default().len())?;
+            strings = add(strings, attribute.name().len())?;
+            strings = add(strings, attribute.value().len())?;
+            if matches!(
+                (attribute.namespace(), attribute.name()),
+                (Some(XML), "lang") | (Some(RDF), "resource") | (Some(RDF), "value")
+            ) {
+                strings = add(strings, attribute.value().len())?;
+            }
+        }
+        for text in node.children().filter(Node::is_text) {
+            strings = add(strings, text.text().unwrap_or_default().len())?;
+        }
+        if node.parent().is_some_and(|parent| parent.is_element()) {
+            entries = add(entries, 1)?;
+        }
+        if node.attributes().len() != 0 {
+            boxes = add(boxes, 1)?;
+        }
+    }
+    let tree_nodes = add(add(entries, elements)?, maximum_depth)?;
+    let trees = mul(tree_nodes, tree_node::<Name, Value>()?)?;
+    let vector_entries = add(mul(2, elements)?, mul(8, arrays)?)?;
+    add(
+        strings,
+        add(
+            trees,
+            add(
+                mul(vector_entries, std::mem::size_of::<Value>())?,
+                mul(boxes, std::mem::size_of::<Value>())?,
+            )?,
+        )?,
+    )
 }
 
 fn elements<'a, 'input>(node: Node<'a, 'input>) -> Result<Vec<Node<'a, 'input>>> {

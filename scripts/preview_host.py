@@ -24,7 +24,7 @@ def sha(path):
 
 def storage(path):
     path = Path(path).resolve()
-    result = {"path": str(path), "capacity": psutil.disk_usage(path)._asdict()}
+    result = {"path": str(path), "capacity": psutil.disk_usage(os.fspath(path))._asdict()}
     try:
         mounts = [p for p in psutil.disk_partitions(all=True)
                   if path == Path(p.mountpoint) or Path(p.mountpoint) in path.parents]

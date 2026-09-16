@@ -518,14 +518,19 @@ impl Catalog {
             )?;
         }
         let storage_processed = crate::catalog_images::step_storage(&tx, limit - rows.len())?;
+        let order_processed = crate::catalog_images::collection_order_index::step(
+            &tx,
+            limit - rows.len() - storage_processed,
+        )?;
         let pending = after < high
+            || !crate::catalog_images::collection_order_index::ready(&tx)?
             || tx.query_row("SELECT EXISTS(SELECT 1 FROM organization_dirty) OR EXISTS(SELECT 1 FROM image_storage_events)", [], |r| {
                 r.get::<_, bool>(0)
             })?;
         tx.commit()?;
         drop(_write);
         Ok(IndexProgress {
-            processed: rows.len() + storage_processed,
+            processed: rows.len() + storage_processed + order_processed,
             backfill_after: after,
             backfill_high: high,
             pending,

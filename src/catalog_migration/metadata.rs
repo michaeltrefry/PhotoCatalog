@@ -5,6 +5,8 @@ use super::{
     organization::{Evidence, Link, SourceRecord, verify_unique_link},
     retention,
 };
+use crate::catalog_migration::repair_memory;
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_images::{self, TranslationState},
@@ -88,7 +90,7 @@ fn previous(
     owner: &str,
     digest: &str,
 ) -> Result<Option<ResultRecord>> {
-    let old:Option<(String,String,Vec<u8>)>=db.query_row("SELECT owner,input_digest,result FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot=?3",params![image,payload,slot],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let old:Option<(String,String,Vec<u8>)>=db.query_row("SELECT owner,input_digest,result FROM migration_metadata WHERE image_source=?1 AND payload_source=?2 AND slot=?3",params![image,payload,slot],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?))).optional()?;
     old.map(|(old_owner, old_digest, bytes)| {
         ensure!(
             old_owner == owner && old_digest == digest,
@@ -219,6 +221,16 @@ impl Catalog {
     pub fn project_migration_catalog_xmp(
         &mut self,
         source: Option<&MigrationSource>,
+        request: &CatalogXmp,
+    ) -> Result<ResultRecord> {
+        self.project_migration_catalog_xmp_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_catalog_xmp_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
         request: &CatalogXmp,
     ) -> Result<ResultRecord> {
         owner(&request.import_source)?;
@@ -452,7 +464,10 @@ impl Catalog {
             request.settings_table,
         )?;
         if let Some(Cell::Text(bytes) | Cell::Blob(bytes)) = fields.get("text")
-            && let Ok(path) = adobe::catalog_settings_path(bytes, adobe::Limits::default())?
+            && let Ok(path) = {
+                super::repair_memory::adobe(bytes)?;
+                adobe::catalog_settings_path(bytes, adobe::Limits::default())?
+            }
         {
             request.settings_path = path;
         }
@@ -463,6 +478,16 @@ impl Catalog {
     pub fn project_migration_current_develop(
         &mut self,
         source: Option<&MigrationSource>,
+        request: &CurrentDevelop,
+    ) -> Result<ResultRecord> {
+        self.project_migration_current_develop_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_current_develop_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
         request: &CurrentDevelop,
     ) -> Result<ResultRecord> {
         validate_current_develop(request)?;
@@ -513,7 +538,7 @@ impl Catalog {
     /// preserve the exact request and commit through the guarded helper below.
     pub(crate) fn prepare_current_develop_projection(
         &self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         request: &CurrentDevelop,
     ) -> Result<PreparedCurrentDevelop> {
         validate_current_develop(request)?;
@@ -562,6 +587,7 @@ impl Catalog {
         };
         let extraction = body
             .map(|bytes| {
+                super::repair_memory::adobe(bytes)?;
                 adobe::extract(
                     bytes,
                     adobe::Input {

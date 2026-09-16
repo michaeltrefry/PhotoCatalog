@@ -12,6 +12,50 @@ pub struct ImageMembership {
     pub position: i64,
     pub provenance: serde_json::Value,
 }
+/// Cursor binds both indexed order phases to the reviewed collection revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionMemberCursor {
+    pub collection: String,
+    pub revision: i64,
+    pub ordered: bool,
+    pub position: i64,
+    pub sequence: i64,
+}
+#[derive(Debug)]
+pub struct CollectionMemberStep {
+    pub member: Option<(i64, ImageMembership)>,
+    pub next: Option<CollectionMemberCursor>,
+    pub scanned: usize,
+}
+const MEMBER_DEFAULT_CANDIDATES: &str = "SELECT image_sequence,0 FROM organization_collection_zero WHERE collection=?1 AND image_sequence>?2 ORDER BY image_sequence LIMIT ?3";
+const MEMBER_ORDERED_CANDIDATE: &str = "SELECT position,image_sequence FROM organization_collection_order INDEXED BY organization_collection_order_page WHERE collection=?1 AND position>0 AND (position,image_sequence)>(?2,?3) ORDER BY position,image_sequence LIMIT 1";
+
+fn member_at(
+    db: &Connection,
+    collection: &str,
+    position: i64,
+    sequence: i64,
+    bytes: usize,
+) -> Result<(i64, ImageMembership)> {
+    let length:i64=db.query_row("SELECT length(CAST(provenance AS BLOB)) FROM organization_collection_members WHERE collection=?1 AND sequence=?2",params![collection,sequence],|r|r.get(0))?;
+    ensure!(
+        length >= 0 && length as u64 <= bytes as u64,
+        "membership provenance exceeds byte admission"
+    );
+    let (asset,variant,evidence):(String,String,String)=db.query_row("SELECT i.asset_id,i.variant_id,m.provenance FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence WHERE m.collection=?1 AND m.sequence=?2",params![collection,sequence],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    Ok((
+        sequence,
+        ImageMembership {
+            key: VariantKey {
+                asset_id: asset,
+                variant_id: variant,
+            },
+            position,
+            provenance: serde_json::from_str(&evidence)?,
+        },
+    ))
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRelation {
     pub sequence: i64,
@@ -165,10 +209,38 @@ pub(crate) fn add_keyword_synonym(
 }
 impl Catalog {
     pub fn place_collection(&mut self, placement: &CollectionPlacement) -> Result<()> {
+        self.place_collection_revision(placement, None)
+    }
+    /// Compare the reviewed collection revision inside the hierarchy transaction.
+    /// Existing import/CLI callers retain their explicit unconditional API.
+    pub fn place_collection_checked(
+        &mut self,
+        placement: &CollectionPlacement,
+        expected_revision: i64,
+    ) -> Result<()> {
+        ensure!(expected_revision >= 0, "negative collection revision");
+        self.place_collection_revision(placement, Some(expected_revision))
+    }
+    fn place_collection_revision(
+        &mut self,
+        placement: &CollectionPlacement,
+        expected_revision: Option<i64>,
+    ) -> Result<()> {
         let _w = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(expected) = expected_revision {
+            let revision: i64 = tx.query_row(
+                "SELECT revision FROM organization_collections WHERE id=?",
+                [&placement.collection],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                revision == expected,
+                "collection changed after placement review"
+            );
+        }
         place_collection(&tx, placement)?;
         tx.commit()?;
         Ok(())
@@ -203,16 +275,141 @@ impl Catalog {
         ensure!(position >= -1 && sequence >= 0, "membership cursor bounds");
         self.db.prepare("SELECT i.sequence,i.asset_id,i.variant_id,COALESCE(o.position,0),m.provenance FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence LEFT JOIN organization_collection_order o ON o.collection=m.collection AND o.image_sequence=m.sequence WHERE m.collection=?1 AND (COALESCE(o.position,0),i.sequence)>(?2,?3) ORDER BY COALESCE(o.position,0),i.sequence LIMIT ?4")?.query_map(params![collection,position,sequence,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?)))?.map(|r|{let(seq,a,v,p,e)=r?;Ok((seq,ImageMembership{key:VariantKey{asset_id:a,variant_id:v},position:p,provenance:serde_json::from_str(&e)?}))}).collect()
     }
+    /// Read at most one member while examining at most `scan` indexed candidates.
+    /// Empty results can carry progress; callers must follow `next` until None.
+    /// Default/zero positions precede positive positions. Both phases seek a
+    /// maintained index; old-catalog initialization is separate bounded maintenance.
+    pub fn image_collection_member_step(
+        &self,
+        collection: &str,
+        after: Option<&CollectionMemberCursor>,
+        scan: usize,
+        bytes: usize,
+    ) -> Result<CollectionMemberStep> {
+        small(collection)?;
+        ensure!(
+            (1..=4096).contains(&scan) && (1..=1024 * 1024).contains(&bytes),
+            "membership scan/byte bounds"
+        );
+        let tx = self.db.unchecked_transaction()?;
+        ensure!(
+            super::collection_order_index::ready(&tx)?,
+            "collection order index is preparing; advance bounded organization maintenance"
+        );
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM organization_collections WHERE id=?",
+            [collection],
+            |r| r.get(0),
+        )?;
+        let mut cursor = after.cloned().unwrap_or(CollectionMemberCursor {
+            collection: collection.into(),
+            revision,
+            ordered: false,
+            position: 0,
+            sequence: 0,
+        });
+        ensure!(
+            cursor.collection == collection && cursor.revision == revision,
+            "collection changed or cursor belongs to another collection"
+        );
+        ensure!(
+            cursor.position >= 0
+                && cursor.sequence >= 0
+                && (cursor.ordered || cursor.position == 0),
+            "membership cursor bounds"
+        );
+        if cursor.ordered {
+            let row: Option<(i64, i64)> = tx
+                .query_row(
+                    MEMBER_ORDERED_CANDIDATE,
+                    params![collection, cursor.position, cursor.sequence],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            return if let Some((position, sequence)) = row {
+                let member = member_at(&tx, collection, position, sequence, bytes)?;
+                cursor.position = position;
+                cursor.sequence = sequence;
+                Ok(CollectionMemberStep {
+                    member: Some(member),
+                    next: Some(cursor),
+                    scanned: 1,
+                })
+            } else {
+                Ok(CollectionMemberStep {
+                    member: None,
+                    next: None,
+                    scanned: 0,
+                })
+            };
+        }
+        let mut scanned = 0;
+        let mut statement = tx.prepare(MEMBER_DEFAULT_CANDIDATES)?;
+        let candidates = statement
+            .query_map(params![collection, cursor.sequence, scan as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+        for row in candidates {
+            let (sequence, position) = row?;
+            scanned += 1;
+            cursor.sequence = sequence;
+            if position == 0 {
+                return Ok(CollectionMemberStep {
+                    member: Some(member_at(&tx, collection, position, sequence, bytes)?),
+                    next: Some(cursor),
+                    scanned,
+                });
+            }
+        }
+        if scanned < scan {
+            cursor.ordered = true;
+            cursor.position = 0;
+            cursor.sequence = 0;
+        }
+        Ok(CollectionMemberStep {
+            member: None,
+            next: Some(cursor),
+            scanned,
+        })
+    }
     pub fn add_keyword_synonym(
         &mut self,
         keyword: i64,
         synonym: &str,
         evidence: &serde_json::Value,
     ) -> Result<()> {
+        self.write_keyword_synonym(keyword, synonym, evidence, false)
+    }
+    /// Create a synonym without overwriting retained source provenance.
+    pub fn create_keyword_synonym(
+        &mut self,
+        keyword: i64,
+        synonym: &str,
+        evidence: &serde_json::Value,
+    ) -> Result<()> {
+        self.write_keyword_synonym(keyword, synonym, evidence, true)
+    }
+    fn write_keyword_synonym(
+        &mut self,
+        keyword: i64,
+        synonym: &str,
+        evidence: &serde_json::Value,
+        create_only: bool,
+    ) -> Result<()> {
         let _w = self.writers.enter(Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if create_only {
+            ensure!(
+                !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=?1 AND synonym=?2)",
+                    params![keyword, synonym],
+                    |r| r.get::<_, bool>(0),
+                )?,
+                "synonym already exists; retained provenance is unchanged"
+            );
+        }
         add_keyword_synonym(&tx, keyword, synonym, evidence)?;
         tx.commit()?;
         Ok(())
@@ -261,3 +458,79 @@ impl Catalog {
 #[cfg(test)]
 #[path = "organization_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod bounded_member_tests {
+    use super::*;
+    #[test]
+    fn candidate_queries_seek_indexes_without_collection_sorts() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE organization_collection_members(collection TEXT,sequence INTEGER,provenance TEXT,PRIMARY KEY(collection,sequence));
+            CREATE TABLE organization_collection_order(collection TEXT,image_sequence INTEGER,position INTEGER,PRIMARY KEY(collection,image_sequence));
+            CREATE INDEX organization_collection_order_page ON organization_collection_order(collection,position,image_sequence);
+            CREATE TABLE organization_collection_zero(collection TEXT,image_sequence INTEGER,PRIMARY KEY(collection,image_sequence)) WITHOUT ROWID;
+            WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000)
+            INSERT INTO organization_collection_members SELECT 'c',x,'{}' FROM n;
+            INSERT INTO organization_collection_order SELECT collection,sequence,10001-sequence FROM organization_collection_members;
+            UPDATE organization_collection_order SET position=0 WHERE image_sequence BETWEEN 5001 AND 5007;
+            INSERT INTO organization_collection_zero SELECT collection,image_sequence FROM organization_collection_order WHERE position=0;")?;
+        let default_plan = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {MEMBER_DEFAULT_CANDIDATES}"))?
+            .query_map(params!["c", 5000, 7], |r| r.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let ordered_plan = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {MEMBER_ORDERED_CANDIDATE}"))?
+            .query_map(params!["c", 0, 0], |r| r.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            default_plan
+                .iter()
+                .chain(&ordered_plan)
+                .all(|v| !v.contains("TEMP B-TREE")),
+            "{default_plan:?} {ordered_plan:?}"
+        );
+        assert!(
+            default_plan
+                .iter()
+                .any(|v| v.contains("collection=? AND image_sequence>?")),
+            "{default_plan:?}"
+        );
+        assert!(
+            ordered_plan
+                .iter()
+                .any(|v| v.contains("organization_collection_order_page")),
+            "{ordered_plan:?}"
+        );
+        let candidates = db
+            .prepare(MEMBER_DEFAULT_CANDIDATES)?
+            .query_map(params!["c", 5000, 7], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(candidates, (5001..=5007).collect::<Vec<_>>());
+        let row: (i64, i64) =
+            db.query_row(MEMBER_ORDERED_CANDIDATE, params!["c", 3, 9998], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        assert_eq!(row, (4, 9997));
+        // A fresh page on a ready positive-only population performs two indexed
+        // seeks, without revisiting every member to prove the zero phase empty.
+        db.execute_batch("DELETE FROM organization_collection_zero; UPDATE organization_collection_order SET position=10001-image_sequence")?;
+        let mut zero = db.prepare(MEMBER_DEFAULT_CANDIDATES)?;
+        let missing = zero
+            .query_row(params!["c", 0, 7], |r| r.get::<_, i64>(0))
+            .optional()?;
+        assert_eq!(missing, None);
+        let mut positive = db.prepare(MEMBER_ORDERED_CANDIDATE)?;
+        let first: (i64, i64) =
+            positive.query_row(params!["c", 0, 0], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        assert_eq!(first, (1, 10000));
+        for statement in [&zero, &positive] {
+            assert_eq!(
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+                0
+            );
+            assert_eq!(statement.get_status(rusqlite::StatementStatus::Sort), 0);
+            assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 128);
+        }
+        Ok(())
+    }
+}

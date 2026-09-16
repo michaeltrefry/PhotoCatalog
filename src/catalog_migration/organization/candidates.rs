@@ -2,6 +2,8 @@
 //! isolated field packets; keyword memberships accumulate only this import's
 //! proven terms. Existing interactive edits and successful receipts are unchanged.
 use super::*;
+use crate::catalog_migration::repair_memory;
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     catalog_metadata::{self, Prepared, Source},
     catalog_migration::{lookup::Lookup, walk::Walk},
@@ -35,7 +37,7 @@ struct Prefix {
 
 pub(super) fn conflicted(db: &Connection, image: &str, field: &str) -> Result<bool> {
     Ok(db.query_row("SELECT COALESCE((SELECT conflicted FROM metadata_effective WHERE asset_id=?1 AND field=?2),0)",
-        params![image, field], |r| r.get(0))?)
+        params![image, field], |r| repair_memory::get(r, 0))?)
 }
 
 fn locator(request: &Projection, image: &SourceRecord, field: &str) -> Result<Vec<u8>> {
@@ -93,7 +95,7 @@ pub(super) fn inspection(bytes: Vec<u8>, limited: bool) -> Inspection {
 /// Bounds fail closed before any new observation; unavailable keys prove nothing.
 fn seed(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     request: &Projection,
     image_ref: &SourceRecord,
     kind: KeywordKind,
@@ -126,7 +128,7 @@ fn seed(
     // Apply the membership-table predicate before the cardinality bound; an
     // image can have thousands of unrelated incoming develop/history references.
     let rows = catalog.db.prepare("SELECT r.record FROM migration_record_lookup f INDEXED BY migration_lookup_target_key JOIN migration_record_lookup r INDEXED BY migration_lookup_source ON r.input=f.input AND r.revision=f.revision AND r.collection=3 AND r.source_id=f.source_id WHERE f.input=?1 AND f.revision=?2 AND f.collection=5 AND f.target_table='Adobe_images' AND f.target_key=?3 AND f.field='image' AND r.table_name='AgLibraryKeywordImage' ORDER BY f.record LIMIT 10001")?
-        .query_map(params![source.binding_blake3(), image_ref.source.capture_revision, key], |r| r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        .query_map(params![source.binding_blake3(), image_ref.source.capture_revision, key], |r| repair_memory::get::<_,i64>(r, 0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     if rows.len() > 10_000 {
         return Ok((BTreeSet::new(), vec![], true));
     }
@@ -135,7 +137,7 @@ fn seed(
         let length: i64 = catalog.db.query_row(
             "SELECT raw_length FROM migration_retained_records WHERE sequence=?1 AND complete=1",
             [row],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )?;
         scanned_bytes = scanned_bytes.saturating_add(usize::try_from(length)?);
         if scanned_bytes > MAX_BYTES {
@@ -151,7 +153,7 @@ fn seed(
         }
         let stored: Option<(String, String)> = catalog.db.query_row(
             "SELECT proof,result FROM migration_organization WHERE source_identity=?1 AND slot='keyword_membership' AND owner=?2",
-            params![identity, request.import_source], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+            params![identity, request.import_source], |r| Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?))).optional()?;
         let Some((proof, result)) = stored else {
             continue;
         };
@@ -206,7 +208,7 @@ fn seed(
         for id in ids {
             if !evidence.records.contains_key(&id) {
                 additional += 1;
-                let size:i64 = catalog.db.query_row("SELECT raw_length FROM migration_retained_records WHERE sequence=?1 AND complete=1",[id],|r|r.get(0))?;
+                let size:i64 = catalog.db.query_row("SELECT raw_length FROM migration_retained_records WHERE sequence=?1 AND complete=1",[id],|r|repair_memory::get(r, 0))?;
                 additional_bytes = additional_bytes.saturating_add(usize::try_from(size)?);
             }
         }
@@ -243,7 +245,7 @@ fn seed(
 
 pub(super) fn prepare(
     catalog: &Catalog,
-    source: Option<&MigrationSource>,
+    source: Option<&dyn MigrationRead>,
     request: &Projection,
     image_ref: &SourceRecord,
     expected: &ImageMetadataIdentity,
@@ -289,7 +291,7 @@ pub(super) fn prepare(
         Operation::AddKeyword { kind, path } => {
             let current: Option<(i64, i64, String, i64)> = catalog.db.query_row(
                 "SELECT o.id,m.id,o.status,b.raw_length FROM image_metadata_sources s JOIN metadata_observations o ON o.id=s.current_observation JOIN metadata_models m ON m.observation_id=o.id JOIN metadata_blobs b ON b.hash=m.blob_hash WHERE s.asset_id=?1 AND s.kind='catalog' AND s.locator=?2 AND m.ordinal=0",
-                params![expected.image_id, locator], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+                params![expected.image_id, locator], |r| Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?,repair_memory::get(r, 3)?))).optional()?;
             let (base, terms) = if let Some((observation, model, status, length)) = current {
                 ensure!(
                     (0..=LIMIT as i64).contains(&length),

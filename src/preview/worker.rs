@@ -19,6 +19,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+pub(crate) mod managed;
+pub(crate) mod managed_process;
+mod managed_transport;
+pub(crate) mod read_transport;
+
 const RECEIPT_LIMIT: u64 = 192 * 1024;
 use super::prepared_cache::{
     MAX_PROXY_BYTES, PROXY_EDGE, PreparedReference, ProducedPrepared, SourceInstance,
@@ -152,6 +157,8 @@ impl std::error::Error for WorkerFailure {}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ObjectReceipt {
+    #[serde(default)]
+    rgb: Option<managed::Rgb>,
     key: PreviewKey,
     width: u32,
     height: u32,
@@ -160,6 +167,8 @@ struct ObjectReceipt {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct RenderReceipt {
+    #[serde(default)]
+    native: Option<managed::Binding>,
     edit_input: Option<EditInputProvenance>,
     peak_resident_bytes: Option<u64>,
     peak_method: String,
@@ -167,6 +176,18 @@ struct RenderReceipt {
     provenance: RenderProvenance,
     objects: Vec<ObjectReceipt>,
     prepared: Option<(crate::edit::PreparedProxyReceipt, SourceInstance)>,
+}
+pub(crate) fn receipt_metadata_layouts() -> [(usize, usize); 2] {
+    [
+        (
+            std::mem::size_of::<RenderReceipt>(),
+            std::mem::align_of::<RenderReceipt>(),
+        ),
+        (
+            std::mem::size_of::<ObjectReceipt>(),
+            std::mem::align_of::<ObjectReceipt>(),
+        ),
+    ]
 }
 pub struct ProducedPreview {
     pub key: PreviewKey,
@@ -209,14 +230,21 @@ fn validate_object(key: &PreviewKey, width: u32, height: u32, bytes: &[u8]) -> R
 /// The launcher path is supplied by the application; the library does not guess
 /// a binary from test executables or silently fall back to synchronous rendering.
 pub struct WorkerProcess {
-    child: Child,
+    managed: Option<managed_transport::Render>,
+    child: Option<Child>,
     lease: Option<ChildStdin>,
     staging: PathBuf,
     request: RenderWork,
     exited: bool,
     encoding_admitted: bool,
+    initial_request: Option<Vec<u8>>,
+    start_failure: Option<String>,
+    #[cfg(test)]
+    wait_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 impl WorkerProcess {
+    /// Creates the owned child. Register its resource owner, then call start or
+    /// poll to dispatch; observation helpers do not dispatch implicitly.
     pub fn spawn(executable: &Path, staging_root: &Path, request: RenderWork) -> Result<Self> {
         request.validate()?;
         ensure!(
@@ -240,33 +268,122 @@ impl WorkerProcess {
             .env("RAYON_NUM_THREADS", "1")
             .spawn()
             .context("start preview worker")?;
-        let lease = child.stdin.take().context("worker stdin lease missing")?;
-        let mut value = Self {
-            child,
-            lease: Some(lease),
+        // Establish the child owner before any fallible transport operation.
+        let lease = child.stdin.take();
+        Ok(Self {
+            managed: None,
+            child: Some(child),
+            lease,
             staging,
             request,
             exited: false,
             encoding_admitted: false,
-        };
-        let input = value.lease.as_mut().unwrap();
-        input.write_all(&bytes)?;
-        input.write_all(b"\n!")?;
-        input.flush()?;
-        Ok(value)
+            initial_request: Some(bytes),
+            start_failure: None,
+            #[cfg(test)]
+            wait_failures: Default::default(),
+        })
+    }
+    pub(crate) fn spawn_managed(
+        calls: std::sync::Arc<super::stage_io::Calls>,
+        request: RenderWork,
+        limits: &super::ServiceLimits,
+    ) -> Result<Self> {
+        let cost = crate::catalog_session::native::render_cost(
+            &request,
+            limits.per_worker_bytes,
+            limits.cache_codec_scratch_bytes,
+        )?;
+        let job = managed_transport::Render::new(calls.task_lane()?, request.clone(), limits, cost);
+        Ok(Self {
+            managed: Some(job),
+            child: None,
+            lease: None,
+            staging: PathBuf::new(),
+            request,
+            exited: false,
+            encoding_admitted: false,
+            initial_request: None,
+            start_failure: None,
+            #[cfg(test)]
+            wait_failures: Default::default(),
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn test_child(
+        mut child: Child,
+        staging: PathBuf,
+        request: RenderWork,
+        wait_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let lease = child.stdin.take();
+        Self {
+            managed: None,
+            child: Some(child),
+            lease,
+            staging,
+            request,
+            exited: false,
+            encoding_admitted: true,
+            initial_request: None,
+            start_failure: None,
+            wait_failures,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_initial_send_failure(&mut self) {
+        self.initial_request = Some(vec![0]);
+        self.lease.take();
+    }
+    /// Dispatches once while the caller retains this worker and its resources.
+    /// Transport failure is latched for every later poll; partial input is never
+    /// replayed. The owner must stop/drain before releasing this instance.
+    pub fn start(&mut self) -> Result<()> {
+        if let Some(job) = &mut self.managed {
+            return job.start();
+        }
+        if let Some(failure) = &self.start_failure {
+            bail!("{failure}");
+        }
+        if let Some(bytes) = self.initial_request.take() {
+            let result = (|| -> Result<()> {
+                let input = self.lease.as_mut().context("worker stdin lease missing")?;
+                input.write_all(&bytes)?;
+                input.write_all(b"\n!")?;
+                input.flush()?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                self.start_failure = Some(format!("{e:#}"));
+                return Err(e);
+            }
+        }
+        Ok(())
     }
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        if let Some(job) = &self.managed {
+            return job.pid();
+        }
+        self.child.as_ref().expect("owned preview process").id()
     }
     /// Returns only after exit. The service releases the scheduler reservation
     /// after consuming this batch, including its validated decoded pixel buffers.
     pub fn poll(&mut self, canceled: &AtomicBool) -> Result<Option<RenderedPreviewBatch>> {
+        if let Some(job) = &mut self.managed {
+            return job.poll(canceled);
+        }
         ensure!(!self.exited, "worker already consumed");
         if canceled.load(Ordering::Acquire) {
             self.stop()?;
             bail!("preview request canceled");
         }
-        let Some(status) = self.child.try_wait()? else {
+        self.start()?;
+        let Some(status) = self
+            .child
+            .as_mut()
+            .expect("owned preview process")
+            .try_wait()?
+        else {
             if !self.encoding_admitted && self.awaiting_encode_admission()? {
                 let lease = self.lease.as_mut().context("worker lease closed")?;
                 lease.write_all(b"E")?;
@@ -346,6 +463,7 @@ impl WorkerProcess {
             provenance: receipt.provenance,
             objects,
             prepared: receipt.prepared.map(|(receipt, source)| ProducedPrepared {
+                managed: None,
                 path: self.staging.join("prepared.linear"),
                 receipt,
                 source,
@@ -355,6 +473,10 @@ impl WorkerProcess {
     /// The worker holds a decoded source under its reservation until a subsequent
     /// owner poll admits encoding. No output transport or blocking read is needed.
     pub fn awaiting_encode_admission(&self) -> Result<bool> {
+        if self.managed.is_some() {
+            // The retained transport task owns the managed checkpoint handshake.
+            return Ok(false);
+        }
         if self.encoding_admitted || self.exited {
             return Ok(false);
         }
@@ -368,22 +490,73 @@ impl WorkerProcess {
         );
         Ok(true)
     }
-    fn stop(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_spawn(&mut self) {
+        self.managed
+            .as_mut()
+            .expect("managed fixture")
+            .fail_next_cleanup_spawn();
+    }
+    pub(crate) fn progress_transport(&mut self, canceled: &AtomicBool) {
+        if let Some(managed) = &mut self.managed {
+            managed.progress(canceled);
+        }
+    }
+    pub(crate) fn transport_busy(&self) -> bool {
+        self.managed.as_ref().is_some_and(|m| m.busy())
+    }
+    pub(crate) fn signal_stop(&mut self) {
+        if let Some(job) = &mut self.managed {
+            job.signal_stop();
+            return;
+        }
         self.lease.take();
         if !self.exited {
-            let kill = self.child.kill();
-            let waited = self.child.wait();
+            // Wait, rather than kill's result, establishes that ownership ended.
+            let _ = self.child.as_mut().expect("owned preview process").kill();
+        }
+    }
+    pub(crate) fn stop(&mut self) -> Result<()> {
+        if let Some(job) = &mut self.managed {
+            job.stop()?;
+            self.exited = true;
+            return Ok(());
+        }
+        self.signal_stop();
+        if !self.exited {
+            #[cfg(test)]
+            if self
+                .wait_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+            {
+                bail!("injected preview reap failure");
+            }
+            let waited = self.child.as_mut().expect("owned preview process").wait();
             self.exited = waited.is_ok();
             waited.context("wait for canceled preview worker")?;
-            // An already-exited child may reject kill; wait remains authoritative.
-            let _ = kill;
         }
         Ok(())
     }
 }
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if self.managed.is_some() {
+            if self.stop().is_err() {
+                std::mem::forget(self.managed.take());
+            }
+            return;
+        }
+        if self.stop().is_err() {
+            // Explicit owners keep self for retry. Drop cannot report a reap
+            // failure; retain the native process handle without claiming exit.
+            std::mem::forget(self.child.take());
+            return;
+        }
         if self.exited {
             let _ = clean_staging_directory(&self.staging);
         }
@@ -668,8 +841,24 @@ fn run_worker() -> Result<()> {
         line.last() == Some(&b'\n') && (line.len() as u64) < RECEIPT_LIMIT,
         "incomplete worker request"
     );
-    let request: RenderWork = serde_json::from_slice(&line)?;
-    let source = request.validate()?;
+    let (native, work) =
+        match serde_json::from_slice::<crate::catalog_session::native::Envelope>(&line) {
+            Ok(envelope) => {
+                envelope.work.validate()?;
+                (
+                    Some(managed::Binding {
+                        operation: envelope.operation,
+                        stage: envelope.stage,
+                    }),
+                    envelope.work,
+                )
+            }
+            Err(_) => (
+                None,
+                crate::catalog_session::native::Work::Render(serde_json::from_slice(&line)?),
+            ),
+        };
+    drop(line);
     let mut start = [0];
     input
         .read_exact(&mut start)
@@ -688,6 +877,20 @@ fn run_worker() -> Result<()> {
             }
             std::process::exit(74);
         })?;
+    if matches!(
+        work,
+        crate::catalog_session::native::Work::DecodeEncoded { .. }
+    ) {
+        return managed::decode_encoded(
+            work,
+            native.context("managed decode binding missing")?,
+            admitted,
+        );
+    }
+    let crate::catalog_session::native::Work::Render(request) = work else {
+        unreachable!()
+    };
+    let source = request.validate()?;
     let (instance, _source_write_lease) =
         SourceInstance::read_for_worker(&source, request.decode_limits.max_encoded_bytes)?;
     let mut prepared_receipt = None;
@@ -813,10 +1016,19 @@ fn run_worker() -> Result<()> {
             "encoded worker allowance exceeded"
         );
         write_exclusive(Path::new(&format!("{index}.preview")), &bytes)?;
+        let (width, height) = (rgb.width(), rgb.height());
+        drop(rgb);
+        let rgb = if native.is_some() {
+            let verified = validate_object(key, width, height, &bytes)?;
+            Some(managed::write_rgb(index, &verified)?)
+        } else {
+            None
+        };
         objects.push(ObjectReceipt {
+            rgb,
             key: key.clone(),
-            width: rgb.width(),
-            height: rgb.height(),
+            width,
+            height,
             bytes: bytes.len() as u64,
             checksum: blake3::hash(&bytes).to_hex().to_string(),
         });
@@ -835,6 +1047,7 @@ fn run_worker() -> Result<()> {
     // source verification. Only the bounded 64 KiB receipt write follows.
     let (peak_resident_bytes, peak_method) = peak_resident_memory();
     let receipt = serde_json::to_vec(&RenderReceipt {
+        native,
         edit_input,
         peak_resident_bytes,
         peak_method,
@@ -935,12 +1148,17 @@ mod tests {
             decode_limits: DecodeLimits::default(),
         };
         let mut worker = WorkerProcess {
-            child,
+            managed: None,
+            child: Some(child),
             lease,
             staging: stage.clone(),
             request,
             exited: false,
             encoding_admitted: false,
+            initial_request: None,
+            start_failure: None,
+            #[cfg(test)]
+            wait_failures: Default::default(),
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

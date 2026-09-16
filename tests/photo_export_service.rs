@@ -3,7 +3,7 @@
 use photocatalog::{
     Catalog,
     catalog_edits::VariantKey,
-    catalog_exports::{ExportTarget, MetadataSelection},
+    catalog_exports::{ExportControl, ExportTarget, MetadataSelection},
     edit::{Recipe, RecipeV1, RenderLimits},
     export_service::{ExportEvent, ExportService, ExportServiceLimits},
     image_export::*,
@@ -16,6 +16,147 @@ use std::{
     sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
+
+#[test]
+fn detached_executor_requires_same_catalog_drained_permit_and_reaps_before_release()
+-> anyhow::Result<()> {
+    use std::sync::{Arc, atomic::Ordering, mpsc};
+    for action in ["yield", "cancel", "drop", "drain"] {
+        let root = tempfile::tempdir()?;
+        let (mut catalog, key, mut previews, original) = setup(root.path())?;
+        let bytes = std::fs::read(&original)?;
+        let job = enqueue(
+            &mut catalog,
+            &key,
+            &root.path().join("detached.png"),
+            OutputFormat::Png {
+                depth: IntegerDepth::Eight,
+            },
+        )?;
+        let handle = catalog.relink_worker_handle()?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let id = job.clone();
+        let (ready, opened) = mpsc::sync_channel(1);
+        let (permit_send, permit_recv) = mpsc::sync_channel::<NativeLaunchPermit>(1);
+        let (started, running) = mpsc::sync_channel(1);
+        let (advance, advance_recv) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || -> anyhow::Result<()> {
+            let mut selected = handle.open()?;
+            let mut service = ExportService::open(&selected, &executable(), limits())?;
+            // Open and read never execute recovery; this is the explicit action.
+            assert!(
+                service
+                    .tick_detached(&mut selected, &id, &mut ExportControl::new(&signal))
+                    .is_err()
+            );
+            assert!(
+                service
+                    .recover_cancellable(&mut selected, 32, &mut ExportControl::new(&signal))?
+                    .complete
+            );
+            assert!(matches!(
+                service.tick_detached(&mut selected, &id, &mut ExportControl::new(&signal))?,
+                ExportEvent::WaitingForPreviews
+            ));
+            ready.send(())?;
+            let permit = permit_recv.recv_timeout(Duration::from_secs(10))?;
+            service.admit_native(&selected, permit)?;
+            let ExportEvent::Started { pid, .. } =
+                service.tick_detached(&mut selected, &id, &mut ExportControl::new(&signal))?
+            else {
+                anyhow::bail!("native worker did not start")
+            };
+            started.send(pid)?;
+            advance_recv.recv_timeout(Duration::from_secs(10))?;
+            if action == "drop" {
+                drop(service);
+                return Ok(());
+            }
+            if action == "drain" {
+                service.drain_native()?;
+                assert!(!service.is_active());
+                assert_eq!(service.reserved_bytes(), 0);
+                return Ok(());
+            }
+            let event = if action == "cancel" {
+                service.tick_detached(&mut selected, &id, &mut ExportControl::new(&signal))?
+            } else {
+                service.yield_to_previews(&mut selected)?
+            };
+            assert!(matches!(
+                event,
+                ExportEvent::Failed { .. } | ExportEvent::Yielded { .. }
+            ));
+            assert_eq!(service.reserved_bytes(), 0);
+            assert!(!service.is_active());
+            Ok(())
+        });
+        opened.recv_timeout(Duration::from_secs(10))?;
+        let pause = previews.pause_native_launches()?;
+        assert!(previews.native_work_drained());
+        let permit = previews.native_launch_permit(&catalog, pause)?;
+        let duplicate = previews.pause_native_launches()?;
+        assert!(previews.native_launch_permit(&catalog, duplicate).is_err());
+        let wrong = Catalog::open(root.path().join("other-catalog"))?;
+        let wrong_pause = previews.pause_native_launches()?;
+        assert!(previews.native_launch_permit(&wrong, wrong_pause).is_err());
+        permit_send
+            .send(permit)
+            .map_err(|_| anyhow::anyhow!("permit receiver stopped"))?;
+        let pid = running.recv_timeout(Duration::from_secs(10))?;
+        assert_eq!(catalog.photo_export_job(&job)?.state, "queued");
+        assert_eq!(
+            catalog.photo_export_items(&job, 0, 1)?[0].state,
+            "rendering"
+        );
+        assert_eq!(catalog.edit_variant(&key)?.revision, 0);
+        let duplicate = previews.pause_native_launches()?;
+        assert!(previews.native_launch_permit(&catalog, duplicate).is_err());
+        if action == "cancel" {
+            cancel.store(true, Ordering::Release);
+        }
+        advance.send(())?;
+        thread.join().unwrap()?;
+        #[cfg(unix)]
+        {
+            assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        #[cfg(windows)]
+        let _ = pid;
+        let pause = previews.pause_native_launches()?;
+        drop(previews.native_launch_permit(&catalog, pause)?);
+        assert_eq!(
+            catalog.photo_export_job(&job)?.state,
+            if action == "cancel" {
+                "canceled"
+            } else {
+                "queued"
+            }
+        );
+        if ["drop", "drain"].contains(&action) {
+            assert_eq!(
+                catalog.photo_export_items(&job, 0, 1)?[0].state,
+                "rendering"
+            );
+            // Reopen alone preserves evidence; only explicit recovery fences it.
+            let mut service = ExportService::open(&catalog, &executable(), limits())?;
+            assert_eq!(
+                catalog.photo_export_items(&job, 0, 1)?[0].state,
+                "rendering"
+            );
+            assert!(service.recover(&mut catalog, 32)?.complete);
+            assert_eq!(catalog.photo_export_items(&job, 0, 1)?[0].state, "pending");
+        }
+        assert_eq!(std::fs::read(&original)?, bytes);
+        assert!(!root.path().join("detached.png").exists());
+    }
+    Ok(())
+}
 fn limits() -> ExportServiceLimits {
     let render = RenderLimits {
         max_pixels: 1_000_000,
@@ -333,8 +474,7 @@ fn undo_aba_invalidates_active_export_before_any_destination_publication() -> an
 }
 
 #[test]
-fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan()
--> anyhow::Result<()> {
+fn parent_sealing_rerenders_before_reusing_orphan() -> anyhow::Result<()> {
     for mode in ["resume", "canceled", "stale"] {
         let root = tempfile::tempdir()?;
         let (mut c, key, mut p, _) = setup(root.path())?;
@@ -359,6 +499,10 @@ fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan
             xmp.as_deref(),
             limits().render,
         )?;
+        let recovery = path.parent().unwrap().canonicalize()?.join(format!(
+            ".photocatalog-photo-export-{}",
+            work.plan.destination.operation
+        ));
         let deadline = Instant::now() + Duration::from_secs(30);
         let result = loop {
             if let Some(result) = worker.poll(&AtomicBool::new(false))? {
@@ -367,10 +511,11 @@ fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
         };
-        // This is the crash boundary: the process completed and sealed bytes, but
-        // no catalog acceptance or destination publication happened.
+        // This is the crash boundary: the local parent sealed the child output,
+        // but no catalog acceptance or destination publication happened.
         assert!(!path.exists());
-        assert!(result.sealed.recovery_directory().is_dir());
+        assert_eq!(result.sealed.recovery_directory(), recovery);
+        assert!(recovery.is_dir());
         drop(worker);
         drop(service);
         if mode == "canceled" {
@@ -407,5 +552,61 @@ fn crash_after_sealing_before_catalog_acceptance_rerenders_before_reusing_orphan
             assert!(result.sealed.recovery_directory().is_dir());
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn native_catalog_staging_and_destination_paths_use_real_reaped_export_workers()
+-> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = tempfile::tempdir()?;
+    let root = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b'c', 255]));
+    if let Err(error) = std::fs::create_dir(&root) {
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(92) {
+            assert!(!root.exists());
+            eprintln!(
+                "non-UTF filesystem probe rejected before export: EILSEQ92; byte-wire custody remains tested"
+            );
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let (mut c, key, mut previews, original) = setup(&root)?;
+    let original_bytes = std::fs::read(&original)?;
+    let mut service = ExportService::open(&c, &executable(), limits())?;
+    assert!(service.recover(&mut c, 32)?.complete);
+    for destination in [
+        temp.path().join("utf-destination.png"),
+        root.join(std::ffi::OsString::from_vec(b"export\xff.png".to_vec())),
+    ] {
+        let job = enqueue(
+            &mut c,
+            &key,
+            &destination,
+            OutputFormat::Png {
+                depth: IntegerDepth::Eight,
+            },
+        )?;
+        finish(&mut service, &mut c, &mut previews, &job)?;
+        let metrics = service.take_completion_metrics().unwrap();
+        assert_ne!(metrics.worker_pid, std::process::id());
+        assert_eq!(service.reserved_bytes(), 0);
+        let image = image::open(&destination)?;
+        assert_eq!((image.width(), image.height()), (48, 32));
+        let item = &c.photo_export_items(&job, 0, 1)?[0];
+        assert_eq!(item.state, "published");
+        assert_eq!(item.receipt.as_ref().unwrap().destination, destination);
+        let (plan, authority) = c.photo_export_plan(&job, 1)?;
+        assert_eq!(plan.version, 3);
+        assert_eq!(
+            blake3::hash(plan.raw().as_bytes()).to_hex().as_str(),
+            authority
+        );
+    }
+    assert_eq!(std::fs::read(original)?, original_bytes);
     Ok(())
 }

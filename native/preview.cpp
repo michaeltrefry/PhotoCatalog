@@ -6,12 +6,40 @@
 #include <cstring>
 #include <memory>
 #include <exception>
+#include <new>
 
 namespace {
 constexpr uint64_t max_pixels = 8192ull * 8192;
-int fail(PcPreviewBuffer *out, const char *error) {
+int fail(PcPreviewBuffer *out, const char *error, int status = PC_PREVIEW_ERROR) {
     std::snprintf(out->error, sizeof(out->error), "%s", error);
-    return 1;
+    return status;
+}
+
+// Only explicit input failures establish cache corruption. Opaque backend, I/O,
+// configuration and internal errors must not authorize cache invalidation.
+int decode_failure(PcPreviewBuffer *out, avifResult result) {
+    int status = PC_PREVIEW_ERROR;
+    switch (result) {
+        case AVIF_RESULT_INVALID_FTYP:
+        case AVIF_RESULT_NO_CONTENT:
+        case AVIF_RESULT_UNSUPPORTED_DEPTH:
+        case AVIF_RESULT_BMFF_PARSE_FAILED:
+        case AVIF_RESULT_MISSING_IMAGE_ITEM:
+        case AVIF_RESULT_COLOR_ALPHA_SIZE_MISMATCH:
+        case AVIF_RESULT_ISPE_SIZE_MISMATCH:
+        case AVIF_RESULT_NO_IMAGES_REMAINING:
+        case AVIF_RESULT_INVALID_EXIF_PAYLOAD:
+        case AVIF_RESULT_INVALID_IMAGE_GRID:
+        case AVIF_RESULT_TRUNCATED_DATA:
+            status = PC_PREVIEW_CORRUPT;
+            break;
+        case AVIF_RESULT_OUT_OF_MEMORY:
+            status = PC_PREVIEW_RESOURCE_LIMIT;
+            break;
+        default:
+            break;
+    }
+    return fail(out, avifResultToString(result), status);
 }
 bool dimensions(uint32_t w, uint32_t h) {
     return w && h && w <= 8192 && h <= 8192 && uint64_t(w)*h <= max_pixels;
@@ -91,46 +119,51 @@ extern "C" int pc_preview_avif(const unsigned char *rgb, uint32_t w, uint32_t h,
 }
 extern "C" int pc_preview_avif_dimensions(const unsigned char *encoded, size_t len, PcPreviewBuffer *out) {
     try {
-        if (!len || len > 256u*1024u*1024u) return fail(out,"AVIF encoded limit");
+        if (!len) return fail(out,"empty AVIF input",PC_PREVIEW_CORRUPT);
+        if (len > 256u*1024u*1024u) return fail(out,"AVIF encoded limit",PC_PREVIEW_RESOURCE_LIMIT);
         std::unique_ptr<avifDecoder,decltype(&avifDecoderDestroy)> decoder(avifDecoderCreate(),avifDecoderDestroy);
-        if (!decoder) return fail(out,"AVIF parser allocation");
+        if (!decoder) return fail(out,"AVIF parser allocation",PC_PREVIEW_RESOURCE_LIMIT);
         decoder->imageSizeLimit=uint32_t(max_pixels); decoder->imageDimensionLimit=8192; decoder->imageCountLimit=1;
         decoder->ignoreExif=AVIF_TRUE; decoder->ignoreXMP=AVIF_TRUE;
         auto result=avifDecoderSetIOMemory(decoder.get(),encoded,len);
         if (result==AVIF_RESULT_OK) result=avifDecoderParse(decoder.get());
-        if (result!=AVIF_RESULT_OK) return fail(out,avifResultToString(result));
-        if (!dimensions(decoder->image->width,decoder->image->height)) return fail(out,"AVIF dimensions");
+        if (result!=AVIF_RESULT_OK) return decode_failure(out,result);
+        if (!dimensions(decoder->image->width,decoder->image->height)) return fail(out,"AVIF dimensions",PC_PREVIEW_CORRUPT);
         out->width=decoder->image->width; out->height=decoder->image->height;
         return 0;
-    } catch (const std::exception &e) { return fail(out,e.what()); }
+    } catch (const std::bad_alloc &) { return fail(out,"AVIF allocation",PC_PREVIEW_RESOURCE_LIMIT); }
+      catch (const std::exception &e) { return fail(out,e.what()); }
       catch (...) { return fail(out,"AVIF header exception"); }
 }
 extern "C" int pc_preview_avif_decode(const unsigned char *encoded, size_t len, PcPreviewBuffer *out) {
     try {
+        if (!len) return fail(out,"empty AVIF input",PC_PREVIEW_CORRUPT);
+        if (len > 256u*1024u*1024u) return fail(out,"AVIF encoded limit",PC_PREVIEW_RESOURCE_LIMIT);
         if (!avifCodecName(AVIF_CODEC_CHOICE_AOM,AVIF_CODEC_FLAG_CAN_DECODE)) return fail(out,"AOM decoding unavailable");
         std::unique_ptr<avifDecoder,decltype(&avifDecoderDestroy)> decoder(avifDecoderCreate(),avifDecoderDestroy);
-        if (!decoder) return fail(out,"AVIF decoder allocation");
+        if (!decoder) return fail(out,"AVIF decoder allocation",PC_PREVIEW_RESOURCE_LIMIT);
         decoder->codecChoice=AVIF_CODEC_CHOICE_AOM; decoder->maxThreads=1;
         decoder->imageSizeLimit=uint32_t(max_pixels); decoder->imageDimensionLimit=8192; decoder->imageCountLimit=1;
         auto result=avifDecoderSetIOMemory(decoder.get(),encoded,len);
         if (result==AVIF_RESULT_OK) result=avifDecoderParse(decoder.get());
         if (result==AVIF_RESULT_OK) result=avifDecoderNextImage(decoder.get());
-        if (result!=AVIF_RESULT_OK) return fail(out,avifResultToString(result));
+        if (result!=AVIF_RESULT_OK) return decode_failure(out,result);
         const auto *image=decoder->image;
         if (!dimensions(image->width,image->height) || image->depth!=8 || image->alphaPlane || image->transformFlags || image->icc.size ||
             image->colorPrimaries!=AVIF_COLOR_PRIMARIES_BT709 || image->transferCharacteristics!=AVIF_TRANSFER_CHARACTERISTICS_SRGB ||
             image->matrixCoefficients!=AVIF_MATRIX_COEFFICIENTS_BT709 || image->yuvRange!=AVIF_RANGE_FULL || image->yuvFormat!=AVIF_PIXEL_FORMAT_YUV420)
-            return fail(out,"AVIF cache color/layout contract mismatch");
+            return fail(out,"AVIF cache color/layout contract mismatch",PC_PREVIEW_CORRUPT);
         out->width=image->width; out->height=image->height; out->len=size_t(out->width)*out->height*3;
         out->data=static_cast<unsigned char *>(std::malloc(out->len));
-        if (!out->data) return fail(out,"AVIF RGB allocation");
+        if (!out->data) return fail(out,"AVIF RGB allocation",PC_PREVIEW_RESOURCE_LIMIT);
         avifRGBImage rgb; avifRGBImageSetDefaults(&rgb,image);
         rgb.depth=8; rgb.format=AVIF_RGB_FORMAT_RGB; rgb.avoidLibYUV=AVIF_TRUE;
         rgb.chromaUpsampling=AVIF_CHROMA_UPSAMPLING_BILINEAR;
         rgb.pixels=out->data; rgb.rowBytes=out->width*3;
         result=avifImageYUVToRGB(image,&rgb);
-        if (result!=AVIF_RESULT_OK) return fail(out,avifResultToString(result));
+        if (result!=AVIF_RESULT_OK) return decode_failure(out,result);
         return 0;
-    } catch (const std::exception &e) { return fail(out,e.what()); }
+    } catch (const std::bad_alloc &) { return fail(out,"AVIF allocation",PC_PREVIEW_RESOURCE_LIMIT); }
+      catch (const std::exception &e) { return fail(out,e.what()); }
       catch (...) { return fail(out,"AVIF decode exception"); }
 }

@@ -18,6 +18,7 @@
 #![deny(warnings)]
 #![doc = include_str!("../README.md")]
 
+mod admitted_string;
 mod ffi;
 mod xmp_date_time;
 mod xmp_error;
@@ -27,6 +28,8 @@ mod xmp_iterator;
 mod xmp_meta;
 pub mod xmp_ns;
 mod xmp_value;
+
+pub use admitted_string::AdmittedString;
 
 #[cfg(feature = "chrono")]
 pub use xmp_date_time::DateTimeConvertError;

@@ -6,7 +6,9 @@
 //! The 100-record/8-MiB limits bound source proofs and decisions, not the number
 //! of internal SQLite rows refreshed by the existing per-image organization
 //! engine. Original paths are never opened by this component.
-use super::{originals::SourceKey, retention};
+use super::{evidence, originals::SourceKey, retention};
+use crate::catalog_migration::repair_memory;
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_edits::VariantKey,
@@ -342,7 +344,7 @@ impl Evidence {
             );
             let (input, length, digest): (String, i64, String) = db.query_row(
                 "SELECT input,raw_length,digest FROM migration_retained_records WHERE sequence=? AND complete=1",
-                [sequence], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                [sequence], |r| Ok((evidence::retained_identity(r, 0)?, repair_memory::get(r, 1)?, evidence::retained_identity(r, 2)?)))?;
             let length = usize::try_from(length)?;
             ensure!(
                 length <= MAX_BYTES - self.bytes,
@@ -391,7 +393,13 @@ impl Evidence {
             let actual: (String, String, bool) = db.query_row(
                 "SELECT input,digest,complete FROM migration_retained_records WHERE sequence=?",
                 [sequence],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| {
+                    Ok((
+                        evidence::retained_identity(r, 0)?,
+                        evidence::retained_identity(r, 1)?,
+                        repair_memory::get(r, 2)?,
+                    ))
+                },
             )?;
             ensure!(
                 actual == (kept.input.clone(), kept.digest.clone(), true),
@@ -419,7 +427,7 @@ fn verify_link(
     evidence: &mut Evidence,
     origin: &SourceRecord,
     link: &Link,
-    source: Option<&MigrationSource>,
+    source: Option<&dyn MigrationRead>,
     live: bool,
 ) -> Result<()> {
     text(&link.field, 1024)?;
@@ -483,9 +491,35 @@ pub(crate) fn verify_unique_link(
     evidence: &mut Evidence,
     origin: &SourceRecord,
     link: &Link,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
 ) -> Result<()> {
     verify_link(db, evidence, origin, link, Some(source), true)
+}
+
+// Compare SQLite-owned identity bytes before creating any application-owned
+// strings. Only TEXT can match the already validated expected identity.
+pub(super) fn stored_text_matches(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    expected: &str,
+) -> Result<bool> {
+    Ok(
+        matches!(row.get_ref(index)?, rusqlite::types::ValueRef::Text(bytes) if bytes == expected.as_bytes()),
+    )
+}
+
+// The schema has no result byte constraint. Bound the borrowed value before
+// UTF-8 validation and JSON decoding; no intermediate owned JSON string is needed.
+pub(super) fn stored_projection_result(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    limit_message: &str,
+) -> Result<ProjectionResult> {
+    let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(index)? else {
+        anyhow::bail!("stored organization result must be TEXT");
+    };
+    ensure!(bytes.len() <= 65536, "{limit_message}");
+    Ok(serde_json::from_str(std::str::from_utf8(bytes)?)?)
 }
 
 fn existing(
@@ -494,21 +528,24 @@ fn existing(
     digest: &str,
 ) -> Result<Option<ProjectionResult>> {
     let identity = request.origin.source.identity()?;
-    let value: Option<(String,String,String,String)> = db.query_row(
+    let mut statement = db.prepare(
         "SELECT owner,adapter,input_digest,result FROM migration_organization WHERE source_identity=? AND slot=?",
-        params![identity,request.decision.slot()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    value
-        .map(|(owner, adapter, stored, result)| {
-            ensure!(
-                owner == request.import_source
-                    && adapter == request.adapter_version
-                    && stored == digest,
-                "organization mapping decision changed; explicit reconciliation required"
-            );
-            ensure!(result.len() <= 65536, "stored organization result limit");
-            Ok(serde_json::from_str(&result)?)
-        })
-        .transpose()
+    )?;
+    let mut rows = statement.query(params![identity, request.decision.slot()])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    ensure!(
+        stored_text_matches(row, 0, &request.import_source)?
+            && stored_text_matches(row, 1, &request.adapter_version)?
+            && stored_text_matches(row, 2, digest)?,
+        "organization mapping decision changed; explicit reconciliation required"
+    );
+    Ok(Some(stored_projection_result(
+        row,
+        3,
+        "stored organization result limit",
+    )?))
 }
 fn save(
     db: &Connection,
@@ -539,16 +576,17 @@ fn save(
     Ok(result)
 }
 fn mapped(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<NativeTarget> {
-    let result:String=db.query_row("SELECT result FROM migration_organization WHERE source_identity=? AND slot='dictionary' AND owner=?",params![reference.source.identity()?,owner],|r|r.get(0))?;
-    ensure!(result.len() <= 65536, "dictionary mapping size limit");
-    Ok(serde_json::from_str::<ProjectionResult>(&result)?.target)
+    let mut statement = db.prepare("SELECT result FROM migration_organization WHERE source_identity=? AND slot='dictionary' AND owner=?")?;
+    let mut rows = statement.query(params![reference.source.identity()?, owner])?;
+    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    Ok(stored_projection_result(row, 0, "dictionary mapping size limit")?.target)
 }
 fn image(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<ImageMetadataIdentity> {
     ensure!(
         reference.source.table == "Adobe_images",
         "image endpoint requires Adobe_images"
     );
-    let id:String=db.query_row("SELECT image_id FROM image_import_map WHERE import_source=? AND capture_revision=? AND source_table=? AND source_id=?",params![owner,reference.source.capture_revision,reference.source.table,reference.source.identity()?],|r|r.get(0))?;
+    let id:String=db.query_row("SELECT image_id FROM image_import_map WHERE import_source=? AND capture_revision=? AND source_table=? AND source_id=?",params![owner,reference.source.capture_revision,reference.source.table,reference.source.identity()?],|r|repair_memory::get(r, 0))?;
     catalog_images::identity(db, &id)
 }
 fn collection(db: &Connection, owner: &str, reference: &SourceRecord) -> Result<String> {
@@ -602,7 +640,7 @@ fn keyword(
     let (kind, path): (String, String) = db.query_row(
         "SELECT kind,path FROM organization_keywords WHERE id=?",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((repair_memory::get(r, 0)?, repair_memory::get(r, 1)?)),
     )?;
     ensure!(path.len() <= 65536, "keyword path bounds");
     let kind = match kind.as_str() {
@@ -770,7 +808,7 @@ pub(crate) fn commit_keyword_projection(
 impl Catalog {
     pub(crate) fn prepare_keyword_projection(
         &self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         request: &Projection,
     ) -> Result<PreparedKeywordProjection> {
         ensure!(
@@ -847,6 +885,16 @@ impl Catalog {
     pub fn project_migration_organization(
         &mut self,
         source: Option<&MigrationSource>,
+        request: &Projection,
+    ) -> Result<ProjectionResult> {
+        self.project_migration_organization_reader(
+            source.map(|value| value as &dyn MigrationRead),
+            request,
+        )
+    }
+    pub(crate) fn project_migration_organization_reader(
+        &mut self,
+        source: Option<&dyn MigrationRead>,
         request: &Projection,
     ) -> Result<ProjectionResult> {
         // Bound serialization before preparing variable-size evidence or native work.
@@ -1060,19 +1108,12 @@ impl Catalog {
         slot: &str,
     ) -> Result<Option<ProjectionResult>> {
         text(slot, 128)?;
-        let result: Option<String> = self
-            .db
-            .query_row(
-                "SELECT result FROM migration_organization WHERE source_identity=? AND slot=?",
-                params![source.identity()?, slot],
-                |r| r.get(0),
-            )
-            .optional()?;
-        result
-            .map(|s| {
-                ensure!(s.len() <= 65536, "organization result limit");
-                Ok(serde_json::from_str(&s)?)
-            })
+        let mut statement = self.db.prepare(
+            "SELECT result FROM migration_organization WHERE source_identity=? AND slot=?",
+        )?;
+        let mut rows = statement.query(params![source.identity()?, slot])?;
+        rows.next()?
+            .map(|row| stored_projection_result(row, 0, "organization result limit"))
             .transpose()
     }
 }
@@ -1098,7 +1139,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                 DictionaryDecision::Reuse { native_id }
                 | DictionaryDecision::ReuseExactHierarchy { native_id, .. } => {
                     text(native_id, 1024)?;
-                    let (actual,old_parent,old_position):(String,Option<String>,i64)=db.query_row("SELECT c.name,s.parent,COALESCE(s.position,0) FROM organization_collections c LEFT JOIN organization_collection_structure s ON s.collection=c.id WHERE c.id=?",[native_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                    let (actual,old_parent,old_position):(String,Option<String>,i64)=db.query_row("SELECT c.name,s.parent,COALESCE(s.position,0) FROM organization_collections c LEFT JOIN organization_collection_structure s ON s.collection=c.id WHERE c.id=?",[native_id],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?)))?;
                     ensure!(
                         actual == *name && old_parent == parent && old_position == *position,
                         "explicit reused collection differs"
@@ -1119,7 +1160,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
             let revision = db.query_row(
                 "SELECT revision FROM organization_collections WHERE id=?",
                 [&id],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )?;
             Ok(NativeTarget::Collection { id, revision })
         }
@@ -1148,7 +1189,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
                         dictionary_kind(*keyword_kind),
                         serde_json::to_string(&path)?
                     ],
-                    |r| r.get(0),
+                    |r| repair_memory::get(r, 0),
                 )
                 .optional()?;
             let id = match decision {
@@ -1174,7 +1215,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
             value,
         } => {
             let (id, _, _) = keyword(db, &request.import_source, &term.target)?;
-            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|r.get(0))?;
+            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|repair_memory::get(r, 0))?;
             ensure!(
                 !exists,
                 "synonym already exists; explicit reconciliation required"
@@ -1188,7 +1229,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
             ..
         } => {
             let (id, _, _) = keyword(db, &request.import_source, &term.target)?;
-            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|r.get(0))?;
+            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_keyword_synonyms WHERE keyword=? AND synonym=?)",params![id,value],|r|repair_memory::get(r, 0))?;
             ensure!(exists, "explicit reused synonym differs");
             Ok(NativeTarget::Synonym { keyword: id })
         }
@@ -1199,7 +1240,7 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
         } => {
             let image = image(db, &request.import_source, &member.target)?;
             let collection = collection(db, &request.import_source, &group.target)?;
-            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence WHERE m.collection=? AND i.id=?)",params![collection,image.image_id],|r|r.get(0))?;
+            let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence WHERE m.collection=? AND i.id=?)",params![collection,image.image_id],|r|repair_memory::get(r, 0))?;
             ensure!(
                 !exists,
                 "membership already exists; explicit reconciliation required"
@@ -1223,6 +1264,48 @@ fn apply(db: &Connection, request: &Projection, proof: &str) -> Result<NativeTar
     }
 }
 
+/// Target layout coefficients; no allocation and no exposure of private state.
+pub(crate) fn evidence_cache_entry_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<Kept>()
+}
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[test]
+fn capacity_fixed_evidence_and_decision_layouts() {
+    use crate::capacity_probes as probe;
+    let baseline = probe::begin();
+    probe::fixed_layout::<Kept>("Kept");
+    probe::fixed_layout::<(SourceRecord, Decision)>("SourceRecord_Decision_pair");
+    let rows: Vec<_> = (0..12i64)
+        .map(|i| {
+            (
+                i,
+                Kept {
+                    record: EvidenceRecord {
+                        revision: format!("{i:064x}"),
+                        collection: Collection::Rows,
+                        rowid: i,
+                        key: Vec::new(),
+                        fields: BTreeMap::new(),
+                    },
+                    input: "i".repeat(64),
+                    digest: "d".repeat(64),
+                },
+            )
+        })
+        .collect();
+    let records = probe::fixed_btree("BTreeMap_i64_Kept", || {
+        let mut map = BTreeMap::new();
+        for (key, value) in rows {
+            assert!(map.insert(key, value).is_none());
+        }
+        map
+    });
+    assert_eq!(records.len(), 12);
+    drop(records);
+    probe::report("fixed-evidence-decision", baseline);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,6 +1313,7 @@ mod tests {
     use crate::lightroom::migration_source::tests::Fixture;
 
     mod candidate_tests;
+    mod saved_query_tests;
 
     struct Bed {
         _temp: tempfile::TempDir,
@@ -1493,6 +1577,48 @@ mod tests {
             }
             Ok((keys[0].clone(), keys[1].clone()))
         }
+    }
+
+    #[test]
+    fn retained_identity_rejection_precedes_decode_and_transaction_recheck() -> Result<()> {
+        let b = Bed::new(false)?;
+        let sequence = b.rows[&100].retained_record;
+        let mut cached = Evidence::default();
+        cached.record(&b.catalog.db, sequence)?;
+        cached.recheck(&b.catalog.db)?;
+        let bytes = cached.bytes;
+        for column in ["input", "digest"] {
+            for expression in [
+                "hex(zeroblob(524288))",
+                "replace(hex(zeroblob(33)), '0', 'é')",
+                "zeroblob(64)",
+                "CAST(x'ff' || zeroblob(63) AS TEXT)",
+                "'short'",
+            ] {
+                b.catalog
+                    .db
+                    .execute_batch("SAVEPOINT corrupt; PRAGMA defer_foreign_keys=ON")?;
+                b.catalog.db.execute(
+                    &format!("UPDATE migration_retained_records SET {column}={expression}, compressed=x'00' WHERE sequence=?"),
+                    [sequence],
+                )?;
+                let mut fresh = Evidence::default();
+                let error = fresh.record(&b.catalog.db, sequence).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                assert!(fresh.records.is_empty());
+                assert_eq!(fresh.bytes, 0);
+                let error = cached.recheck(&b.catalog.db).unwrap_err();
+                assert!(format!("{error:#}").contains("64 bytes of UTF-8 TEXT"));
+                assert_eq!(cached.records.len(), 1);
+                assert_eq!(cached.bytes, bytes);
+                b.catalog
+                    .db
+                    .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            }
+        }
+        cached.recheck(&b.catalog.db)?;
+        assert!(Evidence::default().record(&b.catalog.db, sequence).is_ok());
+        Ok(())
     }
 
     #[test]

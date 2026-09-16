@@ -185,4 +185,131 @@ mod tests {
         assert!(!temp.path().join("stale.xmp").exists());
         Ok(())
     }
+    #[cfg(unix)]
+    #[test]
+    fn native_and_legacy_image_xmp_authorities_keep_raw_bytes_and_stale_restore_only() -> Result<()>
+    {
+        use std::os::unix::ffi::OsStringExt;
+        for legacy in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("catalog");
+            let mut catalog = Catalog::open(&root)?;
+            catalog.db.execute("INSERT INTO assets(id,location,path_display,state) VALUES('a',?1,'synthetic','pending')",[b"synthetic-original".as_slice()])?;
+            let copy = catalog
+                .create_edit_variant(&VariantKey::master("a"), 0, "copy")?
+                .key;
+            let rating = |v: &str| Edit::Set {
+                namespace: crate::xmp::XMP.into(),
+                path: "Rating".into(),
+                value: v.into(),
+            };
+            let own = catalog.edit_metadata_for_image(&copy, 0, None, &[rating("5")])?;
+            let parent = temp.path().join(if legacy {
+                std::ffi::OsString::from("legacy")
+            } else {
+                std::ffi::OsString::from_vec(vec![b'p', 255])
+            });
+            if let Err(error) = std::fs::create_dir(&parent) {
+                #[cfg(target_os = "macos")]
+                if error.raw_os_error() == Some(92) {
+                    assert!(!parent.exists());
+                    eprintln!(
+                        "non-UTF filesystem probe rejected before export: EILSEQ92; byte-wire custody remains tested"
+                    );
+                    continue;
+                }
+                return Err(error.into());
+            }
+            let destination = parent.join(if legacy {
+                std::ffi::OsString::from("old.xmp")
+            } else {
+                std::ffi::OsString::from_vec(b"image\xff.xmp".to_vec())
+            });
+            std::fs::write(&destination, b"original retained sidecar")?;
+            let mut export = catalog.plan_image_metadata_export(
+                &copy,
+                own.revision,
+                own.model_ids[0],
+                &destination,
+            )?;
+            if legacy {
+                export.export.destination.version = 1;
+            }
+            let raw = format!(
+                " \n{}\n ",
+                serde_json::to_string_pretty(&export.export.destination)?
+            );
+            let operation = export.export.destination.operation.clone();
+            catalog.db.execute(
+                "UPDATE metadata_export_plans SET plan=?1 WHERE operation=?2",
+                rusqlite::params![raw, operation],
+            )?;
+            drop(catalog);
+            let mut catalog = Catalog::open(&root)?;
+            let receipt = catalog.apply_metadata_export(&operation)?;
+            assert_eq!(
+                receipt.state,
+                crate::metadata_export::ExportState::Published
+            );
+            assert_eq!(receipt.destination, export.export.destination.destination);
+            let retained: String = catalog.db.query_row(
+                "SELECT plan FROM metadata_export_plans WHERE operation=?1",
+                [&operation],
+                |r| r.get(0),
+            )?;
+            assert_eq!(retained, raw);
+            assert_eq!(
+                std::fs::read(receipt.captured_original.as_ref().unwrap())?,
+                b"original retained sidecar"
+            );
+            assert_eq!(
+                catalog
+                    .recover_metadata_export(&receipt.recovery_directory)?
+                    .state,
+                crate::metadata_export::ExportState::Published
+            );
+            let stale_path = parent.join("stale.xmp");
+            std::fs::write(&stale_path, b"stale original")?;
+            let stale = catalog.plan_image_metadata_export(
+                &copy,
+                own.revision,
+                own.model_ids[0],
+                &stale_path,
+            )?;
+            let (payload, _) = catalog.resolved_export_xmp(
+                &stale.image_identity.image_id,
+                own.revision,
+                own.model_ids[0],
+            )?;
+            let interrupted = crate::metadata_export::apply_export_with_hook(
+                &stale.export.destination,
+                &payload,
+                |boundary| {
+                    if boundary == crate::metadata_export::ExportBoundary::BeforePublish {
+                        Err(std::io::Error::other("interrupted"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            catalog.edit_metadata_for_image(
+                &copy,
+                own.revision,
+                Some(own.model_ids[0]),
+                &[rating("4")],
+            )?;
+            let restored = catalog.recover_metadata_export(&interrupted.recovery_directory)?;
+            assert_ne!(
+                restored.state,
+                crate::metadata_export::ExportState::Published
+            );
+            assert_eq!(std::fs::read(stale_path)?, b"stale original");
+            assert!(
+                !catalog
+                    .metadata_model(&stale.image_identity.image_id, own.model_ids[0])?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
 }

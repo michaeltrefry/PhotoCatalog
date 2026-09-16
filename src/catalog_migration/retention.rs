@@ -2,6 +2,7 @@
 //! One step retains up to 64 small records or one evidence chunk. It never opens an
 //! original image, capture artifact path, or excluded capture.
 use super::evidence::{self, PreparedChunk};
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     catalog_writer::Priority,
@@ -53,6 +54,81 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::lightroom::migration_source::{ReadLimits, tests::Fixture};
+
+    #[test]
+    fn opening_retained_field_guards_descriptor_and_identity_before_copy() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.pragma_update(None, "foreign_keys", true)?;
+        install(&db)?;
+        evidence::install(&db)?;
+        let reference = crate::lightroom::migration_source::ByteRef {
+            seal: "a".repeat(64),
+            revision: "b".repeat(64),
+            collection: Collection::Captures,
+            rowid: 1,
+            field: "manifest".into(),
+            bytes: 3,
+            text: true,
+        };
+        // Real parent rows keep the ordinary schema/foreign-key contract on.
+        // Only the deliberately corrupt reference is deferred inside a
+        // savepoint that is always rolled back before release.
+        db.execute(
+            "INSERT INTO migration_retention(id,seal,approval) VALUES(?1,x'00',x'00')",
+            [&reference.seal],
+        )?;
+        db.execute("INSERT INTO migration_retained_records(sequence,input,revision,collection,source_rowid,compressed,raw_length,digest,next_cursor,complete)
+                    VALUES(1,?1,?2,0,1,x'00',0,?3,'',1)", params![reference.seal,reference.revision,"0".repeat(64)])?;
+        let id = evidence::begin(&db, &serde_json::to_vec(&reference)?, 3)?.id;
+        evidence::append(&db, &id, 0, &PreparedChunk::new(b"yes")?)?;
+        db.execute(
+            "INSERT INTO migration_retained_fields VALUES(1,'manifest',?1)",
+            [&id],
+        )?;
+        let record = EvidenceRecord {
+            revision: reference.revision.clone(),
+            collection: Collection::Captures,
+            rowid: 1,
+            key: vec![],
+            fields: [("manifest".into(), Field::Bytes(reference))].into(),
+        };
+        for (sql, expected) in [
+            (
+                "UPDATE migration_retained_fields SET evidence=replace(hex(zeroblob(33)),'0','é')",
+                "evidence identity type/size",
+            ),
+            (
+                "UPDATE migration_retained_fields SET evidence=zeroblob(64)",
+                "evidence identity type/size",
+            ),
+            (
+                "UPDATE migration_evidence SET descriptor=zeroblob(65537)",
+                "descriptor type/size",
+            ),
+            (
+                "UPDATE migration_evidence SET descriptor=replace(hex(zeroblob(16385)),'0','é')",
+                "descriptor type/size",
+            ),
+        ] {
+            db.execute_batch("SAVEPOINT corrupt; PRAGMA defer_foreign_keys=ON")?;
+            db.execute_batch(sql)?;
+            let error = field_bytes(&db, 1, &record, "manifest", 3).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{sql}: {error:#}");
+            db.execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            assert_eq!(
+                db.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
+                1
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })?,
+                0
+            );
+            assert_eq!(field_bytes(&db, 1, &record, "manifest", 3)?, b"yes");
+        }
+        Ok(())
+    }
 
     #[test]
     fn selected_large_evidence_survives_restart_and_source_disconnect() -> Result<()> {
@@ -133,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn batches_stop_before_uncustodied_bytes_and_resume_without_skips() -> Result<()> {
+    pub(super) fn batches_stop_before_uncustodied_bytes_and_resume_without_skips() -> Result<()> {
         use crate::lightroom::plan::Cell;
         let mut fixture = Fixture::new();
         let revision = fixture.revision().to_owned();
@@ -342,6 +418,9 @@ fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 fn decode(bytes: &[u8], length: usize, digest: &str) -> Result<EvidenceRecord> {
+    Ok(serde_json::from_slice(&decode_raw(bytes, length, digest)?)?)
+}
+fn decode_raw(bytes: &[u8], length: usize, digest: &str) -> Result<Vec<u8>> {
     ensure!(
         length <= RECORD_LIMIT && bytes.len() <= RECORD_LIMIT + 32768,
         "retained record size limit"
@@ -357,22 +436,107 @@ fn decode(bytes: &[u8], length: usize, digest: &str) -> Result<EvidenceRecord> {
             && blake3::hash(&raw).to_hex().as_str() == digest,
         "retained record integrity mismatch"
     );
-    Ok(serde_json::from_slice(&raw)?)
+    Ok(raw)
+}
+
+/// Saved cursor JSON has no legacy raw-byte ceiling. Managed callers reserve
+/// its actual borrowed length before the original String/serde path allocates.
+fn admitted_cursor(
+    row: &rusqlite::Row<'_>,
+    admit: &dyn Fn(usize) -> Result<()>,
+) -> Result<Option<String>> {
+    let value = row.get_ref(0)?;
+    if matches!(value, rusqlite::types::ValueRef::Null) {
+        return Ok(None);
+    }
+    let text = value.as_str()?;
+    admit(text.len())?;
+    Ok(Some(text.to_owned()))
+}
+
+fn pending_record(
+    row: &rusqlite::Row<'_>,
+    admit: &dyn Fn(usize) -> Result<()>,
+) -> Result<(i64, EvidenceRecord, String)> {
+    let sequence = row.get(0)?;
+    let compressed = row.get_ref(1)?.as_blob()?;
+    let length = evidence::size(row, 2)?;
+    ensure!(
+        length <= RECORD_LIMIT && compressed.len() <= RECORD_LIMIT + 32768,
+        "retained record size limit"
+    );
+    let digest = evidence::retained_identity(row, 3)?;
+    let next = row.get_ref(4)?.as_str()?;
+    admit(next.len())?;
+    // SQLite owns the compressed bytes through complete integrity/JSON decoding.
+    let record = decode(compressed, length, &digest)?;
+    Ok((sequence, record, next.to_owned()))
+}
+
+fn pending_field(
+    row: &rusqlite::Row<'_>,
+    record: &EvidenceRecord,
+) -> Result<(crate::lightroom::migration_source::ByteRef, String, u64)> {
+    let field = row.get_ref(0)?.as_str()?;
+    let evidence = evidence::retained_identity(row, 1)?;
+    let offset = evidence::unsigned(row, 2)?;
+    let Field::Bytes(reference) = record
+        .fields
+        .get(field)
+        .context("missing retained field descriptor")?
+    else {
+        anyhow::bail!("retained field is not external bytes");
+    };
+    Ok((reference.clone(), evidence, offset))
 }
 
 /// Resolve completed destination evidence to its retained authorized selection.
 pub(crate) fn selected_record(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
-    let (input, seal, compressed, length, digest): (String, Vec<u8>, Vec<u8>, usize, String) = db.query_row(
-        "SELECT i.id,i.seal,r.compressed,r.raw_length,r.digest FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1 AND r.complete=1",
-        [sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,evidence::size(r,3)?,r.get(4)?)),
+    selected_record_with(db, sequence, |raw, _| Ok(serde_json::from_slice(raw)?))
+}
+/// Artifact-only bounded projection; other callers retain the generic API.
+pub(crate) fn selected_capture(db: &Connection, sequence: i64) -> Result<EvidenceRecord> {
+    selected_record_with(db, sequence, |raw, input| {
+        crate::lightroom::migration_source::record_json::capture(raw, input, RECORD_LIMIT, &|| {
+            false
+        })
+    })
+}
+fn selected_record_with(
+    db: &Connection,
+    sequence: i64,
+    project: impl FnOnce(&[u8], &str) -> Result<EvidenceRecord>,
+) -> Result<EvidenceRecord> {
+    struct RetainedColumns {
+        input: Option<String>,
+        seal: Option<Vec<u8>>,
+        compressed: Option<Vec<u8>>,
+        length: usize,
+        digest: Option<String>,
+    }
+    let RetainedColumns { input, seal, compressed, length, digest } = db.query_row(
+        "SELECT CASE WHEN typeof(i.id)='text' AND length(CAST(i.id AS BLOB))=64 THEN i.id END,
+         CASE WHEN typeof(i.seal)='blob' AND length(i.seal)<=?2 THEN i.seal END,
+         CASE WHEN typeof(r.compressed)='blob' AND length(r.compressed)<=?3
+          AND typeof(r.raw_length)='integer' AND r.raw_length BETWEEN 0 AND ?2 THEN r.compressed END,
+         r.raw_length,
+         CASE WHEN typeof(r.digest)='text' AND length(CAST(r.digest AS BLOB))=64 THEN r.digest END
+         FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1 AND r.complete=1",
+        params![sequence, i64::try_from(RECORD_LIMIT)?, i64::try_from(RECORD_LIMIT + 32768)?],
+        |r|Ok(RetainedColumns {input:r.get(0)?,seal:r.get(1)?,compressed:r.get(2)?,length:evidence::size(r,3)?,digest:r.get(4)?}),
     )?;
-    ensure!(seal.len() <= RECORD_LIMIT, "retained seal size limit");
-    let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
+    let input = input.context("retained input identity type/size limit")?;
+    let seal = seal.context("retained seal type/size limit")?;
+    let compressed = compressed.context("retained record type/size limit")?;
+    let digest = digest.context("retained digest type/size limit")?;
+    let seal =
+        crate::lightroom::migration_source::seal_json::decode(&seal, RECORD_LIMIT, &|| false)?;
     ensure!(
         seal.binding_blake3()? == input,
         "retained seal binding differs"
     );
-    let record = decode(&compressed, length, &digest)?;
+    let raw = decode_raw(&compressed, length, &digest)?;
+    let record = project(&raw, &input)?;
     ensure!(
         seal.selected.iter().any(|s| s.revision == record.revision)
             && !seal.excluded_revisions.contains(&record.revision),
@@ -403,16 +567,20 @@ pub(crate) fn field_bytes(
                 reference.bytes <= maximum as u64,
                 "retained field exceeds interpretation limit"
             );
-            let id: String = db.query_row(
-                "SELECT evidence FROM migration_retained_fields WHERE record=?1 AND field=?2",
+            let id: Option<String> = db.query_row(
+                "SELECT CASE WHEN typeof(evidence)='text' AND length(CAST(evidence AS BLOB))=64
+                 THEN evidence END FROM migration_retained_fields WHERE record=?1 AND field=?2",
                 params![sequence, name],
                 |r| r.get(0),
             )?;
-            let descriptor: Vec<u8> = db.query_row(
-                "SELECT descriptor FROM migration_evidence WHERE id=?1",
-                [&id],
+            let id = id.context("retained field evidence identity type/size limit")?;
+            let descriptor: Option<Vec<u8>> = db.query_row(
+                "SELECT CASE WHEN typeof(descriptor)='blob' AND length(descriptor)<=?2
+                 THEN descriptor END FROM migration_evidence WHERE id=?1",
+                params![id, i64::try_from(evidence::DESCRIPTOR_BYTES)?],
                 |r| r.get(0),
             )?;
+            let descriptor = descriptor.context("retained field descriptor type/size limit")?;
             ensure!(
                 serde_json::from_slice::<crate::lightroom::migration_source::ByteRef>(&descriptor)?
                     == *reference,
@@ -445,6 +613,13 @@ impl Catalog {
         source: &MigrationSource,
         approval: &[u8],
     ) -> Result<RetentionProgress> {
+        self.begin_migration_retention_reader(source, approval)
+    }
+    pub(crate) fn begin_migration_retention_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        approval: &[u8],
+    ) -> Result<RetentionProgress> {
         ensure!(
             approval.len() <= RECORD_LIMIT,
             "selection approval size limit"
@@ -453,8 +628,13 @@ impl Catalog {
             blake3::hash(approval).to_hex().as_str() == source.seal().approval.document_blake3,
             "selection authorization differs"
         );
+        source.admit_retention(0)?;
+        ensure!(
+            crate::lightroom::migration_source::record_json::size(source.seal(), usize::MAX)?
+                <= RECORD_LIMIT,
+            "source seal size limit"
+        );
         let seal = serde_json::to_vec(source.seal())?;
-        ensure!(seal.len() <= RECORD_LIMIT, "source seal size limit");
         let id = source.binding_blake3();
         let _permit = self.writers.enter(Priority::Background)?;
         let tx = self
@@ -464,15 +644,18 @@ impl Catalog {
             "INSERT OR IGNORE INTO migration_retention(id,seal,approval) VALUES(?1,?2,?3)",
             params![id, seal, approval],
         )?;
-        let existing: (Vec<u8>, Vec<u8>) = tx.query_row(
+        let matches = tx.query_row(
             "SELECT seal,approval FROM migration_retention WHERE id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        ensure!(
-            existing.0 == seal && existing.1 == approval,
-            "retained selection identity differs"
-        );
+            |r| {
+                Ok((|| -> Result<bool> {
+                    let stored_seal = r.get_ref(0)?.as_blob()?;
+                    let stored_approval = r.get_ref(1)?.as_blob()?;
+                    Ok(stored_seal == seal && stored_approval == approval)
+                })())
+            },
+        )??;
+        ensure!(matches, "retained selection identity differs");
         let result = progress(&tx, id)?;
         tx.commit()?;
         Ok(result)
@@ -486,29 +669,28 @@ impl Catalog {
         &mut self,
         source: &MigrationSource,
     ) -> Result<RetentionProgress> {
+        self.step_migration_retention_reader(source)
+    }
+    pub(crate) fn step_migration_retention_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+    ) -> Result<RetentionProgress> {
+        source.admit_retention(0)?;
         let id = source.binding_blake3();
         let before = progress(&self.db, id)?;
         if before.complete {
             return Ok(before);
         }
-        let pending:Option<(i64,Vec<u8>,usize,String,String)>=self.db.query_row(
+        let pending = self.db.query_row(
             "SELECT sequence,compressed,raw_length,digest,next_cursor FROM migration_retained_records WHERE input=?1 AND complete=0 ORDER BY sequence LIMIT 1",
-            [id],|r|Ok((r.get(0)?,r.get(1)?,evidence::size(r,2)?,r.get(3)?,r.get(4)?))).optional()?;
-        if let Some((sequence, compressed, length, digest, next)) = pending {
-            let record = decode(&compressed, length, &digest)?;
-            let field:Option<(String,String,u64)>=self.db.query_row(
+            [id], |r| Ok(pending_record(r, &|bytes| source.admit_retention(bytes)))).optional()?.transpose()?;
+        if let Some((sequence, record, next)) = pending {
+            let field = self.db.query_row(
                 "SELECT f.field,e.id,e.committed FROM migration_retained_fields f JOIN migration_evidence e ON e.id=f.evidence WHERE f.record=?1 AND e.complete=0 ORDER BY f.field LIMIT 1",
-                [sequence],|r|Ok((r.get(0)?,r.get(1)?,evidence::unsigned(r,2)?))).optional()?;
-            let prepared = if let Some((field, evidence, offset)) = field {
-                let Field::Bytes(reference) = record
-                    .fields
-                    .get(&field)
-                    .context("missing retained field descriptor")?
-                else {
-                    anyhow::bail!("retained field is not external bytes");
-                };
+                [sequence], |r| Ok(pending_field(r, &record))).optional()?.transpose()?;
+            let prepared = if let Some((reference, evidence, offset)) = field {
                 let bytes = source.read_chunk(
-                    reference,
+                    &reference,
                     offset,
                     evidence::CHUNK_BYTES.min(source.max_chunk_bytes()),
                 )?;
@@ -559,8 +741,8 @@ impl Catalog {
         let cursor: Option<String> = self.db.query_row(
             "SELECT cursor FROM migration_retention WHERE id=?1",
             [id],
-            |r| r.get(0),
-        )?;
+            |r| Ok(admitted_cursor(r, &|bytes| source.admit_retention(bytes))),
+        )??;
         let after: Option<Cursor> = cursor.as_deref().map(serde_json::from_str).transpose()?;
         // Amortize durable commits over ordinary metadata rows. Stop at the first
         // external field so there is at most one pending record, and never advance
@@ -571,12 +753,24 @@ impl Catalog {
             "source exceeded retention batch limit"
         );
         let mut staged = Vec::new();
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::STAGED_READY);
         let mut staged_bytes = 0usize;
         for record in &page.records {
             let index = super::lookup::PreparedIndex::new(record)?;
+            #[cfg(all(test, feature = "internal-capacity-probes"))]
+            crate::capacity_probes::observe(
+                crate::capacity_probes::STAGED_NEXT,
+                index.probe_capacity(),
+            );
             let raw = index.canonical_bytes();
             ensure!(raw.len() <= RECORD_LIMIT, "retained record size limit");
             if !staged.is_empty() && staged_bytes.saturating_add(raw.len()) > RECORD_LIMIT {
+                #[cfg(all(test, feature = "internal-capacity-probes"))]
+                crate::capacity_probes::observe(
+                    crate::capacity_probes::STAGED_BREAK,
+                    staged_bytes + index.probe_capacity(),
+                );
                 break;
             }
             staged_bytes += raw.len();
@@ -604,6 +798,20 @@ impl Catalog {
                 break;
             }
         }
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(
+            crate::capacity_probes::STAGED_READY,
+            staged.capacity() * staged.first().map_or(0, std::mem::size_of_val)
+                + staged
+                    .iter()
+                    .map(|(_, compressed, _, digest, cursor, _, index)| {
+                        compressed.capacity()
+                            + digest.capacity()
+                            + cursor.capacity()
+                            + index.probe_capacity()
+                    })
+                    .sum::<usize>(),
+        );
         ensure!(
             !staged.is_empty() || page.exhausted,
             "empty source page without exhaustion"
@@ -616,13 +824,23 @@ impl Catalog {
             progress(&tx, id)? == before,
             "migration advanced concurrently; retry step"
         );
-        let current: Option<String> = tx.query_row(
+        let unchanged = tx.query_row(
             "SELECT cursor FROM migration_retention WHERE id=?1",
             [id],
-            |r| r.get(0),
-        )?;
+            |r| {
+                Ok((|| -> Result<bool> {
+                    let value = r.get_ref(0)?;
+                    let current = if matches!(value, rusqlite::types::ValueRef::Null) {
+                        None
+                    } else {
+                        Some(value.as_str()?)
+                    };
+                    Ok(current == cursor.as_deref())
+                })())
+            },
+        )??;
         ensure!(
-            current == cursor,
+            unchanged,
             "migration cursor advanced concurrently; retry step"
         );
         if staged.is_empty() {
@@ -698,14 +916,16 @@ impl Catalog {
             if !result.is_empty() && bytes.saturating_add(length) > RECORD_LIMIT {
                 break;
             }
-            result.push((
-                row.get(0)?,
-                decode(
-                    &row.get::<_, Vec<u8>>(1)?,
-                    length,
-                    &row.get::<_, String>(3)?,
-                )?,
-            ));
+            ensure!(length <= RECORD_LIMIT, "retained record size limit");
+            // Keep compressed storage borrowed until admission and decoding finish.
+            let compressed = match row.get_ref(1)? {
+                rusqlite::types::ValueRef::Blob(bytes) if bytes.len() <= RECORD_LIMIT + 32768 => {
+                    bytes
+                }
+                _ => anyhow::bail!("retained record type/size limit"),
+            };
+            let digest = evidence::retained_identity(row, 3)?;
+            result.push((row.get(0)?, decode(compressed, length, &digest)?));
             bytes += length;
         }
         Ok(result)
@@ -716,7 +936,19 @@ impl Catalog {
         record: i64,
         field: &str,
     ) -> Result<evidence::EvidenceState> {
-        let id:String=self.db.query_row("SELECT f.evidence FROM migration_retained_fields f JOIN migration_retained_records r ON r.sequence=f.record WHERE f.record=?1 AND f.field=?2 AND r.complete=1",params![record,field],|r|r.get(0))?;
+        let id:String=self.db.query_row("SELECT f.evidence FROM migration_retained_fields f JOIN migration_retained_records r ON r.sequence=f.record WHERE f.record=?1 AND f.field=?2 AND r.complete=1",params![record,field],|r|evidence::retained_identity(r, 0))?;
         self.migration_evidence(&id)
     }
 }
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[path = "retention_capacity_tests.rs"]
+mod capacity_tests;
+
+#[cfg(test)]
+#[path = "retention_query_tests.rs"]
+mod query_tests;
+
+#[cfg(test)]
+#[path = "retention_admission_tests.rs"]
+mod admission_tests;

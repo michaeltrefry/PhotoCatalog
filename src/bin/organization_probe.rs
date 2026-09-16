@@ -123,6 +123,15 @@ const SCHEMA8_TABLES: &[&str] = &[
     "migration_current_repair_items",
     "migration_current_repair_reports",
 ];
+const SCHEMA11_TABLES: &[&str] = &[
+    "organization_collection_zero",
+    "organization_collection_zero_backfill",
+];
+const SCHEMA12_TABLES: &[&str] = &[
+    "storage_review_summary",
+    "storage_source_fences",
+    "storage_hydration_transitions",
+];
 const SCHEMA10_TABLES: &[&str] = &[
     "migration_keyword_repairs",
     "migration_keyword_repair_items",
@@ -278,9 +287,10 @@ fn fixture_tables(db: &Connection) -> Result<Vec<String>> {
 fn fixture_data_identity(
     db: &Connection,
     tables: &[String],
-    pre_image_columns: bool,
+    prior_schema: i64,
 ) -> Result<(String, Vec<(String, i64)>)> {
     use rusqlite::types::ValueRef;
+    let pre_image_columns = prior_schema < 7;
     let mut hash = blake3::Hasher::new();
     let mut counts = Vec::new();
     for table in tables {
@@ -300,6 +310,9 @@ fn fixture_data_identity(
             .iter()
             .filter(|c| {
                 !(pre_image_columns && table == "assets" && c.as_str() == "physical_generation")
+                    && !(prior_schema < 12
+                        && table == "storage_plans"
+                        && matches!(c.as_str(), "revision" | "review_token" | "rules"))
             })
             .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
             .collect::<Vec<_>>()
@@ -414,10 +427,22 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 10)),
         "schema10 keyword repair table roster disagrees with version"
     );
+    ensure!(
+        SCHEMA11_TABLES
+            .iter()
+            .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 11)),
+        "schema11 collection order table roster disagrees with version"
+    );
+    ensure!(
+        SCHEMA12_TABLES
+            .iter()
+            .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 12)),
+        "schema12 relink review table roster disagrees with version"
+    );
     if before_schema < 7 {
         ensure!(!db.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name IN ('catalog_images','organization_image_relations'))",[],|r|r.get(0))?, "legacy fixture has unexpected image sequence rows");
     }
-    let before = fixture_data_identity(&db, &tables_before, before_schema < 7)?;
+    let before = fixture_data_identity(&db, &tables_before, before_schema)?;
     drop(db);
     drop(Catalog::open(&args.catalog)?);
     let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
@@ -444,12 +469,18 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     if before_schema < 10 {
         expected_added.extend(SCHEMA10_TABLES.iter().map(|s| s.to_string()));
     }
+    if before_schema < 11 {
+        expected_added.extend(SCHEMA11_TABLES.iter().map(|s| s.to_string()));
+    }
+    if before_schema < 12 {
+        expected_added.extend(SCHEMA12_TABLES.iter().map(|s| s.to_string()));
+    }
     expected_added.sort();
     ensure!(
         added == expected_added,
         "unexpected migration table additions"
     );
-    let added_identity = fixture_data_identity(&db, &added, false)?;
+    let added_identity = fixture_data_identity(&db, &added, CURRENT_SCHEMA_VERSION)?;
     // This is a pristine query fixture, not an export-projection benchmark.
     // Migration creates a state row and one dirty row per existing binding;
     // those rows must be verified, not incorrectly classified as empty tables.
@@ -473,7 +504,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
-        false,
+        CURRENT_SCHEMA_VERSION,
     )?;
     ensure!(
         all_initial.1.iter().all(|(name, n)| *n
@@ -490,7 +521,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
-        false,
+        CURRENT_SCHEMA_VERSION,
     )?;
     ensure!(
         image_initial.1.iter().all(|(name, n)| *n
@@ -503,18 +534,25 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             }),
         "schema7 fixture has non-initial image/import rows"
     );
+    if before_schema < 11 {
+        ensure!(db.query_row::<bool,_,_>("SELECT NOT EXISTS(SELECT 1 FROM organization_collection_zero) AND (SELECT count(*)=1 AND min(id)=1 AND min(complete)=NOT EXISTS(SELECT 1 FROM organization_collection_members) FROM organization_collection_zero_backfill)", [], |r| r.get(0))?, "schema11 migration must leave empty derived rows and truthful deferred readiness");
+    }
+    if before_schema < 12 {
+        ensure!(db.query_row::<bool,_,_>("SELECT NOT EXISTS(SELECT 1 FROM storage_plans WHERE revision!=0 OR review_token IS NOT NULL OR rules!='[]')", [], |r| r.get(0))?, "schema12 migration must not invent review decisions");
+    }
     let repair_initial = fixture_data_identity(
         &db,
         &SCHEMA8_TABLES
             .iter()
             .chain(SCHEMA10_TABLES.iter())
+            .chain(SCHEMA12_TABLES.iter())
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
-        false,
+        CURRENT_SCHEMA_VERSION,
     )?;
     ensure!(
         repair_initial.1.iter().all(|(_, n)| *n == 0),
-        "schema8 fixture has unexpected repair state"
+        "fixture has unexpected repair or relink review state"
     );
     ensure!(
         db.query_row::<bool, _, _>(
@@ -526,7 +564,7 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     );
     ensure!(db.query_row::<bool,_,_>("SELECT NOT EXISTS(SELECT 1 FROM assets a LEFT JOIN catalog_images i ON i.id=a.id WHERE i.id IS NULL OR i.sequence!=a.sequence OR i.asset_id!=a.id OR i.variant_id!='master' OR i.role!='master' OR i.origin!='native' OR i.translation_state!='native' OR i.master_sequence IS NOT NULL OR i.copied_from_sequence IS NOT NULL OR i.pixel_generation!=0 OR i.applied_shared_epoch!=0 OR a.physical_generation!=a.render_generation) AND NOT EXISTS(SELECT 1 FROM image_shared_state WHERE epoch!=0)",[],|r|r.get(0))?, "image migration identities/generations changed");
     let alias_initial_state = json!({"unbound":unbound,"dirty":bound});
-    let after = fixture_data_identity(&db, &tables_before, before_schema < 7)?;
+    let after = fixture_data_identity(&db, &tables_before, before_schema)?;
     let after_schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let index: String = db.query_row(
         "SELECT sql FROM sqlite_master WHERE name='organization_lens_capture'",

@@ -19,6 +19,8 @@ use std::{
 
 /// Inspection-plan storage version; independent of the application catalog.
 pub const PLAN_SCHEMA_VERSION: i64 = 3;
+pub(crate) mod desktop;
+pub mod selection;
 const PAGING_INDEXES: &str = "CREATE INDEX rows_revision_sequence ON rows(revision,sequence);
 CREATE INDEX issues_revision_sequence ON issues(revision,sequence);
 CREATE INDEX packets_revision_sequence ON packets(revision,sequence);
@@ -62,15 +64,17 @@ pub(super) fn validate_paging_indexes(db: &Connection) -> Result<()> {
             .split_whitespace()
             .nth(2)
             .context("invalid paging index definition")?;
-        let actual: Option<String> = db
+        let actual: Option<bool> = db
             .query_row(
-                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?",
+                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
                 [name],
-                |r| r.get(0),
+                |r| {
+                    Ok(matches!(r.get_ref(0)?, ValueRef::Text(sql) if sql == definition.as_bytes()))
+                },
             )
             .optional()?;
         ensure!(
-            actual.as_deref() == Some(definition),
+            actual == Some(true),
             "missing or incompatible inspection paging index: {name}"
         );
     }
@@ -202,6 +206,7 @@ pub struct Progress {
 pub struct Plan {
     db: Connection,
     root: PathBuf,
+    execution: Option<Box<super::control::Control>>,
 }
 fn identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
@@ -384,6 +389,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
         Ok(Self {
             db,
             root: fs::canonicalize(root)?,
+            execution: None,
         })
     }
     pub fn open(root: &Path) -> Result<Self> {
@@ -436,12 +442,19 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
         require_current_plan(version)?;
         validate_paging_indexes(&db)?;
         crate::configure_catalog_connection(&db)?;
-        Ok(Self { db, root })
+        Ok(Self {
+            db,
+            root,
+            execution: None,
+        })
     }
     pub fn root(&self) -> &Path {
         &self.root
     }
     pub fn add_capture(&mut self, directory: &Path) -> Result<String> {
+        let control = self.execution.as_deref().cloned();
+        let check = || control.as_ref().map_or(Ok(()), |c| c.check());
+        check()?;
         let directory = fs::canonicalize(directory)?;
         ensure!(
             !directory.starts_with(&self.root) && !self.root.starts_with(&directory),
@@ -466,7 +479,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             manifest.request.limits.max_total_bytes,
         )?;
         ensure!(
-            Some(file.copy_and_hash(None)?) == manifest.logical_blake3,
+            Some(file.copy_and_hash_controlled(None, check)?) == manifest.logical_blake3,
             "logical snapshot digest mismatch"
         );
         ensure!(
@@ -474,6 +487,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             "logical snapshot object/revision differs from capture"
         );
         for artifact in &manifest.artifacts {
+            check()?;
             let relative = Path::new(&artifact.stored);
             ensure!(
                 relative
@@ -488,7 +502,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             )?;
             ensure!(
                 raw.before.bytes == artifact.revision.bytes
-                    && raw.copy_and_hash(None)? == artifact.blake3,
+                    && raw.copy_and_hash_controlled(None, check)? == artifact.blake3,
                 "raw artifact digest mismatch"
             );
         }
@@ -505,6 +519,9 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             return Ok(revision);
         }
         let source = snapshot(&directory.join("logical.sqlite3"), &manifest.request.limits)?;
+        let _source_control = control
+            .clone()
+            .map(|c| super::control::SqlControl::new(&source, c));
         let schemas = read_schema(&source)?;
         let variables = read_variables(&source, &schemas)?;
         let provider = variables.get("Adobe_storeProviderID").cloned();
@@ -583,6 +600,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
                 ) {
                     Ok(n) => Some(n),
                     Err(e) => {
+                        check()?;
                         issue = Some(e.to_string());
                         None
                     }
@@ -593,12 +611,16 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             transaction.execute("INSERT INTO tables(revision,name,columns_json,key_json,schema_json,category,expected,state,issue) VALUES(?,?,?,?,?,?,?,?,?)",params![revision,schema.name,serde_json::to_string(&columns)?,serde_json::to_string(&key)?,serde_json::to_string(&schema)?,category(&schema.name),count,if issue.is_some(){"retained_snapshot_only"}else{"pending"},issue])?;
         }
         file.verify()?;
+        check()?;
         transaction.commit()?;
         Ok(revision)
     }
     /// Retain at most max_rows in transactions of 100. Repeating resumes from the
     /// last committed physical key; source IDs and opaque values remain stable.
     pub fn resume(&mut self, revision: &str, max_rows: usize) -> Result<Progress> {
+        let control = self.execution.as_deref().cloned();
+        let check = || control.as_ref().map_or(Ok(()), |c| c.check());
+        check()?;
         ensure!(
             (1..=100_000).contains(&max_rows),
             "row budget must be 1..100000"
@@ -613,6 +635,9 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             "logical snapshot revision changed since capture"
         );
         let source = snapshot(&directory.join("logical.sqlite3"), &manifest.request.limits)?;
+        let _source_control = control
+            .clone()
+            .map(|c| super::control::SqlControl::new(&source, c));
         let current_stage: String = self.db.query_row(
             "SELECT stage FROM captures WHERE revision=?",
             [revision],
@@ -628,6 +653,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
         }
         let mut retained = 0;
         while retained < max_rows {
+            check()?;
             let table=self.db.query_row("SELECT name,columns_json,key_json,cursor FROM tables WHERE revision=? AND state='pending' ORDER BY name LIMIT 1",[revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?))).optional()?;
             let Some((table, columns, key, cursor)) = table else {
                 break;
@@ -645,6 +671,12 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             );
             match result {
                 Err(error) => {
+                    // Interrupted/budget-limited work remains resumable, not a
+                    // source failure. Ordinary CLI retention behavior is unchanged.
+                    check()?;
+                    if control.is_some() && error.downcast_ref::<rusqlite::Error>().is_some_and(|e| matches!(e, rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::TooBig)) {
+                        return Err(error.context("inspection source row byte budget exceeded; resume with a larger budget"));
+                    }
                     let failure = self.db.transaction()?;
                     failure.execute(
                         "UPDATE tables SET state='failed',issue=? WHERE revision=? AND name=?",
@@ -692,6 +724,9 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
                     transaction.execute("UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",[revision])?;
                     transaction.commit()?;
                     retained += batch.len();
+                    if let Some(control) = &control {
+                        control.progress(retained as u64);
+                    }
                 }
             }
         }
@@ -1518,6 +1553,9 @@ impl Plan {
     /// Bounded direct-path inspection. No directory recursion or root guessing.
     /// `packets=false` performs metadata lookups only and leaves explicit XMP gaps.
     pub fn check_paths(&mut self, revision: &str, limit: usize, packets: bool) -> Result<usize> {
+        let control = self.execution.as_deref().cloned();
+        let check = || control.as_ref().map_or(Ok(()), |c| c.check());
+        check()?;
         ensure!((1..=1000).contains(&limit), "path budget must be 1..1000");
         let (_, manifest) = self.capture(revision)?;
         let selected = {
@@ -1546,6 +1584,7 @@ impl Plan {
             selected
         };
         for (sequence, id, path) in &selected {
+            check()?;
             let transaction = self.db.transaction()?;
             let native: NativePath = serde_json::from_str(path)?;
             let (state, evidence) = match native.to_path() {
@@ -1572,6 +1611,7 @@ impl Plan {
                             id,
                             &path,
                             &manifest.request.limits,
+                            control.as_ref(),
                         )?;
                         let state = if base == "available" {
                             if gaps {
@@ -1603,6 +1643,7 @@ impl Plan {
                 "UPDATE paths SET state=?,evidence=? WHERE sequence=?",
                 params![state, serde_json::to_string(&evidence)?, sequence],
             )?;
+            check()?;
             transaction.execute(
                 "UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",
                 [revision],
@@ -1798,6 +1839,10 @@ impl Plan {
     }
     pub fn families(&self) -> Result<FamilyReport> {
         let _read_snapshot = self.db.unchecked_transaction()?;
+        self.families_in_snapshot()
+    }
+    fn families_in_snapshot(&self) -> Result<FamilyReport> {
+        self.admit_report()?;
         let captures = {
             let mut statement=self.db.prepare("SELECT revision,schema_version,provider,stage,evidence_revision FROM captures ORDER BY revision LIMIT 257")?;
             statement
@@ -2347,6 +2392,7 @@ fn inspect_packets(
     id: &str,
     path: &Path,
     limits: &Limits,
+    control: Option<&super::control::Control>,
 ) -> Result<(Vec<serde_json::Value>, bool)> {
     let packet_limits = xmp_packets::Limits {
         max_source_bytes: limits.max_file_bytes,
@@ -2367,6 +2413,9 @@ fn inspect_packets(
     let mut observations = vec![];
     let mut gaps = false;
     for (origin, file) in candidates {
+        if let Some(control) = control {
+            control.check()?;
+        }
         match fs::symlink_metadata(&file) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 observations.push(serde_json::json!({"origin":origin,"path":NativePath::from_path(&file),"state":"absent"}));
@@ -2379,13 +2428,23 @@ fn inspect_packets(
             }
             _ => {}
         }
-        let inspection = if origin == "embedded" {
+        let inspection = if let Some(control) = control {
+            xmp_packets::inspect_cancellable(
+                &file,
+                &packet_limits,
+                origin != "embedded",
+                &control.cancel,
+            )
+        } else if origin == "embedded" {
             xmp_packets::inspect(&file, &packet_limits)
         } else {
             xmp_packets::inspect_sidecar(&file, &packet_limits)
         };
         match inspection {
             Err(e) => {
+                if let Some(control) = control {
+                    control.check()?;
+                }
                 gaps = true;
                 observations.push(serde_json::json!({"origin":origin,"error":e.to_string()}));
             }

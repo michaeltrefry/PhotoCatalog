@@ -1,4 +1,4 @@
-use photocatalog::{Catalog, preview::*, xmp};
+use photocatalog::{Catalog, preview::*, storage_volume::NativePath, xmp};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -1437,3 +1437,190 @@ fn legacy_virtual_pixel_changes_reject_cache_persisted_and_inflight_jobs() {
         }
     }
 }
+
+fn hydration_fixture(root: &Path) -> (PathBuf, photocatalog::catalog_edits::VariantKey) {
+    let originals = root.join("originals");
+    std::fs::create_dir(&originals).unwrap();
+    let originals = originals.canonicalize().unwrap();
+    let source = originals.join("source.png");
+    image(&source, [40, 70, 100]);
+    let mut catalog = Catalog::open(root.join("catalog")).unwrap();
+    catalog.import(&originals, None, |_| Ok(())).unwrap();
+    let key = photocatalog::catalog_edits::VariantKey::master(
+        catalog.browse(0, 1).unwrap()[0].id.clone(),
+    );
+    catalog
+        .save_edit_recipe(
+            &key,
+            0,
+            &photocatalog::edit::Recipe::V1(photocatalog::edit::RecipeV1 {
+                exposure_ev: 1.0,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    drop(catalog);
+    rusqlite::Connection::open(root.join("catalog/catalog.sqlite3")).unwrap().execute(
+        "UPDATE assets SET state='pending',fingerprint=NULL,metadata=NULL,preview_hash=NULL WHERE id=?1", [&key.asset_id]
+    ).unwrap();
+    (source, key)
+}
+
+#[test]
+#[ignore = "subprocess entry for hydration durable-boundary recovery"]
+fn hydration_crash_child_entry() {
+    let root = PathBuf::from(std::env::var_os("PHOTOCATALOG_HYDRATION_ROOT").unwrap());
+    let phase: ServiceEvent =
+        serde_json::from_str(&std::env::var("PHOTOCATALOG_HYDRATION_PHASE").unwrap()).unwrap();
+    let source = root.join("originals/source.png").canonicalize().unwrap();
+    let mut catalog = Catalog::open(root.join("catalog")).unwrap();
+    let key = photocatalog::catalog_edits::VariantKey::master(
+        catalog.browse(0, 1).unwrap()[0].id.clone(),
+    );
+    let mut previews = service(
+        &root.join("cache"),
+        source.parent().unwrap(),
+        ServiceLimits::default(),
+    );
+    previews.set_observer(move |event| {
+        if event == phase {
+            std::process::exit(86);
+        }
+        Ok(())
+    });
+    let consumer = previews
+        .submit_hydration(
+            &mut catalog,
+            HydrationRequest {
+                variant: &key,
+                source: &NativePath::from_path(&source),
+                fingerprint: blake3::hash(&std::fs::read(&source).unwrap())
+                    .to_hex()
+                    .as_ref(),
+                tier: Tier::Large,
+                priority: Priority::Foreground,
+                interactive: false,
+            },
+        )
+        .unwrap();
+    panic!(
+        "boundary not reached: {:?}",
+        await_result(&mut previews, &mut catalog, consumer)
+    );
+}
+
+#[test]
+fn hydration_crash_recovery_rechecks_source_and_never_retargets_edits_or_paths() {
+    for (phase, change) in [
+        (ServiceEvent::ManifestAttached, "none"),
+        (ServiceEvent::BeforeCatalogCommit, "none"),
+        (ServiceEvent::CatalogCommitted, "none"),
+        (ServiceEvent::JournalRemoving, "none"),
+        (ServiceEvent::ManifestAttached, "edit"),
+        (ServiceEvent::ManifestAttached, "path"),
+        (ServiceEvent::ManifestAttached, "bytes"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (source, key) = hydration_fixture(root.path());
+        let original = std::fs::read(&source).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hydration_crash_child_entry", "--ignored"])
+            .env("PHOTOCATALOG_HYDRATION_ROOT", root.path())
+            .env(
+                "PHOTOCATALOG_HYDRATION_PHASE",
+                serde_json::to_string(&phase).unwrap(),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("hydration boundary timeout {phase:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(86), "{phase:?} {change}");
+        let mut catalog = Catalog::open(root.path().join("catalog")).unwrap();
+        match change {
+            "edit" => {
+                catalog
+                    .save_edit_recipe(&key, 1, &photocatalog::edit::Recipe::default())
+                    .unwrap();
+            }
+            "path" => {
+                let moved = source.with_file_name("different.png");
+                std::fs::copy(&source, &moved).unwrap();
+                // Simulate an independently committed locator update after crash.
+                rusqlite::Connection::open(root.path().join("catalog/catalog.sqlite3"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE storage_bindings SET native_path=?1 WHERE asset_id=?2",
+                        rusqlite::params![
+                            serde_json::to_string(&NativePath::from_path(&moved)).unwrap(),
+                            key.asset_id
+                        ],
+                    )
+                    .unwrap();
+            }
+            "bytes" => image(&source, [100, 70, 40]),
+            _ => (),
+        }
+        let mut previews = service(
+            &root.path().join("cache"),
+            source.parent().unwrap(),
+            ServiceLimits::default(),
+        );
+        let (_, consumers) = previews.resume(&mut catalog, 0, 10, true).unwrap();
+        if change == "edit" || change == "path" {
+            assert!(consumers.is_empty(), "stale authority replayed");
+        } else if matches!(
+            phase,
+            ServiceEvent::ManifestAttached | ServiceEvent::BeforeCatalogCommit
+        ) {
+            assert_eq!(
+                consumers.len(),
+                1,
+                "pending hydration must verify source again"
+            );
+            let done = await_result(&mut previews, &mut catalog, consumers[0]);
+            assert_eq!(
+                matches!(done, ServiceCompletion::Ready),
+                change == "none",
+                "{done:?}"
+            );
+        } else {
+            assert!(consumers.is_empty(), "committed journal should retire");
+        }
+        let physical = catalog.render_identity(&key.asset_id).unwrap();
+        assert_eq!(
+            physical.state,
+            if change == "none" { "ready" } else { "pending" }
+        );
+        assert_eq!(physical.fingerprint.is_some(), change == "none");
+        assert_eq!(
+            catalog.edit_variant(&key).unwrap().revision,
+            if change == "edit" { 2 } else { 1 }
+        );
+        if change == "none" {
+            assert!(
+                previews
+                    .cached_variant(&catalog, &key, Tier::Large, false)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        if change != "bytes" {
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+        }
+    }
+}
+
+#[path = "preview_service/relink.rs"]
+mod relink;
