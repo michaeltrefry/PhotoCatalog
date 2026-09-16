@@ -39,6 +39,16 @@ pub(crate) trait ManagedIo: Send + Sync + 'static {
         request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
         cancel: &AtomicBool,
     ) -> Result<crate::filesystem_worker::wire::LightroomWorkbenchIoReply>;
+    fn sealed_document(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>>;
+    fn artifact_preparation(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>>;
     fn source_open(
         &self,
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,

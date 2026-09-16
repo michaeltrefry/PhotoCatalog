@@ -111,6 +111,12 @@ enum CallbackRequest {
     Filesystem {
         request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
     },
+    SealedDocument {
+        request: crate::filesystem_worker::wire::LightroomSealedRead,
+    },
+    ArtifactPreparation {
+        request: crate::filesystem_worker::wire::LightroomArtifactPreparation,
+    },
     SourceOpen {
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
     },
@@ -142,11 +148,49 @@ enum CallbackRequest {
 enum CallbackValue {
     Admitted,
     Filesystem(crate::filesystem_worker::wire::LightroomWorkbenchIoReply),
+    SealedDocument(Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>),
+    ArtifactPreparation(Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>),
     Source(String),
     Schema(crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects),
     Table(crate::lightroom_migration_worker::source_reader::capture_wire::TableValue),
     Current(crate::lightroom_migration_worker::source_reader::capture_wire::Current),
     Retired,
+}
+
+#[allow(dead_code)] // Read by the integrated Workbench metadata reservation.
+pub(super) struct CallbackMetadataLayouts {
+    pub proxy: usize,
+    pub state: usize,
+    pub assembly: usize,
+    pub request: usize,
+    pub value: usize,
+    pub outcome: usize,
+    pub sealed_request: usize,
+    pub sealed_reply: usize,
+    pub artifact_request: usize,
+    pub artifact_reply: usize,
+}
+
+#[allow(dead_code)] // Read by the integrated Workbench metadata reservation.
+pub(super) fn callback_metadata_layouts() -> CallbackMetadataLayouts {
+    CallbackMetadataLayouts {
+        proxy: std::mem::size_of::<CallbackProxy>(),
+        state: std::mem::size_of::<CallbackState>(),
+        assembly: std::mem::size_of::<CallbackAssembly>(),
+        request: std::mem::size_of::<CallbackRequest>(),
+        value: std::mem::size_of::<CallbackValue>(),
+        outcome: std::mem::size_of::<Outcome>(),
+        sealed_request: std::mem::size_of::<crate::filesystem_worker::wire::LightroomSealedRead>(),
+        sealed_reply: std::mem::size_of::<
+            crate::filesystem_worker::wire::LightroomSealedDocumentPage,
+        >(),
+        artifact_request: std::mem::size_of::<
+            crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        >(),
+        artifact_reply: std::mem::size_of::<
+            crate::filesystem_worker::wire::LightroomArtifactPreparationReply,
+        >(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -458,6 +502,60 @@ impl super::lightroom::ManagedIo for CallbackProxy {
         match self.call(CallbackRequest::Filesystem { request }, cancel)? {
             CallbackValue::Filesystem(value) => Ok(value),
             _ => anyhow::bail!("Workbench filesystem callback result kind"),
+        }
+    }
+    fn sealed_document(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
+        match self.call(
+            CallbackRequest::SealedDocument {
+                request: request.clone(),
+            },
+            cancel,
+        )? {
+            CallbackValue::SealedDocument(value) => match (&request, value) {
+                (crate::filesystem_worker::wire::LightroomSealedRead::Discard { .. }, None) => {
+                    Ok(None)
+                }
+                (_, Some(value)) => {
+                    value.validate_for(&request)?;
+                    Ok(Some(value))
+                }
+                _ => anyhow::bail!("sealed document callback response is absent"),
+            },
+            _ => anyhow::bail!("Workbench sealed-document callback result kind"),
+        }
+    }
+    fn artifact_preparation(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>> {
+        match self.call(
+            CallbackRequest::ArtifactPreparation {
+                request: request.clone(),
+            },
+            cancel,
+        )? {
+            CallbackValue::ArtifactPreparation(value) => match (&request, value) {
+                (
+                    crate::filesystem_worker::wire::LightroomArtifactPreparation::Discard {
+                        ..
+                    }
+                    | crate::filesystem_worker::wire::LightroomArtifactPreparation::DiscardReceipt {
+                        ..
+                    },
+                    None,
+                ) => Ok(None),
+                (_, Some(value)) => {
+                    value.validate_for(&request)?;
+                    Ok(Some(value))
+                }
+                _ => anyhow::bail!("artifact preparation callback response is absent"),
+            },
+            _ => anyhow::bail!("Workbench artifact-preparation callback result kind"),
         }
     }
     fn source_open(
@@ -948,6 +1046,12 @@ impl Client {
             CallbackRequest::Filesystem { request } => Ok(CallbackValue::Filesystem(
                 managed.filesystem(request, cancel.as_ref())?,
             )),
+            CallbackRequest::SealedDocument { request } => Ok(CallbackValue::SealedDocument(
+                managed.sealed_document(request, &cancel)?,
+            )),
+            CallbackRequest::ArtifactPreparation { request } => Ok(
+                CallbackValue::ArtifactPreparation(managed.artifact_preparation(request, &cancel)?),
+            ),
             CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source(
                 managed.source_open(authority, cancel.clone())?,
             )),

@@ -238,7 +238,12 @@ impl Control {
         self.upload = None;
         Ok(Response::Status(self.status()))
     }
-    pub(crate) fn direct(&mut self, request: Request, envelope: usize) -> Result<Response> {
+    pub(crate) fn direct(
+        &mut self,
+        request: Request,
+        envelope: usize,
+        managed: Option<&Arc<dyn lw::ManagedIo>>,
+    ) -> Result<Response> {
         match request {
             Request::Options {} => Ok(Response::Options(options(envelope))),
             Request::Status { workbench, attempt } => {
@@ -315,11 +320,19 @@ impl Control {
                 };
                 Ok(Response::Input(value))
             }
-            Request::SealedDocument { .. } => {
-                anyhow::bail!("sealed document reads require the managed filesystem owner")
+            Request::SealedDocument { request } => {
+                request.validate()?;
+                let value = managed
+                    .context("sealed document reads require the managed filesystem owner")?
+                    .sealed_document(request, &std::sync::atomic::AtomicBool::new(false))?;
+                Ok(Response::SealedDocument(value))
             }
-            Request::ArtifactPreparation { .. } => {
-                anyhow::bail!("artifact preparation requires the managed filesystem owner")
+            Request::ArtifactPreparation { request } => {
+                request.validate()?;
+                let value = managed
+                    .context("artifact preparation requires the managed filesystem owner")?
+                    .artifact_preparation(request, &std::sync::atomic::AtomicBool::new(false))?;
+                Ok(Response::ArtifactPreparation(value))
             }
             _ => anyhow::bail!("inspection request requires actor admission"),
         }
@@ -441,7 +454,7 @@ impl Coordinator {
                 .control
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .direct(request, envelope);
+                .direct(request, envelope, self.managed.as_ref());
         }
         if let Request::Open {
             attempt,
@@ -567,12 +580,35 @@ impl Coordinator {
                         )?;
                     }
                     Action::ApprovalDocuments {
-                        input: _,
-                        review_token: _,
+                        input,
+                        review_token,
                     } => {
-                        anyhow::bail!(
-                            "approval documents require filesystem receipts resolved by the managed desktop owner"
-                        )
+                        let managed = self.managed.as_ref().context(
+                            "approval documents require filesystem receipts resolved by the managed desktop owner",
+                        )?;
+                        let cancel = std::sync::atomic::AtomicBool::new(false);
+                        return c.approval_documents(
+                            &g,
+                            &input,
+                            &review_token,
+                            &cancel,
+                            |receipt| {
+                                let request = crate::filesystem_worker::wire::LightroomArtifactPreparation::Resolve {
+                                    receipt: receipt.into(),
+                                };
+                                match managed.artifact_preparation(request, &cancel)? {
+                                    Some(crate::filesystem_worker::wire::LightroomArtifactPreparationReply::Resolved {
+                                        input_json,
+                                        input_blake3,
+                                        ..
+                                    }) => Ok(crate::lightroom::selection::ExactDocument {
+                                        json: input_json,
+                                        blake3: input_blake3,
+                                    }),
+                                    _ => anyhow::bail!("prepared artifact receipt resolution is absent"),
+                                }
+                            },
+                        );
                     }
                     value => {
                         w.bridge_start(&g.generation, &g.operation, typed_action(value)?)?;

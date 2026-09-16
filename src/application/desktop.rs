@@ -36,6 +36,8 @@ mod tests;
 mod wire;
 #[allow(dead_code)] // Selected by the managed public factory after integration gates.
 pub(crate) mod workbench;
+#[cfg(test)]
+mod workbench_capability_tests;
 use wire::{BytesRequest, Kind, Message};
 type Result<T> = std::result::Result<T, BridgeError>;
 pub(super) const CONTROL_SLOTS: usize = 16;

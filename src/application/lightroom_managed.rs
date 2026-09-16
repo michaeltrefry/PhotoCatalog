@@ -929,6 +929,23 @@ impl ManagedIo for Owner {
         }
     }
 
+    fn sealed_document(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
+        self.filesystem.lightroom_sealed_read(&request, cancel)
+    }
+
+    fn artifact_preparation(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>> {
+        self.filesystem
+            .lightroom_artifact_preparation(&request, cancel)
+    }
+
     fn source_open(
         &self,
         authority: CaptureSqlAuthority,
