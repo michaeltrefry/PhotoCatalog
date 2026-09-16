@@ -192,6 +192,8 @@ impl Owner {
                         .spawn(move || {
                             if let Err(e) = parent_control(control, &state) {
                                 state.fail(format!("desktop control: {e}"));
+                                state.state.lock().unwrap().control_reader_failed = true;
+                                state.wake.notify_all();
                             }
                         })?,
                 );
@@ -351,8 +353,14 @@ impl Owner {
     pub fn drain(&mut self) -> Result<()> {
         if self.supervisor.as_ref().is_some_and(|s| !s.is_finished()) {
             let mut state = self.shared.state.lock().unwrap();
-            while !state.reaped && state.drain_error.is_none() {
+            while !state.reaped && state.drain_error.is_none() && !state.control_reader_failed {
                 state = self.shared.wake.wait(state).unwrap();
+            }
+            if !state.reaped && state.control_reader_failed {
+                return Err(error(
+                    ErrorCode::Native,
+                    "desktop control reader failed; catalog process and pipe custody retained",
+                ));
             }
             if let Some(message) = &state.drain_error {
                 return Err(error(ErrorCode::Native, message));
@@ -2183,6 +2191,37 @@ mod tests {
         assert_eq!(usage.load(Ordering::Acquire), 0);
         assert!(shared.lock().unwrap().retained.remove(&1).is_none());
     }
+    #[test]
+    fn failed_control_reader_returns_retained_owner_without_waiting_for_reap() {
+        let shared = super::super::tests::shared(1024);
+        shared.fail("injected control reader failure");
+        shared.state.lock().unwrap().control_reader_failed = true;
+        let (release, held) = mpsc::sync_channel(0);
+        let supervisor = thread::spawn(move || {
+            let _ = held.recv();
+            (None, vec![])
+        });
+        let mut owner = Owner {
+            child: None,
+            threads: vec![],
+            supervisor: Some(supervisor),
+            shared: shared.clone(),
+            pid: 0,
+            fixture_child: None,
+        };
+        for _ in 0..2 {
+            shared.stop();
+            let error = owner.drain().unwrap_err();
+            assert!(error.message.contains("custody retained"));
+            assert!(owner.supervisor.is_some());
+            let state = shared.state.lock().unwrap();
+            assert!(!state.reaped && !state.child_finished && !state.local_verified);
+            assert_ne!(state.phase, TransportPhase::Closed);
+        }
+        release.send(()).unwrap();
+        owner.supervisor.take().unwrap().join().unwrap();
+    }
+
     #[test]
     fn failed_os_wait_preserves_owner_until_explicit_success() {
         #[cfg(unix)]

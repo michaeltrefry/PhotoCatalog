@@ -22,6 +22,7 @@ pub(super) fn shared(cap: usize) -> Arc<Shared> {
             shutdown_attempt: 0,
             shutdown_sent: 0,
             drain_error: None,
+            control_reader_failed: false,
             reaped: false,
             child_finished: false,
             local_verified: false,
