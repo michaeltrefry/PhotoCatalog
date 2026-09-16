@@ -9,7 +9,7 @@ pub(super) const CONFIG_BYTES: usize = 4 * 1024 * 1024;
 // reply budget is smaller than a serialized ResourceLimit error.
 pub(super) const ERROR_BYTES: usize = 1024;
 const HEADER: usize = 48;
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -35,6 +35,8 @@ pub(super) enum Kind {
     FilesystemStore = 19,
     MigrationAdmission = 20,
     MigrationReply = 21,
+    BackupAdmission = 22,
+    BackupAdmissionReply = 23,
     #[cfg(test)]
     Fixture = 250,
 }
@@ -62,6 +64,8 @@ impl Kind {
             19 => Ok(Self::FilesystemStore),
             20 => Ok(Self::MigrationAdmission),
             21 => Ok(Self::MigrationReply),
+            22 => Ok(Self::BackupAdmission),
+            23 => Ok(Self::BackupAdmissionReply),
             #[cfg(test)]
             250 => Ok(Self::Fixture),
             _ => Err(invalid("unknown desktop frame kind")),
@@ -249,6 +253,7 @@ pub(super) fn build_identity() -> String {
             include_str!("../../metadata_export.rs"),
             include_str!("../../metadata_export/photo_phases.rs"),
             include_str!("wire.rs"),
+            include_str!("backup.rs"),
             include_str!("lightroom_migration.rs"),
             include_str!("migration.rs"),
             include_str!("../lightroom_migration.rs"),

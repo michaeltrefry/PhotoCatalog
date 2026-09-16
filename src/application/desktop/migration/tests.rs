@@ -1643,17 +1643,20 @@ mod actual {
         let mut state = fixture.desktop.0.shared.state.lock().unwrap();
         assert!(state.ready, "actual paired identity handshake was verified");
         assert!(super::super::super::managed_catalog_retired(
-            &state, true, true
+            &state, true, true, true
         ));
         assert!(!super::super::super::managed_catalog_retired(
-            &state, false, true
+            &state, false, true, true
         ));
         assert!(!super::super::super::managed_catalog_retired(
-            &state, true, false
+            &state, true, false, true
+        ));
+        assert!(!super::super::super::managed_catalog_retired(
+            &state, true, true, false
         ));
         state.ready = false;
         assert!(!super::super::super::managed_catalog_retired(
-            &state, true, true
+            &state, true, true, true
         ));
         drop(state);
         assert!(

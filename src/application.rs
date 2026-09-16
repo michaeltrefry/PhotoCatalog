@@ -260,6 +260,10 @@ fn reply(r: std::result::Result<Response, BridgeError>) -> Reply {
 }
 
 enum Work {
+    BackupAdmission(
+        desktop::backup::AdmissionRequest,
+        mpsc::SyncSender<desktop::backup::AdmissionReply>,
+    ),
     MigrationAdmission(
         desktop::lightroom_migration::Request,
         mpsc::SyncSender<desktop::lightroom_migration::Reply>,
@@ -281,7 +285,7 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
-            Work::Shutdown(_) | Work::MigrationAdmission(..) => 0,
+            Work::Shutdown(_) | Work::MigrationAdmission(..) | Work::BackupAdmission(..) => 0,
             Work::Command(Request::Lightroom { .. }, _) => 4,
             Work::Command(Request::Export { request, .. }, _) => {
                 if matches!(
@@ -362,6 +366,9 @@ impl Envelope {
     }
     fn reject(self, code: ErrorCode, message: &str) {
         match self.work {
+            Work::BackupAdmission(_, tx) => {
+                let _ = tx.send(desktop::backup::AdmissionReply::error(error(code, message)));
+            }
             Work::MigrationAdmission(_, tx) => {
                 let _ = tx.send(desktop::lightroom_migration::Reply::Refused(error(
                     code, message,
@@ -515,11 +522,9 @@ impl Bridge {
     }
     fn spawn_engine(config: Config, managed: Option<ManagedCatalogConfig>) -> Result<Self> {
         config.validate()?;
-        let backups = if managed.is_some() {
-            backup::Coordinator::new_managed(Default::default(), std::env::current_exe()?)?
-        } else {
-            backup::Coordinator::new(Default::default())?
-        };
+        // Managed backup B/F descendants belong to the outer desktop owner G.
+        // This in-process coordinator remains the public legacy implementation.
+        let backups = backup::Coordinator::new(Default::default())?;
         let shared = Arc::new(Shared {
             managed_catalog: managed.is_some(),
             lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),
@@ -1296,6 +1301,13 @@ impl Actor {
                     e.reject(ErrorCode::Canceled, "queued operation expired");
                 } else {
                     match e.work {
+                        Work::BackupAdmission(request, tx) => {
+                            let reply = match self.backup_admission(request) {
+                                Ok(admission) => desktop::backup::AdmissionReply::Ok(admission),
+                                Err(error) => desktop::backup::AdmissionReply::error(error),
+                            };
+                            let _ = tx.send(reply);
+                        }
                         Work::MigrationAdmission(request, tx) => {
                             let _ = tx.send(self.migration_request(request, &e.cancel));
                         }
@@ -1927,6 +1939,21 @@ impl Actor {
                 )
                 .map(|r| Response::Lightroom(Box::new(r)))
                 .map_err(native);
+        }
+        if self.managed.is_some()
+            && matches!(
+                r,
+                Request::BackupCreate { .. }
+                    | Request::BackupInspect { .. }
+                    | Request::BackupRestore { .. }
+                    | Request::BackupStatus
+                    | Request::BackupCancel { .. }
+            )
+        {
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "managed backup requests belong to the desktop owner",
+            ));
         }
         if (self.open.as_ref().is_some_and(|o| o.closing)
             || self.failed_admission.is_some()

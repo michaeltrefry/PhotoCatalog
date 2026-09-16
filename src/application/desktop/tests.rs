@@ -27,10 +27,14 @@ pub(super) fn shared(cap: usize) -> Arc<Shared> {
             local_verified: false,
             filesystem_verified: true,
             child_exit: None,
+            catalog_retiring: false,
+            catalog_epoch: 0,
+            backup_admitting: false,
         }),
         wake: Condvar::new(),
         binary: Arc::new(AtomicUsize::new(0)),
         filesystem: None,
+        backup: None,
         metadata: Default::default(),
         migration_stop: Mutex::new(None),
         fixture: Mutex::new(None),
@@ -369,13 +373,15 @@ fn managed_catalog_retirement_requires_identity_reap_join_and_g_drain() {
             for reaped in [false, true] {
                 for joined in [false, true] {
                     for migration in [false, true] {
-                        state.ready = ready;
-                        state.reaped = reaped;
-                        state.child_finished = joined;
-                        assert_eq!(
-                            managed_catalog_retired(&state, paired, migration),
-                            paired && ready && reaped && joined && migration
-                        );
+                        for backup in [false, true] {
+                            state.ready = ready;
+                            state.reaped = reaped;
+                            state.child_finished = joined;
+                            assert_eq!(
+                                managed_catalog_retired(&state, paired, migration, backup),
+                                paired && ready && reaped && joined && migration && backup
+                            );
+                        }
                     }
                 }
             }

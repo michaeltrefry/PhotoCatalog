@@ -14,6 +14,7 @@ use std::{
     },
     thread,
 };
+mod backup;
 #[allow(dead_code)] // Additive, unselected until the FS6 managed actor dependency is admitted.
 mod filesystem;
 pub(crate) use filesystem::admit_export_stage_reply;
@@ -55,6 +56,7 @@ pub struct TransportStatus {
     pub pid: u32,
 }
 enum Delivery {
+    BackupAdmission(mpsc::SyncSender<backup::AdmissionReply>),
     Migration(mpsc::SyncSender<lightroom_migration::Reply>),
     Command(mpsc::SyncSender<Reply>),
     Bytes {
@@ -86,6 +88,9 @@ struct State {
     local_verified: bool,
     filesystem_verified: bool,
     child_exit: Option<i32>,
+    catalog_retiring: bool,
+    catalog_epoch: u64,
+    backup_admitting: bool,
 }
 struct Shared {
     session: [u8; 16],
@@ -94,6 +99,8 @@ struct Shared {
     wake: Condvar,
     binary: Arc<AtomicUsize>,
     filesystem: Option<Arc<filesystem::Parent>>,
+    /// Managed backup B/F run beneath G, never beneath the catalog child C.
+    backup: Option<Arc<Mutex<super::backup::Coordinator>>>,
     metadata: preview_metadata_admission::ProcessReservation,
     migration_stop:
         Mutex<Option<std::sync::Weak<crate::lightroom_migration_worker::process::Stop>>>,
@@ -137,6 +144,12 @@ impl Shared {
     }
     fn fail(&self, message: impl Into<String>) {
         self.cancel_migration();
+        if let Some(backup) = &self.backup {
+            backup
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .signal_shutdown();
+        }
         let message = message.into();
         if let Some(f) = &self.filesystem {
             f.fail(&message);
@@ -167,6 +180,12 @@ impl Shared {
     }
     fn stop(&self) {
         self.cancel_migration();
+        if let Some(backup) = &self.backup {
+            backup
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .signal_shutdown();
+        }
         if let Some(f) = &self.filesystem {
             f.closing();
         }
@@ -212,6 +231,12 @@ impl Shared {
         for (_, e) in entries {
             let message = "desktop process stopped; unacknowledged operation outcome is unknown; explicitly reopen and inspect saved state";
             match e.delivery {
+                Delivery::BackupAdmission(tx) => {
+                    let _ = tx.send(backup::AdmissionReply::error(error(
+                        ErrorCode::Closed,
+                        message,
+                    )));
+                }
                 Delivery::Migration(tx) => {
                     let _ = tx.send(lightroom_migration::Reply::Error(error(
                         ErrorCode::Closed,
@@ -258,8 +283,18 @@ struct Handle {
 /// the complete implementation and the exact F binding. A legacy/unverified C
 /// cannot use this abnormal-exit proof. F.finish_after_dependents still checks
 /// G's native registry before retiring F, independently of G migration custody.
-fn managed_catalog_retired(state: &State, paired: bool, migration_drained: bool) -> bool {
-    paired && state.ready && state.reaped && state.child_finished && migration_drained
+fn managed_catalog_retired(
+    state: &State,
+    paired: bool,
+    migration_drained: bool,
+    backup_drained: bool,
+) -> bool {
+    paired
+        && state.ready
+        && state.reaped
+        && state.child_finished
+        && migration_drained
+        && backup_drained
 }
 impl Handle {
     fn shutdown(&self) -> Result<()> {
@@ -276,10 +311,23 @@ impl Handle {
             .signal_shutdown();
         let result = self.process.lock().unwrap().drain();
         let migration_drained = self.migration.drained();
+        let backup_result = self.shared.backup.as_ref().map_or(Ok(()), |backup| {
+            backup
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shutdown()
+                .map(|_| ())
+                .map_err(super::native)
+        });
+        let backup_drained = backup_result.is_ok();
         let (retired, managed_retired, exit) = {
             let s = self.shared.state.lock().unwrap();
-            let managed =
-                managed_catalog_retired(&s, self.shared.filesystem.is_some(), migration_drained);
+            let managed = managed_catalog_retired(
+                &s,
+                self.shared.filesystem.is_some(),
+                migration_drained,
+                backup_drained,
+            );
             (
                 migration_drained
                     && s.reaped
@@ -314,7 +362,7 @@ impl Handle {
         } else {
             result
         };
-        result.and(filesystem).and(local)
+        result.and(backup_result).and(filesystem).and(local)
     }
 }
 impl Drop for Handle {
@@ -397,6 +445,16 @@ impl DesktopBridge {
             None => e,
         })?;
         let paired = filesystem.is_some();
+        let backup = if paired {
+            Some(Arc::new(Mutex::new(
+                super::backup::Coordinator::new_managed(
+                    Default::default(),
+                    config.worker_executable.clone(),
+                )?,
+            )))
+        } else {
+            None
+        };
         let mut configuration = wire::ConfigWire::from_config(&config);
         configuration.filesystem = filesystem.as_ref().map(|f| f.binding.clone());
         let hello = serde_json::to_vec(&configuration)
@@ -433,10 +491,14 @@ impl DesktopBridge {
                 local_verified: false,
                 filesystem_verified: filesystem.is_none(),
                 child_exit: None,
+                catalog_retiring: false,
+                catalog_epoch: 0,
+                backup_admitting: false,
             }),
             wake: Condvar::new(),
             binary: Arc::new(AtomicUsize::new(0)),
             filesystem,
+            backup,
             metadata,
             migration_stop: Mutex::new(None),
             #[cfg(test)]
@@ -509,6 +571,17 @@ impl DesktopBridge {
             message: s.drain_error.clone().or_else(|| s.message.clone()),
             pid: self.0.pid,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn set_backup_process_probe(
+        &self,
+        probe: Arc<dyn Fn(crate::catalog_backup::managed::ProcessEvent) + Send + Sync>,
+    ) -> Result<()> {
+        self.backup_owner()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_process_probe(probe);
+        Ok(())
     }
     /// Explicit fallible drain for owners that must retain admission after a wait failure.
     pub fn try_shutdown(&self) -> Result<()> {
@@ -648,6 +721,57 @@ impl DesktopBridge {
             });
         }
         self.0.migration.before_catalog_request(&request)?;
+        if self.0.shared.backup.is_some() {
+            if let Request::Export { request, .. } = &request
+                && self.managed_backup_holds_jobs()?
+                && !request.read_only()
+                && !matches!(
+                    request.as_ref(),
+                    super::exports::Request::Cancel {
+                        operation: Some(_),
+                        ..
+                    } | super::exports::Request::Yield { .. }
+                )
+            {
+                return Err(error(
+                    ErrorCode::Busy,
+                    "catalog jobs are held; finish the backup operation",
+                ));
+            }
+            match request {
+                Request::BackupCreate { catalog, bundle } => {
+                    return self.submit_backup_create(catalog, bundle);
+                }
+                Request::BackupInspect { bundle } => {
+                    return self
+                        .start_managed_backup(super::backup::Request::Inspect { bundle }, None);
+                }
+                Request::BackupRestore {
+                    bundle,
+                    destination,
+                } => {
+                    return self.start_managed_backup(
+                        super::backup::Request::Restore {
+                            bundle,
+                            destination,
+                        },
+                        None,
+                    );
+                }
+                Request::BackupStatus => return self.managed_backup_status(None),
+                Request::BackupCancel { operation } => {
+                    return self.managed_backup_status(Some(operation));
+                }
+                Request::Close { catalog } => return self.submit_managed_close(catalog),
+                Request::Create { .. } | Request::OpenExisting { .. } => {
+                    self.require_managed_backup_idle()?;
+                }
+                _ => {}
+            }
+        }
+        self.submit_catalog(request)
+    }
+    fn submit_catalog(&self, request: Request) -> Result<Pending> {
         if local_route(&request) {
             return self.0.local.submit(request);
         }
@@ -670,6 +794,261 @@ impl DesktopBridge {
             control,
             retiring,
         )?;
+        Ok(Pending { receiver, cancel })
+    }
+    fn backup_owner(&self) -> Result<&Arc<Mutex<super::backup::Coordinator>>> {
+        self.0.shared.backup.as_ref().ok_or_else(|| {
+            error(
+                ErrorCode::InvalidRequest,
+                "managed backup owner is unavailable",
+            )
+        })
+    }
+    fn backup_reply(&self, snapshot: Option<super::backup::Snapshot>) -> Reply {
+        let reply = Reply::Ok {
+            value: super::Response::Backup(snapshot),
+        };
+        match serde_json::to_vec(&reply) {
+            Ok(bytes) if bytes.len() <= self.0.shared.limits.reply_bytes => reply,
+            _ => failure(ErrorCode::ResourceLimit, "response byte limit"),
+        }
+    }
+    fn start_managed_backup(
+        &self,
+        request: super::backup::Request,
+        catalog_epoch: Option<u64>,
+    ) -> Result<Pending> {
+        let mut owner = self.backup_owner()?.try_lock().map_err(|_| {
+            error(
+                ErrorCode::Busy,
+                "backup control is busy closing; retry shortly",
+            )
+        })?;
+        let state = self.0.shared.state.lock().unwrap();
+        if !state.ready
+            || state.stopping
+            || state.catalog_retiring
+            || catalog_epoch.is_some_and(|epoch| epoch != state.catalog_epoch)
+        {
+            return Err(error(
+                ErrorCode::Closed,
+                "desktop catalog retirement blocks backup admission",
+            ));
+        }
+        let snapshot = owner.start(request).map_err(super::native)?;
+        drop(owner);
+        drop(state);
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let _ = tx.send(self.backup_reply(Some(snapshot)));
+        Ok(Pending {
+            receiver,
+            cancel: Cancellation::default(),
+        })
+    }
+    fn managed_backup_status(&self, cancel: Option<String>) -> Result<Pending> {
+        let mut owner = self.backup_owner()?.try_lock().map_err(|_| {
+            error(
+                ErrorCode::Busy,
+                "backup control is busy closing; retry shortly",
+            )
+        })?;
+        let snapshot = match cancel {
+            Some(operation) => Some(owner.cancel(&operation).map_err(super::native)?),
+            None => owner.status().map_err(super::native)?,
+        };
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let _ = tx.send(self.backup_reply(snapshot));
+        Ok(Pending {
+            receiver,
+            cancel: Cancellation::default(),
+        })
+    }
+    fn managed_backup_holds_jobs(&self) -> Result<bool> {
+        let mut owner = self.backup_owner()?.try_lock().map_err(|_| {
+            error(
+                ErrorCode::Busy,
+                "backup control is busy closing; retry shortly",
+            )
+        })?;
+        let active = owner
+            .status()
+            .map_err(super::native)?
+            .is_some_and(|snapshot| {
+                matches!(
+                    snapshot.state,
+                    super::backup::State::Running | super::backup::State::CancelRequested
+                )
+            });
+        Ok(active || self.0.shared.state.lock().unwrap().backup_admitting)
+    }
+    fn require_managed_backup_idle(&self) -> Result<()> {
+        let mut owner = self.backup_owner()?.try_lock().map_err(|_| {
+            error(
+                ErrorCode::Busy,
+                "backup control is busy closing; retry shortly",
+            )
+        })?;
+        owner
+            .require_idle_for_catalog_admission()
+            .map_err(super::native)
+    }
+    fn enqueue_backup_admission(&self, catalog: String) -> Result<backup::Pending> {
+        let request = backup::AdmissionRequest { catalog };
+        let bytes = serde_json::to_vec(&request)
+            .map_err(|e| error(ErrorCode::InvalidRequest, e.to_string()))?;
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let cancel = self.enqueue(
+            Kind::BackupAdmission,
+            bytes,
+            Delivery::BackupAdmission(tx),
+            false,
+            None,
+        )?;
+        Ok(backup::Pending { receiver, cancel })
+    }
+    fn submit_backup_create(&self, catalog: String, bundle: NativePath) -> Result<Pending> {
+        let catalog_epoch = {
+            let mut state = self.0.shared.state.lock().unwrap();
+            if !state.ready || state.stopping || state.catalog_retiring {
+                return Err(error(ErrorCode::Closed, "desktop owner unavailable"));
+            }
+            if state.backup_admitting {
+                return Err(error(
+                    ErrorCode::Busy,
+                    "backup admission is already pending",
+                ));
+            }
+            state.backup_admitting = true;
+            state.catalog_epoch
+        };
+        let admission = self.enqueue_backup_admission(catalog).map_err(|error| {
+            let mut state = self.0.shared.state.lock().unwrap();
+            if state.catalog_epoch == catalog_epoch {
+                state.backup_admitting = false;
+            }
+            error
+        })?;
+        let cancel = admission.cancel.clone();
+        let execution_cancel = cancel.clone();
+        let bridge = self.clone();
+        let shared = self.0.shared.clone();
+        let (tx, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("desktop-backup-admission".into())
+            .spawn(move || {
+                let reply = match admission.receiver.recv() {
+                    Ok(backup::AdmissionReply::Ok(admission))
+                        if !execution_cancel.is_canceled() =>
+                    {
+                        bridge
+                            .start_managed_backup(
+                                super::backup::Request::Create {
+                                    source: admission.source,
+                                    bundle,
+                                    expected_source: Some(admission.expected_source),
+                                },
+                                Some(catalog_epoch),
+                            )
+                            .map(Pending::recv)
+                            .unwrap_or_else(|error| Reply::Error { error })
+                    }
+                    Ok(backup::AdmissionReply::Ok(_)) => {
+                        failure(ErrorCode::Canceled, "backup canceled before G admission")
+                    }
+                    Ok(backup::AdmissionReply::Error(error)) => Reply::Error { error },
+                    Err(_) => failure(ErrorCode::Closed, "backup admission actor disconnected"),
+                };
+                let mut state = shared.state.lock().unwrap();
+                if state.catalog_epoch == catalog_epoch {
+                    state.backup_admitting = false;
+                }
+                drop(state);
+                shared.wake.notify_all();
+                let _ = tx.send(reply);
+            })
+            .map_err(|e| {
+                let mut state = self.0.shared.state.lock().unwrap();
+                if state.catalog_epoch == catalog_epoch {
+                    state.backup_admitting = false;
+                }
+                error(ErrorCode::Native, e.to_string())
+            })?;
+        Ok(Pending { receiver, cancel })
+    }
+    fn submit_managed_close(&self, catalog: String) -> Result<Pending> {
+        let backup = self.backup_owner()?.clone();
+        {
+            let mut backup = backup.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.0.shared.state.lock().unwrap();
+            if !state.ready || state.stopping {
+                return Err(error(ErrorCode::Closed, "desktop owner unavailable"));
+            }
+            if state.catalog_retiring {
+                return Err(error(
+                    ErrorCode::Busy,
+                    "catalog retirement is already pending",
+                ));
+            }
+            let next_epoch = state.catalog_epoch.checked_add(1).ok_or_else(|| {
+                error(
+                    ErrorCode::ResourceLimit,
+                    "catalog backup admission epoch exhausted",
+                )
+            })?;
+            state.catalog_retiring = true;
+            state.catalog_epoch = next_epoch;
+            state.backup_admitting = false;
+            backup.signal_shutdown();
+        }
+        let bridge = self.clone();
+        let shared = self.0.shared.clone();
+        let (tx, receiver) = mpsc::sync_channel(1);
+        let cancel_slot = Arc::new(Mutex::new(None::<Cancellation>));
+        let cancel_target = Arc::downgrade(&cancel_slot);
+        let cancel = Cancellation(
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(move || {
+                if let Some(slot) = cancel_target.upgrade()
+                    && let Some(cancel) = slot.lock().unwrap().as_ref()
+                {
+                    cancel.cancel();
+                }
+            })),
+        );
+        let execution_cancel = cancel.clone();
+        thread::Builder::new()
+            .name("desktop-backup-close".into())
+            .spawn(move || {
+                let drained = backup
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shutdown()
+                    .map_err(super::native);
+                let reply = match drained {
+                    Err(error) => Reply::Error { error },
+                    Ok(_) if execution_cancel.is_canceled() => {
+                        failure(ErrorCode::Canceled, "Close canceled after backup drain")
+                    }
+                    Ok(_) => match bridge.submit_catalog(Request::Close { catalog }) {
+                        Err(error) => Reply::Error { error },
+                        Ok(pending) => {
+                            let inner_cancel = pending.cancellation();
+                            *cancel_slot.lock().unwrap() = Some(inner_cancel.clone());
+                            if execution_cancel.is_canceled() {
+                                inner_cancel.cancel();
+                            }
+                            pending.recv()
+                        }
+                    },
+                };
+                shared.state.lock().unwrap().catalog_retiring = false;
+                shared.wake.notify_all();
+                let _ = tx.send(reply);
+            })
+            .map_err(|e| {
+                self.0.shared.state.lock().unwrap().catalog_retiring = false;
+                error(ErrorCode::Native, e.to_string())
+            })?;
         Ok(Pending { receiver, cancel })
     }
     pub fn preview_bytes(

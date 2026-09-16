@@ -143,6 +143,8 @@ pub struct Coordinator {
     backend: Backend,
     latest: Option<Snapshot>,
     active: Option<Active>,
+    #[cfg(test)]
+    process_probe: Option<Arc<dyn Fn(core::managed::ProcessEvent) + Send + Sync>>,
 }
 enum Backend {
     Legacy,
@@ -156,6 +158,8 @@ impl Coordinator {
             backend: Backend::Legacy,
             latest: None,
             active: None,
+            #[cfg(test)]
+            process_probe: None,
         })
     }
     pub(crate) fn new_managed(limits: core::Limits, executable: PathBuf) -> Result<Self> {
@@ -169,6 +173,8 @@ impl Coordinator {
             backend: Backend::Managed(executable),
             latest: None,
             active: None,
+            #[cfg(test)]
+            process_probe: None,
         })
     }
     pub fn start(&mut self, request: Request) -> Result<Snapshot> {
@@ -197,6 +203,8 @@ impl Coordinator {
             Backend::Legacy => None,
             Backend::Managed(executable) => Some((executable.clone(), prepared.managed()?)),
         };
+        #[cfg(test)]
+        let process_probe = self.process_probe.clone();
         let worker = thread::Builder::new()
             .name("catalog-backup".into())
             .spawn(move || {
@@ -210,19 +218,48 @@ impl Coordinator {
                     Ok(())
                 };
                 match managed {
-                    Some((executable, request)) => core::managed::run_process(
-                        &executable,
-                        worker_operation,
-                        request,
-                        limits,
-                        &worker_cancel,
-                        &mut callback,
-                    )
-                    .map(|receipt| match receipt {
-                        core::managed::Receipt::Backup(value) => Receipt::Backup(value.into()),
-                        core::managed::Receipt::Restore(value) => Receipt::Restore(value.into()),
-                    })
-                    .map_err(failure),
+                    Some((executable, request)) => {
+                        #[cfg(test)]
+                        let result = match process_probe {
+                            Some(probe) => core::managed::run_process_with_probe(
+                                &executable,
+                                worker_operation,
+                                request,
+                                limits,
+                                &worker_cancel,
+                                &mut callback,
+                                core::managed::ProcessTestFault::None,
+                                move |event| probe(event),
+                            ),
+                            None => core::managed::run_process(
+                                &executable,
+                                worker_operation,
+                                request,
+                                limits,
+                                &worker_cancel,
+                                &mut callback,
+                            ),
+                        };
+                        #[cfg(not(test))]
+                        let result = core::managed::run_process(
+                            &executable,
+                            worker_operation,
+                            request,
+                            limits,
+                            &worker_cancel,
+                            &mut callback,
+                        );
+                        result
+                            .map(|receipt| match receipt {
+                                core::managed::Receipt::Backup(value) => {
+                                    Receipt::Backup(value.into())
+                                }
+                                core::managed::Receipt::Restore(value) => {
+                                    Receipt::Restore(value.into())
+                                }
+                            })
+                            .map_err(failure)
+                    }
                     None => prepared
                         .run(&limits, &worker_cancel, callback)
                         .map_err(failure),
@@ -282,6 +319,12 @@ impl Coordinator {
         Ok(self.latest.clone())
     }
     pub fn shutdown(&mut self) -> Result<Option<Snapshot>> {
+        self.signal_shutdown();
+        self.join()
+    }
+    /// Signal without joining so an outer owner can cancel all independent
+    /// descendants before it begins any potentially blocking checked drain.
+    pub(crate) fn signal_shutdown(&mut self) {
         if let Some(active) = &self.active {
             active.cancel.cancel();
             if let Some(snapshot) = &mut self.latest {
@@ -289,7 +332,13 @@ impl Coordinator {
                 snapshot.state = State::CancelRequested;
             }
         }
-        self.join()
+    }
+    #[cfg(test)]
+    pub(crate) fn set_process_probe(
+        &mut self,
+        probe: Arc<dyn Fn(core::managed::ProcessEvent) + Send + Sync>,
+    ) {
+        self.process_probe = Some(probe);
     }
     fn read_progress(&mut self) -> Result<()> {
         if let (Some(active), Some(snapshot)) = (&self.active, &mut self.latest) {

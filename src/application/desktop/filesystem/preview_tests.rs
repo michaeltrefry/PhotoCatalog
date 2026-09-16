@@ -499,6 +499,396 @@ fn fixture() -> Result<(Arc<tempfile::TempDir>, PathBuf, PathBuf, VariantKey, St
     drop(catalog);
     Ok((temp, root, originals, key, checksum))
 }
+
+#[cfg(unix)]
+#[derive(Default)]
+struct BackupProcessProbe {
+    state: Mutex<(Vec<crate::catalog_backup::managed::ProcessEvent>, bool)>,
+    wake: std::sync::Condvar,
+}
+#[cfg(unix)]
+impl BackupProcessProbe {
+    fn observe(&self, event: crate::catalog_backup::managed::ProcessEvent) {
+        let mut state = self.state.lock().unwrap();
+        state.0.push(event);
+        self.wake.notify_all();
+        if matches!(
+            event,
+            crate::catalog_backup::managed::ProcessEvent::Spawned { .. }
+        ) {
+            while state.1 {
+                state = self.wake.wait(state).unwrap();
+            }
+        }
+    }
+    fn pause(&self) {
+        self.state.lock().unwrap().1 = true;
+    }
+    fn spawned(&self) -> Result<(u32, u32)> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(pids) = state.0.iter().find_map(|event| match event {
+                crate::catalog_backup::managed::ProcessEvent::Spawned { backup, filesystem } => {
+                    Some((*backup, *filesystem))
+                }
+                _ => None,
+            }) {
+                return Ok(pids);
+            }
+            let now = Instant::now();
+            ensure!(now < deadline, "managed backup process spawn timeout");
+            state = self.wake.wait_timeout(state, deadline - now).unwrap().0;
+        }
+    }
+    fn release(&self) {
+        self.state.lock().unwrap().1 = false;
+        self.wake.notify_all();
+    }
+    fn reaped(&self, backup: u32, filesystem: u32) -> bool {
+        let state = self.state.lock().unwrap();
+        state
+            .0
+            .contains(&crate::catalog_backup::managed::ProcessEvent::BackupReaped { backup })
+            && state.0.contains(
+                &crate::catalog_backup::managed::ProcessEvent::FilesystemReaped { filesystem },
+            )
+    }
+}
+
+#[cfg(unix)]
+fn process_parent(pid: u32) -> Result<u32> {
+    let pid_text = pid.to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", pid_text.as_str()])
+        .output()?;
+    ensure!(output.status.success(), "ps failed for process {pid}");
+    Ok(std::str::from_utf8(&output.stdout)?.trim().parse()?)
+}
+
+#[cfg(unix)]
+fn backup_snapshot(bridge: &DesktopBridge) -> Result<Option<crate::application::backup::Snapshot>> {
+    let Response::Backup(snapshot) = command(bridge, Request::BackupStatus)? else {
+        anyhow::bail!("wrong backup status reply")
+    };
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn wait_backup_terminal(bridge: &DesktopBridge) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if backup_snapshot(bridge)?.is_some_and(|snapshot| {
+            matches!(
+                snapshot.state,
+                crate::application::backup::State::Complete
+                    | crate::application::backup::State::Failed
+            )
+        }) {
+            return Ok(());
+        }
+        ensure!(Instant::now() < deadline, "managed backup terminal timeout");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_g_owns_backup_siblings_and_close_waits_for_checked_drain() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (mut running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let probe = Arc::new(BackupProcessProbe::default());
+    probe.pause();
+    let observer = probe.clone();
+    running
+        .bridge
+        .set_backup_process_probe(Arc::new(move |event| observer.observe(event)))?;
+    let bundle = temporary.path().join("close-backup");
+    let Response::Backup(Some(started)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token.clone(),
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    let (backup_pid, filesystem_pid) = probe.spawned()?;
+    ensure!(
+        process_parent(backup_pid)? == std::process::id(),
+        "B is not a direct G child"
+    );
+    ensure!(
+        process_parent(filesystem_pid)? == std::process::id(),
+        "backup F is not a direct G child"
+    );
+    ensure!(
+        command(
+            &running.bridge,
+            Request::Export {
+                catalog: token.clone(),
+                request: Box::new(crate::application::exports::Request::Begin),
+            },
+        )
+        .is_err(),
+        "G admitted a new export job while backup custody was live"
+    );
+    let close = running.bridge.submit(Request::Close {
+        catalog: token.clone(),
+    })?;
+    ensure!(
+        close
+            .receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "Close acknowledged before the paused B/F drain"
+    );
+    probe.release();
+    match close.receiver.recv_timeout(Duration::from_secs(30))? {
+        Reply::Ok {
+            value: Response::Status(status),
+        } => ensure!(status.catalog.is_none(), "Close retained catalog token"),
+        Reply::Error { error } => return Err(error.into()),
+        _ => anyhow::bail!("wrong Close reply"),
+    }
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        probe.reaped(backup_pid, filesystem_pid),
+        "Close returned before checked B/F reap"
+    );
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.operation == started.operation && snapshot.cancellation_requested
+        }),
+        "Close did not preserve the canceled operation identity"
+    );
+    running.token = None;
+    running.cleanup()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_c_death_cancels_and_reaps_g_owned_backup_siblings() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (mut running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let probe = Arc::new(BackupProcessProbe::default());
+    probe.pause();
+    let observer = probe.clone();
+    running
+        .bridge
+        .set_backup_process_probe(Arc::new(move |event| observer.observe(event)))?;
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token,
+            bundle: NativePath::from_path(&temporary.path().join("c-death-backup")),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    let (backup_pid, filesystem_pid) = probe.spawned()?;
+    let c_pid = running.bridge.status().pid;
+    ensure!(
+        unsafe { libc::kill(c_pid as libc::pid_t, libc::SIGKILL) } == 0,
+        "kill C"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        running.bridge.status().phase,
+        super::super::TransportPhase::Failed | super::super::TransportPhase::Draining
+    ) {
+        ensure!(Instant::now() < deadline, "C death was not observed by G");
+        thread::sleep(Duration::from_millis(5));
+    }
+    probe.release();
+    wait_backup_terminal(&running.bridge)?;
+    running.token = None;
+    running.cleanup()?;
+    ensure!(
+        probe.reaped(backup_pid, filesystem_pid),
+        "C death cleanup returned before checked B/F reap"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_public_backup_cancel_reaps_both_g_children_before_terminal_status() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (mut running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let probe = Arc::new(BackupProcessProbe::default());
+    probe.pause();
+    let observer = probe.clone();
+    running
+        .bridge
+        .set_backup_process_probe(Arc::new(move |event| observer.observe(event)))?;
+    let Response::Backup(Some(started)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token.clone(),
+            bundle: NativePath::from_path(&temporary.path().join("cancel-backup")),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    let (backup_pid, filesystem_pid) = probe.spawned()?;
+    let Response::Backup(Some(canceling)) = command(
+        &running.bridge,
+        Request::BackupCancel {
+            operation: started.operation.clone(),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup cancel reply")
+    };
+    ensure!(
+        canceling.cancellation_requested
+            && canceling.state == crate::application::backup::State::CancelRequested,
+        "public cancel did not retain the running operation"
+    );
+    probe.release();
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        probe.reaped(backup_pid, filesystem_pid),
+        "terminal cancel status preceded checked B/F reap"
+    );
+    running.finish(token)
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_global_inspect_and_restore_remain_legal_after_catalog_close() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (mut running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let bundle = temporary.path().join("closed-inspection");
+    let rejected = temporary.path().join("stale-token");
+    ensure!(
+        command(
+            &running.bridge,
+            Request::BackupCreate {
+                catalog: "stale-catalog-token".into(),
+                bundle: NativePath::from_path(&rejected),
+            },
+        )
+        .is_err(),
+        "C admitted a stale catalog token for backup"
+    );
+    ensure!(
+        !rejected.exists(),
+        "stale token reached G backup process creation"
+    );
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token.clone(),
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.state == crate::application::backup::State::Complete
+                && matches!(
+                    snapshot.receipt,
+                    Some(crate::application::backup::Receipt::Backup(_))
+                )
+        }),
+        "managed create did not publish a backup receipt"
+    );
+    let Response::Status(closed) = command(
+        &running.bridge,
+        Request::Close {
+            catalog: token.clone(),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong Close reply")
+    };
+    ensure!(closed.catalog.is_none(), "catalog remained open");
+    running.token = None;
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupInspect {
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong inspect start reply")
+    };
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.state == crate::application::backup::State::Complete
+                && matches!(
+                    snapshot.receipt,
+                    Some(crate::application::backup::Receipt::Backup(_))
+                )
+        }),
+        "managed inspect did not retain its receipt"
+    );
+    let destination = temporary.path().join("restored");
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupRestore {
+            bundle: NativePath::from_path(&bundle),
+            destination: NativePath::from_path(&destination),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong restore start reply")
+    };
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.state == crate::application::backup::State::Complete
+                && matches!(
+                    snapshot.receipt,
+                    Some(crate::application::backup::Receipt::Restore(_))
+                )
+        }),
+        "managed restore did not retain its receipt"
+    );
+    let restored = crate::Catalog::open(&destination)?;
+    ensure!(
+        restored
+            .restore_status()?
+            .is_some_and(|status| status.jobs_held),
+        "restored catalog lost its external-job hold"
+    );
+    drop(restored);
+    running.cleanup()
+}
 #[test]
 #[ignore = "requires explicitly configured built CLI; actual C/G/F/N fixture"]
 fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {

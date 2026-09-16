@@ -670,6 +670,7 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
                 | Kind::DrainError
                 | Kind::Drained
                 | Kind::MigrationReply
+                | Kind::BackupAdmissionReply
         ) {
             return Err(wire::invalid("unexpected control frame"));
         }
@@ -736,6 +737,16 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
         } else {
             None
         };
+        let decoded_backup = if kind == Kind::BackupAdmissionReply {
+            let reply = serde_json::from_slice::<super::backup::AdmissionReply>(&bytes)
+                .map_err(|_| wire::invalid("invalid backup admission reply"))?;
+            reply
+                .validate()
+                .map_err(|_| wire::invalid("backup admission reply field bounds"))?;
+            Some(reply)
+        } else {
+            None
+        };
         let decoded_error = if kind == Kind::BytesError {
             Some(
                 serde_json::from_slice::<BridgeError>(&bytes)
@@ -760,6 +771,15 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
                 "migration success reply exceeds configured allowance",
             ));
         }
+        if bytes.len() > shared.limits.reply_bytes
+            && decoded_backup
+                .as_ref()
+                .is_some_and(|reply| matches!(reply, super::backup::AdmissionReply::Ok(_)))
+        {
+            return Err(wire::invalid(
+                "backup admission success reply exceeds configured allowance",
+            ));
+        }
         let entry = {
             let mut state = shared.state.lock().unwrap();
             let pending = state
@@ -771,12 +791,16 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
                 (Kind::Reply, Delivery::Command(_))
                     | (Kind::BytesError, Delivery::Bytes { .. })
                     | (Kind::MigrationReply, Delivery::Migration(_))
+                    | (Kind::BackupAdmissionReply, Delivery::BackupAdmission(_))
             ) {
                 return Err(wire::invalid("reply kind does not match request"));
             }
             state.pending.remove(&id).unwrap()
         };
         match (kind, entry.delivery) {
+            (Kind::BackupAdmissionReply, Delivery::BackupAdmission(tx)) => {
+                let _ = tx.send(decoded_backup.unwrap());
+            }
             (Kind::MigrationReply, Delivery::Migration(tx)) => {
                 let _ = tx.send(decoded_migration.unwrap());
             }
@@ -931,6 +955,7 @@ fn parent_binary(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
 }
 
 enum ChildPending {
+    BackupAdmission(super::backup::Pending),
     Migration(super::lightroom_migration::Pending),
     Command(Pending),
     Bytes(PendingBytes, BytesRequest),
@@ -1101,6 +1126,8 @@ fn checked_message(kind: Kind, id: u64, value: &impl serde::Serialize, limit: us
         let e = error(ErrorCode::ResourceLimit, "desktop reply byte limit");
         let bytes = if kind == Kind::Reply {
             serde_json::to_vec(&Reply::Error { error: e }).unwrap()
+        } else if kind == Kind::BackupAdmissionReply {
+            serde_json::to_vec(&super::backup::AdmissionReply::error(e)).unwrap()
         } else {
             serde_json::to_vec(&e).unwrap()
         };
@@ -1119,6 +1146,27 @@ fn collect(
     for id in ids {
         let p = state.pending.remove(&id).unwrap();
         let ready = match p {
+            ChildPending::BackupAdmission(p) => match p.receiver.try_recv() {
+                Ok(reply) => ChildPending::Reply(checked_message(
+                    Kind::BackupAdmissionReply,
+                    id,
+                    &reply,
+                    limit,
+                )),
+                Err(mpsc::TryRecvError::Empty) => {
+                    state.pending.insert(id, ChildPending::BackupAdmission(p));
+                    continue;
+                }
+                Err(_) => ChildPending::Reply(checked_message(
+                    Kind::BackupAdmissionReply,
+                    id,
+                    &super::backup::AdmissionReply::error(error(
+                        ErrorCode::Closed,
+                        "backup admission actor disconnected",
+                    )),
+                    limit,
+                )),
+            },
             ChildPending::Migration(p) => match p.receiver.try_recv() {
                 Ok(reply) => ChildPending::Reply(reply.message(id, limit)),
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1420,7 +1468,7 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
             session,
             &mut |kind, bytes| {
                 if proxy.is_some()
-                    && kind != Kind::MigrationAdmission
+                    && !matches!(kind, Kind::MigrationAdmission | Kind::BackupAdmission)
                     && !paired_preview_route(kind, bytes)?
                 {
                     return Ok(Err(error(
@@ -1493,6 +1541,13 @@ fn paired_preview_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
     ))
 }
 fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<ChildPending>> {
+    if kind == Kind::BackupAdmission {
+        let request: super::backup::AdmissionRequest = serde_json::from_slice(bytes)?;
+        request.validate()?;
+        return Ok(bridge
+            .backup_admission(request)
+            .map(ChildPending::BackupAdmission));
+    }
     if kind == Kind::MigrationAdmission {
         return Ok(bridge
             .migration_admission(serde_json::from_slice(bytes)?)
@@ -1609,7 +1664,7 @@ fn child_input_relay(
         anyhow::ensure!(
             matches!(
                 f.kind,
-                Kind::Command | Kind::Bytes | Kind::MigrationAdmission
+                Kind::Command | Kind::Bytes | Kind::MigrationAdmission | Kind::BackupAdmission
             ),
             "unexpected request kind"
         );
@@ -1698,6 +1753,7 @@ fn child_input_relay(
         match admitted {
             Ok(p) => {
                 let c = match &p {
+                    ChildPending::BackupAdmission(p) => p.cancel.clone(),
                     ChildPending::Migration(p) => p.cancel.clone(),
                     ChildPending::Command(p) => p.cancellation(),
                     ChildPending::Bytes(p, _) => p.cancellation(),
@@ -1712,6 +1768,13 @@ fn child_input_relay(
                     // Dispatch either never entered the actor or failed to
                     // enqueue. No action has executed on this refusal path.
                     super::lightroom_migration::Reply::Refused(e).message(id, limits.reply_bytes)
+                } else if kind == Kind::BackupAdmission {
+                    checked_message(
+                        Kind::BackupAdmissionReply,
+                        id,
+                        &super::backup::AdmissionReply::error(e),
+                        limits.reply_bytes,
+                    )
                 } else if kind == Kind::Command {
                     checked_message(
                         Kind::Reply,
