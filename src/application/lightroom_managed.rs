@@ -205,16 +205,13 @@ impl SourceRouter {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .finish();
-        let recorded = self
-            .failure
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        match (recorded, pump_failure, broker) {
-            (None, None, Ok(())) => Ok(()),
-            (Some(error), _, _) => anyhow::bail!("Workbench Source owner failed: {error}"),
-            (None, Some(error), _) => Err(error),
-            (None, None, Err(error)) => Err(error),
+        // `failure` records why admission was permanently revoked. It is not
+        // itself a failure to retire the already-revoked Source owner. Checked
+        // drain succeeds once both concrete owners have joined successfully.
+        match (pump_failure, broker) {
+            (None, Ok(())) => Ok(()),
+            (Some(error), _) => Err(error),
+            (None, Err(error)) => Err(error),
         }
     }
 }
