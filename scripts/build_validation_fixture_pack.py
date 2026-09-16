@@ -228,7 +228,7 @@ CREATE TABLE Adobe_libraryImageDevelopSnapshot(id_local INTEGER PRIMARY KEY,id_g
 CREATE TABLE Adobe_AdditionalMetadata(id_local INTEGER PRIMARY KEY,image INTEGER,xmp BLOB);
 CREATE TABLE AgLibraryKeyword(id_local INTEGER PRIMARY KEY,id_global TEXT,name TEXT,parent INTEGER);
 CREATE TABLE AgLibraryKeywordImage(id_local INTEGER PRIMARY KEY,image INTEGER,tag INTEGER);
-CREATE TABLE AgLibraryCollection(id_local INTEGER PRIMARY KEY,name TEXT,parent INTEGER);
+CREATE TABLE AgLibraryCollection(id_local INTEGER PRIMARY KEY,name TEXT,parent INTEGER,creationId TEXT);
 CREATE TABLE AgLibraryCollectionImage(id_local INTEGER PRIMARY KEY,image INTEGER,collection INTEGER,positionInCollection TEXT);
 CREATE TABLE Opaque(k INTEGER PRIMARY KEY,n,b,t,r);
 CREATE VIEW Unexecuted AS SELECT load_extension('never-run');
@@ -319,8 +319,13 @@ def create_lightroom_catalog(
         membership = 0
         for index in range(1, collection_count + 1):
             db.execute(
-                "INSERT INTO AgLibraryCollection VALUES(?,?,?)",
-                (index, f"collection-{family}-{index}", None),
+                "INSERT INTO AgLibraryCollection VALUES(?,?,?,?)",
+                (
+                    index,
+                    f"collection-{family}-{index}",
+                    None,
+                    "com.adobe.ag.library.collection",
+                ),
             )
             for image in range(1, min(image_count, 2) + 1):
                 membership += 1

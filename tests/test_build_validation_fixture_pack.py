@@ -55,7 +55,17 @@ class ValidationFixtureBuilderTests(unittest.TestCase):
                 }
                 packet = db.execute("SELECT xmp FROM Adobe_AdditionalMetadata ORDER BY id_local LIMIT 1").fetchone()[0]
                 root_binding = db.execute("SELECT absolutePath FROM AgLibraryRootFolder").fetchone()[0]
+                collection_types = db.execute(
+                    "SELECT creationId FROM AgLibraryCollection ORDER BY id_local"
+                ).fetchall()
             self.assertEqual(observed, {"files": 2, "images": 3, "collections": 2, "xmp": 2})
+            self.assertEqual(
+                collection_types,
+                [
+                    ("com.adobe.ag.library.collection",),
+                    ("com.adobe.ag.library.collection",),
+                ],
+            )
             self.assertEqual(root_binding, builder.PORTABLE_ROOT_BINDING)
             length = int.from_bytes(packet[:4], "big")
             self.assertEqual(len(__import__("zlib").decompress(packet[4:])), length)
