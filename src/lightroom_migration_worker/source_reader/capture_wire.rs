@@ -21,6 +21,7 @@ pub const MAX_CHUNK_BYTES: usize = super::transport::CHUNK_BYTES;
 pub struct FileRevision {
     pub object: String,
     pub bytes: u64,
+    #[serde(with = "option_u128_decimal")]
     pub modified_ns: Option<u128>,
     pub changed: String,
 }
@@ -396,5 +397,47 @@ mod option_hex_bytes {
         Option::<String>::deserialize(d)?
             .map(|v| super::hex_bytes::decode(&v).map_err(serde::de::Error::custom))
             .transpose()
+    }
+}
+
+mod option_u128_decimal {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<u128>, s: S) -> Result<S::Ok, S::Error> {
+        value.map(|value| value.to_string()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|value| {
+                let parsed = value.parse::<u128>().map_err(serde::de::Error::custom)?;
+                if parsed.to_string() != value {
+                    return Err(serde::de::Error::custom(
+                        "canonical unsigned decimal required",
+                    ));
+                }
+                Ok(parsed)
+            })
+            .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileRevision;
+
+    #[test]
+    fn file_revision_preserves_complete_u128_timestamp_range() {
+        for modified_ns in [None, Some(0), Some(u64::MAX as u128), Some(u128::MAX)] {
+            let revision = FileRevision {
+                object: "object".into(),
+                bytes: u64::MAX,
+                modified_ns,
+                changed: "changed".into(),
+            };
+            let encoded = serde_json::to_vec(&revision).unwrap();
+            let decoded: FileRevision = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, revision);
+        }
     }
 }
