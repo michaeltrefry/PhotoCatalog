@@ -4,7 +4,14 @@
 //! treats retained Adobe instructions as executable recipes. The caller owns the
 //! seal and the exclusion of other writers for the entire adapter lifetime.
 
+mod access;
+pub(crate) mod buffered_json;
+pub(crate) mod manifest_json;
 mod reader;
+pub(crate) mod record_json;
+pub(crate) mod seal_json;
+pub(crate) use access::MigrationRead;
+pub(crate) use reader::IMAGE_LINK_LIMITATIONS;
 pub use reader::MigrationSource;
 
 use super::plan::{Cell, RetainedRow};
@@ -98,7 +105,7 @@ impl Default for ReadLimits {
     }
 }
 impl ReadLimits {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         ensure!(
             (1024..=super::PAGE_BYTES).contains(&self.page_bytes),
             "page byte limit"

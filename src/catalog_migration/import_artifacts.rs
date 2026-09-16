@@ -1,19 +1,19 @@
 //! The import worker owns one raw-capture reader at a time. Source admission and
 //! compression happen outside destination writer transactions.
 use super::{
-    artifacts::{ArtifactLimits, ArtifactReader, ArtifactRequest},
+    artifacts::{ArtifactLimits, ArtifactRead, ArtifactRequest},
     importer::{self, Policy, Progress, Stage, Step},
 };
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{
     Catalog,
     lightroom::migration_source::{Collection, MigrationSource},
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::OptionalExtension;
 
 fn request(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     progress: &Progress,
     policy: &Policy,
 ) -> Result<Option<ArtifactRequest>> {
@@ -21,6 +21,11 @@ fn request(
         return Ok(None);
     };
     let manifest = source.capture_manifest(&capture.revision)?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::REQUEST_MANIFEST);
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::request_manifest(crate::capacity_probes::manifest(&manifest));
+
     if progress.artifact_index >= manifest.artifacts.len() {
         return Ok(None);
     }
@@ -50,7 +55,7 @@ fn request(
 }
 pub(crate) fn pending(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     before: &Progress,
     policy: &Policy,
 ) -> Result<Step> {
@@ -71,6 +76,11 @@ pub(crate) fn pending(
         });
     };
     let manifest = source.capture_manifest(&capture.revision)?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::PENDING_MANIFEST,
+        crate::capacity_probes::manifest(&manifest),
+    );
     if before.artifact_index == manifest.artifacts.len() {
         after.capture_index += 1;
         after.artifact_index = 0;
@@ -99,9 +109,11 @@ pub(crate) fn pending(
             )),
         });
     }
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    let _capacity_pending = crate::capacity_probes::phase(crate::capacity_probes::PENDING_MANIFEST);
     let request = request(catalog, source, before, policy)?.context("artifact request absent")?;
-    let found:Option<String>=catalog.db.query_row("SELECT evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2",rusqlite::params![request.retained_capture_record,i64::try_from(request.member_index)?],|r|r.get(0)).optional()?;
-    if found.is_some() {
+    let found:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2)",rusqlite::params![request.retained_capture_record,i64::try_from(request.member_index)?],|r|r.get(0))?;
+    if found {
         let (descriptor, state) =
             catalog.migration_artifact(request.retained_capture_record, request.member_index)?;
         ensure!(
@@ -124,16 +136,55 @@ pub(crate) fn pending(
         needs_decision: None,
     })
 }
+pub(crate) trait ArtifactFactory {
+    fn open(
+        &mut self,
+        catalog: &Catalog,
+        request: ArtifactRequest,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Box<dyn ArtifactRead>>;
+}
+pub(crate) struct LocalArtifacts;
+impl ArtifactFactory for LocalArtifacts {
+    fn open(
+        &mut self,
+        catalog: &Catalog,
+        request: ArtifactRequest,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Box<dyn ArtifactRead>> {
+        Ok(Box::new(
+            catalog.open_migration_artifact(request, limits, stop)?,
+        ))
+    }
+}
 /// Keep this worker alive across steps to hash each captured file once on open.
 /// Dropping it releases source handles; reopening resumes its durable chunks.
 pub struct Worker<'a> {
-    source: &'a MigrationSource,
+    source: &'a dyn MigrationRead,
     run: String,
     limits: ArtifactLimits,
-    artifact: Option<ArtifactReader>,
+    artifact: Option<Box<dyn ArtifactRead + 'a>>,
+    factory: Box<dyn ArtifactFactory + 'a>,
 }
 impl<'a> Worker<'a> {
     pub fn new(source: &'a MigrationSource, run: &str, limits: ArtifactLimits) -> Result<Self> {
+        Self::new_reader(source, run, limits)
+    }
+    pub(crate) fn new_reader(
+        source: &'a dyn MigrationRead,
+        run: &str,
+        limits: ArtifactLimits,
+    ) -> Result<Self> {
+        Self::with_readers(source, run, limits, Box::new(LocalArtifacts))
+    }
+    pub(crate) fn with_readers(
+        source: &'a dyn MigrationRead,
+        run: &str,
+        limits: ArtifactLimits,
+        factory: Box<dyn ArtifactFactory + 'a>,
+    ) -> Result<Self> {
         ensure!(
             run.len() == 64 && run.bytes().all(|v| v.is_ascii_hexdigit()),
             "migration run identity bounds"
@@ -143,12 +194,13 @@ impl<'a> Worker<'a> {
             run: run.into(),
             limits,
             artifact: None,
+            factory,
         })
     }
     pub fn step(&mut self, catalog: &mut Catalog, stop: &dyn Fn() -> bool) -> Result<Step> {
         ensure!(!stop(), "migration stopped before step");
         let before = catalog.selected_import_progress(&self.run)?;
-        let step = catalog.step_selected_import(self.source, &self.run)?;
+        let step = catalog.step_selected_import_reader(self.source, &self.run)?;
         if before.stage != Stage::ArtifactCustody
             || step.progress.stage != Stage::ArtifactCustody
             || step.needs_decision.is_some()
@@ -167,14 +219,14 @@ impl<'a> Worker<'a> {
                 "worker artifact cursor changed"
             );
         } else {
-            self.artifact = Some(catalog.open_migration_artifact(request, self.limits, stop)?);
+            self.artifact = Some(self.factory.open(catalog, request, self.limits, stop)?);
         }
         let reader = self.artifact.as_mut().unwrap();
-        catalog.begin_migration_artifact(reader)?;
-        let state = catalog.step_migration_artifact(reader, stop)?;
+        catalog.begin_migration_artifact_reader(reader.as_mut())?;
+        let state = catalog.step_migration_artifact_reader(reader.as_mut(), stop)?;
         if state.complete {
             self.artifact = None;
-            return catalog.step_selected_import(self.source, &self.run);
+            return catalog.step_selected_import_reader(self.source, &self.run);
         }
         Ok(step)
     }

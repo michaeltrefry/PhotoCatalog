@@ -1,6 +1,4 @@
-#[path = "../src/xmp_rdf.rs"]
-mod xmp_rdf;
-use xmp_rdf::assert_equivalent;
+use super::assert_equivalent;
 
 fn packet(body: &str) -> String {
     format!(
@@ -61,9 +59,9 @@ fn qualification_nested_qualified_fixture_has_a_valid_full_base() {
         "<u:structure rdf:parseType='Resource'><u:child rdf:parseType='Resource'><rdf:value>value</rdf:value><u:flag>yes</u:flag></u:child></u:structure>",
     );
     assert!(assert_equivalent(&invalid, &invalid).is_err());
-    assert!(photocatalog::xmp::parse(invalid.as_bytes()).is_err());
-    let model = photocatalog::xmp::parse(explicit.as_bytes()).unwrap();
-    let serialized = photocatalog::xmp::canonical(&model).unwrap();
+    assert!(crate::xmp::parse(invalid.as_bytes()).is_err());
+    let model = crate::xmp::parse(explicit.as_bytes()).unwrap();
+    let serialized = crate::xmp::canonical(&model).unwrap();
     assert_equivalent(&explicit, &serialized).unwrap();
     let lost_qualifier =
         packet("<u:structure rdf:parseType='Resource'><u:child>value</u:child></u:structure>");

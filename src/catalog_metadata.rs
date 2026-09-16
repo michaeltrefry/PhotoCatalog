@@ -7,13 +7,130 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeSeq};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
+
+use crate::lightroom_migration_worker::memory::{
+    ResourceLimit,
+    layout::{add, mul, tree, vector},
+    requested::{Requested, Scope},
+};
+
+struct JsonCount(usize);
+impl Write for JsonCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn json_bytes(value: &impl Serialize) -> Result<usize> {
+    let mut count = JsonCount(0);
+    serde_json::to_writer(&mut count, value)?;
+    Ok(count.0)
+}
+
+#[derive(Serialize)]
+struct PacketDescriptor<'a> {
+    attributes: &'a BTreeMap<String, String>,
+    container: &'a xmp_packets::Container,
+    group: &'a str,
+    ranges: &'a [xmp_packets::ByteRange],
+}
+#[derive(Serialize)]
+struct ParseDescriptor<'a> {
+    group: &'a str,
+    packet_indices: &'a [usize],
+    transformation: &'a xmp_packets::Transformation,
+}
+struct CombinedIndices<'a> {
+    first: &'a [usize],
+    second: &'a [usize],
+}
+impl Serialize for CombinedIndices<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.first.len() + self.second.len()))?;
+        for index in self.first.iter().chain(self.second) {
+            sequence.serialize_element(index)?;
+        }
+        sequence.end()
+    }
+}
+#[derive(Serialize)]
+struct MergedDescriptor<'a> {
+    derived_from_inputs: [usize; 2],
+    guid: &'a str,
+    packet_indices: CombinedIndices<'a>,
+    transformation: &'static str,
+}
+#[derive(Serialize)]
+struct SourceLocation<'a> {
+    display: &'a str,
+    kind: &'a str,
+    locator: &'a [u8],
+}
+#[derive(Serialize)]
+struct PreparedProvenance<'a> {
+    file_revision: &'a xmp_packets::SourceRevision,
+    source: &'a serde_json::Value,
+    source_location: SourceLocation<'a>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedRevision {
+    file_revision: xmp_packets::SourceRevision,
+}
+#[derive(Serialize)]
+struct CanonicalSourceRevision<'a> {
+    blake3: &'a str,
+    length: u64,
+    modified_unix_ns: Option<u128>,
+}
+struct ModelIdentities<'a>(&'a [PreparedModel]);
+impl Serialize for ModelIdentities<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for model in self.0 {
+            sequence.serialize_element(&(
+                &model.hash,
+                &model.descriptor,
+                &model.projection,
+                &model.error,
+            ))?;
+        }
+        sequence.end()
+    }
+}
+#[derive(Serialize)]
+struct RevisionIdentity<'a> {
+    issues: &'a str,
+    models: ModelIdentities<'a>,
+    packets: &'a [(String, String)],
+    provenance: &'a str,
+    source_revision: CanonicalSourceRevision<'a>,
+    status: &'a str,
+    version: u8,
+}
+struct JsonDigest(blake3::Hasher);
+impl Write for JsonDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 pub(crate) const SCHEMA: &str = "
 ALTER TABLE assets ADD COLUMN render_generation INTEGER NOT NULL DEFAULT 0;
@@ -139,6 +256,22 @@ pub struct FileInstance {
     pub observed_at: String,
 }
 
+/// In-memory prepared edit; fields are private so only validated preparation
+/// can produce this authority. Catalog workers inherit the exact session Arc.
+pub(crate) struct PreparedEdit {
+    catalog_file: std::sync::Arc<crate::catalog_session::CatalogSessionAuthority>,
+    image_identity: crate::catalog_images::ImageMetadataIdentity,
+    expected_revision: i64,
+    base_model: Option<i64>,
+    edits: Vec<Edit>,
+    organization_fields: Vec<String>,
+    source: Source,
+    prepared: Prepared,
+    original: Projection,
+    original_semantics: BTreeMap<String, String>,
+    updated: Projection,
+}
+
 struct PreparedModel {
     hash: String,
     semantics: BTreeMap<String, String>,
@@ -155,8 +288,23 @@ pub(crate) struct Prepared {
     packets: Vec<(String, String)>,
     models: Vec<PreparedModel>,
 }
+pub(crate) struct AdmittedPrepared<'a> {
+    pub(crate) value: Prepared,
+    // Struct fields drop in declaration order, so this outlives value.
+    _scope: Scope<'a>,
+}
 impl Prepared {
     pub(crate) fn new(inspection: &Inspection, source: &Source) -> Result<Self> {
+        let admit = |_| Ok(());
+        let requested = Requested::new(&admit);
+        Ok(Self::new_admitted(inspection, source, &requested)?.value)
+    }
+
+    pub(crate) fn new_admitted<'a>(
+        inspection: &Inspection,
+        source: &Source,
+        requested: &'a Requested<'a>,
+    ) -> Result<AdmittedPrepared<'a>> {
         ensure!(
             inspection.packets.len() <= 1024 && inspection.parse_inputs.len() <= 1024,
             "metadata observation exceeds packet count limit"
@@ -176,13 +324,20 @@ impl Prepared {
                     <= 64 * 1024 * 1024,
             "metadata observation exceeds retained/parse byte limit"
         );
+        let prepared_scope = requested.scope(prepared_storage(inspection, source)?)?;
         let mut value = Self {
             revision: String::new(),
             status: format!("{:?}", inspection.status),
             issues: serde_json::to_string(&inspection.issues)?,
-            provenance: serde_json::to_string(
-                &serde_json::json!({"source":source.provenance,"source_location":{"kind":source.kind,"locator":source.locator,"display":source.display},"file_revision":inspection.revision}),
-            )?,
+            provenance: serde_json::to_string(&PreparedProvenance {
+                file_revision: &inspection.revision,
+                source: &source.provenance,
+                source_location: SourceLocation {
+                    display: &source.display,
+                    kind: &source.kind,
+                    locator: &source.locator,
+                },
+            })?,
             blobs: BTreeMap::new(),
             packets: Vec::new(),
             models: Vec::new(),
@@ -190,7 +345,15 @@ impl Prepared {
         for packet in &inspection.packets {
             let hash = value.blob(&packet.bytes)?;
             ensure!(hash == packet.blake3, "packet digest mismatch");
-            value.packets.push((hash,serde_json::to_string(&serde_json::json!({"container":packet.container,"ranges":packet.ranges,"group":packet.group,"attributes":packet.attributes}))?));
+            value.packets.push((
+                hash,
+                serde_json::to_string(&PacketDescriptor {
+                    attributes: &packet.attributes,
+                    container: &packet.container,
+                    group: &packet.group,
+                    ranges: &packet.ranges,
+                })?,
+            ));
         }
         for input in &inspection.parse_inputs {
             ensure!(
@@ -202,11 +365,26 @@ impl Prepared {
             );
             let hash = value.blob(&input.bytes)?;
             ensure!(hash == input.blake3, "parse input digest mismatch");
-            let (projection, error) = match xmp::project(&input.bytes) {
+            let (projection, error) = match xmp::project_admitted(&input.bytes, requested) {
                 Ok(p) => (p, None),
+                Err(error) if error.downcast_ref::<ResourceLimit>().is_some() => return Err(error),
                 Err(e) => (Projection::default(), Some(format!("{e:#}"))),
             };
-            value.models.push(PreparedModel {semantics:if error.is_none() {xmp::field_semantics(&input.bytes)?} else {BTreeMap::new()},hash,descriptor:serde_json::to_string(&serde_json::json!({"packet_indices":input.packet_indices,"transformation":input.transformation,"group":input.group}))?,projection,error});
+            value.models.push(PreparedModel {
+                semantics: if error.is_none() {
+                    xmp::field_semantics_admitted(&input.bytes, requested)?
+                } else {
+                    BTreeMap::new()
+                },
+                hash,
+                descriptor: serde_json::to_string(&ParseDescriptor {
+                    group: &input.group,
+                    packet_indices: &input.packet_indices,
+                    transformation: &input.transformation,
+                })?,
+                projection,
+                error,
+            });
         }
         // Extended JPEG data is linked by its declared GUID, never by adjacency.
         let mut joined = BTreeSet::new();
@@ -218,8 +396,10 @@ impl Prepared {
             {
                 continue;
             }
-            let Ok(meta) = xmp::parse(&input.bytes) else {
-                continue;
+            let meta = match xmp::parse_admitted(&input.bytes, requested) {
+                Ok(meta) => meta,
+                Err(error) if error.downcast_ref::<ResourceLimit>().is_some() => return Err(error),
+                Err(_) => continue,
             };
             let Some(guid) = meta.property("http://ns.adobe.com/xmp/note/", "HasExtendedXMP")
             else {
@@ -231,31 +411,43 @@ impl Prepared {
                 .next()
                 .context("JPEG main group missing")?;
             let target = format!("{prefix}:extended:{}", guid.value.to_ascii_uppercase());
-            let extensions = inspection
-                .parse_inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    p.group == target
-                        && p.transformation == xmp_packets::Transformation::JpegExtendedReassembled
-                })
-                .collect::<Vec<_>>();
+            let mut extensions = inspection.parse_inputs.iter().enumerate().filter(|(_, p)| {
+                p.group == target
+                    && p.transformation == xmp_packets::Transformation::JpegExtendedReassembled
+            });
+            let extension = extensions.next();
             value.models[index].projection = Projection::default();
-            if extensions.len() != 1 {
+            if extension.is_none() || extensions.next().is_some() {
                 value.models[index].error=Some("JPEG extended XMP association is missing or ambiguous; original main packet retained".into());
                 continue;
             }
-            let (extension_index, extension) = extensions[0];
+            let (extension_index, extension) = extension.unwrap();
             joined.insert(extension_index);
-            match xmp::merge_jpeg(&input.bytes, &extension.bytes) {
-                Ok(bytes) => {
-                    let hash = value.blob(&bytes)?;
-                    value.models.push(PreparedModel{semantics:xmp::field_semantics(&bytes)?,hash,descriptor:serde_json::to_string(&serde_json::json!({"transformation":"JpegMainAndExtendedMerged","derived_from_inputs":[index,extension_index],"packet_indices":input.packet_indices.iter().chain(extension.packet_indices.iter()).collect::<Vec<_>>(),"guid":guid.value}))?,projection:xmp::project(&bytes)?,error:None});
+            match xmp::merge_jpeg_admitted(&input.bytes, &extension.bytes, requested) {
+                Ok(merged) => {
+                    let bytes = &merged.0;
+                    let hash = value.blob(bytes)?;
+                    value.models.push(PreparedModel {
+                        semantics: xmp::field_semantics_admitted(bytes, requested)?,
+                        hash,
+                        descriptor: serde_json::to_string(&MergedDescriptor {
+                            derived_from_inputs: [index, extension_index],
+                            guid: &guid.value,
+                            packet_indices: CombinedIndices {
+                                first: &input.packet_indices,
+                                second: &extension.packet_indices,
+                            },
+                            transformation: "JpegMainAndExtendedMerged",
+                        })?,
+                        projection: xmp::project_admitted(bytes, requested)?,
+                        error: None,
+                    });
                     value.models[index].error = Some(
                         "JPEG main fragment; use the associated merged model for editing/export"
                             .into(),
                     );
                 }
+                Err(error) if error.downcast_ref::<ResourceLimit>().is_some() => return Err(error),
                 Err(error) => {
                     value.models[index].error = Some(format!(
                         "JPEG main/extended reconciliation failed: {error:#}"
@@ -271,17 +463,31 @@ impl Prepared {
         }
         // Distinguish repeated observations with changed extraction/parser status as well as bytes.
         value.revision = value.revision_with_provenance(&value.provenance)?;
-        Ok(value)
+        Ok(AdmittedPrepared {
+            value,
+            _scope: prepared_scope,
+        })
     }
     fn revision_with_provenance(&self, provenance: &str) -> Result<String> {
-        let parsed: serde_json::Value = serde_json::from_str(provenance)?;
-        let source_revision = parsed
-            .get("file_revision")
-            .context("missing source revision")?;
-        let identity = serde_json::to_vec(
-            &serde_json::json!({"version":1,"source_revision":source_revision,"status":self.status,"issues":self.issues,"packets":self.packets,"models":self.models.iter().map(|m| (&m.hash,&m.descriptor,&m.projection,&m.error)).collect::<Vec<_>>(),"provenance":provenance}),
+        let parsed: BorrowedRevision = serde_json::from_str(provenance)?;
+        let mut digest = JsonDigest(blake3::Hasher::new());
+        serde_json::to_writer(
+            &mut digest,
+            &RevisionIdentity {
+                issues: &self.issues,
+                models: ModelIdentities(&self.models),
+                packets: &self.packets,
+                provenance,
+                source_revision: CanonicalSourceRevision {
+                    blake3: &parsed.file_revision.blake3,
+                    length: parsed.file_revision.length,
+                    modified_unix_ns: parsed.file_revision.modified_unix_ns,
+                },
+                status: &self.status,
+                version: 1,
+            },
         )?;
-        Ok(blake3::hash(&identity).to_hex().to_string())
+        Ok(digest.0.finalize().to_hex().to_string())
     }
     /// Compare the current observation with its original file-instance provenance.
     /// File bytes, source provenance, packet layout and parser results must all match.
@@ -319,12 +525,331 @@ impl Prepared {
         );
         let hash = blake3::hash(bytes).to_hex().to_string();
         if !self.blobs.contains_key(&hash) {
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+            let mut encoder = ZlibEncoder::new(
+                Vec::with_capacity(zlib_bound(bytes.len())?),
+                Compression::fast(),
+            );
             encoder.write_all(bytes)?;
             self.blobs
                 .insert(hash.clone(), (bytes.len(), encoder.finish()?));
         }
         Ok(hash)
+    }
+}
+
+fn zlib_bound(bytes: usize) -> Result<usize> {
+    // zlib's public compressBound expression, including wrapper bytes.
+    add(
+        bytes,
+        add(add(bytes >> 12, bytes >> 14)?, add(bytes >> 25, 13)?)?,
+    )
+}
+
+fn merged_descriptor_storage(inspection: &Inspection) -> Result<(usize, usize)> {
+    if !inspection
+        .parse_inputs
+        .iter()
+        .any(|input| input.transformation == xmp_packets::Transformation::JpegExtendedReassembled)
+    {
+        return Ok((0, 0));
+    }
+    let mut mains = 0usize;
+    let mut bytes = 0usize;
+    for (index, input) in inspection.parse_inputs.iter().enumerate() {
+        if !input.packet_indices.iter().any(|packet| {
+            inspection
+                .packets
+                .get(*packet)
+                .is_some_and(|packet| packet.container == xmp_packets::Container::JpegMain)
+        }) {
+            continue;
+        }
+        mains = add(mains, 1)?;
+        let fixed = inspection
+            .parse_inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, extension)| {
+                extension.transformation == xmp_packets::Transformation::JpegExtendedReassembled
+            })
+            .try_fold(0usize, |maximum, (extension_index, extension)| {
+                Ok::<_, anyhow::Error>(maximum.max(json_bytes(&MergedDescriptor {
+                    derived_from_inputs: [index, extension_index],
+                    guid: "",
+                    packet_indices: CombinedIndices {
+                        first: &input.packet_indices,
+                        second: &extension.packet_indices,
+                    },
+                    transformation: "JpegMainAndExtendedMerged",
+                })?))
+            })?;
+        // serde_json can spell one source byte as a six-byte \u00XX escape.
+        // The GUID is borrowed from this main's decoded XMP and cannot exceed
+        // the encoding-derived maximum valid UTF-8 length.
+        bytes = add(
+            bytes,
+            add(fixed, mul(6, xmp::decoded_text_bound(&input.bytes)?)?)?,
+        )?;
+    }
+    Ok((mains, bytes))
+}
+
+/// Persistent Prepared owners are admitted before the first String, Vec, map
+/// node or compressed blob is constructed. Counts come from the selected
+/// Inspection. One generated merged model is possible for every actual JPEG
+/// main; the same extension may lawfully feed all of them, so merged storage is
+/// multiplied by main count rather than extension count.
+fn prepared_storage(inspection: &Inspection, source: &Source) -> Result<usize> {
+    let (mains, merged_descriptors) = merged_descriptor_storage(inspection)?;
+    let models = add(inspection.parse_inputs.len(), mains)?;
+    let blobs = add(
+        add(inspection.packets.len(), inspection.parse_inputs.len())?,
+        mains,
+    )?;
+    let mut compressed = 0usize;
+    let mut source_error_bytes = 0usize;
+    for bytes in inspection
+        .packets
+        .iter()
+        .map(|packet| packet.bytes.len())
+        .chain(
+            inspection
+                .parse_inputs
+                .iter()
+                .map(|input| input.bytes.len()),
+        )
+    {
+        compressed = add(compressed, zlib_bound(bytes)?)?;
+    }
+    for input in &inspection.parse_inputs {
+        source_error_bytes = add(source_error_bytes, xmp::decoded_text_bound(&input.bytes)?)?;
+    }
+    compressed = add(compressed, mul(mains, zlib_bound(xmp::MAX_PACKET_BYTES)?)?)?;
+    // Prepared retains every earlier projection and semantics map while the
+    // next model is built. The fixed model expression includes the existing
+    // 17-field/10,000-item grammar and one compact packet's value payload.
+    let interpreted = mul(models, xmp::prepared_model_storage()?)?;
+
+    let packet_strings = inspection
+        .packets
+        .iter()
+        .try_fold(0usize, |bytes, packet| {
+            add(
+                bytes,
+                json_bytes(&PacketDescriptor {
+                    attributes: &packet.attributes,
+                    container: &packet.container,
+                    group: &packet.group,
+                    ranges: &packet.ranges,
+                })?,
+            )
+        })?;
+    let input_strings = inspection
+        .parse_inputs
+        .iter()
+        .try_fold(0usize, |bytes, input| {
+            add(
+                bytes,
+                json_bytes(&ParseDescriptor {
+                    group: &input.group,
+                    packet_indices: &input.packet_indices,
+                    transformation: &input.transformation,
+                })?,
+            )
+        })?;
+    let issue_strings = json_bytes(&inspection.issues)?;
+    let provenance_strings = json_bytes(&PreparedProvenance {
+        file_revision: &inspection.revision,
+        source: &source.provenance,
+        source_location: SourceLocation {
+            display: &source.display,
+            kind: &source.kind,
+            locator: &source.locator,
+        },
+    })?;
+    let containers = add(
+        vector::<(String, String)>(inspection.packets.len())?,
+        add(
+            vector::<PreparedModel>(models)?,
+            tree::<String, (usize, Vec<u8>)>(blobs)?,
+        )?,
+    )?;
+    let fixed_strings = mul(
+        64,
+        add(add(add(blobs, inspection.packets.len())?, models)?, 2)?,
+    )?;
+    // At most one retained error belongs to each input/generated model. Source
+    // names and XML excerpts cannot exceed two copies of the actual decoded
+    // input family; constant diagnostics are the longest local catch-all text.
+    let diagnostic = [
+        "JPEG extended XMP association is missing or ambiguous; original main packet retained",
+        "JPEG main fragment; use the associated merged model for editing/export",
+        "unassociated JPEG extended fragment retained; explicit association review required",
+    ]
+    .iter()
+    .map(|text| text.len())
+    .max()
+    .unwrap_or(0);
+    let errors = add(mul(2, source_error_bytes)?, mul(models, diagnostic)?)?;
+    add(
+        add(compressed, interpreted)?,
+        add(
+            containers,
+            add(
+                fixed_strings,
+                add(
+                    add(add(packet_strings, input_strings)?, merged_descriptors)?,
+                    add(add(issue_strings, provenance_strings)?, errors)?,
+                )?,
+            )?,
+        )?,
+    )
+}
+
+#[cfg(test)]
+mod prepared_admission_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    const XMP: &[u8] = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"/></rdf:RDF>"#;
+
+    fn empty() -> (Inspection, Source) {
+        (
+            Inspection {
+                revision: xmp_packets::SourceRevision {
+                    length: 0,
+                    blake3: "0".repeat(64),
+                    modified_unix_ns: None,
+                },
+                status: Status::Absent,
+                packets: Vec::new(),
+                parse_inputs: Vec::new(),
+                issues: Vec::new(),
+            },
+            Source {
+                kind: "selected".into(),
+                locator: b"fixture".to_vec(),
+                display: "fixture".into(),
+                ambiguous: false,
+                provenance: serde_json::json!({"fixture":true}),
+            },
+        )
+    }
+
+    #[test]
+    fn prepared_denial_is_typed_and_precedes_first_prepared_owner() -> Result<()> {
+        let (inspection, source) = empty();
+        let calls = RefCell::new(Vec::new());
+        let admit = |required| {
+            calls.borrow_mut().push(required);
+            Err(ResourceLimit {
+                required,
+                available: required.saturating_sub(1),
+            }
+            .into())
+        };
+        let requested = Requested::new(&admit);
+        let error = match Prepared::new_admitted(&inspection, &source, &requested) {
+            Err(error) => error,
+            Ok(_) => panic!("Prepared construction should have been denied"),
+        };
+        let limit = error
+            .downcast_ref::<ResourceLimit>()
+            .context("typed Prepared ResourceLimit")?;
+        assert_eq!(calls.borrow().as_slice(), [limit.required]);
+        assert_eq!(requested.live(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_scope_retains_its_graph_through_nested_requested_storage() -> Result<()> {
+        let (mut inspection, source) = empty();
+        let bytes = b"retained original packet".to_vec();
+        inspection.packets.push(xmp_packets::Packet {
+            container: xmp_packets::Container::Sidecar,
+            blake3: blake3::hash(&bytes).to_hex().to_string(),
+            bytes,
+            ranges: Vec::new(),
+            group: "retained".into(),
+            attributes: BTreeMap::new(),
+        });
+        let calls = RefCell::new(Vec::new());
+        let admit = |required| {
+            calls.borrow_mut().push(required);
+            Ok(())
+        };
+        let requested = Requested::new(&admit);
+        let prepared = Prepared::new_admitted(&inspection, &source, &requested)?;
+        let retained = requested.live();
+        assert!(retained > 0);
+        let nested = requested.scope(17)?;
+        assert_eq!(requested.live(), retained + 17);
+        drop(nested);
+        assert_eq!(requested.live(), retained);
+        drop(prepared);
+        assert_eq!(requested.live(), 0);
+        assert_eq!(calls.borrow().last().copied(), Some(retained + 17));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_resource_limit_is_not_recorded_as_an_xmp_parse_observation() -> Result<()> {
+        let (mut inspection, source) = empty();
+        inspection.parse_inputs.push(xmp_packets::ParseInput {
+            bytes: XMP.to_vec(),
+            blake3: blake3::hash(XMP).to_hex().to_string(),
+            packet_indices: Vec::new(),
+            transformation: xmp_packets::Transformation::Identity,
+            group: "xmp".into(),
+        });
+        let calls = RefCell::new(0usize);
+        let admit = |required| {
+            let mut calls = calls.borrow_mut();
+            *calls += 1;
+            if *calls == 1 {
+                Ok(())
+            } else {
+                Err(ResourceLimit {
+                    required,
+                    available: required.saturating_sub(1),
+                }
+                .into())
+            }
+        };
+        let requested = Requested::new(&admit);
+        let error = match Prepared::new_admitted(&inspection, &source, &requested) {
+            Err(error) => error,
+            Ok(_) => panic!("nested XMP admission should have been denied"),
+        };
+        assert!(error.downcast_ref::<ResourceLimit>().is_some());
+        assert!(*calls.borrow() >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_revision_identity_matches_previous_json_value_digest() -> Result<()> {
+        let (inspection, source) = empty();
+        let prepared = Prepared::new(&inspection, &source)?;
+        let parsed: serde_json::Value = serde_json::from_str(&prepared.provenance)?;
+        let source_revision = parsed
+            .get("file_revision")
+            .context("missing source revision")?;
+        let identity = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source_revision": source_revision,
+            "status": prepared.status,
+            "issues": prepared.issues,
+            "packets": prepared.packets,
+            "models": prepared.models.iter().map(|model| (
+                &model.hash,
+                &model.descriptor,
+                &model.projection,
+                &model.error,
+            )).collect::<Vec<_>>(),
+            "provenance": prepared.provenance,
+        }))?;
+        assert_eq!(prepared.revision, blake3::hash(&identity).to_hex().as_str());
+        Ok(())
     }
 }
 pub(crate) fn revision(db: &Connection, asset: &str) -> Result<i64> {
@@ -559,15 +1084,18 @@ pub(crate) fn rebuild(db: &Connection, asset: &str) -> Result<()> {
     Ok(())
 }
 fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
-    let (length, data): (i64, Vec<u8>) = db.query_row(
-        "SELECT raw_length,compressed FROM metadata_blobs WHERE hash=?1",
-        [hash],
+    // Admit both sizes in the same SQLite read before rusqlite allocates the
+    // compressed bytes. This matches the inspection bridge's retained-blob bound.
+    let (length, data): (i64, Option<Vec<u8>>) = db.query_row(
+        "SELECT raw_length,CASE WHEN raw_length BETWEEN 0 AND ?2 AND length(compressed)<=?3 THEN compressed END FROM metadata_blobs WHERE hash=?1",
+        params![hash, xmp::MAX_PACKET_BYTES as i64, (xmp::MAX_PACKET_BYTES + 65536) as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(
         (0..=xmp::MAX_PACKET_BYTES as i64).contains(&length),
         "invalid retained blob size"
     );
+    let data = data.context("invalid retained compressed blob size")?;
     let mut bytes = Vec::with_capacity(length as usize);
     ZlibDecoder::new(data.as_slice())
         .take(length as u64 + 1)
@@ -577,6 +1105,64 @@ fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
         "retained metadata checksum mismatch"
     );
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod retained_blob_admission_tests {
+    use super::*;
+
+    #[test]
+    fn compressed_size_rejects_before_decoding_even_with_small_raw_claim() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE metadata_blobs(hash TEXT PRIMARY KEY,raw_length INTEGER,compressed BLOB);")?;
+        db.execute(
+            "INSERT INTO metadata_blobs VALUES('oversized',1,zeroblob(?1))",
+            [(xmp::MAX_PACKET_BYTES + 65537) as i64],
+        )?;
+        assert_eq!(
+            read_blob(&db, "oversized").unwrap_err().to_string(),
+            "invalid retained compressed blob size"
+        );
+        for length in [-1, xmp::MAX_PACKET_BYTES as i64 + 1] {
+            db.execute("UPDATE metadata_blobs SET raw_length=?1", [length])?;
+            assert_eq!(
+                read_blob(&db, "oversized").unwrap_err().to_string(),
+                "invalid retained blob size"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_blob_still_requires_exact_raw_length_and_digest() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE metadata_blobs(hash TEXT PRIMARY KEY,raw_length INTEGER,compressed BLOB);")?;
+        let bytes = b"retained exact packet bytes\0\xff";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes)?;
+        db.execute(
+            "INSERT INTO metadata_blobs VALUES(?1,?2,?3)",
+            params![hash, bytes.len() as i64, encoder.finish()?],
+        )?;
+        assert_eq!(read_blob(&db, &hash)?, bytes);
+        for length in [bytes.len() as i64 - 1, bytes.len() as i64 + 1] {
+            db.execute("UPDATE metadata_blobs SET raw_length=?1", [length])?;
+            assert_eq!(
+                read_blob(&db, &hash).unwrap_err().to_string(),
+                "retained metadata checksum mismatch"
+            );
+        }
+        db.execute(
+            "UPDATE metadata_blobs SET raw_length=?1,hash='wrong-digest'",
+            [bytes.len() as i64],
+        )?;
+        assert_eq!(
+            read_blob(&db, "wrong-digest").unwrap_err().to_string(),
+            "retained metadata checksum mismatch"
+        );
+        Ok(())
+    }
 }
 /// Commit a prepared metadata observation within the caller's writer transaction.
 /// Preparation parses and compresses outside the writer; migration proof and its
@@ -675,7 +1261,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current=tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[&expected.asset_id],|r|Ok(RenderIdentity{asset_id:expected.asset_id.clone(),generation:r.get(0)?,fingerprint:r.get(1)?,state:r.get(2)?,metadata_revision:r.get(3)?})).optional()?;
+        let current=tx.query_row("SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[&expected.asset_id],|r|Ok(RenderIdentity{asset_id:expected.asset_id.clone(),generation:r.get(0)?,fingerprint:crate::catalog_row::optional_text(r,1,64)?,state:crate::catalog_row::owned_text(r,2,7)?,metadata_revision:r.get(3)?})).optional()?;
         if !current.as_ref().is_some_and(|current| {
             current.asset_id == expected.asset_id
                 && current.generation == expected.generation
@@ -693,7 +1279,7 @@ impl Catalog {
         let (generation, fingerprint, state, metadata_revision) = self.db.query_row(
             "SELECT a.render_generation,a.fingerprint,a.state,COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",
             [asset],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?)),
+            |r| Ok((r.get(0)?, crate::catalog_row::optional_text(r,1,64)?, crate::catalog_row::owned_text(r,2,7)?,r.get(3)?)),
         )?;
         Ok(RenderIdentity {
             asset_id: asset.into(),
@@ -967,9 +1553,29 @@ impl Catalog {
         organization_fields: &[String],
         after: impl FnOnce(&Connection, i64) -> Result<()>,
     ) -> Result<Change> {
-        crate::catalog_images::require_current(&self.db, asset)?;
+        let prepared = self.prepare_metadata_edit(
+            asset,
+            expected_revision,
+            base_model,
+            edits,
+            organization_fields,
+        )?;
+        self.commit_prepared_metadata_edit(prepared, after)
+    }
+
+    /// Parse, project and compress on the selected catalog worker, without a
+    /// writer permit. The returned value cannot authorize a different session.
+    pub(crate) fn prepare_metadata_edit(
+        &self,
+        asset: &str,
+        expected_revision: i64,
+        base_model: Option<i64>,
+        edits: &[Edit],
+        organization_fields: &[String],
+    ) -> Result<PreparedEdit> {
+        let image_identity = crate::catalog_images::identity(&self.db, asset)?;
         ensure!(
-            revision(&self.db, asset)? == expected_revision,
+            image_identity.metadata_revision == expected_revision,
             "metadata changed; refresh before editing"
         );
         ensure!(
@@ -1062,13 +1668,53 @@ impl Catalog {
         prepared.revision = blake3::hash(&serde_json::to_vec(&(&prepared.revision, &updated))?)
             .to_hex()
             .to_string();
+        Ok(PreparedEdit {
+            catalog_file: self.session.clone(),
+            image_identity,
+            expected_revision,
+            base_model,
+            edits: edits.to_vec(),
+            organization_fields: organization_fields.to_vec(),
+            source,
+            prepared,
+            original,
+            original_semantics,
+            updated,
+        })
+    }
+
+    /// Revalidate the frozen image authority and publish the prepared edit in
+    /// the same transaction as any organization job/event bookkeeping.
+    pub(crate) fn commit_prepared_metadata_edit(
+        &mut self,
+        edit: PreparedEdit,
+        after: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<Change> {
+        ensure!(
+            std::sync::Arc::ptr_eq(&self.session, &edit.catalog_file),
+            "prepared metadata edit belongs to another catalog session"
+        );
+        let PreparedEdit {
+            catalog_file: _,
+            image_identity,
+            expected_revision,
+            base_model,
+            edits,
+            organization_fields,
+            source,
+            prepared,
+            original,
+            original_semantics,
+            updated,
+        } = edit;
+        let asset = image_identity.image_id.as_str();
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        crate::catalog_images::require_current(&tx, asset)?;
+        crate::catalog_images::require_image_metadata_identity(&tx, &image_identity)?;
         ensure!(
             revision(&tx, asset)? == expected_revision,
             "metadata changed while preparing edit"
@@ -1107,6 +1753,10 @@ impl Catalog {
     }
 }
 
+#[cfg(test)]
+#[path = "catalog_metadata/prepared_edit_tests.rs"]
+mod prepared_edit_tests;
+
 fn name_key(name: &std::ffi::OsStr) -> Vec<u8> {
     if let Some(s) = name.to_str() {
         let mut key = vec![1];
@@ -1122,55 +1772,308 @@ fn name_key(name: &std::ffi::OsStr) -> Vec<u8> {
         key
     }
 }
-impl Catalog {
-    pub(crate) fn begin_metadata_scan(&self) -> Result<()> {
-        self.db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS metadata_scan_dirs(directory BLOB PRIMARY KEY); CREATE TEMP TABLE IF NOT EXISTS metadata_scan_files(directory BLOB NOT NULL,name BLOB NOT NULL,stem BLOB NOT NULL,full_name BLOB NOT NULL,path BLOB NOT NULL,display TEXT NOT NULL,sidecar INTEGER NOT NULL,PRIMARY KEY(directory,name)); CREATE INDEX IF NOT EXISTS metadata_scan_stem ON metadata_scan_files(directory,stem); CREATE INDEX IF NOT EXISTS metadata_scan_name ON metadata_scan_files(directory,full_name); DELETE FROM metadata_scan_dirs; DELETE FROM metadata_scan_files;")?;
-        Ok(())
+pub(crate) fn set_import_source_unavailable(
+    tx: &Transaction<'_>,
+    asset: &str,
+    source: &Source,
+    reason: &str,
+) -> Result<bool> {
+    let previous:Option<String>=tx.query_row("SELECT availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![asset,source.kind,source.locator],|r|r.get(0)).optional()?;
+    if previous.as_deref() == Some(reason) {
+        return Ok(false);
     }
-    fn index_metadata_directory(&self, directory: &Path) -> Result<()> {
-        let key = location_bytes(directory);
-        let indexed: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM metadata_scan_dirs WHERE directory=?1)",
-            [&key],
-            |r| r.get(0),
-        )?;
-        if indexed {
-            return Ok(());
-        }
-        // One directory enumeration per import scan; disk-backed indexed joins avoid O(files²).
-        let tx = self.db.unchecked_transaction()?;
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if ext != "xmp" && !crate::media::supported_extension(&ext) {
-                continue;
-            }
-            let name = path.file_name().context("source has no filename")?;
-            let stem = path.file_stem().context("source has no stem")?;
-            tx.execute(
-                "INSERT INTO metadata_scan_files VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    key,
-                    location_bytes(Path::new(name)),
-                    name_key(stem),
-                    name_key(name),
-                    location_bytes(&path),
-                    path.to_string_lossy(),
-                    ext == "xmp"
-                ],
+    tx.execute("INSERT INTO metadata_sources(asset_id,kind,locator,display,association,availability) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(asset_id,kind,locator) DO UPDATE SET availability=excluded.availability",params![asset,source.kind,source.locator,source.display,if source.ambiguous {"ambiguous"} else {"confirmed"},reason])?;
+    // The foreground master receives this change now; the bounded queue
+    // propagates it to followers without advancing the master twice.
+    tx.execute("INSERT OR IGNORE INTO metadata_image_observations SELECT ?1,current_observation FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 AND current_observation IS NOT NULL",params![asset,source.kind,source.locator])?;
+    tx.execute("INSERT INTO metadata_image_sources SELECT ?1,id,current_observation,1,locator,association,availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 ON CONFLICT(image_id,source_id) DO UPDATE SET current_observation=excluded.current_observation,logical_locator=excluded.logical_locator,association=excluded.association,availability=excluded.availability",params![asset,source.kind,source.locator])?;
+    advance(
+        tx,
+        asset,
+        "source_unavailable",
+        &serde_json::json!({"kind":source.kind,"display":source.display,"reason":reason}),
+        true,
+    )?;
+    let source_id: i64 = tx.query_row(
+        "SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",
+        params![asset, source.kind, source.locator],
+        |r| r.get(0),
+    )?;
+    crate::catalog_images::enqueue_source_state(tx, source_id)?;
+    crate::catalog_images::step_refresh(tx, 32)?;
+    Ok(true)
+}
+
+pub(crate) fn apply_import_source(
+    tx: &Transaction<'_>,
+    asset: &str,
+    input: &PreparedImportSource,
+) -> Result<(bool, bool)> {
+    let changed = match &input.prepared {
+        Ok(prepared) => retain_prepared(tx, asset, &input.source, prepared, true)?.changed,
+        Err(reason) => set_import_source_unavailable(tx, asset, &input.source, reason)?,
+    };
+    crate::catalog_storage::record_metadata_path(
+        tx,
+        asset,
+        &input.source.kind,
+        &path_from_bytes(&input.source.locator)?,
+    )?;
+    Ok((changed, input.warning || input.source.ambiguous))
+}
+pub(crate) fn finish_import_sources(
+    tx: &Transaction<'_>,
+    asset: &str,
+    seen: &BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    let previous=tx.prepare("SELECT locator,display,association FROM metadata_sources WHERE asset_id=?1 AND kind='sidecar'")?.query_map([asset],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut changed = false;
+    for (locator, display, association) in previous {
+        if !seen.contains(&locator) {
+            changed |= set_import_source_unavailable(
+                tx,
+                asset,
+                &Source {
+                    kind: "sidecar".into(),
+                    locator,
+                    display,
+                    ambiguous: association == "ambiguous",
+                    provenance: serde_json::Value::Null,
+                },
+                "not found in current directory scan; retained metadata remains available",
             )?;
         }
-        tx.execute("INSERT INTO metadata_scan_dirs VALUES(?1)", [key])?;
-        tx.commit()?;
-        Ok(())
+    }
+    Ok(changed)
+}
+
+pub(crate) fn initialize_discovery(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS metadata_scan_dirs(directory BLOB PRIMARY KEY); CREATE TEMP TABLE IF NOT EXISTS metadata_scan_files(directory BLOB NOT NULL,name BLOB NOT NULL,stem BLOB NOT NULL,full_name BLOB NOT NULL,path BLOB NOT NULL,display TEXT NOT NULL,sidecar INTEGER NOT NULL,PRIMARY KEY(directory,name)); CREATE INDEX IF NOT EXISTS metadata_scan_stem ON metadata_scan_files(directory,stem); CREATE INDEX IF NOT EXISTS metadata_scan_name ON metadata_scan_files(directory,full_name); DELETE FROM metadata_scan_dirs; DELETE FROM metadata_scan_files;")?;
+    Ok(())
+}
+fn index_directory(
+    db: &Connection,
+    directory: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let key = location_bytes(directory);
+    let indexed: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata_scan_dirs WHERE directory=?1)",
+        [&key],
+        |r| r.get(0),
+    )?;
+    if indexed {
+        return Ok(());
+    }
+    // Enumeration only opens a directory; regular-file content remains the
+    // source reader's responsibility. The SQL seam also consumes bounded facts
+    // from an eventual F stream without moving this connection to that owner.
+    index_directory_facts(
+        db,
+        directory,
+        fs::read_dir(directory)?.map(|entry| {
+            let entry = entry?;
+            Ok(DirectoryFact {
+                path: entry.path(),
+                regular: entry.file_type()?.is_file(),
+            })
+        }),
+        cancel,
+    )
+}
+
+pub(crate) struct DirectoryFact {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) regular: bool,
+}
+fn index_directory_facts(
+    db: &Connection,
+    directory: &Path,
+    facts: impl IntoIterator<Item = Result<DirectoryFact>>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let key = location_bytes(directory);
+    let tx = db.unchecked_transaction()?;
+    for (index, fact) in facts.into_iter().enumerate() {
+        if let Some(cancel) = cancel {
+            ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Acquire),
+                "metadata discovery canceled"
+            );
+            ensure!(
+                index < xmp_packets::Limits::default().max_entries,
+                "directory metadata association entry limit exceeded; no truncated associations admitted"
+            );
+        }
+        let fact = fact?;
+        ensure!(
+            fact.path.parent() == Some(directory),
+            "directory fact belongs to another parent"
+        );
+        if cancel.is_some() {
+            let native = crate::storage_volume::NativePath::from_path(&fact.path);
+            let units = match &native {
+                crate::storage_volume::NativePath::UnixBytes(v) => v.len(),
+                crate::storage_volume::NativePath::WindowsWide(v) => v.len(),
+            };
+            ensure!(
+                units <= crate::catalog_session::PATH_UNITS,
+                "directory fact path exceeds byte admission"
+            );
+            native.to_path()?;
+        }
+        if !fact.regular {
+            continue;
+        }
+        let path = &fact.path;
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext != "xmp" && !crate::media::supported_extension(&ext) {
+            continue;
+        }
+        let name = path.file_name().context("source has no filename")?;
+        let stem = path.file_stem().context("source has no stem")?;
+        tx.execute(
+            "INSERT INTO metadata_scan_files VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                key,
+                location_bytes(Path::new(name)),
+                name_key(stem),
+                name_key(name),
+                location_bytes(path),
+                path.to_string_lossy(),
+                ext == "xmp"
+            ],
+        )?;
+    }
+    tx.execute("INSERT INTO metadata_scan_dirs VALUES(?1)", [key])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn initialize_discovery_connection(db: &Connection) -> Result<()> {
+    db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;")?;
+    initialize_discovery(db)?;
+    db.execute_batch("PRAGMA temp.max_page_count=16384; PRAGMA temp.cache_size=-8192;")?;
+    Ok(())
+}
+
+/// Worker-owned directory facts; no catalog connection or authority is held.
+pub(crate) struct ImportDiscovery {
+    db: crate::catalog_session::SqlConnection,
+    progress_registered: bool,
+}
+impl ImportDiscovery {
+    pub(crate) fn new() -> Result<Self> {
+        let db = Connection::open("")?;
+        initialize_discovery_connection(&db)?;
+        Ok(Self {
+            db: db.into(),
+            progress_registered: false,
+        })
+    }
+    pub(crate) fn from_admitted(
+        db: crate::catalog_session::SqlConnection,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self> {
+        let mut owner = Self {
+            db,
+            progress_registered: false,
+        };
+        owner.db.install_cancel_progress(cancel)?;
+        owner.progress_registered = true;
+        initialize_discovery_connection(&owner.db)?;
+        Ok(owner)
+    }
+    pub(crate) fn sidecars(
+        &self,
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Source>> {
+        let directory = path.parent().context("original has no parent")?;
+        index_directory(&self.db, directory, Some(cancel))?;
+        let stem = name_key(path.file_stem().context("original has no stem")?);
+        let name = name_key(path.file_name().context("original has no filename")?);
+        let rows=self.db.prepare("SELECT path,display,stem FROM metadata_scan_files WHERE directory=?1 AND sidecar=1 AND (stem=?2 OR stem=?3) ORDER BY name LIMIT 1025")?.query_map(params![location_bytes(directory),stem,name],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            rows.len() <= 1024,
+            "sidecar association limit exceeded; no associations silently discarded"
+        );
+        let multiple = rows.len() > 1;
+        rows.into_iter().map(|(locator, display, key)| {
+            let matches:i64=self.db.query_row("SELECT count(*) FROM metadata_scan_files WHERE directory=?1 AND sidecar=0 AND (stem=?2 OR full_name=?2)",params![location_bytes(directory),key],|r|r.get(0))?;
+            Ok(Source {kind:"sidecar".into(), locator, display, ambiguous:multiple || matches!=1,
+                provenance:serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}})})
+        }).collect()
+    }
+}
+impl Drop for ImportDiscovery {
+    fn drop(&mut self) {
+        if self.db.hook_owner_unverifiable() {
+            return;
+        }
+        if self.progress_registered && self.db.remove_progress_handler().is_err() {
+            // Managed roles are always owned connections. A check_owned error
+            // violates that invariant: retain the owner without further SQL.
+            return;
+        }
+        if !self.db.is_autocommit() {
+            let _ = self.db.execute_batch("ROLLBACK");
+        }
+    }
+}
+pub(crate) struct PreparedImportSource {
+    pub(crate) source: Source,
+    pub(crate) prepared: std::result::Result<Prepared, String>,
+    pub(crate) warning: bool,
+}
+pub(crate) fn prepare_import_source(
+    source: Source,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedImportSource> {
+    let path = path_from_bytes(&source.locator)?;
+    let inspected = xmp_packets::inspect_cancellable(
+        &path,
+        &Limits::default(),
+        source.kind == "sidecar",
+        cancel,
+    );
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    let (prepared, warning) = match inspected {
+        Ok(inspection) => {
+            let prepared = Prepared::new(&inspection, &source)?;
+            let warning = !matches!(inspection.status, Status::Complete | Status::Absent)
+                || prepared
+                    .models
+                    .iter()
+                    .any(|m| m.error.is_some() || !m.projection.issues.is_empty());
+            (Ok(prepared), warning)
+        }
+        Err(e) => (Err(format!("inspection failed: {e}")), true),
+    };
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    Ok(PreparedImportSource {
+        source,
+        prepared,
+        warning,
+    })
+}
+
+impl Catalog {
+    pub(crate) fn begin_metadata_scan(&self) -> Result<()> {
+        initialize_discovery(&self.db)
+    }
+    fn index_metadata_directory(&self, directory: &Path) -> Result<()> {
+        index_directory(&self.db, directory, None)
     }
     fn unavailable_metadata_source(
         &mut self,
@@ -1184,32 +2087,9 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let previous:Option<String>=tx.query_row("SELECT availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",params![asset,source.kind,source.locator],|r|r.get(0)).optional()?;
-        if previous.as_deref() == Some(reason) {
-            return Ok(false);
-        }
-        tx.execute("INSERT INTO metadata_sources(asset_id,kind,locator,display,association,availability) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(asset_id,kind,locator) DO UPDATE SET availability=excluded.availability",params![asset,source.kind,source.locator,source.display,if source.ambiguous {"ambiguous"} else {"confirmed"},reason])?;
-        // The foreground master receives this change now; the bounded queue
-        // propagates it to followers without advancing the master twice.
-        tx.execute("INSERT OR IGNORE INTO metadata_image_observations SELECT ?1,current_observation FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 AND current_observation IS NOT NULL",params![asset,source.kind,source.locator])?;
-        tx.execute("INSERT INTO metadata_image_sources SELECT ?1,id,current_observation,1,locator,association,availability FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3 ON CONFLICT(image_id,source_id) DO UPDATE SET current_observation=excluded.current_observation,logical_locator=excluded.logical_locator,association=excluded.association,availability=excluded.availability",params![asset,source.kind,source.locator])?;
-        advance(
-            &tx,
-            asset,
-            "source_unavailable",
-            &serde_json::json!({"kind":source.kind,"display":source.display,"reason":reason}),
-            true,
-        )?;
-        let source_id: i64 = tx.query_row(
-            "SELECT id FROM metadata_sources WHERE asset_id=?1 AND kind=?2 AND locator=?3",
-            params![asset, source.kind, source.locator],
-            |r| r.get(0),
-        )?;
-        crate::catalog_images::enqueue_source_state(&tx, source_id)?;
-        crate::catalog_images::step_refresh(&tx, 32)?;
+        let changed = set_import_source_unavailable(&tx, asset, source, reason)?;
         tx.commit()?;
-        drop(_write);
-        Ok(true)
+        Ok(changed)
     }
     fn inspect_metadata_source(
         &mut self,
@@ -1466,7 +2346,7 @@ impl Catalog {
         &mut self,
         operation: &str,
     ) -> Result<crate::metadata_export::ExportReceipt> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         // IMMEDIATE prevents a concurrent catalog writer from changing metadata between the
         // revision check and external publication. Filesystem recovery evidence remains durable
         // even if the catalog transaction itself fails after publication.
@@ -1516,7 +2396,7 @@ impl Catalog {
         &mut self,
         directory: &Path,
     ) -> Result<crate::metadata_export::ExportReceipt> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.require_jobs_released()?;
         let directory = directory.canonicalize()?;
         let name = directory
             .file_name()
@@ -1524,7 +2404,7 @@ impl Catalog {
             .context("invalid recovery operation directory")?;
         let operation = name
             .strip_prefix(".photocatalog-xmp-export-")
-            .context("not a PhotoCatalog export operation")?;
+            .context("not a LensWorks export operation")?;
         let (asset, expected, plan): (String, i64, String) = self.db.query_row(
             "SELECT asset_id,revision,plan FROM metadata_export_plans WHERE operation=?1",
             [operation],
@@ -1588,6 +2468,104 @@ mod image_source_state_tests {
         assert!(!catalog.unavailable_metadata_source("source", &source, "missing fixture")?);
         assert_eq!(catalog.metadata_for_image(&master)?.revision, before + 1);
         assert_eq!(catalog.metadata_for_image(&copy)?.revision, copy_before + 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod managed_discovery_tests {
+    use super::*;
+    #[test]
+    fn bounded_directory_facts_preserve_native_names_and_rollback_incomplete_roster() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().canonicalize()?;
+        let discovery = ImportDiscovery::new()?;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let original = directory.join("photo.cr2");
+        let sidecar = directory.join("photo.cr2.xmp");
+        let paths = vec![original.clone(), sidecar.clone()];
+        #[cfg(unix)]
+        let paths = {
+            use std::os::unix::ffi::OsStringExt;
+            let mut paths = paths;
+            paths.push(directory.join(std::ffi::OsString::from_vec(b"native\xff.xmp".to_vec())));
+            paths
+        };
+        index_directory_facts(
+            &discovery.db,
+            &directory,
+            paths.iter().cloned().map(|path| {
+                Ok(DirectoryFact {
+                    path,
+                    regular: true,
+                })
+            }),
+            Some(&cancel),
+        )?;
+        for path in &paths {
+            let stored: Vec<u8> = discovery.db.query_row(
+                "SELECT path FROM metadata_scan_files WHERE directory=?1 AND name=?2",
+                params![
+                    location_bytes(&directory),
+                    location_bytes(Path::new(path.file_name().unwrap()))
+                ],
+                |r| r.get(0),
+            )?;
+            assert_eq!(stored, location_bytes(path));
+        }
+        assert_eq!(discovery.sidecars(&original, &cancel)?.len(), 1);
+        initialize_discovery(&discovery.db)?;
+        let error = index_directory_facts(
+            &discovery.db,
+            &directory,
+            [
+                Ok(DirectoryFact {
+                    path: original.clone(),
+                    regular: true,
+                }),
+                Ok(DirectoryFact {
+                    path: directory.join("wrong/elsewhere.xmp"),
+                    regular: true,
+                }),
+            ],
+            Some(&cancel),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("another parent"));
+        assert_eq!(
+            discovery
+                .db
+                .query_row("SELECT count(*) FROM metadata_scan_files", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            discovery
+                .db
+                .query_row("SELECT count(*) FROM metadata_scan_dirs", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        let too_many = (0..=xmp_packets::Limits::default().max_entries).map(|_| {
+            Ok(DirectoryFact {
+                path: original.clone(),
+                regular: false,
+            })
+        });
+        assert!(
+            index_directory_facts(&discovery.db, &directory, too_many, Some(&cancel))
+                .unwrap_err()
+                .to_string()
+                .contains("entry limit")
+        );
+        assert_eq!(
+            discovery
+                .db
+                .query_row("SELECT count(*) FROM metadata_scan_dirs", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
         Ok(())
     }
 }

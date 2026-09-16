@@ -2,27 +2,2267 @@
 
 Source of truth: https://app.shortcut.com/trefry/epic/22835
 
-## Current delivery — 2026-09-13
+## Current delivery — 2026-09-15
 
-S1–S10 are Done. S10 PR #14 merged as
-`287d3382538b10717bf943553c73fc29a300ffd6`, with identical content to independently
-reviewed final head `81f931`. Final-head CI `34739779088` and merged-head CI
-`34740733892` passed all four jobs: macOS, Windows, Linux, and benchmark contracts.
-Shortcut sc-22845 and all four tasks were read back as complete; comment 23281
-records acceptance and limits. The selected16 result remains a scratch TEST.
-Canonical migration, Adobe renderer parity, and terminal performance are not
-claimed. No actual catalog or RAID worker remains active.
+Local production checkpoint `b85d78d` integrates the managed C export adapter
+(`b0d2f00` → `e17a666`) and the repository-check repair for sc-23612
+(`9e4d053` → `b85d78d`). Paired desktop Export is admitted through the
+session-owned service, exact pending-operation replay, bounded recovery,
+read-only launch revalidation, and checked G/F native/storage ownership.
+The standalone Local backend remains available.
 
-S11 sc-22846 local implementation and acceptance checks are complete on
-`codex/sc-22846-backup-restore`, based on merged S10. The production source passed
-662 release tests (five existing ignored), with one additional real running-job
-backup test subsequently passing; that addition changed tests only. Strict
-all-target Clippy and formatting passed. Whole-database backup, verified restore
-to a new destination, incomplete-output protection, exact XMP/migration retention,
-explicit restored-job holds, and relink/preview regeneration are covered.
-See [Catalog backup and restore](CATALOG_BACKUP.md). Final review, PR/platform CI,
-merge and tracker closeout remain delivery gates; Shortcut holds their live state.
-S12 desktop packaging and S13 integrated readiness remain required.
+The repair prevents an empty transferred migration lease from releasing its
+new owner's writer permit. It also corrects SQL/Raw test role pinning, phase
+boundary and foreign-path error assertions, and restores strict lint checks.
+Intentionally inline protocol and process-custody values retain their layouts
+with narrow, documented lint expectations; capacity accounting is preserved.
+
+Private `sc-23612-full-regression-6ksvl0py` passes all 48 test targets:
+1,454 passed, zero failed, 68 explicitly ignored. The library contributes
+1,125 passed and 63 ignored. Child helper summaries are not counted twice.
+Formatting and strict all-target Clippy pass in
+`sc-23612-checkpoint-0zgv1pe4`. Independent source reviews cover the original
+adapter, its bounded corrections, the permit repair, and the final lint delta.
+Superseded failed reviews and runs remain retained as negative evidence.
+
+All 408 recorded source hashes match the tested tree after integration.
+`sc-23612-desktop-integration-_r1ueez8` passes frontend build, release test-target
+compilation, fresh CLI build, all 41 native-owner tests and seven capacity tests.
+`sc-23612-desktop-runtime-94w0wt83` passes actual failed-launch recovery,
+six-case metadata/export replay and preview reuse, startup refusal/retry,
+cold/warm preview delivery, checked retirement, and the Tauri release check.
+The six export cases are one test, not six separately counted tests. All 18
+logged process IDs are absent after the run.
+These checks use local synthetic data and captured fresh executables.
+
+sc-23612 is In Review with local implementation and integration verified.
+sc-22847 and the foundation epic remain In Progress: publication, cross-platform
+CI/packages, installation, UI and terminal performance acceptance remain open.
+No RAID/original reads, installation replacement, push or Actions occurred.
+
+Earlier accepted checkpoints:
+
+### Prior sc-23571 integration
+
+Prior local production checkpoint `2c4eea3` integrates sc-23571 from
+`183ef73`: filesystem-owned export executor leases, bounded two-namespace
+recovery, generation fencing, and durable private claims for interrupted
+cleanup. All 21 authored files and 404 recorded source files match the tested
+component. Independent source review `29642b6c`, narrow fixture/diagnostic
+reviews, and evidence audit `1b49c89d` qualify 99 unique runnable tests.
+Failed source reviews and runtime attempts remain preserved; only the final
+passing groups are included in that total.
+
+Private `sc-23571-integration-ga99ajvi` passes frontend build, three focused
+desktop startup/render/retirement tests, and Tauri release check. Independent
+integration audit `8b5477c4` verifies the byte-identical composition and bounded
+recorded-process retirement. The component's full test-target compilation and
+99 tests were not repeated solely for a byte-identical cherry-pick.
+Capacity totals are refreshed in `PREVIEW_METADATA_CAPACITY.md`.
+
+sc-23571 is locally accepted; remote publication, platform CI and installation
+remain outstanding. At that checkpoint, sc-22847 still needed the managed C ExportService adapter
+and complete desktop acceptance; paired Export remained closed. All work in
+this checkpoint used local synthetic data, without RAID access or Actions.
+
+
+
+
+Local production checkpoint `d8ba673` integrates G export-native ownership
+(source `7792e5f`) on the accepted `1be970d` foundation. That foundation adds
+F export admission custody
+(source `e71ede14`, integrated `967f259`), a shared native ByteBudget with
+real reservations through explicit retirement (source `3f4055a`), and the
+Lightroom dropdown type fix `8d5a6a8` preserving its 13 options.
+
+The F component has 48 passing tests, source review `ccd82250` and evidence
+review `265b1ba3`. The native component has 18 exact passing tests, source
+closure `aab3fad1` and Rust evidence review `67930a65`. Earlier Drop review,
+test-only compile error, absent frontend assets and TS2366 receipts remain
+negative evidence; none is presented as a passing full gate.
+
+Combined source matches 16 authored paths and 398 recorded source hashes.
+Private `sc-22847-export-prereqs-integration-_k2o0tq8` plus tail
+`sc-22847-export-prereqs-tail-7ovt0ksm` pass frontend build, formatting,
+full test-target compilation, fresh CLI, 39 aggregate Rust tests and Tauri
+release check. The main receipt `7b9e068a` preserves a runner-count failure:
+10 normal native tests passed but root expected 12, including two ignored
+entries. Tail `8a77fa86` explicitly runs the actual ignored native-custody
+test; the other ignored entry is only its subprocess entrypoint. No source
+changed or earlier tests were rerun to correct that bookkeeping error.
+CLI `0acc74ff`, libtest `98827aa1`, composition review `30d333fb` are retained.
+Final integrated evidence audit `0c755b64` passes.
+
+S12 sc-22847 remains In Progress. Bug sc-23555 is In Review after verified
+local implementation, independent review and integration; publication,
+merge and normal CI remain outstanding (Shortcut comment 23566).
+
+G export native ownership and exact ordinary F stage coordination are locally
+accepted. Source review `a97680ac` closes the lifecycle/control findings; the
+final test-only fixture review is `b15933b3`. The component gate passes all
+62 runnable tests (`51762017`), with independent evidence audit `4b80bbb2`.
+Earlier source rejections, compile errors and the 1/23 then 16/8 fixture-failure
+runs remain negative evidence; none is represented as a passing gate.
+
+Integrated source matches all 401 component source hashes and the 13 authored
+paths. Private `sc-22847-export-owner-integration-7l17765j` passes all 13 commands:
+frontend build, formatting, full release test-target compilation, fresh CLI,
+21 desktop runtime tests and Tauri release check. Receipt `effc73c8`, CLI
+`6b4cc4ef`, libtest `69cd7ec7` and independent integration audit `7f2c7756`
+are retained. The audits bound their cleanup claims to recorded process and
+checked-wait evidence; they do not assert host-wide native idleness or RSS.
+
+C ExportService adaptation is next; paired export route admission remains
+closed until that backend delegates all native/storage ownership correctly. Full installed, platform, UI and RSS acceptance and S13 remain
+open. No RAID/original reads, canonical migration, install replacement, push
+or Actions occurred.
+
+## Current delivery — 2026-09-14
+
+Latest local checkpoint (supersedes older pending notes below):
+
+LM batch3 is locally committed as 848d2a4 and integrated as a345bb2;
+independent final acceptance ef42a760 closes its 27 + 9 + 7 component gates.
+Stateful F publication is locally committed as 01a7f51 and integrated as
+1243dd8; independent evidence 7cf0e881 verifies its 19 exact selected passes.
+The requested-capacity table is refreshed; all 13 tested Rust hashes remain
+unchanged. The combined 56-file manifest matches both source commits.
+
+Integrated HEAD 1243dd8c23138727a5e8deba73fb2783e8df77bc passes formatting,
+full test-target compilation, fresh CLI build, actual managed startup refusal/
+retry, cold/warm preview delivery, Tauri check, 27 LM executor tests and seven
+CLI compatibility tests. Evidence: private sc-22847-lm-publication-integration-
+bio0am7u; receipt cb7aa884, CLI edcc84fd. Root verified 390 source hashes,
+all 12 reported process IDs absent, and no remaining managed workers. Separate
+composition review 4448f225 and integrated evidence audit 99f5d32a pass.
+Export render-only precursor is locally committed as f850edc and integrated as
+fa4f585dc450d897ae3aa3b288e2552a4b831af1. N now emits bounded rendering facts;
+the local parent validates output identity and seals only after checked child
+exit. Existing orphan equality, persisted protocol compatibility, Stop and
+service behavior remain covered. All 389 integrated source hashes equal the
+final tested source. Fourteen worker tests passed in private
+sc-22847-export-fixture-runtime-_jyzox0q; seven service tests passed after a
+fixture-only canonical-path correction in sc-22847-export-service-path-fix-
+4ls1a2tm (receipt 8da015dc). Fresh CLI 63fe2a28 and independent final audit
+3c3bd3dc are retained. Earlier failed gates remain negative evidence.
+
+LM C relay is locally committed as 8d2544e and integrated as 7b092f5.
+Independent source closure 6c5d3192 and corrected evidence audit f7f183a6 pass;
+28 relay tests, one existing ordinary-admission test and three capacity tests
+pass (receipt 84130676). All 15 logged F fixture children retired. The table
+now records all three current requested-backing reports, explicitly not RSS.
+
+Combined source 7b092f5 passes formatting, full test-target compilation, fresh
+CLI build, actual managed startup refusal/retry, cold/warm preview delivery,
+and Tauri check. Evidence: private sc-22847-lm-relay-export-integration-70o_2mrf;
+receipt 375cf1b0, immutable CLI a77b62a6. Independent audit 16b4a005 verifies
+all 392 source hashes, the exact 21 disjoint authored paths, all six logs and
+seven logged C/F/N fixture-child retirements. No integrated source edits were
+needed beyond the accepted component cherry-picks.
+
+Export filesystem staging is accepted: source `282ce0c`, integrated `4a41a71`.
+All 42 component tests pass (13 stage, four capacity, four admission, 14 worker,
+seven service), receipt `4939943b`, independent source review `f7acbbed` and
+runtime audit `63462096`. Earlier failed gates remain preserved as negative
+evidence; the final fixture correction only canonicalizes test paths.
+
+LM target inspection and retained-result/failure prerequisites are accepted:
+source `87487a0`, integrated `a4729ac`. All eleven exact tests pass, receipt
+`846dae33`, source review `f9a11684`, independent runtime audit `dfe16b57`.
+Operation charges survive unknown drain and release after checked retirement;
+bounded result or failure storage remains independently charged until discard.
+
+Combined `a4729ac50ae780729712ae27048e617460f20065` passes format, full test-target
+compile, fresh CLI build, actual managed startup refusal/retry, cold/warm preview,
+four capacity tests and Tauri check. Private evidence:
+`sc-22847-stage-lm-prerequisite-integration-9_wo22yf`; receipt `d2281741`,
+immutable CLI `14befba9`, source-composition review `212ba89f`, independent
+evidence audit `db04e2db`. All 394 source hashes and 21 authored entries match;
+seven command processes and eight logged fixture processes retired. The capacity
+table now records this combined source, explicitly requested backing, not RSS.
+
+Full LM G coordinator/public facade is in runtime repair on
+`codex/sc-22847-lm-facade`. Earlier source findings `950067e3`/`1afc724b`
+are closed by independent source acceptance `ed8dcea1`; the 15-file ACK/provenance
+freeze compiles (`7e7b5f85`). Its runtime built CLI `28f52936`, libtest `a247a5a0`,
+and verified 46 unique filters. Three pure tests pass; the first actual case
+fails on same-live-C reuse because normal asynchronous writer release was
+promoted to poisoned failure. Negative receipt `a9022875`, log `f880e4d6`, and
+all before/after artifacts are preserved; all recorded processes retired.
+
+The bounded release repair passes independent source review `d2eb6b84` and
+compilation `a9ce319a`. The first successor passed 26 exact cases, then exposed
+a fixture SQL-worker count error (negative receipt `ceb04470`). Root corrected
+the expected count from three to two; independent audit `58ee780b` verified
+that correction and production CLI reuse, with a newly compiled test binary.
+
+The corrected gate `sc-22847-lm4-count-runtime-mpf8ijds` passes 28 exact cases,
+including all seven operations. Case29 times out at 488/1024 supplement records
+in the >8 MiB result fixture, leaving DrainPending. Negative receipt `616eff24`,
+log `fad31144`; all 396 source hashes are unchanged. Root recorded and terminated
+two identified orphan synthetic F/C fixtures (`9ca00c4e`); this cleanup is not
+successful managed-retirement evidence. Bounded diagnosis is in progress.
+
+The untouched tail gate `sc-22847-lm4-tail-runtime-2k3rl51m` passes cases30/31.
+Case32 passes abrupt-C lifecycle assertions but fails a final fixture role count:
+PrepareSupplements starts C/LM, not the asserted SQL Source. Negative receipt
+`517d10ac`, log `0d9760e6`; no remaining workers. Case33 in
+`sc-22847-lm4-tail33-runtime-30jotpt0` times out before the intended wait-failure
+injection (negative receipt `c26ced0a`, log `6f0182cc`); no workers remain.
+Runtime is paused for one bounded diagnosis of cases29/32/33. Thirty unique
+cases pass; cases34–50 remain unexecuted.
+The fixture-only repair is frozen at `sc-22847-lm4-fixture-lifecycle-6v_b95l9`
+(manifest `cb45b558`; other 395 source files unchanged). Full compilation passes
+`aaa5d1bd` / receipt `5e281d79`; independent review `3cedf702` passes. The required
+1024 preparation case retains full coverage with a test-only 600-second execution
+allowance; failure cleanup has a separate drain window and preserves the original
+unknown outcome. Case32 roster and case33 fault ordering are corrected, and a new
+actual deadline/cleanup regression is added. Fresh libtest inventory is building
+in `sc-22847-lm4-fixture-build-coluxlhq`. Planned focused gate
+`sc-22847-lm4-fixture-runtime-is8ndnle` covers four repaired/new cases, 17 untouched
+tail cases, and prior cases26/27 to exercise the edited shared helper. The expensive
+1024 case runs last. Prior unaffected evidence remains explicitly tied to its
+source snapshot; independent aggregate evidence review is required before acceptance.
+The rebuilt libtest `d7e0912c` inventories all 51 filters (receipt `4b1e3814`).
+New actual deadline/unknown/cleanup test passes; abrupt-C reaches verified
+retirement but its final helper requests shutdown again and receives the retained
+abnormal F diagnostic (negative receipt `c7415402`). Tail `sc-22847-lm4-fixture-tail-
+77995x5a` passes all 20 preceding cases, including normal multi-operation helpers.
+The 1024 case runs 370.95s and fails a desktop protocol-header check (negative
+receipt `8c286f1d`); all workers retired.
+
+Root isolated probes on the exact libtest establish the cause: the nested default
+libtest writes a 120-byte slow-test notice into restored C protocol stdout after
+60 seconds (hash `3d0aad72`). With `--test-threads=1`, the 65-second control emits
+zero bytes. Both precisely owned probe children were explicitly terminated/waited;
+these diagnostics admitted no C configuration or downstream workers. Evidence:
+`sc-22847-lm4-harness-channel-probe-00jlg7z8` and
+`sc-22847-lm4-harness-single-thread-probe-mvhw7ntv/comparison.json`.
+The minimal fixture-only wrapper/finalization successor is frozen at
+`sc-22847-lm4-fixture-protocol-finalization-c6rtslma` (manifest `bab5a36f`).
+Full compile `43b86d43` / receipt `331ba2a0` and independent review `80c2de3a` pass.
+Fresh libtest `be6ab63b` inventories 51 filters (build receipt `22531553`); unchanged
+production CLI `0432d408` is reused under audited identity evidence.
+`sc-22847-lm4-protocol-runtime-otr0zsc8` passes abrupt-C retirement (`fb207373`)
+and normal Run/Status/all-role retirement (`11e9942c`). Its 1024-result case passes in 370.3s (`6094f60b`), with root receipt `931a9a1a`.
+Independent aggregate audit `9b7ca85c` and matrix `f38650dd` pass: 51 canonical
+filters have exact 1/1 positive evidence (28 reviewed prior-snapshot, 20 lifecycle
+fixture, three final reruns). All 196 recorded command/fixture-child process
+retirements reconcile. This is explicitly not one 51-test run, and earlier
+negative gates/manual cleanup remain preserved. Local source commit
+`312b924c1064e08c1ee6d71a3d4904cfb30bd172` contains the accepted 16-file component;
+integrated as `aeff1722f96ec8b46994d592001ba8b51dd3ae8a`. The combined ten-step
+gate `sc-22847-lm-facade-integration-2bh9gds5` passes (receipt `aea803ee`): format,
+full test-target compile, fresh CLI/capture, managed startup, cold/warm preview,
+four capacity tests, retirement invariant, actual Run/Status/all-role migration,
+and Tauri check. CLI remains `0432d408`; requested capacity figures are unchanged.
+Independent composition `5cd40605` and runtime audit `ae06be79` pass, reconciling
+396 source hashes, all 16 authored files and 20 recorded process retirements.
+No full facade runtime or S12 acceptance is claimed.
+
+A separate managed-C process trace (`df08341a`) establishes that the closed
+paired allowlist has no C-owned OS children. The facade's proposed abrupt-C
+retirement path therefore requires verified paired Ready identity, checked C
+reap and transport completion, joined G migration state, and existing G-native/F
+drain. Legacy/unverified/unknown-G states retain the old conservative policy;
+unknown catalog outcome must remain distinct from safe retirement. This path
+is implemented and source-reviewed but still awaits runtime proof.
+
+Next: implement the already-planned managed G export-native owner and C service
+adapter, preserving exact F stage/work identity, SQL ordering, shared-pool
+admission, checked child retirement, lost-ACK recovery and existing durable
+publication/failure policy. A bounded read-only code-path map is underway.
+Full S12 installed workflows and S13 readiness remain open. No push, CI,
+installation replacement, canonical migration or RAID access occurred.
+
+LM startupFIFO plus checked receiver verdict passes compile5d381c99 and
+independent closure79149970 (0.99). Nine-case runtime active in
+sc-22847-lm3-fifo-proof-runtime9-gdx12zry, outer64705. Publication ENOENT is a
+real Recovery Begin defect: strict seal reader requires the intentionally absent
+payload. Stronger author is factoring metadata-only restore admission while
+preserving strict publish verification, locked restore identity and journal
+checks. Sol explicit-overwrite/diagnostic fixture corrections are preserved.
+
+Publication runtime17: thirteen exact passes, four failures (real-F interrupted
+capture ENOENT; three catalog fixtures lack explicit overwrite). Four old plan
+filters selected zero and were corrected to ownership_tests, then all four
+passed; invalid attempts remain preserved. Evidence ob0ff0a3, suno07sx and
+ownership4-fsgctyr4; source verified, all cargos and F30242 retired. Sol/high
+owns bounded test-fixture diagnosis; no production change inferred. LM startup
+FIFO candidate204ce2c2 is frozen, full test-target compile active in
+sc-22847-lm3-fifo-preflight-r111qniu (outer49187), independent review next.
+
+LM corrected exact-name four-case runtime entpshlh passes three cases; the
+remaining seven-operation fixture reaches current repair and exposes a startup
+multipart ordering race (grant on urgent queue, subsequent data on ordinary
+queue). Stronger author owns bounded transport repair plus deterministic test.
+Invalid zero-selection run mb5e6na7 remains explicitly nonpassing. All native
+processes retired and source unchanged. Publication R4a/R5a successor26a49207
+passes compilee5722759 with exact source/retirement verified; independent closure
+review precedes seventeen prepared tests in publication-runtime17-ob0ff0a3.
+
+LM test-only fixture repair plus two borrowed serialization fixes passes full
+test-target compile e9874267 and separate source review 2a2e8be7 (0.98).
+Exact content assertions derive three evidence identities from dedup semantics.
+Four-case runtime is active in sc-22847-lm3-fixture-runtime4-mb5e6na7,
+outer38328; no result yet. Publication stronger-author successor080e44ab passes
+compile6b735935. Different reviewer is checking all six prior findings and has
+identified remaining allocation-ID coverage and cancellation/error-priority gaps.
+
+LM3 R8 runtime completed five passes and four failures across nine exact tests;
+receipts sc-22847-lm3-runtime9-l1ctuiya and runtime9-remaining-8fi_fbox preserve
+all logs/source identity. Cargo waits verified; no shared-target workers remain.
+Run/status/raw retention, resolver, lock, supplement budget retry and populated
+alias refusal pass. Three failures share a 4-vs-3 evidence-row assertion; one
+expects a different disjointness rejection. A bounded Sol/high fixture repair
+must derive expected evidence content from producer and preserve no-write/path
+semantics before compile, independent review and affected-case rerun. Publication
+R1-R6 remains under separate stronger-author repair; no native run is active.
+
+LM3 R8 T213447 fixes original-path validation before Bootstrap and adds absent
+alias/no-write plus canonical first-use coverage. Full test-target compile
+passed db2dc091 with unchanged source and checked retirement. Independent
+closure review add7688f passed (0.96); nine affected runtime tests are active in
+sc-22847-lm3-runtime9-l1ctuiya, outer42891. Publication review
+9b908768 requires six repairs: original/publication joint custody, bounded
+rejected-step reconciliation, mode binding, allocation owner completeness,
+primary mutation-error retention, and correct recovery/fault coverage. Stronger
+implementation owns that bounded repair; a different reviewer must approve it.
+
+LM3 T212233 compile passed (ffb91e3a), but independent review found that an
+alias to an empty destination can reach Bootstrap before managed no-link
+validation. Author is repairing validation before any create/upgrade authority
+and adding an empty-destination no-write regression; runtime8 remains unexecuted.
+FS9 publication compiler successor 720cdb56 passes the full test-target check
+(aeb05f57, source unchanged, checked process retirement); separate independent
+source review is active. Both components remain uncommitted and unaccepted.
+
+LM3 T205842 passed independent source review b95ead09, but the root runtime
+selected 22 tests and returned 15 passed / 7 failed. Negative log 4d662a21 and
+checked process retirement are preserved in sc-22847-lm3-runtime22-83eq74mn.
+Successor T212233 changes three files: shared canonical destination resolution,
+canonical synthetic fixture paths, and result/error assertions. Manifest 9ab70779;
+root full test-target compile passed in sc-22847-lm3-runtime7-preflight-b0j3hbl0
+(log ffb91e3a, source unchanged, checked process retirement). Independent review
+is active; eight affected tests remain before this repair can be accepted.
+FS9 publication first candidate 6cd318d6 failed compilation with seven type/API
+errors (log ea704de6); source hashes and cargo retirement verified in
+sc-22847-publication-preflight-dwv5x85v. One bounded compiler repair is active.
+No integrated LM3 or publication acceptance, external-drive reads, push, or CI.
+
+LM3 stronger-model candidate T203411 (41 files, manifestc4b97d4f) passes full
+Rust test-target and Tauri compile checks, logs1dca6e22/a1b9196f, source unchanged.
+Different independent reviewcdcf4d07 requires four repairs: Run shared parser/SQL
+admission, continuous preflight/upgrade database identity, exact rejection test
+text, and platform gating of Unix-only fixtures. One bounded V1-V4 repair is
+active; runtime20 is prepared but unexecuted. FS9 publication implementation is
+active in isolated sc-22847-export-publication fromf03c6fe, covering the complete
+stateful preparation/capture/link/restore/verification/cleanup lease. Its design
+preserves exact active-step replay, terminal custody, SQL ownership, and joint
+original/publication accounting. No native jobs are active at this checkpoint.
+
+FS9 original verification is locally committed `dcdfd5d` and integrated `5c210c8`;
+all 14 reviewed blobs match, including observed capacity documentation. Eight
+exact tests passed (each1,953filtered), F61529 checked/reaped and absent;
+evidence review4e868bf4 PASS0.98. Integrated gate
+`sc-22847-original-lease-integration-g25tfc1m` passes formatting, fresh CLI,
+managed startup/refusal/retry, cold/warm render and Tauri. Logs d5307abd,
+05ae6f65,8b00e8e9,3ad528fd; binary4f4fbebd; source unchanged and all reported
+processes absent. Independent integrated review302bd465 PASS0.98. These are
+component and integration-smoke results, not full S12/RSS/default-route proof.
+Requested backing min/default/max is 6274571984/6988676926/1076761649962 bytes,
+not measured allocation or RSS.
+
+LM3 T200212 reviewf846ebd9 requires repair stored-state admission, valid supplement
+fixtures, actual unpinned legacy upgrade, and bounded prepared-input failure
+reporting. Stronger-model implementation owns this bounded repair now; a separate
+reviewer will assess its output. Original author is idle. Next FS9 publication
+capture/link/restore work is read-only mapping, with no implementation admitted.
+
+LM3 T200212 (32 files, manifest5d20174e) passes full test-target and Tauri checks,
+logs52011090/68191804, cargo36889/38062 waited0, source unchanged. Independent
+semantic re-review is active before the 15-test gate. FS9 reviewa9a43cbf found
+PhotoPublication dropped before Finish/Abort; successor e486bce0 restores lifetime
+and adds a lock-retention test. Its full compile passes (cargo45154 waited0,
+loga7c7d4b6); independent review precedes the seven-test gate. Both lanes remain
+local synthetic work, no runtime acceptance yet.
+
+FS9 original-verification source ce64eab9 (14 files, manifest298523b6) passed
+full test-target compile: `sc-22847-original-lease-preflight2-p5po7f2t`,
+cargo15069 waited0, source unchanged, log3a1a5195. Independent review is active.
+First compiler negative d720b6d6 is preserved; its two ownership/conversion errors
+were repaired together. The focused actual-F test uses a real subprocess of the
+libtest executable with a test-only cancellation barrier, not the production CLI;
+its unused production-binary prerequisite is being corrected before runtime.
+
+LM batch3 T192424 (28 files, manifest e1ca27fa) passed the full test-target
+compile preflight in `sc-22847-lm3-preflight3-xyyrpsrk`: cargo67371 waited exit0,
+source unchanged, logd272c6ce. Independent review4d1effbd requires seven repairs:
+startup grant reception, first-use lock creation, typed/retained allocation
+admission, validation before Bootstrap, source/destination separation, fixture
+protocol isolation, and status schema parity. One bounded repair batch is active;
+runtime remains unstarted. General coding author handles the explicit repairs;
+stronger independent review is reserved for cross-process ownership/accounting.
+Coordinator alone owns the serialized native lane. Shortcut23445 records this
+checkpoint. FS9 original-verification ownership remains an independent source lane.
+
+Current combined-tested source is `d3b5c24`, including FS9 facts `786be8c`,
+LM transport `d8f5a6e`, and LM supervisor batch2 `b9e8177a` cherry-picked with
+eleven exact frozen blob matches. T180722 passed four focused tests (each1,
+0failed,924filtered); receipt7207567a and independent evidence review0730ac17
+PASS0.99. Earlier sixteen-test evidence remains retained. Typed Broker cause
+survives cleanup faults and a preexisting secondary cause; external cancellation
+with a live nonfailed Broker stays Canceled. Compiler and PID-publication
+fixture negatives T175237/T180033 remain preserved with narrow successor reviews.
+
+Combined gate `sc-22847-facts-lm2-integration-dymsh3u7` passed package formatting,
+fresh CLI build, actual managed startup and cold/warm render (each1), and Tauri
+release check. Session94548 completed/reaped0, source_changed=[]. Logs: CLI
+021eed03, startup29dd7945, rendera502ec36, Tauridda8d981; independent integrated
+evidence audit PASS0.99 c9567d9e verifies all384 source hashes and current child
+retirement. This remains synthetic local integration, not release
+or complete S12 acceptance. Shortcut23433 read back.
+
+Process audit found old orphaned synthetic pairs34004/34005 and50122/50123 from
+failed preview-io gates. Their runner sampling missed each second worker pair.
+Fresh identity/fixture checks preceded exact-PID SIGTERM; all four now absent,
+fixtures preserved. Evidence `sc-22847-old-fixture-cleanup-1565nxmz`; Shortcut23434
+read back. Current test still skips finish on early errors; isolated test-only
+custody repair is authorized from d3b5c24, preserving production fail-closed
+behavior. LM batch3 shared executor/roles is the independent next source lane;
+neither lane has native authorization yet. G/C application bridge remains batch4.
+
+Current follow-up validation: fixture ownerfix Lvaq3LHQ/d650f744 source PASS0.99
+97ae705f retains the entire unresolved Unstarted owner plus temporary directory.
+Root-owned runtime-sqpgu3te passed early-error, normal-render and metadata-wait
+cases; the fourth plan name selected zero and was rejected. Exact source function
+`actual_catalog_loss_after_start_retains_f` then passed alone in abnormal-_h1h3kax,
+logdc90194b; no source change or repeated first-three tests. Final evidence audit
+pending. Original compiler and invocation negatives remain preserved. JYL1Ia
+freeze and precompile hashes match; an incorrect stale-manifest report was
+explicitly corrected after root comparison.
+
+The broader compile preflight exposed an earlier3b6752b test-harness regression:
+two standalone suites path-included private xmp_rdf, now dependent on LM memory.
+Root xmp-test-harness branch moves all12 unchanged tests into private unit-test
+modules. Full `cargo check --locked --release --tests` passed, source unchanged;
+source/compile review PASS0.99 a140a9af. Runtime12-test gate is active session5342
+under `sc-22847-xmp-test-harness-runtime-4lvmwx83`; no result yet.
+
+LM batch3 initial24-file freeze T185710 is retained; root found its seven-operation
+table covered envelopes, while actual worker execution covered only Run/Status.
+Author is completing the other five successful worker operations before a new
+freeze. Root will apply the disjoint verified XMP test fix before the all-tests
+compile preflight. Root now owns native invocations through verified wrappers;
+authors own code and independent agents review exact evidence.
+
+Follow-up completion: fixture c278ce1 integrated00457cc with exact two blobs;
+four-case evidence review PASS0.99 b2369400. XMP harness93c6806 integrated4911cac;
+all12 tests passed (935filtered), direct cargo97021/outer5342 reaped0, log762cb5d5;
+final evidence review PASS0.99 108fd2a0. No production RDF semantics/public API
+changed. Original-check and runtime snapshots preserve exact moved assertions.
+
+LM batch3 coverage successor T190340/e9da4b3a now includes source tests for all
+seven successful worker paths (still unexecuted). Root cherry-picked disjoint
+XMP harness as08daa03 into that dirty worktree; all27 authored hashes unchanged.
+Root preflight `sc-22847-lm3-preflight-m64jfs7t` checked tracked+untracked sources,
+then stopped on introduced compiler groups: serde tag collision/cascades, role
+threading, supplements borrowing, trait scope, match-guard move and Arc ownership.
+Cargo30781 exit101/absent, outer74182 reaped1, no tests; negative8a31f249 and
+negative-source-receipt verify source_changed=[]. One bounded compiler repair is
+authorized; no native lane active. FS9 original-verification remains read-only
+owner/API clarification, especially lost-ack addressability and retained records.
+
+Last combined-tested source `197e06e` integrates ICC `35f5a70e`; all
+14 files match. Nine focused tests passed, including actual F PID76821 reaped.
+Final component review PASS0.99 `9ec3d5de`; exact evidence is retained in
+`sc-22847-export-profile-final-OihbpM` and the compilefix native gate HYoIfN.
+The first compile failure and bounded reviewed corrections remain recorded.
+
+Integration gate `sc-22847-icc-integration-_ih3kc24` passed package formatting,
+a fresh release CLI build, actual managed startup refusal/same-pool retry,
+actual cold-render/warm-preview delivery, and the Tauri release backend check.
+Session17681 completed/reaped0; source_changed=[] on the exact source snapshot.
+This is local integration, not installation, publication, RSS qualification,
+managed-default selection or complete S12 acceptance. Shortcut23418 is read back;
+S12 remains In Progress. No RAID/photo/original reads or canonical migration.
+
+Production LM lacks a main dispatch/body and non-test application caller.
+Revised contract v3 e99abbf7 passed independent architecture review 575846ab
+(confidence0.91), resolving G/C physical ownership, accepted document/result
+limits, and retained failed-drain ownership. Implementation order v4 is:
+1. Multipart input/admitted result primitives.
+2. Owned supervisor lifetime and typed shared-pool failure.
+3. Common seven-operation executor and worker/Source roles.
+4. G/C authority bridge and application integration.
+
+LM transport batch1 `02a3c69` is integrated as `d8f5a6e`; all six reviewed
+and tested blobs match. Eight focused tests passed (0failed,901filtered), direct
+cargo exit0/PID15100 waited; final review PASS0.99 `71af2b07`. Evidence in
+`sc-22847-lm-worker-batch1-20260914T160953Z/native-second` preserves the complete
+receipt. The first wrapper failed on reserved zsh variable `status`; its test
+output/fresh compilation is supporting evidence only. The identical corrected
+rerun supplies direct exit proof. Integrated package formatting also passes.
+Batch2 owner/API sketch is root-approved; source implementation is active.
+It retains partial post-spawn owners and typed DrainPending, distinguishes
+confirmed join panic from unknown child wait, and checks release acknowledgements.
+Blocking Drop drain is the final ownership guard; normal controls stay pollable.
+Exact shared-pool reservation/result paging and multipart consumption belong
+to this batch. Freeze T170418Z/2f99c89a failed review0.98 (f155403f): guard/drop
+ordering, independently admitted retained failure text, and typed cancellation
+with UTF-8 byte bounds. Corrected T172354Z/01084eb6 passed review0.98 (600addc6),
+including one stale test-call correction. Its exact sixteen-test native gate
+compiled and stopped before tests on four mechanical groups (negative f075f5e4).
+Corrected T172859Z/81d4c766 is frozen for changed-line review before the same
+sixteen-test retry (review9f679e71). While that frozen gate runs, root/reviewer
+confirmed another typed-cause loss (addendum6b668079): Broker Reserve ResourceLimit
+sets shared Stop, then supervisor retains Canceled and discards exact limit at
+drain. Frozen gate passed16/0 (906filtered), cargo60713 and all reported child
+PIDs absent; raw4726f042 and passing-receipt885bb117 retained. The one bounded
+fix/test now preserves actual Broker failure over internal cancellation. No
+batch2 completion claim until its successor review and affected gate pass.
+No executor/G-C caller exists.
+Typed-cause successor T174251 remains CHANGES_REQUIRED0.99 (9744822a): a
+generic LM I/O drain fault can occupy the terminal slot before the primary
+Broker error. Bounded repair retains primary error precedence through checked
+join, tests exact required2/available1 together with LM I/O panic, and tests
+external cancellation with a live nonfailed Broker. No native grant on rejected
+source. Shortcut23430 read back; prior sixteen-test evidence remains valid for
+its frozen source, without a batch2 completion claim.
+Sol/high implements and independently reviews using separate agents, reusing
+context because new-agent thread capacity was exhausted.
+Earlier actual Source evidence used an LM thread substitute; that limitation
+remains until production worker integration and its tests pass.
+
+Parallel FS9 source component `sc-22847-export-facts` starts from checkpoint
+`443f716` (Shortcut23422). Stateless F facts and one stable destination snapshot
+preserve C SQL transactions, alias decisions and current recheck points; no
+cross-request alias session is justified by existing semantics. All existing
+alias callsites remain in scope; capture/link publication and original reads
+remain separately open. Source freeze BHm4KWtG/009c7744 failed independent review
+0.95 (77ba1f76): build identity omits three changed export modules, and the
+cancellation tests only exercise Client pre-admission, not F mid-read translation.
+Successor cancel-wkjznarn/320bebc8 passed independent review0.97 (6f1ce913):
+three fingerprint inputs and deterministic F mid-read cancellation are verified
+at source level. Its exclusive CPU2 ten-test gate is authorized; no native
+result yet. First test failed before routing on the shared synthetic restore
+marker. Fixture-only successor rnyuzas_/77b23d5f passed review0.99 (ab3dd235);
+the second attempt reached the final routing assertion but compared caller
+/var spelling with the canonical /private/var destination. Test-only canonical
+successor tceoyzrk/d41fb3ab passed review0.99 (24f1699b), preserves >=2 rechecks,
+and audits the remaining nine expectations. Third gate eeIDx4 passed all10 exact
+tests, each1selected/910filtered/exit0; F55110 was reaped and no owned process
+remains. Both prior failures are preserved. Docs-only final8_6xi_8s/9d35c2c4 is
+final evidence PASS0.99 (3e33a444); Rust hashes are identical. Component8f03d7d3
+is integrated as786be8c with fifteen blob matches and formatting PASS. Combined
+integration is held until LM batch2 passes; its conditional retry owns CPU2.
+
+
+Read-only next FS9 assessment (not implementation authorization): original
+`VerifiedFile` continuity at accept/publish genuinely needs an F-owned lease;
+`PhotoPublication` owns operation lock plus payload/destination/capture handles
+across capture/link/restore and remains a separate full stateful component.
+Current `ExportService::open` still owns filesystem executor lock/staging in C,
+and `ExportWorkerProcess::spawn` remains C-local. G-owned export process and
+F-owned staging/original acquisition remain explicit managed-route prerequisites.
+No new source work starts from this assessment before current combined checkpoint.
+
+## Retained verified component history
+
+Current desktop source is `96d5fa7`, including C admission `d8bb236`, LM atomic
+projection `c609abf`, and FS9 directory preparation `96d5fa7`. The combined CLI,
+actual managed startup/render and Tauri backend gate passed; component
+evidence is verified below. C preview metadata admission is reviewed and
+verified locally. Its mandatory explicit shared allowance precedes ConfigWire
+copy and C launch; the guard spans OS wait/pipe joins plus final Shared/Parent
+owner drop. Typed refusal preserves F startup custody and supports same-pool
+retry. Nine tests, fresh CLI build and package formatting pass; source review
+PASS (confidence0.99). Evidence `sc-22847-c-admission-c5xhb6jj/passing-v3.json`
+verifies nine source hashes and seven qualifying command receipts. Initial
+passing tests missed surviving G relay storage; reviewer found that issue and
+final configured tests now keep the charge until parent drop, then start a
+second actual C/F pair. Superseded evidence remains visible. Requested aggregate
+adds96 bytes for its exact guard storage; it is not RSS or a native/image budget.
+Sol/high implemented LM preprojection in a separate worktree, with independent
+Sol/high review (new-agent thread capacity was exhausted). Root escalated the
+cross-layer design after failed static-peak proofs; the shared-ledger/atomic
+successor passed four tests and final review. A separate Sol/high component
+completed FS9 output-directory preparation from `d8bb236`: move directory resolution/checks to F,
+preserve catalog-based native naming/revision/error behavior and prove the
+managed route. ICC/profile admission, aliases and export publication remain open.
+Its nine focused tests and final review pass; source writes did not overlap LM.
+LM T140535Z native verification disproved the claimed complete initial peak:
+the managed core rose from 3,466,257,961 to 3,503,438,666 bytes (15 growth
+attempts). Two helper tests passed; the actual managed test failed. Source-review
+PASS is therefore insufficient. Root owns the cross-layer diagnosis after
+repeated incomplete peak proofs; Sol/high has a bounded test-only trace task
+to distinguish growth before and after the historical commit. No extra slack
+or production formula change is authorized pending that evidence. FS9's exact
+13-file freeze is independently under review. Shortcut briefly returned HTTP
+503, then recovered; comment 23408 and S12 In Progress were read back.
+The T141633Z single-test diagnostic now proves timing: 37,180,469 bytes of
+growth precede the historical commit and another 232 bytes occur between the
+historical and supplemental commits. It failed the expected assertion and all
+processes were reaped. Raw log SHA-256 is
+`b7063ddce4f7a6f0e093ede406912bfe043cc9ddf771b96d637d6a59c73fde14`.
+Root selected shared-ledger preparation of both projections before a single
+atomic commit, rather than an unproven complete static XMP peak. The Sol/high
+author is checking a bounded extraction plan before implementation. Required
+proof: supplemental preparation refusal changes no projection/native metadata
+tables; same-pool retry preserves both outcomes and exact retained XMP.
+FS9 successor `sc-22847-export-directory-successor-FZVawZ` passed independent
+source review (0.97); candidate SHA-256
+`dfafe0141da1f2e0c4fddc13e509f1cf4f62d9fc8cb76a99474a514c2d7884df`.
+Review caught and corrected the uncounted outer C caller request backing.
+Nine exact focused tests are granted the CPU2 lane against frozen source,
+including real F process and actual managed destinations routing. No native
+success is claimed until the receipt is returned.
+LM atomic T144126Z now passes all four selected native tests, including real
+shared-pool supplemental refusal before writes, same-pool retry, no admission
+growth during commit, and second-write rollback. Cargo PID 94489 and Source
+child 96154 were reaped. Log SHA-256
+`b1ced5d8ca5db556db59d67ac3f1228c12a9ed7646e3ffe9029e488414dfdf46`;
+requested core high was 6,720,502,850 bytes (not an RSS measurement).
+FS9 retains five passing focused tests. Its real-F shutdown initially failed
+because libtest appended a stdout trailer after the protocol completed; the
+test-only child now exits cleanly before that trailer. A subsequent run selected
+zero tests due to a stale shared-target artifact from the LM worktree, so it is
+explicitly invalid. Force the active crate's Rust rebuild on worktree switches
+(mtime-only root touch, content hash unchanged); do not clean native SDK caches.
+Native runs remain serialized CPU2 and unchanged checks are retained. Production
+route/shared-pool policy, full LM/S12 and S13 remain open. No RAID reads,
+installed-app replacement, push or Actions.
+
+Combined gate `sc-22847-combined-gate-9q1g4k6t/receipt.json` passes formatting,
+fresh release CLI build, actual managed startup refusal/same-pool retry (one
+test), actual cold-render/warm-preview delivery (one test), and release Tauri
+backend check. All five direct commands and outer session 8050 were waited,
+exit 0; all frozen Rust/manifest/lock source hashes remained unchanged. Root
+integration preserved the reviewed component blobs exactly. This is local
+integration evidence, not installation, platform packaging or S13 performance.
+
+The bounded wave is integrated locally: metadata aggregate (Sol/high), managed
+SqlReader selected-XMP proof (Sol/high with existing subsystem context), and
+actual-native corrupt-cache fixture (Sol/medium after Terra/medium returned
+planning without implementation). Independent Sol/high reviews checked ownership
+and merge interactions; root repaired issues exposed by integrated tests. Native
+execution remained serialized. Existing unchanged results were retained.
+S12 remains In Progress; full process admission and the remaining desktop
+capabilities are still open, and S13 has not started.
+
+- Desktop LM integration is committed at `f64f6fc`; selected-XMP proof is merged
+  at `2f21444`. The preview aggregate and bounded error storage derive from
+  `1244cae` plus `0cd5078`, with a reviewed root correction using direct anyhow
+  downcasts for typed context markers. Final preview validation passes 24 tests
+  and a fresh CLI build, plus the macOS Tauri release compile check. Evidence is
+  `sc-22847-desktop-lm-integration-q8yn11ac/passing-preview-receipt.json` and
+  `tauri-check-1789390790674933000/receipt.json`; all direct processes were waited.
+  Actual JPEG/WebP/AVIF corruption invalidates only the bad entry, preserves the
+  healthy sibling and verifies C/F/N retirement. Delivery, cancellation and native
+  resource refusal/retry also pass. Earlier fixture SQL-type, warm-decoder-count,
+  permissive truncated-JPEG and unclassified-short-read negatives are retained.
+  The fixture now uses explicit invalid JPEG/WebP syntax and truncated AVIF.
+  The aggregate's 3 passing arithmetic tests are retained across the unrelated
+  typed-context repair; final owner counts are documented in
+  `docs/PREVIEW_METADATA_CAPACITY.md`. This reports requested metadata backing;
+  it neither reserves that capacity nor establishes whole-process/RSS admission.
+
+- LM retained-core admission is committed at `2b742e8568055b104b9235994cde594f5f6a22c7`.
+  v55 passed 16 functional tests and three formatting checks; independent evidence
+  review v2 `b02c27fac4203884e5f6a6d72519cb576ef3de8f3dbdd65dcd9b3bb55f8024f5`
+  confirms denial before insert and one retained record after retry. This includes
+  actual Source children with an LM thread substitute, not full LM production proof.
+- XMP now supports exact-length admission before copying SDK output into an owned
+  Rust string, retaining the admission guard until that string is freed. Local
+  commit `803c2bdce9e3269d241193a0ba227591a454f8e9` passed four allocation probes,
+  15 SDK tests, two formatting checks and vendor-only strict Clippy; receipt
+  `sc-22847-xmp-admitted-tqric7zx/sdk-gate-1789382376301164000/receipt.json`, SHA256
+  `3edd4a5d08b592ba819612813d5fa290850ba807bc75288f5ff880311dae1029`.
+  Both XMP prerequisites are cherry-picked into LM at `a31c52a8e9d73378d52400aab1feeb0f50be98f6`.
+  Opaque SDK
+  allocations remain a separate boundary. The selected-import XMP/Prepared
+  component is now committed at `3b6752b797ac6b9154ebad13ebeb4f3c677aa8f4`:
+  scoped admission precedes XML/RDF/Prepared construction, guards retain owner
+  lifetimes, typed resource denial propagates, and streaming semantic hashes
+  preserve prior bytes. Eleven focused tests pass (eight unchanged results plus
+  final-source selected-import one and JPEG two). Source and identity addendum
+  reviews pass; all 11 committed files match the reviewed freeze and the worktree
+  is clean. Final evidence is `sc-22847-lightroom-migration-bridge-xksnotzh/core-xmp-freeze-20260914T113402Z`;
+  artifact manifest SHA256 `4c63d5d5741cadcc01290d95758da52146d08debbc0a75aec97aab1f1cc416d8`.
+  The initial two compile errors and recovered JPEG transcript/count correction
+  remain recorded. Successor `f27917066b7415d355da8374f2886d250cbb4206`
+  proves selected metadata through the actual managed SqlReader/Source child:
+  required 3,447,432,641 versus available 3,447,432,640 rejects before five table
+  families mutate; same-pool retry preserves raw XMP, semantic hash and rows.
+  One focused test passed with direct exit 0 and independent review PASS (0.95).
+  Operation ownership retires to caller-only 17 then zero; LM is a joined-thread
+  substitute. Receipt is `managed-selected-freeze-20260914T114754Z` under the same
+  private evidence root. Full LM process integration, pre-projection coordinator
+  ownership, large canonical/shared-extension stress and native SDK bounds remain open.
+  Earlier whole-app Clippy failed on
+  182 unchanged baseline diagnostics, so vendor success is not an app Clippy claim.
+- FS8 v31 passed eight SQL/edit/image rollback tests and whole-app strict Clippy.
+  Only fixture formatting failed; receipt
+  `sc-22847-fs8-implementation-glc4j7lt/gate-initial-1789383275716977000/receipt.json`,
+  SHA256 `beb4fd5032823ad49503c60980866ea6bb65d111d99ae693a752cdd99f9758a3`.
+  All direct commands were waited; the outer runner exited 1. The earlier v29/v30
+  negatives exposed test setup transactions/identity triggers and are preserved.
+  The successor combines formatting with reviewed count-before-copy SavedJob
+  serialization. v32 then passed its three affected tests, strict Clippy,
+  formatting, fresh CLI build and all three actual preview fixtures: prepared
+  reuse, changed-original/corrupt-cache fallback, cold/warm delivery and
+  JPEG/WebP/AVIF. Initial receipt SHA256
+  `4344b9afcfa64dbea031d7ac5b35f12f1254af9db0ec626cb2dc35f7873b6cb5`;
+  configured receipt SHA256
+  `ab30907026f3f58013ac3ab15b6b7efdc27ab913a1002c21c70fe4c1a941fc7a`.
+  Both outer runners exited 0; all nine direct commands were waited. Four cached
+  previews at 2 MiB took 995.719 ms in this synthetic batch; this is not S13's
+  200-preview p95 benchmark. The local checkpoint is committed at
+  `b2ecda61fae387848d3cfae30c9ebe393cdd92d3`, with all 68 committed file hashes
+  verified against source-v32. Merged into desktop at `dd58654`; application source
+  exactly matches the checkpoint. The LM checkpoint integration preserves managed
+  job guards and both SQLite fixes.
+  Independent Sol/high review found two stale LM catalog-constructor references;
+  both now use the session authority and SQL wrapper. A schema-index check also
+  conflicted with the restricted SQLite function whitelist; it now compares
+  borrowed text without adding authorization. Exact repairs pass source review.
+  Combined validation passes 26 focused tests: supervisor 5, exclusive-open 2,
+  database identity 4, prepared edits 4, directory discovery 1, index validation 1,
+  bridge 8 and metadata rollback 1. The six bridge failures before the index fix
+  are preserved. Evidence is `sc-22847-desktop-lm-integration-q8yn11ac`, with
+  passing receipts `gate-1789387799261340000` (first five commands) and
+  `gate-1789388111029829000` (all three commands); all direct processes were waited.
+  A shared-target stale XMP Rust
+  artifact caused the first compile failure; only wrapper freshness was
+  invalidated, with source hashes unchanged, before retrying.
+  No remote publication or full FS8 completion claim.
+- Execution uses the reloaded shortcut-epic model policy: Luna/low for mechanical
+  evidence verification, Terra/medium for localized review and fixture repair,
+  Sol/high for cross-layer XMP implementation. Each received an explicit model and
+  a self-contained brief without inherited conversation history. Earlier inherited
+  agents were stopped. Valid unchanged tests and reviews are retained.
+
+S12 remains In Progress. Full preview aggregate admission, production migration,
+remaining desktop surfaces and S13 acceptance are open. No RAID/original reads,
+installed-app replacement, remote push or new Actions run at this checkpoint.
+
+
+S12 sc-22847 is In Progress; S13 sc-22848 is unstarted. Draft PR16 at
+`f5917e19c01f648ed5af61e97f6a1b5bd7fa5de2` passed all four CI34804834306 jobs
+and all three installer/archive/payload audits. Root verified 28 artifact hashes
+in `sc-22847-ci-34804834306-z9sy0qyl/receipt.json`, SHA256
+`2de9984ef36b72e6ab8ca0bf8afce306ed23ff5ca12f44372e0785995eee239d`.
+PR description and exact head/body readback match. This qualifies the published
+FS7 checkpoint and packaging evidence, not full desktop interaction. The Mac
+observer binary was not uploaded; its reported hash is not independently verified.
+
+Lightroom admission prerequisites remain isolated from the desktop PR:
+
+- `bc759a8`: four fixed-layout allocation probes passed.
+- `4c36a57`: two bounded error-formatting regressions and formatting passed.
+- `af6b7b2`: saved artifact descriptors and IDs are validated on borrowed SQLite
+  values before copying; existence-only reads use EXISTS. Four tests and formatting
+  passed, including malformed-row pending/recheck, retry, offline raw custody and
+  authority separation. Root verified 122 committed blobs and nine runtime
+  artifacts. Receipt `sc-22847-saved-artifact-guards-giq85t1c/gate-initial-1789361046416382000/receipt.json`
+  SHA256 `46070894fd747ccfcfb80c24d68eb93e3e9b9b04066b6cbfb2d0c13ad529b213`;
+  independent final review SHA256
+  `c1448f7257a327767d10800bd84f1b86a5595b7e5fbc91d8db9e02c4b8f02747` passed.
+- `00038f0ed323b8347120d51a00ddcf4f85607a50`: closed-roster Source path
+  preparation uses explicit allocation grants retained through child reap and
+  pipe joins; Source children disable library backtrace capture locally. Sixteen
+  functional host tests (ten in-process, six actual-process) and formatting
+  passed; all 17 commands were waited. Root verified 124 committed blobs and 25
+  gate artifacts. Host receipt SHA256
+  `c19e6f2938ff4c3db9d8930e0d04fa919b0873718e870d56796302bdf730a030`;
+  compatibility receipt SHA256
+  `562e61c027b9fe9666b6bd1945d2936753d4694fc7ed1c6a9d6bf70d30655d94`;
+  independent qualification SHA256
+  `e56263e28b1510cfae0a987a2e46041fb0d8b073a4c398cb8e6d53f3a170a1ad`.
+  The first attempt failed compilation before running any tests; three old
+  fixture calls were corrected and the negative evidence retained. Windows
+  runtime, whole migration integration and aggregate memory admission remain
+  unqualified.
+
+FS8 native/stage/prepared design v6 passed independent review; actual child
+ownership, header/full decode and shared scheduler implementation is in progress.
+The F-stage repair passed bounded source review: exact transfer abort, retained
+prepared-folder identity, nonreplacing cleanup claims, sealed header-only rearm
+and supervisor abandonment after all native owners drain. The first integrated
+compile found 12 errors before any test ran (receipt
+`2061d2b2c17d45a23479efe8c44a1138b1cad0a721d406b0ca484ae7851f1501`).
+Independent review found six integration defects: blocking actor I/O, incomplete
+descendant proof, render/read fairness, cache acceptance parity, premature root
+authority release, and synchronous self-wait during an existing native pause.
+Source v3 passed compile-only verification: one waited Cargo command, zero
+tests executed; receipt `91c2734d7bf2db944ac2da952f9f98f357818c783e21131500b48ce6a3609479`.
+Its three warnings do not constitute a Clippy pass. Subsequent off-actor I/O,
+synchronous-read preflight and native-admission repairs change that source;
+the successor integrated runtime gate remains pending.
+
+Two components have isolated runtime evidence, separate from package acceptance:
+four retained transport-task tests passed (receipt
+`eddc2fd016e00ea8fd6aa2b1c12916b68fa284703168931d7358e7f585954c54`),
+and twelve scheduler tests passed (eight FS8, four existing; receipt
+`db806880f32c8b14311922c4ca1c024961b7dd8f8ce1e2ddb943e3c2c1ff1e8b`).
+The scheduler now shares priority/arrival arbitration between cache reads and
+renders; retries retain request age but receive a new lease to reject stale
+completion. Independent scheduler review passed,
+`f12944cf636bde5b96e19caae2cbcae2e71b2a100aa86fce780318fab02bcb47`.
+The isolated scheduler wrapper's initial module-path compilation failure was
+retained; only the wrapper changed. Full G actual-child, concurrent stage-lane
+replay, held-transfer responsiveness and desktop queue acceptance remain open.
+
+The v4 successor also failed compilation before tests (missing test-only
+`CodecSettings` import); five evidence hashes and waited exit 101 are verified
+in receipt `094d06b8b3d004e91af143deb773577a2539d4f43b8bd78dd1bfadbf991ce72b`.
+V5 repairs that import and three independently identified shutdown issues:
+canceled unstarted work exits before waiting on an unresolved admission, reads
+receive reserved Stop before sequential shutdown joins, and Render shutdown
+reconciles an unknown filesystem admission when no Job was returned. Its focused
+runtime gate compiled and passed 101 tests before one managed recovery fixture
+failed (two expected Spawn calls versus one observed); the distinction between
+authenticated Stop/status recovery and exact initial replay is being checked.
+Eleven evidence hashes and all six waited commands are verified, with no observed
+owned survivors; receipt `51bb62b838e34623176bab3376e8e86f84f9cd05d3ee3aac7f5b7d7cf50067f3`.
+The remaining groups, Clippy and formatting were not reached in v5. Its failing
+fixture expected an unnecessary second Spawn after authenticated Stop/status
+already recovered the identity; a separate exact-replay regression remains.
+The foreign filesystem shutdown cycle was repaired and independently reviewed.
+V7 passed 30 focused tests, then strict Clippy reported 12 diagnostics; formatting
+was not reached. Receipt
+`93b37293394e44150b174185e500fd583114dd1b649fe7f628221891672b0154`
+preserves all eight waited commands and no observed survivors. This is bounded
+coverage, with earlier unaffected component evidence retained.
+
+Normal service progress also needed to advance completed transport cleanup while
+a sibling waits on the unresolved filesystem operation. Independent review caught
+a cleanup-thread creation error being treated as terminal, preventing retry; v9
+corrects this and adds a regression. Its gate failed before tests because the
+new fixture omitted the Duration import. Receipt
+`5fdd0ca6c09baac1155a1c6e15042f77831a9534dc0ea0b2c33b11bbd76cf71f`
+has five verified evidence hashes, Cargo14767 waited101 and no observed survivors.
+The import-only v10 correction passed all 32 focused tests (two ignored), strict
+all-target Clippy and package formatting. Root verified 16 evidence artifacts and
+all 11 waited commands, with no observed survivors; receipt
+`6a6cc8f6b16564e8952d8872dcf51320639e94cc8e071eba6aa09a83fd7b5c47`.
+This includes the two normal-tick recovery tests and retained-result regression.
+Ready-ticket encoded delivery still
+needs off-actor storage I/O, and stage metadata needs actual capacity admission
+before filesystem effects. These remain within full FS8 acceptance; configured
+C/G/F/N delivery, final accounting and bounded measurements are not yet qualified.
+The stage capacity repair is applied on the isolated FS8 branch: fixed 16-slot
+storage is charged by actual capacity, sealed digest and cleanup path growth are
+reserved, prepared paths are admitted before filesystem changes, and exhausted
+metadata allowance cannot block authorized cleanup. Three new regression tests
+and the two-file source passed independent review
+`9b5ff283fa43ae6d10e662f60b2501a55748362c3b7e95f7485d457207c2f0f2`;
+all three added regressions subsequently passed in v12. Source files are retained
+privately in `sc-22847-stage-capacity-czfw9qcf` for exact comparison.
+
+The next encoded-delivery implementation has source review for its retained
+read/native pause, SQL identity checks, off-actor transfer and exact E/binary
+reservation lifetime. V11 failed compilation before tests (module path, shadowed
+Context trait and private read-state accessor); receipt
+`a6cecf59675a5a60d234f32b04c008ccfd3ba9439477192a205b02427e354cd6`
+has five verified artifacts and Cargo39083 waited101, with no observed survivors.
+V12 corrects those three issues and rejects delivery when CancelPreview has
+changed an already-ready ticket state. Independent successor review
+`fbb7dce99535996b3a8f10872e2434175dc4dc469f4b32c3ab3479974c2f79e5`
+passed. The v12 focused gate passed all 20 tests, strict all-target Clippy and
+formatting; root verified thirteen artifacts, all eight waited commands and no
+observed survivors. Receipt
+`32dce8f47f28091938ad05beffd691b4d5ab9a79f4aa5fc3f0ebcd269fc22899`
+qualifies the affected stage11, delivery4, transfer2, preflight1 and progress2
+cases. Actual configured C/G/F/N and full desktop acceptance remain pending.
+
+The private legacy-read extension also passed three-file source review
+`1963bea5601baa65911de8f927f72e7555051dc7ecb40c4382f98fede19fafbd`.
+It opens only catalog-root previews by validated hash under the 4MiB legacy cap,
+using the existing single stage stream with a generated read lease and exact
+replay/Finish/Abort. Four tests cover catalog versus manifest authority, bounded
+chunks, cancellation, integrity and no source deletion. The three F files are now
+applied; both managed call sites use C-only hash selection and owned F tasks.
+Three additional adapter tests cover lost-begin/middle-read replay, foreign-lane
+isolation and held first/middle cancellation with retained task/result charges;
+independent test review `a6c1d286ddb86adfd9059d369581afcad1b2f7a5f3f5283ed6f3a2ab80026b7b`
+passed. V13 composition review verified all 44 pins and the exact seven-file delta,
+`ba0aeef713296dc29ff3bef7d7387dd3b77739709f474b9f87642556504c8215`.
+The v13 gate passed all 38 tests, strict Clippy and formatting; receipt
+`fdae94d1ab0069af7b8af3e24bf76a64bd325efc55ed617cee69a8df89f73005`
+has fourteen verified artifacts and nine directly waited commands. Source is
+preserved in `sc-22847-legacy-read-lrx3ovg7`. V14 added two configured preview
+fixtures and a fifth delivery regression. Independent review found test-only
+pre-C cleanup custody CF-1; v15 corrects the sole fixture file and passed source
+review `f9bec6b855e1c7541f06ae9163a47e9cb9c2f05fe3679cb2355ca4c4ee374ff7`.
+V15 delivery5 passed; test-only Clippy correction v16 then passed strict Clippy
+and formatting. Configured v16 stopped on invalid fixture SQL before workers;
+v17 reached workers but rejected the test-only null ConfigWire field. V18 omits
+that field, passed strict Clippy/formatting, and reached real G/C/F startup. It
+then exposed the obsolete FS6 helper gate: Proxy-backed worker_main still chose
+legacy Bridge, rejected OpenExisting and parked cleanup. The hung fixture was
+explicitly interrupted and directly waited; ten receipt artifacts and no observed
+survivors verified (`0eb7180c6867eefc5015019f3a581a7344cea3e62f11cdc8c49e04073c6d279d`).
+V19 selects the existing managed helper for Proxy-backed work and permits only
+already-converted routes. Its first compile stopped before tests on a missing
+ImportCancel fixture field. V20 corrects that field and passes all eleven focused
+tests (codec four, cache two, saved-query three, full upgrade one, helper one),
+strict Clippy and formatting. Root verified thirteen artifact hashes and eight
+waited commands; receipt `63d970f7a3912df22919df3fe492ba1292585e303bf4f7d6e49b97fb3ebac308`.
+
+Configured v20 reaches actual G/C/F and Render N but fails with a generic
+filesystem-unavailable error. The CLI and fixture were directly waited, and all
+seven artifact hashes match with no observed survivors; receipt
+`b1f3493c835173640b10af604b904fdc2690fec1b3f495856a1987ddcf3d1918`.
+The underlying fault was discarded at relay boundaries. V21 preserves it through
+the existing bounded error formatter; independent two-file review
+`747e6326a384616c0d385aaeb89cea0f0353e56023f1bd594ce4e0c2c1aace9c`
+passes without changing classification, admission or cleanup. Strict Clippy and
+formatting pass with six verified artifacts and two waited commands; receipt
+`cae42fb666a90a295a97ccd63fe12c9c14d46ba2ba84ff65bf2bace3bc463f33`.
+Configured v21 failed with `missing field value` in the filesystem reply.
+The isolated skipped-tuple Chunk round-trip reproduced this failure; a named
+skipped field preserves the adjacent-tag value object. V22 applies that repair
+and passes 28 focused tests plus strict Clippy and formatting (receipt
+`61e7c02a130d072538a7d77157667886c9459828222081b0accb0e706900f613`).
+Its actual CLI run completes Render N, Decode N, encoded delivery and checked
+retirement in the first session, then fails reopening the small-budget session
+before N. The complete configured test remains failed (receipt
+`c0e8a7a8a60b85b07f5ea1088d84b012f54904ee9b99842de5e7ae2fd1275e60`).
+V23 adds bounded typed diagnostics without changing limits. One focused test,
+strict Clippy and formatting pass; the first runner's incorrect discovery prefix
+is preserved separately. The actual retry identifies a selected 91,998-byte cache
+object with zero encoded allowance (receipt
+`4d0493e145e5b711dd7e3d3f57e46023ff16b4f2e437571ef492af0a4e47f3b6`).
+Root verified seven artifact hashes, both direct waits and no observed survivors.
+Source tracing identifies a duplicate hydration lookup of a read-owned queued
+ticket. Predicate and managed retry routing are being corrected; the 2 MiB
+working limit and 8 MiB encoded allowance are unchanged.
+
+Six abnormal catalog-worker loss fixtures and the staggered two-native-worker
+fixture now pass independent source review, with actual runtime pending.
+The staggered fixture submits B only after A has received its encode grant and
+is held alive. It exposes the dispatch loop's busy-task early return; the reviewed
+repair lets managed jobs reach the existing admission scheduler while preserving
+publication fences. Managed prepared-cache candidate selection leaves full
+source/receipt/content verification to N; rejected candidates still decode the
+original. These fixtures do not yet establish full FS8 acceptance.
+
+The codec correction now has local runtime evidence: typed native/JPEG/WebP
+resource and unknown failures are retained, explicit invalid cache data is
+Corrupt, and the broad managed error wrapper is removed. Only direct edges to
+already-locked backend versions are added. Four tests pass in v20; independent
+source review `83c73a4e1d9e71edb1d3b2714b2ebb5685833c45f9910be7312054d69607b6e0`.
+Source and the initial negative review are preserved under
+`sc-22847-codec-errors-6l024y0_`.
+
+Saved preview job recovery and schema-upgrade descriptors check borrowed TEXT,
+existing 64hex identities and 64KiB descriptor bounds before copying/JSON. All
+three new tests and the existing full upgrade test pass in v20; independent
+review `f41ac8871f0ce71994190b9afbf12f5224eb966758a4a64e0642004fda507b4b`.
+Root RenderWork/receipt/RenderRecord graph note passed shape review
+`dbb25958b65a3613b720946e3dd033f09c9f61aa4027a7166a95d1238c9da95d`.
+The pinned std/serde Vec construction and clone notes now distinguish fresh
+length-sized clones from original spare capacity and shared Arc backing. Final
+checked aggregate accounting remains open. Private WebP/AVIF route fixtures have
+source review; root abnormal-C/live-N/F-retention fixture is under review. Neither
+has runtime evidence yet. No installed-app or full FS8 acceptance follows.
+
+Lightroom Source admission v52 is committed locally as
+`f9ac9cc44d8ae922f84364d9adfdf9e38bed34e1`. Root verified 137 committed
+source blobs and 32 qualification artifacts. Fifteen in-process tests and five
+actual Source-process tests pass, with two formatting checks and all 22 commands
+directly waited. Qualification receipt
+`e404f6560e1b6dd56baeed7475756df6026a195f5538664cf195142c36dea25e`
+and independent review
+`e89c1f14fe084c3a443a22babfd0e092ac776e57f17ef9316c51a73102cdc295`
+pass. This includes three retained-query boundary/rollback tests and explicit
+funding for simultaneously retained source partition trees. Recorded allowances
+are phase high-water bounds, not measured live allocation or RSS. The fixture
+still substitutes a joined thread for LM; actual LM/core/protocol/production-pool
+integration remains required. Twenty libtest warnings are not a Clippy result.
+
+The subsequent preview v24 test build stopped on a boxed-Request fixture type
+mismatch before tests. V25 corrects only that test line; three regressions pass
+(read-owned hydration, managed prepared candidate retention and bounded
+RenderRecord serialization), with strict Clippy/formatting. Root verified all 59
+source pins, eleven artifacts and six waited commands; receipt
+`71c52dcf1660b779872213bc4c6ca30d07c2f83861dac0cba7ae7b6fc0846cd0`.
+Independent composition review found temporary descriptor saturation in the new
+managed hydration retry could mark a valid queued ticket Stale (HY-1; review
+`7d877d2a21301ba7a695924307ceb8ec01bafdc176613a0a548f9b09ceccdc1d`).
+Configured v25 was withheld; preserve Queued until a slot becomes available,
+then prove retry before the actual process suite. Prepared cache recovery keeps
+its existing 1024-entry limit; the separate worker-stage recovery batch is 128.
+
+Root's four-file organization query correction is composed on the migration
+branch after independent source review
+`36611200f4e1d83439107c8123f40fb12d84f7e73ea2db0a484590d0873b9c38`.
+The existing, mapped, public-projection and dictionary-slot readers compare
+SQLite-owned TEXT identities and check the inclusive 64 KiB result bound before
+UTF-8/JSON decoding, without an intermediate owned JSON String. Two regressions
+cover exact-limit success, malformed/oversized storage, identity precedence and
+rollback/replay. Runtime remains pending. Private source manifest
+`b9543f9f11d4629d5feb9a4d418f2ab09d184daced517646705c38ebf7d09f1a`
+is under `sc-22847-organization-query-w9vqymoo` in private results.
+
+Preview v26 closes the read-ownership/backpressure regression with five focused
+tests and nineteen configured/compatibility positives, strict Clippy and
+formatting. Root verified the thirty artifact hashes and twenty direct waits;
+initial receipt `6826f88b33c331a44d2eb83db355fea6213b97413d50692af4b22956a7888b0f`,
+configured receipt `9966238a3648e82c4fcc566ee55b7ca4e62b4d8ec41c0826efdeecd070385a81`.
+Independent runtime review
+`09d95775dd24a393b10792fd7cae2ff89ce0c23855c7f2f99669df2a84b717c2`
+verifies 60 source pins and the exact CLI. The real small 2 MiB reopening case,
+JPEG/WebP/AVIF, held transfer, six catalog-loss phases, two staggered live native
+workers and ten invalid header grants now pass. Actual N/C/F retirement is
+checked; no full FS8/S13 or installed-app acceptance follows. Prepared reuse plus
+two validated fallbacks and a fresh four-image cache batch have source-reviewed
+fixtures awaiting execution. Final SQL construction guards and aggregate
+accounting remain in progress.
+
+Lightroom v53 is committed locally as
+`b4909e1c5cd14acc5eaf5d0d607802303d479f72`; root verified all 140 committed
+blobs. Seven tests pass: transport refusal before spawn, both organization query
+regressions and four actual executor ownership cases. Formatting and all eight
+direct waits pass, with twelve verified raw artifact hashes; receipt
+`09bdc87253a3b516098bb753ca43963a8075119c1d49ee64f4d41f81bc499f88`.
+Independent checkpoint review
+`879050767caf6f13e725ea14bc0b4f66d67a1e6d1913cac3a0c9feb3e1c53a8f`
+passes. This qualifies the reviewed transport/query delta only; actual core
+admission, custody cursor/row guards, XMP interpretation ownership and production
+LM integration remain open. No push or new Actions run was made.
+
+Preview v28 composed the reviewed SQL guards and actual prepared/cache fixture,
+with 67 source pins verified. Its discovery compile stopped before tests on two
+test-only `usize` SQL parameters; root verified five artifacts and the direct
+waited exit 101, with no observed survivors. Receipt
+`b72e9c708663cc4cc3b3f46cb693a83bf40961b0413d8676cc002286699394f6`
+is retained. SQL v3 changes only those two fixture parameters to checked `i64`
+conversions; its six-file manifest is
+`f2539d217ee7d1632cadac4edef73af593f39a4e0a1dc8694fba3dba59407c47`.
+Production guards remain unchanged; the successor runtime gate is pending.
+
+Lightroom v54 adds core/retention pre-copy admission, but its finite independent
+review found one omitted nested owner: retained-stage lookup parses a saved
+InputSeal while page/cursor/staged owners remain live. Review
+`caefec298f22fde683556c95d25172b6fc375369f6c64f8d8abcbe64c3c9fa69`
+keeps v54 unqualified without running its native gate. Its repair must preserve
+the saved seal's generic decoding surface rather than imposing Source roster
+limits on an API that did not validate those limits previously.
+
+The root XMP prerequisite is isolated on `codex/sc-22847-xmp-bounded` at base
+`b4909e1`. It checks exact lossy UTF-8 length while borrowing the native C string
+before the existing compact 16 MiB limit can allocate a Rust output String.
+Canonical serialization and native SDK allocations are separate open terms.
+All 715 vendor files reproduce byte-for-byte from the pinned upstream archive,
+including previously omitted JPEG wrapper patches. Eight-file source v2
+`995542b0c24df6ebea660b24af1bed2c26ab03800f78a3fe7ef1c03711c3bdd8`
+and three standalone helper tests pass independent review
+`7b4f7bf4c5beb4ded7d4a5f132b95e2ae930ab903b32056ec19ce7bd382f6ae6`.
+The tests verify zero output allocations on refusal, one on exact retry and
+65,025 byte-pair conversions. Their three commands were directly waited with
+exit zero, receipt `9a97fdf8ba107c80246268d88649b3a8667527ea6601164ecc497d50476065e0`.
+This standalone probe used Rust 1.97.1. Repository-pinned Rust 1.98 SDK tests
+subsequently passed all thirteen cases (one new boundary/error/retry regression,
+four empty-scalar and eight model-preservation regressions); two formatting
+checks passed. The exact eight-file checkpoint is committed locally as
+`ff8a0119df602cb9d8d2b5c513e4e18912584212`, all eight committed blobs verified,
+receipt `188cd0d6b65c3271bf047347ea903eb2b3f535c9a01b7f45c8c2ae78c5685140`.
+Independent finite qualification
+`8ce7abe78fc79322b3bbf239aa1c6fdd62049c22522e645f43a96a1ede0d232b`
+preserves strict Clippy's failure: 182 primary diagnostics in thirty files that
+are byte-identical to the pre-change LM base, with no XMP changed-file location.
+No warnings were suppressed and no full Clippy pass is claimed. SDK receipt
+`fcb1c25542e93981e3788c556c7cf8a776c10ec462b47326d16425028b102a09`
+and style-only successor
+`f389748c1d3e5fd11e351db821efc58de4293944b5c8b03f3fa5c8f5e7f57e08`
+record all five direct waits, including Clippy exit 101.
+
+Lightroom v55 repairs the saved seal overlap without narrowing saved-state
+grammar. Its sixteen functional checks and three formatting commands pass;
+root verified 31 raw artifact hashes and all nineteen direct waits. Receipts
+`6c3389f9de57b6ce2c4a1d19a96109e248f96a77719eaa8c8057998fab714e07`,
+`f4352fb258da2ca3ed2bf63bfe16d8719a01eb7fde5a74a11cc596346374d0fd`,
+`e9071498b73fc2c953628a8528e30015cec81932e95c9e4c33f2d599050da0d5`
+preserve the finite phases. An actual Source feeds the retention test; a thread
+substitutes for LM, so this is not actual LM-process qualification. One byte
+below the required admission rejects before INSERT; retry retains one record,
+then releases the operation and caller charges to zero. The runner's malformed
+declared marker regex was not automatically enforced; a separate corrected raw
+marker readback is preserved for final review. No RAID/original access, app
+replacement, push or new Actions run occurred in this continuation.
+
+Complete Source/core aggregate admission and migration wiring remain active.
+Managed migration requires G to own both actual SQL/raw Source processes through
+an epoch/token-bound relay; reaping LM alone cannot prove its Source children
+stopped. Preserve the existing 128 KiB Source frame grammar using bounded 16 KiB
+relay chunks, with independent health/cancel controls and cancel-all-before-join
+ordering. The shared pool cannot retire until LM and both Source process/I/O
+owners drain. Direction and API review passed (`fb85126a3ae17944d77b15fe106708baaa20b3076a7b7c669837bcf1738e8ea5`);
+implementation, simultaneous-copy accounting and abrupt-death tests are pending.
+V47 relay/permit source passed 17 exact in-process tests and formatting; all 18
+commands were waited and 22 artifacts verified, with no observed survivors.
+Receipt `58ebffd07ec519c4f715771a8a6ae9bfe878604779aca4714fdb2ff746a4d5b3`
+preserves the thread-affine real writer permit, cancellation/replay and reserved
+listener-failure cases. The earlier v44 non-Send Permit compile failure remains
+retained. V47 actual-process qualification passed its first four broker cases, then stopped
+on fixture EAGAIN in the fifth case. Root verified nine artifacts and all five
+waited commands, with no observed survivors; receipt
+`caf8378944e0caed4835ca5063f493987a90fee514709736fa18dfee0ed7ba86`.
+V48 changes only that fixture to set an accepted socket explicitly blocking with
+finite timeouts and contextual errors. The targeted corrective test passed both
+malformed-output and actual stdin-write-failure modes with no ordinary event
+consumption before reserved failure. Receipt
+`24c6b2fbf3dd29ec293cef55223e63a08d5de620974ac0d498691a4c7623679c`
+has five verified artifacts and one waited command. The remaining six exact
+process tests and formatting then passed; receipt
+`a7e7237132cacd3c11522b0004dd9da442697f991083a79b639c17edd14b2fe8`
+has eleven verified artifacts and seven waited commands. No observed owners
+remain. This yields 28 distinct functional positives (17 in-process and eleven
+actual-process) across the preserved phases. Compatibility8 and formatting then
+passed (receipt `9d1c1da181758f968166abd0155967d4fdc51cc9121a91ee196190f337a64c77`,
+13 verified artifacts, nine waited commands). The bounded checkpoint is committed
+as `a363142f06568d143102058b8904789d67cb09b2`; root verified all 135 committed
+blobs. Independent final review
+`7677aff44d969fd3f08515ea6b58c1602e326c9f0acbcaa66e9d5ce14f77d1fe`
+verified 66 artifacts and 36 distinct functional positives (21 in-process, 15
+actual-process), three formatting checks and all 40 waited commands including
+the preserved failed fixture. Twenty-one warnings are not a Clippy pass. This is
+relay/permit qualification, not whole migration or installed-platform acceptance. Original EAGAIN attribution remains an
+inference because the failed log did not identify its precise I/O operation.
+V49 implements exact Source-scoped grants and two-condition retirement. Its pure
+gate failed compilation before tests because a new fixture called a nonexistent
+MigrationRead verification method. Five artifacts and waited Cargo50603 exit101
+are verified, with no observed survivors; receipt
+`13a9c4d24aade72fa0d9dbf7c369bd178c9b3a884514afb5f2f78035ff282ad9`.
+V50 removes only that invalid fixture call after capture_manifest; production
+source review passed (`b5b9512f05098c5134f6107618e9804c52d21406c4f33013f6ec24518d498fc8`)
+and the one-line successor review passed
+`84e435ffaf89a48cd9d8b3955d3170c6ac30ca5b47c24a626d8aa40e0e5bc1e3`.
+V50 passed nine pure and eight actual Source-process tests plus two formatting
+checks. Independent final review
+`be35c80eb3db06a7bd39c834cb7e470f3780a76eff66bc0b02d27cfbf8da2ad3`
+verified 135 pins, 41 artifacts and 20 direct waits including preserved v49 failure.
+The bounded nine-file checkpoint is committed as
+`4047c17f502b8655019f47a146bcb20cbbd0d243`; root verified all 135 committed blobs.
+Runtime markers prove scope 60→30→60→10→0 and typed pool 341→17→0. The typed
+fixture uses a joined LM thread, so it does not qualify abrupt actual LM death.
+Source charges require both G process/pipe/relay drain and LM proxy quiescence;
+operation/caller allocations remain separate. Eighteen compiler warnings are
+not a strict Clippy pass. Full numerical admission and coordinator wiring remain
+active and unqualified. Root retained-migration query guards passed independent
+source review `7770f4ea724a4c7bb419a189634ae267185aac253805d4b625b8a0f76caf0d3a`:
+compressed SQLite bytes are borrowed under the existing cap, and digest/field
+identities are checked before copying. Three public-query regression tests await
+the coherent numerical source gate. This query is also reached by current
+import_artifacts::request, not only planned metadata browsing.
+Remaining
+filesystem, backup, Workbench, metadata editor and installed UI acceptance retain
+the full tracked scope. Current local tests use synthetic files without RAID/GPU.
+
+## Earlier checkpoints — preserved history
+
+
+FS7 is independently accepted and integrated as
+`f13ddb30bbb6eedf3158ac00a9e718f2870c49a3` from author
+`b8a1cefa30ccd19ef45b6436041ce2273c642b57`. All19 committed/source blobs match
+the reviewed checkpoint. Root verified61 final qualification artifacts;
+independent review `sc-22847-fs7-final-independent-wf08wccl/review-final.json`
+has SHA256 `b8313ad90b0ca01bc0b506877ded781662450e6a6f7a3b5866e8debc6872d52b`.
+Coverage is113 distinct positives:105 focused, six configured C/F cases and two
+compatibility tests, plus strict Clippy and formatting. Integrated Mac Tauri
+release/locked compilation passed in16.44seconds; exec92743/PID34725 terminal0
+and reaped. Its receipt is
+`sc-22847-fs7-integration-1bdnfsrv/gate-initial-1789358718496710000/receipt.json`,
+SHA256 `5bada1b51a2bbf388a2d893f4d7647cf835599158bac62fe191031d842a774de`.
+This batch is ready for publication; newer CI is not yet qualified. Managed route
+selection, FS8 native ownership, full Source/core admission and remaining S12
+requirements remain open. Later paragraphs below preserve earlier checkpoints.
+
+Latest continuation checkpoint: the isolated Lightroom migration branch now
+includes `040dd7b4bdf09943acd705c5f68731e28dfe7af0`, which validates retained
+identity storage, exact byte length and UTF-8 before allocation at all three
+identified initial/recheck readers. Independent source review and six regression/
+compatibility tests plus formatting passed. Root verified all122 committed blobs
+and nine gate artifacts. Receipt `sc-22847-retained-identities-c1b54mxh/gate-initial-1789358190523259000/receipt.json`
+has SHA256 `9761d043e6d0617e7b1789f8f09e88e15216633623daf041b6673d05f5c303be`.
+This remains isolated from the desktop PR; aggregate Source/core memory admission
+and production integration are unfinished.
+
+FS7 local qualification now covers105 focused positives, six configured C/F
+process cases and two compatibility cases, strict all-target Clippy and format.
+The nine ordinary ignored entries are six configured behavior tests subsequently
+passed plus three inert entrypoints, correcting earlier shorthand that called
+all nine inert. Source v4 is frozen pending final independent acceptance.
+FS8's required next inventory includes both native worker-output validation and
+encoded-cache-hit decode; managed N owns decode/encode. No user originals or
+catalogs were accessed by these synthetic gates.
+
+The user selected **LensWorks** as the product name on 2026-09-13. Current
+branding uses LensWorks; historical evidence below retains its original names.
+Repository, bundle and persistent format identifiers remain compatible.
+Shortcut epic E1 and S12 were updated; comment23342 records the decision.
+
+S12 sc-22847 remains In Progress; S13 sc-22848 has not started. Public draft
+PR16 head `81986e37e0119793682cdca6aa3559cc903c59b6` passed all four
+CI34797188873 jobs and all three installer/archive/payload audits. Root verified
+all41 evidence hashes in `sc-22847-ci-34797188873-rw8rygeh/receipt.json`, SHA256
+`b8d83dd403dee42a455599be99b2df5ff84057548ac5efaf8e56be20c0d65f10`. The preceding `33d4a84` checkpoint passed all four
+CI34794176560 jobs. All three provider archives, installers, native payloads,
+notices and installed-worker evidence passed read-only audit. Root reverified
+all56 evidence hashes in `sc-22847-ci-34794176560-p04ycpod/receipt.json`, SHA256
+`97280aaadc9624be2f46728ccf85c348167e9142383ba659f2a28f96617f62d7`.
+The published head includes the configured catalog/filesystem relay fixtures;
+FS6 custody is now independently qualified and integrated locally at `9acecca`.
+No whole desktop or GUI acceptance is claimed.
+
+FS6 author `7174222b85844bccbc54f49d75b6f8bf97773455` is integrated as
+`9aceccadf5627007f7f68a165fc5289fe3a4dcee`. Root verified all21 committed
+blobs against reviewed source and all62 qualification artifacts. Independent
+final review `sc-22847-fs6-ipc-review-j6xayps7/review-final-v7.json`, SHA256
+`45476fc752a814c8fbdaf2af86b9986b9a8d5b178d8830a989af7acc7da33040`, passes
+all six original findings. Qualified coverage is F32/relay25/C4, six configured
+process fixtures and two compatibility cases; the changed queued fixture also
+checks successful worker retirement and relay join explicitly. Strict all-target
+Clippy and formatting pass. Integrated Mac Tauri release/locked check passed in
+10.44 seconds with all21 source pins intact; session66336/PID36192 is terminal
+and reaped. Receipt `sc-22847-fs6-integration-leosphhb/receipt.json` records log
+SHA256 `4b6ec628b0a8070c2ad2218ca40d4c6969f6fc91333bc95c3e99f8a365faec49`.
+The filesystem helper retains preview tier/relocation locks through the final SQL
+drain; retries retain exact operation identity, stale operations cannot repeat
+effects, and bounded status remains independent of blocked work. The managed
+route is still unselected. FS7/FS8, actual native-descendant integration and full
+S12 acceptance remain required; these tests did not touch originals or XMP.
+
+LM Part C v30 is frozen for independent source review (114 pins), including the
+runtime-unqualified v29 lint batch. Complete bounded seal/authority/descriptor
+opening and shared core-private retained-record projection are implemented in
+its isolated worktree. Nine new fixtures and carried affected tests await the
+combined gate; aggregate memory qualification and production migration wiring
+remain unfinished. Source receipt `foundation-source-v30.json`, SHA256
+`edffd90ccd0bdf27a9d20e7c8456b8a6929e923f67e84e402516abf23268dd47`, under
+`sc-22847-lightroom-migration-bridge-xksnotzh`. This is not part of the published
+FS6 batch and no runtime parity is claimed yet.
+
+Current public head `81986e37e0119793682cdca6aa3559cc903c59b6` includes the
+qualified FS6 integration and this ledger. Fresh CI34797188873 is running;
+comment23353 and exact PR body/head were read back. Its private audit directory
+is `sc-22847-ci-34797188873-rw8rygeh`; prior successful CI receipts stay frozen.
+
+FS7/FS8 plan-v3 is accepted in comment23354 after independent design review
+`sc-22847-fs78-design-independent-d0rcl58x/review.json`, SHA256
+`cc9eb46412417c7eb9557cd612ea4eca77d37d1bdd2543521ca283315aa6ef76`.
+FS7 implementation starts on isolated `codex/sc-22847-preview-io`: bounded binary
+transport followed by complete cache/relocation filesystem operations. FS8 keeps
+staging/prepared work and managed G-owned native children as a required next
+slice. Native wait must never block Stop while holding the sole live Child;
+actual wait and IO joins precede cleanup/fence release. No production selection.
+
+LM Part C v30 initial gate failed and stopped after five passing tests and one
+Authority grammar mismatch. Root verified all10 evidence hashes; all114 source
+pins remain unchanged. Receipt `source-v30-initial-20260914T015313Z-41219/receipt.json`
+SHA256 `3ac75f41daacb8c3985acc02d56af76a301f7063321c09a890641cc3c3295466`
+under `sc-22847-lightroom-migration-bridge-xksnotzh`. Session21101 is terminal and
+reaped; no observed descendants remain. Independent source review8314d59 requires
+buffered enum/path unit grammar and map-only Authority struct-variant corrections.
+The author is applying both before the successor freeze; unrun tests remain unrun.
+Measured macOS structs: InputSeal304, SelectedCapture104, SupplementPin176,
+String24, ArtifactDescriptor496. The successful seal payload expression is
+21,365,041 bytes excluding parser/transient/allocator owners; this is not an
+aggregate opening/RSS qualification.
+
+FS7/FS8 v4 makes kill-error ownership explicit; independent delta review
+`sc-22847-fs78-design-independent-d0rcl58x/review-v4.json` SHA256
+`3b01c6ad410137189cd40e8fa5173d3a18f0e8f7e65ba343c2e246013f862b6d`
+passes without topology/scope changes. FS7 source implementation is active.
+
+LM correction v31 is frozen at115 pins for independent review. It preserves
+buffered-only numeric NativePath identifiers and empty-map unit enum payloads,
+keeps direct parsing unchanged, and requires Authority variant bodies to be maps.
+Two new public-oracle matrix functions supplement the original fixtures; no new
+runtime claim yet. Source manifest SHA256
+`5c2cbc990016d31ad09c00b797945f1cac9902f20fcd29cd79346212249452eb`.
+Lifetime accounting review separately identifies parent-side chosen Artifact and
+request clones before descriptor admission, whole Manifest/retained record/seal
+overlap, validation BTreeSets and Source native-path/URI/open transients. These
+must remain charged through rejection; the small descriptor-decoder bound does
+not bound the parent constructor or total RSS.
+
+LM v31 independent source review `review-v31.json` SHA256
+`b34f7a8c613d044a4cc06f156fb4a212299680753d3dec3f5c19c30c7d7fdc88`
+passes both corrective findings. Initial gate now passes15 actual functions plus
+package formatting; root verified all20 evidence hashes,115 stationary pins and
+exact counts. Session4966 is terminal/reaped. Receipt
+`source-v31-initial-20260914T020507Z-45843/receipt.json` SHA256
+`8fcb4176b7aba8089e0afebe8ec634142e7f1467b931941f753177119e3c8b83`.
+Compiled Manifest box576 and Value inline192 bytes were measured; the tested
+nested grammar cutoff agrees with the public decoder (123 accepted,124 rejected
+in this fixture). Compatibility16 functions are now running separately; no result
+or aggregate-memory qualification is implied yet.
+
+LM v31 functional checkpoint is committed clean at
+`50926345cdb3e0c476c129548fba9a1a9a89da59` (22 files). Root verified all115
+committed blobs. Final independent source/runtime review SHA256
+`c6b2be29ea049b4367c3bf85917f3638c70235937e06c6b87a71f8bbfae12caa`
+passes30 functional tests (four actual-process) plus one inert helper and fmt;
+root independently verified all40 runtime evidence hashes. Compatibility receipt
+`source-v31-compatibility-20260914T020743Z-46819/receipt.json` SHA256
+`f9948d55fc4b57476d845185434cf8734cd38bdf16a09d4514f8e0c547675d56`.
+All native sessions are terminal/reaped. This functional source remains isolated
+from PR16; aggregate memory/maximum observations, strict Clippy production wiring
+and complete LM acceptance remain open. Actual consumer analysis additionally
+finds pending/request retaining two Manifests; their overlap must stay charged.
+
+At CI34797188873 / `81986e3`, macOS/Linux/contracts are successful; Windows
+is still running. Download session11907 completed/reaped. macOS archive10330293580
+(77,567,711 bytes), SHA256
+`ca073ea5f1eebc9758867b7caeb606bfd1d6ccdba76bc09b61570bf5c248544f`,
+and Linux10329789542 (51,540,951 bytes), SHA256
+`ca4370d8615f0e296b9a0a6ac6dc2eb22c88b304ec683d92d86fe30f2c4e6ca5`,
+match provider receipts. Both payload/installer/notice/worker-evidence readbacks
+pass (Mac18 closure files/25 notices, Linux4/17; Mac observer receipt-only,
+Linux included observer rehashed). This is not all-platform terminal acceptance.
+
+Reference Mac launch smoke now verifies the actual new LensWorks package:
+47 payload files and deep/strict code signature verified; native window/header/menu,
+onboarding and catalog-picker open/cancel observed through computer use. No
+catalog/photo was opened. The native picker restored the prior RAID test folder
+and listed directory/file metadata. Command-Q reported App quit and known PID56948
+was absent afterward; root is not its wait parent and makes no wait/reap claim.
+No full catalog/editing/accessibility/color acceptance. Private fresh copy and
+receipt `sc-22847-mac-gui-fs6-_d_97zwv/receipt.json`, SHA256
+`30a1e81707260adb97384c5f29606465aa9bc8827225448b70e91997ec574cfd`.
+Original CI artifacts remain unchanged. PR body/head read back exactly after
+updating this limited native GUI evidence. Native/UI lane is released.
+
+LM numerical observation plan-v3 is accepted for test-only implementation after
+finite consumer review435cf4cc (16 committed pins). Five families cover opening,
+parent Artifact construction, actual consumer overlap, retention batch break/resume
+and transport overlap. A nondefault internal-capacity-probes feature gates all
+allocator instrumentation behind cfg(test); default ordinary suite and production
+builds keep their allocator. Source plan SHA256
+`c656e16eb7476ae92e46b9af433ba683e6b16a6a31ff386dfe89fffa17738351`.
+No native measurement or aggregate memory qualification yet.
+
+Earlier PR16 checkpoint `e841bdb8a452c747bbf4e1eaf429c52f82c402b6` passed all four
+CI34783536524 jobs (macOS, Linux, Windows, contracts). All three provider ZIP
+digests and included installers, executables, native closure and notices passed
+artifact audit. Root verified all 40 evidence hashes. Receipt
+`sc-22847-ci-34783536524-2pvqkiwe/receipt.json`, SHA256
+`169148975be76f7aa150a9d1ecd6952cb4c2914bfb66397c97fa21493f076d55`.
+Linux/Windows observer executables were included and rehashed; Mac observer is
+receipt-only. Known root/child reaping and temporary cleanup were verified;
+GUI acceptance and absence of undiscovered descendants are not claimed.
+This run includes additive catalog transport and the exclusive-create guard.
+Shortcut comment23340 and In Progress state were read back exactly.
+
+The LensWorks/helper batch is published at `383944d`. Fresh CI34790332966
+finished with contracts passing and three platform failures. Windows stopped at
+a test-only Unix mutation warning; macOS/Linux passed the Rust suite and built
+LensWorks, then rejected ambiguous cached PhotoCatalog/LensWorks bundle outputs.
+Both failures are repaired together: only the Unix fixture binding is mutable,
+and disposable CI clears generated bundle output before bundling while preserving
+compiled executables/dependencies. The focused discovery test, strict all-target
+Clippy and formatting pass; thirteen staging/packaging tests pass on the pinned
+Python runtime, including stale app/DEB/NSIS outputs and link refusal. The initial
+default-Python import failure is preserved separately. These are local repair
+results; fresh hosted qualification remains required. Comment23345 records the
+preceding integrated gate and the XMP zero-test correction; it was read back.
+
+The repairs are published at `872667e7375f64246e564e74ce3ce795fc38a316`.
+CI34791575107 passed all four jobs, including macOS, Linux and Windows packaging
+and installed-worker checks. All three provider archives and their included
+payload, notices, installer and worker evidence passed read-only verification.
+Receipt `sc-22847-ci-34791575107-5284b88m/receipt.json`, SHA256
+`042a3d7efe02bf7b938906845b357b7af7d7c4167736726eb0b3c36b4a611d67`.
+Mac observer remains receipt-only; GUI acceptance and undiscovered descendant
+absence are not claimed. Comment23346 and its In Progress state were read back
+exactly.
+
+Source Part B's refined full-method admission plan is accepted in comment23347:
+first qualify explicit public/private JSON grammar and shortest accepted forms,
+then implement exact-capacity Manifest decoding and request-derived preflight
+for all nine result kinds and ten Page collections. Candidate byte weights are
+not qualified limits. Part C and combined lifetime admission remain required.
+The first test-only milestone passes all four grammar functions and package
+formatting at frozen v27 (104 pins). The tests confirm the private decoder's
+sequence-tag acceptance widening, which the production B implementation must
+repair. Receipt `sc-22847-lightroom-migration-bridge-xksnotzh/`
+`source-v27-runtime-receipt.json`, SHA256
+`cb69174946734ba46c9c5125b948db057f12523abc284bbf2d8181ecfcdf3297`;
+root verified all four evidence hashes and actual test/gap output. No real files
+or child workers were opened by this JSON-only gate.
+
+FS6 plan v4 is accepted in comment23348 (SHA256
+`0b5794e1dd8aadb958f26d3af1decfd00b06b90b89be5c3741732b865d12f928`).
+The existing F will own preview/configuration descriptors through a session-bound
+C adapter, retaining current, partial and retired root locks until verified final
+native and SQL drain. Managed admission uses independent 16-root/2 MiB actual
+owned-capacity limits, exact 256-byte serialized markers and the existing native
+path cap. Real lock contention, lost results, restart/promotion and checked release
+must be tested before acceptance. Store status has its own bounded control and
+response capacity alongside bootstrap admission status. Both comments and S12's
+In Progress state were read back; FS7/FS8 and production route selection remain
+required.
+
+The real catalog/filesystem relay is integrated as `f7c0b15` (author
+`9539540a3fa04cf3870b7f8877fa52cca38745d8`). All nine integrated files initially
+matched qualified v6 exactly. Twenty-one pure tests and six actual-process
+fixtures pass, along with strict all-target Clippy, package formatting and the
+exact CLI build. Actual SQLite contention verifies held write locks across F
+marker operations, nine SQL closes before root release, and C fatal-74 retirement
+before F termination after lost confirmation. Root verified all 43 final evidence
+artifacts and nine committed blobs. Final author receipt
+`sc-22847-filesystem-relay-y8j0veyc/final-receipt.json`, SHA256
+`65fa85c02640604175040d7fa5c6baca61fed87a1d11906647c2f1b0377e545f`.
+The integrated release/locked Tauri check also passes (8.86 seconds).
+
+Integration found the configured-CLI fixtures needed a dedicated CI invocation:
+the ordinary all-target test step runs before CLI build and supplies no helper
+path. The six external-process tests are now explicitly ignored in ordinary test
+runs and required by a separate post-build runner (six on Unix, five on Windows).
+It supplies the exact built executable and rejects zero-test success; the two
+inert subprocess entrypoints are never admitted as ordinary tests. Local runner
+qualification passes: exact D release build, all six configured fixtures through
+the new runner, and package formatting (session31048 terminal/reaped). Receipt
+`sc-22847-filesystem-relay-y8j0veyc/root-ci-wiring-gate.json` preserves the four
+source pins and all three logs. Independent review then caught Unix-only physical
+IDs in a pure test helper; it now emits the proper native identity on Windows as
+well. The ordinary desktop gate passes 21 tests with eight explicitly ignored
+external/helper entrypoints and no configured executable; strict all-target Clippy
+and formatting also pass (session68966 terminal/reaped). Independent four-file
+source review passes with exact hashes. This fixture correction is checked
+separately from unchanged actual-process test bodies. The relay and CI wiring are
+published at `33d4a84f3e992e7d423ddf046e21b3450946e735`; fresh CI34794176560 is
+running. Draft PR16 head/body and Shortcut comment23350 were read back exactly.
+Production selection still requires the remaining custody work.
+
+FS6 frozen v1 (20 files) requires a finite repair batch before native testing.
+Root review identified stale operation replay after the latest receipt changes,
+and ResourceLimit being downgraded on exact replay. Independent IPC review found
+missing helper source-identity inputs, Stop canceling pending cleanup, unchecked
+StoreStatus failures/query identities, and a status query that could wait after
+the control transport stopped. The private store operation becomes a monotonic
+U64 with a retained high-water fence, exact latest replay, cancellation gaps and
+checked exhaustion. No persistent schema changes. Root review SHA256
+`c70001ed915c21b1e5ae763a1b55bfb07c1f1aa05716872aa750f09df152b187`;
+IPC review `d9c61fb211a9b13380ee7057a12c7bfd5606589afc68d55d79139f307c27bd45`.
+
+LM Source Part B v28 passed independent review (107 pins, 11-file delta) and
+the initial native gate: nine Manifest grammar/admission tests, four method
+preflight tests and package formatting. Session71706 and all three commands were
+reaped; source remained unchanged. Root verified all eight evidence hashes and
+the actual thirteen-test result. Receipt
+`sc-22847-lightroom-migration-bridge-xksnotzh/source-v28-runtime-receipt.json`,
+SHA256 `375b0f74bca65280f7cf9db903d801bbd9ff5e7396517c05aa1174d151088f95`.
+Larger private reader/lifecycle tests are next; Part C and aggregate memory are
+still required. Shortcut comment23351 and In Progress state were read back exactly.
+
+Part B is now a clean source checkpoint at
+`a7682ba82e7fb09a9f29cbcfd31b412cb5428484`; root verified all107 committed blobs.
+The larger gate also passed, totaling26 functional functions (9 actual-process,
+17 in-process) plus one inert helper. Corrected runtime receipt SHA256
+`f5573fffa02bbdcc9e29f58021a8ea72fae159a40b94409e4fa7d548e236c5bc` and independent
+audit `6319685683f2568076061a3a57f1e01a997ee3267ec0ff71fdb015cac6fa33cf` distinguish
+the nine actual-process functions from pure framing tests and the inert entrypoint.
+Root verified21 larger-gate evidence hashes and the14 selected function results;
+the initial13 remain the separately verified gate above. The full16MiB shortest
+Issue fixture retained1,525,033 entries in109,802,376 exact vector bytes; foreign
+path evidence retained8,387,806 native units. These measurements do not establish
+aggregate allocation or RSS. Concrete Clippy repairs and the remaining production
+integration/Part C are still required. Comment23352 was read back exactly.
+
+At published33d4, CI34794176560 finished with all four jobs successful. All three
+provider archives, payloads, installers and notices passed read-only verification.
+macOS has18 closure files/25 notices and a receipt-only observer; Linux has4/17
+and Windows4/71 with their observers included and rehashed. The frozen audit is
+under `sc-22847-ci-34794176560-p04ycpod`; root reverified all56 evidence hashes.
+
+Earlier successful checkpoints remain preserved: CI34779651605 at `ab921727`
+qualifies reader/preview drain before transport and the exclusive-create guard;
+CI34776023414 at `3bd92de` qualifies its preceding identity/close corrections.
+Their original source, artifact and negative-attempt receipts remain available.
+
+The complete custody design, call-site inventory and additive desktop transport
+slice were accepted and read back in comment23326. The transport remains
+unselected. Comment23328 records the complete Source reader/lock protocol,
+including finite admission, all existing reader methods, consumption ownership,
+and the explicit commit-winning reader-death rule. The migration foundation
+checkpoint `41fdc91` passed 31 focused functions and independent review of
+attempted writer-hold retirement; it does not qualify the whole migration bridge.
+The raw-file executor, managed SQL roles and integration/installed parity remain
+required. Preview drain repairs from comment23327 are locally qualified below;
+no unverified worker exit may authorize resource release or Closed.
+
+The additive transport is locally integrated as `b828834` + `222d897` (authors
+`c7fd476` + `8094f514`); all 17 integrated source files match frozen v7. It passes
+91 application functions, including 15 transport functions, 16 application bridge
+functions, one Lightroom bridge function and one actual CLI transport process
+test, plus strict all-target release Clippy and formatting. The actual transport
+child test covers Status/Close before opening a catalog; native descendants and
+installed GUI behavior are outside this test. Independent final review verified
+the clean source and all 26 receipt artifacts:
+`sc-22847-catalog-transport-independent-mwbdzs68/review-final.json`, SHA256
+`c34fc35f4e418c4d43d4094fb2f9ee0a4e7eb979f406286178dbffe645bd6a21`.
+Receipt: `sc-22847-catalog-desktop-transport-q7ofz57b/final-receipt.json`, SHA256
+`6584882e25561716d006ca5d4dc1fb5859efd4d958927a059390d3eecda5ec56`.
+Mac release/locked Tauri compilation for its hidden child dispatch passes;
+session77548 is terminal/reaped. All 17 integrated source hashes still match.
+Root integration receipt SHA256
+`864469933168431f9e58aff7d37fc1f9631c828e7dd2334864891a1de910dfd5`.
+Production State
+still uses the existing engine; managed SQL roles and filesystem isolation are
+the next required implementation, not completed by transport alone. The earlier
+owned-worker PID fixture failure is retained and unexplained; the unchanged
+binary passed three isolated observations and the unchanged fixture passed the
+full final suite. Shortcut comment23332 and In Progress state were read back.
+
+The SQLite exclusive-create guard is integrated as `aafd442` (author
+`cc42d94`). Pinned SQLite 3.51.1 could retry a failed Unix exclusive temporary
+open as read-only, then unlink an existing hardlink on close. The one-line guard
+preserves exclusive creation. The supported SQLite filename fixture reproduces
+the old behavior; the fixed existing-hardlink regression and fresh-file control
+pass. Prior identity tests, strict all-target release Clippy and formatting pass.
+All five source hashes and the complete two-patch upstream delta were verified;
+no natural random-filename race or user-data corruption is claimed. Independent
+final review: `sc-22847-sqlite-exclusive-independent-88sgcr8c/review-final.json`,
+SHA256 `f2f835b09ada6a372ad1384d19389cfdf72be31ec58e10524cb335953be41237`.
+Local receipt: `sc-22847-sqlite-exclusive-1uczt_3n/receipt.json`, SHA256
+`20a814e86d0d980f3f2e009c6de0d00809f8c129ec750c23c32daa7a0d09eed6`.
+Integrated release/locked Tauri compilation passed in 19.90 seconds;
+session57536 is terminal/reaped and all five integrated hashes match.
+Windows/Linux qualification passed in CI34783536524 at the published checkpoint.
+
+The complete paired managed SQL session and filesystem bootstrap/restore plans
+were accepted and read back in comment23334. They preserve all eight fixed
+catalog/manifest connection roles, a private discovery role, explicit admission
+confirmation, checked query cancellation, original creation semantics and bounded
+restore documents. Implementation continues in isolated worktrees. Filesystem
+ownership is a sibling of the catalog child; a failed bootstrap must not run SQL
+cleanup against unconfirmed handles. Remaining backup, native worker, publication,
+metadata and migration filesystem routes are still required.
+
+The migration reader remains under qualification in its separate worktree.
+Source v12 replaced a manually owned SQLite commit-hook context with a connection-
+owned closure, retaining its lifetime if Catalog moves out of its lock wrapper.
+The first v12 actual-owner attempt failed frame admission; that evidence remains.
+Source v13 repaired private authority tagging for the full u128 range and opening
+failure frames. Its six proxy functions pass, including actual Source ownership,
+cancellation, drain and moved-Catalog death-before/after-commit behavior. The
+three closed-reader functions passed on unchanged reader code. Independent final
+review verifies 96 committed source pins and 11 evidence artifacts; focused receipt
+SHA256 `634286acd0d9b54595d6c76fbbc246883f4bef236943802543d74b2ef98492b8`.
+Source v14 passes three maximal-buffer fixtures and uses exact two-pass encoding.
+Its object-Issue measurement is a specific representation, not the maximum of
+all accepted sequence forms. The Source-specific borrowed Manifest decoder is
+qualified at `8909ec4`: two Manifest parity, six budget, six proxy and three
+closed-reader functions pass. Root verified 99 committed source pins and 12
+evidence hashes in final receipt
+`sc-22847-lightroom-migration-bridge-xksnotzh/source-v17-final-receipt.json`,
+SHA256 `b1f5354e85aa9f97353f9458bcac0a061376268b87702021ef13b6088f5bce9e`.
+Original retained bytes and their digest remain authoritative; decoded views do
+not normalize the retained source. Earlier authoring/fixture failures remain
+preserved. Numerical aggregate memory admission is still unqualified.
+
+The finite Source opening guards are qualified in clean author commit `6aa0967`;
+all 102 committed source pins were verified. Ten focused functions pass. The
+large accepted sequence fixture retains 16,777,207 input bytes and 1,290,413
+Issues with a 150,994,944-byte Vec capacity, producing 52,908,799 encoded bytes.
+This disproves the prior 128 MiB typed allowance; no replacement aggregate
+allowance is claimed. Failed compile, fixture and source-manifest attempts remain
+preserved. Borrowed supplement selection is the next finite memory slice; other
+preallocation and the numerical aggregate remain required. Comment23341 records
+the qualified checkpoint.
+
+Supplement projection Part A is clean checkpoint `b037b85`, with all 104 source
+pins verified. Five functions pass, including original-parser parity, reserved
+RawValue forms, cancellation and an actual reader fixture preserving source
+bytes. The 8,388,604-byte synthetic baseline has 299,588 ignored members and nine
+final projected nodes; this is not peak-allocation or RSS evidence. Source review
+and the two test-only corrections are preserved. Runtime receipt SHA256
+`052f802560ee2ec4f26aa19378a82d8458feefed6bff6e57dc4d9284434c6396`.
+Whole-branch strict Clippy still fails in eighteen files unchanged from its
+pre-Part-A baseline; no suppression or full migration acceptance is claimed.
+Part B must account for every accepted representation, including shorter Some
+values and serde map/sequence differences. The earlier large fixture is one exact
+measurement, not a global maximum or replacement aggregate memory allowance.
+
+The filesystem bootstrap/restore helper is qualified at author `e413c0a`, locally
+integrated as `c10d546` plus `b21b13b`. Eighteen worker functions, one configured
+CLI helper test, twelve marker tests, strict Clippy and formatting pass. Actual
+fault children were reaped; the ordinary-harness helper is excluded. Independent
+review SHA256
+`38ce64f4352f340031310fba3ed131618ac3a927492284994bd64cb9620a28c5`
+and integrated Tauri qualification are retained privately. These results do not
+prove the real SQL/filesystem overlap or production route selection.
+
+Managed SQL author `f46ba230` is integrated as `deae865`. The sole initialization
+conflict preserves its shared initializer, the filesystem module and LensWorks
+diagnostic text. Independent source review verifies 23 of 26 author files are
+identical and the three remaining differences are expected branding and existing
+filesystem integration. Review SHA256
+`31774cff4f7fe55322295032632af0e8ed3896e10804194d6d6712e06298982e`.
+Real CatalogFilesystem relay implementation continues under comment23343; FS6
+store leases and remaining filesystem routes still prevent production selection.
+
+LensWorks branding is commit `1513ded`: desktop/window/installer/dialog/CLI names
+and new derivative CreatorTool change; imported XMP bytes and persistent/internal
+identifiers remain compatible. Frontend build and 63 tests plus the Python
+metadata derivative test passed. The initial Rust XMP selector selected zero
+tests, so its exit zero is compile-only evidence. The corrected run at `deae865`
+passes 64 actual XMP functions. Preserved corrective receipt
+`sc-22847-lensworks-branding/xmp-correction.json`, SHA256
+`7274f5b3276ac882e204bfcb2579ba799ad1eb14ae96f04aaafa38cd08bce1cb`.
+
+Integrated `deae865` passes XMP64, session14 (one inert harness helper),
+filesystem18 (one helper ignored), cancellation3 and discovery1, strict all-target
+release Clippy, Mac Tauri release/locked compilation and formatting. All eight
+gates are terminal/reaped. Receipt
+`sc-22847-lensworks-sql-integration-jwt471d5/receipt.json`, SHA256
+`49e81608cb1ff1f67b8526922b500960039133f79170cc3cf2489cc2beebda7c`.
+Root reverified all eight logs and 26 integrated source hashes. This remains local
+qualification; the new batch has no fresh hosted or installed acceptance yet.
+
+Local `db023e1` (author `ef98f82e`) corrects preview cleanup and checked Quit.
+Failed native wait retains the active child, scheduler/encoded reservations,
+cache owner and complete catalog/import owner in Closing, with explicit retry.
+Actor unwind retains the same complete owner if drain fails. Startup transport
+errors are latched only after resource registration; partial requests are never
+replayed. Native and global Workbench cancellation precede joins, while ordinary
+Catalog Close preserves independent Workbench lifetime and direct status/cancel.
+All 176 selected test functions pass (two ordinary-harness helper entrypoints are
+ignored), plus strict all-target release Clippy and formatting. Actual worker
+render/cancel, injected failed-wait/retry/panic and held-shutdown tests are
+included. Mac Tauri release/locked compile passes; this is not installed GUI or
+new hosted-platform qualification. Earlier export-status and decode-only test
+failures and a syntax diagnostic are preserved, corrected and covered by the
+final passing gate. No natural OS failure or historical preview cause is inferred.
+Independent committed-source/20-artifact review:
+`sc-22847-preview-drain-independent-2eq50unj/review-final.json`, SHA256
+`fc155b555f96a61f669602b656a572fbb78e7f1f9b8c9cbb866cdcef59729ebd`.
+Final core/Tauri receipt: `sc-22847-preview-drain-ehze1aof/receipt-final.json`, SHA256
+`07ce0bb6b451877872a0b708aaaa20572a705360df229a62f3a469e9524cf054`.
+All local test and compile sessions are terminal/reaped; full process/filesystem
+custody conversion remains required.
+
+Local `298b03c` also binds the sealed Lightroom reader's actual opened SQLite
+object to its retained Source before any PRAGMA and on every verification.
+Old checks failed all three new regressions, including accepting a byte-identical
+substitute during directory ABA. Fixed full reader group20 functions, strict
+all-target release Clippy and formatting pass. Independent committed-source and
+nine-artifact readback:
+`sc-22847-migration-reader-identity-independent-iwv0u6d5/review-final.json`, SHA256
+`fd3890d2a98adf84e9588d8ca2aac02dfb3998b55b21e1b260c0fa73a810ee08`.
+All local native owners drained. This remains an identity-only prerequisite;
+shared raw descriptor/failed-open lifetime and external filesystem isolation are
+still required. No new installed/RAID/GUI or three-platform runtime claim.
+Local reviewed batch now adds Close/lease repair `716b2ad` and actual-opened
+SQLite identity `63c7796` (author `91610d13`). All 37 frozen identity files and
+committed blobs match, including the upstream ignored lockfile; the full code tree
+matches the qualified author tree (only this ledger differs). Three substantive
+identity/lock tests plus their subprocess helper, 20 relink tests, five notice
+tests, strict all-target release Clippy and formatting passed. The host-filtered
+locked desktop dependency graph resolves exactly one local SQLite links package.
+Unrestricted offline metadata failed only on an uncached Android dependency; no
+all-platform qualification is inferred. Independent review:
+`sc-22847-sqlite-identity-independent-c78ncxhr/review-final.json`, SHA256
+`ad4d492da6feea7f77e621a464a52ed61cd6e93f6c7b6469786ecedf22f9ba79`.
+This is a narrow identity prerequisite. Shared connection/raw-descriptor custody
+remains open; the accepted catalog-session helper and filesystem executor plan
+is being implemented in isolated worktrees. Hosted identity/Close qualification
+is provided by CI34776023414 above.
+
+The earlier reviewed batch
+includes copy/relink lifecycle repair `5eca77f`, export actor `8ea4d55`, serialized
+Lightroom inspection workbench `9deedea`, and Windows boundary repair `e239268`.
+The full export frontend is integrated as `c74e9aa` plus `eb0ef3c`. Independent
+review verified the repaired completed-review settings binding and the combined
+App merge. All 50 integrated frontend tests and TypeScript/Vite build pass. The
+initial 32 and repair 18 private evidence hashes match. Review:
+`sc-22847-export-interface-independent-4zfru_0x/review-repaired.json`. Integrated
+receipt: `sc-22847-export-frontend-integrated-rbkjseev/receipt.json`. The earlier
+batch qualified Mac/Linux; Windows observer repair is now qualified by
+CI34773173909 as recorded below. No actual export GUI claim yet.
+
+CI34765013818 is terminal: macOS, Linux and evidence contracts passed. Downloaded
+Mac/Linux qualification receipts and installer hashes match; installed synthetic
+preview/export workers reaped successfully. These receipts do not claim GUI testing.
+Windows passed 434 library tests and failed two before installed qualification.
+Root's independently reviewed repair checks native sharing-refusal codes and keeps
+only the Windows SQLite manifest representable while retaining native thumbnail and
+relocation data paths. Invalid Windows manifest paths reject before root creation;
+Unix native manifest coverage remains. Actual Windows validation is still required.
+Evidence: private `sc-22847-ci-34765013818-o2vc1r2w/readback.json` and
+`sc-22847-windows-boundary-independent-p_1yrz8c/review-format-final.json`.
+
+The combined local batch passed 54 focused Rust tests, strict all-target Clippy and
+formatting, plus the separate Tauri picker-purpose mapping test. One macOS native
+cache test returns at filesystem EILSEQ92; this function count is not physical
+nonUnicode workflow coverage. Picker mapping is not actual native-dialog validation.
+The six frozen source hashes match the committed tree. Receipt:
+`sc-22847-export-lightroom-windows-integrated-eenm_abb/receipt.json`, SHA256
+`bdb2bb0760a4cd80bcf0ae68b512517a2ae273f1e3a7749a23f9f5c8b3c63a89`.
+
+Copy/relink retry and stale-callback repair passed independent actual-hook/gate
+verification (nine source and 32 evidence hashes), 43 frontend tests and build.
+The full export actor passed independent review and 35 distinct focused tests,
+including synthetic PNG export through the application bridge, explicit recovery,
+foreground preview preemption, and child drain before ownership release. Strict
+Clippy and formatting pass. Its frontend is integrated above; actual installed GUI acceptance remains open.
+
+The serialized Lightroom workbench passed 62 executed tests, strict Clippy and
+formatting; independent review verified 12 source and 19 evidence files. It provides
+owned discovery/capture/inspection, exact result chunks, explicit family decisions
+and selection sealing. The complete desktop bridge `a6dad4e` passed independent review and 29 distinct
+focused functions plus strict Clippy, formatting and TypeScript. Reviewed local desktop integration is `ab7a6e1`/
+`ff2bf93`/`d2c53dc`, byte-identical to the isolated reviewed UI tree apart from this
+ledger. This bridge is in the current PR16 checkpoint but remains absent from v6. Root controller
+`0f84f56` passed 54 frontend functions and synthetic actual-hook lifecycle checks:
+same-generation reads, hidden panel/catalog changes, stale callbacks, lost starts,
+exact Cancel, and ambiguous or typed Close replies. Final delta keeps an accepted
+Close pending through Closing until Closed even when its reply is an error. Final
+TypeScript/build passes; independent final review verified four source and 36
+evidence hashes. Review SHA256:
+`199b9aada077f4d1d934095128a84d7d409e2fedf684e1ffaa547ac19ab5e7cc`. This is
+not installed GUI proof. The full panel is integrated as `2fabffd`: all 11 actions,
+13 queries and five review collections, with App-owned input/status lifetime and
+explicit preparation gaps. Independent final review passed after repairing global
+ID continuation, linear UTF-8 chunking and BOM preservation. All 63 frontend tests,
+TypeScript/Vite and 18 actual-App synthetic snapshots pass. Eleven source/dependency
+hashes match the reviewed tree. Review SHA256:
+`2de77e3f54b60dd634046f19fd42d8d2d45e15c67569a39bf3267111acd497df`.
+
+The complete seven-command migration PLAN/WIREv4 now supersedes the v3 transfer
+mechanism. Exact documents/source delta were recorded in Shortcut comment23315 and
+read back (64,147 characters). Independent v4 readback passed, SHA256
+`898e6976ceaf7a7c891d6f2d9f6a9ab75c13a54788ad6a9d8510ea183c252b26`.
+Pinned XNU source shows that malformed descriptor receipt under FD exhaustion can
+release GUI POSIX locks before quarantine exists. V4 removes GUI descriptor receipt:
+one owned helper holds the physical import lock and sole SQL executor; GUI owns
+process/reap and exact cancellable Writers grants. Source/reader lifetime, alias
+poisoning, separate bootstrap grants and complete seven-command/two-repair scope
+remain mandatory. Unqualified transfer/fence/spawn drafts were preserved before
+removal. The first source compile succeeded; six fixture tests hit macOS temporary
+path symlinks before intended assertions. Fixture correction and full implementation
+remain in progress. No canonical user migration occurred.
+
+The old v1 app was closed normally. Installed v5 opens the selected16 TEST catalog:
+preparation reached Catalog ready, and a known existing 2017 CR2 displayed both a
+thumbnail and a large Develop preview. No editing controls were changed. Evidence:
+`sc-22847-installed-gui-v5-125d2K/receipt.json`. The 2014-02-21 folder exposes a
+separate stale-source issue: its catalog lists 93 photos, but its current directory
+contains two renamed DNG files and no `IMG_6997.CR2`. Bounded DNG headers identify
+one as converted from `IMG_7058.CR2`; they do not identify the missing IMG_6997 or
+other originals. No guessed association or relink was performed. The user question
+about conversion/removal is pending. V5 is the immutable `4e40972` checkpoint and
+does not contain this newer export/workbench batch.
+
+CI34768145412 at exact `d62fe14` is terminal: Mac/Linux/contracts passed. Windows
+passed code/recovery/native-path/RAW/frontend/Tauri checks, then failed the final
+observer executable association. Downloaded Windows evidence proves workers passed
+and known processes were reaped; Rust's `\\?\` canonical prefix differed from the
+Python input spelling. Reviewed fix `67975e0` compares actual file identity, keeps
+pre/post SHA pins and literal cleanup verification, and rejects a separate file
+with the same bytes. Nine local test functions pass; the Windows verbatim case
+requires its native host. Observer tests now run in each platform matrix after
+psutil setup. Independent source review SHA256:
+`e9e267fd9a9478041babcccb2ce76bf2348594640df3e7c56006b1221f46f342`.
+No claim that the failed workflow is green; next batched push must qualify the fix.
+Mac/Linux downloaded installer/executable/receipt readback SHA256:
+`5a6ade05fd436060a8115e54674a890616841ddf60c05f6184e32ccffe79a4ff`.
+The downloaded Mac artifact does not include the observer at the Linux package
+path; root independently verified the Linux observer only.
+
+A controlled-metadata prerequisite found a retained-blob allocation gap. Reviewed
+`616aa18` admits raw and compressed lengths in one SQL read before allocating the
+compressed Rust vector. Exact output length and digest checks remain. All 15
+focused functions, strict all-target Clippy and formatting pass; session61932
+exited0. Receipt SHA256:
+`4cad10fed7cac6a6374cf689140e81f28ea5fdff218e6034973b99cd2d3a0dae`.
+Independent review SHA256:
+`331e3ebe4097a9d6f7a020b52b7012976144d45a2b7593e6aaaf9bed80cdec9e`.
+The prepare/commit seam is now integrated as `0537b29`. It prepares XMP off the
+writer, carries early full image identity and an exact shared catalog-session pin,
+then revalidates under the commit transaction. Four new tests cover all edit forms,
+variant isolation, stale identity/revision, session mismatch and callback rollback.
+All 40 affected functions, strict Clippy and formatting passed; the initial empty
+organization filter is excluded and its corrected two-test run is retained. Final
+independent review SHA256:
+`5d923bf9df072136f0ebcaee7c9a91743e742ac227a03d379daf71491de0903c`.
+This seam does not establish bounded writer duration or the desktop editor/sidecar
+workflow; that complete workflow is being planned from the existing core surface.
+
+The immutable Mac v6 package contains exact `d62fe14` (tree
+`14ffdf0ad510912a8bf4f2e26fdd193c68374427`). All eight bounded build/package/worker
+gates passed. Root verified 95 package file hashes, 65 evidence hashes, source/tree
+identity, and all individually known children reaped. Private package:
+`sc-22847-mac-checkpoint-v6/PhotoCatalog.app`; receipt:
+`sc-22847-mac-v6-build-2l4msxyj/receipt.json`, SHA256
+`1d341ea586ae1cff0a9108357a284ec4960cdd5a18291203ad4e4898abe864f7`.
+Root readback SHA256:
+`ef5f0d8f3bcc6cc7bda51d1fe617c94bdab6d72fd7f5d4de9fa04d6d9a1b952c`.
+This is arm64 development/ad-hoc packaging, not notarized. V6 GUI acceptance waits
+for the user to unlock the Mac. V5 PID20724 and executable remained unchanged;
+no app switch occurred. Full controlled XMP
+editing, sidecar exports, settings/accessibility/platform acceptance and S13 remain
+open. Shortcut comments23311 and23312 were read back with S12 still In Progress.
+
+The next integrated code head `2fabffd17e80f0bb3f60550e549ff1d39f1d5773`
+passes 63 frontend tests, TypeScript/Vite, six bridge tests, four prepared-edit
+regressions, Tauri compile plus the existing export-picker mapping test, and
+formatting. This does not validate the new Lightroom pickers. Native
+session64501 exited0 and was reaped. All 11 panel/dependency pins remain exact.
+Receipt `sc-22847-lightroom-ui-integrated-rzlpj9m6/receipt.json`, SHA256
+`c487c47a365d668d1a64fd392a12df4dedf2259a437f85b13803782c6bbfd08e`.
+Independent exact-head integration review passed with no findings, SHA256
+`e1552e3321ce00601ee3c5cc8be4bb694edd2c23dd5a02930e419754bfe3a378`.
+This is combined source validation; installed GUI and fresh hosted CI remain open.
+
+CI34773173909 exposed a close/reopen race at application_lightroom_bridge.rs394:
+cached Closed preceded coordinator join and release of the process inspection lease.
+Reviewed local repair `716b2ad` keeps Closing until both complete. Its deterministic
+regression failed on old code, then seven bridge tests, the complete synthetic
+capture/resume/close/reopen integration, strict Clippy and formatting passed.
+Final receipt SHA256:
+`6525e1d2fbb115d0a5207077f461f29867d08f5c530abeae81e2215b95285ab3`;
+independent source review:
+`f2c27c32fdfc49dc86a0f2eb2cfc501dbe226f4caca781cce279e76ebf18abf9`.
+Native baseline62974 and repaired76727 are terminal/reaped. No retry push yet.
+Downloaded Linux installer, executable, observer and worker receipts at0046341
+verified; readback SHA256:
+`e36b3c99c5db1986138109f5ee991357e84cccaa3f1ff40547a3fd6ea54ba2e1`.
+Windows installer/executable and qualified worker receipts also verified, including
+accepted verbatim path spelling and both known workers reaped. Windows readback:
+`5525afe7400d99af0d711110ebbc741d8788084c858c841994e1b8817b6b8ef0`.
+Its observer executable is not in the downloaded Windows payload; no independent
+observer hash readback is claimed there. The failed Mac job produces no new Mac
+installer qualification. These checks do not test GUI behavior.
+
+New custody findings qualify the earlier integration PASS. Same-process photo
+export destination snapshot opens/closes can release a live Workbench Source lock
+if a destination aliases its SQLite object; the proposed metadata filesystem paths
+share that defect. Review addendum SHA256:
+`11a711cad6ce858384237d216e04ec288c24638157a0176a50e185e94c701892`.
+A separately owned filesystem executor with the parent SQL transaction/permit held
+through child drain is being planned. RelinkWorkerHandle::open_with also opens and
+closes three raw catalog descriptors outside SQLite's deferred-close ownership;
+existing export/relink callers and new metadata are affected. Unix HAS_MOVED alone
+does not compare the expected held inode. The safe shared connection admission
+replacement is a required unresolved prerequisite, not permission to remove identity
+checks or assume startup is quiescent. Assessment SHA256:
+`814a2783399c3cb8a16c7cffb52eb20e2ad98d1783da6511564ce5ed87a71e14`.
+Metadata plan v3 remains unimplemented pending that design, including all four
+edit forms, sidecars, durable receipts and explicit evidence reconciliation. The
+complete final documents were recorded/read back in comment23322 (55,179
+characters); schema13 is reserved. Qualified design review SHA256:
+`7626b0a77316d6633d83c34640a2b70b8f4d3583b3349d15596aaba56599f768`.
+The shared actual-opened identity slice is recorded/read back in comment23321:
+one custom opcode in the pinned bundled SQLite returns actual Unix dev/inode
+without another descriptor; Windows keeps its supported native-handle check.
+This addresses migration LM-F4 and does not by itself solve GUI wrong-object
+cleanup. Its isolated implementation and the complete custody design are active.
+The migration lock-name finding was retracted after verifying the existing CLI
+uses `.lightroom-import.lock`; no desktop-only rename is planned. These findings
+are tracked on S12 comment23317; S12/epic remain In Progress, S13 unstarted.
+
+CI34797188873 at81986e3 is terminal success in all four jobs. Root reverified
+all41 receipt artifact hashes after the third archive download and full payload
+audit; Windows artifact10331355869 is49,698,135 bytes, SHA256
+`c826108989e6776de7c0c4f516695b96513451f42e853a7a8a6f1b8c8a988599`.
+Final receipt `sc-22847-ci-34797188873-rw8rygeh/receipt.json`, SHA256
+`b8d83dd403dee42a455599be99b2df5ff84057548ac5efaf8e56be20c0d65f10`, is
+frozen. Included closure files/notices are Mac18/25, Linux4/17, Windows4/71.
+The Mac observer remains receipt-only; the separate GUI smoke retains its
+limited scope. PR16 exact body/head and Shortcut comment23357 were read back.
+
+FS7 source v1 is frozen for independent review at19 changed/new files, manifest
+`sc-22847-preview-io-82489lu8/source-v1.json`, SHA256
+`cc24a0680b2af4d9b570e9d0c686567168688516891d51ac7e5a5169a6fee330`.
+No native/source qualification is claimed. Review identified legacy pending-name
+admission and lost-reply cleanup cases for a bounded correction batch. FS8 and
+production route selection remain next required work.
+
+LM test-only capacity v32 review verified122 pins and found two fixture evidence
+gaps: cancellation must immediately follow an observed full send, and bounded
+escaped/native-path cases must supplement the maximum-roster observation.
+Artifact `sc-22847-capacity-v32-review-0ijkm_bd/review-v32.json`, SHA256
+`185277f498d4193bd4ca6e226daa1db8c796e371e3710103e317c841d2dea48d`.
+Author corrected only two test files in v33; root read both deltas and granted
+the initial three exact synthetic tests under the existing serialized native
+lane. Frozen v33 manifest SHA256
+`0d9e0090f77211fae1f73ee45133bc862aaeda34bf29503df28d84e6ec8fbbec`.
+No production/default allocator, protocol or original/RAID operation changes.
+
+FS7 v1 independent source review returned two concrete fixes: retain exact
+operation identity through undelivered failures and retire a reconciled known
+failure so later reads can recover; preserve legacy pending-name cleanup with
+borrowed SQL admission before materialization. Review artifact
+`sc-22847-fs7-independent-4ls1kctl/review-source-v1.json`, SHA256
+`eec1bda04b920983d457898b5cd1ab482e60bfdde1649cf52f8db7bbdd7256b0`.
+No speculative active-step defect was asserted; actual current stream failures
+and pre-admission failures were distinguished. Author is applying both findings.
+
+LM v33 initial gate passed allocator and exact-key BTree observations, then
+stopped on an invalid maximum-roster fixture (16384 selected plus one inherited
+exclusion exceeded the existing combined cap). Root verified seven artifacts
+in `source-v33-initial-20260914T030217Z-59508/receipt.json`, SHA256
+`c311c2425e26bae4316eea7981cec177fd26468bcc5e22c9661b531bf01cb15e`.
+Session53109 is terminal/reaped with no observed descendants. Actual Rust1.98
+arm64 node layouts104/200 and280/376, alignment8, combine with the pinned
+occupancy/transient proof to bound three validation sets at2,545,584 requested
+node bytes. String owners, stack, allocator overhead and RSS are separate.
+Independent partial review `sc-22847-capacity-v32-review-0ijkm_bd/review-v33-partial.json`,
+SHA256 `ab817dc6c3fd870013f363051fe357a5eee343889ce68e74c0190d01b9453299`.
+
+The v35 test-only correction passes the affected seal test, including exact
+16384 selected/0 excluded and16383/1 boundaries and six escaped/native-path
+8/16MiB grammar cases. The physical SQLite fixture remains small and unchanged.
+Root verified five artifacts in
+`source-v35-initial-20260914T030846Z-65270/receipt.json`, SHA256
+`827a92a728211647d5433eec239446b020d83a24e247091bc45302711414c8d4`.
+Session44531 is terminal/reaped. All122 source pins remain stationary at manifest
+`db27cca9d562d658504304486ed1e716ecbd62d49d6a540373a3eb1ec150a353`.
+The91,987,768-byte process peak includes deliberate fixture/expected/decoded
+copies and is not a production aggregate. Remaining five numerical probes plus
+formatting are now authorized serially; the two unchanged passing probes are
+not repeated. Whole LM wiring, aggregate reservation and strict Clippy remain open.
+
+The complete test-only LM observation milestone now has eight distinct positive
+functions plus formatting, with failed fixture runs retained. v35 consumers
+stopped at an expected-size fixture assertion; only one probe ran, no later
+four/fmt. Receipt `source-v35-compatibility-20260914T031131Z-66430/receipt.json`,
+SHA256 `d9d0056033677b0846ae3d20a6969594a587b8ddf5c0a9511c1fa5336eab78db`,
+has five root-verified artifacts. The descriptor fixture correction changes
+only decimal byte97 to120 to meet its existing near64KiB assertion.
+
+v36 descriptor and actual custody-consumer probes pass. Accepted descriptors
+are1351/57277 bytes; overlapping pending/request scopes and three chunk/Verify
+observations are recorded. Retention then failed because its fixture expected
+four large records in one saved-record page despite the existing8MiB cap.
+Root verified seven artifacts in
+`source-v36-compatibility-20260914T031939Z-82927/receipt.json`, SHA256
+`73e4d9f8678659ad46c925e8f76e6f20c036f65fb9c157e838b7a1b5b6341f28`.
+No production cap or retention behavior was changed by either fixture repair.
+
+v37 checks SQL has four complete records, reads keys1–3 on the first bounded
+saved page, key4 after the exact durable sequence cursor, then exhaustion.
+That affected test, both actual-process probes and package fmt pass; prior five
+successful functions are source-equivalent and not rerun. Root verified eight
+artifacts in `source-v37-compatibility-20260914T032444Z-83731/receipt.json`, SHA256
+`9709390451f677619c9810a66ae6da1b7e88451600901c25b71a9217464ccde1`.
+All122 live/before/after pins remain exact at v37 manifest SHA256
+`d0997034c4d669e5dbe2fa655a76b5803345240aead5dce79aadade966ea9b29`.
+SQL/raw PIDs88273/88274 exercised64 queries with two caller Manifests and one
+raw reader; pipe88430 observed Full then canceled. Known helpers report checked
+wait/reap, all runners are terminal, and no observed same-identity descendants
+remain. Unlabeled child peak observations101899/108473 bytes stay unordered,
+not assigned to roles without independent evidence. Numerical substitution
+and full independent closeout are pending; no production aggregate/RSS claim.
+
+FS7 v2 freezes the two review repairs across19 files, manifest SHA256
+`fe822e56723153fd22123c03b890e579d4065131deda46e55002e22e30283186`.
+Its fixed optional failure receipt binds exact admitted operation/step/request;
+transport uncertainty cannot erase the pending request. Legacy pending-name
+cleanup uses borrowed SQL metadata admission and the complete packet cap.
+Five added regressions bring new FS7 tests to17. Independent repair review is
+active, and the private native harness is being strengthened for interruption
+cleanup before the105-function initial suite/Clippy/fmt. Source remains frozen;
+no FS7 native claim. Shortcut comment23358 and In Progress state were read back.
+
+LM test-only observation milestone is independently qualified and committed clean
+as `837ddec0ff70cc3d0fcdec6abb2291ece074f72e` (18-file delta). Root verified
+all122 committed blobs. Committed receipt SHA256
+`474cea884e701ae9470c49867e1c4f3bde9fb2d07f2718a61ab156b492e49ea0`;
+cumulative readback `source-v37-cumulative-readback.json`, SHA256
+`80c34a8d82186cdfe2873fec2c22f03db46aba8ac163d6a84a6841c19dbe5caa`,
+verifies31 artifacts. Independent final `review-v37-final.json`, SHA256
+`07a50f4bff5957f2b5d121ef24e365b6c8fbc60d12018003962c51aff4614ab1`,
+confirms eight distinct functions (six in-process, two actual-process), formatting,
+source equivalence of carried passes and known helper retirement. No push or
+integration into the desktop branch yet.
+
+The corrected inventory `PART-C-NUMERICAL-SUBSTITUTION-v37-v2.md`, SHA256
+`affdd72d48eedf4749be22aa7e20bef41c4c9711f771653af83bace44112c742`,
+preserves the original report and distinguishes seal dynamic21,364,737 bytes
+from complete21,365,041 including its304-byte root. The576-byte Manifest box
+exists only while the wire Value owns it; public returned values have separate
+inline root placement. These report corrections change no source or runtime
+qualification. Remaining Policy/Evidence and constructor/path/protocol owner
+terms are being derived independently before aggregate admission/enforcement.
+
+FS7 v2 repair source passes independent review `review-source-v2.json`, SHA256
+`5ccf5fab849a77fe281bf21cd9b1cbcff80994d4148f9a8d0686f71ce7c991ee`.
+Root strengthened only the private gate harness: v3 adds bounded owned-process
+cleanup and terminal evidence; v4 uses current PID/start-matched process groups
+rather than stale historical group values. A pure row regression covers moved
+groups and PID reuse. All source v2 and prior harness artifacts remain intact.
+Runner-v4 receipt SHA256
+`eab96308bf57a230f52de26986c0188ad6c54a2e51beee73d45c752a8d41836b`.
+Initial native gate is running with standard caps, discovery then105 positive
+functions/9 inert ignored, Clippy and formatting; later configured phases are
+not yet granted. No FS7 runtime qualification is claimed at this checkpoint.
+
+## Earlier integration checkpoints
+
+The entries below preserve historical evidence and pending-state descriptions at
+those checkpoints. Current source, CI and user-app status are stated above.
+
+Cache native-path repair `1f51107` is integrated as `4a51c9c`. It preserves legacy
+TEXT rows, stored previews and both relocation phases while writing versioned
+native BLOB paths under cache schema5. All54 focused local test functions and
+strict Clippy/fmt pass; three physical nonUTF cases remain unqualified on this
+Mac due to filesystem EILSEQ92. Independent review verified7 source and14 evidence
+files: `sc-22847-ci-native-path-independent-rhr25ssc/review.json`.
+CI34762593643 is terminal: contracts passed, all three platform jobs failed.
+Windows reached the same obsolete version1 assertion; its log is retained with
+the Mac/Linux logs. That assertion and the premature-restore fixture are repaired;
+fresh hosted validation and installed Windows execution remain pending.
+
+Latest local integration includes detached export execution `18b6e9e` as `bbf1a67`,
+immutable Lightroom selection review/sealing `51a4fa0` as `b28cf67`, copy admission
+repair `3742163`, and output settings controls `2140721`. Export's48 distinct focused
+tests and strict Clippy/fmt pass; native service7 counts test functions, including
+one macOS EILSEQ92 early exit, not seven physical workflows. Root verified12 source
+and21 evidence hashes; independent final review is private
+`sc-22847-export-execution-independent-s5jqietk/review-final.json`.
+Selection passed11 new +17 reader +1 family tests and strict Clippy/fmt; root verified
+six source and20 evidence hashes, including the approved final rustdoc-only delta.
+It retains exact explicit approval bytes and all-family decisions, rejects observed
+source drift, and publishes a new immutable seal at a documented final-CAS decision
+point. Live SQLite SHM cache semantics and process-scoped lock ownership are explicit;
+the later workbench serializes inspection access. No canonical migration ran.
+
+Copy admission browser checks reproduce an accepted Run with an unresolved reply
+leaving Cancel unavailable. Independent status polling now settles UI admission,
+keeps late replies from replacing state, preserves stable identical terminal objects,
+and fences pre-admission/pre-error reads while retaining uncertainty until fresh
+status. Independent review found and verified repairs for both terminal-refresh and
+lost-error write-hold races. Evidence: private `sc-22847-copy-admission-ui-vvfj1300`.
+Output controls cover the complete current format/depth/size/profile/alpha surface;
+43 frontend tests/build and synthetic actual-component browser checks pass. Controls
+and controller/bridge integration remain unfinished, with no actual export UI claim.
+
+Draft PR16 remote head is `2698e8690d3daa47d73f7e4f6e5fcff6ede7081b` in the PUBLIC
+repository. CI34762593643 contracts passed; all three platforms failed.
+The platform jobs expose an obsolete XMP version1
+fixture (new native-path version3); Linux additionally exposes a restore fixture
+that already rolled back automatically and a real Unicode-only preview-cache path
+restriction. Private logs: `sc-22847-ci-34762593643-hlby48a6`. The bounded fix preserves
+legacy cache rows/journals through native-path BLOB compatibility in cache schema5;
+implementation is integrated above and hosted proof remains pending. This is not a main
+catalog schema change. Full export actor/UI and serialized Lightroom workbench
+are active next slices; S12 remains In Progress and S13 has not started.
+
+
+Mac v5 is an immutable local checkpoint of `4e409726c0cce5434e51e10ed730da77cba4da61`.
+Integrated worker/capture tests, strict Clippy/fmt, Tauri build/bundle and installed
+preview, edited-PNG export and Lightroom capture passed. Installed capture used a
+small synthetic committed-WAL fixture: original main/WAL/SHM/auxiliary hashes stayed
+unchanged, logical rating3 was recovered, and cancel/Drop/owner EOF all reaped.
+Root verified65 private evidence files and95 package/image-root files, including46
+app files. Receipt: private `sc-22847-mac-v5-build-mw_p9xb3/receipt.json`.
+The app/DMG under `sc-22847-mac-checkpoint-v5` require arm64 macOS26, use ad-hoc
+signing and are not notarized. The old app49373 exited normally; bounded actual
+user-catalog GUI preview verification is recorded above. Full acceptance remains open.
+
+CI repair `c96f063` is integrated as `7b84a86`: the three-command frontend step now
+explicitly selects Bash, so Windows stops at a failed install/test/build command.
+Four local command-exit fixtures and independent source review pass. Previous
+Windows advancement past this step is not proof that its frontend tests passed;
+terminal logs remain required. No jobs, runner matrix or additional workflows were added.
+
+
+Latest S12 integration: export path compatibility `1da8212` is integrated as
+`ed547a4`, backup lifecycle repairs are `58e3c78`, and owned Lightroom capture
+`ee83b33` is integrated as `cb10f73`. All three received independent source review.
+Export wire formats now retain exact native path units in plans, snapshots, seals,
+receipts and worker completion while preserving legacy raw plan bytes and authority
+hashes. Sixty focused test functions and strict Clippy pass. Four physical nonUTF
+fixtures report the exact macOS EILSEQ92 filename limitation before publication;
+they do not establish physical nonUTF export on this Mac. Five representable-path
+worker/service workflows ran. Root verified11 integrated source and23 evidence
+hashes in private `sc-22847-export-native-path-qnt6co3y`.
+
+Backup browser checks reproduce then repair stale destination/picker/restore replies
+crossing catalog or panel scopes, and unusable Cancel behind an unresolved start
+acknowledgement. Independent status polling now reconciles admission and owns status;
+exact-operation cancellation is separate from review admission. Same-catalog reopen
+also releases an obsolete pending restore-review callback. Actual-component synthetic
+browser evidence is `sc-22847-backup-ui-gilg1rzz`;38 frontend tests and build pass.
+CI34760079137 at90e4041 is terminal. All platforms reported obsolete frontend
+lifecycle-key expectations;58e3c78 checks stable ownership through indexing, distinct
+sibling keys, and replacement across catalog sessions. Windows passed the earlier
+original-observation regression and its native library/CLI stage, then failed in
+installed-worker observation. The digest-verified Windows artifact proves a psutil
+WindowsPath TypeError before the first telemetry sample; temporary-directory cleanup
+then masked it with WinError32. Repair9aa8564 is integrated as8bdbcda: all five affected
+qualification helper calls use os.fspath, and caller cwd/environment restore precedes
+temporary-directory deletion. Fifty Python tests pass; original-helper regressions
+fail as expected. Root independently reviewed all8 source and22 evidence hashes in
+private sc-22847-windows-worker-pfoyscb1. This proves the observer defect, not installed
+Windows worker execution; fresh integrated terminal CI remains required.
+
+Owned Lightroom capture adds bounded create-new request/result transport, pre-source
+request digest admission, child-only original handles and POSIX byte locks, and an
+EOF ownership lease with explicit cancel/Drop kill and reap. Hidden CLI/Tauri dispatch
+runs before app initialization; the legacy capture-worker protocol remains available.
+Five focused and24 Lightroom integration tests plus strict Clippy/fmt pass. Private
+`sc-22847-lightroom-capture-worker-hdne55hk` retains source, failures and receipt.
+This is a prerequisite: installed helper execution passed on Mac v5; the full
+desktop Lightroom workbench and photo-export/metadata-write workflows remain open.
+No actual user catalog was recaptured or migrated, and no original was changed.
+
+
+S1–S11 are Done. S10 PR #14 merged as
+`287d3382538b10717bf943553c73fc29a300ffd6`; final and merged CI passed.
+The selected16 migration remains a scratch TEST, with no canonical migration
+or Adobe renderer parity claim. The user has opened this TEST in the first local
+Mac checkpoint app. Read-only diagnosis verified a selected original exists at
+its recorded path while its migrated physical asset remains pending.
+
+S11 PR #15 merged as `e43997aad29bafc90f079fa2954df9f6db084266`, identical
+to independently reviewed `6105679`. Final PR CI `34742822480` and merged CI
+`34743768864` passed all four jobs (macOS, Windows, Linux, evidence contracts).
+Shortcut sc-22846 was read back Done; comment23286 records acceptance and limits.
+Its whole-database backup, verified new-destination restore, interruption safety,
+XMP/migration retention, restored-job holds, relink and preview regeneration are
+covered by [Catalog backup and restore](CATALOG_BACKUP.md). This does not claim a
+measured backup of the73GB TEST catalog.
+
+S12 sc-22847 is In Progress on `codex/sc-22847-desktop`. React/TypeScript/Vite
+and Tauri implement the first grid/editor integration; PhotoCatalog remains the
+working name. Actual filesystem folders across all years share one catalog.
+The UI-independent Rust application actor owns typed bounded commands, precise
+paths/revisions, foreground priority, preview scheduling and worker lifecycle.
+Draft PR #16 remains open on the
+PUBLIC repository. Run `34751855171` finished: contracts passed; Linux failed
+late JPEG XL discovery after Python setup replaced PKG_CONFIG_PATH; Windows failed
+notice collection; macOS package/installed-worker checks passed but evidence upload
+failed. Linux environment repair `d242842` is local; remaining platform failures are
+repaired by `be54877` integrated as `e762c1d`, with 37 Python tests and independent review.
+Run `34754042585` finished with contracts passing and three platform failures:
+macOS exposed a scheduling race in the backup cancellation test; Linux and Windows
+reached installed payload verification, which rejected Tauri's package marker patch.
+Captured installer bytes on both platforms prove the only change is the pinned
+first marker UNK→DEB/NSS. The local repair predicts that exact whole-file digest
+before bundling and still rejects every unrelated byte change. Eleven staging
+tests, the deterministic SQLite cancellation regression, strict Clippy and independent
+source review pass. Private evidence is `sc-22847-ci-marker-backup-gate-v2` and
+`sc-22847-ci-34754042585`. Run34755832775 at04d6913 passed macOS,
+Linux and evidence contracts. Windows built and inspected the NSIS payload but
+failed before worker launch because its environment snapshot uses SYSTEMROOT,
+while the smoke launcher looked up SystemRoot. Repair7fd2d81 normalizes Windows
+environment keys and uses exact Windows path syntax;45 Python tests and independent
+source review pass. Fresh Windows installed-worker qualification remains pending.
+Run34758374938 atc53fbe5 is terminal: contracts passed; all platforms failed the
+schema4 organization fixture because it omitted the shared schema12 teardown.
+The one-line test-only repair233569f passed all23 organization tests and independent
+SQL/source review. Windows additionally timed out in the original-observation test;
+its unqualified channel error does not identify the failed boundary. Test diagnostics
+now report the exact request or checkpoint and worker status without relaxing deadlines.
+The focused local test passes; the Windows cause and installed-worker gate remain pending.
+Local import `557c0ff` is integrated as
+`eebc6e5` after 85 focused tests, strict Clippy and independent source review.
+Root backup dispatch/UI, search/import controls and loading feedback `6e21ff0`
+passed 24 native bridge/actor tests, strict Clippy, Tauri check, frontend build and
+seven frontend tests with an independent source review.
+
+The actual macOS checkpoint's dependency closure and installed preview/export
+workers passed local validation. Its linked native libraries require macOS 26;
+macOS 12 compatibility is not established. Signing-sanitized tooling now forces
+ad-hoc local builds; two earlier unintended signing/notarization attempts are
+recorded in Shortcut comment23288. No GitHub release was published.
+
+User testing reached Catalog ready after initial indexing, but exposed pending
+Lightroom originals being called unavailable. Initial physical preparation
+`a1d5500` is integrated as `47551b4`: 46 distinct focused tests passed, including
+variant-specific pixels, translated import recipe history, retained metadata/XMP,
+missing originals, held-reader cancellation and seven crash cases. Exact v4 source
+review passed independently. Preparation reads one selected original at a time;
+its result establishes physical readiness without replacing recipes or paths.
+Root integrated 14 bridge + 9 organization tests and strict Clippy pass. Mac v3
+package at e762c1d passes frontend22/build, Tauri build, dependency closure and
+installed preview/export worker checks. Actual RAW GUI validation is still pending; the Mac
+was locked when Computer Use attempted it, and the user has an unlock request.
+Mac v4 atc53fbe5 also passed build/bundle, dependency closure and installed synthetic
+preview/edited-PNG export. Root verified46 installed file hashes and22 evidence
+artifacts. The app/DMG under private `sc-22847-mac-checkpoint-v4` are immutable,
+arm64 macOS26 debug checkpoints, ad-hoc signed and not notarized. The original user
+app is unchanged; Computer Use still reports a locked Mac.
+
+Schema11 durable zero-position collection projection `97e0394` is integrated as
+`01af9b4`: 50 focused tests plus query-counter fixture and strict Clippy passed;
+independent review verified all source/log hashes. Bounded persistent initialization
+prevents a full membership scan before a positive-only first page. Root dispatcher
+and bounded single-collection lookup passed integrated gates and source
+review. Organization UI review identified transient-indexing unmount and false
+end-of-page on errors; both are repaired in `5ab1560`, integrated as `77b58c0`, and independently
+re-reviewed PASS with all 11 source files matching root exactly. Older recorded
+drive paths remain unchanged; the new relink workflow has not been used on the user catalog.
+
+Compatibility badges now distinguish translated, retained-only and untranslated
+Lightroom settings without asserting Adobe appearance equivalence (`72b0e41`).
+Metadata adapters15330a6/f4f4e57 expose selected-variant effective values,
+conflict resolution, source/packet/observation/decision provenance, exact retained
+bytes, immutable Lightroom graph history, actual source columns and Adobe settings
+interpretation. Native-copy ancestry follows immutable same-asset predecessors.
+Four metadata UI findings were repaired and independently re-reviewed.
+
+Relink core5fc7b5d introduces schema12 with detached bounded candidate preparation,
+explicit association acknowledgement where no historical digest exists, exact source
+fences, cancellable apply/undo, pinned existing database workers, and hydration lineage.
+Its58 focused tests and strictClippy passed independent exact-source review. Adapter
+2214d55 plus sparse-scan repair8e38d9b owns status/cancel and worker drain, preserves
+cached browsing during write holds, and bounds Rules scans by candidates examined.
+The10k-row sparse-exclusion regression and native imported master/copy hydration/undo
+passed. Legacy plans report counts unavailable but retain strict lineage-checked undo.
+
+Desktopdaa9dc2 adds Metadata & XMP and Locate originals workflows. All36 frontend
+tests/build and bounded independent reviews pass. Synthetic browser scenarios cover
+history continuation, failed-read retry, opaque provenance, explicit whole-plan
+confirmation, commit-winning cancellation, undo, and stale picker/cancel replies.
+The post-apply image refresh binds catalog, request generation and selected-row identity.
+Root61b45f8 validates selected-copy metadata revision and session isolation and the
+schema12 downgrade fixture. The combined gate passes41 actor tests,15 native bridge
+tests and strictClippy; independent integration review passes. Its held transaction
+permits metadata reads and rejects conflict-resolution writes. Duplicate React keys
+on the retained-column and settings-path siblings were found in the browser console
+and repaired with distinct anchor-qualified keys; the narrow review and build pass. These are local source/fixture results, not installed user-catalog
+or canonical migration acceptance. Computer Use rechecked the Mac: still locked;
+the old checkpoint remains running and unmodified.
+
+Adjustment-copy adapter80eb2a5 exposes all seven groups through immutable source
+inspection, bounded named target/job/result pages, explicit append/seal/run/resume,
+and scoped queue-bypass cancellation. One target runs per background opportunity;
+the reviewed priority fix yields to selected previews and byte delivery too. Six
+adapter, nine actor and seven core tests pass with strictClippy and independent review.
+The actual held-relink/copy-cancel/Close test verifies drain before durable cancellation
+and no automatic resume on reopen. Root integrated six copy tests, the original-location
+test and strictClippy pass with exact source hashes unchanged.
+
+Frontend5ad942f provides page-scoped target selection across one persistent batch,
+source groups, review, progress and per-target outcomes. All38 frontend tests/build
+pass; independent review fixes stale canceled-job state, catalog-owned refresh holds,
+and lost Run reply recovery. Synthetic browser evidence covers seven groups, exact
+large revisions, lost append replies, cross-page appends, explicit execution and hidden
+cancellation. The actual App close-race fixture holds Close, completes copy, acknowledges
+Close, then opens another catalog; all11 recipe sliders are enabled. Seven namespaced
+React keys remove the observed sibling collisions, with narrow independent review and
+no duplicate-key console output in the repeated App check. Private evidence is
+`sc-22847-copy-ui-45uny_am`, `sc-22847-copy-close-ui-trxv5o70`,
+`sc-22847-copy-independent-j_66flda` and `sc-22847-copy-integrated-pz_h936r`.
+
+S12 remains incomplete. Lightroom discovery/capture/dry-run/import/reconciliation,
+full export and controlled metadata-write workflows, backup
+settings, preview-cache/color settings, accessibility, user visual review, and complete
+installed three-platform workflows remain in the agreed foundation scope. Existing
+organization, metadata, relink and adjustment-copy implementations still need integrated installed
+acceptance; their local tests do not close S12.
+Export native-path compatibility is integrated as recorded above. Detached cancellable
+export execution and immutable Lightroom selection sealing are the next bounded
+implementation prerequisites; their actor/UI workflows remain unfinished.
+S13 remains the sole terminal integrated readiness/scale campaign after S12 is stable.
 
 ## S10 pre-merge checkpoint — 2026-09-13
 

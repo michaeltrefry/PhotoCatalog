@@ -1,0 +1,19 @@
+dialog:has(.metadata-panel) { width: min(880px, calc(100vw - 60px)); }
+dialog[open]:has(.metadata-panel) { display: flex; flex-direction: column; }
+dialog:has(.metadata-panel) .dialog-title { flex-shrink: 0; }
+dialog:has(.metadata-panel) .dialog-body { min-height: 0; }
+.metadata-panel { width: 100%; }
+.metadata-panel nav { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.metadata-panel article { padding: 12px 0; border-bottom: 1px solid var(--border, #444); }
+.metadata-panel section { margin-top: 20px; }
+.metadata-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; font-size: 12px; }
+.metadata-value { margin: 10px 0; }
+.metadata-value strong { display: block; margin-bottom: 4px; }
+.metadata-value button { margin-left: 6px; }
+.metadata-panel details { margin: 10px 0; }
+.metadata-columns { display: grid; gap: 6px; margin: 10px 0; }
+.metadata-columns button { display: flex; justify-content: space-between; text-align: left; gap: 12px; }
+.metadata-conflict { color: var(--warning, #e1bc72); }
+.metadata-byte-viewer { border: 1px solid var(--border, #444); padding: 14px; }
+.metadata-byte-viewer header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.metadata-byte-viewer pre { white-space: pre; overflow-wrap: normal; max-height: 340px; }

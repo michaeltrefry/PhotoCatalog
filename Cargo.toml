@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 
+[features]
+internal-capacity-probes = []
+
 [dependencies]
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
+# Match the image backend versions so decode errors retain typed categories.
+image-webp = "=0.2.4"
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 lcms2 = { version = "6", features = ["static"] }
 flate2 = "1"
 png = "=0.18.1"
@@ -17,7 +23,7 @@ tiff = "=0.10.3"
 kamadak-exif = "0.6"
 rusqlite = { version = "0.38", features = ["bundled", "hooks", "backup"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
@@ -34,3 +40,6 @@ vcpkg = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
+
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }

@@ -23,9 +23,29 @@ impl PreviewConfiguration {
         file.read_exact(&mut bytes)?;
         let mut extra = [0];
         ensure!(file.read(&mut extra)? == 0, "preview configuration grew");
-        let value: Self = serde_json::from_slice(&bytes)?;
+        Self::from_bytes(&bytes)
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        ensure!(bytes.len() <= 64 * 1024, "preview configuration size limit");
+        let value: Self = serde_json::from_slice(bytes)?;
         ensure!(value.original_roots.len() <= 1024, "original root limit");
         Ok(value)
+    }
+    pub fn read_managed(
+        filesystem: &dyn crate::catalog_session::CatalogFilesystem,
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let bytes = filesystem.read_preview_configuration(
+            &crate::storage_volume::NativePath::from_path(&path),
+            cancel,
+        )?;
+        Self::from_bytes(&bytes)
     }
     pub fn open(
         &self,

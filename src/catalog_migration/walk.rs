@@ -7,10 +7,14 @@ use super::{
     originals::SourceKey,
     retention,
 };
+use crate::catalog_migration::repair_memory;
+use crate::lightroom::migration_source::MigrationRead;
+#[cfg(test)]
+use crate::lightroom::migration_source::MigrationSource;
 use crate::{
     Catalog,
     lightroom::{
-        migration_source::{Collection, EvidenceRecord, MigrationSource, Resolution},
+        migration_source::{Collection, EvidenceRecord, Resolution},
         plan::Cell,
     },
 };
@@ -27,13 +31,13 @@ pub(crate) enum LinkResolution {
 
 pub(crate) struct Walk<'a> {
     catalog: &'a Catalog,
-    source: &'a MigrationSource,
+    source: &'a dyn MigrationRead,
     revision: &'a str,
 }
 impl<'a> Walk<'a> {
     pub(crate) fn new(
         catalog: &'a Catalog,
-        source: &'a MigrationSource,
+        source: &'a dyn MigrationRead,
         revision: &'a str,
     ) -> Result<Self> {
         ensure!(
@@ -60,7 +64,13 @@ impl<'a> Walk<'a> {
         let (input, revision, complete): (String, String, bool) = self.catalog.db.query_row(
             "SELECT input,revision,complete FROM migration_retained_records WHERE sequence=?1",
             [sequence],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    repair_memory::get(r, 0)?,
+                    repair_memory::get(r, 1)?,
+                    repair_memory::get(r, 2)?,
+                ))
+            },
         )?;
         ensure!(
             input == self.source.binding_blake3() && revision == self.revision && complete,

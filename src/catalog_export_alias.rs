@@ -10,7 +10,10 @@
 //! directory limit. Unknown, foreign or excessive scope is refused, not guessed.
 //! These checks do not freeze external filesystem changes after admission;
 //! callers retain destination revision/no-clobber publication and source guards.
-use crate::storage_volume::{self, NativePath};
+use crate::{
+    catalog_session::{ExportAliasFactKind, ExportAliasFactValue, ExportObjectKey},
+    storage_volume::{self, NativePath},
+};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -291,44 +294,62 @@ struct Admission<'a> {
     target: Option<(u64, u128)>,
     limits: AliasLimits,
     proof: AliasProof,
+    checkpoint: &'a mut dyn FnMut() -> Result<()>,
+    facts: &'a mut dyn FnMut(&NativePath, ExportAliasFactKind) -> Result<ExportAliasFactValue>,
 }
+
+fn matches_file_object(value: ExportAliasFactValue, expected: (u64, u128)) -> Result<bool> {
+    match value {
+        ExportAliasFactValue::File { object, .. } => Ok(object.native()? == expected),
+        ExportAliasFactValue::Missing | ExportAliasFactValue::Directory { .. } => Ok(false),
+    }
+}
+
+fn matches_directory_object(value: ExportAliasFactValue, expected: (u64, u128)) -> Result<bool> {
+    match value {
+        ExportAliasFactValue::Directory { object } => Ok(object.native()? == expected),
+        ExportAliasFactValue::Missing | ExportAliasFactValue::File { .. } => Ok(false),
+    }
+}
+
 impl Admission<'_> {
     fn candidate(&mut self, encoded: String) -> Result<()> {
+        (self.checkpoint)()?;
         self.proof.candidates += 1;
         ensure!(
             self.proof.candidates <= self.limits.candidates,
             "export alias ambiguity exceeds candidate budget; reconcile or choose an unambiguous destination"
         );
         let native: NativePath = serde_json::from_str(&encoded)?;
-        let source = native
-            .to_path()
-            .context("foreign original path needs explicit mapping before overwrite")?;
-        match fs::metadata(&source) {
-            Ok(metadata) => {
-                ensure!(
-                    metadata.is_file(),
-                    "catalog original changed file type; reconcile before overwrite"
-                );
+        match (self.facts)(&native, ExportAliasFactKind::File)
+            .context("cannot resolve catalog original alias")?
+        {
+            ExportAliasFactValue::File { object, .. } => {
                 if let Some(target) = self.target {
                     ensure!(
-                        storage_volume::object_key(&source, &metadata)? != target,
+                        object.native()? != target,
                         "export destination aliases a catalog original"
                     );
                 } else {
                     // An existing source cannot alias a currently absent name;
                     // the publisher still enforces the exact absence snapshot.
                     ensure!(
-                        !self.destination.try_exists()?,
+                        matches!(
+                            (self.facts)(
+                                &NativePath::from_path(self.destination),
+                                ExportAliasFactKind::Destination
+                            )?,
+                            ExportAliasFactValue::Missing
+                        ),
                         "export destination appeared during alias validation"
                     );
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.target.is_some() => {
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+            ExportAliasFactValue::Missing if self.target.is_some() => {}
+            ExportAliasFactValue::Missing => bail!(
                 "missing catalog original has an ambiguous export spelling; map it or choose another destination"
             ),
-            Err(error) => return Err(error).context("cannot resolve catalog original alias"),
+            _ => bail!("catalog original changed file type; reconcile before overwrite"),
         }
         Ok(())
     }
@@ -353,6 +374,24 @@ pub fn protect_destination(
     destination: &Path,
     limits: AliasLimits,
 ) -> Result<AliasProof> {
+    protect_destination_with_checkpoint(db, destination, limits, &mut || Ok(()))
+}
+pub fn protect_destination_with_checkpoint(
+    db: &Connection,
+    destination: &Path,
+    limits: AliasLimits,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<AliasProof> {
+    protect_destination_with_facts(db, destination, limits, checkpoint, &mut local_alias_fact)
+}
+pub(crate) fn protect_destination_with_facts(
+    db: &Connection,
+    destination: &Path,
+    limits: AliasLimits,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+    facts: &mut dyn FnMut(&NativePath, ExportAliasFactKind) -> Result<ExportAliasFactValue>,
+) -> Result<AliasProof> {
+    checkpoint()?;
     ensure!(
         !db.is_autocommit(),
         "alias validation requires an authoritative catalog transaction"
@@ -380,31 +419,23 @@ pub fn protect_destination(
     );
     let native = NativePath::from_path(destination);
     let p = projection(&native)?;
-    let metadata = match fs::symlink_metadata(destination) {
-        Ok(m) => Some(m),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
+    let target = match facts(&native, ExportAliasFactKind::Destination)? {
+        ExportAliasFactValue::Missing => None,
+        ExportAliasFactValue::File { object, .. } => Some(object.native()?),
+        _ => bail!("export destination is not an ordinary file"),
     };
-    let target = metadata
-        .as_ref()
-        .map(|m| {
-            ensure!(
-                m.is_file() && !m.file_type().is_symlink(),
-                "export destination is not an ordinary file"
-            );
-            Ok(storage_volume::object_key(destination, m)?)
-        })
-        .transpose()?;
     let mut admission = Admission {
         db,
         destination,
         target,
         limits,
+        checkpoint,
         proof: AliasProof {
             overwrite: target.is_some(),
             directories: 0,
             candidates: 0,
         },
+        facts,
     };
     if let Some(exact) = &p.ascii {
         let known: bool = db.query_row(
@@ -431,11 +462,15 @@ pub fn protect_destination(
     }
     if let Some(target) = target {
         let parent = destination.parent().context("destination parent missing")?;
-        let parent_metadata = fs::metadata(parent)?;
-        let parent_key = storage_volume::object_key(parent, &parent_metadata)?;
+        let parent_native = NativePath::from_path(parent);
+        let parent_key = match (admission.facts)(&parent_native, ExportAliasFactKind::Directory)? {
+            ExportAliasFactValue::Directory { object } => object.native()?,
+            _ => bail!("destination parent is not an ordinary directory"),
+        };
         let mut statement=db.prepare("SELECT id,native_path FROM export_alias_directories INDEXED BY export_alias_active_directories WHERE members>0 ORDER BY id LIMIT ?1")?;
         let mut rows = statement.query([limits.directories as i64 + 1])?;
         while let Some(row) = rows.next()? {
+            (admission.checkpoint)()?;
             admission.proof.directories += 1;
             ensure!(
                 admission.proof.directories <= limits.directories,
@@ -444,19 +479,14 @@ pub fn protect_destination(
             let id: i64 = row.get(0)?;
             let encoded: String = row.get(1)?;
             let native: NativePath = serde_json::from_str(&encoded)?;
-            let directory = native
-                .to_path()
-                .context("foreign original directory requires explicit mapping before overwrite")?;
-            let m = match fs::metadata(&directory) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e).context("cannot validate original directory"),
+            let directory_key = match (admission.facts)(&native, ExportAliasFactKind::Directory)
+                .context("cannot validate original directory")?
+            {
+                ExportAliasFactValue::Missing => continue,
+                ExportAliasFactValue::Directory { object } => object.native()?,
+                _ => bail!("original directory changed type; reconcile before export"),
             };
-            ensure!(
-                m.is_dir(),
-                "original directory changed type; reconcile before export"
-            );
-            if storage_volume::object_key(&directory, &m)? != parent_key {
+            if directory_key != parent_key {
                 continue;
             }
             if let Some(filename) = &p.filename {
@@ -466,25 +496,85 @@ pub fn protect_destination(
                 admission.candidates("SELECT b.native_path FROM export_alias_paths p CROSS JOIN storage_bindings b ON b.asset_id=p.asset_id WHERE p.parent=?1 ORDER BY p.filename,p.asset_id LIMIT ?2",params![id,admission.remaining()])?;
             }
             ensure!(
-                storage_volume::object_key(&directory, &fs::metadata(&directory)?)? == parent_key,
+                matches_directory_object(
+                    (admission.facts)(&native, ExportAliasFactKind::Directory)?,
+                    parent_key,
+                )?,
                 "original parent changed during export validation"
             );
         }
-        let current_destination = fs::symlink_metadata(destination)?;
         ensure!(
-            current_destination.is_file()
-                && !current_destination.file_type().is_symlink()
-                && storage_volume::object_key(parent, &fs::metadata(parent)?)? == parent_key
-                && storage_volume::object_key(destination, &current_destination)? == target,
+            matches_directory_object(
+                (admission.facts)(&parent_native, ExportAliasFactKind::Directory)?,
+                parent_key,
+            )? && matches_file_object(
+                (admission.facts)(&native, ExportAliasFactKind::Destination)?,
+                target,
+            )?,
             "destination changed during export validation"
         );
     } else {
         ensure!(
-            !destination.try_exists()?,
+            matches!(
+                (admission.facts)(&native, ExportAliasFactKind::Destination)?,
+                ExportAliasFactValue::Missing
+            ),
             "destination appeared during alias validation"
         );
     }
     Ok(admission.proof)
+}
+
+pub(crate) fn local_alias_fact(
+    native: &NativePath,
+    kind: ExportAliasFactKind,
+) -> Result<ExportAliasFactValue> {
+    let path = native.to_path()?;
+    let metadata = match kind {
+        ExportAliasFactKind::Destination => fs::symlink_metadata(&path),
+        _ => fs::metadata(&path),
+    };
+    let metadata = match metadata {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExportAliasFactValue::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match kind {
+        ExportAliasFactKind::Destination => {
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "export destination is not an ordinary file"
+            );
+            Ok(ExportAliasFactValue::File {
+                object: ExportObjectKey::from_native(storage_volume::object_key(&path, &metadata)?),
+                canonical: None,
+            })
+        }
+        ExportAliasFactKind::File | ExportAliasFactKind::CanonicalFile => {
+            ensure!(
+                metadata.is_file(),
+                "catalog original changed file type; reconcile before overwrite"
+            );
+            Ok(ExportAliasFactValue::File {
+                object: ExportObjectKey::from_native(storage_volume::object_key(&path, &metadata)?),
+                canonical: matches!(kind, ExportAliasFactKind::CanonicalFile)
+                    .then(|| fs::canonicalize(&path))
+                    .transpose()?
+                    .map(|path| NativePath::from_path(&path)),
+            })
+        }
+        ExportAliasFactKind::Directory => {
+            ensure!(
+                metadata.is_dir(),
+                "original directory changed type; reconcile before export"
+            );
+            Ok(ExportAliasFactValue::Directory {
+                object: ExportObjectKey::from_native(storage_volume::object_key(&path, &metadata)?),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +662,38 @@ mod tests {
             }
             assert_eq!(fs::read(original).unwrap(), b"retained");
         }
+    }
+    #[test]
+    fn stateless_facts_recheck_an_initially_absent_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = fs::canonicalize(root.path()).unwrap();
+        let destination = folder.join("appeared.jpg");
+        let db = database();
+        let tx = db.unchecked_transaction().unwrap();
+        let mut destination_reads = 0;
+        let error = protect_destination_with_facts(
+            &tx,
+            &destination,
+            AliasLimits::default(),
+            &mut || Ok(()),
+            &mut |path, kind| {
+                assert_eq!(path, &NativePath::from_path(&destination));
+                assert_eq!(kind, ExportAliasFactKind::Destination);
+                destination_reads += 1;
+                if destination_reads == 1 {
+                    Ok(ExportAliasFactValue::Missing)
+                } else {
+                    Ok(ExportAliasFactValue::File {
+                        object: ExportObjectKey::from_native((1, 2)),
+                        canonical: None,
+                    })
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(destination_reads, 2);
+        assert!(error.to_string().contains("appeared"));
+        assert!(!destination.exists());
     }
     #[cfg(unix)]
     #[test]
@@ -731,11 +853,13 @@ mod tests {
         reconcile(&db);
         let destination = folder.join("export.jpg");
         fs::write(&destination, b"old export").unwrap();
+        let error = guard(&db, &destination, AliasLimits::default()).unwrap_err();
+        assert_eq!(error.to_string(), "cannot validate original directory");
         assert!(
-            guard(&db, &destination, AliasLimits::default())
-                .unwrap_err()
-                .to_string()
-                .contains("foreign original directory")
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::InvalidInput),
+            "foreign path must fail native conversion: {error:#}"
         );
         assert_eq!(fs::read(destination).unwrap(), b"old export");
     }

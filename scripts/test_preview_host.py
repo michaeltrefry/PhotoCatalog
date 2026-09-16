@@ -8,6 +8,22 @@ import preview_host
 
 
 class HostBindingTests(unittest.TestCase):
+    def test_storage_capacity_passes_native_string_to_windows_disk_api(self):
+        disk_usage=preview_host.psutil.disk_usage
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder).resolve()
+            def windows_disk_usage(path):
+                self.assertIsInstance(path,str)
+                self.assertEqual(path,str(root))
+                return disk_usage(path)
+            with patch.object(preview_host.psutil,'disk_usage',side_effect=windows_disk_usage) as usage, \
+                 patch.object(preview_host.psutil,'disk_partitions',return_value=[]):
+                value=preview_host.storage(root)
+            usage.assert_called_once()
+            self.assertEqual(value['path'],str(root))
+            self.assertGreater(value['capacity']['total'],0)
+            self.assertEqual(value['status'],'unavailable')
+
     def test_initial_unavailable_gpu_is_retained_and_receipt_binds_bytes(self):
         sample={"kind":"sample","gpu":{"status":"unavailable","reason":"fixture"},"cpu":{"status":"baseline"}}
         with tempfile.TemporaryDirectory() as root, patch.object(preview_host.observer.HostSampler, "sample", return_value=sample):

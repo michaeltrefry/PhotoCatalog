@@ -85,6 +85,7 @@ pub struct ImageRefreshProgress {
     pub pending: bool,
 }
 
+pub(crate) mod collection_order_index;
 pub mod organization;
 
 const SCHEMA: &str = r#"
@@ -199,7 +200,7 @@ pub(crate) fn id(db: &Connection, key: &VariantKey) -> Result<String> {
     db.query_row(
         "SELECT id FROM catalog_images WHERE asset_id=?1 AND variant_id=?2",
         params![key.asset_id, key.variant_id],
-        |r| r.get(0),
+        |r| crate::catalog_row::owned_text(r, 0, 256),
     )
     .context("logical image not found")
 }
@@ -217,7 +218,7 @@ pub(crate) fn require_current(db: &Connection, image: &str) -> Result<()> {
 }
 pub(crate) fn identity(db: &Connection, image: &str) -> Result<ImageMetadataIdentity> {
     require_current(db, image)?;
-    Ok(db.query_row("SELECT i.id,i.asset_id,i.variant_id,COALESCE(m.revision,0),i.pixel_generation,s.epoch,a.physical_generation FROM catalog_images i JOIN assets a ON a.id=i.asset_id JOIN image_shared_state s ON s.asset_id=i.asset_id LEFT JOIN metadata_assets m ON m.asset_id=i.id WHERE i.id=?",[image],|r|Ok(ImageMetadataIdentity{image_id:r.get(0)?,key:VariantKey{asset_id:r.get(1)?,variant_id:r.get(2)?},metadata_revision:r.get(3)?,pixel_generation:r.get(4)?,shared_source_epoch:r.get(5)?,physical_generation:r.get(6)?}))?)
+    Ok(db.query_row("SELECT i.id,i.asset_id,i.variant_id,COALESCE(m.revision,0),i.pixel_generation,s.epoch,a.physical_generation FROM catalog_images i JOIN assets a ON a.id=i.asset_id JOIN image_shared_state s ON s.asset_id=i.asset_id LEFT JOIN metadata_assets m ON m.asset_id=i.id WHERE i.id=?",[image],|r|Ok(ImageMetadataIdentity{image_id:crate::catalog_row::owned_text(r,0,256)?,key:VariantKey{asset_id:crate::catalog_row::owned_text(r,1,256)?,variant_id:crate::catalog_row::owned_text(r,2,256)?},metadata_revision:r.get(3)?,pixel_generation:r.get(4)?,shared_source_epoch:r.get(5)?,physical_generation:r.get(6)?}))?)
 }
 /// Call inside the same writer transaction as authority reservation/publication.
 pub fn require_image_metadata_identity(
@@ -265,6 +266,9 @@ pub(crate) fn register_copy(db: &Connection, key: &VariantKey, source: &VariantK
     db.execute("INSERT INTO organization_flags SELECT t.sequence,f.flag,f.provenance FROM catalog_images s JOIN organization_flags f ON f.sequence=s.sequence JOIN catalog_images t ON t.id=?1 WHERE s.id=?2", params![target,from])?;
     db.execute("INSERT INTO organization_collection_members SELECT m.collection,t.sequence,m.provenance FROM catalog_images s JOIN organization_collection_members m ON m.sequence=s.sequence JOIN catalog_images t ON t.id=?1 WHERE s.id=?2", params![target,from])?;
     db.execute("INSERT INTO organization_collection_order SELECT o.collection,t.sequence,o.position FROM catalog_images s JOIN organization_collection_order o ON o.image_sequence=s.sequence JOIN catalog_images t ON t.id=?1 WHERE s.id=?2", params![target,from])?;
+    // A copied member can sort before a paused collection cursor. Advance the
+    // affected collection revisions in this same variant-creation transaction.
+    db.execute("UPDATE organization_collections SET revision=revision+1 WHERE id IN (SELECT m.collection FROM organization_collection_members m JOIN catalog_images i ON i.sequence=m.sequence WHERE i.id=?1)", [&target])?;
     crate::organization::refresh(db, &target)?;
     Ok(())
 }

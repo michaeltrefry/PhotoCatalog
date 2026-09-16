@@ -1,5 +1,10 @@
 //! Application-owned preview service. All catalog/manifest mutations occur on
 //! the owner; native workers can only return isolated, validated image results.
+#[path = "encoded_delivery.rs"]
+pub(crate) mod encoded_delivery;
+#[path = "managed_reads.rs"]
+mod managed_reads;
+pub(crate) use managed_reads::metadata_root_layout as managed_read_metadata_root_layout;
 #[path = "read_queue.rs"]
 mod read_queue;
 use super::*;
@@ -55,6 +60,10 @@ pub struct ServiceLimits {
     /// temporary encoded Vec. Measured RSS is separate evidence, not this count.
     pub working_bytes: u64,
     pub per_worker_bytes: u64,
+    #[serde(default = "default_header_scratch")]
+    pub cache_header_scratch_bytes: u64,
+    #[serde(default = "default_codec_scratch")]
+    pub cache_codec_scratch_bytes: u64,
     pub decode_limits: crate::media::DecodeLimits,
     pub encoded_staging_bytes: u64,
     pub per_worker_encoded_bytes: u64,
@@ -65,6 +74,12 @@ pub struct ServiceLimits {
     pub prepared_cache_bytes: u64,
     #[serde(default = "default_prepared_entries")]
     pub prepared_cache_entries: usize,
+}
+fn default_header_scratch() -> u64 {
+    crate::catalog_session::native::DEFAULT_HEADER_SCRATCH
+}
+fn default_codec_scratch() -> u64 {
+    crate::catalog_session::native::DEFAULT_CODEC_SCRATCH
 }
 fn default_prepared_bytes() -> u64 {
     256 * 1024 * 1024
@@ -84,6 +99,8 @@ impl Default for ServiceLimits {
             workers: 1,
             working_bytes: 3 * 1024 * 1024 * 1024,
             per_worker_bytes: 2164 * 1024 * 1024,
+            cache_header_scratch_bytes: default_header_scratch(),
+            cache_codec_scratch_bytes: default_codec_scratch(),
             encoded_staging_bytes: 32 * 1024 * 1024,
             per_worker_encoded_bytes: 8 * 1024 * 1024,
             decoded_cache_bytes: 256 * 1024 * 1024,
@@ -94,6 +111,14 @@ impl Default for ServiceLimits {
         }
     }
 }
+pub struct HydrationRequest<'a> {
+    pub variant: &'a VariantKey,
+    pub source: &'a NativePath,
+    pub fingerprint: &'a str,
+    pub tier: Tier,
+    pub priority: Priority,
+    pub interactive: bool,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedJob {
     request: RenderWork,
@@ -102,6 +127,8 @@ struct SavedJob {
     edit: Option<EditRenderIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     import_image: Option<EditRenderIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hydration: Option<EditRenderIdentity>,
     import: bool,
     state: JobState,
 }
@@ -201,6 +228,25 @@ impl Drop for NativeLaunchPause {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
+/// Transferable proof that this sole preview owner is paused and drained.
+/// Neither cloneable nor constructible by callers. The external owner must reap
+/// its process before dropping this permit; keep PreviewService alive until then.
+pub struct NativeLaunchPermit {
+    _pause: NativeLaunchPause,
+    exclusive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    catalog: std::sync::Arc<crate::catalog_session::CatalogSessionAuthority>,
+}
+impl NativeLaunchPermit {
+    pub(crate) fn matches_catalog(&self, catalog: &Catalog) -> bool {
+        std::sync::Arc::ptr_eq(&self.catalog, &catalog.session)
+    }
+}
+impl Drop for NativeLaunchPermit {
+    fn drop(&mut self) {
+        self.exclusive
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 /// Diagnostic receipt for the most recently consumed successful worker result.
 /// Keys identify the producer; a later cache hit is not a new worker measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,12 +256,32 @@ pub struct WorkerResourceMetrics {
     pub peak_resident_bytes: Option<u64>,
     pub peak_method: String,
 }
+// Allows Drop to retain the whole cache owner, including SQL and all locks,
+// when an OS failure leaves a child or external native permit unverified.
+struct StoreOwner(Option<PreviewStore>);
+impl std::ops::Deref for StoreOwner {
+    type Target = PreviewStore;
+    fn deref(&self) -> &PreviewStore {
+        self.0.as_ref().expect("live preview store owner")
+    }
+}
+impl std::ops::DerefMut for StoreOwner {
+    fn deref_mut(&mut self) -> &mut PreviewStore {
+        self.0.as_mut().expect("live preview store owner")
+    }
+}
+
 pub struct PreviewService {
+    stopping: bool,
     launch_pauses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    external_native: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    native_catalog: Option<std::sync::Arc<crate::catalog_writer::Writers>>,
     reads: read_queue::ReadQueue,
+    delivery_io: Arc<std::sync::atomic::AtomicBool>,
+    delivery_pending: Arc<std::sync::atomic::AtomicBool>,
     prepared: super::prepared_cache::PreparedCache,
     observer: std::cell::RefCell<Option<ServiceObserver>>,
-    store: PreviewStore,
+    store: StoreOwner,
     decoded: DecodedCache,
     scheduler: PreviewScheduler,
     executable: PathBuf,
@@ -339,6 +405,51 @@ fn import_image_current(
 impl SavedJob {
     fn validate(&self) -> Result<()> {
         self.request.validate_persisted()?;
+        if let Some(image) = &self.hydration {
+            ensure!(
+                !self.import
+                    && self.edit.is_none()
+                    && self.import_image.is_none()
+                    && image
+                        .image_identity
+                        .as_ref()
+                        .is_some_and(|i| i.key == image.key
+                            && i.physical_generation == image.source.generation)
+                    && image.source.state == "pending"
+                    && image.source.fingerprint.is_none()
+                    && same_pixels(&image.source, &self.expected)
+                    && self.request.keys.len() == 1,
+                "mixed initial hydration authority"
+            );
+            let key = &self.request.keys[0];
+            ensure!(
+                key.asset_id == image.key.asset_id
+                    && key.variant_id == image.key.variant_id
+                    && key.edit_revision == u64::try_from(image.revision)?
+                    && key.image_pixel_generation
+                        == image
+                            .image_identity
+                            .as_ref()
+                            .map(|i| i.pixel_generation as u64)
+                    && key.generation
+                        == u64::try_from(image.source.generation)?
+                            .checked_add(1)
+                            .context("hydration generation overflow")?,
+                "hydration key identity differs"
+            );
+            if let Some(work) = &self.request.edit {
+                ensure!(
+                    work.recipe_digest == image.recipe_digest,
+                    "hydration recipe differs"
+                );
+            } else {
+                ensure!(
+                    image.key.variant_id == MASTER && image.revision == 0,
+                    "missing hydration recipe"
+                );
+            }
+            return Ok(());
+        }
         if let Some(image) = &self.import_image {
             ensure!(
                 self.import
@@ -419,6 +530,24 @@ impl SavedJob {
         Ok(())
     }
     fn current(&self, catalog: &Catalog) -> Result<bool> {
+        if let Some(image) = &self.hydration {
+            for key in &self.request.keys {
+                if crate::catalog_storage::hydration_fence(
+                    &catalog.db,
+                    &image.key.asset_id,
+                    &key.fingerprint,
+                )
+                .is_err()
+                {
+                    return Ok(false);
+                }
+            }
+            return Ok(crate::initial_hydration_source(
+                &catalog.db,
+                &image.key.asset_id,
+                &self.request.source,
+            )? && same_edit(image, &current_edit(catalog, image)?));
+        }
         if let Some(edit) = &self.edit {
             Ok(same_edit(edit, &current_edit(catalog, edit)?))
         } else {
@@ -445,6 +574,12 @@ impl SavedJob {
     }
 }
 impl PreviewService {
+    pub(crate) fn uses_managed_filesystem(&self) -> bool {
+        self.store.stage_calls().is_some()
+    }
+    pub(crate) fn return_managed_sql(&mut self) {
+        self.store.return_managed_sql();
+    }
     pub fn open(
         config: StoreConfig,
         original_roots: &[PathBuf],
@@ -452,7 +587,34 @@ impl PreviewService {
         policy: PreviewPolicy,
         limits: ServiceLimits,
     ) -> Result<Self> {
+        Self::validate_open(&executable, &policy, &limits)?;
+        let config = PreviewStore::current_configuration(config)?;
+        let store = PreviewStore::open(config, original_roots)?;
+        Self::from_store(store, executable, policy, limits)
+    }
+    pub(crate) fn open_admitted(
+        config: StoreConfig,
+        db: crate::catalog_session::SqlConnection,
+        origin: super::store::ManifestOrigin,
+        files: std::sync::Arc<dyn super::store::AdmittedStoreFiles>,
+        executable: PathBuf,
+        policy: PreviewPolicy,
+        limits: ServiceLimits,
+    ) -> Result<Self> {
+        Self::validate_open(&executable, &policy, &limits)?;
+        let store = PreviewStore::open_admitted(config, db, origin, files)?;
+        Self::from_store(store, executable, policy, limits)
+    }
+    fn validate_open(
+        executable: &std::path::Path,
+        policy: &PreviewPolicy,
+        limits: &ServiceLimits,
+    ) -> Result<()> {
         limits.decode_limits.validate()?;
+        ensure!(
+            limits.cache_header_scratch_bytes > 0 && limits.cache_codec_scratch_bytes > 0,
+            "zero native scratch admission"
+        );
         ensure!(
             executable.is_absolute() && executable.is_file(),
             "preview worker executable unavailable"
@@ -470,21 +632,46 @@ impl PreviewService {
             ensure!((1..=8192).contains(&tier.edge), "preview policy dimensions");
             tier.encoding.validate()?;
         }
-        let config = PreviewStore::current_configuration(config)?;
-        let store = PreviewStore::open(config, original_roots)?;
+        Ok(())
+    }
+    fn from_store(
+        store: PreviewStore,
+        executable: PathBuf,
+        policy: PreviewPolicy,
+        limits: ServiceLimits,
+    ) -> Result<Self> {
         let staging = store.configuration().manifest_root.join("workers");
-        recover_worker_staging(&staging, 128)?;
-        let prepared = super::prepared_cache::PreparedCache::open(
-            store.configuration().manifest_root.join("prepared"),
-            limits.prepared_cache_bytes,
-            limits.prepared_cache_entries,
-        )?;
+        let prepared_root = store.configuration().manifest_root.join("prepared");
+        let prepared = if let Some(calls) = store.stage_calls() {
+            calls.call(
+                crate::catalog_session::preview_stage::Action::Recover { limit: 128 },
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+            super::prepared_cache::PreparedCache::open_managed(
+                prepared_root,
+                limits.prepared_cache_bytes,
+                limits.prepared_cache_entries,
+                calls,
+            )?
+        } else {
+            recover_worker_staging(&staging, 128)?;
+            super::prepared_cache::PreparedCache::open(
+                prepared_root,
+                limits.prepared_cache_bytes,
+                limits.prepared_cache_entries,
+            )?
+        };
         Ok(Self {
+            stopping: false,
             launch_pauses: Default::default(),
+            external_native: Default::default(),
+            native_catalog: None,
             prepared,
             reads: read_queue::ReadQueue::default(),
+            delivery_io: Default::default(),
+            delivery_pending: Default::default(),
             observer: std::cell::RefCell::new(None),
-            store,
+            store: StoreOwner(Some(store)),
             decoded: DecodedCache::new(
                 limits.decoded_cache_bytes,
                 limits.decoded_live_bytes,
@@ -679,6 +866,29 @@ impl PreviewService {
         metrics.returned_pixels = matches!(&result, Ok(Some(_)));
         result
     }
+    fn ensure_synchronous_read_available(&self) -> Result<()> {
+        let usage = self.scheduler.usage();
+        ensure!(
+            !self.reads.active()
+                && !self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
+                && !self
+                    .delivery_pending
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && usage.active == 0
+                && usage.queued == 0
+                && self
+                    .launch_pauses
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+                && !self
+                    .external_native
+                    .load(std::sync::atomic::Ordering::Acquire),
+            super::stage_io::Busy(
+                "Native preview work is busy; release the active permit or use a queued cache read"
+            )
+        );
+        Ok(())
+    }
     fn cached_inner(
         &mut self,
         catalog: &Catalog,
@@ -688,6 +898,17 @@ impl PreviewService {
         interactive: bool,
         mut metrics: Option<&mut CacheReadMetrics>,
     ) -> Result<Option<PreviewView>> {
+        if self.store.stage_calls().is_some() {
+            match self.begin_managed_read(catalog, variant, tier, allow_stale, interactive, true)? {
+                managed_reads::Begin::Ready(view) => return Ok(view.map(|v| *v)),
+                managed_reads::Begin::Pending(mut read) => loop {
+                    if let Some(view) = self.poll_managed_read(catalog, &mut read)? {
+                        return Ok(view);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                },
+            }
+        }
         let identity = measured(&mut metrics, ReadPhase::Identity, || {
             catalog.edit_render_identity(variant)
         })?;
@@ -884,10 +1105,74 @@ impl PreviewService {
                 expected,
                 edit: None,
                 import_image: Some(import_image),
+                hydration: None,
                 import: true,
                 state: JobState::Queued,
             },
             Priority::Background,
+        )
+    }
+    pub fn submit_hydration(
+        &mut self,
+        catalog: &mut Catalog,
+        request: HydrationRequest<'_>,
+    ) -> Result<Consumer> {
+        let image = catalog.edit_render_identity(request.variant)?;
+        ensure!(
+            crate::initial_hydration_source(&catalog.db, &image.key.asset_id, request.source)?,
+            "original is not an initial metadata-only source at this path"
+        );
+        crate::catalog_storage::hydration_fence(
+            &catalog.db,
+            &image.key.asset_id,
+            request.fingerprint,
+        )?;
+        let view = catalog.edit_variant(request.variant)?;
+        ensure!(
+            view.revision == image.revision && view.recipe_digest == image.recipe_digest,
+            "hydration edit changed"
+        );
+        let mut key = if request.interactive {
+            self.interactive_key(&image, request.tier)?
+        } else {
+            self.variant_key(&image, request.tier)?
+        };
+        key.generation = key
+            .generation
+            .checked_add(1)
+            .context("hydration generation overflow")?;
+        key.fingerprint = request.fingerprint.to_owned();
+        let edit = if !request.interactive && image.key.variant_id == MASTER && image.revision == 0
+        {
+            None
+        } else {
+            Some(super::worker::EditWork {
+                recipe: view.recipe,
+                recipe_digest: view.recipe_digest,
+                limits: self.edit_limits(),
+                interactive: request.interactive,
+                prepared_bytes: 0,
+                prepared: None,
+            })
+        };
+        self.submit(
+            catalog,
+            SavedJob {
+                expected: image.source.clone(),
+                hydration: Some(image),
+                edit: None,
+                import_image: None,
+                import: false,
+                state: JobState::Queued,
+                request: RenderWork {
+                    source: request.source.clone(),
+                    keys: vec![key],
+                    encoded_limit: self.limits.per_worker_encoded_bytes,
+                    decode_limits: self.limits.decode_limits,
+                    edit,
+                },
+            },
+            request.priority,
         )
     }
     pub fn request(
@@ -973,6 +1258,7 @@ impl PreviewService {
                 expected: expected.source.clone(),
                 edit: Some(expected),
                 import_image: None,
+                hydration: None,
                 import: false,
                 state: JobState::Queued,
             },
@@ -992,6 +1278,7 @@ impl PreviewService {
         job: SavedJob,
         priority: Priority,
     ) -> Result<Consumer> {
+        ensure!(!self.stopping, "preview service is draining");
         job.validate()?;
         job.request.validate()?;
         self.ensure_original_separate(&job.request.source.to_path()?)?;
@@ -999,7 +1286,7 @@ impl PreviewService {
         let id = blake3::hash(&serde_json::to_vec(&job.request.keys)?)
             .to_hex()
             .to_string();
-        let stored = serde_json::to_string(&job)?;
+        let stored = super::store::encoded_descriptor(&job, "saved job serialization changed")?;
         let writer_priority = match priority {
             Priority::Foreground => crate::catalog_writer::Priority::Foreground,
             Priority::Background => crate::catalog_writer::Priority::Background,
@@ -1011,7 +1298,22 @@ impl PreviewService {
             }
             Ok(())
         };
-        let admitted = if let Some(edit) = &job.edit {
+        let admitted = if let Some(image) = &job.hydration {
+            with_preview_transaction(catalog, image, writer_priority, |tx| {
+                ensure!(
+                    crate::initial_hydration_source(tx, &image.key.asset_id, &job.request.source)?,
+                    "initial hydration source changed"
+                );
+                for key in &job.request.keys {
+                    crate::catalog_storage::hydration_fence(
+                        tx,
+                        &image.key.asset_id,
+                        &key.fingerprint,
+                    )?;
+                }
+                persist()
+            })?
+        } else if let Some(edit) = &job.edit {
             with_preview_transaction(catalog, edit, writer_priority, |_| persist())?
         } else {
             catalog.with_render_transaction(&job.expected, writer_priority, |tx| {
@@ -1023,9 +1325,19 @@ impl PreviewService {
             })?
         };
         ensure!(admitted.is_some(), "stale preview request");
-        let consumer =
-            self.scheduler
-                .request(id.clone(), self.limits.per_worker_bytes, priority)?;
+        let consumer = self.scheduler.request(
+            id.clone(),
+            if self.store.stage_calls().is_some() {
+                crate::catalog_session::native::render_cost(
+                    &job.request,
+                    self.limits.per_worker_bytes,
+                    self.limits.cache_codec_scratch_bytes,
+                )?
+            } else {
+                self.limits.per_worker_bytes
+            },
+            priority,
+        )?;
         self.consumers.insert(consumer, id.clone());
         self.jobs.insert(id, job);
         Ok(consumer)
@@ -1046,6 +1358,30 @@ impl PreviewService {
     /// One bounded owner iteration. Native work remains in at most `workers`
     /// children; stale/canceled children are joined before reservations release.
     pub fn tick(&mut self, catalog: &mut Catalog) -> Result<()> {
+        ensure!(!self.stopping, "preview service is draining");
+        for active in self.active.values_mut() {
+            if active
+                .lease
+                .canceled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                active.worker.signal_stop();
+            }
+            // A finished task may own the receipt another live task awaits.
+            // Collect it/start origin cleanup before the publication fence.
+            active.worker.progress_transport(&active.lease.canceled);
+        }
+        // Existing publication/maintenance uses synchronous F calls. Do not
+        // enter them while a retained data task may own F's ordinary slot.
+        if self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
+            || self.reads.transport_busy()
+            || self.active.values().any(|a| a.worker.transport_busy())
+        {
+            if self.store.stage_calls().is_some() {
+                self.dispatch_ready(catalog)?;
+            }
+            return Ok(());
+        }
         let active_ids = self.active.keys().copied().collect::<Vec<_>>();
         for lease_id in active_ids {
             let active = &self.active[&lease_id];
@@ -1065,8 +1401,17 @@ impl PreviewService {
                 active.worker.poll(&active.lease.canceled)
             };
             if matches!(result, Ok(None)) {
+                if self.active.values().any(|a| a.worker.transport_busy()) {
+                    if self.store.stage_calls().is_some() {
+                        self.dispatch_ready(catalog)?;
+                    }
+                    return Ok(());
+                }
                 continue;
             }
+            // A poll error can precede process exit (transport/OS errors).
+            // Keep every lease and byte reservation until wait succeeds.
+            self.active.get_mut(&lease_id).unwrap().worker.stop()?;
             let active = self.active.remove(&lease_id).unwrap();
             let id = active.lease.key.clone();
             let canceled = active
@@ -1127,6 +1472,13 @@ impl PreviewService {
                 self.completed.insert(consumer, status.clone());
             }
         }
+        self.dispatch_ready(catalog)
+    }
+    // Launch admission is independent of result publication. The managed path
+    // below uses C-owned SQL/cache state and the existing source-path separation
+    // check. It makes no synchronous F calls: stage/native transport begins only
+    // after insertion into the active registry.
+    fn dispatch_ready(&mut self, catalog: &mut Catalog) -> Result<()> {
         if self.store.relocation_pending()?
             || self
                 .launch_pauses
@@ -1177,18 +1529,28 @@ impl PreviewService {
                         &edit.recipe.validate()?.settings().white_balance,
                     )?;
                 }
-                WorkerProcess::spawn(&self.executable, &self.staging, request)
+                if let Some(calls) = self.store.stage_calls() {
+                    WorkerProcess::spawn_managed(calls, request, &self.limits)
+                } else {
+                    WorkerProcess::spawn(&self.executable, &self.staging, request)
+                }
             })();
             match launch {
                 Ok(worker) => {
+                    let lease_id = lease.id;
                     self.active.insert(
-                        lease.id,
+                        lease_id,
                         ActiveJob {
                             lease,
                             worker,
                             _encoded: guard,
                         },
                     );
+                    // Dispatch only after every owner is registered. A failure
+                    // is latched in the worker and follows normal poll/drain.
+                    if self.store.stage_calls().is_none() {
+                        let _ = self.active.get_mut(&lease_id).unwrap().worker.start();
+                    }
                 }
                 Err(error) => {
                     drop(guard);
@@ -1201,6 +1563,11 @@ impl PreviewService {
                 }
             }
         }
+        if self.store.stage_calls().is_some() {
+            for active in self.active.values_mut() {
+                let _ = active.worker.start();
+            }
+        }
         Ok(())
     }
     fn publish_batch(
@@ -1210,7 +1577,7 @@ impl PreviewService {
         batch: RenderedPreviewBatch,
     ) -> Result<ServiceCompletion> {
         ensure!(
-            !job.import || batch.objects.len() == 1,
+            !(job.import || job.hydration.is_some()) || batch.objects.len() == 1,
             "import publication requires one retained tier"
         );
         let mut stale = false;
@@ -1228,7 +1595,23 @@ impl PreviewService {
             let publication =
                 self.store
                     .publish_record(&object.key, &object.encoded, &record, |attach| {
-                        let result = if job.import {
+                        let result = if let Some(image) = &job.hydration {
+                            catalog.commit_preview_hydration(
+                                image,
+                                crate::HydrationPublication {
+                                    source: &job.request.source,
+                                    fingerprint: &object.key.fingerprint,
+                                    metadata: &batch.metadata,
+                                    preview_key: &object.key.digest()?,
+                                },
+                                || {
+                                    let publication = attach()?;
+                                    self.observe(ServiceEvent::ManifestAttached)?;
+                                    Ok(publication)
+                                },
+                                || self.observe(ServiceEvent::BeforeCatalogCommit),
+                            )?
+                        } else if job.import {
                             catalog.commit_preview_import_guarded(
                                 &job.expected,
                                 &object.key.fingerprint,
@@ -1276,7 +1659,7 @@ impl PreviewService {
                                 )?
                             }
                         };
-                        if job.import && result.is_some() {
+                        if (job.import || job.hydration.is_some()) && result.is_some() {
                             self.observe(ServiceEvent::CatalogCommitted)?;
                         }
                         Ok(result.unwrap_or(Publication::Stale))
@@ -1295,8 +1678,7 @@ impl PreviewService {
         job: &SavedJob,
         error: anyhow::Error,
     ) -> Result<ServiceCompletion> {
-        let message = format!("{error:#}");
-        let message = message.chars().take(4096).collect::<String>();
+        let message = failure_message(&error);
         let kind = error
             .downcast_ref::<WorkerFailure>()
             .and_then(|failure| failure.decode_status);
@@ -1336,8 +1718,11 @@ impl PreviewService {
         };
         let mut saved = job.clone();
         saved.state = state;
-        self.store
-            .save_job(id, &serde_json::to_string(&saved)?, self.limits.requests)?;
+        self.store.save_job(
+            id,
+            &super::store::encoded_descriptor(&saved, "saved job serialization changed")?,
+            self.limits.requests,
+        )?;
         Ok(status)
     }
     pub fn jobs(&self, after: i64, limit: usize) -> Result<Vec<JobView>> {
@@ -1403,6 +1788,9 @@ impl PreviewService {
                     self.store.finish_job(&id)?;
                     continue;
                 }
+                // A hydration journal always re-renders while its source is pending.
+                // A retained attachment alone cannot prove the original bytes are
+                // still the fingerprint captured before the crash.
                 // Crash after manifest attachment but before catalog ready commit.
                 if job.import
                     && self.store.current_is_intact(key)?
@@ -1440,7 +1828,24 @@ impl PreviewService {
                     .keys
                     .iter()
                     .map(|key| {
-                        if let Some(edit) = &job.edit {
+                        if let Some(image) = &job.hydration {
+                            let interactive = job
+                                .request
+                                .edit
+                                .as_ref()
+                                .is_some_and(|work| work.interactive);
+                            let mut key = if interactive {
+                                self.interactive_key(image, key.tier)?
+                            } else {
+                                self.variant_key(image, key.tier)?
+                            };
+                            key.generation = key
+                                .generation
+                                .checked_add(1)
+                                .context("hydration generation overflow")?;
+                            key.fingerprint = fingerprint.clone();
+                            Ok(key)
+                        } else if let Some(edit) = &job.edit {
                             if job
                                 .request
                                 .edit
@@ -1549,6 +1954,7 @@ impl PreviewService {
             .saturating_sub(self.consumers.len() + self.reads.len())
     }
     pub fn pause_native_launches(&self) -> Result<NativeLaunchPause> {
+        ensure!(!self.stopping, "preview service is draining");
         self.launch_pauses
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
@@ -1561,7 +1967,52 @@ impl PreviewService {
     /// Queued descriptors may remain while paused; only active children and
     /// their reservations must drain before the owner admits an external worker.
     pub fn native_work_drained(&self) -> bool {
-        self.active.is_empty() && self.scheduler.usage().reserved_bytes == 0
+        self.active.is_empty()
+            && self.scheduler.usage().reserved_bytes == 0
+            && !self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Mint without filesystem access on the actor. Pause provenance, actual
+    /// native drain and exclusive external ownership are checked here. The first
+    /// permit binds this service to the selected catalog's shared writer registry.
+    /// Each permit also carries the selected database pin; detached connections
+    /// opened from its worker handle preserve that exact handle lineage.
+    pub fn native_launch_permit(
+        &mut self,
+        catalog: &Catalog,
+        pause: NativeLaunchPause,
+    ) -> Result<NativeLaunchPermit> {
+        ensure!(!self.stopping, "preview service is draining");
+        ensure!(
+            std::sync::Arc::ptr_eq(&pause.0, &self.launch_pauses),
+            "native pause belongs to another preview service"
+        );
+        ensure!(
+            self.native_work_drained(),
+            "preview native work has not drained"
+        );
+        ensure!(
+            self.native_catalog
+                .as_ref()
+                .is_none_or(|registry| std::sync::Arc::ptr_eq(registry, &catalog.writers)),
+            "preview native admission belongs to another selected catalog"
+        );
+        ensure!(
+            self.external_native
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire
+                )
+                .is_ok(),
+            "another external native permit is active"
+        );
+        self.native_catalog = Some(catalog.writers.clone());
+        Ok(NativeLaunchPermit {
+            _pause: pause,
+            exclusive: self.external_native.clone(),
+            catalog: catalog.session.clone(),
+        })
     }
     /// Bounded by configured workers. These are owned, not-yet-reaped process
     /// IDs; callers must observe OS liveness separately and account for PID reuse.
@@ -1582,21 +2033,134 @@ impl PreviewService {
     pub fn clear_decoded_cache(&mut self) {
         self.decoded.clear();
     }
+    /// Stops dispatch and signals every worker without joining. Call before
+    /// waiting on other owners that may be blocked behind a native worker.
+    pub fn signal_shutdown(&mut self) {
+        self.signal_read_shutdown();
+        self.stopping = true;
+        for active in self.active.values_mut() {
+            active
+                .lease
+                .canceled
+                .store(true, std::sync::atomic::Ordering::Release);
+            active.worker.signal_stop();
+        }
+    }
+    /// Reaps owned workers. On failure self, cache ownership and all unverified
+    /// reservations remain available for retry.
+    pub fn try_shutdown(&mut self) -> Result<()> {
+        self.signal_shutdown();
+        // A closing lane can encounter another owner's retained F receipt.
+        // Attempt every origin's cleanup before returning the first error, so
+        // hash iteration order cannot prevent that receipt's reconciliation.
+        let mut failure = None;
+        for active in self.active.values_mut() {
+            if let Err(error) = active.worker.stop() {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.try_read_shutdown() {
+            failure.get_or_insert(error);
+        }
+        if self
+            .external_native
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            failure.get_or_insert_with(|| {
+                anyhow::anyhow!("external native worker ownership has not drained")
+            });
+        }
+        if self.delivery_io.load(std::sync::atomic::Ordering::Acquire) {
+            failure.get_or_insert_with(|| anyhow::anyhow!("encoded delivery remains owned"));
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        // Every worker is verified before any aggregate reservation is released.
+        self.finish_read_shutdown()?;
+        for (id, active) in self.active.drain() {
+            drop(active);
+            self.scheduler.finished(id, WorkerOutcome::Stopped)?;
+        }
+        Ok(())
+    }
+
     pub fn maintenance(&self) -> Result<()> {
+        if self.delivery_io.load(std::sync::atomic::Ordering::Acquire)
+            || self.reads.transport_busy()
+            || self.active.values().any(|a| a.worker.transport_busy())
+        {
+            return Ok(());
+        }
         self.store.flush_touches()?;
         self.store.recover(128)?;
-        recover_worker_staging(&self.staging, 128)?;
+        if let Some(calls) = self.store.stage_calls() {
+            calls.call(
+                crate::catalog_session::preview_stage::Action::Recover { limit: 128 },
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+        } else {
+            recover_worker_staging(&self.staging, 128)?;
+        }
         Ok(())
     }
 }
 
 impl Drop for PreviewService {
     fn drop(&mut self) {
-        // Join workers before releasing the manifest owner's process lock.
-        self.active.clear();
+        if self.try_shutdown().is_err() {
+            // Retain the cache lock and unverified worker/resource owners rather
+            // than permit overlapping work. Checked callers retain self/retry.
+            std::mem::forget(std::mem::take(&mut self.active));
+            std::mem::forget(std::mem::take(&mut self.reads));
+            std::mem::forget(self.store.0.take());
+        }
     }
+}
+
+// Preserve the existing 4096-character diagnostic prefix, including UTF-8.
+// The maximum backing is admitted before formatting, with no full error String.
+fn failure_message(error: &anyhow::Error) -> String {
+    struct Prefix {
+        text: String,
+        remaining: usize,
+    }
+    impl std::fmt::Write for Prefix {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            for character in value.chars() {
+                if self.remaining == 0 {
+                    return Err(std::fmt::Error);
+                }
+                self.text.push(character);
+                self.remaining -= 1;
+            }
+            Ok(())
+        }
+    }
+    let mut prefix = Prefix {
+        text: String::with_capacity(4 * 4096),
+        remaining: 4096,
+    };
+    let _ = std::fmt::write(&mut prefix, format_args!("{error:#}"));
+    prefix.text
 }
 
 #[cfg(test)]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "drain_tests.rs"]
+mod drain_tests;
+
+#[cfg(test)]
+#[path = "sync_read_tests.rs"]
+mod sync_read_tests;
+
+#[cfg(test)]
+#[path = "transport_progress_tests.rs"]
+mod transport_progress_tests;
+
+#[cfg(test)]
+#[path = "descriptor_capacity_tests.rs"]
+mod descriptor_capacity_tests;

@@ -250,3 +250,19 @@ worker before dropping the RAII token; foreground native work can resume then.
 The token does not kill an export or claim parallel-worker memory enforcement.
 These source additions still require focused native tests and S8 measurements;
 previous S6 measurements remain evidence for their frozen implementation.
+
+Cache manifest schema 5 stores newly written location and relocation paths as
+SQLite BLOBs containing a version-1 `NativePath` envelope. Existing Unicode TEXT
+paths, preview objects, and pending relocation journals remain intact. Both path
+formats are read during reopen and copy/cleanup recovery; no cache rebuild is
+required. Earlier binaries reject schema 5. The main catalog schema is unchanged.
+Persisted paths have a 1 MiB serialized byte bound, checked in SQLite before the
+path body is returned, then validated for the host platform and embedded NULs.
+Malformed and future formats fail before migration or use of their paths.
+Thumbnail and large-cache locations preserve native path units independently of
+the SQLite manifest directory. On Windows, SQLite requires the manifest database
+path to be valid Unicode; an unpaired surrogate there is rejected before creating
+cache roots. Such units remain supported in the separately located preview data
+and relocation paths. The Windows physical-path fixture keeps the manifest
+representable and exercises both relocation restart phases without narrowing
+those data paths; Unix retains native manifest-path coverage as well.

@@ -106,12 +106,12 @@ fn verify(path: &Path, length: u64, checksum: &str) -> Result<()> {
 }
 impl PreviewStore {
     pub(super) fn recover_relocation_lock(&mut self) -> Result<()> {
-        let value: Option<(String, String, String, String)> = self
+        let value: Option<(String, PathBuf, PathBuf, String)> = self
             .db
             .query_row(
-                "SELECT tier,source,target,phase FROM relocations LIMIT 1",
+                "SELECT tier,CASE WHEN length(CAST(source AS BLOB))<=1048576 THEN source ELSE NULL END,CASE WHEN length(CAST(target AS BLOB))<=1048576 THEN target ELSE NULL END,phase FROM relocations LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, read_path(r, 1)?, read_path(r, 2)?, r.get(3)?)),
             )
             .optional()?;
         if let Some((tier, source, target, phase)) = value {
@@ -126,12 +126,25 @@ impl PreviewStore {
                 ensure!(phase == "cleanup", "invalid relocation phase");
                 source
             };
-            self._relocation_lock = Some(lock_root(
-                Path::new(&extra),
-                &self.identity,
-                tier,
-                self.config.layout,
-            )?);
+            if let Some(files) = &self.managed_files {
+                let extra = custody::normalized(&extra, "relocation recovery")?;
+                let reservation = if let Some(held) = files.recovered_root() {
+                    ensure!(
+                        held.path == crate::storage_volume::NativePath::from_path(&extra)
+                            && held.tier == tier,
+                        "recovered preview root facts mismatch"
+                    );
+                    held
+                } else {
+                    files.reserve_root(&extra, tier)?
+                };
+                // Acquisition errors retain partial custody in F until root close.
+                files.lock_reserved(&reservation)?;
+                self.managed_relocation = Some(reservation);
+            } else {
+                self._relocation_lock =
+                    Some(lock_root(&extra, &self.identity, tier, self.config.layout)?);
+            }
         }
         Ok(())
     }
@@ -188,6 +201,11 @@ impl PreviewStore {
         );
         self.flush_touches()?;
         let destination = prospective(destination)?;
+        let destination = if self.managed_files.is_some() {
+            custody::normalized(&destination, "relocation target")?
+        } else {
+            destination
+        };
         for other in [
             &self.config.manifest_root,
             &self.config.thumbnail_root,
@@ -205,69 +223,130 @@ impl PreviewStore {
                 "relocation overlaps originals"
             );
         }
-        fs::create_dir_all(&destination)?;
+        // Reserve finite F ownership before any destination or journal effect.
+        let reservation = self
+            .managed_files
+            .as_ref()
+            .map(|files| files.reserve_root(&destination, tier))
+            .transpose()?;
+        if self.managed_files.is_none() {
+            fs::create_dir_all(&destination)?;
+        }
         // A crash after durable ownership markers but before the journal insert
         // can be retried only by this same manifest/tier/layout. No data objects
         // or foreign entries may be adopted. The marker lock below authenticates
         // ownership before an incomplete relocation marker is rewritten.
-        for entry in fs::read_dir(&destination)? {
-            let entry = entry?;
-            ensure!(
-                entry.file_type()?.is_file()
-                    && matches!(
-                        entry.file_name().to_str(),
-                        Some(".photocatalog-preview-owner" | ".photocatalog-relocation")
-                    ),
-                "relocation destination contains non-admission files"
-            );
-        }
-        let relocation_marker = destination.join(".photocatalog-relocation");
-        ensure!(
-            !relocation_marker.exists() || destination.join(".photocatalog-preview-owner").exists(),
-            "relocation marker has no owning manifest"
-        );
-        if relocation_marker.exists() {
-            ensure!(
-                fs::metadata(destination.join(".photocatalog-preview-owner"))?.len() > 0,
-                "relocation admission has no recorded owner identity"
-            );
-        }
-        let target_lock = lock_root(&destination, &self.identity, tier, self.config.layout)?;
-        let id = if relocation_marker.exists() {
-            ensure!(
-                fs::metadata(&relocation_marker)?.len() <= 36,
-                "invalid relocation admission marker"
-            );
-            let mut bytes = [0; 37];
-            let count = File::open(&relocation_marker)?.read(&mut bytes)?;
-            std::str::from_utf8(&bytes[..count])
-                .ok()
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .unwrap_or_else(uuid::Uuid::new_v4)
-                .to_string()
+        let preflight = if let (Some(files), Some(reservation)) =
+            (&self.managed_files, &reservation)
+        {
+            files
+                .cache_call(
+                    crate::catalog_session::preview_io::Action::InspectRelocation {
+                        target: reservation.token.clone(),
+                    },
+                )
+                .map(|_| ())
         } else {
-            uuid::Uuid::new_v4().to_string()
+            (|| -> Result<()> {
+                if destination.exists() {
+                    for entry in fs::read_dir(&destination)? {
+                        let entry = entry?;
+                        ensure!(
+                            entry.file_type()?.is_file()
+                                && matches!(
+                                    entry.file_name().to_str(),
+                                    Some(
+                                        ".photocatalog-preview-owner" | ".photocatalog-relocation"
+                                    )
+                                ),
+                            "relocation destination contains non-admission files"
+                        );
+                    }
+                }
+                let relocation_marker = destination.join(".photocatalog-relocation");
+                ensure!(
+                    !relocation_marker.exists()
+                        || destination.join(".photocatalog-preview-owner").exists(),
+                    "relocation marker has no owning manifest"
+                );
+                if relocation_marker.exists() {
+                    ensure!(
+                        fs::metadata(destination.join(".photocatalog-preview-owner"))?.len() > 0,
+                        "relocation admission has no recorded owner identity"
+                    );
+                }
+                Ok(())
+            })()
         };
-        let mut marker = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(relocation_marker)?;
-        marker.write_all(id.as_bytes())?;
-        marker.sync_all()?;
-        #[cfg(unix)]
-        File::open(&destination)?.sync_all()?;
+        if let Err(error) = preflight {
+            if let (Some(files), Some(reservation)) = (&self.managed_files, &reservation) {
+                files
+                    .abandon_root(reservation)
+                    .context("retain or abandon failed relocation preflight")?;
+            }
+            return Err(error);
+        }
+        let target_lock =
+            if let (Some(files), Some(reservation)) = (&self.managed_files, &reservation) {
+                files.lock_reserved(reservation)?;
+                None
+            } else {
+                Some(lock_root(
+                    &destination,
+                    &self.identity,
+                    tier,
+                    self.config.layout,
+                )?)
+            };
+        let id = if let (Some(files), Some(reservation)) = (&self.managed_files, &reservation) {
+            match files.cache_call(
+                crate::catalog_session::preview_io::Action::AdmitRelocation {
+                    target: reservation.token.clone(),
+                },
+            )? {
+                crate::catalog_session::preview_io::Value::Relocation(id) => id,
+                _ => bail!("unexpected relocation marker receipt"),
+            }
+        } else {
+            let relocation_marker = destination.join(".photocatalog-relocation");
+            let id = if relocation_marker.exists() {
+                ensure!(
+                    fs::metadata(&relocation_marker)?.len() <= 36,
+                    "invalid relocation admission marker"
+                );
+                let mut bytes = [0; 37];
+                let count = File::open(&relocation_marker)?.read(&mut bytes)?;
+                std::str::from_utf8(&bytes[..count])
+                    .ok()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .unwrap_or_else(uuid::Uuid::new_v4)
+                    .to_string()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            let mut marker = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(relocation_marker)?;
+            marker.write_all(id.as_bytes())?;
+            marker.sync_all()?;
+            #[cfg(unix)]
+            File::open(&destination)?.sync_all()?;
+            id
+        };
         after_markers()?;
         self.db.execute(
             "INSERT INTO relocations VALUES(?1,?2,?3,?4,'copy','')",
             params![
                 tier.name(),
                 id,
-                self.root(tier).to_str().context("cache path encoding")?,
-                destination.to_str().context("cache path encoding")?
+                encode_path(self.root(tier))?,
+                encode_path(&destination)?
             ],
         )?;
-        self._relocation_lock = Some(target_lock);
+        self._relocation_lock = target_lock;
+        self.managed_relocation = reservation;
         Ok(())
     }
     /// At most `limit` entries and `byte_limit` bytes per call; an individual
@@ -282,12 +361,20 @@ impl PreviewStore {
             (1..=1024).contains(&limit) && byte_limit > 0,
             "relocation batch admission"
         );
-        let row: Option<(String, String, String, String, String)> = self
+        let row: Option<(String, PathBuf, PathBuf, String, String)> = self
             .db
             .query_row(
-                "SELECT id,source,target,phase,cursor FROM relocations WHERE tier=?1",
+                "SELECT id,CASE WHEN length(CAST(source AS BLOB))<=1048576 THEN source ELSE NULL END,CASE WHEN length(CAST(target AS BLOB))<=1048576 THEN target ELSE NULL END,phase,cursor FROM relocations WHERE tier=?1",
                 [tier.name()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        read_path(r, 1)?,
+                        read_path(r, 2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                    ))
+                },
             )
             .optional()?;
         let Some((id, source, target, phase, cursor)) = row else {
@@ -299,20 +386,59 @@ impl PreviewStore {
                 complete: true,
             });
         };
-        let source = PathBuf::from(source);
-        let target = PathBuf::from(target);
-        let mut marker_file = File::open(target.join(".photocatalog-relocation"))?;
-        ensure!(
-            id.len() <= 128 && marker_file.metadata()?.len() == id.len() as u64,
-            "relocation marker length"
-        );
-        let mut marker = [0u8; 128];
-        marker_file.read_exact(&mut marker[..id.len()])?;
-        let mut extra = [0];
-        ensure!(
-            &marker[..id.len()] == id.as_bytes() && marker_file.read(&mut extra)? == 0,
-            "relocation destination ownership changed"
-        );
+        let source = if self.managed_files.is_some() {
+            custody::normalized(&source, "relocation source")?
+        } else {
+            source
+        };
+        let target = if self.managed_files.is_some() {
+            custody::normalized(&target, "relocation target")?
+        } else {
+            target
+        };
+        // A committed SQL transition can outlive its F reply. Reconcile the exact
+        // retained promotion before reading or deleting another cache object.
+        if phase == "cleanup"
+            && let Some(files) = &self.managed_files
+        {
+            let current = if tier == Tier::Thumbnail {
+                &self.config.thumbnail_root
+            } else {
+                &self.config.large_root
+            };
+            if current != &target {
+                let held = self
+                    .managed_relocation
+                    .as_ref()
+                    .context("managed relocation target missing")?;
+                self.managed_relocation = Some(files.promote_root(held)?);
+                match tier {
+                    Tier::Thumbnail => self.config.thumbnail_root = target.clone(),
+                    Tier::Large => self.config.large_root = target.clone(),
+                }
+            }
+        }
+        if let Some(files) = &self.managed_files {
+            files.cache_call(
+                crate::catalog_session::preview_io::Action::CheckRelocation {
+                    target: files.cache_root(&target)?,
+                    id: id.clone(),
+                },
+            )?;
+        } else {
+            let mut marker_file = File::open(target.join(".photocatalog-relocation"))?;
+            ensure!(
+                id.len() <= 128 && marker_file.metadata()?.len() == id.len() as u64,
+                "relocation marker length"
+            );
+            let mut marker = [0u8; 128];
+            marker_file.read_exact(&mut marker[..id.len()])?;
+            let mut extra = [0];
+            ensure!(
+                &marker[..id.len()] == id.as_bytes() && marker_file.read(&mut extra)? == 0,
+                "relocation destination ownership changed"
+            );
+        }
         let rows=self.db.prepare("SELECT key,bytes,checksum FROM objects WHERE tier=?1 AND status='ready' AND key>?2 ORDER BY key LIMIT ?3")?.query_map(params![tier.name(),cursor,limit as i64],|r|Ok((r.get::<_,String>(0)?,unsigned(r,1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut progress = RelocationProgress {
             tier,
@@ -329,60 +455,77 @@ impl PreviewStore {
                 );
                 break;
             }
-            let old = object_path(&source, self.config.layout, key)?;
-            let new = object_path(&target, self.config.layout, key)?;
-            if phase == "copy" {
-                if new.exists() {
-                    verify(&new, *length, checksum)?;
-                } else {
-                    ensure_destination_parent(&target, self.config.layout, key)?;
-                    let temporary = new.with_extension("relocation-pending");
-                    if temporary.exists() {
-                        ensure!(
-                            fs::symlink_metadata(&temporary)?.file_type().is_file(),
-                            "invalid relocation temporary file"
-                        );
-                        fs::remove_file(&temporary)?;
-                    }
-                    // This deterministic path belongs to the marker-protected job;
-                    // restart replaces only its own incomplete copy.
-                    let mut output = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&temporary)?;
-                    let mut input = File::open(&old)?;
-                    let mut hash = blake3::Hasher::new();
-                    let mut buffer = [0u8; 64 * 1024];
-                    let mut copied = 0;
-                    loop {
-                        let n = input.read(&mut buffer)?;
-                        if n == 0 {
-                            break;
-                        }
-                        copied += n as u64;
-                        ensure!(copied <= *length, "relocation source grew");
-                        output.write_all(&buffer[..n])?;
-                        hash.update(&buffer[..n]);
-                    }
-                    ensure!(
-                        copied == *length && hash.finalize().to_hex().as_str() == checksum,
-                        "relocation source checksum mismatch"
-                    );
-                    output.sync_all()?;
-                    drop(output);
-                    fs::hard_link(&temporary, &new)
-                        .context("publish relocation copy without replacing an existing file")?;
-                    fs::remove_file(&temporary)?;
-                    #[cfg(unix)]
-                    File::open(new.parent().unwrap())?.sync_all()?;
-                }
+            if let Some(files) = &self.managed_files {
+                ensure!(
+                    phase == "copy" || phase == "cleanup",
+                    "unknown relocation phase"
+                );
+                files.cache_call(crate::catalog_session::preview_io::Action::Relocate {
+                    source: files.cache_root(&source)?,
+                    target: files.cache_root(&target)?,
+                    id: id.clone(),
+                    key: key.clone(),
+                    bytes: crate::application::U64(*length),
+                    checksum: checksum.clone(),
+                    cleanup: phase == "cleanup",
+                })?;
             } else {
-                ensure!(phase == "cleanup", "unknown relocation phase");
-                // The authoritative copy is rechecked before removing the old one.
-                verify(&new, *length, checksum)?;
-                if old.exists() {
-                    verify(&old, *length, checksum)?;
-                    fs::remove_file(&old)?;
+                let old = object_path(&source, self.config.layout, key)?;
+                let new = object_path(&target, self.config.layout, key)?;
+                if phase == "copy" {
+                    if new.exists() {
+                        verify(&new, *length, checksum)?;
+                    } else {
+                        ensure_destination_parent(&target, self.config.layout, key)?;
+                        let temporary = new.with_extension("relocation-pending");
+                        if temporary.exists() {
+                            ensure!(
+                                fs::symlink_metadata(&temporary)?.file_type().is_file(),
+                                "invalid relocation temporary file"
+                            );
+                            fs::remove_file(&temporary)?;
+                        }
+                        // This deterministic path belongs to the marker-protected job;
+                        // restart replaces only its own incomplete copy.
+                        let mut output = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&temporary)?;
+                        let mut input = File::open(&old)?;
+                        let mut hash = blake3::Hasher::new();
+                        let mut buffer = [0u8; 64 * 1024];
+                        let mut copied = 0;
+                        loop {
+                            let n = input.read(&mut buffer)?;
+                            if n == 0 {
+                                break;
+                            }
+                            copied += n as u64;
+                            ensure!(copied <= *length, "relocation source grew");
+                            output.write_all(&buffer[..n])?;
+                            hash.update(&buffer[..n]);
+                        }
+                        ensure!(
+                            copied == *length && hash.finalize().to_hex().as_str() == checksum,
+                            "relocation source checksum mismatch"
+                        );
+                        output.sync_all()?;
+                        drop(output);
+                        fs::hard_link(&temporary, &new).context(
+                            "publish relocation copy without replacing an existing file",
+                        )?;
+                        fs::remove_file(&temporary)?;
+                        #[cfg(unix)]
+                        File::open(new.parent().unwrap())?.sync_all()?;
+                    }
+                } else {
+                    ensure!(phase == "cleanup", "unknown relocation phase");
+                    // The authoritative copy is rechecked before removing the old one.
+                    verify(&new, *length, checksum)?;
+                    if old.exists() {
+                        verify(&old, *length, checksum)?;
+                        fs::remove_file(&old)?;
+                    }
                 }
             }
             self.db.execute(
@@ -399,7 +542,7 @@ impl PreviewStore {
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 tx.execute(
                     "UPDATE locations SET path=?1 WHERE tier=?2",
-                    params![target.to_str().context("cache encoding")?, tier.name()],
+                    params![encode_path(&target)?, tier.name()],
                 )?;
                 tx.execute(
                     "UPDATE relocations SET phase='cleanup',cursor='' WHERE tier=?1",
@@ -407,21 +550,39 @@ impl PreviewStore {
                 )?;
                 tx.commit()?;
                 let index = if tier == Tier::Thumbnail { 0 } else { 1 };
-                let target_lock = self
-                    ._relocation_lock
-                    .take()
-                    .context("relocation target lock missing")?;
-                self._relocation_lock =
-                    Some(std::mem::replace(&mut self._tier_locks[index], target_lock));
+                if let Some(files) = &self.managed_files {
+                    let target_lock = self
+                        .managed_relocation
+                        .as_ref()
+                        .context("managed relocation target lock missing")?;
+                    self.managed_relocation = Some(files.promote_root(target_lock)?);
+                } else {
+                    let target_lock = self
+                        ._relocation_lock
+                        .take()
+                        .context("relocation target lock missing")?;
+                    self._relocation_lock = self._tier_locks[index].replace(target_lock);
+                }
                 match tier {
                     Tier::Thumbnail => self.config.thumbnail_root = target,
                     Tier::Large => self.config.large_root = target,
                 };
                 progress.phase = "cleanup".into();
             } else {
+                if let Some(files) = &self.managed_files {
+                    let old = self
+                        .managed_relocation
+                        .as_ref()
+                        .context("managed relocation cleanup lock missing")?;
+                    files.retire_root(old)?;
+                }
                 self.db
                     .execute("DELETE FROM relocations WHERE tier=?1", [tier.name()])?;
-                self._relocation_lock.take();
+                if self.managed_files.is_some() {
+                    self.managed_relocation.take();
+                } else {
+                    self._relocation_lock.take();
+                }
                 progress.phase = "complete".into();
                 progress.complete = true;
                 // Keep the small ownership marker as an audit anchor. Foreign
@@ -432,25 +593,38 @@ impl PreviewStore {
     }
     /// Resolve authoritative locations after a relocation committed but the app's
     /// settings file was not yet updated. The supplied roots initialize new stores.
-    pub fn current_configuration(mut config: StoreConfig) -> Result<StoreConfig> {
+    pub fn current_configuration(config: StoreConfig) -> Result<StoreConfig> {
         let path = config.manifest_root.join("previews.sqlite3");
         if !path.exists() {
             return Ok(config);
         }
         let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::current_configuration_on(&db, config, ManifestOrigin::Existing)
+    }
+    pub(crate) fn current_configuration_on(
+        db: &Connection,
+        mut config: StoreConfig,
+        origin: ManifestOrigin,
+    ) -> Result<StoreConfig> {
+        if origin == ManifestOrigin::CreatedByAdmission {
+            return Ok(config);
+        }
         ensure!(
             db.pragma_query_value(None, "application_id", |r| r.get::<_, i64>(0))? == 0x50435056,
             "not a preview manifest"
         );
+        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!((1..=5).contains(&version), "unsupported preview manifest");
+        validate_paths(db)?;
         for tier in [Tier::Thumbnail, Tier::Large] {
-            let path: String = db.query_row(
-                "SELECT path FROM locations WHERE tier=?1",
+            let path = db.query_row(
+                "SELECT CASE WHEN length(CAST(path AS BLOB))<=1048576 THEN path ELSE NULL END FROM locations WHERE tier=?1",
                 [tier.name()],
-                |r| r.get(0),
+                |r| read_path(r, 0),
             )?;
             match tier {
-                Tier::Thumbnail => config.thumbnail_root = path.into(),
-                Tier::Large => config.large_root = path.into(),
+                Tier::Thumbnail => config.thumbnail_root = path,
+                Tier::Large => config.large_root = path,
             };
         }
         let has_budgets: bool = db.query_row(
@@ -493,7 +667,7 @@ mod tests {
             use std::io::Seek;
             // Windows excludes reads through a second handle while this marker
             // is byte-range locked. Inspect the actual owning handle instead.
-            let mut owner = &store._tier_locks[0].0;
+            let mut owner = &store._tier_locks[0].as_ref().unwrap().0;
             owner.rewind().unwrap();
             let mut bytes = Vec::new();
             owner.take(257).read_to_end(&mut bytes).unwrap();
@@ -572,5 +746,46 @@ mod tests {
             before
         );
         assert!(!destination.join(".photocatalog-relocation").exists());
+    }
+}
+
+#[cfg(test)]
+mod admitted_manifest_tests {
+    use super::*;
+    #[test]
+    fn trusted_created_flag_preserves_missing_versus_preexisting_empty_behavior() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = StoreConfig {
+            manifest_root: temp.path().join("manifest"),
+            thumbnail_root: temp.path().join("thumb"),
+            large_root: temp.path().join("large"),
+            layout: Layout::HashPrefix,
+            thumbnail_bytes: 1000,
+            large_bytes: 2000,
+        };
+        let db = Connection::open_in_memory()?;
+        let resolved = PreviewStore::current_configuration_on(
+            &db,
+            config.clone(),
+            ManifestOrigin::CreatedByAdmission,
+        )?;
+        assert_eq!(resolved.thumbnail_root, config.thumbnail_root);
+        assert_eq!(resolved.large_bytes, config.large_bytes);
+        assert!(
+            PreviewStore::current_configuration_on(&db, config.clone(), ManifestOrigin::Existing)
+                .unwrap_err()
+                .to_string()
+                .contains("not a preview manifest")
+        );
+        db.execute_batch("PRAGMA application_id=1346588758; PRAGMA user_version=99;")?;
+        // A future existing manifest must fail before even querying locations.
+        assert!(
+            PreviewStore::current_configuration_on(&db, config, ManifestOrigin::Existing).is_err()
+        );
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
+            99
+        );
+        Ok(())
     }
 }

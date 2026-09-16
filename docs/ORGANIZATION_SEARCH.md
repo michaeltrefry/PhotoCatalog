@@ -211,3 +211,31 @@ most one bounded batch in the connection's TEMP database until the next reset
 or connection close; it never becomes catalog evidence. TEMP writes use the same
 main read snapshot, including sessions opened with read-only main access. They
 must not acquire a main writer lock or mutate the catalog/main WAL.
+
+## Ordered desktop collection members (schema 11)
+
+The bounded image-aware membership API preserves implicit order absence and
+explicit zero positions in the authoritative tables. Schema 11 adds a derived
+zero/default membership table keyed by collection and image sequence. Positive
+positions continue to use the existing ordered index. A ready collection starts
+with an indexed zero/default seek, followed by an indexed positive-position seek;
+it does not rescan every positive member before returning its first row.
+
+Migration installs an empty projection, transactional membership/order triggers,
+and a durable cursor with the last pre-existing membership key. It does not
+backfill synchronously. `organization_index(limit)` shares its existing row
+allowance with resumable projection maintenance; `pending` remains true until
+coverage is complete. Concurrent authoritative writes update the projection in
+the same transaction. Reopening retains the cursor or completed state.
+
+`collection_order_index_ready()` reports coverage. Desktop member requests return
+`Busy` while preparing, so an incomplete projection cannot appear as an empty
+collection. The existing revision-bound membership continuation remains opaque;
+a response-byte cut retains the cursor before the unreturned row. Source
+provenance and absent explicit order records are not rewritten by preparation.
+
+Local fixtures cover migration/reopen, bounded preparation, transactional
+updates and rollback, variant identity, stale revisions, and byte-cut continuity.
+A 10,000-member positive-only query fixture checks no SQLite full scan or sort
+and fewer than 128 VM steps for each initial seek. This does not qualify
+million-item initialization, first-page latency, or platform GUI responsiveness.

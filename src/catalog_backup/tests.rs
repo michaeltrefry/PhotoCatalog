@@ -265,22 +265,11 @@ fn sqlite_verification_observes_cancel_and_vm_budget() -> Result<()> {
     let cancel = CancellationToken::default();
     let l = limits();
     let op = Operation::new(&l, &cancel, |_| Ok(()))?;
-    op.guard(&db)?;
-    let ticks = Arc::clone(&op.vm);
     let c = cancel.clone();
-    let done = Arc::new(AtomicBool::new(false));
-    let finished = Arc::clone(&done);
-    let thread = std::thread::spawn(move || {
-        while ticks.load(Ordering::Relaxed) == 0 && !finished.load(Ordering::Relaxed) {
-            std::thread::yield_now();
-        }
-        if !finished.load(Ordering::Relaxed) {
-            c.cancel();
-        }
-    });
+    // Cancel from the first actual SQLite progress callback. A competing OS
+    // thread can miss an integrity check that finishes before it is scheduled.
+    op.guard_observed(&db, move || c.cancel())?;
     let result = db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0));
-    done.store(true, Ordering::Relaxed);
-    thread.join().unwrap();
     assert!(cancel.is_cancelled());
     assert!(result.is_err());
     let l = Limits {
@@ -436,5 +425,63 @@ fn non_utf8_directory_nonempty_journal_is_rejected() -> Result<()> {
         assert!(no_journal(&db).is_err());
         fs::remove_file(file)?;
     }
+    Ok(())
+}
+
+#[test]
+fn controlled_restore_release_preserves_publication_on_late_cancellation() -> Result<()> {
+    // No SQLite is involved in restore-control observation/publication.
+    for stop_at in 1..=7 {
+        let temp = tempfile::tempdir()?;
+        let receipt = RestoreReceipt {
+            protocol: 1,
+            restore_id: uuid::Uuid::new_v4().to_string(),
+            backup: BackupReceipt {
+                protocol: 1,
+                backup_id: "retained backup evidence".into(),
+                application_id: APPLICATION_ID,
+                schema_version: CURRENT_SCHEMA_VERSION,
+                database_bytes: 0,
+                database_blake3: "opaque retained digest".into(),
+            },
+            schema_version: CURRENT_SCHEMA_VERSION,
+        };
+        write_document(&temp.path().join(RESTORE), &receipt)?;
+        let mut calls = 0;
+        let result =
+            resume_restored_jobs_controlled(temp.path(), &receipt.restore_id, true, &mut || {
+                calls += 1;
+                ensure!(
+                    calls != stop_at,
+                    "injected cancellation at publication boundary"
+                );
+                Ok(())
+            });
+        assert!(result.is_err());
+        let observed = restore_status(temp.path())?.unwrap();
+        assert_eq!(observed.receipt, receipt);
+        assert_eq!(observed.jobs_held, stop_at < 7);
+        if stop_at == 7 {
+            // The rename won before the directory-sync checkpoint failed. An
+            // explicit observation, not a replayed release, establishes state.
+            assert!(temp.path().join(RESUMED).is_file());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn restore_control_document_exact_limit_and_overflow_are_bounded() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("bounded.json");
+    let value = "x".repeat(DOCUMENT_BYTES as usize - 2);
+    let encoded = serde_json::to_vec(&value)?;
+    assert_eq!(encoded.len(), DOCUMENT_BYTES as usize);
+    fs::write(&path, &encoded)?;
+    assert_eq!(read_document::<String>(&path)?, value);
+    let mut oversized = encoded;
+    oversized.push(b' ');
+    fs::write(&path, oversized)?;
+    assert!(read_document::<String>(&path).is_err());
     Ok(())
 }

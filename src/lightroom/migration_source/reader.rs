@@ -1,7 +1,7 @@
 use super::*;
 use crate::lightroom::{bounded_json, capture::Manifest, digest, plan, source::Source};
 use anyhow::bail;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use std::{
     cell::Cell as Flag,
     collections::BTreeSet,
@@ -9,8 +9,18 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
+
+use crate::lightroom::source::closed_path as reader_uri;
+#[path = "supplement_json.rs"]
+mod supplement_json;
+
+pub(crate) const IMAGE_LINK_LIMITATIONS: &str = "Only exact unique retained schema3 links; missing is not proof of a master sentinel or current settings. History/snapshots and unknown tables remain separately retained.";
 
 struct Spec {
     table: &'static str,
@@ -19,6 +29,12 @@ struct Spec {
     numeric_key: bool,
 }
 impl Collection {
+    pub(crate) fn transport_shape(
+        self,
+    ) -> (&'static [&'static str], &'static [&'static str], bool) {
+        let spec = self.spec();
+        (spec.keys, spec.fields, spec.numeric_key)
+    }
     fn spec(self) -> Spec {
         match self {
             Self::Captures => Spec {
@@ -131,12 +147,14 @@ impl Collection {
 }
 
 struct Budget {
+    cancel: Arc<AtomicBool>,
     until: Instant,
     remaining: u64,
 }
 unsafe extern "C" fn progress(context: *mut std::ffi::c_void) -> i32 {
     let budget = unsafe { &mut *context.cast::<Budget>() };
-    if budget.remaining == 0
+    if budget.cancel.load(Ordering::Relaxed)
+        || budget.remaining == 0
         || (budget.remaining.is_multiple_of(1000) && Instant::now() >= budget.until)
     {
         return 1;
@@ -149,8 +167,9 @@ struct QueryBudget<'a> {
     state: Box<Budget>,
 }
 impl<'a> QueryBudget<'a> {
-    fn new(db: &'a Connection, limits: ReadLimits) -> Self {
+    fn new(db: &'a Connection, limits: ReadLimits, cancel: Arc<AtomicBool>) -> Self {
         let mut state = Box::new(Budget {
+            cancel,
             until: Instant::now() + Duration::from_millis(limits.deadline_ms),
             remaining: limits.vm_steps,
         });
@@ -165,6 +184,10 @@ impl<'a> QueryBudget<'a> {
         Self { db, state }
     }
     fn check(&self) -> Result<()> {
+        ensure!(
+            !self.state.cancel.load(Ordering::Relaxed),
+            "inspection-source read canceled"
+        );
         ensure!(
             Instant::now() < self.state.until,
             "inspection-source read deadline exceeded"
@@ -253,7 +276,10 @@ pub struct MigrationSource {
     seal: InputSeal,
     namespace: String,
     limits: ReadLimits,
+    #[cfg(windows)]
+    prepared_companions: Option<reader_uri::Companions>,
     poisoned: Flag<bool>,
+    cancel: Arc<AtomicBool>,
 }
 
 fn digest_valid(value: &str) -> bool {
@@ -289,6 +315,8 @@ impl InputSeal {
         )?))
     }
     fn validate(&self) -> Result<()> {
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::SEAL_SETS);
         ensure!(self.protocol == 1, "unsupported migration-source seal");
         ensure!(
             digest_valid(&self.blake3) && self.identity.bytes > 0,
@@ -361,31 +389,193 @@ impl InputSeal {
                 "duplicate supplemental evidence"
             );
         }
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(
+            crate::capacity_probes::SEAL_SETS,
+            crate::capacity_probes::seal(self),
+        );
         Ok(())
     }
 }
 
 impl MigrationSource {
     pub fn open(seal: InputSeal, limits: ReadLimits) -> Result<Self> {
+        Self::open_cancellable(seal, limits, Arc::new(AtomicBool::new(false)))
+    }
+    /// The cancellation flag covers initial hashing, SQL admission and later reads.
+    /// This adds interruption without changing any seal or source validation rule.
+    pub fn open_cancellable(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        Self::open_with_connection(seal, limits, cancel, |path| {
+            Ok(Connection::open_with_flags(
+                plan::uri(path)?,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?)
+        })
+    }
+
+    fn open_with_connection(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+        open: impl FnOnce(&Path) -> Result<Connection>,
+    ) -> Result<Self> {
+        Self::open_ordered(seal, limits, cancel, None, None, |path, _| open(path))
+    }
+
+    /// Only for the dedicated closed-roster process. All handles are opened and
+    /// identified before acquiring the first custom Source lock. No new source,
+    /// destination, output, diagnostic or SQLite opener may run in that process
+    /// after this returns until the entire reader is retired. Existing Windows
+    /// path identity verification retains its handle-scoped reopen, using only
+    /// the precharged prepared original-prefix roster and target path.
+    pub(crate) fn open_closed_roster(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_ordered(
+            seal,
+            limits,
+            cancel,
+            Some(protected),
+            Some(admit),
+            |path, admit| {
+                Ok(Connection::open_with_flags(
+                    reader_uri::prepare(path, admit.expect("closed-roster allowance"))?,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_URI
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?)
+            },
+        )
+    }
+
+    fn open_ordered(
+        seal: InputSeal,
+        limits: ReadLimits,
+        cancel: Arc<AtomicBool>,
+        protected: Option<&[crate::lightroom_migration_worker::identity::FileKey]>,
+        mut admit: Option<&mut dyn FnMut(usize) -> Result<()>>,
+        open: impl FnOnce(&Path, Option<&mut dyn FnMut(usize) -> Result<()>>) -> Result<Connection>,
+    ) -> Result<Self> {
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "inspection-source read canceled"
+        );
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        let _capacity_open = crate::capacity_probes::phase(crate::capacity_probes::OPEN_AUTHORITY);
         limits.validate()?;
         seal.validate()?;
+        if let Some(protected) = protected {
+            ensure!(
+                protected.len() <= 4096,
+                "sealed reader protected identity bound"
+            );
+        }
+        #[cfg(windows)]
+        if let (Some(admit), crate::storage_volume::NativePath::WindowsWide(units)) =
+            (admit.as_mut(), &seal.database)
+        {
+            // NativePath::to_path uses the same pinned from_wide growth route.
+            let payload = units
+                .len()
+                .checked_mul(3)
+                .context("native path allocation overflow")?;
+            let growing = payload
+                .checked_mul(2)
+                .context("native path growth overflow")?
+                .max(8);
+            (*admit)(
+                payload
+                    .checked_add(growing)
+                    .context("native path transient overflow")?,
+            )?;
+        }
         let path = seal.database.to_path()?;
         ensure!(path.is_absolute(), "sealed database path must be absolute");
+        #[cfg(windows)]
+        let prepared_companions = if let Some(admit) = admit.as_mut() {
+            Some(reader_uri::Companions::prepare(&path, *admit)?)
+        } else {
+            no_companions(&path)?;
+            None
+        };
+        #[cfg(not(windows))]
         no_companions(&path)?;
         #[cfg(windows)]
-        let lease = {
+        let legacy_lease = if admit.is_none() {
             use std::os::windows::fs::OpenOptionsExt;
             crate::lightroom::source::reject_links(&path)?;
-            fs::OpenOptions::new()
-                .read(true)
-                .share_mode(1)
-                .open(&path)?
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(&path)?,
+            )
+        } else {
+            None
         };
+        #[cfg(windows)]
+        let mut guard = if let Some(admit) = admit.as_mut() {
+            Source::open_prepared(&path, seal.identity.bytes, *admit, reader_uri::file_path)?
+        } else {
+            Source::open(&path, seal.identity.bytes)?
+        };
+        #[cfg(not(windows))]
         let mut guard = Source::open(&path, seal.identity.bytes)?;
+        #[cfg(windows)]
+        let lease = match legacy_lease {
+            Some(lease) => lease,
+            None => {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(guard.prepared_path())?
+            }
+        };
+        let verify_companions = || -> Result<()> {
+            #[cfg(windows)]
+            if let Some(prepared) = &prepared_companions {
+                return prepared.verify();
+            }
+            no_companions(&path)
+        };
         ensure!(
             guard.before == seal.identity,
             "sealed inspection file identity differs"
         );
+        let mut open = Some(open);
+        let admitted = if let Some(protected) = protected {
+            let identity = crate::lightroom_migration_worker::identity::FileKey::of(&guard.file)?;
+            ensure!(
+                !protected.contains(&identity),
+                "sealed reader aliases a protected object"
+            );
+            #[cfg(windows)]
+            ensure!(
+                crate::lightroom_migration_worker::identity::FileKey::of(&lease)? == identity,
+                "sealed deny-write handle differs from Source"
+            );
+            let db = open.take().expect("one sealed SQL opener")(&path, admit.take())?;
+            crate::catalog_storage::verify_database_object(&db, &guard.file)
+                .context("closed-roster sealed inspection opened object")?;
+            db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
+            db.busy_timeout(Duration::ZERO)?;
+            guard.verify()?;
+            verify_companions()?;
+            Some(db)
+        } else {
+            None
+        };
         guard.lock(0x4000_0000, 512)?;
         let deadline = Instant::now() + Duration::from_millis(limits.open_deadline_ms);
         guard.file.seek(SeekFrom::Start(0))?;
@@ -393,6 +583,10 @@ impl MigrationSource {
         let mut hash = blake3::Hasher::new();
         let mut buffer = [0; 128 * 1024];
         while left > 0 {
+            ensure!(
+                !cancel.load(Ordering::Relaxed),
+                "inspection-source read canceled"
+            );
             ensure!(
                 Instant::now() < deadline,
                 "sealed source hashing deadline exceeded"
@@ -407,15 +601,21 @@ impl MigrationSource {
             "sealed inspection digest differs"
         );
         guard.verify()?;
-        no_companions(&path)?;
-        let db = Connection::open_with_flags(
-            plan::uri(&path)?,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
-        db.busy_timeout(Duration::ZERO)?;
+        verify_companions()?;
+        let db = if let Some(db) = admitted {
+            // Re-identify the already-open descriptor; never reopen after lock.
+            crate::catalog_storage::verify_database_object(&db, &guard.file)
+                .context("locked sealed inspection opened object")?;
+            db
+        } else {
+            // Keep the historical synchronous CLI ordering unchanged.
+            let db = open.take().expect("one legacy sealed SQL opener")(&path, None)?;
+            crate::catalog_storage::verify_database_object(&db, &guard.file)
+                .context("sealed inspection opened object")?;
+            db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY;")?;
+            db.busy_timeout(Duration::ZERO)?;
+            db
+        };
         let namespace = seal.binding_blake3()?;
         let value = Self {
             db,
@@ -425,7 +625,10 @@ impl MigrationSource {
             seal,
             namespace,
             limits,
+            #[cfg(windows)]
+            prepared_companions,
             poisoned: Flag::new(false),
+            cancel,
         };
         value
             .operation(|| value.admit())
@@ -451,7 +654,16 @@ impl MigrationSource {
         let result = self
             .guard
             .verify()
-            .and_then(|()| no_companions(&self.guard.path));
+            .and_then(|()| {
+                #[cfg(windows)]
+                if let Some(prepared) = &self.prepared_companions {
+                    return prepared.verify();
+                }
+                no_companions(&self.guard.path)
+            })
+            .and_then(|()| {
+                crate::catalog_storage::verify_database_object(&self.db, &self.guard.file)
+            });
         if result.is_err() {
             self.poisoned.set(true);
         }
@@ -459,7 +671,11 @@ impl MigrationSource {
     }
     fn operation<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
         self.verify()?;
-        let budget = QueryBudget::new(&self.db, self.limits);
+        ensure!(
+            !self.cancel.load(Ordering::Relaxed),
+            "inspection-source read canceled"
+        );
+        let budget = QueryBudget::new(&self.db, self.limits, self.cancel.clone());
         let result = read();
         self.verify()?;
         budget.check()?;
@@ -513,45 +729,62 @@ impl MigrationSource {
         plan::validate_paging_indexes(&self.db).context("source admission paging indexes")?;
         let mut rows = self
             .db
-            .prepare("SELECT revision FROM captures ORDER BY revision LIMIT 16385")
+            .prepare("SELECT CASE WHEN typeof(revision)='text' AND length(CAST(revision AS BLOB))=64 THEN revision END FROM captures ORDER BY revision LIMIT 16385")
             .context("prepare source admission capture roster")?;
-        let actual = rows
-            .query_map([], |r| r.get::<_, String>(0))
+        // Insert directly: BTreeSet::from_iter first retains a Vec and stable
+        // sort scratch. The opening allowance covers these two trees and one
+        // current 64-byte candidate, without those extra collection owners.
+        let mut actual = BTreeSet::new();
+        for revision in rows
+            .query_map([], |r| r.get::<_, Option<String>>(0))
             .context("query source admission capture roster")?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()
-            .context("read source admission capture roster")?;
-        let expected = self
+        {
+            let revision = revision
+                .context("read source admission capture roster")?
+                .context("capture revision storage type/64-byte admission")?;
+            actual.insert(revision);
+        }
+        let mut expected = BTreeSet::new();
+        for revision in self
             .seal
             .selected
             .iter()
-            .map(|r| r.revision.clone())
-            .chain(self.seal.excluded_revisions.iter().cloned())
-            .collect::<BTreeSet<_>>();
+            .map(|r| &r.revision)
+            .chain(self.seal.excluded_revisions.iter())
+        {
+            expected.insert(revision.clone());
+        }
         ensure!(
             actual == expected,
             "selected/excluded capture partition differs from sealed plan"
         );
         for entry in &self.seal.selected {
-            let (revision, evidence, reason): (String, String, String) = self
+            let (revision, evidence, reason): (Option<String>, Option<String>, Option<String>) = self
                 .db
                 .query_row(
-                    "SELECT revision,evidence_digest,reason FROM family_choices WHERE family=?",
+                    "SELECT CASE WHEN typeof(revision)='text' AND length(CAST(revision AS BLOB))=64 THEN revision END,CASE WHEN typeof(evidence_digest)='text' AND length(CAST(evidence_digest AS BLOB))=64 THEN evidence_digest END,CASE WHEN typeof(reason)='text' AND length(CAST(reason AS BLOB))<=4096 THEN reason END FROM family_choices WHERE family=?",
                     [&entry.family],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .with_context(|| {
                     format!("source admission family choice revision={}", entry.revision)
                 })?;
+            let revision = revision.context("family revision storage type/64-byte admission")?;
+            let evidence =
+                evidence.context("family evidence digest storage type/64-byte admission")?;
+            // Plan::choose already limits this exact reason to 4096 UTF-8 bytes.
+            // Retain Rust's Unicode trim semantics after byte admission.
+            let reason = reason.context("family reason storage type/4096-byte admission")?;
             ensure!(
                 revision == entry.revision
                     && evidence == entry.family_evidence_digest
                     && !reason.trim().is_empty(),
                 "family choice differs from approved selection"
             );
-            let (stage, current): (String, i64) = self
+            let (complete, current): (bool, i64) = self
                 .db
                 .query_row(
-                    "SELECT stage,evidence_revision FROM captures WHERE revision=?",
+                    "SELECT typeof(stage)='text' AND stage='inspection_complete_with_reported_gaps',evidence_revision FROM captures WHERE revision=?",
                     [&entry.revision],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -559,8 +792,7 @@ impl MigrationSource {
                     format!("source admission capture state revision={}", entry.revision)
                 })?;
             ensure!(
-                stage == "inspection_complete_with_reported_gaps"
-                    && current == entry.evidence_revision,
+                complete && current == entry.evidence_revision,
                 "selected inspection not complete or evidence changed"
             );
             let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM paths WHERE revision=? AND (state IN ('pending','available_packets_uninspected') OR json_extract(evidence,'$.embedded_sidecar_xmp') IS NOT NULL))", [&entry.revision], |r| r.get(0)).with_context(|| format!("source admission pending paths revision={}", entry.revision))?;
@@ -600,7 +832,9 @@ impl MigrationSource {
             digest(&bytes) == selected.manifest_blake3,
             "capture manifest differs from seal"
         );
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        let manifest = super::manifest_json::decode_cancellable(&bytes, &|| {
+            self.cancel.load(Ordering::Relaxed)
+        })?;
         ensure!(
             manifest.revision_id.as_deref() == Some(revision)
                 && manifest.state == "captured"
@@ -641,30 +875,9 @@ impl MigrationSource {
             blob.len() <= crate::lightroom::PAGE_BYTES,
             "supplement baseline metadata limit"
         );
-        let evidence: serde_json::Value = serde_json::from_slice(&blob.read(0, blob.len())?)?;
-        let matches = evidence
-            .get("inspections")
-            .and_then(|v| v.as_array())
-            .context("supplement has no retained original inspection")?
-            .iter()
-            .filter(|v| v.get("origin").and_then(|v| v.as_str()) == Some(&pin.origin))
-            .collect::<Vec<_>>();
-        ensure!(
-            matches.len() == 1,
-            "supplement original association missing or ambiguous"
-        );
-        let source: crate::xmp_packets::SourceRevision = serde_json::from_value(
-            matches[0]
-                .get("revision")
-                .context("supplement source revision missing")?
-                .clone(),
-        )?;
-        let status: crate::xmp_packets::Status = serde_json::from_value(
-            matches[0]
-                .get("status")
-                .context("supplement status missing")?
-                .clone(),
-        )?;
+        let bytes = blob.read(0, blob.len())?;
+        let (source, status) =
+            supplement_json::select(&bytes, &pin.origin, &|| self.cancel.load(Ordering::Relaxed))?;
         ensure!(
             source == pin.source_revision && status == pin.historical_status,
             "supplement differs from retained original identity/status"
@@ -939,31 +1152,58 @@ impl MigrationSource {
         );
         self.operation(|| {
             // Same schema3 numeric keys and join order as Plan::unique_target.
-            let mut stmt = self.db.prepare("SELECT target.source_id FROM references_out reference CROSS JOIN entities target ON target.revision=reference.revision AND target.table_name=reference.target_table AND target.local_key=reference.target_key WHERE reference.revision=? AND reference.source_id=? AND reference.field=? AND reference.target_table=? LIMIT 2")?;
+            let mut stmt = self.db.prepare("SELECT CASE WHEN typeof(target.source_id)='text' AND length(CAST(target.source_id AS BLOB))<=4096 THEN target.source_id END FROM references_out reference CROSS JOIN entities target ON target.revision=reference.revision AND target.table_name=reference.target_table AND target.local_key=reference.target_key WHERE reference.revision=? AND reference.source_id=? AND reference.field=? AND reference.target_table=? LIMIT 2")?;
             let mut rows = stmt.query(params![revision,source_id,field,target_table])?;
-            let first = rows.next()?.map(|r| r.get::<_,String>(0)).transpose()?;
+            let first = rows.next()?.map(|r| r.get::<_,Option<String>>(0)).transpose()?;
             if rows.next()?.is_some() { return Ok(Resolution::Ambiguous); }
-            Ok(first.map_or(Resolution::Missing,Resolution::Unique))
+            match first {
+                None => Ok(Resolution::Missing),
+                Some(Some(value)) => Ok(Resolution::Unique(value)),
+                Some(None) => bail!("resolved source ID must be TEXT within 4096 bytes; retain complete identity evidence through pages/chunks"),
+            }
         })
     }
 
     pub fn image_links(&self, revision: &str, source_id: &str) -> Result<ImageLinks> {
         self.selected(revision)?;
+        ensure!(
+            !source_id.is_empty() && source_id.len() <= 4096,
+            "source ID limit"
+        );
         self.operation(|| {
-            let table: Option<String> = self
-                .db
-                .query_row(
-                    "SELECT table_name FROM entities WHERE revision=? AND source_id=?",
-                    params![revision, source_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            ensure!(
-                table.as_deref() == Some("Adobe_images"),
-                "not an observed Adobe image record"
-            );
+            let observed: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entities WHERE revision=? AND source_id=? AND table_name='Adobe_images')",
+                params![revision, source_id], |r| r.get(0))?;
+            ensure!(observed, "not an observed Adobe image record");
             Ok(())
         })?;
-        Ok(ImageLinks { image_source_id:source_id.into(), file:self.resolve(revision,source_id,"rootFile","AgLibraryFile")?, master:self.resolve(revision,source_id,"masterImage","Adobe_images")?, current_develop:self.resolve(revision,source_id,"developSettingsIDCache","Adobe_imageDevelopSettings")?, limitations:"Only exact unique retained schema3 links; missing is not proof of a master sentinel or current settings. History/snapshots and unknown tables remain separately retained.".into() })
+        Ok(ImageLinks {
+            image_source_id: source_id.into(),
+            file: self.resolve(revision, source_id, "rootFile", "AgLibraryFile")?,
+            master: self.resolve(revision, source_id, "masterImage", "Adobe_images")?,
+            current_develop: self.resolve(
+                revision,
+                source_id,
+                "developSettingsIDCache",
+                "Adobe_imageDevelopSettings",
+            )?,
+            limitations: IMAGE_LINK_LIMITATIONS.into(),
+        })
     }
 }
+
+#[cfg(test)]
+#[path = "reader_identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
+#[path = "reader_closed_tests.rs"]
+mod closed_tests;
+
+#[cfg(test)]
+#[path = "reader_opening_tests.rs"]
+mod opening_tests;
+
+#[cfg(all(test, feature = "internal-capacity-probes"))]
+#[path = "reader_capacity_tests.rs"]
+mod capacity_tests;

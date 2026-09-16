@@ -108,6 +108,8 @@ fn actual_child_cancellation_waits_and_cleans_private_staging() {
     let mut worker =
         WorkerProcess::spawn(executable(), &root.path().join("staging"), request).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
+    // Start after taking ownership, without admitting post-decode encoding.
+    worker.start().unwrap();
     while !worker.awaiting_encode_admission().unwrap() {
         assert!(
             Instant::now() < deadline,

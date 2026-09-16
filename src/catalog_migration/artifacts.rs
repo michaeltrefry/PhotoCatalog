@@ -32,6 +32,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod descriptor_json;
+mod preparation;
+pub use preparation::{MappingPreparation, prepare_mapping};
+
 const DESCRIPTOR_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,7 +63,7 @@ pub struct ArtifactLimits {
     pub chunk_bytes: usize,
 }
 impl ArtifactLimits {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         ensure!(
             self.maximum_bytes > 0 && self.maximum_bytes <= i64::MAX as u64,
             "artifact byte admission limit"
@@ -101,28 +105,40 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
 }
 
 fn mapping_path(mapping: &ArtifactMapping) -> Result<PathBuf> {
-    for native in [&mapping.root, &mapping.relative] {
+    mapping_path_parts(&mapping.root, &mapping.relative)
+}
+fn mapping_path_parts(root: &NativePath, relative: &NativePath) -> Result<PathBuf> {
+    let (root_path, relative_path) = mapping_native_paths(root, relative)?;
+    reject_links(&root_path)?;
+    ensure!(
+        fs::symlink_metadata(&root_path)?.is_dir(),
+        "artifact sealed root is not a directory"
+    );
+    Ok(root_path.join(relative_path))
+}
+fn mapping_native_paths(root: &NativePath, relative: &NativePath) -> Result<(PathBuf, PathBuf)> {
+    for native in [root, relative] {
         let units = match native {
             NativePath::UnixBytes(v) => v.len(),
             NativePath::WindowsWide(v) => v.len(),
         };
         ensure!((1..=32768).contains(&units), "artifact mapping path length");
     }
-    let root = mapping.root.to_path()?;
-    let relative = mapping.relative.to_path()?;
+    let root_path = root.to_path()?;
+    let relative_path = relative.to_path()?;
     ensure!(
-        root.is_absolute() && !relative.is_absolute(),
+        root_path.is_absolute() && !relative_path.is_absolute(),
         "artifact mapping root/relative shape"
     );
     ensure!(
-        relative
+        relative_path
             .components()
             .all(|c| matches!(c, Component::Normal(_)))
-            && relative.components().count() <= 256,
+            && relative_path.components().count() <= 256,
         "artifact mapping contains non-normal component"
     );
     // components() normalizes a/./b; reject lexical dot components as well.
-    match &mapping.relative {
+    match relative {
         NativePath::UnixBytes(v) => ensure!(
             v.split(|b| *b == b'/')
                 .all(|p| !p.is_empty() && p != b"." && p != b".."),
@@ -134,24 +150,83 @@ fn mapping_path(mapping: &ArtifactMapping) -> Result<PathBuf> {
             "artifact relative path component"
         ),
     }
-    reject_links(&root)?;
-    ensure!(
-        fs::symlink_metadata(&root)?.is_dir(),
-        "artifact sealed root is not a directory"
-    );
-    Ok(root.join(relative))
+    Ok((root_path, relative_path))
+}
+
+/// Only the owned raw Source epoch uses this allocation path. The public/CLI
+/// mapping route keeps its existing behavior. Grants occur before Source locks.
+fn admitted_mapping_path(
+    mapping: &ArtifactMapping,
+    admit: &mut dyn FnMut(usize) -> Result<()>,
+) -> Result<PathBuf> {
+    fn add(a: usize, b: usize) -> Result<usize> {
+        a.checked_add(b)
+            .context("artifact path allocation overflow")
+    }
+    fn mul(a: usize, b: usize) -> Result<usize> {
+        a.checked_mul(b)
+            .context("artifact path allocation overflow")
+    }
+    for native in [&mapping.root, &mapping.relative] {
+        let units = match native {
+            NativePath::UnixBytes(v) => v.len(),
+            NativePath::WindowsWide(v) => v.len(),
+        };
+        ensure!((1..=32768).contains(&units), "artifact mapping path length");
+        #[cfg(unix)]
+        let bytes = units;
+        #[cfg(windows)]
+        let bytes = add(mul(units, 3)?, mul(units, 6)?.max(8))?;
+        admit(bytes)?;
+    }
+    let (root, relative) = mapping_native_paths(&mapping.root, &mapping.relative)?;
+    #[cfg(windows)]
+    Source::check_prepared_directory(&root, admit)?;
+    #[cfg(unix)]
+    {
+        // Original-prefix PathBuf growth and transient CString used by std FS.
+        admit(add(mul(root.as_os_str().len(), 4)?, 9)?)?;
+        reject_links(&root)?;
+        ensure!(
+            fs::symlink_metadata(&root)?.is_dir(),
+            "artifact sealed root is not a directory"
+        );
+    }
+    let capacity = add(add(root.as_os_str().len(), relative.as_os_str().len())?, 1)?;
+    admit(capacity)?;
+    let mut original = std::ffi::OsString::with_capacity(capacity);
+    original.push(&root);
+    // Native component validation above has excluded absolute/non-normal relative
+    // paths. Raw append avoids PathBuf::push's verbatim Vec/rebuild allocations.
+    #[cfg(unix)]
+    let separator = "/";
+    #[cfg(windows)]
+    let separator = "\\";
+    if !original.as_encoded_bytes().ends_with(separator.as_bytes()) {
+        original.push(separator);
+    }
+    original.push(&relative);
+    #[cfg(unix)]
+    // Source.path clone + prefix growth/realloc + std CString scratch. Retained
+    // until reader reap, reused during serial revision checks.
+    admit(add(mul(original.len(), 5)?, 9)?)?;
+    Ok(original.into())
 }
 
 fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDescriptor> {
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    let _capacity_phase = crate::capacity_probes::phase(crate::capacity_probes::DESCRIPTOR_RECORD);
     ensure!(
         request.retained_capture_record > 0 && i64::try_from(request.member_index).is_ok(),
         "artifact member selector bounds"
     );
-    let record = retention::selected_record(db, request.retained_capture_record)?;
+    let record = retention::selected_capture(db, request.retained_capture_record)?;
     ensure!(
         record.collection == Collection::Captures,
         "artifact authority must be a retained Captures record"
     );
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(crate::capacity_probes::DESCRIPTOR_RECORD, 0);
     let bytes = retention::field_bytes(
         db,
         request.retained_capture_record,
@@ -159,7 +234,15 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         "manifest",
         crate::lightroom::MANIFEST_BYTES,
     )?;
-    let manifest: Manifest = serde_json::from_slice(&bytes)?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(crate::capacity_probes::DESCRIPTOR_BYTES, bytes.capacity());
+    let manifest = crate::lightroom::migration_source::manifest_json::decode(&bytes)?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::DESCRIPTOR_MANIFEST,
+        crate::capacity_probes::manifest(&manifest),
+    );
+
     ensure!(
         manifest.protocol == 1
             && manifest.state == "captured"
@@ -167,12 +250,19 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
             && crate::lightroom::json_digest(&manifest.artifacts)? == record.revision,
         "retained artifact manifest revision differs"
     );
-    let (input, seal): (String, Vec<u8>) = db.query_row("SELECT i.id,i.seal FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1", [request.retained_capture_record], |r| Ok((r.get(0)?,r.get(1)?)))?;
-    ensure!(
-        seal.len() <= crate::lightroom::MANIFEST_BYTES,
-        "retained seal limit"
+    let (input, seal): (Option<String>, Option<Vec<u8>>) = db.query_row("SELECT CASE WHEN typeof(i.id)='text' AND length(CAST(i.id AS BLOB))=64 THEN i.id END,CASE WHEN typeof(i.seal)='blob' AND length(i.seal)<=?2 THEN i.seal END FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=?1", params![request.retained_capture_record,crate::lightroom::MANIFEST_BYTES as i64], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    let input = input.context("retained input identity storage type/64-byte admission")?;
+    let seal = seal.context("retained seal storage type/byte admission limit")?;
+    let seal = crate::lightroom::migration_source::seal_json::decode(
+        &seal,
+        crate::lightroom::MANIFEST_BYTES,
+        &|| false,
+    )?;
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::DESCRIPTOR_SEAL,
+        crate::capacity_probes::seal(&seal),
     );
-    let seal: crate::lightroom::migration_source::InputSeal = serde_json::from_slice(&seal)?;
     let selected = seal
         .selected
         .iter()
@@ -208,6 +298,14 @@ fn descriptor(db: &Connection, request: &ArtifactRequest) -> Result<ArtifactDesc
         manifest_blake3,
         artifact,
     };
+    #[cfg(all(test, feature = "internal-capacity-probes"))]
+    crate::capacity_probes::observe(
+        crate::capacity_probes::DESCRIPTOR_CLONES,
+        crate::capacity_probes::artifact(&result.artifact)
+            + crate::capacity_probes::path(&result.request.mapping.root)
+            + crate::capacity_probes::path(&result.request.mapping.relative)
+            + crate::capacity_probes::revision(&result.request.mapping.copy_identity),
+    );
     crate::lightroom::bounded_json(&result, DESCRIPTOR_LIMIT)?;
     Ok(result)
 }
@@ -217,10 +315,10 @@ fn existing(
     descriptor: &[u8],
     request: &ArtifactRequest,
 ) -> Result<Option<String>> {
-    let previous: Option<(Vec<u8>,String)> = db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2", params![request.retained_capture_record,i64::try_from(request.member_index)?], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-    if let Some((old, id)) = previous {
+    let previous: Option<(bool,String)> = db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2", params![request.retained_capture_record,i64::try_from(request.member_index)?], |r| Ok((evidence::retained_descriptor(r, 0)? == descriptor, evidence::retained_identity(r, 1)?))).optional()?;
+    if let Some((matches, id)) = previous {
         ensure!(
-            old == descriptor,
+            matches,
             "artifact custody mapping or provenance differs; explicit reconciliation required"
         );
         return Ok(Some(id));
@@ -240,71 +338,119 @@ pub struct ArtifactReader {
     poisoned: bool,
 }
 impl ArtifactReader {
-    pub fn descriptor(&self) -> &ArtifactDescriptor {
-        &self.descriptor
-    }
-    fn verify(&mut self) -> Result<()> {
-        ensure!(!self.poisoned, "artifact reader previously invalidated");
-        let result = self.source.verify();
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
-    }
-    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>> {
-        self.verify()?;
-        ensure!(!stop(), "artifact custody stopped");
-        let deadline = Instant::now() + Duration::from_millis(self.limits.chunk_deadline_ms);
-        ensure!(
-            offset <= self.source.before.bytes,
-            "artifact offset exceeds source"
-        );
-        let size = (self.source.before.bytes - offset).min(self.limits.chunk_bytes as u64) as usize;
-        let mut bytes = vec![0; size];
-        self.source.file.seek(SeekFrom::Start(offset))?;
-        self.source.file.read_exact(&mut bytes)?;
-        self.verify()?;
-        ensure!(
-            Instant::now() < deadline && !stop(),
-            "artifact chunk deadline/stop"
-        );
-        Ok(bytes)
-    }
-}
-
-impl Catalog {
-    /// Full-file verification is outside the destination writer. A resumed
-    /// reader repeats this admission hash once; individual chunks do not.
-    pub fn open_migration_artifact(
-        &self,
-        request: ArtifactRequest,
+    pub(crate) fn open_descriptor(
+        descriptor: ArtifactDescriptor,
         limits: ArtifactLimits,
         stop: &dyn Fn() -> bool,
-    ) -> Result<ArtifactReader> {
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+    ) -> Result<Self> {
+        Self::open_descriptor_impl(descriptor, limits, stop, protected, None)
+    }
+    pub(crate) fn open_owned_descriptor(
+        descriptor: ArtifactDescriptor,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_descriptor_impl(descriptor, limits, stop, protected, Some(admit))
+    }
+    fn open_descriptor_impl(
+        descriptor: ArtifactDescriptor,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+        protected: &[crate::lightroom_migration_worker::identity::FileKey],
+        mut admit: Option<&mut dyn FnMut(usize) -> Result<()>>,
+    ) -> Result<Self> {
         limits.validate()?;
         ensure!(!stop(), "artifact custody stopped");
+        ensure!(protected.len() <= 4096, "artifact protected identity bound");
         let deadline = Instant::now() + Duration::from_millis(limits.open_deadline_ms);
-        let descriptor = descriptor(&self.db, &request)?;
         let encoded = crate::lightroom::bounded_json(&descriptor, DESCRIPTOR_LIMIT)?;
-        existing(&self.db, &encoded, &request)?;
+        let request = &descriptor.request;
+        ensure!(
+            descriptor.protocol == 1
+                && request.retained_capture_record > 0
+                && i64::try_from(request.member_index).is_ok(),
+            "artifact descriptor protocol/member bounds"
+        );
+        ensure!(
+            descriptor.artifact.revision.bytes == request.mapping.copy_identity.bytes,
+            "artifact copy length differs from descriptor"
+        );
+        for hash in [
+            &descriptor.selected_input,
+            &descriptor.capture_revision,
+            &descriptor.manifest_blake3,
+            &descriptor.artifact.blake3,
+        ] {
+            ensure!(
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "artifact descriptor digest bounds"
+            );
+        }
         ensure!(
             descriptor.artifact.revision.bytes <= limits.maximum_bytes,
             "artifact exceeds declared maximum bytes"
         );
-        let path = mapping_path(&request.mapping)?;
+        let path = if let Some(admit) = admit.as_mut() {
+            admitted_mapping_path(&request.mapping, *admit)?
+        } else {
+            mapping_path(&request.mapping)?
+        };
         #[cfg(windows)]
-        let lease = {
+        let legacy_lease = if admit.is_none() {
             use std::os::windows::fs::OpenOptionsExt;
             reject_links(&path)?;
-            fs::OpenOptions::new()
-                .read(true)
-                .share_mode(1)
-                .open(&path)?
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(&path)?,
+            )
+        } else {
+            None
         };
+        #[cfg(windows)]
+        let mut source = if let Some(admit) = admit.as_mut() {
+            Source::open_prepared(
+                &path,
+                limits.maximum_bytes,
+                *admit,
+                crate::lightroom::source::closed_path::file_path,
+            )?
+        } else {
+            Source::open(&path, limits.maximum_bytes)?
+        };
+        #[cfg(not(windows))]
         let mut source = Source::open(&path, limits.maximum_bytes)?;
+        #[cfg(windows)]
+        let lease = match legacy_lease {
+            Some(lease) => lease,
+            None => {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(source.prepared_path())?
+            }
+        };
         ensure!(
             source.before == request.mapping.copy_identity,
             "artifact sealed copy identity differs"
+        );
+        let key = crate::lightroom_migration_worker::identity::FileKey::of(&source.file)?;
+        ensure!(
+            !protected.contains(&key),
+            "artifact aliases a protected object"
+        );
+        #[cfg(windows)]
+        ensure!(
+            crate::lightroom_migration_worker::identity::FileKey::of(&lease)? == key,
+            "artifact deny-write handle differs"
         );
         source.lock(0, 0)?;
         let mut remaining = source.before.bytes;
@@ -340,9 +486,100 @@ impl Catalog {
         })
     }
 
+    pub fn descriptor(&self) -> &ArtifactDescriptor {
+        &self.descriptor
+    }
+    fn verify(&mut self) -> Result<()> {
+        ensure!(!self.poisoned, "artifact reader previously invalidated");
+        let result = self.source.verify();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>> {
+        self.verify()?;
+        ensure!(!stop(), "artifact custody stopped");
+        let deadline = Instant::now() + Duration::from_millis(self.limits.chunk_deadline_ms);
+        ensure!(
+            offset <= self.source.before.bytes,
+            "artifact offset exceeds source"
+        );
+        let size = (self.source.before.bytes - offset).min(self.limits.chunk_bytes as u64) as usize;
+        let mut bytes = vec![0; size];
+        self.source.file.seek(SeekFrom::Start(offset))?;
+        self.source.file.read_exact(&mut bytes)?;
+        self.verify()?;
+        ensure!(
+            Instant::now() < deadline && !stop(),
+            "artifact chunk deadline/stop"
+        );
+        Ok(bytes)
+    }
+}
+
+/// Internal transport implementations must bind all returned bytes to the
+/// admitted descriptor and retain their reader epoch through transaction drain.
+/// Public callers cannot construct a reader from untrusted digest claims.
+pub(crate) trait ArtifactRead {
+    fn descriptor(&self) -> &ArtifactDescriptor;
+    fn encoded(&self) -> &[u8];
+    fn length(&self) -> u64;
+    fn verify(&mut self) -> Result<()>;
+    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>>;
+}
+impl ArtifactRead for ArtifactReader {
+    fn descriptor(&self) -> &ArtifactDescriptor {
+        &self.descriptor
+    }
+    fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+    fn length(&self) -> u64 {
+        self.source.before.bytes
+    }
+    fn verify(&mut self) -> Result<()> {
+        ArtifactReader::verify(self)
+    }
+    fn chunk(&mut self, offset: u64, stop: &dyn Fn() -> bool) -> Result<Vec<u8>> {
+        ArtifactReader::chunk(self, offset, stop)
+    }
+}
+
+impl Catalog {
+    /// Full-file verification is outside the destination writer. A resumed
+    /// reader repeats this admission hash once; individual chunks do not.
+    pub fn open_migration_artifact(
+        &self,
+        request: ArtifactRequest,
+        limits: ArtifactLimits,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<ArtifactReader> {
+        limits.validate()?;
+        ensure!(!stop(), "artifact custody stopped");
+        let descriptor = self.migration_artifact_reader_descriptor(&request)?;
+        ArtifactReader::open_descriptor(descriptor, limits, stop, &[])
+    }
+    /// Resolve immutable destination authority without opening the raw copy.
+    pub(crate) fn migration_artifact_reader_descriptor(
+        &self,
+        request: &ArtifactRequest,
+    ) -> Result<ArtifactDescriptor> {
+        let descriptor = descriptor(&self.db, request)?;
+        let encoded = crate::lightroom::bounded_json(&descriptor, DESCRIPTOR_LIMIT)?;
+        existing(&self.db, &encoded, request)?;
+        Ok(descriptor)
+    }
+
     pub fn begin_migration_artifact(
         &mut self,
         reader: &mut ArtifactReader,
+    ) -> Result<EvidenceState> {
+        self.begin_migration_artifact_reader(reader)
+    }
+    pub(crate) fn begin_migration_artifact_reader(
+        &mut self,
+        reader: &mut dyn ArtifactRead,
     ) -> Result<EvidenceState> {
         reader.verify()?;
         let _permit = self.writers.enter(Priority::Background)?;
@@ -353,25 +590,25 @@ impl Catalog {
         // cannot authorize a coincidentally equal retained-record sequence.
         ensure!(
             crate::lightroom::bounded_json(
-                &descriptor(&tx, &reader.descriptor.request)?,
+                &descriptor(&tx, &reader.descriptor().request)?,
                 DESCRIPTOR_LIMIT
-            )? == reader.encoded,
+            )? == reader.encoded(),
             "artifact destination authority differs"
         );
-        existing(&tx, &reader.encoded, &reader.descriptor.request)?;
+        existing(&tx, reader.encoded(), &reader.descriptor().request)?;
         reader.verify()?;
         let result = evidence::begin_owned(
             &tx,
-            &reader.encoded,
-            reader.source.before.bytes,
+            reader.encoded(),
+            reader.length(),
             evidence::Authority::CapturedArtifact,
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO migration_artifacts VALUES(?1,?2,?3,?4)",
             params![
-                reader.descriptor.request.retained_capture_record,
-                i64::try_from(reader.descriptor.request.member_index)?,
-                reader.encoded,
+                reader.descriptor().request.retained_capture_record,
+                i64::try_from(reader.descriptor().request.member_index)?,
+                reader.encoded(),
                 result.id
             ],
         )?;
@@ -386,9 +623,16 @@ impl Catalog {
         reader: &mut ArtifactReader,
         stop: &dyn Fn() -> bool,
     ) -> Result<EvidenceState> {
+        self.step_migration_artifact_reader(reader, stop)
+    }
+    pub(crate) fn step_migration_artifact_reader(
+        &mut self,
+        reader: &mut dyn ArtifactRead,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<EvidenceState> {
         reader.verify()?;
         ensure!(!stop(), "artifact custody stopped");
-        let id = existing(&self.db, &reader.encoded, &reader.descriptor.request)?
+        let id = existing(&self.db, reader.encoded(), &reader.descriptor().request)?
             .context("artifact custody has not begun")?;
         let before = self.migration_evidence(&id)?;
         if before.complete {
@@ -401,9 +645,14 @@ impl Catalog {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(
-            existing(&tx, &reader.encoded, &reader.descriptor.request)?.as_deref()
+            existing(&tx, reader.encoded(), &reader.descriptor().request)?.as_deref()
                 == Some(id.as_str()),
             "artifact custody changed"
+        );
+        #[cfg(all(test, feature = "internal-capacity-probes"))]
+        crate::capacity_probes::observe(
+            crate::capacity_probes::CHUNK_VERIFY,
+            bytes.capacity() + prepared.probe_capacity(),
         );
         reader.verify()?;
         ensure!(!stop(), "artifact custody stopped before commit");
@@ -423,7 +672,7 @@ impl Catalog {
         retained_capture_record: i64,
         member_index: usize,
     ) -> Result<(ArtifactDescriptor, EvidenceState)> {
-        let (bytes,id):(Vec<u8>,String)=self.db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2",params![retained_capture_record,i64::try_from(member_index)?],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (bytes,id):(Vec<u8>,String)=self.db.query_row("SELECT descriptor,evidence FROM migration_artifacts WHERE retained_capture_record=?1 AND member_index=?2",params![retained_capture_record,i64::try_from(member_index)?],|r|Ok((evidence::retained_descriptor(r, 0)?.to_vec(),evidence::retained_identity(r, 1)?)))?;
         ensure!(bytes.len() <= DESCRIPTOR_LIMIT, "artifact descriptor limit");
         ensure!(
             self.migration_evidence_descriptor(&id)? == bytes,
@@ -451,6 +700,12 @@ mod tests {
     }
     impl RawFixture {
         fn new(length: usize) -> Result<(Self, Catalog)> {
+            Self::with_manifest(length, |_| {})
+        }
+        fn with_manifest(
+            length: usize,
+            customize: impl FnOnce(&mut crate::lightroom::capture::Manifest),
+        ) -> Result<(Self, Catalog)> {
             let root = tempfile::tempdir()?;
             let absolute = fs::canonicalize(root.path())?;
             let raw = absolute.join("sealed");
@@ -492,6 +747,7 @@ mod tests {
                     blake3: blake3::hash(bytes).to_hex().to_string(),
                 });
             }
+            customize(&mut manifest);
             let old = inspection.revision().to_owned();
             let revision = crate::lightroom::json_digest(&manifest.artifacts)?;
             manifest.revision_id = Some(revision.clone());
@@ -568,6 +824,163 @@ mod tests {
                 chunk_bytes: 256 * 1024,
             }
         }
+    }
+
+    #[cfg(feature = "internal-capacity-probes")]
+    #[path = "capacity_tests.rs"]
+    mod capacity_tests;
+
+    #[test]
+    fn saved_artifact_identity_and_descriptor_guards_cover_pending_and_recheck() -> Result<()> {
+        use crate::catalog_migration::{import_artifacts, importer};
+        let (fixture, mut catalog) = RawFixture::new(17)?;
+        let request = &fixture.requests[0];
+        let mut reader =
+            catalog.open_migration_artifact(request.clone(), RawFixture::limits(), &|| false)?;
+        let before = catalog.begin_migration_artifact(&mut reader)?;
+        let encoded = reader.encoded().to_vec();
+        drop(reader);
+        let source = fixture.inspection.open();
+        let policy = importer::Policy {
+            import_source: "saved-artifact-guards".into(),
+            overlap: importer::OverlapPolicy::RequireDecision,
+            keyword_overlap: importer::KeywordOverlap::RequireDecision,
+            artifacts: vec![importer::ArtifactInput {
+                capture_revision: fixture.inspection.revision().into(),
+                member_index: request.member_index,
+                mapping: request.mapping.clone(),
+            }],
+            supplements: vec![],
+        };
+        let progress = importer::Progress {
+            id: "synthetic pending checkpoint".into(),
+            input: source.binding_blake3().into(),
+            stage: importer::Stage::ArtifactCustody,
+            capture_index: 0,
+            artifact_index: 0,
+            cursor: None,
+            processed: 0,
+            complete: false,
+        };
+        for expression in [
+            "replace(hex(zeroblob(524288)), '0', 'x')",
+            "replace(hex(zeroblob(33)), '0', 'é')",
+            "CAST(x'ff' || zeroblob(63) AS TEXT)",
+        ] {
+            catalog
+                .db
+                .execute_batch("SAVEPOINT malformed_identity; PRAGMA defer_foreign_keys=ON")?;
+            catalog.db.execute(
+                &format!("UPDATE migration_evidence SET id={expression} WHERE id=?1"),
+                [&before.id],
+            )?;
+            catalog.db.execute(
+                &format!("UPDATE migration_artifacts SET evidence={expression} WHERE evidence=?1"),
+                [&before.id],
+            )?;
+            assert_eq!(
+                catalog
+                    .db
+                    .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))?,
+                0
+            );
+            for error in [
+                existing(&catalog.db, &encoded, request).unwrap_err(),
+                catalog
+                    .migration_artifact(request.retained_capture_record, request.member_index)
+                    .unwrap_err(),
+                import_artifacts::pending(&mut catalog, &source, &progress, &policy).unwrap_err(),
+            ] {
+                assert!(
+                    format!("{error:#}").contains("64 bytes of UTF-8 TEXT"),
+                    "{error:#}"
+                );
+            }
+            catalog
+                .db
+                .execute_batch("ROLLBACK TO malformed_identity; RELEASE malformed_identity")?;
+            assert_eq!(
+                catalog
+                    .migration_artifact(request.retained_capture_record, request.member_index)?
+                    .1,
+                before
+            );
+        }
+        catalog.db.execute(
+            "UPDATE migration_evidence SET descriptor=zeroblob(65537) WHERE id=?1",
+            [&before.id],
+        )?;
+        let error =
+            import_artifacts::pending(&mut catalog, &source, &progress, &policy).unwrap_err();
+        assert!(format!("{error:#}").contains("BLOB of at most 64 KiB"));
+        catalog.db.execute(
+            "UPDATE migration_evidence SET descriptor=?2 WHERE id=?1",
+            params![before.id, encoded],
+        )?;
+        assert_eq!(
+            import_artifacts::pending(&mut catalog, &source, &progress, &policy)?
+                .progress
+                .artifact_index,
+            0
+        );
+        assert_eq!(
+            catalog
+                .migration_artifact(request.retained_capture_record, request.member_index)?
+                .1,
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_opening_retention_columns_reject_before_materialization() -> Result<()> {
+        let (fixture, catalog) = RawFixture::new(17)?;
+        let request = &fixture.requests[0];
+        let original = serde_json::to_vec(&descriptor(&catalog.db, request)?)?;
+        for (sql, expected) in [
+            (
+                "UPDATE migration_retention SET seal=zeroblob(8388609)",
+                "retained seal type/size",
+            ),
+            (
+                "UPDATE migration_retention SET seal='{}'",
+                "retained seal type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET compressed=zeroblob(8421377)",
+                "retained record type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET compressed='bad'",
+                "retained record type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET digest=replace(hex(zeroblob(33)),'0','é')",
+                "retained digest type/size",
+            ),
+            (
+                "UPDATE migration_retained_records SET raw_length=-1",
+                "Integer",
+            ),
+        ] {
+            catalog.db.execute_batch("SAVEPOINT corrupt")?;
+            catalog.db.execute_batch(sql)?;
+            let error = descriptor(&catalog.db, request).unwrap_err();
+            if expected != "Integer" {
+                assert!(format!("{error:#}").contains(expected), "{sql}: {error:#}");
+            }
+            catalog
+                .db
+                .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")?;
+            assert_eq!(
+                serde_json::to_vec(&descriptor(&catalog.db, request)?)?,
+                original
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -803,6 +1216,45 @@ mod tests {
                 .open_migration_artifact(request, RawFixture::limits(), &|| false)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn owned_mapping_grants_precede_paths_and_keep_legacy_native_spelling() -> Result<()> {
+        let (fixture, _catalog) = RawFixture::new(10)?;
+        let mapping = &fixture.requests[0].mapping;
+        let expected = mapping_path(mapping)?;
+        let mut attempts = 0;
+        let denied = admitted_mapping_path(mapping, &mut |_| {
+            attempts += 1;
+            anyhow::bail!("synthetic no allocation allowance")
+        });
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("synthetic no allocation allowance")
+        );
+        assert_eq!(attempts, 1);
+        let mut total = 0usize;
+        let actual = admitted_mapping_path(mapping, &mut |bytes| {
+            total = total.checked_add(bytes).unwrap();
+            Ok(())
+        })?;
+        assert_eq!(actual, expected);
+        assert!(total > actual.as_os_str().len());
+        let mut foreign = mapping.clone();
+        #[cfg(unix)]
+        {
+            foreign.relative = NativePath::WindowsWide(vec![0xd800]);
+        }
+        #[cfg(windows)]
+        {
+            foreign.relative = NativePath::UnixBytes(vec![255]);
+        }
+        assert!(admitted_mapping_path(&foreign, &mut |_| Ok(())).is_err());
+        assert!(mapping_path(&foreign).is_err());
+        println!("RAW_PATH admitted={total} original_native_spelling=true foreign_rejected=true");
         Ok(())
     }
 

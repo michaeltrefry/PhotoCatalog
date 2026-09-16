@@ -8,12 +8,12 @@ use super::{
     },
     walk::{LinkResolution, Walk},
 };
+use crate::lightroom::migration_source::MigrationRead;
+#[cfg(test)]
+use crate::lightroom::migration_source::MigrationSource;
 use crate::{
     Catalog,
-    lightroom::{
-        migration_source::{Field, MigrationSource},
-        plan::Cell,
-    },
+    lightroom::{migration_source::Field, plan::Cell},
     organization::{Flag, KeywordKind},
 };
 use anyhow::{Result, ensure};
@@ -67,7 +67,7 @@ fn name(value: &Cell) -> Option<String> {
 }
 fn unsupported_row(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     construct: &str,
@@ -84,7 +84,7 @@ fn unsupported_row(
 }
 fn behavior(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<ProjectionResult> {
@@ -130,12 +130,12 @@ fn text(value: &Cell) -> Option<String> {
 }
 fn project_one(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     decision: Decision,
 ) -> Result<ProjectionResult> {
-    catalog.project_migration_organization(
+    catalog.project_migration_organization_reader(
         Some(source),
         &Projection {
             origin: origin.clone(),
@@ -147,7 +147,7 @@ fn project_one(
 }
 fn preserve(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     construct: &str,
@@ -184,19 +184,27 @@ fn existing_slot(
     origin: &SourceRecord,
     slot: &str,
 ) -> Result<Option<ProjectionResult>> {
-    let old:Option<(String,String,String)>=catalog.db.query_row("SELECT owner,adapter,result FROM migration_organization WHERE source_identity=? AND slot=?",params![origin.source.identity()?,slot],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    old.map(|(owner, adapter, value)| {
-        ensure!(
-            owner == policy.import_source && adapter == ADAPTER && value.len() <= 65536,
-            "dictionary owner/result differs"
-        );
-        Ok(serde_json::from_str(&value)?)
-    })
-    .transpose()
+    let mut statement = catalog.db.prepare(
+        "SELECT owner,adapter,result FROM migration_organization WHERE source_identity=? AND slot=?",
+    )?;
+    let mut rows = statement.query(params![origin.source.identity()?, slot])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    ensure!(
+        organization::stored_text_matches(row, 0, &policy.import_source)?
+            && organization::stored_text_matches(row, 1, ADAPTER)?,
+        "dictionary owner/result differs"
+    );
+    Ok(Some(organization::stored_projection_result(
+        row,
+        2,
+        "dictionary owner/result differs",
+    )?))
 }
 pub(crate) fn project(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
     stage: Stage,
@@ -427,7 +435,7 @@ pub(crate) fn project(
 }
 fn dictionary(
     catalog: &mut Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<RowResult> {
@@ -648,7 +656,7 @@ fn dictionary(
 /// Source-only single-row decisions for the explicit repair; never commits ancestors.
 pub(crate) fn keyword_row(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     origin: &SourceRecord,
 ) -> Result<Decision> {
     ensure!(
@@ -748,7 +756,7 @@ pub(crate) fn keyword_overlap(
 }
 pub(crate) fn keyword_member(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     policy: &Policy,
     origin: &SourceRecord,
 ) -> Result<Result<Projection, String>> {
@@ -788,6 +796,7 @@ pub(crate) fn keyword_member(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod saved_query_tests;
     use crate::{
         catalog_images::{ImageRole, ImportImageRequest},
         catalog_migration::{lookup::Lookup, organization::Link},

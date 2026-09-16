@@ -1,0 +1,13 @@
+.lightroom-panel { width: min(1050px, 85vw); }
+.lightroom-panel p { max-width: 90ch; }
+.lightroom-panel label { display: flex; gap: .5rem; align-items: center; margin: .5rem 0; }
+.lightroom-panel label:has(input:not([type=checkbox])), .lightroom-panel label:has(textarea) { flex-direction: column; align-items: stretch; }
+.lightroom-panel textarea { width: 100%; min-height: 120px; font-family: monospace; resize: vertical; }
+.lightroom-panel .lightroom-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .65rem; margin: .75rem 0; }
+.lightroom-panel fieldset { min-width: 0; border: 1px solid var(--border, #6666); margin: .75rem 0; padding: .75rem; }
+.lightroom-location { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem; margin: .75rem 0; }
+.lightroom-location span, .lightroom-value, .lightroom-panel code { overflow-wrap: anywhere; white-space: pre-wrap; }
+.lightroom-panel dl { margin: .5rem; }.lightroom-panel dt { font-weight: 600; }.lightroom-panel dd { margin-left: 1rem; overflow-wrap: anywhere; }
+.lightroom-panel .button-group { flex-wrap: wrap; margin: .75rem 0; }
+.lightroom-result { border-block: 1px solid var(--border, #6666); padding-block: 1rem; }
+.lightroom-activity { flex-wrap: wrap; }

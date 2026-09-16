@@ -34,7 +34,7 @@ fn queue_is_read_only_and_photo_extensions_do_not_widen_xmp() -> anyhow::Result<
     assert!(snapshot_photo_destination(&root.path().join("metadata.xmp"), 1024).is_err());
     assert_eq!(
         plan_export(&root.path().join("metadata.XmP"), b"packet")?.version,
-        1
+        3
     );
     Ok(())
 }

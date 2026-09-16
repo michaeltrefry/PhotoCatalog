@@ -2,7 +2,7 @@
 use super::*;
 use crate::edit::{Recipe, RecipeV1};
 
-fn setup(root: &Path) -> (Catalog, PreviewService, String, PathBuf) {
+pub(super) fn setup(root: &Path) -> (Catalog, PreviewService, String, PathBuf) {
     let originals = root.join("originals");
     std::fs::create_dir(&originals).unwrap();
     let source = originals.join("source.png");
@@ -47,7 +47,7 @@ fn persist(previews: &PreviewService, job: &SavedJob) -> String {
     }
     id
 }
-fn import_job(
+pub(super) fn import_job(
     catalog: &Catalog,
     previews: &PreviewService,
     asset: &str,
@@ -71,6 +71,7 @@ fn import_job(
     key.renderer_version = "previous-import-renderer".into();
     SavedJob {
         import_image: None,
+        hydration: None,
         request: RenderWork {
             source: NativePath::from_path(source),
             keys: vec![key],
@@ -121,6 +122,7 @@ fn old_renderer_edited_jobs_rekey_without_retargeting_recipe_or_undo_revision() 
         key.renderer_version = "previous-edit-renderer:proxy1600".into();
         let job = SavedJob {
             import_image: None,
+            hydration: None,
             request: RenderWork {
                 source: NativePath::from_path(&source),
                 keys: vec![key],

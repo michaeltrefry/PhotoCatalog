@@ -1,0 +1,172 @@
+import {useEffect,useRef,useState} from 'react';
+import {chooseLocation,errorText,type NativePath} from '../bridge';
+import {inspectionTerminal,type Action,type InspectionLimits,type Query,type SelectionLimits,type WorkbenchLimits} from '../lightroom';
+import {useLightroom,inspectionGuard,sameInspection} from '../state/useLightroom';
+import {useLightroomInput} from '../state/useLightroomInput';
+import {array,decimal,families,field,guardKey,limits,nativePath,nextQuery,scalar,selectionDocument,type Family} from '../lightroomWorkflow';
+import {parseLosslessJson} from '../lightroomJson';
+import {Dialog,ErrorNotice,Section} from './Controls';
+import {Evidence,LightroomResult,type ReviewedResult} from './LightroomEvidence';
+import './lightroom.css';
+
+type Controller=ReturnType<typeof useLightroom>;
+type Location={path:NativePath;display:string};
+type Purpose=Parameters<typeof chooseLocation>[0];
+type Descriptor={operation:string;action?:Action;query?:Query};
+const evidenceQueries=['Families','CaptureManifest','Rows','Report','Paths','Issues','Packets','PacketBytes','MetadataConflicts','GlobalIdConflicts','PathCollisions','SelectionSummary','SelectionPage'] as const satisfies readonly Query['kind'][];
+type EvidenceQueryKind=typeof evidenceQueries[number];
+const labels:Record<string,string>={request_bytes:'Request bytes',result_bytes:'Result bytes',page_bytes:'Page bytes',row_bytes:'Row bytes',native_path_units:'Native path units',vm_steps:'SQLite VM steps',deadline_ms:'Deadline milliseconds',max_files:'Maximum files',max_depth:'Maximum discovery depth',max_file_bytes:'Maximum bytes per file',max_total_bytes:'Maximum total bytes',max_cell_bytes:'Maximum cell bytes',review_bytes:'Review bytes',snapshot_bytes:'Snapshot bytes'};
+function LimitFields<T extends object>({title,value,change,disabled}:{title:string;value:T|null;change:(v:T)=>void;disabled:boolean}) {return <Section title={title} open={false}>{value?<fieldset disabled={disabled} className="lightroom-fields">{Object.entries(value).map(([key,item])=><label key={key}>{labels[key]??key}<input inputMode="numeric" value={item as string} onChange={e=>change({...value,[key]:e.target.value})}/></label>)}</fieldset>:<p>Load bridge options to review limits.</p>}</Section>;}
+function Text({label,value,set,disabled=false}:{label:string;value:string;set:(v:string)=>void;disabled?:boolean}) {return <label>{label}<input value={value} onChange={e=>set(e.target.value)} disabled={disabled}/></label>;}
+const RECENTS='photocatalog.lightroom.recent.v1';
+type Recent={root:Location;staging:Location};
+function recent():Recent[]{try{const raw=localStorage.getItem(RECENTS)??'[]';if(raw.length>262144)return [];const parsed:unknown=JSON.parse(raw);if(!Array.isArray(parsed)||parsed.length>8)return [];return parsed.filter((value):value is Recent=>{const valid=(p:Location)=>p&&typeof p.display==='string'&&p.display.length<=32768&&p.path&&['UnixBytes','WindowsWide'].includes(p.path.encoding)&&Array.isArray(p.path.units)&&p.path.units.length>0&&p.path.units.length<=32768&&p.path.units.every(n=>Number.isInteger(n)&&n>0&&n<=(p.path.encoding==='UnixBytes'?255:65535));return value&&valid(value.root)&&valid(value.staging);});}catch{return [];}}
+export function LightroomActivity({controller:c,onOpen}:{controller:Controller;onOpen:()=>void}) {
+  if(!c.status&&!c.error&&!c.admitting)return null;
+  return <div className="activity lightroom-activity" role="status"><span>Lightroom inspection: {!c.ready?'checking status':c.closePending?'closing and draining':c.admitting?'waiting for admission':c.status?.phase??'unavailable'}{c.status?` · ${c.status.processed} processed`:''}. Independent of the photo catalog.</span><button onClick={onOpen}>Inspect Lightroom…</button>{c.status&&!inspectionTerminal(c.status)&&<button onClick={()=>void c.cancel()}>Cancel inspection</button>}{c.status&&!c.status.closed&&<button onClick={()=>void c.close()}>Close inspection</button>}{c.closePending&&<button onClick={()=>void c.retryClose()}>Retry closing inspection</button>}<button onClick={c.retry}>Recheck inspection status</button>{c.error&&<span>{c.error}</span>}</div>;
+}
+export function LightroomPanel({controller:c,open,onClose}:{controller:Controller;open:boolean;onClose:()=>void}) {
+  const [mode,setMode]=useState<'Create'|'OpenExisting'>('Create');
+  const [root,setRoot]=useState<Location|null>(null),[staging,setStaging]=useState<Location|null>(null),[discovery,setDiscovery]=useState<Location|null>(null),[source,setSource]=useState<Location|null>(null),[capture,setCapture]=useState<Location|null>(null),[evidenceDir,setEvidenceDir]=useState<Location|null>(null),[sealOutput,setSealOutput]=useState<Location|null>(null);
+  const [recents,setRecents]=useState(recent);
+  const [workbenchLimits,setWorkbenchLimits]=useState<WorkbenchLimits|null>(null),[inspectionLimits,setInspectionLimits]=useState<InspectionLimits|null>(null),[selectionLimits,setSelectionLimits]=useState<SelectionLimits|null>(null);
+  const [closedEvidence,setClosedEvidence]=useState(''),[closedChecked,setClosedChecked]=useState(false),[auxiliary,setAuxiliary]=useState(true);
+  const [revision,setRevision]=useState(''),[rightRevision,setRightRevision]=useState(''),[table,setTable]=useState(''),[after,setAfter]=useState('0'),[limit,setLimit]=useState('50'),[leftCursor,setLeftCursor]=useState(''),[rightCursor,setRightCursor]=useState(''),[sequence,setSequence]=useState('1'),[packetOffset,setPacketOffset]=useState('0'),[packetLimit,setPacketLimit]=useState('4096'),[decoded,setDecoded]=useState(false),[resumeRows,setResumeRows]=useState('100'),[originalLimit,setOriginalLimit]=useState('100');
+  const [queryKind,setQueryKind]=useState<EvidenceQueryKind>('Families'),[collection,setCollection]=useState<Extract<Query,{kind:'SelectionPage'}>['collection']>('Families');
+  const [family,setFamily]=useState(''),[reason,setReason]=useState(''),[chooseRevision,setChooseRevision]=useState('');
+  const [familyReport,setFamilyReport]=useState<{rows:Family[];review:ReviewedResult}|null>(null),[decisions,setDecisions]=useState<Record<string,string>>({});
+  const [review,setReview]=useState<ReviewedResult|null>(null),[descriptor,setDescriptor]=useState<Descriptor|null>(null);
+  const [approval,setApproval]=useState(''),[approvalChecked,setApprovalChecked]=useState(false),[digest,setDigest]=useState('');
+  const [active,setActive]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState('');
+  const input=useLightroomInput(c.status,c.options);
+  const current=useRef(c);current.current=c;const dialog=useRef({open,generation:0});if(dialog.current.open!==open)dialog.current={open,generation:dialog.current.generation+1};
+  const workbench=c.status?.workbench??null;const workbenchScope=JSON.stringify([workbench,c.status?.generation??null]);const ownWorkbench=useRef(workbench);ownWorkbench.current=workbench;
+  const waiting=useRef(0),mounted=useRef(true);
+  useEffect(()=>()=>{mounted.current=false;waiting.current++;},[]);
+  useEffect(()=>{if(c.options){setWorkbenchLimits(v=>v??c.options!.workbench);setInspectionLimits(v=>v??c.options!.inspection);setSelectionLimits(v=>v??c.options!.selection);}},[c.options]);
+  useEffect(()=>{setReview(null);setDescriptor(null);setFamilyReport(null);setDecisions({});setRevision('');setRightRevision('');setApprovalChecked(false);setError('');setNotice('');waiting.current++;setActive('');},[workbenchScope]);
+  useEffect(()=>{setReview(value=>value&&c.status&&sameInspection(c.status,inspectionGuard(value.status))?value:null);},[c.status?.operation]);
+  useEffect(()=>{if(!open){waiting.current++;setActive('');}},[open]);
+  const stop=()=>{waiting.current++;setActive('');setNotice('Stopped waiting locally. Submitted work may still finish; status and Close inspection remain available.');};
+  const run=async(label:string,action:()=>Promise<unknown>)=>{if(active)return;const token=++waiting.current;setActive(label);setError('');try{await action();}catch(e){if(mounted.current&&token===waiting.current)setError(errorText(e));}finally{if(mounted.current&&token===waiting.current)setActive('');}};
+  const inspect=async(value:Action|Query,type:'action'|'query',expected?:Parameters<Controller['action']>[1])=>{
+    const original=current.current.current();if(!original)throw new Error('Open an inspection first.');const admission=await(type==='action'?c.action(value as Action,expected):c.read(value as Query,expected));
+    const now=current.current.current();if(!now||now.workbench!==original.workbench||now.operation!==admission.operation)return;
+    setReview(null);setDescriptor({operation:admission.operation,...(type==='action'?{action:value as Action}:{query:value as Query})});
+    if(type==='action'&&['AssignFamily','Choose','RegisterInventory','AddCapture','Resume','InspectOriginals'].includes(value.kind)){setFamilyReport(null);setDecisions({});}
+    const terminal=await admission.completion;if(ownWorkbench.current===terminal.workbench&&current.current.current()?.operation===terminal.operation){setNotice(terminal.phase==='Complete'?'Inspection operation finished. Review its evidence and any issues.':`Inspection ${terminal.phase}. ${terminal.error??''}`);}
+  };
+  const choose=async(purpose:Purpose,put:(p:Location)=>void)=>{const scope=dialog.current,owner=current.current.current();const valid=()=>{const now=current.current.current();return dialog.current===scope&&scope.open&&(owner?!!now&&guardKey(now)===guardKey(owner):now===null);};try{const value=await chooseLocation(purpose);if(value&&valid())put(value);}catch(e){if(valid())setError(errorText(e));}};
+  const pathControl=(label:string,value:Location|null,purpose:Purpose,put:(p:Location)=>void,disabled=false)=><div className="lightroom-location"><span>{label}: {value?.display??'No location selected'}</span><button disabled={disabled} onClick={()=>void choose(purpose,put)}>Choose {label.toLowerCase()}…</button></div>;
+  const canUse=!c.busy&&!active&&input.ready&&!input.busy&&!!c.status?.initialized&&!c.status.closed;
+  const canInspect=canUse&&!input.value;
+  const retainedReview=!!c.status?.review_token;
+  const mutate=(label:string,value:Action)=>void run(label,()=>inspect(value,'action'));
+  const required=(value:string,label:string)=>{if(!value.trim())throw new Error(`Enter ${label}.`);return value;};
+  const query=():Query=>{
+    const rows=decimal(limit,'Page row limit',1n,queryKind==='SelectionPage'?256n:1000n),cursor=decimal(after,'Page cursor',0n,9223372036854775807n);
+    switch(queryKind){
+      case 'Families':case 'SelectionSummary':return {kind:queryKind};
+      case 'CaptureManifest':if(!evidenceDir)throw new Error('Choose a capture evidence folder.');return {kind:queryKind,directory:evidenceDir.path};
+      case 'Report':return {kind:queryKind,revision:required(revision,'capture revision')};
+      case 'Rows':return {kind:queryKind,revision:required(revision,'capture revision'),table:table||null,after:cursor,limit:rows};
+      case 'Paths':case 'Issues':case 'Packets':case 'MetadataConflicts':return {kind:queryKind,revision:required(revision,'capture revision'),after:cursor,limit:rows};
+      case 'PacketBytes':return {kind:queryKind,revision:required(revision,'capture revision'),sequence:decimal(sequence,'Packet sequence',1n,9223372036854775807n),decoded,offset:decimal(packetOffset,'Packet offset',0n,9223372036854775807n),limit:decimal(packetLimit,'Packet byte limit',1n,1048576n)};
+      case 'GlobalIdConflicts':return {kind:queryKind,left:required(revision,'left capture revision'),right:required(rightRevision,'right capture revision'),after_left:leftCursor,after_right:rightCursor,limit:rows};
+      case 'PathCollisions':return {kind:queryKind,left:required(revision,'left capture revision'),right:required(rightRevision,'right capture revision'),after_left:decimal(leftCursor||'0','Left collision cursor'),after_right:decimal(rightCursor||'0','Right collision cursor'),limit:rows};
+      case 'SelectionPage':if(!c.status?.review_token)throw new Error('Prepare a selection review first.');return {kind:queryKind,review_token:c.status.review_token,collection,after:cursor,limit:rows};
+    }
+  };
+  const reviewed=(value:ReviewedResult)=>{
+    if(!sameInspection(current.current.current(),inspectionGuard(value.status)))return;setReview(value);
+    if(descriptor?.operation===value.status.operation&&descriptor.query?.kind==='Families'){try{const rows=families(value.node);setFamilyReport({rows,review:value});setDecisions({});}catch(e){setError(errorText(e));}}
+    if(descriptor?.operation===value.status.operation&&['Capture','AddCapture'].includes(descriptor.action?.kind??'')){try{const id=field(value.node,'revision_id')??field(value.node,'revision');if(id)setRevision(scalar(id));}catch{/* Exact raw evidence remains visible if a result has another shape. */}}
+  };
+  const next=()=>{if(!review||!descriptor?.query||descriptor.operation!==review.status.operation)throw new Error('Assemble the current query result first.');const q=nextQuery(descriptor.query,review.node);if(!q)throw new Error('This result has no continuation.');return inspect(q,'query');};
+  const stage=(raw:string,purpose:Parameters<typeof input.begin>[1])=>void run(`Stage ${purpose}`,()=>input.begin(raw,purpose,digest||null));
+  const upload=()=>void run('Upload staged bytes',async()=>{const token=waiting.current;let progress=input.value;if(!progress)throw new Error('Begin a staged input first.');while(progress&&!progress.complete&&BigInt(progress.received_bytes)<BigInt(progress.total_bytes)){progress=await input.append();if(token!==waiting.current)return;}});
+  const consume=(purpose:'Inventory'|'SelectionRequest'|'Approval')=>{
+    const v=input.value,d=input.document;if(!v?.complete||!v.blake3||!d||d.purpose!==purpose||v.purpose!==purpose)throw new Error('Finish and review this locally staged document first.');
+    if(purpose==='Inventory')return inspect({kind:'RegisterInventory',input:v.input},'action',d.guard);
+    if(purpose==='SelectionRequest'){if(!selectionLimits)throw new Error('Load selection limits.');return inspect({kind:'PrepareSelection',input:v.input,limits:limits(selectionLimits)},'action',d.guard);}
+    if(!sealOutput||!c.status?.review_token)throw new Error('Choose a new seal output and prepare its selection review.');if(!approvalChecked||d.raw!==approval)throw new Error('Review and acknowledge the exact frozen approval document.');return inspect({kind:'Seal',input:v.input,review_token:c.status.review_token,approval_blake3:v.blake3,output:sealOutput.path},'action',d.guard);
+  };
+  if(!open)return input.value||input.busy?<div className="activity" role="status">Lightroom staged input: {input.busy?'command pending; do not replay':`${input.value?.received_bytes} of ${input.value?.total_bytes} bytes${input.value?.complete?' · finished':''}`}.<button onClick={input.retry}>Recheck staged input status</button><button onClick={()=>void c.close()}>Close inspection and discard staged input</button></div>:null;
+  return <Dialog title="Lightroom inspection" onClose={onClose}><div className="lightroom-panel">
+    <p>Inspect Lightroom custody and compare catalog families before any migration. Opening a workbench does not discover, capture, resume, select, or import anything. Closing the photo catalog leaves this inspection running.</p>
+    <LightroomActivity controller={c} onOpen={()=>{}}/>{error&&<ErrorNotice message={error} dismiss={()=>setError('')}/>} {notice&&<p role="status">{notice}</p>}
+    {active&&<div role="status">{active}… <button onClick={stop}>Stop waiting locally</button></div>}
+    <Section title="Workbench">
+      <p>{c.status?`${c.status.phase} · workbench ${c.status.workbench} · generation ${c.status.generation} · operation ${c.status.operation}`:'No inspection is open.'}</p>
+      <label>Workbench mode<select value={mode} onChange={e=>{setMode(e.target.value as typeof mode);setRoot(null);}} disabled={!!c.status&&!c.status.closed}><option value="Create">Create a new inspection folder</option><option value="OpenExisting">Open an existing inspection</option></select></label>
+      {pathControl('Workbench folder',root,mode==='Create'?'lightroom_new_workbench':'lightroom_workbench',setRoot,!!c.status&&!c.status.closed)}
+      {pathControl('Capture staging folder',staging,'lightroom_capture_staging',setStaging,!!c.status&&!c.status.closed)}
+      <LimitFields title="Workbench resource limits" value={workbenchLimits} change={setWorkbenchLimits} disabled={!!c.status&&!c.status.closed}/>
+      <button disabled={c.busy||!!active||!root||!staging||!workbenchLimits||!!c.status&&!c.status.closed} onClick={()=>void run('Open inspection',async()=>{const chosenRoot=root!,chosenStaging=staging!;const admission=await c.open({root:chosenRoot.path,capture_staging:chosenStaging.path,mode,limits:limits(workbenchLimits!)});const result=await admission.completion;if(result.initialized&&!result.closed&&current.current.current()?.workbench===result.workbench){const entries=[{root:chosenRoot,staging:chosenStaging},...recents.filter(item=>JSON.stringify(item.root.path)!==JSON.stringify(chosenRoot.path))].slice(0,8);setRecents(entries);try{const raw=JSON.stringify(entries);if(raw.length<=262144)localStorage.setItem(RECENTS,raw);}catch{setNotice('Inspection opened; recent location could not be stored.');}}})}>{mode==='Create'?'Create inspection':'Open inspection'}</button>
+      {recents.length>0&&<details><summary>Recent inspection locations — never reopened automatically</summary>{recents.map((item,index)=><div key={index}><span>{item.root.display}</span><button disabled={!!c.status&&!c.status.closed} onClick={()=>{setMode('OpenExisting');setRoot(item.root);setStaging(item.staging);}}>Use these locations</button></div>)}<button onClick={()=>{localStorage.removeItem(RECENTS);setRecents([]);}}>Forget recent locations</button></details>}
+    </Section>
+    <LimitFields title="Discovery and capture limits" value={inspectionLimits} change={setInspectionLimits} disabled={!!active}/>
+    <Section title="Discover and register candidates">
+      <p>Discovery lists candidates and its issues. Filename and modification hints are not proof of catalog lineage or priority. Review the complete inventory, then explicitly stage and register those exact bytes.</p>
+      {pathControl('Discovery root',discovery,'lightroom_discovery_root',setDiscovery)}
+      <button disabled={!canInspect||retainedReview||!discovery||!inspectionLimits} onClick={()=>void run('Discover candidates',()=>inspect({kind:'Discover',root:discovery!.path,limits:limits(inspectionLimits!)},'action'))}>Discover candidates</button>
+      <button disabled={!canInspect||retainedReview||!review||descriptor?.action?.kind!=='Discover'||descriptor.operation!==review.status.operation} onClick={()=>stage(review!.raw,'Inventory')}>Stage reviewed inventory</button>
+      {review&&descriptor?.action?.kind==='Discover'&&<details open><summary>Candidate inventory</summary>{array(field(review.node,'candidates')).map((candidate,index)=><div key={index}><Evidence node={candidate}/><button disabled={!canInspect} onClick={()=>void run('Choose reviewed candidate',async()=>{const p=nativePath(field(candidate,'path')!);const display=p.encoding==='UnixBytes'?new TextDecoder().decode(new Uint8Array(p.units)):p.units.map(unit=>String.fromCharCode(unit)).join('');setSource({path:p,display});setClosedChecked(false);setClosedEvidence('');})}>Use candidate {index+1} as capture source</button></div>)}<Evidence node={review.node}/></details>}
+    </Section>
+    <Section title="Capture and inspect retained evidence">
+      <p>Close Lightroom and other applications using this source first. The dedicated child makes a read-only custody capture in a new destination. A picker selection alone is not closed-application evidence.</p>
+      {pathControl('Source catalog',source,'lightroom_source_catalog',value=>{setSource(value);setClosedChecked(false);setClosedEvidence('');})}{pathControl('New capture folder',capture,'lightroom_new_capture',setCapture)}
+      <label><input type="checkbox" checked={closedChecked} onChange={e=>setClosedChecked(e.target.checked)}/>I have closed applications using this source catalog</label>
+      <Text label="Closed-application evidence" value={closedEvidence} set={setClosedEvidence}/><label><input type="checkbox" checked={auxiliary} onChange={e=>setAuxiliary(e.target.checked)}/>Include auxiliary source evidence</label>
+      <button disabled={!canInspect||retainedReview||!source||!capture||!closedChecked||!closedEvidence.trim()||!inspectionLimits} onClick={()=>void run('Capture source',()=>inspect({kind:'Capture',source:source!.path,output:capture!.path,include_auxiliary:auxiliary,closed_application_evidence:closedEvidence,limits:limits(inspectionLimits!)},'action'))}>Capture read-only evidence</button>
+      {pathControl('Capture evidence folder',evidenceDir,'lightroom_capture_evidence',setEvidenceDir)}
+      <button disabled={!canInspect||retainedReview||!evidenceDir} onClick={()=>mutate('Add capture',{kind:'AddCapture',directory:evidenceDir!.path})}>Add captured evidence to inspection</button>
+      <div className="lightroom-fields"><Text label="Capture revision" value={revision} set={setRevision}/><Text label="Resume maximum rows" value={resumeRows} set={setResumeRows}/><Text label="Original inspection limit" value={originalLimit} set={setOriginalLimit}/></div>
+      <div className="button-group"><button disabled={!canInspect||retainedReview||!revision} onClick={()=>void run('Resume retained rows',()=>inspect({kind:'Resume',revision,max_rows:decimal(resumeRows,'Resume rows',1n,100000n)},'action'))}>Resume retained row inspection</button>{(['MetadataOnly','Packets'] as const).map(kind=><button key={kind} disabled={!canInspect||retainedReview||!revision} onClick={()=>void run('Inspect originals',()=>inspect({kind:'InspectOriginals',revision,limit:decimal(originalLimit,'Original inspection limit',1n,1000n),inspection:kind},'action'))}>{kind==='MetadataOnly'?'Inspect original metadata':'Inspect original packets'}</button>)}</div>
+    </Section>
+    <Section title="Browse retained inspection evidence">
+      <p>Every query has an explicit bounded page. Use “Continue this query” only after assembling its result; it follows the server cursor even when the page is short.</p>
+      <label>Evidence view<select value={queryKind} onChange={e=>setQueryKind(e.target.value as EvidenceQueryKind)}>{evidenceQueries.map(kind=><option key={kind}>{kind}</option>)}</select></label>
+      <div className="lightroom-fields"><Text label="Table name (optional for retained rows)" value={table} set={setTable}/><Text label="Page after cursor" value={after} set={setAfter}/><Text label="Page row limit" value={limit} set={setLimit}/><Text label="Right capture revision" value={rightRevision} set={setRightRevision}/><Text label="Left pair cursor" value={leftCursor} set={setLeftCursor}/><Text label="Right pair cursor" value={rightCursor} set={setRightCursor}/><Text label="Packet sequence" value={sequence} set={setSequence}/><Text label="Packet byte offset" value={packetOffset} set={setPacketOffset}/><Text label="Packet byte limit" value={packetLimit} set={setPacketLimit}/></div>
+      <label><input type="checkbox" checked={decoded} onChange={e=>setDecoded(e.target.checked)}/>Read transformed packet bytes instead of the independently retained original bytes</label>
+      <label>Selection review collection<select value={collection} onChange={e=>setCollection(e.target.value as typeof collection)}>{(['Families','Captures','UninspectedCandidates','ConflictSample','PathCollisionSample'] as const).map(value=><option key={value}>{value}</option>)}</select></label>
+      <div className="button-group"><button disabled={!canInspect||retainedReview&&!['SelectionSummary','SelectionPage'].includes(queryKind)} onClick={()=>void run('Read inspection evidence',()=>inspect(query(),'query'))}>Read evidence page</button><button disabled={!canInspect||!review||!descriptor?.query||descriptor.operation!==review.status.operation} onClick={()=>void run('Continue inspection query',next)}>Continue this query</button></div>
+      {retainedReview&&<p>A pinned selection review is open. Only its summary and five review collections can be read until you explicitly release the review.</p>}
+    </Section>
+    <LightroomResult status={c.status} options={c.options} onReview={reviewed}/>
+    <Section title="Review complete catalog families">
+      <p>Read and assemble the Families view before assigning or choosing. Every family requires an explicit selection or exclusion; suggestions never fill a decision automatically.</p>
+      <button disabled={!canInspect||retainedReview} onClick={()=>void run('Read all families',()=>inspect({kind:'Families'},'query'))}>Read complete family report</button>
+      {familyReport?<>
+        <p>{familyReport.rows.length} families in the retained report. Review uninspected candidates, inventory completeness, conflicts, and collision evidence below.</p>
+        <Evidence node={familyReport.review.node}/>
+        {familyReport.rows.map(row=><fieldset key={row.id}><legend>Family {row.id}</legend><p>Evidence digest <code>{row.evidence}</code></p><label>Decision for family {row.id}<select value={decisions[row.id]??''} disabled={retainedReview||!!active} onChange={e=>setDecisions(v=>({...v,[row.id]:e.target.value}))}><option value="">Choose explicitly…</option><option value="exclude">Exclude this family</option>{row.members.map(member=><option key={member.revision} value={member.revision}>Select capture {member.revision}</option>)}</select></label>{row.members.map(member=><details key={member.revision}><summary>Capture {member.revision}</summary><Evidence node={member.details}/><button disabled={!!active} onClick={()=>{setRevision(member.revision);setFamily(row.id);setChooseRevision(member.revision);}}>Use capture and family in controls</button></details>)}</fieldset>)}
+        <button disabled={!canInspect||retainedReview||familyReport.rows.some(row=>!decisions[row.id])} onClick={()=>void run('Stage complete family decisions',()=>input.begin(selectionDocument(c.status!.root,familyReport.rows,decisions),'SelectionRequest',digest||null))}>Stage all family decisions</button>
+      </>:<p>No complete family report is currently reviewed.</p>}
+      <div className="lightroom-fields"><Text label="Family identifier" value={family} set={setFamily}/><Text label="Revision to choose" value={chooseRevision} set={setChooseRevision}/><Text label="Assignment or choice reason" value={reason} set={setReason}/></div>
+      <div className="button-group"><button disabled={!canInspect||retainedReview||!revision||!family.trim()||!reason.trim()} onClick={()=>mutate('Assign family',{kind:'AssignFamily',revision,family,reason})}>Assign capture to family with reason</button><button disabled={!canInspect||retainedReview||!familyReport||!family||!chooseRevision||!reason.trim()} onClick={()=>void run('Choose family revision',()=>{const row=familyReport!.rows.find(item=>item.id===family);if(!row||!row.members.some(member=>member.revision===chooseRevision))throw new Error('Choose a member from the current complete family evidence.');return inspect({kind:'Choose',family,revision:chooseRevision,expected_evidence:row.evidence,reason},'action');})}>Record explicit family choice</button></div>
+    </Section>
+    <LimitFields title="Immutable selection review limits" value={selectionLimits} change={setSelectionLimits} disabled={!!active||retainedReview}/>
+    <Section title="Exact staged document">
+      <p>One input slot belongs to the current inspection operation. Begin freezes the document; upload uses exact UTF-8 offsets. Finish computes its BLAKE3. A missing expected digest means no independent client digest check. An uncertain reply requires status reconciliation, never a blind replay. Finish using or explicitly discard this slot before another inspection query or action.</p>
+      <Text label="Expected input BLAKE3 (optional)" value={digest} set={setDigest} disabled={!!input.value||input.busy}/>
+      {input.error&&<ErrorNotice message={input.error}/>}
+      <p role="status">{input.busy?'A staged command is pending.':!input.ready?'Checking the staged input slot.':input.value?`${input.value.purpose} · ${input.value.received_bytes} of ${input.value.total_bytes} bytes · ${input.value.complete?'finished':'unfinished'}`:'No staged input.'}</p>
+      {input.value&&<p>Input <code>{input.value.input}</code> · Computed BLAKE3: <code>{input.value.blake3??'not finished'}</code></p>}
+      {input.document&&<details><summary>Exact frozen document</summary><textarea readOnly aria-label="Exact staged document" value={input.document.raw}/></details>}
+      {input.value&&!input.document&&<p>This slot was not staged by the current UI lifetime. Its bytes cannot be approved here. Inspect its status or explicitly discard it before staging a reviewed document.</p>}
+      <div className="button-group"><button onClick={input.retry}>Recheck staged input status</button><button disabled={!canUse||!input.document||!input.value||input.value.complete||input.value.received_bytes===input.value.total_bytes} onClick={upload}>Upload remaining bytes</button><button disabled={!canUse||!input.value||input.value.complete||input.value.received_bytes!==input.value.total_bytes} onClick={()=>void run('Finish staged input',input.finish)}>Finish and verify input</button><button disabled={!canUse||!input.value} onClick={()=>void run('Discard staged input',input.discard)}>Discard staged input</button></div>
+      <div className="button-group"><button disabled={!canUse||!input.document||!input.value?.complete||input.value.purpose!=='Inventory'||retainedReview} onClick={()=>void run('Register reviewed inventory',()=>consume('Inventory'))}>Register reviewed inventory explicitly</button><button disabled={!canUse||!input.document||!input.value?.complete||input.value.purpose!=='SelectionRequest'||retainedReview} onClick={()=>void run('Prepare immutable selection',()=>consume('SelectionRequest'))}>Prepare immutable selection review</button></div>
+    </Section>
+    <Section title="Review and seal an exact approval" open={false}>
+      <p>Guided complete migration artifact and supplement preparation is not yet connected to this inspection interface. Inspection and family selection do not complete migration or import. The advanced path below accepts an existing complete approval document without parsing and reserializing its authority.</p>
+      <p>Prepare the immutable selection, then review its summary and all five collections. The approval must name that exact review token, destination, policy, supplements, and authorization. Sealing writes to a new destination only when you explicitly request it.</p>
+      <label>Exact approval document<textarea value={approval} onChange={e=>{setApproval(e.target.value);setApprovalChecked(false);}} maxLength={16777216}/></label>
+      <label><input type="checkbox" checked={approvalChecked} onChange={e=>setApprovalChecked(e.target.checked)}/>I reviewed this exact approval document and its destination, policy, supplements, and authorization</label>
+      <button disabled={!canUse||!retainedReview||!approvalChecked||!approval||!!input.value} onClick={()=>void run('Stage exact approval',()=>{parseLosslessJson(approval,{bytes:Number(BigInt(c.status!.limits.request_bytes)),nodes:200000,depth:128});return input.begin(approval,'Approval',digest||null);})}>Stage exact reviewed approval</button>
+      {pathControl('New seal folder',sealOutput,'lightroom_new_seal',setSealOutput)}
+      <button disabled={!canUse||!retainedReview||!approvalChecked||!sealOutput||!input.document||input.document.raw!==approval||!input.value?.complete||input.value.purpose!=='Approval'} onClick={()=>void run('Seal approved selection',()=>consume('Approval'))}>Seal exact approved selection</button>
+      <button disabled={!canInspect||!retainedReview} onClick={()=>mutate('Release pinned review',{kind:'ReleaseReview'})}>Release pinned review explicitly</button>
+    </Section>
+  </div></Dialog>;
+}

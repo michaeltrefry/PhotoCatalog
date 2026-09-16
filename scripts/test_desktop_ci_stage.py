@@ -1,0 +1,224 @@
+import json
+from pathlib import Path
+import tempfile
+import subprocess
+import unittest
+from unittest.mock import patch
+
+import desktop_ci_stage as stage
+import desktop_ci_package as package
+import collect_desktop_notices as notices
+import package_desktop as p
+
+
+class StageTests(unittest.TestCase):
+    def test_stale_bundles_cannot_enter_fresh_installer_qualification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            release = Path(tmp)/'release'; release.mkdir()
+            executable = release/'photocatalog-desktop'
+            executable.write_bytes(b'current compiled executable')
+            for directory, pattern, old_name, new_name in [
+                ('macos', '*.app', 'PhotoCatalog.app', 'LensWorks.app'),
+                ('deb', '*.deb', 'photocatalog_0.1_amd64.deb', 'lensworks_0.1_amd64.deb'),
+                ('nsis', '*-setup.exe', 'PhotoCatalog_0.1-setup.exe', 'LensWorks_0.1-setup.exe'),
+            ]:
+                with self.subTest(directory=directory):
+                    folder = release/'bundle'/directory; folder.mkdir(parents=True)
+                    for name in (old_name, new_name):
+                        if directory == 'macos': (folder/name).mkdir()
+                        else: (folder/name).write_bytes(b'stale cached installer')
+                    with self.assertRaisesRegex(p.PackageError, 'expected one'):
+                        package.one(folder, pattern)
+                    package.clear_cached_bundles(release)
+                    self.assertFalse((release/'bundle').exists())
+                    self.assertEqual(executable.read_bytes(), b'current compiled executable')
+                    folder.mkdir(parents=True)
+                    if directory == 'macos': (folder/new_name).mkdir()
+                    else: (folder/new_name).write_bytes(b'new installer')
+                    self.assertEqual(package.one(folder, pattern), folder/new_name)
+                    package.clear_cached_bundles(release)
+            package.clear_cached_bundles(release)  # Cold cache is already clean.
+
+    def test_cached_bundle_link_cannot_delete_another_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); release = root/'release'; release.mkdir()
+            outside = root/'installed'; outside.mkdir()
+            sentinel = outside/'keep'; sentinel.write_bytes(b'existing application')
+            try:
+                (release/'bundle').symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f'directory symlinks unavailable: {error}')
+            with self.assertRaisesRegex(p.PackageError, 'must not be a link'):
+                package.clear_cached_bundles(release)
+            self.assertEqual(sentinel.read_bytes(), b'existing application')
+
+    def test_pinned_tauri_patch_is_exact_and_handles_chunk_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); exe = root/'app'; marker = b'__TAURI_BUNDLE_TYPE_VAR_UNK'
+            # The first marker crosses a streaming hash boundary; a later copy
+            # must remain unchanged, matching upstream's first-match behavior.
+            original = b'x'*(65536-7) + marker + b'tail' + marker
+            exe.write_bytes(original)
+            for platform, suffix in [('linux', b'DEB'), ('windows', b'NSS')]:
+                proof = stage.expected_bundled_executable(exe, platform)
+                expected = original.replace(marker, marker[:-3] + suffix, 1)
+                self.assertEqual(proof['bundled_executable_sha256'], notices.digest(expected))
+                self.assertEqual(exe.read_bytes(), original)
+                installed = root/'installed'; installed.mkdir(exist_ok=True)
+                output = installed/'app'; output.write_bytes(expected)
+                if platform == 'linux':
+                    (installed/'usr/lib/photocatalog-desktop/native').mkdir(parents=True, exist_ok=True)
+                (root/'stage.json').write_text(json.dumps({'platform': platform,
+                    'executable_sha256': p.sha256(exe), **proof, 'native': {}}))
+                package.verify_staged_payload(platform, installed, output, root)
+                for bad in (original, expected[:-1]+b'!', expected.replace(marker, marker[:-3]+suffix)):
+                    output.write_bytes(bad)
+                    with self.assertRaisesRegex(p.PackageError, 'changed staged executable'):
+                        package.verify_staged_payload(platform, installed, output, root)
+            exe.write_bytes(b'no marker')
+            with self.assertRaisesRegex(p.PackageError, 'marker absent'):
+                stage.expected_bundled_executable(exe, 'linux')
+
+    def test_windows_notices_follow_installed_ports_not_generic_share_directories(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); vcpkg = root/'vcpkg'; triplet = 'x64-windows-static-md'
+            inventory = vcpkg/'installed/vcpkg/info'; inventory.mkdir(parents=True)
+            share = vcpkg/'installed'/triplet/'share'
+            for name in ('zlib', 'doc'):
+                (share/name).mkdir(parents=True)
+            copyright_file = share/'zlib/copyright'; copyright_file.write_bytes(b'exact zlib terms')
+            (inventory/f'zlib_1.3.1_{triplet}.list').write_text(f'{triplet}/share/zlib/copyright\n')
+            (inventory/'host-tool_1.0_x64-windows.list').write_text('other triplet\n')
+            vs = root/'vs'; (vs/'Licenses').mkdir(parents=True)
+            (vs/'Licenses/terms.txt').write_bytes(b'exact runtime terms')
+            native = root/'native'; native.mkdir()
+            args = SimpleNamespace(vcpkg=vcpkg, visual_studio=vs)
+            manifest = stage.native_notices('windows', args, native, {'library_origins': {}}, root/'notices')
+            value = json.loads(manifest.read_text())
+            files = value['components'][0]['files']
+            self.assertEqual(len(files), 1)
+            self.assertEqual((manifest.parent/files[0]['path']).read_bytes(), b'exact zlib terms')
+            # An actually installed port still must have its copyright material.
+            copyright_file.unlink()
+            with self.assertRaisesRegex(p.PackageError, 'copyright absent: zlib'):
+                stage.native_notices('windows', args, native, {'library_origins': {}}, root/'missing')
+            (inventory/f'zlib_1.3.1_{triplet}.list').unlink()
+            with self.assertRaisesRegex(p.PackageError, 'inventory absent'):
+                stage.installed_vcpkg_ports(vcpkg, triplet)
+
+    def test_windows_requires_explicit_os_contract_not_developer_dll(self):
+        self.assertTrue(stage.system_windows('KERNEL32.dll'))
+        self.assertTrue(stage.system_windows('api-ms-win-core-memory-l1-1-0.dll'))
+        for name in ('vcruntime140.dll', 'libraw.dll', 'plugin.exe', 'developer.dll', '../kernel32.dll'):
+            self.assertFalse(stage.system_windows(name), name)
+
+    def test_windows_regular_and_delay_names_preserved_and_missing_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); exe = root/'app.exe'; exe.write_bytes(b'app')
+            installed = root/'vcpkg'; (installed/'bin').mkdir(parents=True)
+            vs = root/'VS'; redist = vs/'VC/Redist/MSVC/14.44.1/x64/Microsoft.VC143.CRT'
+            redist.mkdir(parents=True); (redist/'vcruntime140.dll').write_bytes(b'crt')
+            output = root/'stage'; output.mkdir()
+            def info(path):
+                return (['vcruntime140.dll', 'kernel32.dll'] if path == exe else ['kernel32.dll'], [], 'AMD64')
+            with patch.object(p, 'pe_info', side_effect=info):
+                native, policy, proof = stage.windows_stage(exe, installed, vs, output)
+            self.assertEqual((native/'vcruntime140.dll').read_bytes(), b'crt')
+            self.assertEqual(proof['library_origins'], {'vcruntime140.dll': 'msvc'})
+            self.assertEqual(set(policy['system_dependencies']), {'kernel32.dll'})
+            output2 = root/'bad'; output2.mkdir()
+            with patch.object(p, 'pe_info', return_value=(['custom.exe'], [], 'AMD64')):
+                with self.assertRaisesRegex(p.PackageError, 'unknown Windows import: custom.exe'):
+                    stage.windows_stage(exe, installed, vs, output2)
+
+    def test_native_copy_rejects_basename_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); out = root/'out'; out.mkdir()
+            lib = root/'x.dll'; lib.write_bytes(b'expected')
+            stage.copy_library(lib, out)
+            lib.write_bytes(b'changed')
+            with self.assertRaisesRegex(p.PackageError, 'collision'):
+                stage.copy_library(lib, out)
+
+    def test_linux_requires_exact_installed_package_owner(self):
+        owner = subprocess.CompletedProcess([], 0, 'libraw23:amd64: /usr/lib/libraw.so.23\n', '')
+        with patch.object(stage.subprocess, 'run', return_value=owner), patch.object(p, 'run', return_value='0.23.1'):
+            self.assertEqual(stage.linux_system('libraw.so.23', {'libraw.so.23': {'/usr/lib/libraw.so.23'}})['package'], 'libraw23:amd64')
+        with self.assertRaisesRegex(p.PackageError, 'unknown/ambiguous'):
+            stage.linux_system('libraw.so.23', {})
+
+    def test_linux_merged_usr_owner_spelling_does_not_hide_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); actual = root/'usr/lib/libc.so.6'; actual.parent.mkdir(parents=True)
+            actual.write_bytes(b'ELF'); (root/'lib').symlink_to(actual.parent)
+            alias = root/'lib/libc.so.6'
+            owner = subprocess.CompletedProcess([], 0, f'libc6:amd64: {alias}\n', '')
+            missing = subprocess.CompletedProcess([], 1, '', '')
+            with patch.object(stage.subprocess, 'run', side_effect=[owner, missing]), patch.object(p, 'run', return_value='2.39'):
+                self.assertEqual(stage.linux_system('libc.so.6', {'libc.so.6': {str(alias)}})['package'], 'libc6:amd64')
+
+    def test_locked_winapi_parent_fetches_verified_notice_on_cold_cache(self):
+        from test_collect_desktop_notices import archive
+        data = archive({'LICENSE-MIT': b'exact parent notice'})
+        package = {'name': 'winapi', 'version': '0.3.9', 'checksum': notices.digest(data)}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(notices, 'download', return_value=data) as fetch:
+            _, files, _ = notices.locked_crate(package, Path(tmp), True)
+            self.assertEqual(files['LICENSE-MIT'], b'exact parent notice')
+            fetch.assert_called_once()
+            package['checksum'] = '0'*64
+            with self.assertRaisesRegex(ValueError, 'checksum'):
+                notices.locked_crate(package, Path(tmp), True)
+
+    def test_bundle_paths_are_actual_loader_and_notice_locations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root/'native').mkdir(); (root/'native/x.so').write_bytes(b'x')
+            (root/'stage.json').write_text(json.dumps({'depends': ['libc6 (>= 2.39)']}))
+            text = root/'notices'; text.mkdir(); (text/'manifest.json').write_text('{}')
+            linux = package.bundle_config('linux', root, text)['bundle']['linux']['deb']
+            self.assertIn('/usr/lib/photocatalog-desktop/native/x.so', linux['files'])
+            self.assertIn('/usr/lib/photocatalog-desktop/THIRD_PARTY_NOTICES/manifest.json', linux['files'])
+            self.assertEqual(linux['depends'], ['libc6 (>= 2.39)'])
+            windows = package.bundle_config('windows', root, text)['bundle']
+            self.assertEqual(windows['resources'][str(root/'native/x.so')], 'x.so')
+            self.assertEqual(windows['windows']['nsis']['installMode'], 'currentUser')
+
+    def test_installer_must_preserve_staged_executable_and_native_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); installed = root/'installed'; installed.mkdir()
+            exe = installed/'app.exe'; exe.write_bytes(b'app')
+            dll = installed/'native.dll'; dll.write_bytes(b'native')
+            (root/'stage.json').write_text(json.dumps({'platform': 'windows',
+                'executable_sha256': p.sha256(exe), 'native': {dll.name: p.sha256(dll)}}))
+            package.verify_staged_payload('windows', installed, exe, root)
+            dll.write_bytes(b'changed')
+            with self.assertRaisesRegex(p.PackageError, 'changed native payload'):
+                package.verify_staged_payload('windows', installed, exe, root)
+            exe.write_bytes(b'rebuilt')
+            with self.assertRaisesRegex(p.PackageError, 'changed staged executable'):
+                package.verify_staged_payload('windows', installed, exe, root)
+
+    def test_explicit_native_notice_bytes_digest_and_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); out = root/'out'; out.mkdir()
+            text = b'Copyright\r\nexact notice\xff'; (root/'copyright').write_bytes(text)
+            value = {'protocol': 1, 'platform': 'windows', 'components': [{'component': 'vcpkg-native',
+                'libraries': ['x.dll'], 'files': [{'path': 'copyright', 'sha256': notices.digest(text)}]}]}
+            control = root/'input.json'; control.write_text(json.dumps(value))
+            copied, proof = notices.import_native_input(control, out)
+            self.assertEqual((out/copied[0]['files'][0]['path']).read_bytes(), text)
+            self.assertEqual(proof['platform'], 'windows')
+            (root/'copyright').write_bytes(b'wrong')
+            with self.assertRaisesRegex(ValueError, 'digest'):
+                notices.import_native_input(control, out)
+            value['components'][0]['files'][0]['path'] = '../outside'
+            control.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, 'path'):
+                notices.import_native_input(control, out)
+            value['platform'] = 'macos'; control.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, 'platform'):
+                notices.import_native_input(control, out)
+
+
+if __name__ == '__main__':
+    unittest.main()

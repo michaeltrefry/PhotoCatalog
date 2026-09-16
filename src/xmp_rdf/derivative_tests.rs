@@ -1,6 +1,5 @@
-use photocatalog::xmp::{self, DerivativeFields, Edit};
-#[path = "../src/xmp_rdf.rs"]
-mod xmp_rdf;
+use crate::xmp::{self, DerivativeFields, Edit};
+use crate::xmp_rdf;
 
 const TIFF: &str = "http://ns.adobe.com/tiff/1.0/";
 const EXIF: &str = "http://ns.adobe.com/exif/1.0/";

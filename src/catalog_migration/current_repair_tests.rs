@@ -94,6 +94,27 @@ fn request(catalog: &Catalog, run: &str) -> Result<current_repair::Request> {
         reason: "synthetic wrapped-container integration correction".into(),
     })
 }
+
+#[cfg(unix)]
+pub(crate) struct ManagedFixture {
+    pub(crate) fixture: ImportFixture,
+    pub(crate) request: current_repair::Request,
+    pub(crate) approval: String,
+}
+
+#[cfg(unix)]
+pub(crate) fn managed_fixture() -> Result<ManagedFixture> {
+    let fixture = ImportFixture::with_wrapper(false, true)?;
+    let (catalog, source, complete) = old_complete(&fixture)?;
+    let request = request(&catalog, &complete.id)?;
+    drop(source);
+    drop(catalog);
+    Ok(ManagedFixture {
+        fixture,
+        request,
+        approval: std::str::from_utf8(APPROVAL)?.into(),
+    })
+}
 fn to_project(catalog: &mut Catalog, source: &MigrationSource, id: &str) -> Result<()> {
     for _ in 0..10 {
         if catalog.current_develop_repair_progress(id)?.phase == current_repair::Phase::Project {

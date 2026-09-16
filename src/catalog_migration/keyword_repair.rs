@@ -7,6 +7,8 @@ use super::{
     organization_walk,
     walk::Walk,
 };
+use crate::catalog_migration::repair_memory;
+use crate::lightroom::migration_source::MigrationRead;
 use crate::{Catalog, catalog_writer::Priority, lightroom::migration_source::MigrationSource};
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -180,16 +182,16 @@ fn epoch(db: &Connection) -> Result<i64> {
     Ok(db.query_row(
         "SELECT epoch FROM migration_mapping_epoch WHERE id=1",
         [],
-        |r| r.get(0),
+        |r| repair_memory::get(r, 0),
     )?)
 }
 fn raw_progress(db: &Connection, run: &str) -> Result<Vec<u8>> {
-    let b:Option<Vec<u8>>=db.query_row("SELECT CASE WHEN length(progress)<=8388608 THEN progress END FROM migration_runs WHERE id=?",[run],|r|r.get(0))?;
+    let b:Option<Vec<u8>>=db.query_row("SELECT CASE WHEN length(CAST(progress AS BLOB))<=8388608 THEN progress END FROM migration_runs WHERE id=?",[run],|r|repair_memory::get(r, 0))?;
     b.context("run progress bound")
 }
 fn read(db: &Connection, id: &str) -> Result<(Binding, Progress)> {
     ensure!(hash(id), "keyword repair identity bound");
-    let (a,b):(Option<Vec<u8>>,Option<Vec<u8>>)=db.query_row("SELECT CASE WHEN length(binding)<=8388608 THEN binding END,CASE WHEN length(progress)<=8388608 THEN progress END FROM migration_keyword_repairs WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let (a,b):(Option<Vec<u8>>,Option<Vec<u8>>)=db.query_row("SELECT CASE WHEN length(CAST(binding AS BLOB))<=8388608 THEN binding END,CASE WHEN length(CAST(progress AS BLOB))<=8388608 THEN progress END FROM migration_keyword_repairs WHERE id=?",[id],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?)))?;
     let a = a.context("keyword binding bound")?;
     let b = b.context("keyword progress bound")?;
     let binding: Binding = serde_json::from_slice(&a)?;
@@ -213,7 +215,7 @@ pub(crate) fn require_owner(db: &Connection, run: &str, owner: Option<&str>) -> 
         .query_row(
             "SELECT id FROM migration_keyword_repairs WHERE run=?",
             [run],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )
         .optional()?;
     if let Some(id) = id {
@@ -289,7 +291,7 @@ fn validate_roots(db: &Connection, input: &str, r: &Request) -> Result<()> {
                 && record_digest(db, input, root.retained_table)? == root.table_digest,
             "keyword root raw/schema predicate differs"
         );
-        let present:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM migration_run_items WHERE run=? AND stage=? AND record=? AND revision=?)",params![r.run,KEYWORDS,root.origin.retained_record,root.origin.source.capture_revision],|r|r.get(0))?;
+        let present:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM migration_run_items WHERE run=? AND stage=? AND record=? AND revision=?)",params![r.run,KEYWORDS,root.origin.retained_record,root.origin.source.capture_revision],|r|repair_memory::get(r, 0))?;
         ensure!(
             present,
             "admitted keyword root is absent from run dictionary ledger"
@@ -305,13 +307,13 @@ pub fn preflight(db: &Connection, input: &str, r: &Request) -> Result<()> {
     ensure!(p.input == input, "keyword repair input differs");
     current_complete(db, r)?;
     validate_roots(db, input, r)?;
-    let table:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='migration_keyword_repairs')",[],|r|r.get(0))?;
+    let table:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='migration_keyword_repairs')",[],|r|repair_memory::get(r, 0))?;
     if table {
         let id: Option<String> = db
             .query_row(
                 "SELECT id FROM migration_keyword_repairs WHERE run=?",
                 [&r.run],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )
             .optional()?;
         if let Some(id) = id {
@@ -343,7 +345,7 @@ pub fn preflight(db: &Connection, input: &str, r: &Request) -> Result<()> {
         let actual: i64 = db.query_row(
             "SELECT count(*) FROM migration_run_items WHERE run=? AND stage=?",
             params![r.run, stage],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )?;
         ensure!(
             usize::try_from(actual)? == n,
@@ -384,7 +386,7 @@ fn advance(db: &Connection, a: &Progress, b: &Progress) -> Result<()> {
     Ok(())
 }
 fn receipt(db: &Connection, source: &str, slot: &str) -> Result<Option<Receipt>> {
-    let v=db.query_row("SELECT source_identity,slot,owner,adapter,input_digest,CASE WHEN length(result)<=8388608 THEN result END,retained_record,CASE WHEN length(proof)<=8388608 THEN proof END FROM migration_organization WHERE source_identity=? AND slot=?",params![source,slot],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get::<_,Option<String>>(5)?,r.get(6)?,r.get::<_,Option<String>>(7)?))).optional()?;
+    let v=db.query_row("SELECT source_identity,slot,owner,adapter,input_digest,CASE WHEN length(CAST(result AS BLOB))<=8388608 THEN result END,retained_record,CASE WHEN length(CAST(proof AS BLOB))<=8388608 THEN proof END FROM migration_organization WHERE source_identity=? AND slot=?",params![source,slot],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?,repair_memory::get(r, 3)?,repair_memory::get(r, 4)?,repair_memory::get::<_,Option<String>>(r, 5)?,repair_memory::get(r, 6)?,repair_memory::get::<_,Option<String>>(r, 7)?))).optional()?;
     v.map(
         |(source_identity, slot, owner, adapter, input_digest, result, retained_record, proof)| {
             Ok(Receipt {
@@ -402,11 +404,11 @@ fn receipt(db: &Connection, source: &str, slot: &str) -> Result<Option<Receipt>>
     .transpose()
 }
 fn item(db: &Connection, run: &str, stage: &str, record: i64) -> Result<Vec<u8>> {
-    let b:Option<Vec<u8>>=db.query_row("SELECT CASE WHEN length(outcome)<=8388608 THEN outcome END FROM migration_run_items WHERE run=? AND stage=? AND record=?",params![run,stage,record],|r|r.get(0))?;
+    let b:Option<Vec<u8>>=db.query_row("SELECT CASE WHEN length(CAST(outcome AS BLOB))<=8388608 THEN outcome END FROM migration_run_items WHERE run=? AND stage=? AND record=?",params![run,stage,record],|r|repair_memory::get(r, 0))?;
     b.context("keyword ledger outcome bound")
 }
 fn archived(db: &Connection, id: &str, stage: &str, record: i64) -> Result<Archive> {
-    let (b,n,d):(Option<Vec<u8>>,i64,String)=db.query_row("SELECT CASE WHEN length(archive)<=8454144 THEN archive END,raw_length,digest FROM migration_keyword_repair_items WHERE repair=? AND stage=? AND record=?",params![id,stage,record],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (b,n,d):(Option<Vec<u8>>,i64,String)=db.query_row("SELECT CASE WHEN length(CAST(archive AS BLOB))<=8454144 THEN archive END,raw_length,digest FROM migration_keyword_repair_items WHERE repair=? AND stage=? AND record=?",params![id,stage,record],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?)))?;
     Ok(serde_json::from_slice(&decompress(
         &b.context("keyword compressed bound")?,
         n,
@@ -417,7 +419,7 @@ fn record_digest(db: &Connection, input: &str, record: i64) -> Result<String> {
     Ok(db.query_row(
         "SELECT digest FROM migration_retained_records WHERE sequence=? AND input=? AND complete=1",
         params![record, input],
-        |r| r.get(0),
+        |r| repair_memory::get(r, 0),
     )?)
 }
 fn roster_next(prior: &str, stage: &str, record: i64, a: &Archive) -> Result<String> {
@@ -437,7 +439,7 @@ fn roster_next(prior: &str, stage: &str, record: i64, a: &Archive) -> Result<Str
 #[cfg(test)]
 pub(crate) fn predecessor_roster_blake3(
     catalog: &Catalog,
-    source: &MigrationSource,
+    source: &dyn MigrationRead,
     run: &str,
 ) -> Result<String> {
     let mut chain = digest(ADAPTER.as_bytes());
@@ -445,7 +447,7 @@ pub(crate) fn predecessor_roster_blake3(
     for stage in [KEYWORDS, MEMBERS] {
         let mut after = 0;
         loop {
-            let next:Option<(i64,String)>=catalog.db.query_row("SELECT record,revision FROM migration_run_items WHERE run=? AND stage=? AND record>? ORDER BY record LIMIT 1",params![run,stage,after],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let next:Option<(i64,String)>=catalog.db.query_row("SELECT record,revision FROM migration_run_items WHERE run=? AND stage=? AND record>? ORDER BY record LIMIT 1",params![run,stage,after],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?))).optional()?;
             let Some((record, revision)) = next else {
                 break;
             };
@@ -480,14 +482,21 @@ impl Catalog {
         source: &MigrationSource,
         r: &Request,
     ) -> Result<Progress> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.begin_keyword_repair_reader(source, r)
+    }
+    pub(crate) fn begin_keyword_repair_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        r: &Request,
+    ) -> Result<Progress> {
+        self.require_jobs_released()?;
         preflight(&self.db, source.binding_blake3(), r)?;
         let (before, policy) = importer::read(&self.db, &r.run)?;
         ensure!(
             source.seal().selected.len() == r.counts().2,
             "keyword selected capture roster differs"
         );
-        let (seal,approval,complete):(Option<Vec<u8>>,Option<Vec<u8>>,bool)=self.db.query_row("SELECT CASE WHEN length(seal)<=8388608 THEN seal END,CASE WHEN length(approval)<=8388608 THEN approval END,complete FROM migration_retention WHERE id=?",[&before.input],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let (seal,approval,complete):(Option<Vec<u8>>,Option<Vec<u8>>,bool)=self.db.query_row("SELECT CASE WHEN length(CAST(seal AS BLOB))<=8388608 THEN seal END,CASE WHEN length(CAST(approval AS BLOB))<=8388608 THEN approval END,complete FROM migration_retention WHERE id=?",[&before.input],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?)))?;
         ensure!(
             complete
                 && seal.context("keyword seal bound")? == encode(source.seal())?
@@ -508,7 +517,7 @@ impl Catalog {
             .query_row(
                 "SELECT id FROM migration_keyword_repairs WHERE run=?",
                 [&r.run],
-                |r| r.get(0),
+                |r| repair_memory::get(r, 0),
             )
             .optional()?;
         if let Some(old) = old {
@@ -598,7 +607,7 @@ impl Catalog {
             _ => anyhow::bail!("stage is outside keyword repair"),
         };
         let a = archived(&self.db, id, stage, record)?;
-        let (disposition,new_outcome_digest)=self.db.query_row("SELECT disposition,new_outcome_digest FROM migration_keyword_repair_items WHERE repair=? AND stage=? AND record=?",params![id,stage,record],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (disposition,new_outcome_digest)=self.db.query_row("SELECT disposition,new_outcome_digest FROM migration_keyword_repair_items WHERE repair=? AND stage=? AND record=?",params![id,stage,record],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?)))?;
         Ok(Predecessor {
             origin: a.origin,
             old_outcome: a.outcome,
@@ -612,7 +621,14 @@ impl Catalog {
         read_progress(&self.db, id)
     }
     pub fn step_keyword_repair(&mut self, source: &MigrationSource, id: &str) -> Result<Step> {
-        crate::catalog_backup::require_jobs_released(&self.root)?;
+        self.step_keyword_repair_reader(source, id)
+    }
+    pub(crate) fn step_keyword_repair_reader(
+        &mut self,
+        source: &dyn MigrationRead,
+        id: &str,
+    ) -> Result<Step> {
+        self.require_jobs_released()?;
         let (b, p) = read(&self.db, id)?;
         ensure!(
             source.binding_blake3() == b.input,
@@ -658,7 +674,7 @@ impl Catalog {
     }
     fn keyword_archive_report(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         p: &Progress,
     ) -> Result<Step> {
@@ -666,7 +682,7 @@ impl Catalog {
             return self.keyword_move(b, p, Phase::PlanDictionaries);
         }
         let revision = &source.seal().selected[p.report_index].revision;
-        let (raw,e):(Option<Vec<u8>>,i64)=self.db.query_row("SELECT CASE WHEN length(report)<=8388608 THEN report END,epoch FROM migration_reconciliation WHERE run=? AND revision=?",params![p.run,revision],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (raw,e):(Option<Vec<u8>>,i64)=self.db.query_row("SELECT CASE WHEN length(CAST(report AS BLOB))<=8388608 THEN report END,epoch FROM migration_reconciliation WHERE run=? AND revision=?",params![p.run,revision],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?)))?;
         let raw = raw.context("keyword predecessor report bound")?;
         ensure!(
             e == b.request.expected_mapping_epoch,
@@ -701,13 +717,13 @@ impl Catalog {
     }
     fn keyword_plan(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         p: &Progress,
     ) -> Result<Step> {
         let dict = p.phase == Phase::PlanDictionaries;
         let stage = if dict { KEYWORDS } else { MEMBERS };
-        let next:Option<(i64,String)>=self.db.query_row("SELECT record,revision FROM migration_run_items WHERE run=? AND stage=? AND record>? ORDER BY record LIMIT 1",params![p.run,stage,p.after_record],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let next:Option<(i64,String)>=self.db.query_row("SELECT record,revision FROM migration_run_items WHERE run=? AND stage=? AND record>? ORDER BY record LIMIT 1",params![p.run,stage,p.after_record],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?))).optional()?;
         let Some((record, revision)) = next else {
             return self.keyword_move(
                 b,
@@ -827,8 +843,11 @@ impl Catalog {
             let mut rows = q.query(params![p.id, KEYWORDS])?;
             while let Some(r) = rows.next()? {
                 nodes.insert(
-                    r.get::<_, i64>(0)?,
-                    (r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?),
+                    repair_memory::get::<_, i64>(r, 0)?,
+                    (
+                        repair_memory::get::<_, Option<i64>>(r, 1)?,
+                        repair_memory::get::<_, String>(r, 2)?,
+                    ),
                 );
             }
         }
@@ -897,7 +916,7 @@ impl Catalog {
     }
     fn keyword_project(
         &mut self,
-        source: &MigrationSource,
+        source: &dyn MigrationRead,
         b: &Binding,
         p: &Progress,
     ) -> Result<Step> {
@@ -917,7 +936,7 @@ impl Catalog {
                     stage,
                     if dict { p.order_index } else { p.after_record }
                 ],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((repair_memory::get(r, 0)?, repair_memory::get(r, 1)?)),
             )
             .optional()?;
         let Some((record, index)) = next else {
@@ -1023,7 +1042,7 @@ impl Catalog {
     fn keyword_verify(&mut self, b: &Binding, p: &Progress) -> Result<Step> {
         let dict = p.phase == Phase::VerifyDictionaries;
         let stage = if dict { KEYWORDS } else { MEMBERS };
-        let next:Option<VerificationItem>=self.db.query_row("SELECT record,disposition,new_outcome_digest,CASE WHEN length(new_receipts)<=8388608 THEN new_receipts END FROM migration_keyword_repair_items WHERE repair=? AND stage=? AND record>? ORDER BY record LIMIT 1",params![p.id,stage,p.after_record],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let next:Option<VerificationItem>=self.db.query_row("SELECT record,disposition,new_outcome_digest,CASE WHEN length(CAST(new_receipts AS BLOB))<=8388608 THEN new_receipts END FROM migration_keyword_repair_items WHERE repair=? AND stage=? AND record>? ORDER BY record LIMIT 1",params![p.id,stage,p.after_record],|r|Ok((repair_memory::get(r, 0)?,repair_memory::get(r, 1)?,repair_memory::get(r, 2)?,repair_memory::get(r, 3)?))).optional()?;
         let Some((record, state, expected, refs)) = next else {
             if !dict {
                 ensure!(
@@ -1207,7 +1226,7 @@ pub(crate) fn finish(tx: &Transaction<'_>, id: &str) -> Result<()> {
         let actual: i64 = tx.query_row(
             "SELECT count(*) FROM migration_run_items WHERE run=? AND stage=?",
             params![p.run, stage],
-            |r| r.get(0),
+            |r| repair_memory::get(r, 0),
         )?;
         ensure!(
             usize::try_from(actual)? == n,
@@ -1218,13 +1237,13 @@ pub(crate) fn finish(tx: &Transaction<'_>, id: &str) -> Result<()> {
     let mut rows = q.query(params![id, p.run])?;
     let mut count = 0;
     while let Some(r) = rows.next()? {
-        let expected: Option<String> = r.get(1)?;
-        let e: Option<i64> = r.get(2)?;
-        let bytes: Option<Vec<u8>> = r.get(3)?;
+        let expected: Option<String> = repair_memory::get(r, 1)?;
+        let e: Option<i64> = repair_memory::get(r, 2)?;
+        let bytes: Option<Vec<u8>> = repair_memory::get(r, 3)?;
         let bytes = bytes.context("fresh keyword report absent/bounded")?;
         ensure!(
             Some(digest(&bytes)) == expected
-                && e == r.get::<_, Option<i64>>(4)?
+                && e == repair_memory::get::<_, Option<i64>>(r, 4)?
                 && e == Some(b.request.expected_mapping_epoch),
             "fresh keyword report identity differs"
         );

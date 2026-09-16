@@ -20,9 +20,9 @@ use std::{
 };
 
 use crate::{
+    ffi::{self, CXmpString},
     IterOptions, OpenFileOptions, XmpDateTime, XmpError, XmpErrorType, XmpFile, XmpIterator,
     XmpProperty, XmpResult, XmpValue,
-    ffi::{self, CXmpString},
 };
 
 /// Represents the data model of an XMP packet.
@@ -2030,6 +2030,42 @@ impl XmpMeta {
     ///
     /// [`Display`]: std::fmt::Display
     pub fn to_string_with_options(&self, options: ToStringOptions) -> XmpResult<String> {
+        self.serialize_with(options, |result| Ok(result.as_string()))
+    }
+
+    /// Serializes RDF with an inclusive bound on the Rust-owned UTF-8 output.
+    ///
+    /// Returns `Ok(None)` if the lossy UTF-8 output would exceed `max_bytes`,
+    /// before allocating that Rust string. Native serialization and its errors
+    /// are unchanged; this does not limit the C++ toolkit's own allocations.
+    pub fn to_string_with_options_bounded(
+        &self,
+        options: ToStringOptions,
+        max_bytes: usize,
+    ) -> XmpResult<Option<String>> {
+        self.serialize_with(options, |result| result.as_string_bounded(max_bytes))
+    }
+
+    /// Serializes RDF after the caller admits the exact Rust UTF-8 output size.
+    ///
+    /// After successful native serialization, `admit` is called once with the
+    /// exact lossy UTF-8 byte length, before allocating the Rust output string.
+    /// Its error is returned unchanged. On success, the returned guard stays
+    /// with the text until the text buffer is freed. Native serialization and
+    /// native allocations precede this callback and are not bounded by it.
+    pub fn to_string_with_options_admitted<G, E: From<XmpError>>(
+        &self,
+        options: ToStringOptions,
+        admit: impl FnOnce(usize) -> Result<G, E>,
+    ) -> Result<crate::AdmittedString<G>, E> {
+        self.serialize_with(options, |result| result.as_string_admitted(admit))
+    }
+
+    fn serialize_with<T, E: From<XmpError>>(
+        &self,
+        options: ToStringOptions,
+        copy: impl FnOnce(&CXmpString) -> Result<T, E>,
+    ) -> Result<T, E> {
         if let Some(m) = self.m {
             let c_newline = CString::new(options.newline).unwrap_or_default();
             let c_indent = CString::new(options.indent).unwrap_or_default();
@@ -2049,10 +2085,10 @@ impl XmpMeta {
 
                 XmpError::raise_from_c(&err)?;
 
-                Ok(result.as_string())
+                copy(&result)
             }
         } else {
-            Err(no_cpp_toolkit())
+            Err(no_cpp_toolkit().into())
         }
     }
 }

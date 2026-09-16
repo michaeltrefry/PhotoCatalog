@@ -2,29 +2,32 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
+#[cfg(test)]
+use photocatalog::catalog_migration::importer::Progress;
 use photocatalog::{
     Catalog,
     catalog_migration::{
         artifacts::ArtifactLimits,
         current_repair,
-        import_artifacts::Worker,
-        importer::{Policy, Progress},
+        importer::Policy,
         keyword_repair,
+        lightroom_executor::{self, WorkLimit},
     },
     lightroom::migration_source::{InputSeal, MigrationSource, ReadLimits},
 };
 use serde::de::DeserializeOwned;
+#[cfg(test)]
+use std::path::Component;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
 };
 
 const DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(about = "Import an explicitly sealed Lightroom selection into one PhotoCatalog catalog")]
+#[command(about = "Import an explicitly sealed Lightroom selection into one LensWorks catalog")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -162,45 +165,11 @@ fn document<T: DeserializeOwned>(path: &Path) -> Result<T> {
 
 /// Resolve only the existing ancestor. A source directory need not be online.
 fn destination_path(path: &Path) -> Result<PathBuf> {
-    ensure!(path.is_absolute(), "destination must be absolute");
-    ensure!(
-        path.components()
-            .all(|c| !matches!(c, Component::ParentDir | Component::CurDir)),
-        "destination cannot contain relative components"
-    );
-    let mut ancestor = path;
-    let mut remaining = Vec::new();
-    loop {
-        match fs::symlink_metadata(ancestor) {
-            Ok(meta) => {
-                ensure!(meta.is_dir(), "destination ancestor must be a directory");
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                remaining.push(
-                    ancestor
-                        .file_name()
-                        .context("destination has no ancestor")?,
-                );
-                ancestor = ancestor.parent().context("destination has no parent")?;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    let mut resolved = fs::canonicalize(ancestor)?;
-    for part in remaining.iter().rev() {
-        resolved.push(part);
-    }
-    Ok(resolved)
+    lightroom_executor::destination_path(path)
 }
 
 fn disjoint(destination: &Path, source: &Path) -> Result<()> {
-    let source = fs::canonicalize(source)?;
-    ensure!(
-        !destination.starts_with(&source) && !source.starts_with(destination),
-        "destination and source custody must be separate directories"
-    );
-    Ok(())
+    lightroom_executor::disjoint(destination, source)
 }
 
 fn lock_destination(destination: &Path) -> Result<File> {
@@ -225,34 +194,17 @@ fn emit(value: &impl serde::Serialize) -> Result<()> {
 }
 
 fn status_database(destination: &Path) -> Result<rusqlite::Connection> {
-    let db = rusqlite::Connection::open_with_flags(
-        destination.join("catalog.sqlite3"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    db.busy_timeout(Duration::from_secs(5))?;
-    let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-    let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    ensure!(
-        app == 0x50484341 && schema == photocatalog::CURRENT_SCHEMA_VERSION,
-        "status requires a current PhotoCatalog catalog; no schema migration was performed"
-    );
-    Ok(db)
+    lightroom_executor::status_database(destination)
 }
 
+#[cfg(test)]
 fn read_status(destination: &Path, run: &str) -> Result<Progress> {
     ensure!(
         run.len() == 64 && run.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid run identity"
     );
     let db = status_database(destination)?;
-    let raw: Vec<u8> = db.query_row(
-        "SELECT progress FROM migration_runs WHERE id=?1 AND length(progress)<=?2",
-        rusqlite::params![run, i64::try_from(DOCUMENT_BYTES)?],
-        |r| r.get(0),
-    )?;
-    let progress: Progress = serde_json::from_slice(&raw)?;
-    ensure!(progress.id == run, "stored run identity differs");
-    Ok(progress)
+    lightroom_executor::run_progress(&db, run)
 }
 
 // Reject a stale repair request before upgrading an existing schema7 destination.
@@ -262,56 +214,7 @@ fn preflight_repair_upgrade(
     input: &str,
     request: &current_repair::Request,
 ) -> Result<()> {
-    let hash = |s: &str| {
-        s.len() == 64
-            && s.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    };
-    ensure!(
-        hash(&request.run)
-            && hash(&request.expected_complete_progress_blake3)
-            && request.expected_mapping_epoch >= 0
-            && !request.reason.trim().is_empty()
-            && request.reason.len() <= 4096,
-        "invalid repair request"
-    );
-    let path = destination.join("catalog.sqlite3");
-    ensure!(
-        fs::symlink_metadata(&path)?.is_file(),
-        "repair database must be a regular file"
-    );
-    let db =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
-    let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(
-        app == 0x50484341 && (7..=photocatalog::CURRENT_SCHEMA_VERSION).contains(&schema),
-        "repair requires a completed-import catalog schema"
-    );
-    if schema == 7 {
-        let raw: Vec<u8> = db.query_row(
-            "SELECT progress FROM migration_runs WHERE id=?1 AND length(progress)<=?2",
-            rusqlite::params![request.run, i64::try_from(DOCUMENT_BYTES)?],
-            |r| r.get(0),
-        )?;
-        let progress: Progress = serde_json::from_slice(&raw)?;
-        let epoch: i64 = db.query_row(
-            "SELECT epoch FROM migration_mapping_epoch WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            progress.id == request.run
-                && progress.input == input
-                && progress.complete
-                && progress.stage == photocatalog::catalog_migration::importer::Stage::Complete
-                && blake3::hash(&raw).to_hex().as_str()
-                    == request.expected_complete_progress_blake3
-                && epoch == request.expected_mapping_epoch,
-            "legacy repair predecessor differs"
-        );
-    }
-    Ok(())
+    lightroom_executor::preflight_current_upgrade(destination, input, request)
 }
 
 fn preflight_keyword_upgrade(
@@ -319,21 +222,7 @@ fn preflight_keyword_upgrade(
     input: &str,
     request: &keyword_repair::Request,
 ) -> Result<()> {
-    let path = destination.join("catalog.sqlite3");
-    ensure!(
-        fs::symlink_metadata(&path)?.is_file(),
-        "keyword repair database must be a regular file"
-    );
-    let db =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    db.busy_timeout(Duration::from_secs(5))?;
-    let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
-    let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(
-        app == 0x50484341 && (9..=photocatalog::CURRENT_SCHEMA_VERSION).contains(&schema),
-        "keyword repair requires schema9 or current schema"
-    );
-    keyword_repair::preflight(&db, input, request)
+    lightroom_executor::preflight_keyword_upgrade(destination, input, request)
 }
 
 fn stop_requested(path: Option<&Path>) -> Result<bool> {
@@ -355,7 +244,7 @@ fn main() -> Result<()> {
         } => {
             let destination = destination_path(&destination)?;
             let db = status_database(&destination)?;
-            emit(&current_repair::read_progress(&db, &repair)?)
+            emit(&lightroom_executor::current_repair_status(&db, &repair)?)
         }
         Command::RepairCurrent {
             destination,
@@ -406,41 +295,19 @@ fn main() -> Result<()> {
                 .context("preflight current-settings repair destination")?;
             let mut catalog =
                 Catalog::open(&destination).context("open current-settings repair destination")?;
-            let mut progress = catalog
-                .begin_current_develop_repair(&source, &request)
-                .context("begin or resume current-settings repair")?;
-            let started = Instant::now();
-            let deadline = started + Duration::from_secs(max_seconds);
-            let mut steps = 0;
-            let mut stopped = stop_requested(stop_file.as_deref())?;
-            let mut last_report = Instant::now();
-            while !progress.complete && steps < max_steps && Instant::now() < deadline && !stopped {
-                progress = catalog
-                    .step_current_develop_repair(&source, &progress.id)
-                    .with_context(|| {
-                        format!(
-                            "current-settings repair phase={:?} after_record={} examined={}",
-                            progress.phase, progress.after_record, progress.examined
-                        )
-                    })?
-                    .progress;
-                steps += 1;
-                stopped = stop_requested(stop_file.as_deref())?;
-                if last_report.elapsed() >= Duration::from_secs(5) {
-                    eprintln!(
-                        "{:?}: examined {}, repaired {}, steps {}",
-                        progress.phase, progress.examined, progress.repaired, steps
-                    );
-                    last_report = Instant::now();
-                }
-            }
-            emit(&serde_json::json!({
-                "protocol": 1,
-                "status": if progress.complete { "complete" } else if stopped { "stopped" } else { "paused" },
-                "repair": progress, "steps": steps,
-                "elapsed_seconds": started.elapsed().as_secs_f64(),
-                "adobe_rendering_equivalent": false
-            }))
+            emit(
+                &lightroom_executor::repair_current_local(
+                    &mut catalog,
+                    &source,
+                    &request,
+                    WorkLimit {
+                        steps: max_steps,
+                        seconds: max_seconds,
+                    },
+                    &|| stop_requested(stop_file.as_deref()),
+                )
+                .context("execute current-settings repair")?,
+            )
         }
         Command::KeywordRepairStatus {
             destination,
@@ -448,7 +315,7 @@ fn main() -> Result<()> {
         } => {
             let destination = destination_path(&destination)?;
             let db = status_database(&destination)?;
-            emit(&keyword_repair::read_progress(&db, &repair)?)
+            emit(&lightroom_executor::keyword_repair_status(&db, &repair)?)
         }
         Command::RepairKeywords {
             destination,
@@ -499,41 +366,19 @@ fn main() -> Result<()> {
                 .context("preflight keyword repair destination")?;
             let mut catalog =
                 Catalog::open(&destination).context("open keyword repair destination")?;
-            let mut progress = catalog
-                .begin_keyword_repair(&source, &request)
-                .context("begin or resume keyword repair")?;
-            let started = Instant::now();
-            let deadline = started + Duration::from_secs(max_seconds);
-            let mut steps = 0;
-            let mut stopped = stop_requested(stop_file.as_deref())?;
-            let mut last_report = Instant::now();
-            while !progress.complete && steps < max_steps && Instant::now() < deadline && !stopped {
-                progress = catalog
-                    .step_keyword_repair(&source, &progress.id)
-                    .with_context(|| {
-                        format!(
-                            "keyword repair phase={:?} after_record={} examined={}",
-                            progress.phase, progress.after_record, progress.examined
-                        )
-                    })?
-                    .progress;
-                steps += 1;
-                stopped = stop_requested(stop_file.as_deref())?;
-                if last_report.elapsed() >= Duration::from_secs(5) {
-                    eprintln!(
-                        "{:?}: examined {}, repaired {}, steps {}",
-                        progress.phase, progress.examined, progress.repaired, steps
-                    );
-                    last_report = Instant::now();
-                }
-            }
-            emit(&serde_json::json!({
-                "protocol": 1,
-                "status": if progress.complete { "complete" } else if stopped { "stopped" } else { "paused" },
-                "repair": progress, "steps": steps,
-                "elapsed_seconds": started.elapsed().as_secs_f64(),
-                "adobe_rendering_equivalent": false
-            }))
+            emit(
+                &lightroom_executor::repair_keywords_local(
+                    &mut catalog,
+                    &source,
+                    &request,
+                    WorkLimit {
+                        steps: max_steps,
+                        seconds: max_seconds,
+                    },
+                    &|| stop_requested(stop_file.as_deref()),
+                )
+                .context("execute keyword repair")?,
+            )
         }
         Command::PrepareSupplements {
             destination,
@@ -552,16 +397,11 @@ fn main() -> Result<()> {
             let _lock = lock_destination(&destination)?;
             let mut catalog = Catalog::open(&destination)?;
             let stop = std::sync::atomic::AtomicBool::new(false);
-            let mut prepared = Vec::with_capacity(requests.len());
-            for request in &requests {
-                prepared.push(catalog.prepare_migration_supplement(request, &stop)?);
-                eprintln!(
-                    "Prepared supplemental proof {}/{}",
-                    prepared.len(),
-                    requests.len()
-                );
-            }
-            emit(&prepared)
+            emit(&lightroom_executor::prepare_supplements(
+                &mut catalog,
+                &requests,
+                &stop,
+            )?)
         }
         Command::Status { destination, run } => {
             let destination = destination_path(&destination)?;
@@ -569,8 +409,8 @@ fn main() -> Result<()> {
                 destination.join("catalog.sqlite3").is_file(),
                 "destination catalog is absent"
             );
-            let progress = read_status(&destination, &run)?;
-            emit(&progress)
+            let db = status_database(&destination)?;
+            emit(&lightroom_executor::run_status(&db, &run)?)
         }
         Command::Run {
             destination,
@@ -628,59 +468,23 @@ fn main() -> Result<()> {
             .context("open and admit sealed inspection source")?;
             let _lock = lock_destination(&destination)?;
             let mut catalog = Catalog::open(&destination)?;
-            let mut progress: Progress =
-                catalog.begin_selected_import(&source, &approval, &policy)?;
-            let mut worker = Worker::new(
+            emit(&lightroom_executor::run_local(
+                &mut catalog,
                 &source,
-                &progress.id,
+                &approval,
+                &policy,
                 ArtifactLimits {
                     maximum_bytes: max_artifact_bytes,
                     open_deadline_ms: artifact_open_seconds * 1000,
                     chunk_deadline_ms: 120_000,
                     chunk_bytes: 1024 * 1024,
                 },
-            )?;
-            let started = Instant::now();
-            let deadline = started + Duration::from_secs(max_seconds);
-            let mut stopped = stop_requested(stop_file.as_deref())?;
-            let mut last_report = Instant::now();
-            let mut steps = 0;
-            let mut needs_decision = None;
-            while !progress.complete && steps < max_steps && Instant::now() < deadline && !stopped {
-                // CLI cancellation is sampled between steps, so an admitted
-                // step finishes and real read/checksum errors still propagate.
-                let step = worker.step(&mut catalog, &|| false)?;
-                steps += 1;
-                progress = step.progress;
-                needs_decision = step.needs_decision;
-                stopped = stop_requested(stop_file.as_deref())?;
-                if last_report.elapsed() >= Duration::from_secs(5) || needs_decision.is_some() {
-                    eprintln!(
-                        "{:?}: capture {}, processed {}, steps {}",
-                        progress.stage, progress.capture_index, progress.processed, steps
-                    );
-                    last_report = Instant::now();
-                }
-                if needs_decision.is_some() {
-                    break;
-                }
-            }
-            let state = if progress.complete {
-                "complete"
-            } else if needs_decision.is_some() {
-                "needs_decision"
-            } else if stopped {
-                "stopped"
-            } else {
-                "paused"
-            };
-            emit(&serde_json::json!({
-                "protocol": 1, "status": state, "progress": progress,
-                "steps": steps, "elapsed_seconds": started.elapsed().as_secs_f64(),
-                "needs_decision": needs_decision,
-                "adobe_rendering_equivalent": false,
-                "native_collection_order_equivalent": false
-            }))
+                WorkLimit {
+                    steps: max_steps,
+                    seconds: max_seconds,
+                },
+                &|| stop_requested(stop_file.as_deref()),
+            )?)
         }
     }
 }

@@ -15,7 +15,7 @@ mod cli_backup;
 mod cli_edits;
 mod cli_exports;
 #[derive(Parser)]
-#[command(version, about = "PhotoCatalog Rust catalog and metadata tools")]
+#[command(version, about = "LensWorks Rust catalog and metadata tools")]
 struct Cli {
     #[arg(long)]
     catalog: PathBuf,
@@ -473,6 +473,36 @@ enum MetadataCommand {
 }
 
 fn main() -> Result<()> {
+    match std::env::args_os().nth(1).as_deref() {
+        Some(arg) if arg == "--lightroom-migration-worker" => {
+            return photocatalog::lightroom_migration_worker::worker_main();
+        }
+        Some(arg) if arg == "--lightroom-source-reader-sql" => {
+            return photocatalog::lightroom_migration_worker::managed_source_reader_main(false);
+        }
+        Some(arg) if arg == "--lightroom-source-reader-raw" => {
+            return photocatalog::lightroom_migration_worker::managed_source_reader_main(true);
+        }
+        _ => {}
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--catalog-filesystem-worker")
+    {
+        // stderr is a framed control stream; suppress Rust's unframed Result
+        // main diagnostic. The parent observes exit plus verified stream joins.
+        std::process::exit(if photocatalog::filesystem_worker::worker_main().is_ok() {
+            0
+        } else {
+            1
+        });
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--catalog-desktop-worker")
+    {
+        return photocatalog::application::desktop::worker_main();
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--photo-export-worker")

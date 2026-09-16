@@ -292,6 +292,72 @@ fn captures_committed_wal_and_preserves_original_sidecars() {
         4
     );
 }
+
+#[test]
+fn owned_capture_of_closed_wal_preserves_custody_and_explicit_evidence() {
+    let temp = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let originals = temp.path().join("source");
+    fs::create_dir(&originals).unwrap();
+    let source = originals.join("closed.lrcat");
+    let db = fixture(&source, "1300000", 10.0);
+    db.pragma_update(None, "journal_mode", "WAL").unwrap();
+    db.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    db.execute("UPDATE Adobe_images SET rating=3", []).unwrap();
+    let closed_wal = tree(&originals);
+    drop(db);
+    // Construct a synthetic closed/crash-style WAL image from a consistent
+    // committed main/WAL/SHM roster. No process retains a source SQLite handle.
+    for (relative, bytes) in &closed_wal {
+        fs::write(originals.join(relative), bytes).unwrap();
+    }
+    fs::write(
+        originals.join("closed.lrcat-data"),
+        b"retained opaque auxiliary",
+    )
+    .unwrap();
+    let before = tree(&originals);
+    let destination = temp.path().join("capture");
+    let mut request = request(&source, &destination);
+    request.closed_application_evidence =
+        Some("synthetic closed WAL; all fixture SQLite handles closed".into());
+    let mut owned = capture::CaptureProcess::spawn(&worker(), temp.path(), &request).unwrap();
+    let staging = owned.staging_directory().to_path_buf();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let manifest = loop {
+        if let Some(manifest) = owned.poll().unwrap() {
+            break manifest;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(manifest.state, "captured");
+    assert_eq!(
+        manifest.application_consistency,
+        "closed_application_assertion_recorded"
+    );
+    assert_eq!(
+        manifest.request.closed_application_evidence,
+        request.closed_application_evidence
+    );
+    assert!(manifest.wal.as_ref().unwrap().last_commit_frame > 0);
+    assert!(manifest.artifacts.iter().any(|a| a.role == "auxiliary"));
+    assert_eq!(before, tree(&originals));
+    assert!(staging.join("result.json").exists());
+    let retained = capture::read_manifest(&destination).unwrap();
+    assert_eq!(retained.revision_id, manifest.revision_id);
+    let logical = Connection::open_with_flags(
+        destination.join("logical.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        logical
+            .query_row("SELECT min(rating) FROM Adobe_images", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+}
 #[test]
 fn changed_evidence_and_corrupted_raw_artifacts_are_rejected() {
     let temp = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();

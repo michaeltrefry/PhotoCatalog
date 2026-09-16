@@ -1527,6 +1527,8 @@ fn remove_alias_schema(conn: &rusqlite::Connection) -> Result<()> {
 // while leaving schema7 columns, foreign keys, and triggers installed.
 fn remove_image_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+    conn.execute_batch(include_str!("fixtures/relink-v12-downgrade.sql"))?;
+    conn.execute_batch("DROP TRIGGER organization_member_zero_insert; DROP TRIGGER organization_member_zero_update; DROP TRIGGER organization_order_zero_insert; DROP TRIGGER organization_order_zero_update; DROP TRIGGER organization_order_zero_delete; DROP TABLE organization_collection_zero; DROP TABLE organization_collection_zero_backfill;")?;
     conn.execute_batch("DROP TABLE migration_keyword_repair_items; DROP TABLE migration_keyword_repair_reports; DROP TABLE migration_keyword_repairs;")?;
     conn.execute_batch("DROP TABLE migration_current_repair_items; DROP TABLE migration_current_repair_reports; DROP TABLE migration_current_repairs;")?;
     let triggers=conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'image_%' OR name='organization_metadata_update')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;

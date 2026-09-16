@@ -17,7 +17,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -161,8 +161,13 @@ struct View<'a> {
 }
 impl View<'_> {
     fn record(&mut self, sequence: i64) -> Result<EvidenceRecord> {
-        let (input, revision, bytes): (String,String,i64) = self.catalog.db.query_row(
-            "SELECT input,revision,raw_length FROM migration_retained_records WHERE sequence=? AND complete=1", [sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let (input, revision, bytes, compressed, seal): (String,String,i64,i64,i64) = self.catalog.db.query_row(
+            "SELECT r.input,r.revision,r.raw_length,length(r.compressed),length(i.seal) FROM migration_retained_records r JOIN migration_retention i ON i.id=r.input WHERE r.sequence=? AND r.complete=1", [sequence], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+        ensure!(
+            (0..=(MAX_BYTES + 32768) as i64).contains(&compressed)
+                && (0..=MAX_BYTES as i64).contains(&seal),
+            "history stored record/seal byte bound"
+        );
         let bytes = usize::try_from(bytes)?;
         ensure!(
             input == self.input && revision == self.revision,
@@ -363,11 +368,53 @@ impl View<'_> {
 
 type ImportedOrigin = (String, String, String, String, i64, i64, String, String);
 
-fn root<'a>(catalog: &'a Catalog, key: &VariantKey) -> Result<(View<'a>, Anchor, RawRow)> {
+// Native copies retain immutable ancestry, not a second importer mapping. Each
+// parent seek stays on the selected physical asset and moves strictly backward;
+// this also rejects corrupt cycles without an unbounded visited set.
+const MAX_COPY_ANCESTRY: usize = 64;
+fn history_origin(catalog: &Catalog, key: &VariantKey) -> Result<VariantKey> {
     key.validate()?;
+    let mut current = key.clone();
+    for depth in 0..=MAX_COPY_ANCESTRY {
+        let (sequence, parent, role, mapped): (i64, Option<i64>, String, bool) = catalog.db.query_row(
+            "SELECT i.sequence,i.copied_from_sequence,i.role,EXISTS(SELECT 1 FROM image_import_map m WHERE m.image_id=i.id) FROM catalog_images i WHERE i.asset_id=?1 AND i.variant_id=?2",
+            params![current.asset_id,current.variant_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).context("history selected image or ancestry missing")?;
+        if mapped {
+            return Ok(current);
+        }
+        ensure!(
+            role == "native_copy",
+            "selected variant has no retained migration origin"
+        );
+        let parent = parent.context("history copy ancestry has no retained migration origin")?;
+        ensure!(
+            parent < sequence,
+            "history copy ancestry cycle or invalid ordering"
+        );
+        ensure!(
+            depth < MAX_COPY_ANCESTRY,
+            "history copy ancestry exceeds 64 links"
+        );
+        current.variant_id = catalog
+            .db
+            .query_row(
+                "SELECT variant_id FROM catalog_images WHERE sequence=?1 AND asset_id=?2",
+                params![parent, key.asset_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .context("history copy ancestor missing or belongs to another physical asset")?;
+    }
+    unreachable!("bounded ancestry exits at its depth check")
+}
+
+fn root<'a>(catalog: &'a Catalog, key: &VariantKey) -> Result<(View<'a>, Anchor, RawRow)> {
+    let origin = history_origin(catalog, key)?;
     let rows: Vec<ImportedOrigin> = {
-        let mut q=catalog.db.prepare("SELECT m.import_source,m.capture_revision,m.source_table,m.source_id,p.retained_record,p.retained_table,p.result,r.input FROM catalog_images i JOIN image_import_map m ON m.image_id=i.id JOIN migration_images p ON p.source_identity=m.source_id AND p.owner=m.import_source AND p.input_digest=m.input_digest JOIN migration_retained_records r ON r.sequence=p.retained_record WHERE i.asset_id=?1 AND i.variant_id=?2 ORDER BY m.import_source,m.capture_revision,m.source_table,m.source_id LIMIT 2")?;
-        q.query_map(params![key.asset_id, key.variant_id], |r| {
+        let mut q=catalog.db.prepare("SELECT m.import_source,m.capture_revision,m.source_table,m.source_id,p.retained_record,p.retained_table,CASE WHEN length(CAST(p.result AS BLOB))<=8388608 THEN p.result ELSE NULL END,r.input FROM catalog_images i JOIN image_import_map m ON m.image_id=i.id JOIN migration_images p ON p.source_identity=m.source_id AND p.owner=m.import_source AND p.input_digest=m.input_digest JOIN migration_retained_records r ON r.sequence=p.retained_record WHERE i.asset_id=?1 AND i.variant_id=?2 ORDER BY m.import_source,m.capture_revision,m.source_table,m.source_id LIMIT 2")?;
+        q.query_map(params![origin.asset_id, origin.variant_id], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -394,7 +441,7 @@ fn root<'a>(catalog: &'a Catalog, key: &VariantKey) -> Result<(View<'a>, Anchor,
     let result: images::ProjectionResult = serde_json::from_str(&result)?;
     ensure!(
         result.source_identity == identity
-            && matches!(&result.outcome,images::Outcome::Image {key:k,..} if k==key),
+            && matches!(&result.outcome,images::Outcome::Image {key:k,..} if k==&origin),
         "history native mapping differs"
     );
     let mut view = View {
@@ -541,8 +588,9 @@ fn resolve<'a>(catalog: &'a Catalog, anchor: &Anchor) -> Result<(View<'a>, RawRo
 }
 
 impl Catalog {
-    /// Direct source rows referring to this imported image, not sibling images
-    /// sharing a file. Outgoing current-develop links use source_evidence below.
+    /// Source rows for this imported image or its proven native-copy ancestor.
+    /// Anchors retain the selected variant; shared-file siblings grant no access.
+    /// Outgoing current-develop links use source_evidence below.
     pub fn migration_variant_evidence(
         &self,
         key: &VariantKey,

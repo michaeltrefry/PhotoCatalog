@@ -1,8 +1,11 @@
 //! Fallible XMP interpretation and explicit edits. Original packet bytes live separately.
+mod semantics_json;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use xmp_toolkit::{FromStrOptions, ToStringOptions, XmpMeta, XmpValue};
+use xmp_toolkit::{AdmittedString, FromStrOptions, ToStringOptions, XmpMeta, XmpValue};
+
+use crate::lightroom_migration_worker::memory::requested::{Requested, Scope};
 
 pub const XMP: &str = "http://ns.adobe.com/xap/1.0/";
 pub const DC: &str = "http://purl.org/dc/elements/1.1/";
@@ -52,12 +55,8 @@ pub enum Edit {
 }
 
 /// Strict UTF-8/16/32 decoding; retained bytes are never replaced by this parse representation.
-pub fn xml_text(bytes: &[u8]) -> Result<String> {
-    ensure!(
-        bytes.len() <= MAX_PACKET_BYTES,
-        "XMP packet exceeds parse limit"
-    );
-    let (skip, width, little) = if bytes.starts_with(&[0xff, 0xfe, 0, 0]) {
+fn encoding(bytes: &[u8]) -> (usize, usize, bool) {
+    if bytes.starts_with(&[0xff, 0xfe, 0, 0]) {
         (4, 4, true)
     } else if bytes.starts_with(&[0, 0, 0xfe, 0xff]) {
         (4, 4, false)
@@ -79,27 +78,32 @@ pub fn xml_text(bytes: &[u8]) -> Result<String> {
             1,
             false,
         )
-    };
+    }
+}
+
+pub(crate) fn decoded_text_bytes(bytes: &[u8]) -> Result<usize> {
+    ensure!(
+        bytes.len() <= MAX_PACKET_BYTES,
+        "XMP packet exceeds parse limit"
+    );
+    let (skip, width, little) = encoding(bytes);
     let body = &bytes[skip..];
-    let text = match width {
-        1 => std::str::from_utf8(body)
-            .context("XMP is not UTF-8")?
-            .to_owned(),
+    match width {
+        1 => Ok(std::str::from_utf8(body).context("XMP is not UTF-8")?.len()),
         2 => {
             ensure!(body.len().is_multiple_of(2), "truncated UTF-16 XMP");
-            let units = body
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| {
-                    if little {
-                        u16::from_le_bytes([b[0], b[1]])
-                    } else {
-                        u16::from_be_bytes([b[0], b[1]])
-                    }
-                })
-                .collect::<Vec<_>>();
-            String::from_utf16(&units).context("invalid UTF-16 XMP")?
+            std::char::decode_utf16(body.as_chunks::<2>().0.iter().map(|b| {
+                if little {
+                    u16::from_le_bytes([b[0], b[1]])
+                } else {
+                    u16::from_be_bytes([b[0], b[1]])
+                }
+            }))
+            .try_fold(0usize, |length, character| {
+                length
+                    .checked_add(character.context("invalid UTF-16 XMP")?.len_utf8())
+                    .context("decoded XMP byte length overflow")
+            })
         }
         4 => {
             ensure!(body.len().is_multiple_of(4), "truncated UTF-32 XMP");
@@ -115,10 +119,132 @@ pub fn xml_text(bytes: &[u8]) -> Result<String> {
                     })
                     .context("invalid UTF-32 XMP")
                 })
-                .collect::<Result<String>>()?
+                .try_fold(0usize, |length, character| {
+                    length
+                        .checked_add(character?.len_utf8())
+                        .context("decoded XMP byte length overflow")
+                })
         }
         _ => unreachable!(),
-    };
+    }
+}
+
+/// Maximum valid UTF-8 length for this packet's detected transport encoding.
+/// UTF-16 needs at most three UTF-8 bytes per two input bytes; UTF-8 and UTF-32
+/// cannot expand beyond their original byte count. This does not validate the
+/// packet and therefore cannot turn a later observed parse error into a failure.
+pub(crate) fn decoded_text_bound(bytes: &[u8]) -> Result<usize> {
+    let (skip, width, _) = encoding(bytes);
+    let body = bytes.len().saturating_sub(skip);
+    if width == 2 {
+        crate::lightroom_migration_worker::memory::layout::mul(body.div_ceil(2), 3)
+    } else {
+        Ok(body)
+    }
+}
+
+/// Complete persistent Projection plus field-semantics graph for one model.
+/// The projection has seventeen fixed field names, three simple arrays and
+/// three localized maps, each using the existing 10,000-item acceptance. All
+/// returned value strings are present in the already bounded compact packet,
+/// so their combined payload is bounded by MAX_PACKET_BYTES.
+pub(crate) fn prepared_model_storage() -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::layout::{add, mul, tree, vector};
+    const FIELDS: [&str; 17] = [
+        "rating",
+        "label",
+        "capture_date",
+        "camera_make",
+        "camera_model",
+        "orientation",
+        "lens",
+        "gps_latitude",
+        "gps_longitude",
+        "create_date",
+        "modify_date",
+        "title",
+        "description",
+        "rights",
+        "creator",
+        "keywords",
+        "hierarchical_keywords",
+    ];
+    let field_names = FIELDS
+        .iter()
+        .try_fold(0usize, |bytes, field| add(bytes, field.len()))?;
+    let issues = FIELDS.iter().try_fold(0usize, |bytes, field| {
+        let scalar = add(
+            field.len(),
+            ": expected scalar; original structure retained".len(),
+        )?;
+        let array = add(
+            field.len(),
+            ": non-simple or ambiguous items; full array retained".len(),
+        )?;
+        let limit = add(
+            field.len(),
+            ": projection limit exceeded; full array retained".len(),
+        )?;
+        add(bytes, scalar.max(array).max(limit))
+    })?;
+    let projection_containers = add(
+        tree::<String, Value>(FIELDS.len())?,
+        add(
+            mul(3, vector::<String>(MAX_ITEMS)?)?,
+            mul(3, tree::<String, String>(MAX_ITEMS)?)?,
+        )?,
+    )?;
+    let semantics = add(
+        tree::<String, String>(FIELDS.len())?,
+        add(field_names, mul(64, FIELDS.len())?)?,
+    )?;
+    add(
+        MAX_PACKET_BYTES,
+        add(
+            projection_containers,
+            add(
+                semantics,
+                add(vector::<String>(FIELDS.len())?, add(issues, field_names)?)?,
+            )?,
+        )?,
+    )
+}
+
+/// Strict UTF-8/16/32 decoding; retained bytes are never replaced by this parse representation.
+pub fn xml_text(bytes: &[u8]) -> Result<String> {
+    let length = decoded_text_bytes(bytes)?;
+    let (skip, width, little) = encoding(bytes);
+    let body = &bytes[skip..];
+    let mut text = String::with_capacity(length);
+    match width {
+        1 => text.push_str(std::str::from_utf8(body).context("XMP is not UTF-8")?),
+        2 => {
+            for character in std::char::decode_utf16(body.as_chunks::<2>().0.iter().map(|b| {
+                if little {
+                    u16::from_le_bytes([b[0], b[1]])
+                } else {
+                    u16::from_be_bytes([b[0], b[1]])
+                }
+            })) {
+                text.push(character.context("invalid UTF-16 XMP")?);
+            }
+        }
+        4 => {
+            for b in body.as_chunks::<4>().0 {
+                let value = [b[0], b[1], b[2], b[3]];
+                text.push(
+                    char::from_u32(if little {
+                        u32::from_le_bytes(value)
+                    } else {
+                        u32::from_be_bytes(value)
+                    })
+                    .context("invalid UTF-32 XMP")?,
+                );
+            }
+        }
+        _ => unreachable!(),
+    }
+    debug_assert_eq!(text.len(), length);
     ensure!(!text.contains('\0'), "NUL in XMP text");
     ensure!(
         !text.contains("<!DOCTYPE") && !text.contains("<!ENTITY"),
@@ -127,7 +253,16 @@ pub fn xml_text(bytes: &[u8]) -> Result<String> {
     Ok(text)
 }
 pub fn parse(bytes: &[u8]) -> Result<XmpMeta> {
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    parse_admitted(bytes, &requested)
+}
+
+pub(crate) fn parse_admitted<'a>(bytes: &[u8], requested: &'a Requested<'a>) -> Result<XmpMeta> {
+    let _text_scope = requested.scope(decoded_text_bytes(bytes)?)?;
     let text = xml_text(bytes)?;
+    let _document_scope =
+        requested.scope(crate::lightroom_migration_worker::memory::core::xml_document(&text)?)?;
     let document = roxmltree::Document::parse_with_options(
         &text,
         roxmltree::ParsingOptions {
@@ -138,11 +273,13 @@ pub fn parse(bytes: &[u8]) -> Result<XmpMeta> {
     )
     .context("validate complete XMP XML")?;
     const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-    let roots = document
+    let mut roots = document
         .descendants()
-        .filter(|n| n.has_tag_name((RDF, "RDF")))
-        .collect::<Vec<_>>();
-    ensure!(roots.len() == 1, "XMP must contain exactly one RDF model");
+        .filter(|n| n.has_tag_name((RDF, "RDF")));
+    ensure!(
+        roots.next().is_some() && roots.next().is_none(),
+        "XMP must contain exactly one RDF model"
+    );
     for node in document.descendants().filter(|n| n.is_element()) {
         ensure!(
             node.ancestors().take(66).count() <= 65,
@@ -162,31 +299,62 @@ pub fn parse(bytes: &[u8]) -> Result<XmpMeta> {
     // Compare original RDF before trusting any native projection. The pinned
     // preservation feature prevents known migrations; this independent boundary
     // also detects unsupported graph semantics or future native normalization.
+    // Compact output has an existing 16 MiB pre-copy bound. Its native C
+    // backing and the SDK model are separate native owners; this scope covers
+    // only the bounded Rust copy returned by the wrapper.
+    let _compact_scope = requested.scope(MAX_PACKET_BYTES)?;
     let serialized = serialize(&model)?;
-    crate::xmp_rdf::assert_equivalent(&text, std::str::from_utf8(&serialized)?)?;
+    crate::xmp_rdf::assert_equivalent_admitted(
+        &text,
+        std::str::from_utf8(&serialized)?,
+        requested,
+    )?;
     Ok(model)
 }
 fn serialize(meta: &XmpMeta) -> Result<Vec<u8>> {
-    let bytes = meta
-        .to_string_with_options(ToStringOptions::default().use_compact_format())?
-        .into_bytes();
-    ensure!(bytes.len() <= MAX_PACKET_BYTES, "edited XMP exceeds limit");
-    Ok(bytes)
+    Ok(meta
+        .to_string_with_options_bounded(
+            ToStringOptions::default().use_compact_format(),
+            MAX_PACKET_BYTES,
+        )?
+        .context("edited XMP exceeds limit")?
+        .into_bytes())
 }
 /// Full fallible serialization avoids the SDK wrapper's lossy Clone/iterator error paths.
 pub fn canonical(meta: &XmpMeta) -> Result<String> {
-    let mut copy = parse(&serialize(meta)?)?;
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    Ok(canonical_admitted(meta, &requested)?.as_ref().to_owned())
+}
+
+pub(crate) fn canonical_admitted<'a>(
+    meta: &XmpMeta,
+    requested: &'a Requested<'a>,
+) -> Result<AdmittedString<Scope<'a>>> {
+    let _compact_scope = requested.scope(MAX_PACKET_BYTES)?;
+    let serialized = serialize(meta)?;
+    let mut copy = parse_admitted(&serialized, requested)?;
     copy.sort()?;
-    Ok(copy.to_string_with_options(
+    copy.to_string_with_options_admitted(
         ToStringOptions::default()
             .omit_packet_wrapper()
             .use_canonical_format()
             .omit_all_formatting(),
-    )?)
+        |bytes| requested.scope(bytes),
+    )
 }
 
 pub fn project(bytes: &[u8]) -> Result<Projection> {
-    let meta = parse(bytes)?;
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    project_admitted(bytes, &requested)
+}
+
+pub(crate) fn project_admitted<'a>(
+    bytes: &[u8],
+    requested: &'a Requested<'a>,
+) -> Result<Projection> {
+    let meta = parse_admitted(bytes, requested)?;
     let mut result = Projection::default();
     for (field, ns, path) in [
         ("rating", XMP, "Rating"),
@@ -611,22 +779,119 @@ pub(crate) fn field_address(field: &str) -> Option<(&'static str, &'static str)>
         _ => return None,
     })
 }
-fn xml_attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('"', "&quot;")
-        .replace('\r', "&#13;")
-        .replace('\n', "&#10;")
-        .replace('\t', "&#9;")
+fn push_xml_attribute(output: &mut String, value: &str) {
+    for character in value.chars() {
+        output.push_str(match character {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '"' => "&quot;",
+            '\r' => "&#13;",
+            '\n' => "&#10;",
+            '\t' => "&#9;",
+            _ => {
+                output.push(character);
+                continue;
+            }
+        });
+    }
 }
 type Properties = BTreeMap<(String, String), String>;
+struct AdmittedProperties<'a> {
+    name: String,
+    properties: Properties,
+    // Owner fields drop before their requested-storage guard.
+    _scope: Scope<'a>,
+}
 fn properties(bytes: &[u8]) -> Result<(String, Properties)> {
-    let meta = parse(bytes)?;
-    let name = meta.name();
-    let serialized = canonical(&meta)?;
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    let admitted = properties_admitted(bytes, &requested)?;
+    Ok((admitted.name, admitted.properties))
+}
+
+fn escaped_attribute_bytes(value: &str) -> Result<usize> {
+    value.chars().try_fold(0usize, |bytes, character| {
+        bytes
+            .checked_add(match character {
+                '&' => 5,
+                '<' => 4,
+                '"' => 6,
+                '\r' => 5,
+                '\n' | '\t' => 4,
+                _ => character.len_utf8(),
+            })
+            .context("escaped XML attribute byte length overflow")
+    })
+}
+
+fn properties_admitted<'a>(
+    bytes: &[u8],
+    requested: &'a Requested<'a>,
+) -> Result<AdmittedProperties<'a>> {
+    let meta = parse_admitted(bytes, requested)?;
+    let serialized = canonical_admitted(&meta, requested)?;
+    let _document_scope = requested
+        .scope(crate::lightroom_migration_worker::memory::core::xml_document(&serialized)?)?;
     let doc = roxmltree::Document::parse(&serialized)?;
     let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let descriptions = doc.descendants().filter(|node| {
+        node.has_tag_name((rdf, "Description"))
+            && node
+                .parent()
+                .is_some_and(|parent| parent.has_tag_name((rdf, "RDF")))
+    });
+    let mut count = 0usize;
+    let mut owned = 0usize;
+    for description in descriptions {
+        let subject = description.attribute((rdf, "about")).unwrap_or_default();
+        for property in description.children().filter(|node| node.is_element()) {
+            count = count
+                .checked_add(1)
+                .context("canonical property count overflow")?;
+            let namespace = property
+                .tag_name()
+                .namespace()
+                .context("canonical property lacks namespace")?;
+            owned = owned
+                .checked_add(namespace.len())
+                .and_then(|value| value.checked_add(property.tag_name().name().len()))
+                .and_then(|value| value.checked_add("<rdf:Description rdf:about=\"\"".len()))
+                .context("canonical property storage overflow")?;
+            owned = owned
+                .checked_add(escaped_attribute_bytes(subject)?)
+                .and_then(|value| value.checked_add(1 + property.range().len()))
+                .and_then(|value| value.checked_add("</rdf:Description>".len()))
+                .context("canonical property storage overflow")?;
+            for namespace in property.namespaces() {
+                let prefix = namespace.name().map_or(0, str::len);
+                owned = owned
+                    .checked_add(if namespace.name().is_some() {
+                        " xmlns:=\"\"".len() + prefix
+                    } else {
+                        " xmlns=\"\"".len()
+                    })
+                    .context("canonical namespace storage overflow")?;
+                owned = owned
+                    .checked_add(escaped_attribute_bytes(namespace.uri())?)
+                    .context("canonical namespace storage overflow")?;
+            }
+        }
+    }
+    let name_bytes = doc
+        .descendants()
+        .find(|node| node.has_tag_name((rdf, "Description")))
+        .and_then(|node| node.attribute((rdf, "about")))
+        .unwrap_or_default()
+        .len();
+    let map =
+        crate::lightroom_migration_worker::memory::layout::tree::<(String, String), String>(count)?;
+    let property_scope = requested.scope(
+        owned
+            .checked_add(name_bytes)
+            .and_then(|value| value.checked_add(map))
+            .context("canonical property graph overflow")?,
+    )?;
+    let name = meta.name();
     let mut output = BTreeMap::new();
     for description in doc.descendants().filter(|n| {
         n.has_tag_name((rdf, "Description"))
@@ -638,40 +903,99 @@ fn properties(bytes: &[u8]) -> Result<(String, Properties)> {
                 .namespace()
                 .context("canonical property lacks namespace")?;
             let key = (ns.to_owned(), property.tag_name().name().to_owned());
-            let mut fragment = format!("<rdf:Description rdf:about=\"{}\"", xml_attribute(&name));
+            let mut fragment_bytes = "<rdf:Description rdf:about=\"\"".len()
+                + escaped_attribute_bytes(&name)?
+                + 1
+                + property.range().len()
+                + "</rdf:Description>".len();
+            for namespace in property.namespaces() {
+                fragment_bytes = fragment_bytes
+                    .checked_add(if let Some(prefix) = namespace.name() {
+                        " xmlns:=\"\"".len() + prefix.len()
+                    } else {
+                        " xmlns=\"\"".len()
+                    })
+                    .context("canonical property fragment overflow")?;
+                fragment_bytes = fragment_bytes
+                    .checked_add(escaped_attribute_bytes(namespace.uri())?)
+                    .context("canonical property fragment overflow")?;
+            }
+            let mut fragment = String::with_capacity(fragment_bytes);
+            fragment.push_str("<rdf:Description rdf:about=\"");
+            push_xml_attribute(&mut fragment, &name);
+            fragment.push('"');
             for ns in property.namespaces() {
                 if let Some(prefix) = ns.name() {
-                    fragment.push_str(&format!(" xmlns:{prefix}=\"{}\"", xml_attribute(ns.uri())));
+                    fragment.push_str(" xmlns:");
+                    fragment.push_str(prefix);
+                    fragment.push_str("=\"");
                 } else {
-                    fragment.push_str(&format!(" xmlns=\"{}\"", xml_attribute(ns.uri())));
+                    fragment.push_str(" xmlns=\"");
                 }
+                push_xml_attribute(&mut fragment, ns.uri());
+                fragment.push('"');
             }
             fragment.push('>');
             fragment.push_str(&serialized[property.range()]);
             fragment.push_str("</rdf:Description>");
+            debug_assert_eq!(fragment.len(), fragment_bytes);
             ensure!(
                 output.insert(key, fragment).is_none(),
                 "duplicate canonical top-level property"
             );
         }
     }
-    Ok((name, output))
+    Ok(AdmittedProperties {
+        name,
+        properties: output,
+        _scope: property_scope,
+    })
 }
 fn assemble(properties: &Properties, subject: &str) -> Result<Vec<u8>> {
-    let mut text = String::from(
-        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
-    );
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    Ok(assemble_admitted(properties, subject, &requested)?.0)
+}
+
+fn assemble_admitted<'a>(
+    properties: &Properties,
+    subject: &str,
+    requested: &'a Requested<'a>,
+) -> Result<(Vec<u8>, Scope<'a>)> {
+    const OPEN: &str = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">";
+    const CLOSE: &str = "</rdf:RDF></x:xmpmeta>";
+    let fragments = properties.values().try_fold(0usize, |bytes, fragment| {
+        bytes
+            .checked_add(fragment.len())
+            .context("assembled XMP byte length overflow")
+    })?;
+    let empty = if properties.is_empty() {
+        "<rdf:Description rdf:about=\"\"/>".len() + escaped_attribute_bytes(subject)?
+    } else {
+        0
+    };
+    let text_bytes = OPEN
+        .len()
+        .checked_add(fragments)
+        .and_then(|value| value.checked_add(empty))
+        .and_then(|value| value.checked_add(CLOSE.len()))
+        .context("assembled XMP byte length overflow")?;
+    let _text_scope = requested.scope(text_bytes)?;
+    let mut text = String::with_capacity(text_bytes);
+    text.push_str(OPEN);
     for fragment in properties.values() {
         text.push_str(fragment);
     }
     if properties.is_empty() {
-        text.push_str(&format!(
-            "<rdf:Description rdf:about=\"{}\"/>",
-            xml_attribute(subject)
-        ));
+        text.push_str("<rdf:Description rdf:about=\"");
+        push_xml_attribute(&mut text, subject);
+        text.push_str("\"/>");
     }
-    text.push_str("</rdf:RDF></x:xmpmeta>");
-    serialize(&parse(text.as_bytes())?)
+    text.push_str(CLOSE);
+    debug_assert_eq!(text.len(), text_bytes);
+    let meta = parse_admitted(text.as_bytes(), requested)?;
+    let output_scope = requested.scope(MAX_PACKET_BYTES)?;
+    Ok((serialize(&meta)?, output_scope))
 }
 /// Copy selected complete common properties, including nested data and qualifiers.
 /// A None source is an explicit removal. Everything outside these properties remains from base.
@@ -817,7 +1141,7 @@ pub fn rendered_derivative(base: &[u8], fields: &DerivativeFields) -> Result<Vec
         ),
         (PHOTOSHOP, "ICCProfile", fields.profile_name.clone()),
         (DC, "format", fields.mime_type.clone()),
-        (XMP, "CreatorTool", "PhotoCatalog".into()),
+        (XMP, "CreatorTool", "LensWorks".into()),
     ] {
         edits.push(Edit::Set {
             namespace: namespace.into(),
@@ -861,49 +1185,55 @@ pub fn rendered_derivative(base: &[u8], fields: &DerivativeFields) -> Result<Vec
     Ok(output)
 }
 
+#[cfg(test)]
 pub(crate) fn merge_jpeg(main: &[u8], extended: &[u8]) -> Result<Vec<u8>> {
-    let (name, mut props) = properties(main)?;
-    let (other, more) = properties(extended)?;
-    ensure!(name == other, "JPEG main/extended RDF subjects differ");
-    props.remove(&(
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    Ok(merge_jpeg_admitted(main, extended, &requested)?.0)
+}
+
+pub(crate) fn merge_jpeg_admitted<'a>(
+    main: &[u8],
+    extended: &[u8],
+    requested: &'a Requested<'a>,
+) -> Result<(Vec<u8>, Scope<'a>)> {
+    let mut main = properties_admitted(main, requested)?;
+    let extended = properties_admitted(extended, requested)?;
+    ensure!(
+        main.name == extended.name,
+        "JPEG main/extended RDF subjects differ"
+    );
+    main.properties.remove(&(
         "http://ns.adobe.com/xmp/note/".into(),
         "HasExtendedXMP".into(),
     ));
-    for (key, value) in more {
+    for (key, value) in extended.properties {
         ensure!(
-            props.insert(key, value).is_none(),
+            main.properties.insert(key, value).is_none(),
             "JPEG main/extended properties overlap; explicit reconciliation required"
         );
     }
-    assemble(&props, &name)
+    assemble_admitted(&main.properties, &main.name, requested)
 }
 
 /// Prefix-independent full-property identities for conflict detection. Values alone
 /// cannot distinguish two ratings or keywords carrying different unknown qualifiers.
 pub(crate) fn field_semantics(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
-    fn node_value(node: roxmltree::Node<'_, '_>) -> serde_json::Value {
-        if node.is_text() {
-            return serde_json::json!(["text", node.text().unwrap_or_default()]);
-        }
-        let mut attributes = node
-            .attributes()
-            .map(|a| (a.namespace().unwrap_or_default(), a.name(), a.value()))
-            .collect::<Vec<_>>();
-        attributes.sort();
-        serde_json::json!([
-            node.tag_name().namespace().unwrap_or_default(),
-            node.tag_name().name(),
-            attributes,
-            node.children()
-                .filter(|n| n.is_element() || n.is_text())
-                .map(node_value)
-                .collect::<Vec<_>>()
-        ])
-    }
-    let meta = parse(bytes)?;
-    let serialized = canonical(&meta)?;
+    let admit = |_| Ok(());
+    let requested = Requested::new(&admit);
+    field_semantics_admitted(bytes, &requested)
+}
+
+pub(crate) fn field_semantics_admitted<'a>(
+    bytes: &[u8],
+    requested: &'a Requested<'a>,
+) -> Result<BTreeMap<String, String>> {
+    let meta = parse_admitted(bytes, requested)?;
+    let serialized = canonical_admitted(&meta, requested)?;
+    let _document_scope = requested
+        .scope(crate::lightroom_migration_worker::memory::core::xml_document(&serialized)?)?;
     let doc = roxmltree::Document::parse(&serialized)?;
-    let projection = project(bytes)?;
+    let projection = project_admitted(bytes, requested)?;
     let mut result = BTreeMap::new();
     for field in projection.fields.keys() {
         let address = field_address(field).context("unknown projected field")?;
@@ -921,12 +1251,8 @@ pub(crate) fn field_semantics(bytes: &[u8]) -> Result<BTreeMap<String, String>> 
                     })
             })
             .context("canonical projected property missing")?;
-        result.insert(
-            field.clone(),
-            blake3::hash(&serde_json::to_vec(&node_value(node))?)
-                .to_hex()
-                .to_string(),
-        );
+        let _attributes_scope = requested.scope(semantics_json::attribute_bytes(node)?)?;
+        result.insert(field.clone(), semantics_json::hash(node)?);
     }
     Ok(result)
 }
