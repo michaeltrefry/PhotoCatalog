@@ -13,7 +13,8 @@ use std::{
 
 pub(crate) const PATH_UNITS: usize = 32 * 1024;
 pub(crate) const ERROR_BYTES: usize = 16 * 1024;
-pub(crate) const UUID_BYTES: usize = 36;
+// Inspected manifests accept all Uuid::parse_str formats, including URNs.
+pub(crate) const UUID_BYTES: usize = uuid::fmt::Urn::LENGTH;
 pub(crate) const DIGEST_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
