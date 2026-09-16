@@ -6,11 +6,14 @@
 use super::lightroom_bridge::{Coordinator, Request, Response};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(test)]
+use std::process::ChildStdout;
 use std::{
     io::{Read, Write},
     path::Path,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Condvar, Mutex, atomic::AtomicBool},
+    thread,
 };
 
 pub const ENVELOPE_BYTES: usize = 128 * 1024;
@@ -612,16 +615,52 @@ pub fn worker_main() -> Result<()> {
             }
             Work::Shutdown { sequence } => {
                 ensure!(sequence.0 > 0, "Workbench shutdown sequence");
-                coordinator.shutdown()?;
-                callback.close();
-                write_packet(
-                    &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
-                    &Outcome::Drained {
-                        sequence,
-                        instance: startup.instance,
-                    },
-                )?;
-                return Ok(());
+                let drain_callback = callback.clone();
+                let drain_output = output.clone();
+                let instance = startup.instance.clone();
+                let drain = thread::Builder::new()
+                    .name("workbench-checked-drain".into())
+                    .spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            coordinator.shutdown()
+                        }));
+                        if !matches!(result, Ok(Ok(()))) {
+                            drain_callback.close();
+                            // No Drained acknowledgement can escape a failed
+                            // or panicked SQLite close. OS teardown releases
+                            // retained W handles and the parent proves exit.
+                            std::process::exit(1);
+                        }
+                        drain_callback.close();
+                        write_packet(
+                            &mut *drain_output
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()),
+                            &Outcome::Drained { sequence, instance },
+                        )
+                    })
+                    .context("start Workbench checked drain")?;
+                loop {
+                    let Some(work) = read_packet::<Work>(&mut input)? else {
+                        break;
+                    };
+                    match work {
+                        Work::CallbackBegin {
+                            sequence,
+                            bytes,
+                            blake3,
+                        } => callback.reply(sequence, bytes, blake3)?,
+                        Work::CallbackChunk {
+                            sequence,
+                            offset,
+                            bytes,
+                        } => callback.chunk(sequence, offset, bytes)?,
+                        _ => anyhow::bail!("only callback replies are accepted while draining"),
+                    }
+                }
+                return drain
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Workbench checked drain panicked"))?;
             }
             Work::CallbackBegin {
                 sequence,
@@ -1054,6 +1093,10 @@ impl Client {
             return source_result;
         }
         let graceful = (|| -> Result<()> {
+            ensure!(
+                owner.poisoned.is_none(),
+                "poisoned Workbench requires checked revoke"
+            );
             if owner.child.is_none() {
                 return Ok(());
             }
@@ -1158,6 +1201,14 @@ impl Client {
         let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
         let child = owner.child.as_mut().context("Workbench child missing")?;
         child.kill().context("terminate Workbench fixture")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self, detail: &str) {
+        self.owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .poisoned = Some(detail.into());
     }
 }
 impl Drop for Client {

@@ -1066,7 +1066,10 @@ impl Drop for Owner {
 mod tests {
     use super::*;
     use crate::storage_volume::NativePath;
-    use std::sync::MutexGuard;
+    use std::{
+        sync::MutexGuard,
+        time::{Duration, Instant},
+    };
 
     static PROCESS_SERIAL: Mutex<()> = Mutex::new(());
 
@@ -1102,6 +1105,40 @@ mod tests {
         PROCESS_SERIAL
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn open_managed_plan(generation: &Generation, parent: &Path) -> Result<()> {
+        let parent = std::fs::canonicalize(parent)?;
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let status = match generation.call(lightroom_bridge::Request::Open {
+            attempt: attempt.clone(),
+            root: NativePath::from_path(&parent.join("inspection")),
+            mode: crate::application::lightroom::OpenMode::Create,
+            capture_staging: NativePath::from_path(&parent),
+            limits: crate::application::lightroom::Limits::default().into(),
+        })? {
+            lightroom_bridge::Response::Status(Some(status)) => status,
+            _ => anyhow::bail!("managed Workbench open reply kind"),
+        };
+        let workbench = status.workbench;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = match generation.call(lightroom_bridge::Request::Status {
+                workbench: Some(workbench.clone()),
+                attempt: Some(attempt.clone()),
+            })? {
+                lightroom_bridge::Response::Status(Some(status)) => status,
+                _ => anyhow::bail!("managed Workbench status reply kind"),
+            };
+            if status.initialized {
+                return Ok(());
+            }
+            ensure!(
+                status.error.is_none() && Instant::now() < deadline,
+                "managed Workbench plan did not initialize: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     fn seal_request(action: &str) -> LightroomWorkbenchIo {
@@ -1205,6 +1242,48 @@ mod tests {
                 Some(libc::ESRCH)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn opened_plan_shutdown_serves_filesystem_callbacks_until_checked_reap() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let fixture = ManagedFixture::start(temp.path())?;
+        let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
+        open_managed_plan(&generation, temp.path())?;
+        let pid = generation.pid().context("Workbench fixture PID")?;
+
+        generation.shutdown_checked()?;
+
+        assert!(generation.pid().is_none());
+        assert!(fixture.owner.workbench_reaped.load(Ordering::Acquire));
+        fixture.drain()?;
+        #[cfg(unix)]
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        Ok(())
+    }
+
+    #[test]
+    fn poisoned_live_workbench_revokes_before_filesystem_release() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let fixture = ManagedFixture::start(temp.path())?;
+        let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
+        open_managed_plan(&generation, temp.path())?;
+        let pid = generation.pid().context("Workbench fixture PID")?;
+        generation
+            .workbench
+            .poison_for_test("injected retained fatal SQL owner");
+
+        let failure = generation.shutdown_checked().unwrap_err();
+
+        assert!(failure.to_string().contains("poisoned Workbench"));
+        assert!(generation.pid().is_none());
+        assert!(fixture.owner.workbench_reaped.load(Ordering::Acquire));
+        fixture.drain()?;
+        #[cfg(unix)]
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
         Ok(())
     }
 
