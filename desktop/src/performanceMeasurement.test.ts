@@ -26,6 +26,27 @@ test('durable cull and presentation opportunity use the same input ordinal', () 
   })]);
 });
 
+test('animation frames retain the browser receiver after the scheduler is stored', () => {
+  let now = 0;
+  const frames: FrameRequestCallback[] = [];
+  function receiverSensitiveFrame(this: typeof globalThis, callback: FrameRequestCallback) {
+    if (this !== globalThis) throw new TypeError('Illegal invocation');
+    frames.push(callback);
+    return frames.length;
+  }
+  const recorder = new PerformanceRecorder(
+    'run', 8, { now: () => now, timeOrigin: 1234 }, receiverSensitiveFrame,
+  );
+  const ordinal = recorder.begin('cull', context)!;
+  recorder.present(ordinal, () => true);
+  frames.splice(0).forEach(callback => callback(now));
+  now = 5;
+  frames.splice(0).forEach(callback => callback(now));
+  expect(recorder.receipt().samples).toEqual([
+    expect.objectContaining({ kind: 'cull', outcome: 'complete', presentation_us: 5000 }),
+  ]);
+});
+
 test('a post-commit failure cannot revoke a durable cull presentation', () => {
   const h = harness();
   const ordinal = h.recorder.begin('cull', context)!;

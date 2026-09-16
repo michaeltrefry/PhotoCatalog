@@ -94,7 +94,7 @@ export class PerformanceRecorder {
     this.runId = runId;
     this.maxSamples = maxSamples;
     this.clock = clock;
-    this.frame = frame;
+    this.frame = frame.bind(globalThis);
     this.changed = changed;
   }
 
