@@ -1,5 +1,5 @@
 use photocatalog::{
-    application::{Bridge, Cancellation, PreviewBytes, Reply, Request},
+    application::{Cancellation, PreviewBytes, Reply, Request, desktop::DesktopBridge},
     storage_volume::NativePath,
 };
 use serde::{Deserialize, Serialize};
@@ -19,14 +19,14 @@ struct Operation {
     canceled: bool,
 }
 pub struct State {
-    pub bridge: Bridge,
+    pub bridge: DesktopBridge,
     operations: Mutex<HashMap<String, Operation>>,
     handoffs: Mutex<HashMap<String, PreviewBytes>>,
     pub frontend_ready: AtomicBool,
     pub quitting: AtomicBool,
 }
 impl State {
-    pub fn new(bridge: Bridge) -> Self {
+    pub fn new(bridge: DesktopBridge) -> Self {
         Self {
             bridge,
             operations: Mutex::new(HashMap::new()),
@@ -215,9 +215,16 @@ pub async fn catalog_choose_location(
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = app.dialog().file();
         let selected = match purpose {
-            LocationPurpose::PreviewDestination => dialog.set_title("Choose a new preview storage folder").set_file_name("LensWorks Previews").blocking_save_file(),
-            LocationPurpose::OriginalRoot => dialog.set_title("Choose an original photo root").blocking_pick_folder(),
-            LocationPurpose::LightroomSeal => dialog.set_title("Open a sealed Lightroom selection").blocking_pick_folder(),
+            LocationPurpose::PreviewDestination => dialog
+                .set_title("Choose a new preview storage folder")
+                .set_file_name("LensWorks Previews")
+                .blocking_save_file(),
+            LocationPurpose::OriginalRoot => dialog
+                .set_title("Choose an original photo root")
+                .blocking_pick_folder(),
+            LocationPurpose::LightroomSeal => dialog
+                .set_title("Open a sealed Lightroom selection")
+                .blocking_pick_folder(),
             LocationPurpose::LightroomNewWorkbench => dialog
                 .set_title("Choose a new Lightroom inspection folder")
                 .set_file_name("Lightroom Inspection")

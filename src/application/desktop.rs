@@ -1,5 +1,4 @@
-//! Additive desktop process façade. Production still selects the local Bridge.
-//! Transport qualification does not establish SQL/source/FS custody isolation.
+//! Desktop process façade with independently admitted filesystem and Workbench owners.
 use super::{
     Bridge, BridgeError, Cancellation, Config, ErrorCode, Limits, Pending, PendingBytes,
     PreviewBytes, Reply, Request, error, failure,
@@ -27,6 +26,8 @@ pub(crate) use export_native::tests::fixture as export_native_test_fixture;
 mod filesystem_tests;
 pub(crate) mod lightroom_migration;
 mod migration;
+mod startup;
+pub use startup::{Allocations, StartupFailure};
 mod native;
 mod preview_metadata_admission;
 pub(crate) mod preview_metadata_capacity;
@@ -573,7 +574,14 @@ impl Drop for Handle {
 pub struct DesktopBridge(Arc<Handle>);
 impl DesktopBridge {
     pub fn spawn(config: Config) -> anyhow::Result<Self> {
-        Self::spawn_inner(config, None, None, None, None)
+        let allocations = Allocations::for_config(&config)?;
+        Self::spawn_with_allocations(config, allocations)
+    }
+    pub fn spawn_with_allocations(
+        config: Config,
+        allocations: Allocations,
+    ) -> anyhow::Result<Self> {
+        startup::spawn(config, allocations)
     }
     /// Unselected paired transport. Process metadata, native work, migration
     /// Source payloads and retained migration results use distinct caller-owned
@@ -669,6 +677,11 @@ impl DesktopBridge {
             }
             None => e,
         })?;
+        if let Some(parent) = &filesystem {
+            parent
+                .retain_metadata(metadata.clone())
+                .map_err(|e| filesystem::before_child_failure(&filesystem, e))?;
+        }
         Self::spawn_reserved(config, filesystem, metadata, migration, None)
     }
 
@@ -701,11 +714,6 @@ impl DesktopBridge {
                 &filesystem,
                 "desktop configuration byte limit",
             ));
-        }
-        if let Some(parent) = &filesystem {
-            parent
-                .retain_metadata(metadata.clone())
-                .map_err(|e| filesystem::before_child_failure(&filesystem, e))?;
         }
         let shared = Arc::new(Shared {
             session: *uuid::Uuid::new_v4().as_bytes(),
