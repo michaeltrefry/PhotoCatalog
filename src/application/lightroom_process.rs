@@ -846,7 +846,11 @@ impl Client {
         let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if fixture_harness {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()?;
         let mut starting = StartingChild(Some(child));
         let bootstrap = (|| -> Result<(Child, ChildStdin, Box<dyn Read + Send>)> {
@@ -1266,9 +1270,14 @@ mod tests {
 
     #[test]
     #[ignore = "owned Workbench fixture subprocess entrypoint"]
-    fn owned_workbench_entrypoint() -> Result<()> {
-        worker_main()?;
-        std::process::exit(0);
+    fn owned_workbench_entrypoint() {
+        match worker_main() {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("owned Workbench fixture failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
     }
 
     #[test]
