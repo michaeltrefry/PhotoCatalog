@@ -2343,9 +2343,9 @@ mod tests {
     #[test]
     fn managed_backup_owner_control_and_relay_backings_are_reserved() -> Result<()> {
         let config = config();
-        let report = report(&config)?;
+        let default_report = report(&config)?;
         let contribution = |name| {
-            report
+            default_report
                 .contributions
                 .iter()
                 .find(|entry| entry.name == name)
@@ -2408,7 +2408,7 @@ mod tests {
             .find(|entry| entry.name == "relay.backup_admission_complete_message_backings")
             .context("maximum backup admission message contribution")?;
         assert!(maximum_messages.each > default_messages);
-        assert!(maximum_report.requested > report.requested);
+        assert!(maximum_report.requested > default_report.requested);
         Ok(())
     }
 

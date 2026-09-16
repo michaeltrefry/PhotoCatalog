@@ -39,12 +39,33 @@ type Result<T> = std::result::Result<T, BridgeError>;
 const CONTROL_SLOTS: usize = 16;
 
 fn validate_public_request(request: &Request, limit: usize) -> Result<()> {
-    let bytes =
-        serde_json::to_vec(request).map_err(|e| error(ErrorCode::InvalidRequest, e.to_string()))?;
-    if bytes.len() > limit {
+    struct Count {
+        remaining: usize,
+        exceeded: bool,
+    }
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(remaining) = self.remaining.checked_sub(bytes.len()) else {
+                self.exceeded = true;
+                return Err(std::io::Error::other("request byte limit"));
+            };
+            self.remaining = remaining;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Reject before allocating an encoded copy of an oversized caller value.
+    let mut count = Count {
+        remaining: limit,
+        exceeded: false,
+    };
+    let encoded = serde_json::to_writer(&mut count, request);
+    if count.exceeded {
         return Err(error(ErrorCode::ResourceLimit, "request byte limit"));
     }
-    Ok(())
+    encoded.map_err(|e| error(ErrorCode::InvalidRequest, e.to_string()))
 }
 
 /// Closed requires verified child/pipe drain and verified local Workbench drain.
