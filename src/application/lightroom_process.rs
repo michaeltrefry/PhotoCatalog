@@ -659,165 +659,204 @@ impl super::lightroom::ManagedIo for CallbackProxy {
     }
 }
 
-/// Hidden W entrypoint. stdout is the only response stream; stderr remains
-/// unused so an unframed diagnostic can never be mistaken for protocol data.
+enum CoordinatorCommand {
+    Request {
+        sequence: crate::application::U64,
+        request_digest: String,
+        request: Request,
+    },
+    Shutdown {
+        sequence: crate::application::U64,
+    },
+}
+
+pub(super) fn coordinator_channel_backing() -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    add(
+        channels::bounded(1, std::alloc::Layout::new::<CoordinatorCommand>())?,
+        channels::arc(std::alloc::Layout::new::<Mutex<Option<Coordinator>>>())?,
+    )
+}
+
+/// Hidden W entrypoint. A single retained thread owns Coordinator; this input
+/// thread stays available to deliver callback replies during ordinary requests
+/// as well as checked shutdown. No request thread is detached.
 pub fn worker_main() -> Result<()> {
     let mut input = std::io::stdin().lock();
     let startup: Startup = read_packet(&mut input)?.context("missing Workbench bootstrap")?;
     startup.validate()?;
     let output = Arc::new(Mutex::new(std::io::stdout()));
-    write_packet(
-        &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
-        &Outcome::Ready {
-            instance: startup.instance.clone(),
-            build: build_identity(),
-        },
-    )?;
     let executable = std::env::current_exe()?;
-    let control = std::sync::Arc::new(Mutex::new(super::lightroom_bridge::Control::default()));
+    let control = Arc::new(Mutex::new(super::lightroom_bridge::Control::default()));
     let callback = Arc::new(CallbackProxy {
         output: output.clone(),
         state: Mutex::new(CallbackState::default()),
         wake: Condvar::new(),
     });
-    let mut coordinator = if startup.managed {
+    let coordinator = if startup.managed {
         Coordinator::new_managed(control, callback.clone())
     } else {
         Coordinator::new(control)
     };
-    loop {
-        let work: Work = read_packet(&mut input)?.context("Workbench control stream ended")?;
-        match work {
-            Work::Request {
-                sequence,
-                request_digest: expected,
-                request,
-            } => {
-                ensure!(
-                    sequence.0 > 0 && request_digest(&request)? == expected,
-                    "Workbench request binding mismatch"
-                );
-                #[cfg(test)]
-                if let Request::Status {
-                    attempt: Some(marker),
-                    ..
-                } = &request
-                    && let Some(marker) = marker.strip_prefix("fixture-stall:")
-                {
-                    std::fs::write(marker, b"entered Workbench request")?;
+    // Thread creation failure must not Drop a callback-owning Coordinator on
+    // the sole input thread. Keep its exact owner outside the spawn closure.
+    let retained = Arc::new(Mutex::new(Some(coordinator)));
+    let owner = retained.clone();
+    let worker_callback = callback.clone();
+    let worker_output = output.clone();
+    let instance = startup.instance.clone();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("workbench-coordinator".into())
+        .spawn(move || {
+            let Some(mut coordinator) = owner.lock().unwrap_or_else(|e| e.into_inner()).take()
+            else {
+                std::process::exit(1);
+            };
+            // Keep Coordinator outside the unwind boundary: on failure, exit
+            // without running a potentially blocking owner Drop. G proves the
+            // W process exit before reconciling F and retains Source ownership.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     loop {
-                        std::thread::park();
-                    }
-                }
-                coordinator.maintain()?;
-                let result = coordinator
-                    .request(request, &executable, ENVELOPE_BYTES)
-                    .map_err(|error| {
-                        if coordinator.fatal() {
-                            Failure::fatal(error)
-                        } else {
-                            Failure::new(error)
+                        match receive
+                            .recv()
+                            .context("Workbench request dispatcher disconnected")?
+                        {
+                            CoordinatorCommand::Request {
+                                sequence,
+                                request_digest,
+                                request,
+                            } => {
+                                #[cfg(test)]
+                                if let Request::Status {
+                                    attempt: Some(marker),
+                                    ..
+                                } = &request
+                                    && let Some(marker) = marker.strip_prefix("fixture-stall:")
+                                {
+                                    std::fs::write(marker, b"entered Workbench request")?;
+                                    loop {
+                                        std::thread::park();
+                                    }
+                                }
+                                coordinator.maintain()?;
+                                let result = coordinator
+                                    .request(request, &executable, ENVELOPE_BYTES)
+                                    .map_err(|error| {
+                                        if coordinator.fatal() {
+                                            Failure::fatal(error)
+                                        } else {
+                                            Failure::new(error)
+                                        }
+                                    });
+                                if let Err(error) = &result {
+                                    error.validate()?;
+                                }
+                                write_packet(
+                                    &mut *worker_output.lock().unwrap_or_else(|e| e.into_inner()),
+                                    &Outcome::Reply {
+                                        sequence,
+                                        request_digest,
+                                        result,
+                                    },
+                                )?;
+                            }
+                            CoordinatorCommand::Shutdown { sequence } => {
+                                coordinator.shutdown()?;
+                                worker_callback.close();
+                                write_packet(
+                                    &mut *worker_output.lock().unwrap_or_else(|e| e.into_inner()),
+                                    &Outcome::Drained {
+                                        sequence,
+                                        instance: instance.clone(),
+                                    },
+                                )?;
+                                return Ok(());
+                            }
                         }
-                    });
-                if let Err(error) = &result {
-                    error.validate()?;
-                }
-                write_packet(
-                    &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
-                    &Outcome::Reply {
+                    }
+                }));
+            if !matches!(result, Ok(Ok(()))) {
+                worker_callback.close();
+                std::process::exit(1);
+            }
+        });
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(_) => std::process::exit(1),
+    };
+    drop(retained);
+    let run = (|| -> Result<()> {
+        write_packet(
+            &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
+            &Outcome::Ready {
+                instance: startup.instance,
+                build: build_identity(),
+            },
+        )?;
+        let mut draining = false;
+        loop {
+            let Some(work) = read_packet::<Work>(&mut input)? else {
+                ensure!(draining, "Workbench control stream ended before shutdown");
+                return Ok(());
+            };
+            match work {
+                Work::Request {
+                    sequence,
+                    request_digest: expected,
+                    request,
+                } => {
+                    ensure!(!draining, "request during Workbench shutdown");
+                    ensure!(
+                        sequence.0 > 0 && request_digest(&request)? == expected,
+                        "Workbench request binding mismatch"
+                    );
+                    send.try_send(CoordinatorCommand::Request {
                         sequence,
                         request_digest: expected,
-                        result,
-                    },
-                )?;
-            }
-            Work::Shutdown { sequence } => {
-                ensure!(sequence.0 > 0, "Workbench shutdown sequence");
-                let drain_callback = callback.clone();
-                let drain_output = output.clone();
-                let instance = startup.instance.clone();
-                let retained = Arc::new(Mutex::new(Some(coordinator)));
-                let drain_owner = retained.clone();
-                let drain = thread::Builder::new()
-                    .name("workbench-checked-drain".into())
-                    .spawn(move || {
-                        let Some(mut coordinator) = drain_owner
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .take()
-                        else {
-                            drain_callback.close();
-                            std::process::exit(1);
-                        };
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            coordinator.shutdown()
-                        }));
-                        if !matches!(result, Ok(Ok(()))) {
-                            drain_callback.close();
-                            // No Drained acknowledgement can escape a failed
-                            // or panicked SQLite close. OS teardown releases
-                            // retained W handles and the parent proves exit.
-                            std::process::exit(1);
-                        }
-                        drain_callback.close();
-                        write_packet(
-                            &mut *drain_output
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner()),
-                            &Outcome::Drained { sequence, instance },
-                        )
-                    });
-                let drain = match drain {
-                    Ok(drain) => drain,
-                    Err(_) => {
-                        callback.close();
-                        // `retained` still owns Coordinator here. Exiting
-                        // without unwinding prevents its blocking Drop from
-                        // re-entering the callback path on this input loop.
-                        std::process::exit(1);
-                    }
-                };
-                drop(retained);
-                loop {
-                    let Some(work) = read_packet::<Work>(&mut input)? else {
-                        break;
-                    };
-                    match work {
-                        Work::CallbackBegin {
-                            sequence,
-                            bytes,
-                            blake3,
-                        } => callback.reply(sequence, bytes, blake3)?,
-                        Work::CallbackChunk {
-                            sequence,
-                            offset,
-                            bytes,
-                        } => callback.chunk(sequence, offset, bytes)?,
-                        _ => anyhow::bail!("only callback replies are accepted while draining"),
-                    }
+                        request,
+                    })
+                    .map_err(|_| anyhow::anyhow!("Workbench bounded coordinator unavailable"))?;
                 }
-                return drain
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("Workbench checked drain panicked"))?;
-            }
-            Work::CallbackBegin {
-                sequence,
-                bytes,
-                blake3,
-            } => {
-                ensure!(startup.managed, "callback reply for unmanaged Workbench");
-                callback.reply(sequence, bytes, blake3)?;
-            }
-            Work::CallbackChunk {
-                sequence,
-                offset,
-                bytes,
-            } => {
-                ensure!(startup.managed, "callback reply for unmanaged Workbench");
-                callback.chunk(sequence, offset, bytes)?;
+                Work::Shutdown { sequence } => {
+                    ensure!(!draining && sequence.0 > 0, "Workbench shutdown sequence");
+                    send.try_send(CoordinatorCommand::Shutdown { sequence })
+                        .map_err(|_| {
+                            anyhow::anyhow!("Workbench shutdown dispatcher unavailable")
+                        })?;
+                    draining = true;
+                }
+                Work::CallbackBegin {
+                    sequence,
+                    bytes,
+                    blake3,
+                } => {
+                    ensure!(startup.managed, "callback reply for unmanaged Workbench");
+                    callback.reply(sequence, bytes, blake3)?;
+                }
+                Work::CallbackChunk {
+                    sequence,
+                    offset,
+                    bytes,
+                } => {
+                    ensure!(startup.managed, "callback reply for unmanaged Workbench");
+                    callback.chunk(sequence, offset, bytes)?;
+                }
             }
         }
+    })();
+    callback.close();
+    drop(send);
+    if run.is_err() {
+        // Never join a coordinator while its external callback transport is
+        // unavailable; OS teardown is checked by the retained G child owner.
+        std::process::exit(1);
     }
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("Workbench coordinator panicked"))?;
+    Ok(())
 }
 
 struct Transport {

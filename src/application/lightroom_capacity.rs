@@ -172,6 +172,7 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
 
     let w = super::lightroom::metadata_layouts();
     let (w_channel, w_receiver) = super::lightroom::channel_metadata_layouts()?;
+    let coordinator_channel = lightroom_process::coordinator_channel_backing()? as u64;
     let bridge = super::lightroom_bridge::metadata_layouts();
     let managed = super::lightroom_managed::metadata_layouts();
     let f = crate::filesystem_worker::lightroom_workbench_retained_metadata_layouts();
@@ -347,6 +348,8 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
             w.worker_owner as u64,
             w_channel as u64,
             w_receiver as u64,
+            coordinator_channel,
+            c.mul(2, c.json(lightroom_process::ENVELOPE_BYTES as u64)?)?,
             bridge.control as u64,
             bridge.coordinator as u64,
             sql_control as u64,
