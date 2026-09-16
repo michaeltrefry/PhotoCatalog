@@ -500,6 +500,18 @@ impl Handle {
         self.shared.stop();
         self.local.signal_shutdown();
         let result = self.process.lock().unwrap().drain();
+        {
+            let state = self.shared.state.lock().unwrap();
+            if state.control_reader_failed && !state.reaped {
+                // Pending control tasks can still await replies from this dead
+                // reader. Keep their handles and all dependent owners instead
+                // of joining them or claiming a verified drain.
+                return Err(error(
+                    ErrorCode::Native,
+                    "desktop control reader failed; catalog and dependent owners retained",
+                ));
+            }
+        }
         let migration_drained = self.migration.drained();
         let backup_result = self.shared.backup.as_ref().map_or(Ok(()), |backup| {
             backup
