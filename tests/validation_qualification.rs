@@ -832,20 +832,48 @@ fn validate_path_evidence(
         })?
         .to_string_lossy();
     let evidence = &row["evidence"];
+    let expected_origins = [
+        "embedded",
+        "sidecar_xmp",
+        "sidecar_XMP",
+        "sidecar_appended_xmp",
+        "sidecar_appended_XMP",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     if !SELECTED.contains(&catalog) {
         let expected = match catalog {
             "2014-v13.lrcat" => "2014/January/2014-01-02/excluded-only-2014.jpg",
             "2015-v13-3.lrcat" => "2015/February/2015-02-03/excluded-only-2015.jpg",
             _ => bail!("unexpected excluded fixture catalog: {catalog}"),
         };
+        let inspections = evidence["inspections"]
+            .as_array()
+            .context("missing original inspection evidence")?;
+        let origins = inspections
+            .iter()
+            .map(|inspection| {
+                inspection["origin"]
+                    .as_str()
+                    .context("missing original inspection origin")
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
         ensure!(
             state == "missing"
                 && relative == expected
                 && evidence["packet_gaps"] == false
                 && evidence["metadata"]["missing"] == true
-                && evidence["inspections"]
-                    .as_array()
-                    .is_some_and(Vec::is_empty),
+                && inspections.len() == expected_origins.len()
+                && origins == expected_origins
+                && inspections.iter().all(|inspection| {
+                    inspection["state"] == "absent"
+                        && inspection["error"].is_null()
+                        && inspection["status"].is_null()
+                        && inspection["revision"].is_null()
+                        && inspection["issues"].is_null()
+                        && inspection["packets"] == 0
+                        && inspection["parse_inputs"] == 0
+                }),
             "excluded fixture path evidence differs for {catalog}: {relative} {state}"
         );
         return Ok(());
@@ -862,15 +890,6 @@ fn validate_path_evidence(
                 .context("original inspection origin")
         })
         .collect::<Result<BTreeSet<_>>>()?;
-    let expected_origins = [
-        "embedded",
-        "sidecar_xmp",
-        "sidecar_XMP",
-        "sidecar_appended_xmp",
-        "sidecar_appended_XMP",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
     ensure!(
         inspections.len() == expected_origins.len() && origins == expected_origins,
         "original inspection origin roster differs for {relative}"
