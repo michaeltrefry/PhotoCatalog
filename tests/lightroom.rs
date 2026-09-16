@@ -1159,7 +1159,7 @@ fn emitted_packet_page_includes_newline_in_exact_byte_limit() {
 }
 
 #[test]
-fn create_cli_reports_inspection_schema_three() {
+fn create_cli_reports_current_inspection_schema() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("plan");
     let output = std::process::Command::new(worker())
@@ -1173,7 +1173,10 @@ fn create_cli_reports_inspection_schema_three() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["schema"], 3);
+    assert_eq!(
+        value["schema"],
+        photocatalog::lightroom::plan::PLAN_SCHEMA_VERSION
+    );
     let db = Connection::open_with_flags(
         root.join("inspection.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1182,7 +1185,7 @@ fn create_cli_reports_inspection_schema_three() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        photocatalog::lightroom::plan::PLAN_SCHEMA_VERSION
     );
 }
 

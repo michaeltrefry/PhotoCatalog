@@ -130,7 +130,7 @@ fn explicit_fixture_migration_preserves_typed_data_and_rejects_wrong_index() -> 
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION
             && receipt["protocol"] == 2
             && receipt["identity_scope"] == "pre_existing_tables"
-            && receipt["added_tables"].as_array().unwrap().len() == 56
+            && receipt["added_tables"].as_array().unwrap().len() == 57
             && receipt["added_tables"]
                 .as_array()
                 .unwrap()
@@ -229,7 +229,7 @@ fn schema_five_requires_explicit_migration_and_current_noop_is_truthful() -> Res
     ensure!(migrated["logical_before"] == migrated["logical_after"]);
     ensure!(migrated["identity_scope"] == "pre_existing_tables");
     ensure!(migrated["alias_initial_state"] == serde_json::json!({"unbound":999,"dirty":1}));
-    ensure!(migrated["added_tables"].as_array().unwrap().len() == 56);
+    ensure!(migrated["added_tables"].as_array().unwrap().len() == 57);
     ensure!(
         migrated["added_tables"]
             .as_array()
@@ -395,7 +395,7 @@ fn schema_six_adds_only_verified_image_state_and_rejects_legacy_sequence_spoof()
             && receipt["schema_after"] == photocatalog::CURRENT_SCHEMA_VERSION,
         "{receipt}"
     );
-    ensure!(receipt["added_tables"].as_array().unwrap().len() == 43);
+    ensure!(receipt["added_tables"].as_array().unwrap().len() == 44);
     ensure!(
         receipt["logical_before"] == receipt["logical_after"]
             && receipt["original_columns_preserved"] == true
