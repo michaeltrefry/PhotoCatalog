@@ -526,7 +526,7 @@ mod tests {
             .bytes;
         assert!(wider_queued > queued);
         assert_eq!(
-            report.required,
+            default_report.required,
             default_report.retained + default_report.active
         );
         assert!(SOURCE_PAYLOAD_POOL_CONTRACT.starts_with("distinct"));

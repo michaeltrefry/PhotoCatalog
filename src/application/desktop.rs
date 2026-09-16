@@ -336,6 +336,57 @@ impl LocalOwner {
         }
     }
 }
+
+struct StartupOwners {
+    local: LocalOwner,
+    filesystem: Option<Arc<filesystem::Parent>>,
+}
+/// A failed startup whose exact child owners need another checked drain attempt.
+/// Callers may downcast the startup error and retry without admitting replacements.
+pub struct RetainedStartup {
+    message: String,
+    owners: Mutex<Option<StartupOwners>>,
+}
+impl std::fmt::Debug for RetainedStartup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedDesktopStartup")
+            .field("message", &self.message)
+            .finish()
+    }
+}
+impl std::fmt::Display for RetainedStartup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; desktop startup owners retained", self.message)
+    }
+}
+impl std::error::Error for RetainedStartup {}
+impl RetainedStartup {
+    pub fn try_shutdown(&self) -> anyhow::Result<()> {
+        let mut slot = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(owners) = slot.as_ref() {
+            owners.local.try_shutdown()?;
+            if let Some(filesystem) = &owners.filesystem {
+                filesystem.finish_after_dependents(true)?;
+            }
+        }
+        slot.take();
+        Ok(())
+    }
+}
+impl Drop for RetainedStartup {
+    fn drop(&mut self) {
+        if self.try_shutdown().is_err() {
+            // Losing the error value is not proof of process retirement. Keep
+            // both the exact owner graph and its aggregate allowance retained.
+            std::mem::forget(
+                self.owners
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+            );
+        }
+    }
+}
 struct Handle {
     local: LocalOwner,
     shared: Arc<Shared>,
@@ -668,7 +719,15 @@ impl DesktopBridge {
         let owner = match process::Owner::spawn(&config.worker_executable, shared.clone(), hello) {
             Ok(owner) => owner,
             Err(e) => {
-                let _ = local.try_shutdown();
+                if let Err(cleanup) = local.try_shutdown() {
+                    return Err(anyhow::Error::new(RetainedStartup {
+                        message: format!("{e}; Workbench cleanup: {cleanup}"),
+                        owners: Mutex::new(Some(StartupOwners {
+                            local,
+                            filesystem: shared.filesystem.clone(),
+                        })),
+                    }));
+                }
                 if let Some(f) = &shared.filesystem
                     && f.finish_after_dependents(true).is_err()
                 {
