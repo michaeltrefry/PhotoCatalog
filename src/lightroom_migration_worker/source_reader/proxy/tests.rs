@@ -130,6 +130,25 @@ fn can_write(path: &Path) -> bool {
         fs2::FileExt::try_lock_exclusive(&file).is_ok()
     }
 }
+#[test]
+fn capture_total_deadline_bounds_individual_reads_independently_of_open() {
+    let mut limits = crate::lightroom_migration_worker::source_reader::capture_wire::Limits {
+        open_deadline_ms: U64(1),
+        total_deadline_ms: U64(600_000),
+        vm_steps: U64(1),
+        schema_objects: U64(1),
+        schema_bytes: U64(1),
+        page_bytes: U64(1),
+        max_cell_bytes: U64(1),
+        result_bytes: U64(1),
+        inline_bytes: U64(1),
+        chunk_bytes: U64(1),
+        max_rows: U64(1),
+    };
+    assert_eq!(capture_session_deadlines(limits), (1, 120_000));
+    limits.total_deadline_ms = U64(10_000);
+    assert_eq!(capture_session_deadlines(limits), (1, 10_000));
+}
 fn same<T: serde::Serialize>(a: T, b: T) {
     assert_eq!(
         serde_json::to_vec(&a).unwrap(),

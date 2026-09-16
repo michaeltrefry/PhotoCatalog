@@ -40,6 +40,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const MAX_READ_DEADLINE_MS: u64 = 120_000;
+
 /// Atomic-only single-epoch observation for writer admission and the privately owned
 /// destination connection's precommit hook. Observation never sends IPC or opens
 /// a file. A commit that wins before observed loss remains durable authority.
@@ -113,7 +115,7 @@ impl Session {
     ) -> Result<Self> {
         epoch.validate()?;
         ensure!(
-            (1..=3_600_000).contains(&open_ms) && (1..=3_600_000).contains(&read_ms),
+            (1..=3_600_000).contains(&open_ms) && (1..=MAX_READ_DEADLINE_MS).contains(&read_ms),
             "source process deadline bounds"
         );
         let kind = match &authority {
@@ -178,7 +180,7 @@ impl Session {
             memory,
         } = admission;
         ensure!(
-            (1..=3_600_000).contains(&open_ms) && (1..=120_000).contains(&read_ms),
+            (1..=3_600_000).contains(&open_ms) && (1..=MAX_READ_DEADLINE_MS).contains(&read_ms),
             "source process deadline bounds"
         );
         let until = Instant::now() + Duration::from_millis(open_ms);
@@ -675,6 +677,13 @@ pub(crate) struct RawReader {
 pub(crate) struct CaptureSqlReader {
     session: RefCell<Session>,
 }
+fn capture_session_deadlines(limits: super::capture_wire::Limits) -> (u64, u64) {
+    let open = limits.open_deadline_ms.0;
+    // CaptureSource enforces total_deadline_ms across the complete operation.
+    // Handshake latency and individual query latency have independent bounds.
+    // Narrow only the query wait when the operation limit is shorter.
+    (open, limits.total_deadline_ms.0.min(MAX_READ_DEADLINE_MS))
+}
 #[allow(dead_code)]
 impl CaptureSqlReader {
     pub(crate) fn open(
@@ -694,14 +703,15 @@ impl CaptureSqlReader {
                 .checked_mul(6)
                 .context("CaptureSql producer allocation")?,
         )?;
+        let (open_ms, read_ms) = capture_session_deadlines(limits);
         let session = Session::open(
             relay,
             Epoch { guard, reader },
             Authority::CaptureSql { value: authority },
             opening,
             cancel,
-            limits.open_deadline_ms.0,
-            limits.total_deadline_ms.0,
+            open_ms,
+            read_ms,
         )?;
         Ok(Self {
             session: RefCell::new(session),
