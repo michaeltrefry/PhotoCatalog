@@ -339,13 +339,13 @@ impl Handle {
             ControlTaskKind::BackupAdmission => &mut tasks.backup_admission,
             ControlTaskKind::Close => &mut tasks.close,
         };
-        if slot.as_ref().is_some_and(thread::JoinHandle::is_finished) {
-            if slot.take().unwrap().join().is_err() {
-                return Err(error(
-                    ErrorCode::Native,
-                    "desktop backup control task panicked",
-                ));
-            }
+        if slot.as_ref().is_some_and(thread::JoinHandle::is_finished)
+            && slot.take().unwrap().join().is_err()
+        {
+            return Err(error(
+                ErrorCode::Native,
+                "desktop backup control task panicked",
+            ));
         }
         if slot.is_some() {
             return Err(error(
@@ -1059,12 +1059,11 @@ impl DesktopBridge {
         };
         let admission = self
             .enqueue_backup_admission(backup::AdmissionRequest::Create { catalog })
-            .map_err(|error| {
+            .inspect_err(|_| {
                 let mut state = self.0.shared.state.lock().unwrap();
                 if state.catalog_epoch == catalog_epoch {
                     state.backup_admitting = false;
                 }
-                error
             })?;
         let cancel = admission.cancel.clone();
         let execution_cancel = cancel.clone();
@@ -1143,12 +1142,11 @@ impl DesktopBridge {
                 catalog: catalog.clone(),
                 epoch: catalog_epoch,
             })
-            .map_err(|error| {
+            .inspect_err(|_| {
                 let mut state = self.0.shared.state.lock().unwrap();
                 if state.catalog_epoch == catalog_epoch {
                     state.close_admitting = false;
                 }
-                error
             })?;
         let shared = self.0.shared.clone();
         let (tx, receiver) = mpsc::sync_channel(1);

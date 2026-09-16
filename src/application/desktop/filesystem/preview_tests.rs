@@ -788,7 +788,7 @@ fn actual_public_backup_cancel_reaps_both_g_children_before_terminal_status() ->
     );
     ensure!(executable.is_absolute(), "configured CLI must be absolute");
     let (temporary, root, originals, _, _) = fixture()?;
-    let (mut running, token) =
+    let (running, token) =
         Running::start(temporary.clone(), &executable, &root, &originals, false)?;
     let probe = Arc::new(BackupProcessProbe::default());
     probe.pause();
