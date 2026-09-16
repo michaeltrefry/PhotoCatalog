@@ -184,7 +184,7 @@ fn run(shared: &Shared, generation: &lightroom_managed::Generation) {
     }
 }
 
-pub(super) fn metadata_layouts() -> [(usize, usize); 3] {
+pub(crate) fn metadata_layouts() -> [(usize, usize); 3] {
     [
         (
             std::mem::size_of::<Dispatcher>(),
