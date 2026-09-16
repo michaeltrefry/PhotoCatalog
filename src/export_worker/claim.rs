@@ -493,7 +493,7 @@ fn reopen_claimed_files(
         }
         if let Some(file) = &inner.files[index] {
             ensure!(
-                lease_identity(&file)? == identity,
+                lease_identity(file)? == identity,
                 "claimed export artifact identity changed during move"
             );
             continue;
