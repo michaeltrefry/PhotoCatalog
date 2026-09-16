@@ -274,7 +274,11 @@ fn read_packet<T: DeserializeOwned>(reader: &mut impl Read) -> Result<Option<T>>
             && header[4] == PROTOCOL
             && header[5..8] == [0, 0, 0]
             && header[44..48] == [0, 0, 0, 0],
-        "Workbench frame header mismatch"
+        "Workbench frame header mismatch: {}",
+        header[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     );
     let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
     ensure!(length <= ENVELOPE_BYTES, "Workbench frame byte limit");
