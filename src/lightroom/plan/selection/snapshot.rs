@@ -150,6 +150,7 @@ impl SelectionReview {
         expected_physical: &crate::lightroom_migration_worker::identity::FileKey,
         cancel: Arc<AtomicBool>,
         mut progress: impl FnMut(SelectionProgress),
+        commit_authority: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let limits = self.summary.limits;
         let until = Instant::now() + Duration::from_millis(limits.deadline_ms);
@@ -228,6 +229,7 @@ impl SelectionReview {
         budget.check()?;
         drop(budget);
         self.current(expected_review_token)?;
+        commit_authority()?;
         self.plan.db.execute_batch("COMMIT")?;
         Ok(())
     }

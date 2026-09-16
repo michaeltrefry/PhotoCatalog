@@ -957,6 +957,7 @@ impl Plan {
         directory: &NativePath,
         manifest: &Manifest,
         schema: &crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects,
+        commit_authority: impl FnOnce() -> Result<()>,
     ) -> Result<String> {
         use crate::lightroom_migration_worker::source_reader::capture_wire::{
             ObjectKind, PhysicalCursor,
@@ -1052,6 +1053,7 @@ impl Plan {
             let issue = table.retained_only.as_ref().map(|v| format!("{v:?}"));
             transaction.execute("INSERT INTO tables(revision,name,columns_json,key_json,schema_json,category,expected,state,issue) VALUES(?,?,?,?,?,?,?,?,?)",params![revision,name,serde_json::to_string(&columns)?,serde_json::to_string(&keys)?,serde_json::to_string(&stable)?,&table.category,table.expected_count.map(|v|v.0),if issue.is_some(){"retained_snapshot_only"}else{"pending"},issue])?;
         }
+        commit_authority()?;
         transaction.commit()?;
         Ok(revision)
     }
@@ -1089,6 +1091,7 @@ impl Plan {
         revision: &str,
         stable: &ManagedTable,
         value: crate::lightroom_migration_worker::source_reader::capture_wire::TableValue,
+        commit_authority: impl FnOnce() -> Result<()>,
     ) -> Result<usize> {
         use crate::lightroom_migration_worker::source_reader::capture_wire::TableValue;
         let (_, manifest) = self.capture(revision)?;
@@ -1175,18 +1178,24 @@ impl Plan {
             "UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",
             [revision],
         )?;
+        commit_authority()?;
         transaction.commit()?;
         Ok(retained)
     }
-    pub(crate) fn finish_managed_resume(&mut self, revision: &str) -> Result<String> {
+    pub(crate) fn finish_managed_resume(
+        &mut self,
+        revision: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
         let pending: i64 = self.db.query_row(
             "SELECT count(*) FROM tables WHERE revision=? AND state='pending'",
             [revision],
             |r| r.get(0),
         )?;
         if pending == 0 {
-            self.reconcile(revision)
+            self.reconcile_with_commit(revision, commit_authority)
         } else {
+            commit_authority()?;
             Ok("pending".into())
         }
     }
@@ -1803,6 +1812,13 @@ fn retain_entity(
 }
 impl Plan {
     fn reconcile(&mut self, revision: &str) -> Result<String> {
+        self.reconcile_with_commit(revision, || Ok(()))
+    }
+    fn reconcile_with_commit(
+        &mut self,
+        revision: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
         let transaction = self.db.transaction()?;
         transaction.execute("DELETE FROM issues WHERE revision=? AND code IN ('dangling_reference','duplicate_local_id','duplicate_global_id','hierarchy_cycle','hierarchy_depth_limit','ambiguous_hierarchy_reference','required_auxiliary_missing','unknown_schema_version')",[revision])?;
         {
@@ -1979,6 +1995,7 @@ impl Plan {
             "UPDATE captures SET stage=? WHERE revision=?",
             params![stage, revision],
         )?;
+        commit_authority()?;
         transaction.commit()?;
         Ok(stage.into())
     }
@@ -2034,6 +2051,7 @@ impl Plan {
         &mut self,
         candidate: &OriginalCandidate,
         observation: OriginalObservation,
+        commit_authority: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         ensure!(
             observation.token == candidate.token,
@@ -2124,15 +2142,25 @@ impl Plan {
             "UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",
             [&candidate.revision],
         )?;
+        commit_authority()?;
         transaction.commit()?;
         Ok(())
     }
-    pub(crate) fn finish_managed_originals(&mut self, revision: &str) -> Result<()> {
+    pub(crate) fn finish_managed_originals(
+        &mut self,
+        revision: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let pending: i64 = self
             .db
             .query_row(PATH_PENDING, [revision], |row| row.get(0))?;
         if pending == 0 {
-            self.db.execute("UPDATE captures SET stage='inspection_complete_with_reported_gaps' WHERE revision=? AND stage='rows_reconciled_paths_pending'",[revision])?;
+            let transaction = self.db.transaction()?;
+            transaction.execute("UPDATE captures SET stage='inspection_complete_with_reported_gaps' WHERE revision=? AND stage='rows_reconciled_paths_pending'",[revision])?;
+            commit_authority()?;
+            transaction.commit()?;
+        } else {
+            commit_authority()?;
         }
         Ok(())
     }
@@ -2395,6 +2423,20 @@ impl Plan {
         &mut self,
         inventory: &super::discovery::Inventory,
     ) -> Result<String> {
+        self.register_inventory_with_commit(inventory, || Ok(()))
+    }
+    pub(crate) fn register_inventory_managed(
+        &mut self,
+        inventory: &super::discovery::Inventory,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        self.register_inventory_with_commit(inventory, commit_authority)
+    }
+    fn register_inventory_with_commit(
+        &mut self,
+        inventory: &super::discovery::Inventory,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
         ensure!(
             inventory.protocol == PROTOCOL,
             "unsupported discovery protocol"
@@ -2405,13 +2447,34 @@ impl Plan {
             "inventory exceeds manifest budget"
         );
         let hash = digest(json.as_bytes());
-        self.db.execute(
+        let transaction = self.db.transaction()?;
+        transaction.execute(
             "INSERT OR IGNORE INTO inventories VALUES(?,?)",
             params![hash, json],
         )?;
+        commit_authority()?;
+        transaction.commit()?;
         Ok(hash)
     }
     pub fn assign_family(&mut self, revision: &str, family: &str, reason: &str) -> Result<()> {
+        self.assign_family_with_commit(revision, family, reason, || Ok(()))
+    }
+    pub(crate) fn assign_family_managed(
+        &mut self,
+        revision: &str,
+        family: &str,
+        reason: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.assign_family_with_commit(revision, family, reason, commit_authority)
+    }
+    fn assign_family_with_commit(
+        &mut self,
+        revision: &str,
+        family: &str,
+        reason: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         self.capture(revision)?;
         ensure!(
             !family.trim().is_empty()
@@ -2420,7 +2483,10 @@ impl Plan {
                 && reason.len() <= 4096,
             "explicit bounded family and reason required"
         );
-        self.db.execute("INSERT INTO family_assignments VALUES(?,?,?) ON CONFLICT(revision) DO UPDATE SET family=excluded.family,reason=excluded.reason",params![revision,family,reason])?;
+        let transaction = self.db.transaction()?;
+        transaction.execute("INSERT INTO family_assignments VALUES(?,?,?) ON CONFLICT(revision) DO UPDATE SET family=excluded.family,reason=excluded.reason",params![revision,family,reason])?;
+        commit_authority()?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn families(&self) -> Result<FamilyReport> {
@@ -3225,6 +3291,39 @@ mod bounded_plan_tests {
         assert!(failure.error.to_string().contains("identity"));
         assert!(failure.plan.is_some());
         assert!((*failure.plan.unwrap()).close_checked().is_ok());
+    }
+
+    #[test]
+    fn managed_commit_gate_rolls_back_before_capture_stage_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = Plan::create(&temp.path().join("plan")).unwrap();
+        plan.db
+            .execute(
+                "INSERT INTO captures(revision,lineage,path,manifest,stage) VALUES('r','l','{}','{}','rows_reconciled_paths_pending')",
+                [],
+            )
+            .unwrap();
+
+        let failure = plan
+            .finish_managed_originals("r", || anyhow::bail!("injected F loss at commit selection"))
+            .unwrap_err();
+        assert!(failure.to_string().contains("injected F loss"));
+        let stage: String = plan
+            .db
+            .query_row("SELECT stage FROM captures WHERE revision='r'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stage, "rows_reconciled_paths_pending");
+
+        plan.finish_managed_originals("r", || Ok(())).unwrap();
+        let stage: String = plan
+            .db
+            .query_row("SELECT stage FROM captures WHERE revision='r'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stage, "inspection_complete_with_reported_gaps");
     }
 
     #[test]

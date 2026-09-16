@@ -25,6 +25,15 @@ pub(crate) trait ManagedIo: Send + Sync + 'static {
     /// separate from callback validation so F loss can stop W even while no F
     /// callback is currently in flight.
     fn admit(&self) -> Result<()>;
+    /// Final generation-scoped authority check performed while a managed SQL
+    /// transaction is still rollback-capable, immediately before COMMIT.
+    fn commit(&self) -> Result<()>;
+    /// Permanently revoke this generation before fatal W cleanup. In
+    /// particular, W may no longer release F root custody ahead of its reap.
+    fn revoke_generation(&self);
+    /// Record that the sole W child is gone. G may reconcile F only after this
+    /// notification on every successfully started generation.
+    fn workbench_reaped(&self);
     fn filesystem(
         &self,
         request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
@@ -58,10 +67,11 @@ pub(crate) trait ManagedIo: Send + Sync + 'static {
         source: &str,
     ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::Current>;
     fn source_retire(&self, source: &str) -> Result<()>;
-    /// G-owned terminal gate. Implementations revoke and checked-reap every S
-    /// generation and reconcile retained F resources for this W owner. It does
-    /// not stop the shared F process, which application shutdown drains last.
-    fn drain(&self) -> Result<()>;
+    /// Stop admission and checked-reap every independently owned Source.
+    fn drain_sources(&self) -> Result<()>;
+    /// Reconcile retained F resources after W has been checked-reaped. This
+    /// phase must never run while a W child can still hold SQLite authority.
+    fn drain_filesystem(&self) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

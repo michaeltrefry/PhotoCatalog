@@ -41,6 +41,11 @@ use std::{
     time::Duration,
 };
 
+/// One generation retains a fixed owner/router/monitor assembly, at most one
+/// reader map node, and bounded clones of five F custody identities/tokens.
+/// Payload buffers remain charged by their existing Source/F reservations.
+pub(crate) const RETAINED_METADATA_BYTES: u64 = 64 * 1024;
+
 struct SourceRouter {
     guard: Guard,
     stop: Arc<Stop>,
@@ -385,6 +390,7 @@ impl Custody {
 /// shared allocation pool if construction fails, so startup can be retried or
 /// explicitly drained without losing an active owner.
 pub(crate) struct Owner {
+    _metadata: crate::preview::ByteReservation,
     filesystem: Arc<FilesystemClient>,
     router: Arc<SourceRouter>,
     relay: Arc<RelayClient>,
@@ -393,11 +399,16 @@ pub(crate) struct Owner {
     next_reader: AtomicU64,
     custody: Mutex<Custody>,
     failed: AtomicBool,
+    root_release_allowed: AtomicBool,
+    workbench_started: AtomicBool,
+    workbench_reaped: AtomicBool,
     monitor_stop: AtomicBool,
     monitor: Mutex<Option<JoinHandle<()>>>,
     drain_lock: Mutex<()>,
     source_drain: Mutex<Option<Option<String>>>,
     filesystem_drained: AtomicBool,
+    #[cfg(test)]
+    fail_next_commit: AtomicBool,
 }
 
 /// One concrete G generation. Construction borrows the dependency owner, so a
@@ -414,6 +425,23 @@ impl Generation {
         dependencies.admit()?;
         let managed = dependencies.as_io();
         let workbench = lightroom_process::Client::spawn_managed(executable, &managed)?;
+        dependencies
+            .workbench_started
+            .store(true, Ordering::Release);
+        Ok(Self {
+            workbench,
+            dependencies: dependencies.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    fn start_fixture(dependencies: &Arc<Owner>, executable: &Path) -> Result<Self> {
+        dependencies.admit()?;
+        let managed = dependencies.as_io();
+        let workbench = lightroom_process::Client::spawn_managed_fixture(executable, &managed)?;
+        dependencies
+            .workbench_started
+            .store(true, Ordering::Release);
         Ok(Self {
             workbench,
             dependencies: dependencies.clone(),
@@ -424,20 +452,28 @@ impl Generation {
         &self,
         request: lightroom_bridge::Request,
     ) -> Result<lightroom_bridge::Response> {
-        self.dependencies.admit()?;
+        if let Err(error) = self.dependencies.admit() {
+            let cleanup = self.shutdown_checked();
+            return if self.workbench.checked_drained() {
+                Err(error.context(format!(
+                    "managed generation failure checked-drained{}",
+                    cleanup
+                        .err()
+                        .map(|value| format!(" after {value:#}"))
+                        .unwrap_or_default()
+                )))
+            } else {
+                Err(error.context(format!(
+                    "managed generation remains nonterminal; checked drain failed: {:#}",
+                    cleanup.expect_err("undrained generation must report failure")
+                )))
+            };
+        }
         self.workbench.call(request)
     }
 
     pub(crate) fn shutdown_checked(&self) -> Result<()> {
-        let workbench = self.workbench.shutdown();
-        let dependencies = self.dependencies.drain_checked();
-        match (workbench, dependencies) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(workbench), Err(dependencies)) => Err(workbench.context(format!(
-                "managed Workbench dependency drain also failed: {dependencies:#}"
-            ))),
-        }
+        self.workbench.shutdown()
     }
 
     pub(crate) fn pid(&self) -> Option<u32> {
@@ -465,9 +501,13 @@ impl Owner {
             operation: "workbench-sources".into(),
         };
         guard.validate()?;
+        let metadata = allocation
+            .reserve_exact(RETAINED_METADATA_BYTES)
+            .context("reserve retained Workbench generation metadata")?;
         let budget = MemoryBudget::from_shared(allocation);
         let (router, relay) = SourceRouter::start(source_executable, guard.clone(), budget)?;
         let owner = Arc::new(Self {
+            _metadata: metadata,
             filesystem: filesystem.clone(),
             router,
             relay,
@@ -476,11 +516,16 @@ impl Owner {
             next_reader: AtomicU64::new(1),
             custody: Mutex::new(Custody::default()),
             failed: AtomicBool::new(false),
+            root_release_allowed: AtomicBool::new(true),
+            workbench_started: AtomicBool::new(false),
+            workbench_reaped: AtomicBool::new(false),
             monitor_stop: AtomicBool::new(false),
             monitor: Mutex::new(None),
             drain_lock: Mutex::new(()),
             source_drain: Mutex::new(None),
             filesystem_drained: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_commit: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&owner);
         let monitor = thread::Builder::new()
@@ -530,8 +575,32 @@ impl Owner {
 
     fn fail_sources(&self) {
         self.failed.store(true, Ordering::Release);
+        self.root_release_allowed.store(false, Ordering::Release);
         self.relay.revoke();
         self.router.fail("managed Workbench owner failed");
+    }
+
+    fn commit(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_commit.swap(false, Ordering::AcqRel) {
+            self.fail_sources();
+            anyhow::bail!("injected F loss at managed commit gate");
+        }
+        self.admit()
+            .context("managed Workbench commit authority revoked")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_f_loss_at_next_commit(&self) {
+        self.fail_next_commit.store(true, Ordering::Release);
+    }
+
+    fn revoke_generation(&self) {
+        self.fail_sources();
+    }
+
+    fn workbench_reaped(&self) {
+        self.workbench_reaped.store(true, Ordering::Release);
     }
 
     pub(crate) fn as_io(self: &Arc<Self>) -> Arc<dyn ManagedIo> {
@@ -688,7 +757,7 @@ impl Owner {
         }
     }
 
-    fn drain_all(&self) -> Result<()> {
+    fn drain_sources(&self) -> Result<()> {
         let _drain = self
             .drain_lock
             .lock()
@@ -733,28 +802,42 @@ impl Owner {
             }
             state.clone().flatten()
         };
-        let filesystem_failure = if self.filesystem_drained.load(Ordering::Acquire) {
-            None
-        } else {
-            match self.cleanup_filesystem() {
-                Ok(()) => {
-                    self.filesystem_drained.store(true, Ordering::Release);
-                    None
-                }
-                Err(error) => Some(format!("filesystem checked drain: {error:#}")),
-            }
-        };
-        match (source_failure, filesystem_failure) {
-            (None, None) => Ok(()),
-            (Some(error), None) | (None, Some(error)) => Err(anyhow::anyhow!(error)),
-            (Some(source), Some(filesystem)) => {
-                anyhow::bail!("{source}; {filesystem}")
-            }
+        match source_failure {
+            None => Ok(()),
+            Some(error) => Err(anyhow::anyhow!(error)),
         }
     }
 
+    fn drain_filesystem(&self) -> Result<()> {
+        let _drain = self
+            .drain_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        ensure!(
+            self.source_drain
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(Option::is_none),
+            "Source owners are not checked-drained before F reconciliation"
+        );
+        ensure!(
+            !self.workbench_started.load(Ordering::Acquire)
+                || self.workbench_reaped.load(Ordering::Acquire),
+            "F reconciliation retained until W is checked-reaped"
+        );
+        if self.filesystem_drained.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.cleanup_filesystem()
+            .context("filesystem checked drain")?;
+        self.filesystem_drained.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) fn drain_checked(&self) -> Result<()> {
-        self.drain_all()
+        self.drain_sources()?;
+        self.drain_filesystem()
     }
 }
 
@@ -763,12 +846,30 @@ impl ManagedIo for Owner {
         Owner::admit(self)
     }
 
+    fn commit(&self) -> Result<()> {
+        Owner::commit(self)
+    }
+
+    fn revoke_generation(&self) {
+        Owner::revoke_generation(self);
+    }
+
+    fn workbench_reaped(&self) {
+        Owner::workbench_reaped(self);
+    }
+
     fn filesystem(
         &self,
         request: LightroomWorkbenchIo,
         cancel: &AtomicBool,
     ) -> Result<LightroomWorkbenchIoReply> {
         request.validate()?;
+        if matches!(&request, LightroomWorkbenchIo::RootRelease { .. }) {
+            ensure!(
+                self.root_release_allowed.load(Ordering::Acquire),
+                "F root release retained until fatal W is checked-reaped"
+            );
+        }
         self.custody
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -807,17 +908,21 @@ impl ManagedIo for Owner {
         );
         match owner {
             Ok(owner) => {
-                let replaced = self
+                let mut readers = self
                     .readers
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(
-                        reader.clone(),
-                        Reader::Capture {
-                            owner: Box::new(owner),
-                            cancel,
-                        },
-                    );
+                    .unwrap_or_else(|error| error.into_inner());
+                ensure!(
+                    readers.is_empty(),
+                    "previous Source generation remains retained"
+                );
+                let replaced = readers.insert(
+                    reader.clone(),
+                    Reader::Capture {
+                        owner: Box::new(owner),
+                        cancel,
+                    },
+                );
                 ensure!(replaced.is_none(), "Source generation collision");
                 Ok(reader)
             }
@@ -850,17 +955,21 @@ impl ManagedIo for Owner {
         );
         match owner {
             Ok(owner) => {
-                let replaced = self
+                let mut readers = self
                     .readers
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(
-                        reader.clone(),
-                        Reader::Sql {
-                            owner: Box::new(owner),
-                            cancel,
-                        },
-                    );
+                    .unwrap_or_else(|error| error.into_inner());
+                ensure!(
+                    readers.is_empty(),
+                    "previous Source generation remains retained"
+                );
+                let replaced = readers.insert(
+                    reader.clone(),
+                    Reader::Sql {
+                        owner: Box::new(owner),
+                        cancel,
+                    },
+                );
                 ensure!(replaced.is_none(), "Source generation collision");
                 Ok(reader)
             }
@@ -937,14 +1046,19 @@ impl ManagedIo for Owner {
         reader.retire().inspect_err(|_| self.fail_sources())
     }
 
-    fn drain(&self) -> Result<()> {
-        self.drain_all()
+    fn drain_sources(&self) -> Result<()> {
+        Owner::drain_sources(self)
+    }
+
+    fn drain_filesystem(&self) -> Result<()> {
+        Owner::drain_filesystem(self)
     }
 }
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        let _ = self.drain_all();
+        let _ = self.drain_sources();
+        let _ = self.drain_filesystem();
     }
 }
 
@@ -952,6 +1066,43 @@ impl Drop for Owner {
 mod tests {
     use super::*;
     use crate::storage_volume::NativePath;
+    use std::sync::MutexGuard;
+
+    static PROCESS_SERIAL: Mutex<()> = Mutex::new(());
+
+    struct ManagedFixture {
+        filesystem: Arc<FilesystemClient>,
+        owner: Arc<Owner>,
+    }
+    impl ManagedFixture {
+        fn start(temp: &Path) -> Result<Self> {
+            let filesystem = Arc::new(crate::filesystem_worker::client::migration_fixture(temp)?);
+            let owner = Owner::start(
+                &filesystem,
+                &std::env::current_exe()?,
+                crate::preview::ByteBudget::new(1024 * 1024 * 1024)?,
+            )?;
+            Ok(Self { filesystem, owner })
+        }
+        fn drain(&self) -> Result<()> {
+            self.owner.drain_checked()?;
+            self.filesystem.try_shutdown()
+        }
+    }
+    impl Drop for ManagedFixture {
+        fn drop(&mut self) {
+            if self.drain().is_err() {
+                std::mem::forget(self.filesystem.clone());
+                std::mem::forget(self.owner.clone());
+            }
+        }
+    }
+
+    fn process_serial() -> MutexGuard<'static, ()> {
+        PROCESS_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
 
     fn seal_request(action: &str) -> LightroomWorkbenchIo {
         match action {
@@ -1028,5 +1179,110 @@ mod tests {
             },
         );
         assert!(custody.root.is_none());
+    }
+
+    #[test]
+    fn real_generation_checked_shutdown_reaps_w_then_f() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let fixture = ManagedFixture::start(temp.path())?;
+        let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
+        let pid = generation.pid().context("Workbench fixture PID")?;
+        assert!(matches!(
+            generation.call(lightroom_bridge::Request::Options {})?,
+            lightroom_bridge::Response::Options(_)
+        ));
+
+        generation.shutdown_checked()?;
+        assert!(generation.pid().is_none());
+        assert!(fixture.owner.workbench_reaped.load(Ordering::Acquire));
+        fixture.drain()?;
+        #[cfg(unix)]
+        {
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_w_startup_retains_retryable_dependencies() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let fixture = ManagedFixture::start(temp.path())?;
+        let missing = temp.path().join("missing-workbench-executable");
+        let failure = match Generation::start(&fixture.owner, &missing) {
+            Ok(_) => anyhow::bail!("missing Workbench executable was admitted"),
+            Err(failure) => failure,
+        };
+        assert!(!format!("{failure:#}").is_empty());
+        fixture.owner.admit()?;
+        fixture.drain()?;
+        Ok(())
+    }
+
+    #[test]
+    fn injected_f_loss_revokes_commit_authority_and_admission() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let fixture = ManagedFixture::start(temp.path())?;
+        fixture.owner.inject_f_loss_at_next_commit();
+        let failure = fixture.owner.commit().unwrap_err();
+        assert!(failure.to_string().contains("injected F loss"));
+        assert!(fixture.owner.admit().is_err());
+        fixture.drain()?;
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_reconciliation_waits_for_checked_w_reap() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let fixture = ManagedFixture::start(temp.path())?;
+        fixture
+            .owner
+            .workbench_started
+            .store(true, Ordering::Release);
+        fixture.owner.drain_sources()?;
+        let failure = fixture.owner.drain_filesystem().unwrap_err();
+        assert!(failure.to_string().contains("W is checked-reaped"));
+        assert_eq!(fixture.filesystem.status().phase, FilesystemPhase::Ready);
+
+        fixture.owner.workbench_reaped();
+        fixture.owner.drain_filesystem()?;
+        fixture.filesystem.try_shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn fatal_w_transport_drains_before_return_and_never_readmits() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let fixture = ManagedFixture::start(temp.path())?;
+        let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
+        let pid = generation.pid().context("Workbench fixture PID")?;
+        generation.workbench.terminate_for_test()?;
+
+        let failure = generation
+            .call(lightroom_bridge::Request::Options {})
+            .unwrap_err();
+        assert!(
+            format!("{failure:#}").contains("checked-drained"),
+            "fatal result escaped before exact drain: {failure:#}"
+        );
+        assert!(generation.pid().is_none());
+        assert!(fixture.owner.workbench_reaped.load(Ordering::Acquire));
+        assert!(
+            generation
+                .call(lightroom_bridge::Request::Options {})
+                .is_err()
+        );
+        fixture.drain()?;
+        #[cfg(unix)]
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        Ok(())
     }
 }

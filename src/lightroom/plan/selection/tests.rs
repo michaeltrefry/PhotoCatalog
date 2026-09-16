@@ -613,6 +613,7 @@ fn managed_backup_cancel_at_last_page_retains_source_snapshot() -> Result<()> {
                 request_cancel.store(true, Ordering::Release);
             }
         },
+        || Ok(()),
     );
     ensure!(
         request_cancel.load(Ordering::Acquire),

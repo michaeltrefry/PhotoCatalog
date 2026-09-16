@@ -2276,6 +2276,12 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         ])?,
     )?;
     a.push(
+        "workbench.generation_owner",
+        Phase::Retained,
+        1,
+        crate::application::lightroom_managed::RETAINED_METADATA_BYTES,
+    )?;
+    a.push(
         "fixed.proxy_packet_type_roots",
         Phase::Active,
         1,
@@ -2511,6 +2517,16 @@ mod tests {
                 u64::try_from(fixed)?,
                 Checked.mul(u64::try_from(paths)?, Checked.vec(2, PATH_UNITS as u64)?,)?,
             ])?
+        );
+        let workbench_generation = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "workbench.generation_owner")
+            .unwrap();
+        assert_eq!(workbench_generation.phase, Phase::Retained);
+        assert_eq!(
+            workbench_generation.each,
+            crate::application::lightroom_managed::RETAINED_METADATA_BYTES
         );
         let export_caller = default_report
             .contributions

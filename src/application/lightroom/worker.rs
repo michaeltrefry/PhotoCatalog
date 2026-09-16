@@ -266,7 +266,7 @@ pub(super) fn run(
                 continue;
             }
         }
-        let result = (|| -> Result<String> {
+        let mut result = (|| -> Result<String> {
             control.check()?;
             owner.verify_root(&control)?;
             if let Some(plan) = &mut owner.plan {
@@ -292,12 +292,18 @@ pub(super) fn run(
                 Err(query) => owner.query(query, &control, &operation),
             }
         })();
-        let fatal = owner.poisoned
-            || result.is_err()
-                && owner
-                    .managed
-                    .as_ref()
-                    .is_some_and(|managed| managed.admit().is_err());
+        let managed_failure = owner
+            .managed
+            .as_ref()
+            .and_then(|managed| managed.admit().err());
+        if result.is_ok()
+            && let Some(error) = managed_failure.as_ref()
+        {
+            result = Err(anyhow::anyhow!(format!(
+                "managed authority failed before result publication: {error:#}"
+            )));
+        }
+        let fatal = owner.poisoned || managed_failure.is_some();
         if fatal {
             owner.poisoned = true;
             closing.store(true, Ordering::Release);
@@ -558,6 +564,7 @@ impl Owner {
                 &physical,
                 control.cancel.clone(),
                 move |value| progress.store(value.completed, Ordering::Release),
+                || io.commit(),
             ) {
                 self.poisoned = true;
                 return Err(error).context("managed destination backup failed");
@@ -747,9 +754,9 @@ impl Owner {
         // plan transaction. The evidence lease remains retained through commit.
         self.evidence_current(operation, &capture_generation, control)?;
         self.verify_root(control)?;
-        let revision = self
-            .plan(control)?
-            .add_capture_managed(&directory, &manifest, &schema)?;
+        let revision =
+            self.plan(control)?
+                .add_capture_managed(&directory, &manifest, &schema, || io.commit())?;
         self.release_evidence(operation, &capture_generation)?;
         Ok(revision)
     }
@@ -830,9 +837,12 @@ impl Owner {
                         }
                     };
                     self.verify_root(control)?;
-                    let added = self
-                        .plan(control)?
-                        .apply_managed_table(revision, &stable, value)?;
+                    let added = self.plan(control)?.apply_managed_table(
+                        revision,
+                        &stable,
+                        value,
+                        || io.commit(),
+                    )?;
                     cursor = next_cursor;
                     stable.cursor.clone_from(&cursor);
                     retained = retained.checked_add(added).context("retained row count")?;
@@ -865,7 +875,9 @@ impl Owner {
         };
         self.evidence_current(operation, &capture_generation, control)?;
         self.verify_root(control)?;
-        let stage = self.plan(control)?.finish_managed_resume(revision)?;
+        let stage = self
+            .plan(control)?
+            .finish_managed_resume(revision, || io.commit())?;
         self.release_evidence(operation, &capture_generation)?;
         Ok(core::plan::Progress {
             revision_id: revision.into(),
@@ -960,7 +972,7 @@ impl Owner {
             );
             self.verify_root(control)?;
             self.plan(control)?
-                .apply_managed_original(&candidate, observation)?;
+                .apply_managed_original(&candidate, observation, || io.commit())?;
             let release = LightroomWorkbenchIo::OriginalRelease {
                 operation: operation.into(),
                 workbench: self.workbench.clone(),
@@ -973,7 +985,8 @@ impl Owner {
             control.progress(processed as u64);
         }
         self.verify_root(control)?;
-        self.plan(control)?.finish_managed_originals(revision)?;
+        self.plan(control)?
+            .finish_managed_originals(revision, || io.commit())?;
         Ok(processed)
     }
     fn verify_root(&mut self, control: &Control) -> Result<()> {
@@ -1182,7 +1195,12 @@ impl Owner {
                 for excluded in &inventory.exclusions {
                     native_units(excluded, path_limit)?;
                 }
-                let digest = self.plan(control)?.register_inventory(&inventory)?;
+                let digest = if let Some(io) = self.managed.clone() {
+                    self.plan(control)?
+                        .register_inventory_managed(&inventory, || io.commit())?
+                } else {
+                    self.plan(control)?.register_inventory(&inventory)?
+                };
                 encode(&serde_json::json!({"inventory_digest":digest}), limit)
             }
             Action::AddCapture { directory } => {
@@ -1232,8 +1250,17 @@ impl Owner {
                 family,
                 reason,
             } => {
-                self.plan(control)?
-                    .assign_family(&revision, &family, &reason)?;
+                if let Some(io) = self.managed.clone() {
+                    self.plan(control)?.assign_family_managed(
+                        &revision,
+                        &family,
+                        &reason,
+                        || io.commit(),
+                    )?;
+                } else {
+                    self.plan(control)?
+                        .assign_family(&revision, &family, &reason)?;
+                }
                 encode(
                     &serde_json::json!({"revision":revision,"family":family}),
                     limit,
@@ -1245,8 +1272,11 @@ impl Owner {
                 expected_evidence,
                 reason,
             } => {
+                let managed = self.managed.clone();
                 let plan = self.plan(control)?;
-                plan.desktop_choose(&family, &revision, &expected_evidence, &reason)?;
+                plan.desktop_choose(&family, &revision, &expected_evidence, &reason, || {
+                    managed.as_ref().map_or(Ok(()), |io| io.commit())
+                })?;
                 encode(
                     &serde_json::json!({"family":family,"revision":revision,"evidence":expected_evidence}),
                     limit,
