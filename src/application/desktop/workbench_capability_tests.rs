@@ -219,7 +219,7 @@ fn managed_dispatcher_preserves_sealed_artifact_and_approval_capabilities() -> R
     let allocation = lightroom_capacity::Allocation::from_subgrant(
         requirement,
         metadata.reserve_exact(requirement.bytes())?,
-        ByteBudget::new(1024 * 1024 * 1024)?,
+        ByteBudget::new(lightroom_capacity::source_requirement()?)?,
     )?;
     let filesystem = Arc::new(FilesystemClient::spawn(
         &config.worker_executable,
