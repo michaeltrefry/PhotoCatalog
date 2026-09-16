@@ -27,8 +27,25 @@ export type MeasurementReceipt = {
   readonly run_id: string;
   readonly time_origin_ms: number;
   readonly overflowed: number;
+  readonly thumbnail_diagnostics: ThumbnailDiagnostics;
   readonly samples: readonly MeasurementSample[];
 };
+
+export type ThumbnailDiagnostics = {
+  attempts: number;
+  decode_completed: number;
+  decode_failed: number;
+  source_changed: number;
+  disconnected: number;
+  incomplete: number;
+  zero_size: number;
+  nonvisible: number;
+  accepted: number;
+  roster_tiles: number;
+  pending_expected: number;
+};
+
+type ThumbnailPresentation = Exclude<keyof ThumbnailDiagnostics, 'attempts' | 'decode_completed' | 'decode_failed' | 'roster_tiles' | 'pending_expected'>;
 
 type Active = {
   kind: MeasurementKind;
@@ -56,6 +73,11 @@ export class PerformanceRecorder {
   private frozen: MeasurementReceipt | null = null;
   private readonly active = new Map<number, Active>();
   private readonly samples: MeasurementSample[] = [];
+  private readonly thumbnailDiagnostics: ThumbnailDiagnostics = {
+    attempts: 0, decode_completed: 0, decode_failed: 0, source_changed: 0,
+    disconnected: 0, incomplete: 0, zero_size: 0, nonvisible: 0,
+    accepted: 0, roster_tiles: 0, pending_expected: 0,
+  };
   readonly runId: string;
   readonly maxSamples: number;
   private readonly clock: Clock;
@@ -123,28 +145,41 @@ export class PerformanceRecorder {
     const expected = new Set(tileIds);
     if (!expected.size) return;
     active.expected = expected;
+    this.thumbnailDiagnostic('roster_tiles', expected.size);
     active.presented ??= new Map();
     this.finishBrowseIfReady(active);
   }
 
-  thumbnailDecoded(ordinal: number, tileId: string, verify: () => boolean) {
+  thumbnailAttempt() { this.thumbnailDiagnostic('attempts'); }
+  thumbnailDecodeCompleted() { this.thumbnailDiagnostic('decode_completed'); }
+  thumbnailDecodeFailed() { this.thumbnailDiagnostic('decode_failed'); }
+
+  thumbnailDecoded(ordinal: number, tileId: string, inspect: () => ThumbnailPresentation) {
     this.afterTwoFrames(() => {
       const active = this.active.get(ordinal);
       if (!active || active.kind !== 'browse') return;
-      let presented = false;
-      try { presented = verify(); } catch { /* Leave the sample incomplete without affecting browsing. */ }
-      if (!presented) return;
+      let outcome: ThumbnailPresentation = 'incomplete';
+      try { outcome = inspect(); } catch { /* Leave the sample incomplete without affecting browsing. */ }
+      if (outcome !== 'accepted') { this.thumbnailDiagnostic(outcome); return; }
       active.presented ??= new Map();
-      if (!active.presented.has(tileId)) active.presented.set(tileId, this.clock.now());
+      if (!active.presented.has(tileId)) {
+        active.presented.set(tileId, this.clock.now());
+        this.thumbnailDiagnostic('accepted');
+      }
       this.finishBrowseIfReady(active);
     });
   }
 
   receipt(): MeasurementReceipt {
     if (this.frozen) return this.frozen;
-    for (const active of [...this.active.values()]) this.finish(active, 'incomplete', null);
+    for (const active of [...this.active.values()]) {
+      if (active.kind === 'browse' && active.expected) {
+        this.thumbnailDiagnostic('pending_expected', [...active.expected].filter(id => !active.presented?.has(id)).length);
+      }
+      this.finish(active, 'incomplete', null);
+    }
     const samples = Object.freeze(this.samples.map(sample => Object.freeze({ ...sample })));
-    this.frozen = Object.freeze({ protocol: 1, presentation_model: 'two_animation_frames', context_model: 'last_observed_status_at_start', run_id: this.runId, time_origin_ms: this.clock.timeOrigin, overflowed: this.overflowed, samples });
+    this.frozen = Object.freeze({ protocol: 1, presentation_model: 'two_animation_frames', context_model: 'last_observed_status_at_start', run_id: this.runId, time_origin_ms: this.clock.timeOrigin, overflowed: this.overflowed, thumbnail_diagnostics: Object.freeze({ ...this.thumbnailDiagnostics }), samples });
     return this.frozen;
   }
 
@@ -152,6 +187,10 @@ export class PerformanceRecorder {
   // establish compositor delivery or physical scanout; those need native trace evidence.
   private afterTwoFrames(action: () => void) { this.frame(() => { this.frame(() => action()); }); }
   private notify() { try { this.changed(); } catch { /* Measurement status cannot affect product work. */ } }
+  private thumbnailDiagnostic(kind: keyof ThumbnailDiagnostics, count = 1) {
+    if (this.frozen) return;
+    this.thumbnailDiagnostics[kind] = Math.min(0xffffffff, this.thumbnailDiagnostics[kind] + count);
+  }
 
   private finishBrowseIfReady(active: Active) {
     if (!active.expected || !active.presented || ![...active.expected].every(id => active.presented!.has(id))) return;
@@ -233,16 +272,23 @@ export const measurementEnded = (ordinal: number | undefined, outcome: 'backend_
 export const measurementSearchResponse = (ordinal: number | undefined, rows: number) => { if (ordinal !== undefined) recorder?.searchResponse(ordinal, rows); };
 export const measurementVisible = (ordinal: number | undefined, ids: string[]) => { if (ordinal !== undefined) recorder?.visible(ordinal, ids); };
 
+export function classifyThumbnailPresentation(image: Pick<HTMLImageElement, 'getAttribute' | 'isConnected' | 'complete' | 'naturalWidth' | 'naturalHeight' | 'getBoundingClientRect'>, expectedSource: string): ThumbnailPresentation {
+  if (image.getAttribute('src') !== expectedSource) return 'source_changed';
+  if (!image.isConnected) return 'disconnected';
+  if (!image.complete) return 'incomplete';
+  if (image.naturalWidth <= 0 || image.naturalHeight <= 0) return 'zero_size';
+  const rect = image.getBoundingClientRect();
+  if (!(rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth)) return 'nonvisible';
+  return 'accepted';
+}
+
 export async function measurementThumbnail(ordinal: number | undefined, tileId: string, image: HTMLImageElement, expectedSource: string) {
   if (ordinal === undefined || !recorder) return;
+  recorder.thumbnailAttempt();
   try { await image.decode(); }
-  catch { return; }
-  if (image.getAttribute('src') !== expectedSource) return;
-  recorder.thumbnailDecoded(ordinal, tileId, () => {
-    if (image.getAttribute('src') !== expectedSource || !image.isConnected || !image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) return false;
-    const rect = image.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
-  });
+  catch { recorder.thumbnailDecodeFailed(); return; }
+  recorder.thumbnailDecodeCompleted();
+  recorder.thumbnailDecoded(ordinal, tileId, () => classifyThumbnailPresentation(image, expectedSource));
 }
 
 export async function finalizeMeasurement() {

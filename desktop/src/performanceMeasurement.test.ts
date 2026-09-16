@@ -1,5 +1,5 @@
 import { expect, test, vi } from 'vitest';
-import { PerformanceRecorder, ReceiptFinalizer } from './performanceMeasurement';
+import { classifyThumbnailPresentation, PerformanceRecorder, ReceiptFinalizer } from './performanceMeasurement';
 
 const context = { duringImport: false, duringExport: false };
 
@@ -42,15 +42,64 @@ test('browse completes only after the frozen visible roster is decoded and prese
   const h = harness();
   const ordinal = h.recorder.begin('browse', context)!;
   h.advance(3); h.recorder.searchResponse(ordinal, 100);
-  h.recorder.thumbnailDecoded(ordinal, 'second', () => true);
+  h.recorder.thumbnailAttempt();
+  h.recorder.thumbnailDecoded(ordinal, 'second', () => 'accepted');
   h.frame(); h.advance(5); h.frame();
   h.recorder.visible(ordinal, ['first', 'second']);
-  h.advance(2); h.recorder.thumbnailDecoded(ordinal, 'first', () => true);
+  h.advance(2); h.recorder.thumbnailAttempt(); h.recorder.thumbnailDecoded(ordinal, 'first', () => 'accepted');
   h.frame(); h.advance(7); h.frame();
   expect(h.recorder.receipt().samples).toEqual([expect.objectContaining({
     kind: 'browse', outcome: 'complete', search_response_us: 3000, first_thumbnail_us: 8000,
     visible_complete_us: 17000, page_rows: 100, visible_count: 2,
   })]);
+  expect(h.recorder.receipt().thumbnail_diagnostics).toEqual(expect.objectContaining({ attempts: 2, accepted: 2, roster_tiles: 2 }));
+});
+
+test('thumbnail diagnostics distinguish every presentation rejection without completing the roster', () => {
+  const h = harness();
+  const ordinal = h.recorder.begin('browse', context)!;
+  h.recorder.searchResponse(ordinal, 100);
+  h.recorder.visible(ordinal, ['tile']);
+  h.recorder.thumbnailAttempt(); h.recorder.thumbnailDecodeFailed();
+  h.recorder.thumbnailDecoded(ordinal, 'tile', () => 'source_changed');
+  h.frame(); h.frame();
+  const receipt = h.recorder.receipt();
+  expect(receipt.samples).toEqual([expect.objectContaining({ kind: 'browse', outcome: 'incomplete', visible_count: 1 })]);
+  expect(receipt.thumbnail_diagnostics).toEqual({
+    attempts: 1, decode_completed: 0, decode_failed: 1, source_changed: 1,
+    disconnected: 0, incomplete: 0, zero_size: 0, nonvisible: 0,
+    accepted: 0, roster_tiles: 1, pending_expected: 1,
+  });
+});
+
+test('accepted diagnostics count unique expected tiles and retain pending roster size', () => {
+  const h = harness();
+  const ordinal = h.recorder.begin('browse', context)!;
+  h.recorder.searchResponse(ordinal, 100);
+  h.recorder.visible(ordinal, ['first', 'second']);
+  h.recorder.thumbnailAttempt(); h.recorder.thumbnailDecodeCompleted();
+  h.recorder.thumbnailDecoded(ordinal, 'first', () => 'accepted');
+  h.recorder.thumbnailDecoded(ordinal, 'first', () => 'accepted');
+  h.frame(); h.frame();
+  const receipt = h.recorder.receipt();
+  expect(receipt.thumbnail_diagnostics).toEqual(expect.objectContaining({
+    attempts: 1, decode_completed: 1, accepted: 1, roster_tiles: 2, pending_expected: 1,
+  }));
+});
+
+test('thumbnail presentation classifier keeps current decoded visible element gates explicit', () => {
+  const image = {
+    getAttribute: () => 'blob:current', isConnected: true, complete: true,
+    naturalWidth: 100, naturalHeight: 80,
+    getBoundingClientRect: () => ({ width: 100, height: 80, top: 1, left: 1, bottom: 81, right: 101, x: 1, y: 1, toJSON: () => ({}) }),
+  } as unknown as HTMLImageElement;
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { innerHeight: 600, innerWidth: 800 } });
+  expect(classifyThumbnailPresentation(image, 'blob:current')).toBe('accepted');
+  expect(classifyThumbnailPresentation({ ...image, getAttribute: () => 'blob:stale' }, 'blob:current')).toBe('source_changed');
+  expect(classifyThumbnailPresentation({ ...image, isConnected: false }, 'blob:current')).toBe('disconnected');
+  expect(classifyThumbnailPresentation({ ...image, complete: false }, 'blob:current')).toBe('incomplete');
+  expect(classifyThumbnailPresentation({ ...image, naturalWidth: 0 }, 'blob:current')).toBe('zero_size');
+  expect(classifyThumbnailPresentation({ ...image, getBoundingClientRect: () => ({ width: 100, height: 80, top: 700, left: 1, bottom: 780, right: 101, x: 1, y: 700, toJSON: () => ({}) }) }, 'blob:current')).toBe('nonvisible');
 });
 
 test('sample and active bounds fail closed without growing the receipt', () => {

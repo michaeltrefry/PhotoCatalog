@@ -12,6 +12,7 @@ const MAX_SAMPLES: usize = 512;
 const MAX_RECEIPT_BYTES: usize = 128 * 1024;
 const MAX_DURATION_US: u64 = 30 * 60 * 1_000_000;
 const MAX_STARTED_US: u64 = 24 * 60 * 60 * 1_000_000;
+const MAX_THUMBNAIL_EVENTS: u32 = 1_000_000;
 
 struct Target {
     run_id: String,
@@ -165,7 +166,23 @@ pub struct Receipt {
     run_id: String,
     time_origin_ms: f64,
     overflowed: u32,
+    thumbnail_diagnostics: ThumbnailDiagnostics,
     samples: Vec<Sample>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+pub struct ThumbnailDiagnostics {
+    attempts: u32,
+    decode_completed: u32,
+    decode_failed: u32,
+    source_changed: u32,
+    disconnected: u32,
+    incomplete: u32,
+    zero_size: u32,
+    nonvisible: u32,
+    accepted: u32,
+    roster_tiles: u32,
+    pending_expected: u32,
 }
 
 pub fn run_id() -> Result<Option<String>, String> {
@@ -223,6 +240,21 @@ fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
         || receipt.time_origin_ms < 0.0
         || receipt.time_origin_ms > 10_000_000_000_000.0
         || receipt.samples.len() > MAX_SAMPLES
+        || [
+            receipt.thumbnail_diagnostics.attempts,
+            receipt.thumbnail_diagnostics.decode_completed,
+            receipt.thumbnail_diagnostics.decode_failed,
+            receipt.thumbnail_diagnostics.source_changed,
+            receipt.thumbnail_diagnostics.disconnected,
+            receipt.thumbnail_diagnostics.incomplete,
+            receipt.thumbnail_diagnostics.zero_size,
+            receipt.thumbnail_diagnostics.nonvisible,
+            receipt.thumbnail_diagnostics.accepted,
+            receipt.thumbnail_diagnostics.roster_tiles,
+            receipt.thumbnail_diagnostics.pending_expected,
+        ]
+        .into_iter()
+        .any(|value| value > MAX_THUMBNAIL_EVENTS)
     {
         return Err("Measurement receipt header is invalid".into());
     }
@@ -340,6 +372,7 @@ mod tests {
             run_id: "run".into(),
             time_origin_ms: 42.0,
             overflowed: 0,
+            thumbnail_diagnostics: ThumbnailDiagnostics::default(),
             samples: vec![Sample {
                 kind: Kind::Cull,
                 ordinal: 1,
@@ -398,6 +431,19 @@ mod tests {
             run_id: "x".repeat(64),
             time_origin_ms: 10_000_000_000_000.0,
             overflowed: u32::MAX,
+            thumbnail_diagnostics: ThumbnailDiagnostics {
+                attempts: MAX_THUMBNAIL_EVENTS,
+                decode_completed: MAX_THUMBNAIL_EVENTS,
+                decode_failed: MAX_THUMBNAIL_EVENTS,
+                source_changed: MAX_THUMBNAIL_EVENTS,
+                disconnected: MAX_THUMBNAIL_EVENTS,
+                incomplete: MAX_THUMBNAIL_EVENTS,
+                zero_size: MAX_THUMBNAIL_EVENTS,
+                nonvisible: MAX_THUMBNAIL_EVENTS,
+                accepted: MAX_THUMBNAIL_EVENTS,
+                roster_tiles: MAX_THUMBNAIL_EVENTS,
+                pending_expected: MAX_THUMBNAIL_EVENTS,
+            },
             samples: (1..=MAX_SAMPLES)
                 .map(|ordinal| Sample {
                     kind: Kind::Browse,
@@ -434,6 +480,7 @@ mod tests {
             run_id: "persist-once".into(),
             time_origin_ms: 42.0,
             overflowed: 0,
+            thumbnail_diagnostics: ThumbnailDiagnostics::default(),
             samples: Vec::new(),
         };
         let path = PathBuf::from(state.finish(receipt).unwrap());
@@ -447,6 +494,7 @@ mod tests {
                 run_id: "persist-once".into(),
                 time_origin_ms: 42.0,
                 overflowed: 0,
+                thumbnail_diagnostics: ThumbnailDiagnostics::default(),
                 samples: Vec::new(),
             })
             .unwrap();
@@ -460,6 +508,7 @@ mod tests {
                     run_id: "persist-once".into(),
                     time_origin_ms: 43.0,
                     overflowed: 0,
+                    thumbnail_diagnostics: ThumbnailDiagnostics::default(),
                     samples: Vec::new(),
                 })
                 .is_err()
