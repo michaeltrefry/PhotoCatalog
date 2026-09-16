@@ -154,7 +154,9 @@ enum CallbackValue {
     ArtifactPreparation {
         value: Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>,
     },
-    Source(String),
+    Source {
+        value: String,
+    },
     Schema(crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects),
     Table(crate::lightroom_migration_worker::source_reader::capture_wire::TableValue),
     Current(crate::lightroom_migration_worker::source_reader::capture_wire::Current),
@@ -568,7 +570,7 @@ impl super::lightroom::ManagedIo for CallbackProxy {
         cancel: Arc<AtomicBool>,
     ) -> Result<String> {
         match self.call(CallbackRequest::SourceOpen { authority }, &cancel)? {
-            CallbackValue::Source(value) => Ok(value),
+            CallbackValue::Source { value } => Ok(value),
             _ => anyhow::bail!("Workbench source-open callback result kind"),
         }
     }
@@ -587,7 +589,7 @@ impl super::lightroom::ManagedIo for CallbackProxy {
             },
             &cancel,
         )? {
-            CallbackValue::Source(value) => Ok(value),
+            CallbackValue::Source { value } => Ok(value),
             _ => anyhow::bail!("Workbench SQL13 source-open callback result kind"),
         }
     }
@@ -1105,19 +1107,16 @@ impl Client {
                     value: managed.artifact_preparation(request, cancel.as_ref())?,
                 })
             }
-            CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source(
-                managed.source_open(authority, cancel.clone())?,
-            )),
+            CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source {
+                value: managed.source_open(authority, cancel.clone())?,
+            }),
             CallbackRequest::SourceSqlOpen {
                 seal,
                 limits,
                 protected,
-            } => Ok(CallbackValue::Source(managed.source_sql_open(
-                seal,
-                limits,
-                protected,
-                cancel.clone(),
-            )?)),
+            } => Ok(CallbackValue::Source {
+                value: managed.source_sql_open(seal, limits, protected, cancel.clone())?,
+            }),
             CallbackRequest::SourceSchema { source } => {
                 Ok(CallbackValue::Schema(managed.source_schema(&source)?))
             }
@@ -1654,6 +1653,89 @@ mod tests {
         oversized.extend_from_slice(&u32::MAX.to_le_bytes());
         oversized.extend_from_slice(&[0; 36]);
         assert!(read_packet::<Startup>(&mut oversized.as_slice()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn callback_values_round_trip_through_the_chunked_payload_envelope() -> Result<()> {
+        use crate::lightroom_migration_worker::source_reader::capture_wire as capture;
+
+        let values = [
+            ("admitted", CallbackValue::Admitted),
+            (
+                "filesystem",
+                CallbackValue::Filesystem(
+                    crate::filesystem_worker::wire::LightroomWorkbenchIoReply::Released {
+                        operation: "operation".into(),
+                    },
+                ),
+            ),
+            (
+                "sealed_document",
+                CallbackValue::SealedDocument { value: None },
+            ),
+            (
+                "artifact_preparation",
+                CallbackValue::ArtifactPreparation { value: None },
+            ),
+            (
+                "source",
+                CallbackValue::Source {
+                    value: "capture-sql-1".into(),
+                },
+            ),
+            (
+                "schema",
+                CallbackValue::Schema(capture::SchemaObjects {
+                    authority_binding: "binding".into(),
+                    schema_roster_blake3: "roster".into(),
+                    objects: vec![],
+                    tables: vec![],
+                    variables: std::collections::BTreeMap::new(),
+                }),
+            ),
+            (
+                "table",
+                CallbackValue::Table(capture::TableValue::Batch(capture::TableBatch {
+                    authority_binding: "binding".into(),
+                    schema_roster_blake3: "roster".into(),
+                    table_handle: "table".into(),
+                    request_sequence: crate::application::U64(1),
+                    rows: vec![],
+                    next_cursor: None,
+                    eof: true,
+                    observed: crate::application::U64(0),
+                })),
+            ),
+            (
+                "current",
+                CallbackValue::Current(capture::Current {
+                    authority_binding: "binding".into(),
+                    schema_roster_blake3: "roster".into(),
+                    data_version: crate::application::I64(1),
+                }),
+            ),
+            ("retired", CallbackValue::Retired),
+        ];
+        for (expected, value) in values {
+            let result: std::result::Result<CallbackValue, Failure> = Ok(value);
+            let bytes = encode_limit(&result, CALLBACK_BYTES)?;
+            let decoded: std::result::Result<CallbackValue, Failure> =
+                decode_limit(&bytes, CALLBACK_BYTES)?;
+            let actual = match decoded {
+                Ok(CallbackValue::Admitted) => "admitted",
+                Ok(CallbackValue::Filesystem(_)) => "filesystem",
+                Ok(CallbackValue::SealedDocument { .. }) => "sealed_document",
+                Ok(CallbackValue::ArtifactPreparation { .. }) => "artifact_preparation",
+                Ok(CallbackValue::Source { .. }) => "source",
+                Ok(CallbackValue::Schema(_)) => "schema",
+                Ok(CallbackValue::Table(_)) => "table",
+                Ok(CallbackValue::Current(_)) => "current",
+                Ok(CallbackValue::Retired) => "retired",
+                Err(failure) => anyhow::bail!("callback {expected} failed: {}", failure.detail),
+            };
+            assert_eq!(actual, expected);
+        }
         Ok(())
     }
 
