@@ -345,7 +345,7 @@ impl Coordinator {
             }
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_process_probe(
         &mut self,
         probe: Arc<dyn Fn(core::managed::ProcessEvent) + Send + Sync>,

@@ -848,7 +848,7 @@ impl DesktopBridge {
             pid: self.0.pid,
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_backup_process_probe(
         &self,
         probe: Arc<dyn Fn(crate::catalog_backup::managed::ProcessEvent) + Send + Sync>,

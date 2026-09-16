@@ -1514,6 +1514,7 @@ impl SqlGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::Catalog;
 
     #[cfg(unix)]

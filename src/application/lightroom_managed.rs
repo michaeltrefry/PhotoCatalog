@@ -1791,7 +1791,7 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir()?;
         let fixture = ManagedFixture::start(temp.path())?;
         let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
-        let pid = generation.pid().context("Workbench fixture PID")?;
+        let _pid = generation.pid().context("Workbench fixture PID")?;
         assert!(matches!(
             generation.call(lightroom_bridge::Request::Options {})?,
             lightroom_bridge::Response::Options(_)
@@ -1803,7 +1803,7 @@ pub(crate) mod tests {
         fixture.drain()?;
         #[cfg(unix)]
         {
-            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+            assert_eq!(unsafe { libc::kill(_pid as libc::pid_t, 0) }, -1);
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::ESRCH)
@@ -1819,7 +1819,7 @@ pub(crate) mod tests {
         let fixture = ManagedFixture::start(temp.path())?;
         let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
         open_managed_plan(&generation, temp.path())?;
-        let pid = generation.pid().context("Workbench fixture PID")?;
+        let _pid = generation.pid().context("Workbench fixture PID")?;
 
         generation.shutdown_checked()?;
 
@@ -1827,7 +1827,7 @@ pub(crate) mod tests {
         assert!(fixture.owner.workbench_reaped.load(Ordering::Acquire));
         fixture.drain()?;
         #[cfg(unix)]
-        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(unsafe { libc::kill(_pid as libc::pid_t, 0) }, -1);
         Ok(())
     }
 
@@ -1838,7 +1838,7 @@ pub(crate) mod tests {
         let fixture = ManagedFixture::start(temp.path())?;
         let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
         open_managed_plan(&generation, temp.path())?;
-        let pid = generation.pid().context("Workbench fixture PID")?;
+        let _pid = generation.pid().context("Workbench fixture PID")?;
         generation
             .workbench
             .poison_for_test("injected retained fatal SQL owner");
@@ -1850,7 +1850,7 @@ pub(crate) mod tests {
         assert!(fixture.owner.workbench_reaped.load(Ordering::Acquire));
         fixture.drain()?;
         #[cfg(unix)]
-        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(unsafe { libc::kill(_pid as libc::pid_t, 0) }, -1);
         Ok(())
     }
 
@@ -1913,7 +1913,7 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir()?;
         let fixture = ManagedFixture::start(temp.path())?;
         let generation = Generation::start_fixture(&fixture.owner, &std::env::current_exe()?)?;
-        let pid = generation.pid().context("Workbench fixture PID")?;
+        let _pid = generation.pid().context("Workbench fixture PID")?;
         generation.workbench.terminate_for_test()?;
 
         let failure = generation
@@ -1932,7 +1932,7 @@ pub(crate) mod tests {
         );
         fixture.drain()?;
         #[cfg(unix)]
-        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(unsafe { libc::kill(_pid as libc::pid_t, 0) }, -1);
         Ok(())
     }
 }
