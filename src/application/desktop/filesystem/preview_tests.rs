@@ -640,6 +640,45 @@ fn actual_g_owns_backup_siblings_and_close_waits_for_checked_drain() -> Result<(
         .is_err(),
         "G admitted a new export job while backup custody was live"
     );
+    ensure!(
+        command(
+            &running.bridge,
+            Request::Close {
+                catalog: "stale-close-token".into(),
+            },
+        )
+        .is_err(),
+        "stale Close unexpectedly reached G retirement"
+    );
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.operation == started.operation
+                && snapshot.state == crate::application::backup::State::Running
+                && !snapshot.cancellation_requested
+        }),
+        "stale Close changed the active backup"
+    );
+    ensure!(
+        unsafe { libc::kill(backup_pid as libc::pid_t, 0) } == 0
+            && unsafe { libc::kill(filesystem_pid as libc::pid_t, 0) } == 0,
+        "stale Close retired a G backup child"
+    );
+    let oversized = "x".repeat(running.bridge.0.shared.limits.request_bytes + 1);
+    ensure!(
+        running
+            .bridge
+            .submit(Request::Close { catalog: oversized })
+            .is_err(),
+        "oversized Close passed the shared public request boundary"
+    );
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.operation == started.operation
+                && snapshot.state == crate::application::backup::State::Running
+                && !snapshot.cancellation_requested
+        }),
+        "oversized Close changed the active backup"
+    );
     let close = running.bridge.submit(Request::Close {
         catalog: token.clone(),
     })?;
@@ -671,6 +710,15 @@ fn actual_g_owns_backup_siblings_and_close_waits_for_checked_drain() -> Result<(
     );
     running.token = None;
     running.cleanup()?;
+    ensure!(
+        running.bridge.status().phase == super::super::TransportPhase::Closed,
+        "desktop reported Closed before complete control-task drain"
+    );
+    let tasks = running.bridge.0.control_tasks.lock().unwrap();
+    ensure!(
+        tasks.backup_admission.is_none() && tasks.close.is_none(),
+        "Closed retained a backup control task"
+    );
     Ok(())
 }
 
@@ -722,6 +770,11 @@ fn actual_c_death_cancels_and_reaps_g_owned_backup_siblings() -> Result<()> {
     ensure!(
         probe.reaped(backup_pid, filesystem_pid),
         "C death cleanup returned before checked B/F reap"
+    );
+    let tasks = running.bridge.0.control_tasks.lock().unwrap();
+    ensure!(
+        tasks.backup_admission.is_none() && tasks.close.is_none(),
+        "C death cleanup retained a backup control task"
     );
     Ok(())
 }

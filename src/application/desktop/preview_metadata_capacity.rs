@@ -2013,6 +2013,16 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             std::mem::size_of::<Mutex<Option<super::preview_metadata_admission::ProcessReservation>>>() as u64,
         ])?,
     )?;
+    let backup_control = super::backup_control_tasks_layout();
+    a.push(
+        "fixed.desktop_backup_control_task_slots",
+        Phase::Retained,
+        1,
+        // This is the exact incremental G Handle field. The two JoinHandles
+        // are fixed inline slots; allocator metadata, TLS, and thread stacks
+        // remain excluded by this ledger's documented boundary.
+        u64::try_from(backup_control.0)?,
+    )?;
     a.push(
         "fixed.preview_byte_budget_arc_backings",
         Phase::Retained,
@@ -2100,6 +2110,23 @@ mod tests {
             limits: Default::default(),
             import_checkpoint: None,
         }
+    }
+
+    #[test]
+    fn desktop_backup_control_slots_are_fixed_and_reserved() -> Result<()> {
+        let report = report(&config())?;
+        let control = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.desktop_backup_control_task_slots")
+            .context("desktop backup control task slot contribution")?;
+        assert_eq!(control.phase, Phase::Retained);
+        assert_eq!(control.count, 1);
+        assert_eq!(
+            control.each,
+            u64::try_from(super::super::backup_control_tasks_layout().0)?
+        );
+        Ok(())
     }
 
     #[test]

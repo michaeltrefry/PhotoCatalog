@@ -9,14 +9,23 @@ use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct AdmissionRequest {
-    pub catalog: String,
+#[serde(
+    tag = "action",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(super) enum AdmissionRequest {
+    Create { catalog: String },
+    Close { catalog: String, epoch: u64 },
 }
 impl AdmissionRequest {
     pub fn validate(&self) -> anyhow::Result<()> {
+        let catalog = match self {
+            Self::Create { catalog } | Self::Close { catalog, .. } => catalog,
+        };
         anyhow::ensure!(
-            !self.catalog.is_empty() && self.catalog.len() <= 128,
+            !catalog.is_empty() && catalog.len() <= 128,
             "catalog identity length"
         );
         Ok(())
@@ -24,19 +33,37 @@ impl AdmissionRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Admission {
-    pub source: NativePath,
-    pub expected_source: PhysicalObjectId,
+#[serde(
+    tag = "action",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(super) enum Admission {
+    Create {
+        source: NativePath,
+        expected_source: PhysicalObjectId,
+    },
+    Close {
+        epoch: u64,
+    },
 }
 impl Admission {
     pub fn validate(&self) -> anyhow::Result<()> {
-        crate::catalog_session::validate_path(&self.source)?;
-        anyhow::ensure!(
-            self.source.to_path()?.is_absolute(),
-            "backup source must be absolute"
-        );
-        self.expected_source.validate()
+        match self {
+            Self::Create {
+                source,
+                expected_source,
+            } => {
+                crate::catalog_session::validate_path(source)?;
+                anyhow::ensure!(
+                    source.to_path()?.is_absolute(),
+                    "backup source must be absolute"
+                );
+                expected_source.validate()
+            }
+            Self::Close { .. } => Ok(()),
+        }
     }
 }
 
@@ -136,6 +163,14 @@ impl Actor {
                 "catalog is closing; retry Close after cleanup failure",
             ));
         }
+        let (catalog, close_epoch) = match request {
+            AdmissionRequest::Create { catalog } => (catalog, None),
+            AdmissionRequest::Close { catalog, epoch } => (catalog, Some(epoch)),
+        };
+        if let Some(epoch) = close_epoch {
+            self.current(&catalog)?;
+            return Ok(Admission::Close { epoch });
+        }
         if self.migration.held() {
             return Err(error(
                 ErrorCode::Busy,
@@ -144,7 +179,7 @@ impl Actor {
         }
         let export_control = self.shared.exports.clone();
         let export_busy = export_control.lock().unwrap().busy();
-        let open = self.current(&request.catalog)?;
+        let open = self.current(&catalog)?;
         if open.relink.write_hold() {
             return Err(error(
                 ErrorCode::Busy,
@@ -169,7 +204,7 @@ impl Actor {
                 "managed catalog physical identity is unavailable",
             )
         })?;
-        Ok(Admission {
+        Ok(Admission::Create {
             source: NativePath::from_path(&open.catalog.root),
             expected_source,
         })
