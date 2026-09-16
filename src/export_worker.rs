@@ -1241,22 +1241,29 @@ fn rename_directory_held(source: &File, parent: &File, name: &std::ffi::OsStr) -
         file_name_length: u32,
         file_name: [u16; N],
     }
-    #[link(name = "kernel32")]
+    #[repr(C)]
+    struct IoStatus {
+        status: usize,
+        information: usize,
+    }
+    #[link(name = "ntdll")]
     unsafe extern "system" {
-        fn SetFileInformationByHandle(
+        fn NtSetInformationFile(
             handle: *mut std::ffi::c_void,
-            class: i32,
+            status: *mut IoStatus,
             info: *const std::ffi::c_void,
             bytes: u32,
+            class: i32,
         ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
     }
     let encoded: Vec<u16> = name.encode_wide().collect();
     ensure!(
         !encoded.is_empty() && encoded.len() <= 128 && !encoded.contains(&0),
         "invalid retired export name"
     );
-    // FILE_RENAME_INFO declares FileName[1], and Windows requires the input
-    // buffer to include sizeof(FILE_RENAME_INFO) plus the named UTF-16 bytes.
+    // FILE_RENAME_INFORMATION declares FileName[1]; include the declared
+    // structure size plus the named UTF-16 bytes.
     // Keep one extra code unit in the backing object so that formula is valid
     // on both 32- and 64-bit Windows, including the maximum accepted name.
     let mut info = RenameInfo::<129> {
@@ -1273,18 +1280,31 @@ fn rename_directory_held(source: &File, parent: &File, name: &std::ffi::OsStr) -
         bytes <= std::mem::size_of_val(&info),
         "retired export name overflow"
     );
-    ensure!(
-        unsafe {
-            SetFileInformationByHandle(
-                source.as_raw_handle(),
-                3, // FileRenameInfo: fail rather than replace an existing target.
-                std::ptr::from_ref(&info).cast(),
-                u32::try_from(bytes)?,
-            )
-        } != 0,
-        "handle-bound export directory rename failed: {}",
-        std::io::Error::last_os_error()
-    );
+    let mut completion = IoStatus {
+        status: 0,
+        information: 0,
+    };
+    // discard_directory creates synchronous handles (no FILE_FLAG_OVERLAPPED).
+    // The kernel completes this request before these stack buffers are released.
+    // The native API resolves the leaf against the held parent; the Win32
+    // wrapper rejects this relative-root request with ERROR_INVALID_PARAMETER.
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle(),
+            &mut completion,
+            std::ptr::from_ref(&info).cast(),
+            u32::try_from(bytes)?,
+            10, // FileRenameInformation; flags == 0 prohibits replacement.
+        )
+    };
+    for status in [status, completion.status as i32] {
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32,
+            ))
+            .context("handle-bound export directory rename failed");
+        }
+    }
     Ok(())
 }
 impl ClaimedCleanup {
