@@ -115,15 +115,10 @@ impl Operation {
         Ok(())
     }
     pub(crate) fn result_maximum(&self) -> Result<usize> {
-        fn expanded(bytes: usize) -> Result<usize> {
-            bytes
-                .checked_mul(6)
-                .context("migration result JSON expansion overflow")
-        }
         match self {
             Self::PrepareSupplements => protocol::result::prepared_supplements_bound(1024),
             Self::Status { .. } | Self::RepairStatus { .. } | Self::KeywordRepairStatus { .. } => {
-                expanded(lightroom_executor::DOCUMENT_BYTES as usize)
+                expanded_result(lightroom_executor::DOCUMENT_BYTES as usize)
             }
             // Progress documents are stored through the existing 8 MiB bounded
             // encoders. A decoded source byte can require at most six JSON bytes.
@@ -131,12 +126,7 @@ impl Operation {
             // largest producer bound is 16 KiB). The literal below includes the
             // largest operation wrapper and full-width u64/f64 scalar spellings.
             Self::Run { .. } | Self::RepairCurrent { .. } | Self::RepairKeywords { .. } => {
-                const DECISION_BYTES: usize = 16 * 1024;
-                const WRAPPER: usize = br#"{"protocol":1,"status":"needs_decision","progress":,"steps":18446744073709551615,"elapsed_seconds":-1.7976931348623157e308,"needs_decision":,"adobe_rendering_equivalent":false,"native_collection_order_equivalent":false}"#.len();
-                expanded(8 * 1024 * 1024)?
-                    .checked_add(expanded(DECISION_BYTES)?)
-                    .and_then(|n| n.checked_add(WRAPPER))
-                    .context("migration result bound overflow")
+                run_result_maximum()
             }
         }
     }
@@ -148,6 +138,131 @@ impl Operation {
             _ => None,
         }
     }
+}
+
+fn expanded_result(bytes: usize) -> Result<usize> {
+    bytes
+        .checked_mul(6)
+        .context("migration result JSON expansion overflow")
+}
+
+fn run_result_maximum() -> Result<usize> {
+    const DECISION_BYTES: usize = 16 * 1024;
+    const WRAPPER: usize = br#"{"protocol":1,"status":"needs_decision","progress":,"steps":18446744073709551615,"elapsed_seconds":-1.7976931348623157e308,"needs_decision":,"adobe_rendering_equivalent":false,"native_collection_order_equivalent":false}"#.len();
+    expanded_result(8 * 1024 * 1024)?
+        .checked_add(expanded_result(DECISION_BYTES)?)
+        .and_then(|n| n.checked_add(WRAPPER))
+        .context("migration result bound overflow")
+}
+
+/// Retained result pages and a later terminal failure can coexist until the
+/// public Discard retires the operation. This is the complete distinct result
+/// pool requirement for every currently supported operation.
+pub(crate) fn managed_result_requirement() -> Result<usize> {
+    use super::memory::layout::add;
+    let maximum = protocol::result::prepared_supplements_bound(1024)?
+        .max(expanded_result(
+            lightroom_executor::DOCUMENT_BYTES as usize,
+        )?)
+        .max(run_result_maximum()?);
+    let (retained, _) = protocol::result::retained_storage_bytes(maximum)?;
+    add(retained, super::supervisor::failure_storage_requirement())
+}
+
+fn supplement_requests_retained_maximum() -> Result<usize> {
+    use super::memory::layout::{add, mul, vector};
+    const REQUESTS: usize = 1024;
+    const PATH_BYTES: usize = 16 * 1024;
+    const SOURCE_ID_BYTES: usize = 4096;
+    const DIGEST_BYTES: usize = 64;
+    let per_request = add(
+        mul(2, PATH_BYTES)?,
+        add(mul(3, DIGEST_BYTES)?, SOURCE_ID_BYTES)?,
+    )?;
+    add(
+        vector::<supplements::Request>(REQUESTS)?,
+        mul(REQUESTS, per_request)?,
+    )
+}
+
+/// Complete monotonic requested-storage grant for one valid managed migration.
+/// The parent grant never releases a nested reservation before checked drain,
+/// so independent G, supervisor, LM and Source contributions are summed. Only
+/// mutually exclusive operation-specific graphs use a maximum.
+pub(crate) fn managed_source_requirement(
+    executable: &std::path::Path,
+    request_bytes: usize,
+    reply_bytes: usize,
+) -> Result<usize> {
+    use super::{
+        memory::{
+            core,
+            layout::{add, mul},
+            transport,
+        },
+        process::Process,
+        source_reader::{self, relay::broker::Broker},
+    };
+
+    let documents = DocumentSet::RunWithAuthorization
+        .roles()
+        .iter()
+        .try_fold(0usize, |bytes, role| add(bytes, role.maximum_bytes()))?;
+    let relay = add(mul(4, request_bytes)?, mul(2, reply_bytes)?)?;
+    let coordinator = add(
+        core::worker_envelope(request_bytes)?,
+        add(relay, documents)?,
+    )?;
+
+    let supervisor = add(
+        input::INPUT_BYTES,
+        add(
+            core::worker_envelope(request_bytes)?,
+            add(
+                Process::<protocol::ChildFrame>::allocation_backing()?,
+                add(
+                    Broker::allocation_backing()?,
+                    add(
+                        executable.as_os_str().len(),
+                        transport::payloads(true)?.total()?,
+                    )?,
+                )?,
+            )?,
+        )?,
+    )?;
+
+    let managed_sources = source_reader::managed_migration_requirement(
+        core::managed_migration_core_maximum(source_reader::managed_result_bytes())?,
+    )?;
+    let repair = crate::catalog_migration::repair_memory::operation_requirement()?;
+    let run = add(
+        core::worker_run_documents(
+            input::CLI_DOCUMENT_BYTES,
+            input::CLI_DOCUMENT_BYTES,
+            input::CLI_DOCUMENT_BYTES,
+            input::EXECUTION_AUTHORIZATION_BYTES,
+        )?,
+        add(repair, managed_sources)?,
+    )?;
+    let repair_operation = add(
+        core::worker_repair_documents(input::CLI_DOCUMENT_BYTES, input::CLI_DOCUMENT_BYTES)?,
+        add(repair, managed_sources)?,
+    )?;
+    let supplements = add(
+        supplement_requests_retained_maximum()?,
+        core::worker_supplement_execution(1024)?,
+    )?
+    .max(core::worker_supplement_documents(
+        input::CLI_DOCUMENT_BYTES,
+    )?);
+    let operation = run
+        .max(repair_operation)
+        .max(supplements)
+        .max(core::worker_status()?);
+
+    // The uploaded Strings remain in G while LM owns an independent admitted
+    // copy of every part. Both are retained until the operation is drained.
+    add(coordinator, add(supervisor, add(documents, operation)?)?)
 }
 
 impl Envelope {

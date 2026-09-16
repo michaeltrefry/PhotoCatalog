@@ -57,6 +57,20 @@ fn pure(pool: &ByteBudget) -> Result<(Arc<Shared>, Coordinator)> {
     let coordinator = Coordinator::new(&shared, config.worker_executable, Some(funding));
     Ok((shared, coordinator))
 }
+fn full_source_pool() -> Result<ByteBudget> {
+    let shared = super::super::tests::shared(1024 * 1024);
+    let config = Config {
+        worker_executable: std::env::current_exe()?,
+        cache_root: None,
+        original_roots: vec![],
+        preview_policy: Default::default(),
+        preview_limits: Default::default(),
+        limits: shared.limits.clone(),
+        import_checkpoint: None,
+    };
+    let (source, _) = operation_requirements(&config)?;
+    ByteBudget::new(source)
+}
 #[test]
 fn migration_funding_transfers_metadata_and_separates_source_and_result() -> Result<()> {
     let shared = super::super::tests::shared(1024 * 1024);
@@ -108,8 +122,101 @@ fn migration_funding_transfers_metadata_and_separates_source_and_result() -> Res
         )
         .is_err()
     );
+    let metadata_alias = ByteBudget::new(required)?;
+    let alias_reservation = super::super::preview_metadata_admission::ProcessReservation::reserve(
+        &config,
+        &metadata_alias,
+    )?;
+    assert!(
+        Funding::from_subgrant(
+            &config,
+            alias_reservation.split_migration(&config)?,
+            ByteBudget::new(49)?,
+            metadata_alias,
+        )
+        .is_err()
+    );
     drop(reservation);
     assert_eq!(metadata_pool.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn migration_operation_requirements_are_checked_exact_independent_boundaries() -> Result<()> {
+    let shared = super::super::tests::shared(1024 * 1024);
+    let config = Config {
+        worker_executable: std::env::current_exe()?,
+        cache_root: None,
+        original_roots: vec![],
+        preview_policy: Default::default(),
+        preview_limits: Default::default(),
+        limits: shared.limits.clone(),
+        import_checkpoint: None,
+    };
+    let (source, result) = operation_requirements(&config)?;
+    assert!(source > 2 * crate::lightroom_migration_worker::input::CLI_DOCUMENT_BYTES as u64);
+    assert_eq!(result, worker::managed_result_requirement()? as u64);
+    let operations = [
+        api::Operation::Run {
+            approval_blake3: "a".repeat(64),
+            max_steps: U64(1),
+            max_seconds: U64(1),
+            source_open_ms: U64(1),
+            artifact_open_ms: U64(1),
+            max_artifact_bytes: U64(1),
+        },
+        api::Operation::Status { run: "r".into() },
+        api::Operation::PrepareSupplements,
+        api::Operation::RepairCurrent {
+            max_steps: U64(1),
+            max_seconds: U64(1),
+            source_open_ms: U64(1),
+        },
+        api::Operation::RepairStatus { repair: "r".into() },
+        api::Operation::RepairKeywords {
+            max_steps: U64(1),
+            max_seconds: U64(1),
+            source_open_ms: U64(1),
+        },
+        api::Operation::KeywordRepairStatus { repair: "r".into() },
+    ];
+    let mut observed_result = 0usize;
+    for operation in &operations {
+        let (retained, _) =
+            crate::lightroom_migration_worker::protocol::result::retained_storage_bytes(
+                operation.result_maximum()?,
+            )?;
+        observed_result = observed_result.max(
+            retained + crate::lightroom_migration_worker::supervisor::failure_storage_requirement(),
+        );
+    }
+    assert_eq!(result, observed_result as u64);
+
+    let exact_source = ByteBudget::new(source)?;
+    let held_source = exact_source
+        .reserve_exact(source)
+        .map_err(anyhow::Error::new)?;
+    assert_eq!(exact_source.used(), source);
+    drop(held_source);
+    let short_source = ByteBudget::new(source - 1)?;
+    let refusal = match short_source.reserve_exact(source) {
+        Err(refusal) => refusal,
+        Ok(_) => anyhow::bail!("short migration Source allowance admitted"),
+    };
+    assert_eq!((refusal.required, refusal.available), (source, source - 1));
+
+    let exact_result = ByteBudget::new(result)?;
+    let held_result = exact_result
+        .reserve_exact(result)
+        .map_err(anyhow::Error::new)?;
+    assert_eq!(exact_result.used(), result);
+    drop(held_result);
+    let short_result = ByteBudget::new(result - 1)?;
+    let refusal = match short_result.reserve_exact(result) {
+        Err(refusal) => refusal,
+        Ok(_) => anyhow::bail!("short migration result allowance admitted"),
+    };
+    assert_eq!((refusal.required, refusal.available), (result, result - 1));
     Ok(())
 }
 fn upload(
@@ -143,7 +250,7 @@ fn upload(
 #[test]
 fn lm_facade_exact_independent_raw_uploads_preserve_bytes_and_refuse_reorder() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let pool = ByteBudget::new(4 * 1024 * 1024 * 1024)?;
+    let pool = full_source_pool()?;
     let (shared, coordinator) = pure(&pool)?;
     let baseline = pool.used();
     let mut documents = vec![];
@@ -234,7 +341,7 @@ fn lm_facade_source_pool_required_minus_one_retries_without_authority_or_storage
         api::Operation::PrepareSupplements,
         &documents,
     );
-    let pool = ByteBudget::new(2 * 1024 * 1024 * 1024)?;
+    let pool = full_source_pool()?;
     let (_shared, coordinator) = pure(&pool)?;
     let baseline = pool.used();
     let guard = snap(coordinator.request(api::Request::Begin {
@@ -336,7 +443,7 @@ fn lm_facade_public_json_seven_headers_guards_and_existing_commands_are_strict()
             vec![],
         ),
     ];
-    let pool = ByteBudget::new(2 * 1024 * 1024 * 1024)?;
+    let pool = full_source_pool()?;
     let (shared, coordinator) = pure(&pool)?;
     let baseline = pool.used();
     for (index, (operation, roles)) in cases.into_iter().enumerate() {
@@ -383,7 +490,7 @@ fn lm_facade_public_json_seven_headers_guards_and_existing_commands_are_strict()
 #[test]
 fn lm_facade_begin_replay_and_small_reply_refusal_keep_guard_and_admission_exact() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let pool = ByteBudget::new(2 * 1024 * 1024 * 1024)?;
+    let pool = full_source_pool()?;
     let (shared, coordinator) = pure(&pool)?;
     let documents = vec![(api::InputRole::SupplementRequests, "[]".into())];
     let h = header(
@@ -446,7 +553,7 @@ fn lm_facade_begin_replay_and_small_reply_refusal_keep_guard_and_admission_exact
 #[test]
 fn lm_facade_prefunded_bookkeeping_is_retained_once_per_operation() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let pool = ByteBudget::new(1024 * 1024 * 1024)?;
+    let pool = full_source_pool()?;
     let (shared, coordinator) = pure(&pool)?;
     let destination = temp.path().canonicalize()?.join("target");
     let documents = vec![(api::InputRole::SupplementRequests, "[]".into())];
@@ -891,28 +998,16 @@ mod actual {
             // C/F metadata, migration Source and migration result owners have
             // separately identified allowances. The metadata process charge is
             // transferred once; operation pools preserve the requested scope.
-            use crate::lightroom_migration_worker::memory::{core, layout::add};
-            let operation_allowance = add(
-                add(4 * 1024 * 1024 * 1024, core::worker_repair_execution()?)?,
-                add(
-                    core::worker_supplement_documents(input::CLI_DOCUMENT_BYTES)?,
-                    core::worker_supplement_execution(1024)?,
-                )?,
-            )?;
-            let operation_allowance = add(
-                operation_allowance,
-                crate::catalog_migration::file_metadata::tests::Test::managed_preprojection()?
-                    .managed_preprojection_allowance_bytes()?,
-            )?;
+            let (source_allowance, result_allowance) = operation_requirements(&config)?;
             let metadata_allowance = config.requested_preview_metadata_bytes()?;
             let metadata_pool = ByteBudget::new(metadata_allowance)?;
-            let pool = ByteBudget::new(operation_allowance as u64)?;
-            let result_pool = ByteBudget::new(operation_allowance as u64)?;
+            let pool = ByteBudget::new(source_allowance)?;
+            let result_pool = ByteBudget::new(result_allowance)?;
             // Future export G receives this same native pool; never fold it into
             // the requested-storage allowance above.
             let native = ByteBudget::new(config.preview_limits.working_bytes)?;
             println!(
-                "LM_FACADE_POOLS metadata={metadata_allowance} source={operation_allowance} result={operation_allowance}"
+                "LM_FACADE_POOLS metadata={metadata_allowance} source={source_allowance} result={result_allowance}"
             );
             let desktop = super::super::super::DesktopBridge::spawn_with_filesystem(
                 config,
@@ -940,10 +1035,15 @@ mod actual {
             })
         }
         fn operation_used(&self) -> u64 {
-            self.pool
-                .used()
-                .checked_add(self.result_pool.used())
+            self.source_used()
+                .checked_add(self.result_used())
                 .expect("fixture operation allowances fit u64")
+        }
+        fn source_used(&self) -> u64 {
+            self.pool.used()
+        }
+        fn result_used(&self) -> u64 {
+            self.result_pool.used()
         }
         fn public(&self, request: api::Request) -> Result<api::Response> {
             match self
@@ -1434,7 +1534,9 @@ mod actual {
             thread::sleep(Duration::from_millis(5));
         };
         let held = fixture.operation_used();
-        assert!(held > 0);
+        let held_source = fixture.source_used();
+        let held_result = fixture.result_used();
+        assert!(held_source > 0 && held_result > 0 && held > 0);
         assert!(
             fixture
                 .public(api::Request::ResultPage {
@@ -1464,7 +1566,8 @@ mod actual {
                 .code,
             ErrorCode::Busy
         ));
-        assert!(fixture.operation_used() >= held);
+        assert!(fixture.source_used() >= held_source);
+        assert_eq!(fixture.result_used(), held_result);
         {
             let mut faults = fixture.desktop.0.migration.faults.lock().unwrap();
             assert_eq!(faults.lost, 2);
@@ -1484,6 +1587,8 @@ mod actual {
             thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(status.phase, api::Phase::Complete, "{status:?}");
+        assert!(fixture.source_used() < held_source);
+        assert_eq!(fixture.result_used(), held_result);
         assert!(fixture.operation_used() < held);
         fixture.public(api::Request::Discard { guard })?;
         fixture.close(catalog)?;
@@ -1870,6 +1975,8 @@ mod actual {
             thread::sleep(Duration::from_millis(5));
         }
         let held = fixture.operation_used();
+        let held_source = fixture.source_used();
+        let held_result = fixture.result_used();
         assert!(!fixture.desktop.0.migration.drained());
         assert!(
             fixture
@@ -1878,6 +1985,8 @@ mod actual {
                 })
                 .is_err()
         );
+        assert_eq!(fixture.source_used(), held_source);
+        assert_eq!(fixture.result_used(), held_result);
         assert_eq!(fixture.operation_used(), held);
         fixture.public(api::Request::RetryDrain {
             guard: guard.clone(),
@@ -1893,6 +2002,8 @@ mod actual {
             ensure!(Instant::now() < deadline, "checked wait retry deadline");
             thread::sleep(Duration::from_millis(5));
         }
+        assert!(fixture.source_used() < held_source);
+        assert_eq!(fixture.result_used(), held_result);
         assert!(fixture.operation_used() < held);
         assert!(!destination.exists());
         fixture.public(api::Request::Discard { guard })?;

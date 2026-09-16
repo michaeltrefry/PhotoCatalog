@@ -18,11 +18,15 @@ pub(crate) use proxy::reader_metadata_layouts;
 #[allow(unused_imports)]
 pub(crate) use proxy::{CaptureSqlReader, Health, RawReader, SqlReader};
 
+pub(crate) const fn managed_result_bytes() -> usize {
+    transport::RESULT_BYTES
+}
+
 /// Complete local pool retained by one managed Workbench Source router. This
 /// uses the public accepted maxima of all three fixed Source kinds and the same
 /// phase formula used by RelayClient at runtime. It is an admission allowance,
 /// not a new wire or document limit.
-pub(crate) fn managed_workbench_requirement() -> anyhow::Result<usize> {
+fn managed_requirement(core: usize, include_broker: bool) -> anyhow::Result<usize> {
     use crate::lightroom::{MANIFEST_BYTES, PAGE_BYTES, migration_source::ReadLimits};
     use crate::lightroom_migration_worker::memory::layout::{
         add, mul, seal_dynamic, seal_validation,
@@ -198,13 +202,25 @@ pub(crate) fn managed_workbench_requirement() -> anyhow::Result<usize> {
     // opening allowance.
     let path_opening = crate::lightroom::source::managed_opening_reservation_maximum()?;
     let child_opening = add(mul(2, path_opening)?, capture_opening_graph)?;
-    add(
-        add(
-            relay::broker::Broker::allocation_backing()?,
-            relay::client::managed_allocation_requirement(opening, producer, transient, graph, 0)?,
-        )?,
-        child_opening,
-    )
+    let client =
+        relay::client::managed_allocation_requirement(opening, producer, transient, graph, core)?;
+    let owners = add(client, child_opening)?;
+    if include_broker {
+        add(relay::broker::Broker::allocation_backing()?, owners)
+    } else {
+        Ok(owners)
+    }
+}
+
+pub(crate) fn managed_workbench_requirement() -> anyhow::Result<usize> {
+    managed_requirement(0, true)
+}
+
+/// Migration's supervisor separately reserves the Broker and Process owners.
+/// This term covers the LM-side client, every supported Source phase and both
+/// child opening grants, including the operation's largest core-owned phase.
+pub(crate) fn managed_migration_requirement(core: usize) -> anyhow::Result<usize> {
+    managed_requirement(core, false)
 }
 
 /// Private worker mode on the configured installed executable. Do not initialize

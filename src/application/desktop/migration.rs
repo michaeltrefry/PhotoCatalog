@@ -155,34 +155,46 @@ struct MetadataAdmission {
 }
 
 fn bookkeeping_bytes(executable: &std::path::Path, operation: usize, reply: usize) -> Result<u64> {
-    use std::mem::size_of;
+    use crate::lightroom_migration_worker::memory::{
+        channels,
+        layout::{add, mul},
+    };
+    use std::{alloc::Layout, mem::size_of};
+    let arc = |layout| channels::arc(layout);
+    let executable_backing = executable.as_os_str().len();
     let values = [
         size_of::<Coordinator>(),
-        2 * size_of::<usize>() + size_of::<MetadataAdmission>(),
-        executable.as_os_str().len(),
+        arc(Layout::new::<MetadataAdmission>())?,
+        // Coordinator retains the configured path while the operation thread
+        // owns its clone through checked LM/Source drain.
+        mul(2, executable_backing)?,
         size_of::<Entry>(),
-        size_of::<Job>(),
+        arc(Layout::new::<Job>())?,
+        arc(Layout::new::<Stop>())?,
         size_of::<Report>(),
-        size_of::<Proxy>(),
+        arc(Layout::new::<Proxy>())?,
         2 * size_of::<Waiting>(),
         size_of::<WriteAttempt>(),
-        2 * size_of::<Mutex<Acquisition>>(),
-        size_of::<[usize; 8]>(),
+        mul(2, arc(Layout::new::<Mutex<Acquisition>>())?)?,
+        arc(Layout::new::<WriterProxy>())?,
+        arc(Layout::new::<Writers>())?,
+        crate::lightroom_migration_worker::memory::managed_adapter_metadata_backing()?,
         size_of::<api::Snapshot>(),
         2 * size_of::<Guard>(),
-        2 * (36 + 64),
+        // Session/generation strings plus their digest spellings.
+        mul(2, 36 + 64)?,
         operation,
         operation,
+        // Catalog token, progress phase and result digest retained together.
         128 + 256 + 64,
         reply,
         reply,
+        // Independently retained bounded failure strings on the owner and
+        // terminal snapshots.
         32 * 1024,
         32 * 1024,
     ];
-    let bytes = values
-        .into_iter()
-        .try_fold(0usize, |sum, n| sum.checked_add(n))
-        .context("migration bookkeeping overflow")?;
+    let bytes = values.into_iter().try_fold(0usize, add)?;
     Ok(u64::try_from(bytes)?)
 }
 
@@ -192,6 +204,19 @@ pub(super) fn metadata_requirement(config: &application::Config) -> Result<u64> 
         config.limits.request_bytes,
         config.limits.reply_bytes,
     )
+}
+
+/// Distinct production payload pools for the complete seven-operation API.
+/// Smaller caller-supplied pools remain valid construction choices and fail at
+/// the exact attempted allocation with the existing typed ResourceLimit.
+pub(super) fn operation_requirements(config: &application::Config) -> Result<(u64, u64)> {
+    let source = worker::managed_source_requirement(
+        &config.worker_executable,
+        config.limits.request_bytes,
+        config.limits.reply_bytes,
+    )?;
+    let result = worker::managed_result_requirement()?;
+    Ok((u64::try_from(source)?, u64::try_from(result)?))
 }
 
 impl Funding {

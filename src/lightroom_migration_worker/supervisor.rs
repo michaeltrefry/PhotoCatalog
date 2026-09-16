@@ -26,6 +26,10 @@ mod pending;
 const RESULT_BYTES: usize = 8 * 1024 * 1024;
 const FAILURE_BYTES: usize = 32 * 1024;
 
+pub(crate) const fn failure_storage_requirement() -> usize {
+    FAILURE_BYTES
+}
+
 #[derive(Debug)]
 pub(crate) struct OperationCanceled;
 impl std::fmt::Display for OperationCanceled {
