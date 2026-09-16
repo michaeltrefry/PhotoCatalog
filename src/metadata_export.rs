@@ -438,8 +438,9 @@ pub(crate) fn validate_metadata_export_receipt_wire(
     }
     if receipt.state == ExportState::Restored {
         ensure!(
-            receipt.captured_original.is_none(),
-            "metadata restored receipt still claims a captured original"
+            plan.expected.is_some()
+                && receipt.captured_original.as_ref() == Some(&recovery.join("original")),
+            "metadata restored receipt omitted its retained original"
         );
     }
     Ok(())

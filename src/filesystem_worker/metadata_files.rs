@@ -595,7 +595,7 @@ mod tests {
             &restoring,
             7,
             Action::Begin {
-                mode: Mode::Restore { plan },
+                mode: Mode::Restore { plan: plan.clone() },
                 bytes: U64(0),
                 blake3: blake3::hash(&[]).to_hex().to_string(),
             },
@@ -608,6 +608,9 @@ mod tests {
             restored.state,
             crate::metadata_export::ExportState::Restored
         );
+        assert_eq!(restored.captured_original.as_ref(), Some(&captured));
+        crate::metadata_export::validate_metadata_export_receipt_wire(&restored, &plan)?;
+        assert_eq!(fs::read(&captured)?, b"original sidecar");
         assert_eq!(fs::read(destination)?, b"original sidecar");
         Ok(())
     }

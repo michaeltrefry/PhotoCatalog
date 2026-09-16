@@ -53,7 +53,9 @@ impl PreviewConfiguration {
         additional_original: Option<&Path>,
     ) -> Result<PreviewService> {
         let mut roots = self.original_roots.clone();
-        if let Some(path) = additional_original {
+        if let Some(path) = additional_original
+            && !roots.iter().any(|root| root == path)
+        {
             roots.push(path.to_path_buf());
         }
         PreviewService::open(

@@ -3377,19 +3377,44 @@ mod metadata_reply_tests {
             )
             .is_err()
         );
+        let recovery = crate::metadata_export::metadata_recovery_directory(&plan)?;
         let wrong_receipt = crate::metadata_export::ExportReceipt {
             state: crate::metadata_export::ExportState::Published,
             destination: destination.with_file_name("other.xmp"),
-            recovery_directory: crate::metadata_export::metadata_recovery_directory(&plan)?,
+            recovery_directory: recovery.clone(),
             captured_original: None,
             detail: "spoofed".into(),
         };
         assert!(
             validate_metadata_file_value(
-                &metadata_files::Mode::Apply { plan },
+                &metadata_files::Mode::Apply { plan: plan.clone() },
                 3,
                 blake3::hash(b"new").to_hex().as_ref(),
                 &metadata_files::Value::Receipt(wrong_receipt),
+            )
+            .is_err()
+        );
+        let restored = crate::metadata_export::ExportReceipt {
+            state: crate::metadata_export::ExportState::Restored,
+            destination,
+            recovery_directory: recovery.clone(),
+            captured_original: Some(recovery.join("original")),
+            detail: "restored with retained recovery evidence".into(),
+        };
+        validate_metadata_file_value(
+            &metadata_files::Mode::Restore { plan: plan.clone() },
+            0,
+            blake3::hash(&[]).to_hex().as_ref(),
+            &metadata_files::Value::Receipt(restored.clone()),
+        )?;
+        let mut missing_capture = restored;
+        missing_capture.captured_original = None;
+        assert!(
+            validate_metadata_file_value(
+                &metadata_files::Mode::Restore { plan },
+                0,
+                blake3::hash(&[]).to_hex().as_ref(),
+                &metadata_files::Value::Receipt(missing_capture),
             )
             .is_err()
         );
