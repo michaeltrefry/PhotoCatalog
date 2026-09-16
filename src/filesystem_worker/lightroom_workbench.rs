@@ -430,6 +430,22 @@ fn companion_free(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn verify_capture_artifact(
+    member: &mut Source,
+    artifact: &crate::lightroom::capture::Artifact,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    // The manifest revision identifies the original source handle. The raw
+    // member is a new file by construction, so its inode and timestamps cannot
+    // equal the source revision. Length plus the full content digest binds the
+    // retained copy while Source verifies the opened member did not change.
+    ensure!(
+        member.before.bytes == artifact.revision.bytes
+            && member.copy_and_hash_controlled(None, || canceled(cancel))? == artifact.blake3,
+        "capture artifact differs"
+    );
+    Ok(())
+}
 fn bounded_json(value: &impl serde::Serialize, maximum: usize) -> Result<Vec<u8>> {
     struct Counter {
         bytes: usize,
@@ -828,12 +844,7 @@ impl Owner {
                     );
                     let mut member =
                         Source::open(&root.join(relative), manifest.request.limits.max_file_bytes)?;
-                    ensure!(
-                        member.before == artifact.revision
-                            && member.copy_and_hash_controlled(None, || canceled(cancel))?
-                                == artifact.blake3,
-                        "capture artifact differs"
-                    );
+                    verify_capture_artifact(&mut member, artifact, cancel)?;
                     raw.push(member);
                 }
                 let raw_roster_blake3 = crate::lightroom::digest(&crate::lightroom::bounded_json(
@@ -1439,6 +1450,52 @@ mod tests {
         let reply = owner.execute(request.clone(), &AtomicBool::new(false))?;
         reply.validate_for(&request)?;
         Ok(reply)
+    }
+
+    #[test]
+    fn capture_artifact_verification_accepts_copy_identity_and_rejects_byte_changes() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let temp_path = fs::canonicalize(temp.path())?;
+        let source_path = temp_path.join("source.lrcat");
+        let stored_path = temp_path.join("raw.bin");
+        let bytes = b"captured Lightroom source bytes";
+        fs::write(&source_path, bytes)?;
+        let mut source = Source::open(&source_path, 1024)?;
+        let revision = source.before.clone();
+        let mut stored = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stored_path)?;
+        let blake3 = source.copy_and_hash(Some(&mut stored))?;
+        stored.sync_all()?;
+        drop(stored);
+        drop(source);
+        let artifact = crate::lightroom::capture::Artifact {
+            source: NativePath::from_path(&source_path),
+            role: "main".into(),
+            relative: NativePath::from_path(Path::new("source.lrcat")),
+            stored: "raw/000000.bin".into(),
+            revision,
+            blake3,
+        };
+        let cancel = AtomicBool::new(false);
+
+        let mut retained = Source::open(&stored_path, 1024)?;
+        assert_ne!(retained.before.object, artifact.revision.object);
+        verify_capture_artifact(&mut retained, &artifact, &cancel)?;
+        drop(retained);
+
+        fs::write(&stored_path, b"changed Lightroom source bytes!")?;
+        assert_eq!(fs::metadata(&stored_path)?.len(), artifact.revision.bytes);
+        let mut changed = Source::open(&stored_path, 1024)?;
+        assert!(verify_capture_artifact(&mut changed, &artifact, &cancel).is_err());
+        drop(changed);
+
+        fs::write(&stored_path, b"short")?;
+        let mut shortened = Source::open(&stored_path, 1024)?;
+        assert!(verify_capture_artifact(&mut shortened, &artifact, &cancel).is_err());
+        Ok(())
     }
 
     fn request_chunk(
