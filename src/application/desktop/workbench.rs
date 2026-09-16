@@ -64,7 +64,12 @@ impl Dispatcher {
         let Request::Lightroom { request } = request else {
             unreachable!()
         };
-        let control = request.direct();
+        let control = matches!(
+            request.as_ref(),
+            lightroom_bridge::Request::Status { .. }
+                | lightroom_bridge::Request::Cancel { .. }
+                | lightroom_bridge::Request::Close { .. }
+        );
         let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         if queue.stopping {
             return Err(error(ErrorCode::Closed, "Workbench dispatcher is stopping"));
@@ -130,6 +135,26 @@ impl Drop for Dispatcher {
 }
 
 fn run(shared: &Shared, generation: &lightroom_managed::Generation) {
+    // A panicking dispatcher must reject retained and future requests too.
+    struct Stop<'a>(&'a Shared);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.stopping = true;
+            for entry in queue.control.drain(..) {
+                let _ = entry
+                    .reply
+                    .send(failure(ErrorCode::Closed, "Workbench dispatcher stopped"));
+            }
+            for entry in queue.data.drain(..) {
+                let _ = entry
+                    .reply
+                    .send(failure(ErrorCode::Closed, "Workbench dispatcher stopped"));
+            }
+            self.0.wake.notify_all();
+        }
+    }
+    let _stop = Stop(shared);
     loop {
         let entry = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,16 +162,6 @@ fn run(shared: &Shared, generation: &lightroom_managed::Generation) {
                 queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
             if queue.stopping {
-                for entry in queue.control.drain(..) {
-                    let _ = entry
-                        .reply
-                        .send(failure(ErrorCode::Closed, "Workbench dispatcher stopped"));
-                }
-                for entry in queue.data.drain(..) {
-                    let _ = entry
-                        .reply
-                        .send(failure(ErrorCode::Closed, "Workbench dispatcher stopped"));
-                }
                 return;
             }
             queue
