@@ -493,7 +493,7 @@ mod tests {
                 .iter()
                 .filter(|value| value.phase == Phase::Retained)
                 .map(|value| value.bytes)
-                .sum()
+                .sum::<u64>()
         );
         assert_eq!(
             default_report.active,
@@ -502,7 +502,7 @@ mod tests {
                 .iter()
                 .filter(|value| value.phase == Phase::Active)
                 .map(|value| value.bytes)
-                .sum()
+                .sum::<u64>()
         );
         assert!(
             dispatcher_layouts()
