@@ -765,8 +765,10 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         ])?,
     )?;
     // At peak F's retained envelope coexists with C's exact assembly, decoded
-    // packet/input bytes, and Prepared's copied blob graph. Relay envelopes and
-    // a maximum directory fact chunk are charged independently.
+    // packet/input bytes, and Prepared's copied blob graph. While a Storage
+    // call waits for relay admission, Reference retains the preceding Header's
+    // decoded volume observation. Charge that typed graph independently from
+    // relay-owned envelopes and the maximum directory fact chunk.
     a.push(
         "active.import_c_transfer_decode_and_preparation",
         Phase::Active,
@@ -781,6 +783,7 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
                 6,
                 crate::catalog_session::import::MAX_INSPECTION_METADATA_BYTES as u64,
             )?,
+            wire_typed_graph(c, RELAY_BYTES)?,
             c.mul(4, RELAY_BYTES)?,
             c.mul(4, import_fact_chunk)?,
             c.mul(8, CHUNK_BYTES)?,

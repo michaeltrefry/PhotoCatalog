@@ -559,6 +559,7 @@ pub(crate) struct Reference {
     asset: String,
     path: PathBuf,
     fingerprint: String,
+    storage: Option<VolumeLocation>,
     previous_fingerprint: Option<String>,
     ready: bool,
     seen: BTreeSet<Vec<u8>>,
@@ -584,19 +585,19 @@ impl Reference {
         Ok(())
     }
     pub(crate) fn begin(catalog: &mut Catalog, header: Header) -> Result<Self> {
+        let Header {
+            path,
+            fingerprint,
+            observation,
+        } = header;
         catalog.require_jobs_released()?;
-        let location = location_bytes(&header.path);
-        crate::catalog_storage::verify_location_fence(
-            &catalog.db,
-            &location,
-            Some(&header.fingerprint),
-        )?;
+        let location = location_bytes(&path);
+        crate::catalog_storage::verify_location_fence(&catalog.db, &location, Some(&fingerprint))?;
         ensure!(
-            header.observation.requested_path == NativePath::from_path(&header.path),
+            observation.requested_path == NativePath::from_path(&path),
             "volume observation path differs"
         );
-        let identity = header
-            .observation
+        let identity = observation
             .volume
             .as_ref()
             .and_then(|v| v.persistent_identity.as_ref())
@@ -607,13 +608,11 @@ impl Reference {
         if let Some(bound) = bound {
             ensure!(
                 identity.as_ref() == Some(&bound)
-                    || existing.as_ref().and_then(|v| v.1.as_ref()) == Some(&header.fingerprint),
+                    || existing.as_ref().and_then(|v| v.1.as_ref()) == Some(&fingerprint),
                 "relink-required: source volume identity changed; explicit relink review required"
             );
         }
-        if let (Some(identity), Some(relative)) =
-            (&identity, &header.observation.relative_in_volume)
-        {
+        if let (Some(identity), Some(relative)) = (&identity, &observation.relative_in_volume) {
             let matches:Vec<Vec<u8>>=catalog.db.prepare("SELECT a.location FROM assets a JOIN storage_bindings b ON b.asset_id=a.id JOIN storage_volumes v ON v.id=b.volume_id WHERE v.identity=?1 AND b.relative=?2 LIMIT 2")?.query_map(params![identity,serde_json::to_string(relative)?],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
             ensure!(
                 matches.len() < 2 && matches.iter().all(|p| p == &location),
@@ -622,15 +621,15 @@ impl Reference {
         }
         if let Some((_, fp, state, revision)) = &existing {
             ensure!(
-                *revision == 0 || (fp.as_ref() == Some(&header.fingerprint) && state == "ready"),
+                *revision == 0 || (fp.as_ref() == Some(&fingerprint) && state == "ready"),
                 "source-changed: content or availability changed on an edited image; explicit source review required; edits retained"
             );
         }
-        let ready = existing.as_ref().is_some_and(|(_, fp, state, _)| {
-            fp.as_ref() == Some(&header.fingerprint) && state == "ready"
-        });
+        let ready = existing
+            .as_ref()
+            .is_some_and(|(_, fp, state, _)| fp.as_ref() == Some(&fingerprint) && state == "ready");
         if !ready {
-            catalog.reserve(&header.path, &location)?;
+            catalog.reserve(&path, &location)?;
         }
         let asset: String =
             catalog
@@ -638,20 +637,33 @@ impl Reference {
                 .query_row("SELECT id FROM assets WHERE location=?", [&location], |r| {
                     r.get(0)
                 })?;
-        catalog.record_import_path(&header.path)?;
-        if header.observation.state == LocationState::Available {
-            catalog.bind_storage(&asset, &header.observation)?;
-        }
+        catalog.record_import_path(&path)?;
+        let storage = (observation.state == LocationState::Available).then_some(observation);
         Ok(Self {
             asset,
-            path: header.path,
-            fingerprint: header.fingerprint,
+            path,
+            fingerprint,
+            storage,
             previous_fingerprint: existing.and_then(|v| v.1),
             ready,
             seen: BTreeSet::new(),
             changed: false,
             warnings: 0,
         })
+    }
+    fn bind_storage_with(
+        &mut self,
+        bind: impl FnOnce(&str, &VolumeLocation) -> Result<()>,
+    ) -> Result<()> {
+        let Some(observation) = self.storage.as_ref() else {
+            return Ok(());
+        };
+        bind(&self.asset, observation)?;
+        self.storage = None;
+        Ok(())
+    }
+    pub(crate) fn bind_storage(&mut self, catalog: &mut Catalog) -> Result<()> {
+        self.bind_storage_with(|asset, observation| catalog.bind_storage(asset, observation))
     }
     pub(crate) fn source(
         &mut self,
@@ -1622,6 +1634,72 @@ mod tests {
             existing_ancestor: None,
             issues: vec![],
         }
+    }
+
+    #[test]
+    fn storage_busy_retry_preserves_one_reservation_and_binds_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let originals = temp.path().join("originals");
+        fs::create_dir(&originals)?;
+        let path = originals.canonicalize()?.join("one.png");
+        image::RgbImage::from_pixel(24, 16, image::Rgb([20u8, 40, 70])).save(&path)?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        let mut reference = Reference::begin(
+            &mut catalog,
+            Header {
+                path: path.clone(),
+                fingerprint: crate::fingerprint(&path)?,
+                observation: observation(&path, Path::new("one.png")),
+            },
+        )?;
+        let (asset, generation): (String, i64) = catalog.db.query_row(
+            "SELECT id,render_generation FROM assets WHERE location=?1",
+            [location_bytes(&path)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let binding = |catalog: &Catalog| -> Result<(Option<String>, Option<String>)> {
+            Ok(catalog.db.query_row(
+                "SELECT volume_id,file_key FROM storage_bindings WHERE asset_id=?1",
+                [&asset],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(binding(&catalog)?, (None, None));
+
+        let mut attempts = 0;
+        let error = reference
+            .bind_storage_with(|_, _| {
+                attempts += 1;
+                Err(crate::preview::stage_io::Busy("injected storage admission").into())
+            })
+            .unwrap_err();
+        assert!(error.is::<crate::preview::stage_io::Busy>());
+        assert_eq!(attempts, 1);
+        assert_eq!(binding(&catalog)?, (None, None));
+        assert_eq!(
+            catalog.db.query_row(
+                "SELECT render_generation FROM assets WHERE id=?1",
+                [&asset],
+                |row| row.get::<_, i64>(0),
+            )?,
+            generation
+        );
+
+        reference.bind_storage(&mut catalog)?;
+        let bound = binding(&catalog)?;
+        assert!(bound.0.is_some() && bound.1.is_some());
+        assert_eq!(
+            catalog.db.query_row(
+                "SELECT render_generation FROM assets WHERE id=?1",
+                [&asset],
+                |row| row.get::<_, i64>(0),
+            )?,
+            generation
+        );
+        reference.bind_storage_with(|_, _| panic!("completed binding retried"))?;
+        assert_eq!(binding(&catalog)?, bound);
+        Ok(())
     }
 
     #[test]

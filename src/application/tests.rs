@@ -928,6 +928,67 @@ fn publication_counts(catalog: &Catalog, asset: &str) -> Result<(i64, i64, i64, 
 }
 
 #[test]
+fn actor_cancel_discards_pending_storage_binding_without_repeating_reservation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    let base = root.path().canonicalize()?;
+    let path = base.join("originals/source.png");
+    image::RgbImage::from_pixel(16, 12, image::Rgb([20u8, 40, 70])).save(&path)?;
+    drop(Catalog::open(base.join("catalog"))?);
+    let mut volumes = crate::import_storage::ImportVolumes::new();
+    let header = crate::import_preparation::Header {
+        path: path.clone(),
+        fingerprint: crate::fingerprint(&path)?,
+        observation: volumes.observe(&path)?,
+    };
+    let (_bridge, mut actor) = publication_actor(
+        &base,
+        crate::import_preparation::Event::Header(Box::new(header)),
+        crate::import_preparation::TestPublication::RejectRoot,
+        None,
+        true,
+    )?;
+
+    actor.maintain();
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert!(import.reference.is_some() && !import.failure);
+    let (asset, generation, volume, file): (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+    ) = open.catalog.db.query_row(
+        "SELECT a.id,a.render_generation,b.volume_id,b.file_key FROM assets a JOIN storage_bindings b ON b.asset_id=a.id WHERE a.location=?1",
+        [crate::location_bytes(&path)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!((volume, file), (None, None));
+
+    let open = actor.open.as_mut().unwrap();
+    open.import
+        .as_mut()
+        .unwrap()
+        .request_cancel_owned(&mut open.service);
+    actor.maintain();
+
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert_eq!(import.status.phase, ImportPhase::Canceled);
+    assert!(import.reference.is_none() && !import.failure);
+    let (after_generation, volume, file): (i64, Option<String>, Option<String>) =
+        open.catalog.db.query_row(
+            "SELECT a.render_generation,b.volume_id,b.file_key FROM assets a JOIN storage_bindings b ON b.asset_id=a.id WHERE a.id=?1",
+            [&asset],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    assert_eq!(after_generation, generation);
+    assert_eq!((volume, file), (None, None));
+    Ok(())
+}
+
+#[test]
 fn actor_commits_observed_root_before_acknowledging_managed_walk() -> Result<()> {
     let root = tempfile::tempdir()?;
     drop(Catalog::open(root.path().join("catalog"))?);

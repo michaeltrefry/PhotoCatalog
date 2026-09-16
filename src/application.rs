@@ -3167,6 +3167,14 @@ impl Actor {
                 && o.service.available_request_slots() > 1
             {
                 let applied = (|| -> Result<()> {
+                    if let Some(reference) = import.reference.as_mut()
+                        && let Err(error) = reference.bind_storage(&mut o.catalog)
+                    {
+                        if error.is::<crate::preview::stage_io::Busy>() {
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     let Some(event) = import
                         .preparation
                         .as_ref()
