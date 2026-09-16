@@ -675,9 +675,14 @@ enum CoordinatorCommand {
 
 pub(super) fn coordinator_channel_backing() -> Result<usize> {
     use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    // The channel has two synchronized wakers, its sole receiver blocks, and
+    // the coordinator thread locks the retained owner once before dispatch.
     add(
-        channels::bounded(1, std::alloc::Layout::new::<CoordinatorCommand>())?,
-        channels::arc(std::alloc::Layout::new::<Mutex<Option<Coordinator>>>())?,
+        add(
+            channels::bounded(1, std::alloc::Layout::new::<CoordinatorCommand>())?,
+            channels::arc(std::alloc::Layout::new::<Mutex<Option<Coordinator>>>())?,
+        )?,
+        add(channels::pthread_mutexes(3)?, channels::blocking_waiter()?)?,
     )
 }
 

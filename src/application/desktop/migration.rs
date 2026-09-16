@@ -157,9 +157,13 @@ struct MetadataAdmission {
 
 fn upload_channel_backing() -> Result<usize> {
     use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    // The new owner blocks once until the admitted Upload is transferred.
     add(
-        channels::bounded(1, std::alloc::Layout::new::<Upload>())?,
-        channels::pthread_mutexes(2)?,
+        add(
+            channels::bounded(1, std::alloc::Layout::new::<Upload>())?,
+            channels::pthread_mutexes(2)?,
+        )?,
+        channels::blocking_waiter()?,
     )
 }
 

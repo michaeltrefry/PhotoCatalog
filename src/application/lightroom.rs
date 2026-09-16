@@ -420,10 +420,17 @@ pub(super) fn metadata_layouts() -> MetadataLayouts {
 }
 
 pub(super) fn channel_metadata_layouts() -> Result<(usize, usize)> {
-    use crate::lightroom_migration_worker::memory::channels;
+    use crate::lightroom_migration_worker::memory::{channels, layout::add};
     use std::alloc::Layout;
+    // The worker is the sole blocking receiver; submissions use try_send.
     Ok((
-        channels::bounded(1, Layout::new::<Message>())?,
+        add(
+            add(
+                channels::bounded(1, Layout::new::<Message>())?,
+                channels::pthread_mutexes(2)?,
+            )?,
+            channels::blocking_waiter()?,
+        )?,
         std::mem::size_of::<mpsc::Receiver<Message>>(),
     ))
 }
