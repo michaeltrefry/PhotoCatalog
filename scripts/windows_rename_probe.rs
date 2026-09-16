@@ -18,6 +18,12 @@ struct IoStatus {
     status: usize,
     information: usize,
 }
+#[derive(Clone, Copy, Debug)]
+enum Api {
+    Win32Declared,
+    Win32Exact,
+    Native,
+}
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetFileInformationByHandle(
@@ -48,7 +54,7 @@ fn held(path: &Path) -> io::Result<File> {
         .custom_flags(0x02000000 | 0x00200000)
         .open(path)
 }
-fn rename(source: &File, parent: &File, name: &OsStr, native: bool) -> io::Result<()> {
+fn rename(source: &File, parent: &File, name: &OsStr, api: Api) -> io::Result<()> {
     let units: Vec<u16> = name.encode_wide().collect();
     assert!(!units.is_empty() && units.len() <= 128 && !units.contains(&0));
     let mut info = RenameInfo {
@@ -59,9 +65,14 @@ fn rename(source: &File, parent: &File, name: &OsStr, native: bool) -> io::Resul
     };
     info.name[..units.len()].copy_from_slice(&units);
     // x64 SDK sizeof(FILE_RENAME_INFO) is 24, filename offset is 20.
-    let bytes = (24 + units.len() * 2) as u32;
-    assert!(mem::size_of::<usize>() == 8 && bytes as usize <= mem::size_of_val(&info));
-    if native {
+    let declared_bytes = 24 + units.len() * 2;
+    let exact_bytes = (mem::offset_of!(RenameInfo, name) + units.len() * 2).max(24);
+    let bytes = match api {
+        Api::Win32Exact => exact_bytes,
+        Api::Win32Declared | Api::Native => declared_bytes,
+    };
+    assert!(mem::size_of::<usize>() == 8 && bytes <= mem::size_of_val(&info));
+    if matches!(api, Api::Native) {
         let mut status = IoStatus {
             status: usize::MAX,
             information: 0,
@@ -71,7 +82,7 @@ fn rename(source: &File, parent: &File, name: &OsStr, native: bool) -> io::Resul
                 source.as_raw_handle(),
                 &mut status,
                 (&info as *const RenameInfo).cast(),
-                bytes,
+                bytes as u32,
                 10,
             )
         };
@@ -101,7 +112,7 @@ fn rename(source: &File, parent: &File, name: &OsStr, native: bool) -> io::Resul
                 source.as_raw_handle(),
                 3,
                 (&info as *const RenameInfo).cast(),
-                bytes,
+                bytes as u32,
             )
         };
         if ok == 0 {
@@ -114,7 +125,7 @@ fn scenario(
     base: &Path,
     tag: &str,
     name: &str,
-    native: bool,
+    api: Api,
     move_parent: bool,
     collision: bool,
 ) -> io::Result<()> {
@@ -143,9 +154,9 @@ fn scenario(
         (parent_path, None)
     };
     let source = held(&final_parent.join("source"))?;
-    let result = rename(&source, &parent, OsStr::new(name), native);
+    let result = rename(&source, &parent, OsStr::new(name), api);
     println!(
-        "case={tag} native={native} parent_moved={move_parent} collision={collision} result={result:?}"
+        "case={tag} api={api:?} parent_moved={move_parent} collision={collision} result={result:?}"
     );
     if collision {
         assert!(result.is_err(), "must not replace existing target");
@@ -183,8 +194,24 @@ fn main() -> io::Result<()> {
         std::env::consts::ARCH,
         base.display()
     );
-    let baseline = scenario(&base, "win32-relative", "q", false, false, false);
-    println!("Win32 baseline observation: {baseline:?}");
+    let baseline = scenario(
+        &base,
+        "win32-relative-declared",
+        "q",
+        Api::Win32Declared,
+        false,
+        false,
+    );
+    println!("Win32 declared-size observation: {baseline:?}");
+    let baseline = scenario(
+        &base,
+        "win32-relative-exact",
+        "q",
+        Api::Win32Exact,
+        false,
+        false,
+    );
+    println!("Win32 exact-size observation: {baseline:?}");
     let cases = [
         ("nt-short", "q".to_owned(), false, false),
         ("nt-max", "x".repeat(128), false, false),
@@ -199,7 +226,7 @@ fn main() -> io::Result<()> {
     ];
     let mut failed = false;
     for (tag, name, moved, collision) in cases {
-        if let Err(error) = scenario(&base, tag, &name, true, moved, collision) {
+        if let Err(error) = scenario(&base, tag, &name, Api::Native, moved, collision) {
             println!("FAILED {tag}: {error}");
             failed = true;
         }
