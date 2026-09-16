@@ -60,6 +60,12 @@ pub(crate) fn lightroom_workbench_retained_metadata_layouts()
 -> lightroom_workbench::RetainedMetadataLayouts {
     lightroom_workbench::retained_metadata_layouts()
 }
+pub(crate) fn handler_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<FilesystemHandler>(),
+        std::mem::align_of::<FilesystemHandler>(),
+    )
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;

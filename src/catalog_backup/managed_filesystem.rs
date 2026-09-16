@@ -23,6 +23,8 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+pub(crate) const STEP_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "action",
@@ -221,7 +223,7 @@ impl Hashing {
     }
     fn step(&mut self, file: &mut File, cancel: &AtomicBool) -> Result<(u64, bool)> {
         check_cancel(cancel)?;
-        let mut buffer = vec![0; 1024 * 1024];
+        let mut buffer = vec![0; STEP_BYTES];
         let n = file.read(&mut buffer)?;
         if n == 0 {
             ensure!(
@@ -285,6 +287,23 @@ enum Active {
 #[derive(Default)]
 pub struct Owner {
     active: Option<Active>,
+}
+
+/// Exact F backup-custody roots. File/OS handle internals remain native; the
+/// ledger separately charges every bounded Rust path/string/buffer backing.
+pub(crate) fn metadata_layouts() -> [(usize, usize); 4] {
+    [
+        (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>()),
+        (
+            std::mem::size_of::<Active>(),
+            std::mem::align_of::<Active>(),
+        ),
+        (std::mem::size_of::<Held>(), std::mem::align_of::<Held>()),
+        (
+            std::mem::size_of::<Hashing>(),
+            std::mem::align_of::<Hashing>(),
+        ),
+    ]
 }
 
 impl Owner {
@@ -617,7 +636,7 @@ impl Owner {
                 );
                 check_cancel(cancel)?;
                 disk(limits, target_root, 0)?;
-                let mut buffer = vec![0; 1024 * 1024];
+                let mut buffer = vec![0; STEP_BYTES];
                 let n = source.file.read(&mut buffer)?;
                 if n == 0 {
                     ensure!(

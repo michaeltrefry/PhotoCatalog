@@ -106,6 +106,30 @@ struct Shared {
     wake: Condvar,
     epoch: crate::catalog_session::LeaseId,
 }
+
+/// Exact child-process supervision roots. The caller separately charges Arc,
+/// encoded-message, typed payload, and nested string/path backings.
+pub(crate) fn metadata_layouts() -> [(usize, usize); 5] {
+    [
+        (
+            std::mem::size_of::<Shared>(),
+            std::mem::align_of::<Shared>(),
+        ),
+        (std::mem::size_of::<State>(), std::mem::align_of::<State>()),
+        (
+            std::mem::size_of::<Pending>(),
+            std::mem::align_of::<Pending>(),
+        ),
+        (
+            std::mem::size_of::<Retained>(),
+            std::mem::align_of::<Retained>(),
+        ),
+        (
+            std::mem::size_of::<OperationContext>(),
+            std::mem::align_of::<OperationContext>(),
+        ),
+    ]
+}
 impl Shared {
     fn new(epoch: crate::catalog_session::LeaseId) -> Self {
         Self {

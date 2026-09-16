@@ -28,7 +28,10 @@ use std::{
 };
 
 const PROTOCOL: u8 = 1;
-const FRAME_BYTES: usize = 1024 * 1024;
+pub(crate) const FRAME_BYTES: usize = 1024 * 1024;
+pub(crate) const OUTPUT_CHANNEL_SLOTS: usize = 4;
+pub(crate) const CONTROL_CHANNEL_SLOTS: usize = 1;
+pub(crate) const ERROR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -698,7 +701,7 @@ fn retire_filesystem_after_backup(
 
 fn bounded_error(error: &anyhow::Error) -> String {
     let value = format!("{error:#}");
-    let mut end = value.len().min(16 * 1024);
+    let mut end = value.len().min(ERROR_BYTES);
     while !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -805,6 +808,90 @@ struct RemoteFilesystem {
     nonce: String,
     replies: Mutex<mpsc::Receiver<Parent>>,
     sequence: AtomicU64,
+}
+
+/// Exact parent/B-process protocol roots. Bounded nested backings are charged
+/// from FRAME_BYTES, path limits, and the fixed channel multiplicities above.
+pub(crate) fn transport_metadata_layouts() -> [(usize, usize); 16] {
+    [
+        (
+            std::mem::size_of::<Startup>(),
+            std::mem::align_of::<Startup>(),
+        ),
+        (
+            std::mem::size_of::<Request>(),
+            std::mem::align_of::<Request>(),
+        ),
+        (
+            std::mem::size_of::<Receipt>(),
+            std::mem::align_of::<Receipt>(),
+        ),
+        (
+            std::mem::size_of::<Parent>(),
+            std::mem::align_of::<Parent>(),
+        ),
+        (std::mem::size_of::<Child>(), std::mem::align_of::<Child>()),
+        (
+            std::mem::size_of::<Envelope<Parent>>(),
+            std::mem::align_of::<Envelope<Parent>>(),
+        ),
+        (
+            std::mem::size_of::<Envelope<Child>>(),
+            std::mem::align_of::<Envelope<Child>>(),
+        ),
+        (
+            std::mem::size_of::<std::result::Result<Envelope<Child>, anyhow::Error>>(),
+            std::mem::align_of::<std::result::Result<Envelope<Child>, anyhow::Error>>(),
+        ),
+        (
+            std::mem::size_of::<mpsc::SyncSender<Result<Envelope<Child>>>>(),
+            std::mem::align_of::<mpsc::SyncSender<Result<Envelope<Child>>>>(),
+        ),
+        (
+            std::mem::size_of::<mpsc::Receiver<Result<Envelope<Child>>>>(),
+            std::mem::align_of::<mpsc::Receiver<Result<Envelope<Child>>>>(),
+        ),
+        (
+            std::mem::size_of::<mpsc::SyncSender<Parent>>(),
+            std::mem::align_of::<mpsc::SyncSender<Parent>>(),
+        ),
+        (
+            std::mem::size_of::<mpsc::Receiver<Parent>>(),
+            std::mem::align_of::<mpsc::Receiver<Parent>>(),
+        ),
+        (
+            std::mem::size_of::<RemoteFilesystem>(),
+            std::mem::align_of::<RemoteFilesystem>(),
+        ),
+        (
+            std::mem::size_of::<std::thread::JoinHandle<()>>(),
+            std::mem::align_of::<std::thread::JoinHandle<()>>(),
+        ),
+        (
+            std::mem::size_of::<std::process::Child>(),
+            std::mem::align_of::<std::process::Child>(),
+        ),
+        (
+            std::mem::size_of::<std::process::ChildStdin>(),
+            std::mem::align_of::<std::process::ChildStdin>(),
+        ),
+    ]
+}
+
+/// Exact heap backing for the two bounded channels in one managed backup.
+/// Typed payload graphs retained in and around the slots are charged by the
+/// desktop capacity assembly.
+pub(crate) fn transport_channel_backings() -> Result<(usize, usize)> {
+    use crate::lightroom_migration_worker::memory::channels;
+    use std::alloc::Layout;
+
+    Ok((
+        channels::bounded(
+            OUTPUT_CHANNEL_SLOTS,
+            Layout::new::<Result<Envelope<Child>>>(),
+        )?,
+        channels::bounded(CONTROL_CHANNEL_SLOTS, Layout::new::<Parent>())?,
+    ))
 }
 impl RemoteFilesystem {
     fn next(&self) -> Result<U64> {

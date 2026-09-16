@@ -66,6 +66,13 @@ impl Layout {
     }
 }
 
+fn source_layout((size, align): (usize, usize)) -> Result<Layout> {
+    Ok(Layout {
+        size: u64::try_from(size)?,
+        align: u64::try_from(align)?,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     Retained,
@@ -2224,6 +2231,290 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             shared_notify,
         ])?,
     )?;
+
+    // A running managed backup owns a second, independent F client/process and
+    // one B process. The generic relay/F envelope above funds the primary
+    // catalog filesystem generation only; these owners have distinct pipes,
+    // parsers, retained results and bounded channels for the whole backup.
+    let [
+        backup_startup,
+        _backup_request_root,
+        _backup_receipt_root,
+        backup_parent_root,
+        backup_child_root,
+        backup_parent_envelope,
+        backup_child_envelope,
+        _backup_output_item,
+        backup_output_sender,
+        backup_output_receiver,
+        backup_control_sender,
+        _backup_control_receiver,
+        backup_remote_filesystem,
+        backup_join,
+        backup_child_process,
+        backup_child_input,
+    ] = crate::catalog_backup::managed::transport_metadata_layouts().map(source_layout);
+    let backup_startup = backup_startup?;
+    let backup_parent_root = backup_parent_root?;
+    let backup_child_root = backup_child_root?;
+    let backup_parent_envelope = backup_parent_envelope?;
+    let backup_child_envelope = backup_child_envelope?;
+    let backup_output_sender = backup_output_sender?;
+    let backup_output_receiver = backup_output_receiver?;
+    let backup_control_sender = backup_control_sender?;
+    let backup_remote_filesystem = backup_remote_filesystem?;
+    let backup_join = backup_join?;
+    let backup_child_process = backup_child_process?;
+    let backup_child_input = backup_child_input?;
+    let backup_frame = crate::catalog_backup::managed::FRAME_BYTES as u64;
+    let backup_error = crate::catalog_backup::managed::ERROR_BYTES as u64;
+    let backup_output_slots = crate::catalog_backup::managed::OUTPUT_CHANNEL_SLOTS as u64;
+    let backup_control_slots = crate::catalog_backup::managed::CONTROL_CHANNEL_SLOTS as u64;
+    let (backup_output_channel, backup_control_channel) =
+        crate::catalog_backup::managed::transport_channel_backings()?;
+    let backup_output_channel = u64::try_from(backup_output_channel)?;
+    let backup_control_channel = u64::try_from(backup_control_channel)?;
+    let backup_path = c.vec_growth(2, crate::application::backup::PATH_UNITS as u64)?;
+    let backup_request_backing = c.mul(2, backup_path)?;
+    let backup_filesystem_message = c
+        .add(&[uuid_backing, c.mul(2, backup_path)?, backup_receipt_backing])?
+        .max(backup_error);
+    let backup_child_typed = c.add(&[
+        backup_child_envelope.size,
+        backup_child_root.size,
+        uuid_backing,
+        backup_filesystem_message.max(restore_receipt_backing),
+    ])?;
+    let backup_child_nested = c.add(&[
+        uuid_backing,
+        backup_filesystem_message.max(restore_receipt_backing),
+    ])?;
+    let backup_parent_typed = c.add(&[
+        backup_parent_envelope.size,
+        backup_parent_root.size,
+        uuid_backing,
+        backup_filesystem_message,
+    ])?;
+    let backup_parent_nested = c.add(&[uuid_backing, backup_filesystem_message])?;
+    // Before semantic validation one legal frame can devote nearly all JSON
+    // nodes to strings or either of two NativePath numeric arrays.
+    let backup_frame_partial =
+        c.add(&[backup_frame, c.mul(2, c.vec_growth(2, backup_frame / 2)?)?])?;
+    let backup_child_parse = c.parse(
+        backup_frame,
+        6,
+        c.add(&[
+            backup_child_envelope.size,
+            backup_child_root.size,
+            backup_frame_partial,
+        ])?,
+    )?;
+    let backup_parent_parse = c.parse(
+        backup_frame,
+        6,
+        c.add(&[
+            backup_parent_envelope.size,
+            backup_parent_root.size,
+            backup_frame_partial,
+        ])?,
+    )?;
+    a.push(
+        "fixed.backup_process_parent_supervisor_roots",
+        Phase::Active,
+        1,
+        c.add(&[
+            backup_output_sender.size,
+            backup_output_receiver.size,
+            backup_join.size,
+            backup_child_process.size,
+            backup_child_input.size,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_process_parent_output_channel_and_parser",
+        Phase::Active,
+        1,
+        c.add(&[
+            backup_output_channel,
+            // Four inline slot roots are in the exact channel backing. Add
+            // their nested graphs, the envelope in supervise, and the larger
+            // of a blocked reader envelope or its in-progress parser.
+            c.mul(backup_output_slots, backup_child_nested)?,
+            backup_child_typed,
+            backup_child_typed.max(backup_child_parse),
+        ])?,
+    )?;
+    let backup_startup_serialization = c.add(&[
+        backup_startup.size,
+        backup_frame,
+        backup_request_backing,
+        c.mul(2, uuid_backing)?, // nonce and operation
+        digest_backing,          // build identity
+    ])?;
+    let backup_parent_serialization = c.add(&[backup_frame, backup_parent_typed])?;
+    a.push(
+        "active.backup_process_parent_serialization_and_startup",
+        Phase::Active,
+        1,
+        backup_startup_serialization.max(backup_parent_serialization),
+    )?;
+
+    let [
+        filesystem_client,
+        filesystem_client_shared,
+        _filesystem_client_state,
+        _filesystem_client_owner,
+        filesystem_operation_root,
+        filesystem_response_root,
+        filesystem_message_root,
+        filesystem_assembly_root,
+        filesystem_startup_root,
+        filesystem_input_root,
+        filesystem_output_root,
+        filesystem_control_root,
+    ] = crate::filesystem_worker::client::metadata_layouts().map(source_layout);
+    let filesystem_client = filesystem_client?;
+    let filesystem_client_shared = filesystem_client_shared?;
+    let filesystem_operation_root = filesystem_operation_root?;
+    let filesystem_response_root = filesystem_response_root?;
+    let filesystem_message_root = filesystem_message_root?;
+    let filesystem_assembly_root = filesystem_assembly_root?;
+    let filesystem_startup_root = filesystem_startup_root?;
+    let filesystem_input_root = filesystem_input_root?;
+    let filesystem_output_root = filesystem_output_root?;
+    let filesystem_control_root = filesystem_control_root?;
+    let filesystem_message = crate::filesystem_worker::wire::MESSAGE_BYTES as u64;
+    let filesystem_config = crate::filesystem_worker::wire::CONFIG_BYTES as u64;
+    let filesystem_error = crate::filesystem_worker::wire::ERROR_BYTES as u64;
+    let filesystem_chunk = crate::filesystem_worker::wire::CHUNK_BYTES as u64;
+    let filesystem_reply_typed =
+        c.add(&[filesystem_response_root.size, backup_filesystem_message])?;
+    let filesystem_operation_typed =
+        c.add(&[filesystem_operation_root.size, backup_filesystem_message])?;
+    let filesystem_parse_partial = c.add(&[
+        filesystem_assembly_root.size,
+        filesystem_message_root.size,
+        filesystem_operation_root
+            .size
+            .max(filesystem_response_root.size),
+        filesystem_message,
+        c.mul(2, c.vec_growth(2, filesystem_message / 2)?)?,
+    ])?;
+    let filesystem_client_runtime = c.add(&[
+        filesystem_message, // outbound command retained in State/write loop
+        filesystem_operation_typed,
+        filesystem_reply_typed,
+        c.mul(2, filesystem_error)?, // sticky failure plus Status clone
+        c.mul(
+            2,
+            c.vec_growth(1, crate::application::backup::DIGEST_BYTES as u64)?,
+        )?,
+        c.mul(2, c.parse(filesystem_message, 6, filesystem_parse_partial)?)?,
+        c.mul(3, filesystem_chunk)?,
+    ])?;
+    let filesystem_client_startup = c.add(&[
+        filesystem_startup_root.size,
+        filesystem_config,
+        c.parse(
+            filesystem_config,
+            4,
+            c.add(&[
+                filesystem_startup_root.size,
+                filesystem_assembly_root.size,
+                filesystem_message_root.size,
+                filesystem_config,
+            ])?,
+        )?,
+    ])?;
+    a.push(
+        "fixed.backup_process_second_f_client_roots",
+        Phase::Active,
+        1,
+        c.add(&[
+            filesystem_client.size,
+            c.arc(filesystem_client_shared)?,
+            c.vec_growth(
+                Layout::of::<std::thread::JoinHandle<()>>().size,
+                crate::filesystem_worker::client::IO_THREAD_OWNERS as u64,
+            )?,
+            filesystem_input_root.size,
+            filesystem_output_root.size,
+            filesystem_control_root.size,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_process_second_f_client_transport",
+        Phase::Active,
+        1,
+        filesystem_client_runtime.max(filesystem_client_startup),
+    )?;
+
+    let [
+        filesystem_child_shared,
+        _filesystem_child_state,
+        _filesystem_pending,
+        _filesystem_retained,
+        filesystem_context,
+    ] = crate::filesystem_worker::process::metadata_layouts().map(source_layout);
+    let filesystem_child_shared = filesystem_child_shared?;
+    let filesystem_context = filesystem_context?;
+    let filesystem_handler = source_layout(crate::filesystem_worker::handler_layout())?;
+    let filesystem_child_runtime = c.add(&[
+        c.arc(filesystem_child_shared)?,
+        filesystem_context.size,
+        filesystem_operation_typed,
+        filesystem_reply_typed,
+        c.arc(Layout::of::<AtomicBool>())?,
+        c.arc(Layout::of::<Vec<u8>>())?,
+        c.mul(3, filesystem_message)?, // input assembly + result/control encodings
+        c.parse(filesystem_message, 6, filesystem_parse_partial)?,
+        c.mul(3, filesystem_chunk)?,
+    ])?;
+    a.push(
+        "active.backup_process_second_f_child_transport",
+        Phase::Active,
+        1,
+        c.add(&[filesystem_handler.size, filesystem_child_runtime])?,
+    )?;
+
+    a.push(
+        "active.backup_process_second_f_custody_and_hashing",
+        Phase::Active,
+        1,
+        c.add(&[
+            // Owner/Active/Held/Hashing roots are inline in FilesystemHandler,
+            // which the child-transport contribution already charges.
+            c.mul(4, backup_path)?
+                .max(c.add(&[c.mul(3, backup_path)?, backup_receipt_backing])?),
+            uuid_backing,
+            u64::try_from(crate::catalog_backup::managed_filesystem::STEP_BYTES)?,
+        ])?,
+    )?;
+
+    let backup_b_runtime = c.add(&[
+        backup_startup.size,
+        backup_join.size,
+        c.mul(2, uuid_backing)?, // retained nonce and operation
+        digest_backing,          // retained build identity
+        backup_remote_filesystem.size,
+        backup_control_sender.size,
+        backup_control_channel,
+        c.arc(Layout::of::<Mutex<std::io::Stdout>>())?,
+        c.arc(Layout::of::<AtomicBool>())?,
+        // The channel owns one inline Parent root. Add that slot's nested
+        // graph and the larger of the blocked sender value or parser state.
+        c.mul(backup_control_slots, backup_parent_nested)?,
+        backup_parent_typed.max(backup_parent_parse),
+        backup_frame,
+        backup_child_typed,
+        backup_request_backing.max(c.add(&[restore_receipt_backing, c.mul(3, backup_path)?])?),
+    ])?;
+    a.push(
+        "active.backup_process_b_child_control_and_transport",
+        Phase::Active,
+        1,
+        backup_b_runtime,
+    )?;
     let backup_control = super::backup_control_tasks_layout();
     a.push(
         "fixed.desktop_backup_control_task_slots",
@@ -2406,6 +2697,97 @@ mod tests {
     }
 
     #[test]
+    fn managed_backup_process_transport_graphs_are_source_derived() -> Result<()> {
+        let report = report(&config())?;
+        let contribution = |name| {
+            report
+                .contributions
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        for name in [
+            "fixed.backup_process_parent_supervisor_roots",
+            "active.backup_process_parent_output_channel_and_parser",
+            "active.backup_process_parent_serialization_and_startup",
+            "fixed.backup_process_second_f_client_roots",
+            "active.backup_process_second_f_client_transport",
+            "active.backup_process_second_f_child_transport",
+            "active.backup_process_second_f_custody_and_hashing",
+            "active.backup_process_b_child_control_and_transport",
+        ] {
+            let entry = contribution(name);
+            assert_eq!(entry.phase, Phase::Active);
+            assert_eq!(entry.count, 1);
+            assert!(entry.each > 0, "empty {name}");
+        }
+
+        let transport = crate::catalog_backup::managed::transport_metadata_layouts();
+        let layout = |index| source_layout(transport[index]);
+        let (output_channel, control_channel) =
+            crate::catalog_backup::managed::transport_channel_backings()?;
+        let parent_fixed = Checked.add(&[
+            layout(8)?.size,
+            layout(9)?.size,
+            layout(13)?.size,
+            layout(14)?.size,
+            layout(15)?.size,
+        ])?;
+        assert_eq!(
+            contribution("fixed.backup_process_parent_supervisor_roots").each,
+            parent_fixed
+        );
+        assert!(
+            contribution("active.backup_process_parent_output_channel_and_parser").each
+                > u64::try_from(output_channel)?
+        );
+        assert!(
+            contribution("active.backup_process_b_child_control_and_transport").each
+                > u64::try_from(control_channel)?
+        );
+
+        let client = crate::filesystem_worker::client::metadata_layouts();
+        let client_layout = |index| source_layout(client[index]);
+        let client_fixed = Checked.add(&[
+            client_layout(0)?.size,
+            Checked.arc(client_layout(1)?)?,
+            Checked.vec_growth(
+                Layout::of::<std::thread::JoinHandle<()>>().size,
+                crate::filesystem_worker::client::IO_THREAD_OWNERS as u64,
+            )?,
+            client_layout(9)?.size,
+            client_layout(10)?.size,
+            client_layout(11)?.size,
+        ])?;
+        assert_eq!(
+            contribution("fixed.backup_process_second_f_client_roots").each,
+            client_fixed
+        );
+        assert!(
+            client[0].0 >= client[3].0,
+            "client must inline its process owner"
+        );
+        assert!(
+            client[1].0 >= client[2].0,
+            "shared client state must be inline"
+        );
+
+        let handler = crate::filesystem_worker::handler_layout();
+        let custody = crate::catalog_backup::managed_filesystem::metadata_layouts();
+        assert!(
+            handler.0 >= custody[0].0,
+            "handler must inline backup F owner"
+        );
+        let child = crate::filesystem_worker::process::metadata_layouts();
+        assert!(child[0].0 >= child[1].0, "child state must be inline");
+        assert!(
+            contribution("active.backup_process_second_f_custody_and_hashing").each
+                >= u64::try_from(crate::catalog_backup::managed_filesystem::STEP_BYTES)?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn default_and_supported_boundaries_have_complete_named_assemblies() -> Result<()> {
         let mut default = config();
         let default_report = report(&default)?;
@@ -2442,6 +2824,14 @@ mod tests {
             "relay.backup_admission_request_parser",
             "relay.backup_admission_reply_parser",
             "relay.backup_admission_cancellation_backings",
+            "fixed.backup_process_parent_supervisor_roots",
+            "active.backup_process_parent_output_channel_and_parser",
+            "active.backup_process_parent_serialization_and_startup",
+            "fixed.backup_process_second_f_client_roots",
+            "active.backup_process_second_f_client_transport",
+            "active.backup_process_second_f_child_transport",
+            "active.backup_process_second_f_custody_and_hashing",
+            "active.backup_process_b_child_control_and_transport",
         ] {
             assert!(
                 default_report

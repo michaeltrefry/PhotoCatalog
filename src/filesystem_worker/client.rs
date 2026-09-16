@@ -102,6 +102,60 @@ struct Owner {
     #[cfg(test)]
     faults: Faults,
 }
+
+/// One client owns exactly three pipe threads: stdin, stdout results, and
+/// stderr controls. Thread stacks/runtime storage remain outside the metadata
+/// ledger, while the retained JoinHandle vector backing is charged.
+pub(crate) const IO_THREAD_OWNERS: usize = 3;
+
+/// Exact inline roots for one G-owned filesystem client. Heap backings held by
+/// these roots are assembled separately by the managed metadata ledger.
+pub(crate) fn metadata_layouts() -> [(usize, usize); 12] {
+    [
+        (
+            std::mem::size_of::<Client>(),
+            std::mem::align_of::<Client>(),
+        ),
+        (
+            std::mem::size_of::<Shared>(),
+            std::mem::align_of::<Shared>(),
+        ),
+        (std::mem::size_of::<State>(), std::mem::align_of::<State>()),
+        (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>()),
+        (
+            std::mem::size_of::<super::wire::Operation>(),
+            std::mem::align_of::<super::wire::Operation>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Response>(),
+            std::mem::align_of::<super::wire::Response>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Message>(),
+            std::mem::align_of::<super::wire::Message>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Assembly>(),
+            std::mem::align_of::<super::wire::Assembly>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Startup>(),
+            std::mem::align_of::<super::wire::Startup>(),
+        ),
+        (
+            std::mem::size_of::<std::process::ChildStdin>(),
+            std::mem::align_of::<std::process::ChildStdin>(),
+        ),
+        (
+            std::mem::size_of::<std::process::ChildStdout>(),
+            std::mem::align_of::<std::process::ChildStdout>(),
+        ),
+        (
+            std::mem::size_of::<std::process::ChildStderr>(),
+            std::mem::align_of::<std::process::ChildStderr>(),
+        ),
+    ]
+}
 impl Owner {
     fn start_io(
         &mut self,
