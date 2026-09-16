@@ -1335,7 +1335,7 @@ impl Harness {
             });
         }
         let selection = serde_json::to_string(&SelectionRequest {
-            inspection: NativePath::from_path(&inspection),
+            inspection: NativePath::from_path(&inspection.join("inspection.sqlite3")),
             families: decisions,
         })?;
         let (input, _) = wb_upload(&self.bridge, wb::InputPurpose::SelectionRequest, &selection)?;
