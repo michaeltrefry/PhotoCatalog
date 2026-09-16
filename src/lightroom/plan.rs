@@ -932,26 +932,30 @@ impl Plan {
         })
     }
     fn capture(&self, revision: &str) -> Result<(PathBuf, Manifest)> {
-        let (path, manifest): (String, String) = self.db.query_row(
-            "SELECT path,manifest FROM captures WHERE revision=?",
-            [revision],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .context(CAPTURE_NOT_REGISTERED)?;
+        let (path, manifest): (String, String) = self
+            .db
+            .query_row(
+                "SELECT path,manifest FROM captures WHERE revision=?",
+                [revision],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .context(CAPTURE_NOT_REGISTERED)?;
         Ok((
             serde_json::from_str::<NativePath>(&path)?.to_path()?,
             serde_json::from_str(&manifest)?,
         ))
     }
     pub(crate) fn managed_capture(&self, revision: &str) -> Result<(NativePath, Manifest)> {
-        let (path, manifest): (String, String) = self.db.query_row(
-            "SELECT path,manifest FROM captures WHERE revision=?",
-            [revision],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?
-        .context(CAPTURE_NOT_REGISTERED)?;
+        let (path, manifest): (String, String) = self
+            .db
+            .query_row(
+                "SELECT path,manifest FROM captures WHERE revision=?",
+                [revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .context(CAPTURE_NOT_REGISTERED)?;
         Ok((
             serde_json::from_str(&path)?,
             serde_json::from_str(&manifest)?,
@@ -3345,7 +3349,11 @@ mod bounded_plan_tests {
             plan.capture("missing").unwrap_err(),
             plan.managed_capture("missing").unwrap_err(),
         ] {
-            assert!(error.to_string().contains("capture revision is not registered"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("capture revision is not registered")
+            );
             assert!(error.to_string().contains("add captured evidence"));
         }
     }
