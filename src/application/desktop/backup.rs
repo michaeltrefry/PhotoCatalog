@@ -8,6 +8,8 @@ use crate::{catalog_session::PhysicalObjectId, storage_volume::NativePath};
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 
+pub(super) const CATALOG_BYTES: usize = 128;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "action",
@@ -25,7 +27,7 @@ impl AdmissionRequest {
             Self::Create { catalog } | Self::Close { catalog, .. } => catalog,
         };
         anyhow::ensure!(
-            !catalog.is_empty() && catalog.len() <= 128,
+            !catalog.is_empty() && catalog.len() <= CATALOG_BYTES,
             "catalog identity length"
         );
         Ok(())
@@ -102,6 +104,22 @@ impl AdmissionReply {
 pub(in crate::application) struct Pending {
     pub receiver: mpsc::Receiver<AdmissionReply>,
     pub cancel: Cancellation,
+}
+
+/// Exact typed roots used by the private G/C admission lane. The shared queue
+/// tables already use `ChildPending`'s exact layout; this helper lets the
+/// capacity ledger charge only the additional typed request/reply graphs.
+pub(super) fn metadata_layouts() -> [(usize, usize); 2] {
+    [
+        (
+            std::mem::size_of::<AdmissionRequest>(),
+            std::mem::align_of::<AdmissionRequest>(),
+        ),
+        (
+            std::mem::size_of::<AdmissionReply>(),
+            std::mem::align_of::<AdmissionReply>(),
+        ),
+    ]
 }
 
 impl Bridge {

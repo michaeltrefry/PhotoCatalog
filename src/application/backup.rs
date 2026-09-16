@@ -11,8 +11,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-const PATH_UNITS: usize = 32 * 1024;
-const ERROR_BYTES: usize = 16 * 1024;
+pub(crate) const PATH_UNITS: usize = 32 * 1024;
+pub(crate) const ERROR_BYTES: usize = 16 * 1024;
+pub(crate) const UUID_BYTES: usize = 36;
+pub(crate) const DIGEST_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -149,6 +151,15 @@ pub struct Coordinator {
 enum Backend {
     Legacy,
     Managed(PathBuf),
+}
+/// Exact inline root for the additional managed coordinator retained by G.
+/// `Active` is inline in this root; only its independently allocated Arc/path/
+/// result backings are assembled beside the other managed process metadata.
+pub(crate) fn metadata_owner_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Mutex<Coordinator>>(),
+        std::mem::align_of::<Mutex<Coordinator>>(),
+    )
 }
 impl Coordinator {
     pub fn new(limits: core::Limits) -> Result<Self> {

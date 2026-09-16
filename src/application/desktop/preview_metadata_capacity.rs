@@ -22,6 +22,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::{HashMap, VecDeque},
     mem::{align_of, size_of},
+    path::Path,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::Instant,
 };
@@ -38,6 +39,18 @@ const LEASE_ID_BYTES: u64 = 36;
 // maximum decimal characters, including separators.
 const SOURCE_REVISION_OBJECT_BYTES: u64 = 20 + 1 + 39;
 const SOURCE_REVISION_CHANGED_BYTES: u64 = 20 + 1 + 20;
+
+#[cfg(unix)]
+fn native_path_units(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(u64::try_from(path.as_os_str().as_bytes().len())?)
+}
+
+#[cfg(windows)]
+fn native_path_units(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    Ok(u64::try_from(path.as_os_str().encode_wide().count())?)
+}
 
 #[derive(Clone, Copy)]
 struct Layout {
@@ -2013,6 +2026,204 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             std::mem::size_of::<Mutex<Option<super::preview_metadata_admission::ProcessReservation>>>() as u64,
         ])?,
     )?;
+    let backup_owner = crate::application::backup::metadata_owner_layout();
+    let backup_owner = Layout {
+        size: u64::try_from(backup_owner.0)?,
+        align: u64::try_from(backup_owner.1)?,
+    };
+    let worker_path_units = native_path_units(&config.worker_executable)?;
+    let worker_path_backing = c.vec(2, worker_path_units)?;
+    let uuid_backing = c.vec_growth(1, crate::application::backup::UUID_BYTES as u64)?;
+    let backup_receipt_backing = c.add(&[
+        uuid_backing,
+        c.vec_growth(1, crate::application::backup::DIGEST_BYTES as u64)?,
+    ])?;
+    let restore_receipt_backing = c.add(&[uuid_backing, backup_receipt_backing])?;
+    let backup_failure_backing = c.vec_growth(1, crate::application::backup::ERROR_BYTES as u64)?;
+    let terminal_backing = restore_receipt_backing.max(backup_failure_backing);
+    let snapshot_backing = c.add(&[uuid_backing, terminal_backing])?;
+    let backup_response_bytes = (config.limits.reply_bytes as u64).max(c.add(&[
+        crate::application::backup::ERROR_BYTES as u64,
+        c.mul(3, crate::application::backup::UUID_BYTES as u64)?,
+        crate::application::backup::DIGEST_BYTES as u64,
+        1024,
+    ])?);
+    a.push(
+        "fixed.backup_g_coordinator_arc_backing",
+        Phase::Retained,
+        1,
+        c.arc(backup_owner)?,
+    )?;
+    a.push(
+        "retained.backup_g_executable_and_terminal_backings",
+        Phase::Retained,
+        1,
+        c.add(&[worker_path_backing, snapshot_backing])?,
+    )?;
+    a.push(
+        "active.backup_g_worker_owner_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.arc(Layout::of::<AtomicBool>())?,
+            c.arc(Layout::of::<
+                Mutex<Option<crate::application::backup::Progress>>,
+            >())?,
+            // The worker closure owns an executable clone, Prepared's two
+            // PathBufs and the managed request's two NativePaths. Thread runtime
+            // storage is excluded, but these five heap backings are not.
+            worker_path_backing,
+            c.mul(
+                4,
+                c.vec_growth(2, crate::application::backup::PATH_UNITS as u64)?,
+            )?,
+            uuid_backing,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_g_status_clone_and_serialization",
+        Phase::Active,
+        1,
+        c.add(&[
+            Layout::of::<crate::application::backup::Snapshot>().size,
+            snapshot_backing,
+            // backup_reply_shared serializes before applying reply_bytes. The
+            // larger source-bounded terminal form can therefore coexist with
+            // its clone even when the configured success allowance is smaller.
+            c.vec_growth(1, backup_response_bytes)?,
+        ])?,
+    )?;
+
+    // Create and Close have independent fixed control slots and may coexist.
+    // The public Create bundle has crossed the whole-request byte check but is
+    // not reduced to PATH_UNITS until C returns its source admission.
+    let public_native_path_backing = c
+        .vec_growth(1, config.limits.request_bytes as u64)?
+        .max(c.vec_growth(2, config.limits.request_bytes as u64 / 2)?);
+    a.push(
+        "active.backup_g_public_request_validation",
+        Phase::Active,
+        1,
+        c.add(&[
+            Layout::of::<crate::application::backup::Request>().size,
+            c.mul(2, public_native_path_backing)?,
+            c.vec_growth(1, config.limits.request_bytes as u64)?,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_g_create_control_backings",
+        Phase::Active,
+        1,
+        // C's admitted source path transfers from the charged private reply
+        // graph into the worker; the public bundle is the additional capture.
+        public_native_path_backing,
+    )?;
+    let cancel_arc = c.arc(Layout::of::<AtomicBool>())?;
+    let shared_notify = c.arc(Layout::of::<std::sync::Weak<super::Shared>>())?;
+    let cancel_slot = Layout::of::<Mutex<Option<crate::application::Cancellation>>>();
+    let cancel_slot_notify = c.arc(Layout::of::<
+        std::sync::Weak<Mutex<Option<crate::application::Cancellation>>>,
+    >())?;
+    a.push(
+        "active.backup_g_close_control_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            // The private request clone is in the relay typed graph; this is
+            // the original token retained for the later real Close.
+            c.vec_growth(1, super::backup::CATALOG_BYTES as u64)?,
+            c.arc(cancel_slot)?,
+            // Public Close cancellation and the later inner C Close each own
+            // one flag and one bounded notification closure environment.
+            c.mul(2, cancel_arc)?,
+            cancel_slot_notify,
+            shared_notify,
+        ])?,
+    )?;
+
+    // The generic pending tables already use ChildPending's exact enlarged
+    // layout and their admission limits did not change. Charge only the two
+    // backup-specific message graphs, parsers, typed values and cancellation
+    // allocations that can occupy those tables concurrently.
+    let backup_slots = 2u64;
+    let backup_request = config.limits.request_bytes as u64;
+    let backup_reply = (config.limits.reply_bytes as u64).max(super::wire::ERROR_BYTES as u64);
+    a.push(
+        "relay.backup_admission_complete_message_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            // Per fixed slot, the sender's Message can coexist with the
+            // receiver's complete Assembly in each direction. Parser scratch
+            // below excludes that already charged Assembly raw buffer.
+            c.mul(2 * backup_slots, backup_request)?,
+            c.mul(2 * backup_slots, backup_reply)?,
+            c.mul(4, CHUNK_BYTES)?,
+        ])?,
+    )?;
+    let [backup_request_root, backup_reply_root] = super::backup::metadata_layouts();
+    let backup_request_root = Layout {
+        size: u64::try_from(backup_request_root.0)?,
+        align: u64::try_from(backup_request_root.1)?,
+    };
+    let backup_reply_root = Layout {
+        size: u64::try_from(backup_reply_root.0)?,
+        align: u64::try_from(backup_reply_root.1)?,
+    };
+    let backup_request_typed = c.add(&[
+        backup_request_root.size,
+        c.vec_growth(1, super::backup::CATALOG_BYTES as u64)?,
+    ])?;
+    let backup_reply_typed = c.add(&[
+        backup_reply_root.size,
+        c.vec_growth(2, crate::application::backup::PATH_UNITS as u64)?
+            .max(c.vec_growth(1, super::wire::ERROR_BYTES as u64)?),
+    ])?;
+    a.push(
+        "relay.backup_admission_retained_typed_graphs",
+        Phase::Active,
+        2 * backup_slots,
+        backup_request_typed.max(backup_reply_typed),
+    )?;
+    a.push(
+        "relay.backup_admission_request_parser",
+        Phase::Active,
+        1,
+        c.parse(
+            backup_request,
+            6,
+            c.add(&[backup_request_root.size, c.vec_growth(1, backup_request)?])?,
+        )?
+        .checked_sub(backup_request)
+        .context("backup request parser raw accounting")?,
+    )?;
+    a.push(
+        "relay.backup_admission_reply_parser",
+        Phase::Active,
+        1,
+        c.parse(
+            backup_reply,
+            6,
+            c.add(&[
+                backup_reply_root.size,
+                c.vec_growth(1, backup_reply)?
+                    .max(c.vec_growth(2, backup_reply / 2)?),
+            ])?,
+        )?
+        .checked_sub(backup_reply)
+        .context("backup reply parser raw accounting")?,
+    )?;
+    a.push(
+        "relay.backup_admission_cancellation_backings",
+        Phase::Active,
+        backup_slots,
+        c.add(&[
+            // G's queued Entry owns a flag and Shared notification. C's actor
+            // Pending owns a second flag; clones share these allocations.
+            c.mul(2, cancel_arc)?,
+            shared_notify,
+        ])?,
+    )?;
     let backup_control = super::backup_control_tasks_layout();
     a.push(
         "fixed.desktop_backup_control_task_slots",
@@ -2130,6 +2341,78 @@ mod tests {
     }
 
     #[test]
+    fn managed_backup_owner_control_and_relay_backings_are_reserved() -> Result<()> {
+        let config = config();
+        let report = report(&config)?;
+        let contribution = |name| {
+            report
+                .contributions
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let owner = contribution("fixed.backup_g_coordinator_arc_backing");
+        let owner_layout = crate::application::backup::metadata_owner_layout();
+        assert_eq!(owner.phase, Phase::Retained);
+        assert_eq!(owner.count, 1);
+        assert_eq!(
+            owner.each,
+            Checked.arc(Layout {
+                size: u64::try_from(owner_layout.0)?,
+                align: u64::try_from(owner_layout.1)?,
+            })?
+        );
+
+        for name in [
+            "retained.backup_g_executable_and_terminal_backings",
+            "active.backup_g_worker_owner_backings",
+            "active.backup_g_status_clone_and_serialization",
+            "active.backup_g_public_request_validation",
+            "active.backup_g_create_control_backings",
+            "active.backup_g_close_control_backings",
+            "relay.backup_admission_complete_message_backings",
+            "relay.backup_admission_retained_typed_graphs",
+            "relay.backup_admission_request_parser",
+            "relay.backup_admission_reply_parser",
+            "relay.backup_admission_cancellation_backings",
+        ] {
+            let entry = contribution(name);
+            assert!(entry.total > 0, "empty {name}");
+            assert_eq!(
+                entry.phase,
+                if name.starts_with("retained.") {
+                    Phase::Retained
+                } else {
+                    Phase::Active
+                }
+            );
+        }
+        assert_eq!(
+            contribution("relay.backup_admission_retained_typed_graphs").count,
+            4
+        );
+        assert_eq!(
+            contribution("relay.backup_admission_cancellation_backings").count,
+            2
+        );
+
+        let default_messages =
+            contribution("relay.backup_admission_complete_message_backings").each;
+        let mut maximum = config;
+        maximum.limits.request_bytes = 4 * 1024 * 1024;
+        maximum.limits.reply_bytes = 4 * 1024 * 1024;
+        let maximum_report = report(&maximum)?;
+        let maximum_messages = maximum_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "relay.backup_admission_complete_message_backings")
+            .context("maximum backup admission message contribution")?;
+        assert!(maximum_messages.each > default_messages);
+        assert!(maximum_report.requested > report.requested);
+        Ok(())
+    }
+
+    #[test]
     fn default_and_supported_boundaries_have_complete_named_assemblies() -> Result<()> {
         let mut default = config();
         let default_report = report(&default)?;
@@ -2154,6 +2437,18 @@ mod tests {
             "retained.import_f_source_custody_and_transfer",
             "active.import_f_inspection_parse_and_encoding",
             "active.import_c_transfer_decode_and_preparation",
+            "fixed.backup_g_coordinator_arc_backing",
+            "retained.backup_g_executable_and_terminal_backings",
+            "active.backup_g_worker_owner_backings",
+            "active.backup_g_status_clone_and_serialization",
+            "active.backup_g_public_request_validation",
+            "active.backup_g_create_control_backings",
+            "active.backup_g_close_control_backings",
+            "relay.backup_admission_complete_message_backings",
+            "relay.backup_admission_retained_typed_graphs",
+            "relay.backup_admission_request_parser",
+            "relay.backup_admission_reply_parser",
+            "relay.backup_admission_cancellation_backings",
         ] {
             assert!(
                 default_report
