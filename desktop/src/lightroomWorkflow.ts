@@ -1,5 +1,5 @@
 import type { NativePath } from './bridge';
-import type { Guard, InputStatus, Query } from './lightroom';
+import type { Action, Guard, InputStatus, Query, Status } from './lightroom';
 import { type JsonNode } from './lightroomJson';
 
 export function decimal(value:string, name:string, minimum=0n, maximum=18446744073709551615n):string {
@@ -28,6 +28,14 @@ export function field(node:JsonNode,key:string):JsonNode|undefined {
   if(node.kind!=='object')return;const found=node.entries.filter(([name])=>name===key);if(found.length>1)throw new Error(`Ambiguous duplicate field ${key}; inspect the retained JSON.`);return found[0]?.[1];
 }
 export function scalar(node:JsonNode|undefined):string { if(node?.kind==='string')return node.value;if(node?.kind==='number')return node.lexeme;throw new Error('Expected an exact string or numeric value.'); }
+export type InspectionDescriptor={workbench:string;operation:string;action?:Action;query?:Query};
+export const inspectionFormScope=(status:Pick<Status,'workbench'>|null)=>status?.workbench??null;
+export const invalidatesInspectionSelection=(action:Action)=>['RegisterInventory','AddCapture','Resume','InspectOriginals','AssignFamily','Choose','ReleaseReview'].includes(action.kind);
+export const sameInspectionDescriptor=(descriptor:InspectionDescriptor|null,status:Pick<Status,'workbench'|'operation'>)=>descriptor?.workbench===status.workbench&&descriptor.operation===status.operation;
+export function reviewedCaptureRevision(descriptor:InspectionDescriptor|null,status:Pick<Status,'workbench'|'operation'>,node:JsonNode):string|null {
+  if(!sameInspectionDescriptor(descriptor,status)||!['Capture','AddCapture'].includes(descriptor?.action?.kind??''))return null;
+  const value=field(node,'revision_id')??field(node,'revision');return value?scalar(value):null;
+}
 export const array=(node:JsonNode|undefined):JsonNode[]=>node?.kind==='array'?node.items:[];
 export function nativePath(node:JsonNode):NativePath {
   const encoding=scalar(field(node,'encoding'));if(encoding!=='UnixBytes'&&encoding!=='WindowsWide')throw new Error('Unknown native path encoding.');

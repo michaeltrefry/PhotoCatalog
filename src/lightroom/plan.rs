@@ -28,6 +28,7 @@ CREATE INDEX paths_revision_sequence ON paths(revision,sequence);
 CREATE INDEX facts_revision ON metadata_facts(revision);
 CREATE INDEX paths_pending_queue ON paths(revision,sequence) WHERE state='pending';
 CREATE INDEX paths_packet_queue ON paths(revision,sequence) WHERE state='pending' OR json_extract(evidence,'$.embedded_sidecar_xmp') IS NOT NULL;";
+const CAPTURE_NOT_REGISTERED: &str = "capture revision is not registered; choose its capture evidence folder and add captured evidence before resuming or inspecting it";
 const ROWS_PAGE: &str = "SELECT r.sequence,r.source_id,r.table_name,r.key_json,t.columns_json,r.cells_json,t.category FROM rows r JOIN tables t ON t.revision=r.revision AND t.name=r.table_name WHERE r.revision=?1 AND r.sequence>?2 ORDER BY r.sequence LIMIT ?3";
 const TABLE_ROWS_PAGE: &str = "SELECT r.sequence,r.source_id,r.table_name,r.key_json,t.columns_json,r.cells_json,t.category FROM rows r JOIN tables t ON t.revision=r.revision AND t.name=r.table_name WHERE r.revision=?1 AND r.sequence>?2 AND r.table_name=?3 ORDER BY r.sequence LIMIT ?4";
 const ISSUES_PAGE: &str = "SELECT sequence,source_id,code,detail FROM issues WHERE revision=? AND sequence>? ORDER BY sequence LIMIT ?";
@@ -935,7 +936,9 @@ impl Plan {
             "SELECT path,manifest FROM captures WHERE revision=?",
             [revision],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        )
+        .optional()?
+        .context(CAPTURE_NOT_REGISTERED)?;
         Ok((
             serde_json::from_str::<NativePath>(&path)?.to_path()?,
             serde_json::from_str(&manifest)?,
@@ -946,7 +949,9 @@ impl Plan {
             "SELECT path,manifest FROM captures WHERE revision=?",
             [revision],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        )
+        .optional()?
+        .context(CAPTURE_NOT_REGISTERED)?;
         Ok((
             serde_json::from_str(&path)?,
             serde_json::from_str(&manifest)?,
@@ -3329,6 +3334,20 @@ mod bounded_plan_tests {
             .add_capture_managed(&directory, &manifest, &drift, &schema, || Ok(()))
             .unwrap_err();
         assert!(error.to_string().contains("existing capture evidence"));
+    }
+
+    #[test]
+    fn missing_capture_revision_explains_registration_step() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let plan = Plan::create(&root.join("plan")).unwrap();
+        for error in [
+            plan.capture("missing").unwrap_err(),
+            plan.managed_capture("missing").unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("capture revision is not registered"));
+            assert!(error.to_string().contains("add captured evidence"));
+        }
     }
 
     #[test]

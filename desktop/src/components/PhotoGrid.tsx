@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { imageKey, type GridImage, type Variant } from '../bridge';
+import { createKeyboardFocusRequest, focusLeavesGrid } from '../photoGridNavigation';
 import { usePreview } from '../state/usePreview';
 
 export function PhotoTile({ catalog, row, selected, onSelect, onDevelop, compact = false, editRevision = '' }: {
@@ -25,6 +26,7 @@ export function PhotoGrid({ catalog, rows, selected, onSelect, onDevelop, size =
   catalog: string; rows: GridImage[]; selected: string | null; onSelect: (row: GridImage) => void; onDevelop: () => void; size?: number; edited?: Variant;
 }) {
   const parent = useRef<HTMLDivElement>(null);
+  const keyboardFocus = useRef(createKeyboardFocusRequest());
   const [width, setWidth] = useState(800);
   useEffect(() => {
     if (!parent.current) return;
@@ -36,19 +38,26 @@ export function PhotoGrid({ catalog, rows, selected, onSelect, onDevelop, size =
   const virtual = useVirtualizer({ count: Math.ceil(rows.length / columns), getScrollElement: () => parent.current, estimateSize: () => height, overscan: 2 });
   useEffect(() => { virtual.measure(); }, [height, virtual]);
   useEffect(() => { const index = rows.findIndex(r => r.image_id === selected); if (index >= 0) virtual.scrollToIndex(Math.floor(index / columns), { align: 'auto' }); }, [selected, columns, rows, virtual]);
+  const virtualItems=virtual.getVirtualItems(),visibleRows=virtualItems.map(item=>item.index).join(':');
+  useEffect(()=>{
+    if(!keyboardFocus.current.matches(selected))return;
+    const frame=requestAnimationFrame(()=>{keyboardFocus.current.settle(selected,parent.current?.querySelectorAll<HTMLButtonElement>('.photo-tile')??[]);});
+    return()=>cancelAnimationFrame(frame);
+  },[selected,visibleRows]);
   const navigate = (key: string) => {
     const index = Math.max(0, rows.findIndex(r => r.image_id === selected));
     const delta = key === 'ArrowRight' ? 1 : key === 'ArrowLeft' ? -1 : key === 'ArrowDown' ? columns : key === 'ArrowUp' ? -columns : 0;
     if (!delta) return false;
     const next = rows[Math.min(rows.length - 1, Math.max(0, index + delta))];
-    if (next) onSelect(next);
+    if (next) {keyboardFocus.current.request(next.image_id);onSelect(next);}
     return true;
   };
   return <div className="photo-grid" ref={parent} role="region" aria-label="Photos" tabIndex={selected ? -1 : 0}
     onFocus={e => { if (e.target === e.currentTarget && !selected && rows[0]) onSelect(rows[0]); }}
-    onKeyDown={e => { if (navigate(e.key)) { e.preventDefault(); requestAnimationFrame(() => parent.current?.querySelector<HTMLButtonElement>('.selected')?.focus({ preventScroll: true })); } else if (e.key === 'Enter') onDevelop(); }}>
-    <div style={{ height: virtual.getTotalSize(), position: 'relative' }}>{virtual.getVirtualItems().map(item => <div key={item.key} className="photo-row" style={{ height, gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, transform: `translateY(${item.start}px)` }}>
-      {rows.slice(item.index * columns, (item.index + 1) * columns).map(row => <PhotoTile key={row.image_id} catalog={catalog} row={row} selected={selected === row.image_id} editRevision={edited && imageKey(edited.key) === imageKey(row.key) ? edited.revision : ''} onSelect={() => onSelect(row)} onDevelop={onDevelop} />)}
+    onBlur={e=>{if(focusLeavesGrid(e.currentTarget,e.relatedTarget as Node|null))keyboardFocus.current.cancel();}}
+    onKeyDown={e => { if (navigate(e.key)) e.preventDefault(); else if (e.key === 'Enter') onDevelop(); }}>
+    <div style={{ height: virtual.getTotalSize(), position: 'relative' }}>{virtualItems.map(item => <div key={item.key} className="photo-row" style={{ height, gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, transform: `translateY(${item.start}px)` }}>
+      {rows.slice(item.index * columns, (item.index + 1) * columns).map(row => <PhotoTile key={row.image_id} catalog={catalog} row={row} selected={selected === row.image_id} editRevision={edited && imageKey(edited.key) === imageKey(row.key) ? edited.revision : ''} onSelect={() => {keyboardFocus.current.cancel();onSelect(row);}} onDevelop={onDevelop} />)}
     </div>)}</div>
   </div>;
 }

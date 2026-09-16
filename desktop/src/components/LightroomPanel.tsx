@@ -4,7 +4,7 @@ import {inspectionTerminal,type Action,type ExactDocument,type InspectionLimits,
 import {approvalDraft,discardArtifactPreparation,discardArtifactReceipt,prepareCaptureArtifacts,selectedCaptures,type ArtifactReceipt,type RetainedArtifactPreparation,type SelectedCapture} from '../lightroomApproval';
 import {useLightroom,inspectionGuard,sameInspection} from '../state/useLightroom';
 import {useLightroomInput} from '../state/useLightroomInput';
-import {array,decimal,families,field,guardKey,limits,nativePath,nextQuery,scalar,selectionDocument,type Family} from '../lightroomWorkflow';
+import {array,decimal,families,field,guardKey,inspectionFormScope,invalidatesInspectionSelection,limits,nativePath,nextQuery,reviewedCaptureRevision,sameInspectionDescriptor,scalar,selectionDocument,type Family,type InspectionDescriptor} from '../lightroomWorkflow';
 import {parseLosslessJson} from '../lightroomJson';
 import {Dialog,ErrorNotice,Section} from './Controls';
 import {Evidence,LightroomResult,type ReviewedResult} from './LightroomEvidence';
@@ -13,7 +13,6 @@ import './lightroom.css';
 type Controller=ReturnType<typeof useLightroom>;
 type Location={path:NativePath;display:string};
 type Purpose=Parameters<typeof chooseLocation>[0];
-type Descriptor={operation:string;action?:Action;query?:Query};
 const evidenceQueries=['Families','CaptureManifest','Rows','Report','Paths','Issues','Packets','PacketBytes','MetadataConflicts','GlobalIdConflicts','PathCollisions','SelectionSummary','SelectionPage'] as const satisfies readonly Query['kind'][];
 type EvidenceQueryKind=typeof evidenceQueries[number];
 const labels:Record<string,string>={request_bytes:'Request bytes',result_bytes:'Result bytes',page_bytes:'Page bytes',row_bytes:'Row bytes',native_path_units:'Native path units',vm_steps:'SQLite VM steps',deadline_ms:'Deadline milliseconds',max_files:'Maximum files',max_depth:'Maximum discovery depth',max_file_bytes:'Maximum bytes per file',max_total_bytes:'Maximum total bytes',max_cell_bytes:'Maximum cell bytes',review_bytes:'Review bytes',snapshot_bytes:'Snapshot bytes'};
@@ -40,7 +39,7 @@ export function LightroomPanel({controller:c,open,onClose,onSealed,preparedSuppl
   const [queryKind,setQueryKind]=useState<EvidenceQueryKind>('Families'),[collection,setCollection]=useState<Extract<Query,{kind:'SelectionPage'}>['collection']>('Families');
   const [family,setFamily]=useState(''),[reason,setReason]=useState(''),[chooseRevision,setChooseRevision]=useState('');
   const [familyReport,setFamilyReport]=useState<{rows:Family[];review:ReviewedResult}|null>(null),[decisions,setDecisions]=useState<Record<string,string>>({});
-  const [review,setReview]=useState<ReviewedResult|null>(null),[descriptor,setDescriptor]=useState<Descriptor|null>(null);
+  const [review,setReview]=useState<ReviewedResult|null>(null),[descriptor,setDescriptor]=useState<InspectionDescriptor|null>(null);
   const [approval,setApproval]=useState(''),[policy,setPolicy]=useState(''),[approvalChecked,setApprovalChecked]=useState(false),[digest,setDigest]=useState('');
   const [captures,setCaptures]=useState<SelectedCapture[]>([]),[captureRoots,setCaptureRoots]=useState<Record<string,Location>>({}),[artifacts,setArtifacts]=useState<ArtifactReceipt[]>(retainedReceipts),[approvalDestination,setApprovalDestination]=useState<Location|null>(null);
   const [importSource,setImportSource]=useState('Lightroom selected catalog migration'),[overlap,setOverlap]=useState<'require'|'reuse'>('require'),[overlapReason,setOverlapReason]=useState(''),[keywordOverlap,setKeywordOverlap]=useState<'require'|'reuse'>('require'),[keywordReason,setKeywordReason]=useState(''),[authorization,setAuthorization]=useState('');
@@ -50,7 +49,7 @@ export function LightroomPanel({controller:c,open,onClose,onSealed,preparedSuppl
   const [active,setActive]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState('');
   const input=useLightroomInput(c.status,c.options);
   const current=useRef(c);current.current=c;const dialog=useRef({open,generation:0});if(dialog.current.open!==open)dialog.current={open,generation:dialog.current.generation+1};
-  const workbench=c.status?.workbench??null;const workbenchScope=JSON.stringify([workbench,c.status?.generation??null]);const ownWorkbench=useRef(workbench);ownWorkbench.current=workbench;
+  const workbench=c.status?.workbench??null;const workbenchScope=inspectionFormScope(c.status);const ownWorkbench=useRef(workbench);ownWorkbench.current=workbench;
   const waiting=useRef(0),mounted=useRef(true);
   useEffect(()=>()=>{mounted.current=false;waiting.current++;},[]);
   useEffect(()=>{if(c.options){setWorkbenchLimits(v=>v??c.options!.workbench);setInspectionLimits(v=>v??c.options!.inspection);setSelectionLimits(v=>v??c.options!.selection);}},[c.options]);
@@ -62,8 +61,8 @@ export function LightroomPanel({controller:c,open,onClose,onSealed,preparedSuppl
   const inspect=async(value:Action|Query,type:'action'|'query',expected?:Parameters<Controller['action']>[1])=>{
     const original=current.current.current();if(!original)throw new Error('Open an inspection first.');const admission=await(type==='action'?c.action(value as Action,expected):c.read(value as Query,expected));
     const now=current.current.current();if(!now||now.workbench!==original.workbench||now.operation!==admission.operation)return;
-    setReview(null);setDescriptor({operation:admission.operation,...(type==='action'?{action:value as Action}:{query:value as Query})});
-    if(type==='action'&&['AssignFamily','Choose','RegisterInventory','AddCapture','Resume','InspectOriginals'].includes(value.kind)){setFamilyReport(null);setDecisions({});}
+    setReview(null);setDescriptor({workbench:original.workbench,operation:admission.operation,...(type==='action'?{action:value as Action}:{query:value as Query})});
+    if(type==='action'&&invalidatesInspectionSelection(value as Action)){setFamilyReport(null);setDecisions({});setApprovalChecked(false);setCaptures([]);setCaptureRoots({});setApproval('');setPolicy('');}
     const terminal=await admission.completion;if(ownWorkbench.current===terminal.workbench&&current.current.current()?.operation===terminal.operation){setNotice(terminal.phase==='Complete'?'Inspection operation finished. Review its evidence and any issues.':`Inspection ${terminal.phase}. ${terminal.error??''}`);}
   };
   const choose=async(purpose:Purpose,put:(p:Location)=>void)=>{const scope=dialog.current,owner=current.current.current();const valid=()=>{const now=current.current.current();return dialog.current===scope&&scope.open&&(owner?!!now&&guardKey(now)===guardKey(owner):now===null);};try{const value=await chooseLocation(purpose);if(value&&valid())put(value);}catch(e){if(valid())setError(errorText(e));}};
@@ -91,14 +90,14 @@ export function LightroomPanel({controller:c,open,onClose,onSealed,preparedSuppl
     }
   };
   const reviewed=(value:ReviewedResult)=>{
-    if(!sameInspection(current.current.current(),inspectionGuard(value.status)))return;setReview(value);
-    if(descriptor?.operation===value.status.operation&&descriptor.query?.kind==='Families'){try{const rows=families(value.node);setFamilyReport({rows,review:value});setDecisions({});}catch(e){setError(errorText(e));}}
-    if(descriptor?.operation===value.status.operation&&['Capture','AddCapture'].includes(descriptor.action?.kind??'')){try{const id=field(value.node,'revision_id')??field(value.node,'revision');if(id)setRevision(scalar(id));}catch{/* Exact raw evidence remains visible if a result has another shape. */}}
-    if(descriptor?.operation===value.status.operation&&descriptor.action?.kind==='Seal'){try{const path=nativePath(field(value.node,'directory')!);onSealed({path,display:displayPath(path)});}catch(e){setError(errorText(e));}}
-    if(descriptor?.operation===value.status.operation&&descriptor.query?.kind==='SelectionPage'&&descriptor.query.collection==='Captures'){try{const rows=selectedCaptures(value.node);setCaptures(current=>descriptor.query!.kind==='SelectionPage'&&descriptor.query.after==='0'?rows:[...current,...rows.filter(row=>!current.some(old=>old.revision===row.revision))]);}catch(e){setError(errorText(e));}}
-    if(descriptor?.operation===value.status.operation&&descriptor.action?.kind==='ApprovalDocuments'){try{setApproval(scalar(field(value.node,'approval_json')));setPolicy(scalar(field(value.node,'policy_json')));setApprovalChecked(false);setNotice('The pinned selection owner produced exact approval and policy documents. Review both before sealing.');}catch(e){setError(errorText(e));}}
+    if(!sameInspection(current.current.current(),inspectionGuard(value.status)))return;setReview(value);const currentDescriptor=sameInspectionDescriptor(descriptor,value.status);
+    if(currentDescriptor&&descriptor?.query?.kind==='Families'){try{const rows=families(value.node);setFamilyReport({rows,review:value});setDecisions({});}catch(e){setError(errorText(e));}}
+    try{const id=reviewedCaptureRevision(descriptor,value.status,value.node);if(id)setRevision(id);}catch{/* Exact raw evidence remains visible if a result has another shape. */}
+    if(currentDescriptor&&descriptor?.action?.kind==='Seal'){try{const path=nativePath(field(value.node,'directory')!);onSealed({path,display:displayPath(path)});}catch(e){setError(errorText(e));}}
+    if(currentDescriptor&&descriptor?.query?.kind==='SelectionPage'&&descriptor.query.collection==='Captures'){try{const rows=selectedCaptures(value.node);setCaptures(current=>descriptor.query!.kind==='SelectionPage'&&descriptor.query.after==='0'?rows:[...current,...rows.filter(row=>!current.some(old=>old.revision===row.revision))]);}catch(e){setError(errorText(e));}}
+    if(currentDescriptor&&descriptor?.action?.kind==='ApprovalDocuments'){try{setApproval(scalar(field(value.node,'approval_json')));setPolicy(scalar(field(value.node,'policy_json')));setApprovalChecked(false);setNotice('The pinned selection owner produced exact approval and policy documents. Review both before sealing.');}catch(e){setError(errorText(e));}}
   };
-  const next=()=>{if(!review||!descriptor?.query||descriptor.operation!==review.status.operation)throw new Error('Assemble the current query result first.');const q=nextQuery(descriptor.query,review.node);if(!q)throw new Error('This result has no continuation.');return inspect(q,'query');};
+  const next=()=>{if(!review||!descriptor?.query||!sameInspectionDescriptor(descriptor,review.status))throw new Error('Assemble the current query result first.');const q=nextQuery(descriptor.query,review.node);if(!q)throw new Error('This result has no continuation.');return inspect(q,'query');};
   const stage=(raw:string,purpose:Parameters<typeof input.begin>[1])=>void run(`Stage ${purpose}`,()=>input.begin(raw,purpose,digest||null));
   const upload=()=>void run('Upload staged bytes',async()=>{const token=waiting.current;let progress=input.value;if(!progress)throw new Error('Begin a staged input first.');while(progress&&!progress.complete&&BigInt(progress.received_bytes)<BigInt(progress.total_bytes)){progress=await input.append();if(token!==waiting.current)return;}});
   const consume=(purpose:'Inventory'|'SelectionRequest'|'Approval'|'ApprovalDraft')=>{
