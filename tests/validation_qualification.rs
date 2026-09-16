@@ -37,8 +37,8 @@ use std::{
 };
 
 const BASELINE_MANIFEST_SHA256: &str =
-    "2dcba80e52f0c2698766be5c67a0af8ff582de3d8f06c7423a48e462a5870b3b";
-const BUILDER_COMMIT: &str = "f8e11c7ff597884e2c0d6a8642f9ef5cee65c9fe";
+    "8c67fb42dc821e53f56b45738e3835997e81a865fb76677d0eb6a0b78f761c2d";
+const BUILDER_COMMIT: &str = "b989a0d80eccf2e7651b69cd15a39cb189b68ec8";
 const SELECTED: [&str; 2] = ["2014-v13-2.lrcat", "2015-v13.lrcat"];
 const EXCLUDED: [&str; 2] = ["2014-v13.lrcat", "2015-v13-3.lrcat"];
 const DEADLINE: Duration = Duration::from_secs(300);
