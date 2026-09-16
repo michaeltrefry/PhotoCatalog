@@ -83,20 +83,25 @@ impl Preparation {
         event: Event,
         behavior: TestPublication,
     ) -> Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel(0);
+        // Tests make a single nonblocking actor tick, so publish the fixture
+        // event before returning instead of racing the worker scheduler.
+        let (sender, receiver) = mpsc::sync_channel(1);
         let (command_sender, command_receiver) = mpsc::sync_channel(0);
         let cancel = Arc::new(AtomicBool::new(false));
+        let expected_root = match &event {
+            Event::Begun { source } => Some(source.clone()),
+            _ => None,
+        };
+        sender
+            .send(event)
+            .map_err(|_| anyhow::anyhow!("publication test receiver closed"))?;
         let worker = thread::Builder::new()
             .name("catalog-publication-test".into())
             .spawn(move || {
                 let run = (|| -> Result<()> {
-                    let expected_root = match &event {
-                        Event::Begun { source } => Some(source.clone()),
-                        _ => None,
-                    };
-                    sender
-                        .send(event)
-                        .map_err(|_| anyhow::anyhow!("publication test receiver closed"))?;
+                    // Keep the event stream alive until command handling ends,
+                    // matching the production worker's disconnect ordering.
+                    let _event_sender = sender;
                     match behavior {
                         TestPublication::AcceptRoot => {
                             let Command::AcceptRoot { source, reply } = command_receiver.recv()?
