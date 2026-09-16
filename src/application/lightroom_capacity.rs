@@ -15,46 +15,10 @@ const ROSTER_LIMIT: u64 = crate::lightroom::selection::APPROVAL_ROSTER_LIMIT as 
 pub(crate) const SOURCE_PAYLOAD_POOL_CONTRACT: &str =
     "distinct growable Source payload pool; charged by MemoryBudget reservations";
 
-// Layout-only mirrors of the stationary dispatcher fields. The integration
-// commit verifies these against desktop::workbench::metadata_layouts(); no
-// routing or queue behavior lives here.
-struct DispatcherLayout {
-    _shared: std::sync::Arc<SharedLayout>,
-    _generation: std::sync::Arc<super::lightroom_managed::Generation>,
-    _worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    _shutdown: std::sync::Mutex<()>,
-}
-struct QueueLayout {
-    _data: std::collections::VecDeque<EntryLayout>,
-    _control: std::collections::VecDeque<EntryLayout>,
-    _stopping: bool,
-}
-struct SharedLayout {
-    _queue: std::sync::Mutex<QueueLayout>,
-    _wake: std::sync::Condvar,
-    _limits: super::Limits,
-}
-struct EntryLayout {
-    _request: super::lightroom_bridge::Request,
-    _reply: std::sync::mpsc::SyncSender<super::Reply>,
-    _cancel: super::Cancellation,
-}
-
+// The integrated dispatcher supplies actual compiler layouts; no parallel
+// layout mirror can drift from its retained owner or queue entries.
 pub(crate) fn dispatcher_layouts() -> [(usize, usize); 3] {
-    [
-        (
-            std::mem::size_of::<DispatcherLayout>(),
-            std::mem::align_of::<DispatcherLayout>(),
-        ),
-        (
-            std::mem::size_of::<SharedLayout>(),
-            std::mem::align_of::<SharedLayout>(),
-        ),
-        (
-            std::mem::size_of::<EntryLayout>(),
-            std::mem::align_of::<EntryLayout>(),
-        ),
-    ]
+    super::desktop::workbench::metadata_layouts()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
