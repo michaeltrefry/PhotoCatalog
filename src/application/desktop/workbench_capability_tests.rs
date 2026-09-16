@@ -317,6 +317,21 @@ fn managed_dispatcher_preserves_sealed_artifact_and_approval_capabilities() -> R
             rusqlite::params![capture_revision, former_selected],
         )?;
     }
+    let captures = {
+        let mut statement = db.prepare("SELECT revision,manifest FROM captures")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (revision, manifest) in captures {
+        let manifest: capture::Manifest = serde_json::from_str(&manifest)?;
+        db.execute(
+            "UPDATE captures SET path=?1 WHERE revision=?2",
+            rusqlite::params![serde_json::to_string(&manifest.request.output)?, revision],
+        )?;
+    }
     db.execute("DELETE FROM family_choices", [])?;
     drop(db);
     let attempt = uuid::Uuid::new_v4().to_string();
