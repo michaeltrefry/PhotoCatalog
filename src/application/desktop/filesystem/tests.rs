@@ -676,6 +676,48 @@ fn managed_import_cleanup_waits_for_one_of_two_bounded_relay_slots() -> Result<(
 }
 
 #[test]
+fn relay_selection_orders_retirement_ack_before_replacement_call() -> Result<()> {
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let proxy = Proxy::new(binding.clone());
+    {
+        let mut state = proxy.state.lock().unwrap();
+        state.output.push(
+            &binding,
+            Body::Control(Control::Ack {
+                id: U64(1),
+                digest: "retired-result".into(),
+            }),
+        )?;
+        state.output.push(
+            &binding,
+            Body::Call {
+                id: U64(3),
+                call: Call::Prepare(request()),
+            },
+        )?;
+    }
+
+    let first = proxy
+        .next_relay(true)
+        .context("retirement acknowledgement")?;
+    assert_eq!(first.lane, Lane::Control);
+    assert!(matches!(
+        decode(&binding, &first.bytes, first.lane)?,
+        Body::Control(Control::Ack { id: U64(1), .. })
+    ));
+    let second = proxy.next_relay(true).context("replacement call")?;
+    assert_eq!(second.lane, Lane::Data);
+    assert!(matches!(
+        decode(&binding, &second.bytes, second.lane)?,
+        Body::Call { id: U64(3), .. }
+    ));
+    Ok(())
+}
+
+#[test]
 fn independent_control_capacity_survives_full_data_queue() -> Result<()> {
     let binding = Binding {
         nonce: LeaseId::new(),

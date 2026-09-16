@@ -1510,6 +1510,16 @@ impl Proxy {
     pub fn next(&self, lane: Lane) -> Option<Out> {
         self.state.lock().unwrap().output.next(lane)
     }
+    pub fn next_relay(&self, allow_data: bool) -> Option<Out> {
+        let mut state = self.state.lock().unwrap();
+        // A completed caller can admit its replacement only after receive()
+        // queued the retirement ACK. Choose between those lanes under the same
+        // lock so the replacement Call cannot overtake that ACK on the wire.
+        state
+            .output
+            .next(Lane::Control)
+            .or_else(|| allow_data.then(|| state.output.next(Lane::Data)).flatten())
+    }
     pub fn fail(&self, message: impl std::fmt::Display) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.fault.get_or_insert_with(|| Fault::new(message, true));

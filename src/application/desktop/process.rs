@@ -1029,15 +1029,16 @@ fn output_writer(
                         store = None;
                     }
                 }
-                if let Some(out) = proxy.next(filesystem::Lane::Control) {
-                    RelayOutput { out, offset: 0 }
-                        .frame(session)
-                        .write(&mut w)?;
-                }
-                if relay.is_none() {
-                    relay = proxy
-                        .next(filesystem::Lane::Data)
-                        .map(|out| RelayOutput { out, offset: 0 });
+                if let Some(out) = proxy.next_relay(relay.is_none()) {
+                    match out.lane {
+                        filesystem::Lane::Control => RelayOutput { out, offset: 0 }
+                            .frame(session)
+                            .write(&mut w)?,
+                        filesystem::Lane::Data => relay = Some(RelayOutput { out, offset: 0 }),
+                        filesystem::Lane::Admission | filesystem::Lane::Store => {
+                            unreachable!("relay selector returned a reserved lane")
+                        }
+                    }
                 }
                 if let Some(m) = &mut relay {
                     m.frame(session).write(&mut w)?;
