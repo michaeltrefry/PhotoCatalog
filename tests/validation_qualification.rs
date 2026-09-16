@@ -251,9 +251,14 @@ fn admitted_inputs() -> Result<(PathBuf, PathBuf, PathBuf, WorkingManifest, Stri
 }
 
 fn app_call(bridge: &DesktopBridge, request: Request) -> Result<Response> {
-    match bridge.submit(request)?.recv() {
+    let label = format!("{request:?}");
+    match bridge
+        .submit(request)
+        .with_context(|| format!("submit {label}"))?
+        .recv()
+    {
         Reply::Ok { value } => Ok(value),
-        Reply::Error { error } => Err(error.into()),
+        Reply::Error { error } => Err(anyhow::Error::from(error).context(label)),
     }
 }
 
@@ -1448,87 +1453,96 @@ fn root_native_fixture_import_migration_qualification() -> Result<()> {
         admitted_inputs()?;
     let commit = std::env::var("PHOTOCATALOG_TEST_COMMIT")?;
     let mut harness = Harness::new(executable, working, output)?;
-    let mut token = harness.import()?;
-    let (parts, excluded_revisions, family_evidence) = harness.inspect_and_seal()?;
-    let first = run_migration(&harness.bridge, &token, &harness.catalog, &parts)?;
-    ensure!(
-        first["status"] == "complete" && first["progress"]["complete"] == true,
-        "migration did not complete: {first}"
-    );
-    let run = first["progress"]["id"]
-        .as_str()
-        .context("migration run identity")?
-        .to_owned();
-    harness.record("migration-first.json", &first)?;
-    app_call(&harness.bridge, Request::Close { catalog: token })?;
-    app_call(
-        &harness.bridge,
-        Request::OpenExisting {
-            path: NativePath::from_path(&harness.catalog),
-        },
-    )?;
-    token = wait_ready(&harness.bridge)?;
-    let repeated = run_migration(&harness.bridge, &token, &harness.catalog, &parts)?;
-    ensure!(
-        repeated["status"] == "complete" && repeated["progress"]["complete"] == true,
-        "repeat migration did not complete: {repeated}"
-    );
-    ensure!(
-        repeated["progress"]["id"].as_str() == Some(run.as_str()),
-        "repeat migration did not resume exact durable run"
-    );
-    harness.record("migration-repeat.json", &repeated)?;
-    let (public_counts, public_queries) = harness.public_counts(&token)?;
-    harness.record("destination-public-queries.json", &public_queries)?;
-    app_call(&harness.bridge, Request::Close { catalog: token })?;
-    harness.bridge.try_shutdown()?;
-    let shutdown = harness.bridge.status();
-    ensure!(
-        shutdown.phase == TransportPhase::Closed
-            && shutdown.pending == 0
-            && !shutdown.outcome_unknown,
-        "desktop did not reach checked fully drained shutdown: {shutdown:?}"
-    );
-    harness.record(
-        "desktop-closed.json",
-        &json!({
-            "phase": "closed",
-            "pending": shutdown.pending,
-            "outcome_unknown": shutdown.outcome_unknown,
-            "message": shutdown.message,
-            "pid": shutdown.pid
-        }),
-    )?;
-    let (counts, sqlite_receipt) =
-        closed_sqlite_counts(&harness.catalog, public_counts, &excluded_revisions, &run)?;
-    harness.record("destination-closed-sqlite-counts.json", &sqlite_receipt)?;
-    let qualification = json!({
-        "format_version": 1,
-        "status": "root_native_qualification_complete_pending_review",
-        "fixture_builder_commit": BUILDER_COMMIT,
-        "baseline_manifest_sha256": BASELINE_MANIFEST_SHA256,
-        "working_manifest_sha256": working_manifest_sha256,
-        "tested_product_commit": commit,
-        "qualification_environment": binary_identity,
-        "workflow": "direct import followed by selected Lightroom migration into the same new catalog",
-        "destination_counts": counts,
-        "reconciliation": manifest.source_reconciliation["selected_source_reconciliation"],
-        "selection_evidence": family_evidence,
-        "count_methods": {
-            "assets": "unique asset_id values from fully paged public Images replies",
-            "variants": "logical image rows from fully paged public Images replies",
-            "xmp_sources": "unique source IDs from fully paged public Metadata Identity/Sources replies for every logical image",
-            "virtual_copies": "actual destination catalog_images rows with role=virtual from read-only SQLite after public Close and checked full DesktopBridge shutdown",
-            "collections": "rows from fully paged public Organization Collections replies",
-            "excluded_catalog_rows_imported": "actual destination migration_retained_records rows matching either exact sealed excluded revision, from read-only SQLite after public Close and checked full DesktopBridge shutdown"
-        },
-        "evidence_paths": harness.evidence,
-        "approved_for_platform_handoff": false
-    });
-    create_new_json(
-        &harness.output.join("target-qualification.json"),
-        &qualification,
-    )?;
-    println!("{}", serde_json::to_string_pretty(&qualification)?);
-    Ok(())
+    let result = (|| -> Result<()> {
+        let mut token = harness.import()?;
+        let (parts, excluded_revisions, family_evidence) = harness.inspect_and_seal()?;
+        let first = run_migration(&harness.bridge, &token, &harness.catalog, &parts)?;
+        ensure!(
+            first["status"] == "complete" && first["progress"]["complete"] == true,
+            "migration did not complete: {first}"
+        );
+        let run = first["progress"]["id"]
+            .as_str()
+            .context("migration run identity")?
+            .to_owned();
+        harness.record("migration-first.json", &first)?;
+        app_call(&harness.bridge, Request::Close { catalog: token })?;
+        app_call(
+            &harness.bridge,
+            Request::OpenExisting {
+                path: NativePath::from_path(&harness.catalog),
+            },
+        )?;
+        token = wait_ready(&harness.bridge)?;
+        let repeated = run_migration(&harness.bridge, &token, &harness.catalog, &parts)?;
+        ensure!(
+            repeated["status"] == "complete" && repeated["progress"]["complete"] == true,
+            "repeat migration did not complete: {repeated}"
+        );
+        ensure!(
+            repeated["progress"]["id"].as_str() == Some(run.as_str()),
+            "repeat migration did not resume exact durable run"
+        );
+        harness.record("migration-repeat.json", &repeated)?;
+        let (public_counts, public_queries) = harness.public_counts(&token)?;
+        harness.record("destination-public-queries.json", &public_queries)?;
+        app_call(&harness.bridge, Request::Close { catalog: token })?;
+        harness.bridge.try_shutdown()?;
+        let shutdown = harness.bridge.status();
+        ensure!(
+            shutdown.phase == TransportPhase::Closed
+                && shutdown.pending == 0
+                && !shutdown.outcome_unknown,
+            "desktop did not reach checked fully drained shutdown: {shutdown:?}"
+        );
+        harness.record(
+            "desktop-closed.json",
+            &json!({
+                "phase": "closed",
+                "pending": shutdown.pending,
+                "outcome_unknown": shutdown.outcome_unknown,
+                "message": shutdown.message,
+                "pid": shutdown.pid
+            }),
+        )?;
+        let (counts, sqlite_receipt) =
+            closed_sqlite_counts(&harness.catalog, public_counts, &excluded_revisions, &run)?;
+        harness.record("destination-closed-sqlite-counts.json", &sqlite_receipt)?;
+        let qualification = json!({
+            "format_version": 1,
+            "status": "root_native_qualification_complete_pending_review",
+            "fixture_builder_commit": BUILDER_COMMIT,
+            "baseline_manifest_sha256": BASELINE_MANIFEST_SHA256,
+            "working_manifest_sha256": working_manifest_sha256,
+            "tested_product_commit": commit,
+            "qualification_environment": binary_identity,
+            "workflow": "direct import followed by selected Lightroom migration into the same new catalog",
+            "destination_counts": counts,
+            "reconciliation": manifest.source_reconciliation["selected_source_reconciliation"],
+            "selection_evidence": family_evidence,
+            "count_methods": {
+                "assets": "unique asset_id values from fully paged public Images replies",
+                "variants": "logical image rows from fully paged public Images replies",
+                "xmp_sources": "unique source IDs from fully paged public Metadata Identity/Sources replies for every logical image",
+                "virtual_copies": "actual destination catalog_images rows with role=virtual from read-only SQLite after public Close and checked full DesktopBridge shutdown",
+                "collections": "rows from fully paged public Organization Collections replies",
+                "excluded_catalog_rows_imported": "actual destination migration_retained_records rows matching either exact sealed excluded revision, from read-only SQLite after public Close and checked full DesktopBridge shutdown"
+            },
+            "evidence_paths": harness.evidence,
+            "approved_for_platform_handoff": false
+        });
+        create_new_json(
+            &harness.output.join("target-qualification.json"),
+            &qualification,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&qualification)?);
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        eprintln!(
+            "qualification failed before cleanup: {error:#}; transport: {:?}",
+            harness.bridge.status()
+        );
+    }
+    result
 }
