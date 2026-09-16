@@ -608,9 +608,10 @@ impl Owner {
     }
 
     pub(crate) fn admit(&self) -> Result<()> {
-        if self.filesystem.status().phase != FilesystemPhase::Ready {
+        let status = self.filesystem.status();
+        if status.phase != FilesystemPhase::Ready {
             self.fail_sources();
-            anyhow::bail!("filesystem owner is not ready for Workbench admission")
+            anyhow::bail!("filesystem owner is not ready for Workbench admission: {status:?}")
         }
         self.check_source()
     }
