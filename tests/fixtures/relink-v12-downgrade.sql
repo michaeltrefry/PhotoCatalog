@@ -1,5 +1,6 @@
 -- Synthetic downgrade fixtures only: restore the exact schema11 storage shape.
 -- Call before removing older schemas or lowering user_version.
+DROP TABLE metadata_write_receipts;
 DROP TRIGGER storage_review_plan;
 DROP TRIGGER storage_review_item_insert;
 DROP TRIGGER storage_review_item_update;
