@@ -2041,6 +2041,7 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
     let worker_path_units = native_path_units(&config.worker_executable)?;
     let worker_path_backing = c.vec(2, worker_path_units)?;
     let uuid_backing = c.vec_growth(1, crate::application::backup::UUID_BYTES as u64)?;
+    let digest_backing = c.vec_growth(1, crate::application::backup::DIGEST_BYTES as u64)?;
     let backup_receipt_backing = c.add(&[
         uuid_backing,
         c.vec_growth(1, crate::application::backup::DIGEST_BYTES as u64)?,
