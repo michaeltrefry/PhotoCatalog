@@ -1047,11 +1047,13 @@ impl Client {
                 managed.filesystem(request, cancel.as_ref())?,
             )),
             CallbackRequest::SealedDocument { request } => Ok(CallbackValue::SealedDocument(
-                managed.sealed_document(request, &cancel)?,
+                managed.sealed_document(request, cancel.as_ref())?,
             )),
-            CallbackRequest::ArtifactPreparation { request } => Ok(
-                CallbackValue::ArtifactPreparation(managed.artifact_preparation(request, &cancel)?),
-            ),
+            CallbackRequest::ArtifactPreparation { request } => {
+                Ok(CallbackValue::ArtifactPreparation(
+                    managed.artifact_preparation(request, cancel.as_ref())?,
+                ))
+            }
             CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source(
                 managed.source_open(authority, cancel.clone())?,
             )),
