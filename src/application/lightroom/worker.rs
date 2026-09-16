@@ -1412,6 +1412,9 @@ impl Owner {
                     requested == self.root.to_path()?.join("inspection.sqlite3"),
                     "selection inspection differs from pinned workbench"
                 );
+                self.plan(control)?
+                    .preflight_selection(&request, limits)
+                    .context("selection semantic preflight before writer close")?;
                 if let Some(plan) = self.plan.take()
                     && let Err((plan, error)) = plan.close_checked()
                 {

@@ -311,20 +311,14 @@ fn complete_retained_surface_selection_seal_and_catalog_lifetime_are_independent
         );
     }
     let report = read(&b, Query::Families {});
+    let workbench = status(&b).workbench;
     let mut decisions = vec![];
+    let mut kept_evidence = None;
     for family in report["families"].as_array().unwrap() {
         let id = family["id"].as_str().unwrap().to_owned();
         let evidence = family["evidence_digest"].as_str().unwrap().to_owned();
         if id == "explicit:kept" {
-            act(
-                &b,
-                Action::Choose {
-                    family: id.clone(),
-                    revision: revision.clone(),
-                    expected_evidence: evidence.clone(),
-                    reason: "TEST only".into(),
-                },
-            );
+            kept_evidence = Some(evidence.clone());
             decisions.push(FamilyDecision::Select {
                 family: id,
                 revision: revision.clone(),
@@ -337,6 +331,68 @@ fn complete_retained_surface_selection_seal_and_catalog_lifetime_are_independent
             });
         }
     }
+    let request = SelectionRequest {
+        inspection: NativePath::from_path(&fixture.path),
+        families: decisions,
+    };
+    let input = upload(
+        &b,
+        InputPurpose::SelectionRequest,
+        &serde_json::to_string(&request).unwrap(),
+    );
+    call(
+        &b,
+        Request::Action {
+            guard: g(&status(&b)),
+            action: Action::PrepareSelection {
+                input,
+                limits: crate::lightroom::selection::SelectionLimits::default().into(),
+            },
+        },
+    )
+    .unwrap();
+    let failed = wait(&b);
+    assert_eq!(failed.phase, lw::Phase::Failed);
+    assert_eq!(failed.workbench, workbench);
+    assert!(failed.initialized && !failed.closed);
+    assert!(
+        failed.error.as_deref().is_some_and(
+            |error| error.contains("selection differs from current explicit family choice")
+        ),
+        "{failed:?}"
+    );
+    act(
+        &b,
+        Action::Choose {
+            family: "explicit:kept".into(),
+            revision: revision.clone(),
+            expected_evidence: kept_evidence.unwrap(),
+            reason: "TEST only".into(),
+        },
+    );
+    let report = read(&b, Query::Families {});
+    let decisions = report["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|family| {
+            let id = family["id"].as_str().unwrap().to_owned();
+            let evidence = family["evidence_digest"].as_str().unwrap().to_owned();
+            if id == "explicit:kept" {
+                assert_eq!(family["selected"], revision);
+                FamilyDecision::Select {
+                    family: id,
+                    revision: revision.clone(),
+                    expected_evidence_digest: evidence,
+                }
+            } else {
+                FamilyDecision::Exclude {
+                    family: id,
+                    expected_evidence_digest: evidence,
+                }
+            }
+        })
+        .collect();
     let input = upload(
         &b,
         InputPurpose::SelectionRequest,

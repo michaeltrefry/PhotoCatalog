@@ -42,8 +42,8 @@ export function nativePath(node:JsonNode):NativePath {
   const values=field(node,'units');if(values?.kind!=='array'||!values.items.length||values.items.length>1048576)throw new Error('Invalid native path length.');
   return {encoding,units:values.items.map(value=>Number(decimal(scalar(value),'Native path unit',1n,encoding==='UnixBytes'?255n:65535n)))};
 }
-export type Family={id:string;evidence:string;members:{revision:string;source:JsonNode;details:JsonNode}[];details:JsonNode};
-export function families(node:JsonNode):Family[] {return array(field(node,'families')).map(value=>({id:scalar(field(value,'id')),evidence:scalar(field(value,'evidence_digest')),members:array(field(value,'members')).map(member=>({revision:scalar(field(member,'revision_id')),source:field(member,'source')!,details:member})),details:value}));}
+export type Family={id:string;evidence:string;selected:string|null;members:{revision:string;source:JsonNode;details:JsonNode}[];details:JsonNode};
+export function families(node:JsonNode):Family[] {return array(field(node,'families')).map(value=>{const selected=field(value,'selected');return {id:scalar(field(value,'id')),evidence:scalar(field(value,'evidence_digest')),selected:!selected||selected.kind==='null'?null:scalar(selected),members:array(field(value,'members')).map(member=>({revision:scalar(field(member,'revision_id')),source:field(member,'source')!,details:member})),details:value};});}
 export function selectionDocument(root:NativePath,rows:Family[],decisions:Record<string,string>):string {
   if(!rows.length)throw new Error('Read the complete family report first.');
   // Preserve opaque native units; the selection protocol names the database, not its directory.
@@ -51,7 +51,7 @@ export function selectionDocument(root:NativePath,rows:Family[],decisions:Record
   const last=root.units[root.units.length-1];
   const terminated=last===separator||(root.encoding==='WindowsWide'&&last===47);
   const inspection:NativePath={encoding:root.encoding,units:[...root.units,...(terminated?[]:[separator]),...Array.from('inspection.sqlite3',c=>c.charCodeAt(0))]};
-  return JSON.stringify({inspection,families:rows.map(f=>{const decision=decisions[f.id];if(!decision)throw new Error(`Explicitly select or exclude family ${f.id}.`);if(decision==='exclude')return {kind:'Exclude',family:f.id,expected_evidence_digest:f.evidence};if(!f.members.some(m=>m.revision===decision))throw new Error('Selected revision is no longer a member of its family.');return {kind:'Select',family:f.id,revision:decision,expected_evidence_digest:f.evidence};})});
+  return JSON.stringify({inspection,families:rows.map(f=>{const decision=decisions[f.id];if(!decision)throw new Error(`Explicitly select or exclude family ${f.id}.`);if(decision==='exclude')return {kind:'Exclude',family:f.id,expected_evidence_digest:f.evidence};if(!f.members.some(m=>m.revision===decision))throw new Error('Selected revision is no longer a member of its family.');if(f.selected!==decision)throw new Error(`Record revision ${decision} as the explicit choice for family ${f.id} with a reason, then reread and assemble Families before staging the selection.`);return {kind:'Select',family:f.id,revision:decision,expected_evidence_digest:f.evidence};})});
 }
 /** A short or empty sparse page is not exhaustion when the server supplies a cursor. */
 export function nextQuery(query:Query,node:JsonNode):Query|null {

@@ -136,11 +136,68 @@ impl FamilyDecision {
         }
     }
 }
+
+fn validated_decisions<'a>(
+    report: &FamilyReport,
+    request: &'a SelectionRequest,
+) -> Result<(BTreeMap<&'a str, &'a FamilyDecision>, usize)> {
+    let decisions: BTreeMap<_, _> = request
+        .families
+        .iter()
+        .map(|decision| (decision.family(), decision))
+        .collect();
+    ensure!(
+        decisions.len() == request.families.len() && decisions.len() == report.families.len(),
+        "family decisions must partition every family exactly once"
+    );
+    let mut selected = 0;
+    for family in &report.families {
+        let decision = decisions
+            .get(family.id.as_str())
+            .context("family has no explicit selection or exclusion")?;
+        ensure!(
+            decision.evidence() == family.evidence_digest,
+            "family evidence changed; review again"
+        );
+        if let FamilyDecision::Select { revision, .. } = decision {
+            ensure!(
+                family.selected.as_ref() == Some(revision),
+                "selection differs from current explicit family choice"
+            );
+            selected += 1;
+        }
+    }
+    ensure!(
+        selected > 0,
+        "selection must include at least one explicitly chosen capture"
+    );
+    Ok((decisions, selected))
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionRequest {
     pub inspection: NativePath,
     pub families: Vec<FamilyDecision>,
+}
+
+impl Plan {
+    /// Reject semantic selection mistakes while the writable inspection remains
+    /// available. The owned reader repeats every check after the writer closes.
+    pub(crate) fn preflight_selection(
+        &self,
+        request: &SelectionRequest,
+        limits: SelectionLimits,
+    ) -> Result<()> {
+        limits.validate()?;
+        ensure!(
+            !request.families.is_empty() && request.families.len() <= 256,
+            "explicit complete family decision roster required"
+        );
+        bounded_json(request, limits.review_bytes)?;
+        let report = self.families()?;
+        validated_decisions(&report, request)?;
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -724,33 +781,15 @@ impl SelectionReview {
             });
             check(&cancel, until)?;
             let report = plan.families_in_snapshot()?;
-            let decisions: BTreeMap<_, _> =
-                request.families.iter().map(|d| (d.family(), d)).collect();
-            ensure!(
-                decisions.len() == request.families.len()
-                    && decisions.len() == report.families.len(),
-                "family decisions must partition every family exactly once"
-            );
+            let (decisions, selected) = validated_decisions(&report, &request)?;
             let mut captures = Vec::new();
-            let mut selected = 0;
             for family in &report.families {
                 check(&cancel, until)?;
                 let decision = decisions
                     .get(family.id.as_str())
                     .context("family has no explicit selection or exclusion")?;
-                ensure!(
-                    decision.evidence() == family.evidence_digest,
-                    "family evidence changed; review again"
-                );
                 let chosen = match decision {
-                    FamilyDecision::Select { revision, .. } => {
-                        ensure!(
-                            family.selected.as_ref() == Some(revision),
-                            "selection differs from current explicit family choice"
-                        );
-                        selected += 1;
-                        Some(revision.as_str())
-                    }
+                    FamilyDecision::Select { revision, .. } => Some(revision.as_str()),
                     FamilyDecision::Exclude { .. } => None,
                 };
                 for member in &family.members {
@@ -770,10 +809,6 @@ impl SelectionReview {
                     });
                 }
             }
-            ensure!(
-                selected > 0,
-                "selection must include at least one explicitly chosen capture"
-            );
             captures.sort_by(|a, b| a.revision.cmp(&b.revision));
             let choices = plan
             .db

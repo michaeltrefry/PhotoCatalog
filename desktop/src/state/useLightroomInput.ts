@@ -5,6 +5,11 @@ import {encodeInput,guardKey,inputChunk,inputObserved,utf8Length,type InputExpec
 
 type Document={raw:string;bytes:Uint8Array;purpose:InputPurpose;digest:string|null;guard:Guard};
 type Pending={expected:InputExpectation;reject:(e:unknown)=>void;resolve:(value:InputStatus|null)=>void;rejected:boolean};
+const inputPollCurrent=(ownerKey:string|null,latestKey:string|null,alive:boolean,read:number,epoch:number)=>alive&&ownerKey===latestKey&&read===epoch;
+export async function observeInputPoll<T>(pending:Promise<T>,current:()=>boolean):Promise<{current:false}|{current:true;reply:T}|{current:true;error:unknown}> {
+  try{const reply=await pending;return current()?{current:true,reply}:{current:false};}
+  catch(error){return current()?{current:true,error}:{current:false};}
+}
 /** One staged slot, independently observed. Unknown acknowledgements keep the
  * slot held; a read showing old progress never authorizes replay of a write. */
 export function useLightroomInput(status:Status|null,options:Options|null) {
@@ -12,12 +17,13 @@ export function useLightroomInput(status:Status|null,options:Options|null) {
   const key=guard?guardKey(guard):null;
   const [value,setValue]=useState<InputStatus|null>(null),[document,setDocument]=useState<Document|null>(null),[ready,setReady]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
   const context=useRef<{key:string|null;alive:boolean}>({key:null,alive:false});
+  const latestKey=useRef(key);latestKey.current=key;
   const current=useRef<InputStatus|null>(null),known=useRef(false),pending=useRef<Pending|null>(null),epoch=useRef(0),doc=useRef<Document|null>(null);
   const rendered=context.current;
   useEffect(()=>{
     const own={key,alive:true};context.current=own;const abort=new AbortController();let timer:ReturnType<typeof setTimeout>;
     current.current=null;doc.current=null;known.current=false;setValue(null);setDocument(null);setReady(false);setBusy(false);setError('');
-    const poll=async()=>{const read=epoch.current;try{const reply=await lightroom({kind:'InputStatus',guard:guard!,input:null},abort.signal);if(!own.alive||read!==epoch.current)return;if(reply.kind!=='Input')throw new Error('Unexpected staged input status.');const v=reply.value;if(v&&guardKey(v.guard)!==key)throw new Error('Stale staged input response.');current.current=v;setValue(v);known.current=true;setReady(true);setError('');const p=pending.current;if(p&&(inputObserved(p.expected,v)||p.rejected)){pending.current=null;setBusy(false);p.resolve(v);}}catch(e){if(own.alive&&read===epoch.current){known.current=false;setReady(false);setError(errorText(e));}}finally{if(own.alive)timer=setTimeout(()=>void poll(),500);}};
+    const poll=async()=>{const read=epoch.current;try{const observed=await observeInputPoll(lightroom({kind:'InputStatus',guard:guard!,input:null},abort.signal),()=>inputPollCurrent(own.key,latestKey.current,own.alive,read,epoch.current));if(!observed.current)return;if('error' in observed)throw observed.error;const reply=observed.reply;if(reply.kind!=='Input')throw new Error('Unexpected staged input status.');const v=reply.value;if(v&&guardKey(v.guard)!==key)throw new Error('Stale staged input response.');current.current=v;setValue(v);known.current=true;setReady(true);setError('');const p=pending.current;if(p&&(inputObserved(p.expected,v)||p.rejected)){pending.current=null;setBusy(false);p.resolve(v);}}catch(e){if(inputPollCurrent(own.key,latestKey.current,own.alive,read,epoch.current)){known.current=false;setReady(false);setError(errorText(e));}}finally{if(own.alive&&own.key===latestKey.current)timer=setTimeout(()=>void poll(),500);}};
     if(guard)void poll();
     return()=>{own.alive=false;abort.abort();clearTimeout(timer);const p=pending.current;if(p){p.reject(new Error('Staged input scope changed; inspect the current workbench.'));pending.current=null;}};
     // Identity is the immutable three-part guard, not the changing status object.
