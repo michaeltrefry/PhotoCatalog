@@ -618,10 +618,17 @@ pub fn worker_main() -> Result<()> {
                 let drain_callback = callback.clone();
                 let drain_output = output.clone();
                 let instance = startup.instance.clone();
+                let retained = Arc::new(Mutex::new(Some(coordinator)));
+                let drain_owner = retained.clone();
                 let drain = thread::Builder::new()
                     .name("workbench-checked-drain".into())
                     .spawn(move || {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut coordinator = drain_owner
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .take()
+                                .context("Workbench checked-drain owner missing")?;
                             coordinator.shutdown()
                         }));
                         if !matches!(result, Ok(Ok(()))) {
@@ -638,8 +645,18 @@ pub fn worker_main() -> Result<()> {
                                 .unwrap_or_else(|error| error.into_inner()),
                             &Outcome::Drained { sequence, instance },
                         )
-                    })
-                    .context("start Workbench checked drain")?;
+                    });
+                let drain = match drain {
+                    Ok(drain) => drain,
+                    Err(_) => {
+                        callback.close();
+                        // `retained` still owns Coordinator here. Exiting
+                        // without unwinding prevents its blocking Drop from
+                        // re-entering the callback path on this input loop.
+                        std::process::exit(1);
+                    }
+                };
+                drop(retained);
                 loop {
                     let Some(work) = read_packet::<Work>(&mut input)? else {
                         break;

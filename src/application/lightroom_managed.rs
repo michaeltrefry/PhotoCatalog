@@ -554,7 +554,7 @@ impl Owner {
             Err(error) => {
                 let primary =
                     anyhow::Error::new(error).context("start Workbench filesystem monitor");
-                let cleanup = owner.drain_all();
+                let cleanup = owner.drain_checked();
                 match cleanup {
                     Ok(()) => Err(primary),
                     Err(cleanup) => Err(primary.context(format!(
