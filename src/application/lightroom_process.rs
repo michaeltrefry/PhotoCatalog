@@ -811,7 +811,7 @@ pub struct Client {
     instance: crate::catalog_session::LeaseId,
     owner: Mutex<Owner>,
     child: Mutex<Option<Child>>,
-    interrupted: AtomicBool,
+    interrupted: Arc<AtomicBool>,
     managed: Option<Arc<dyn super::lightroom::ManagedIo>>,
 }
 impl Client {
@@ -918,7 +918,7 @@ impl Client {
             instance: startup.instance,
             managed,
             child: Mutex::new(Some(child)),
-            interrupted: AtomicBool::new(false),
+            interrupted: Arc::new(AtomicBool::new(false)),
             owner: Mutex::new(Owner {
                 transport: Some(Transport {
                     input,
@@ -934,8 +934,8 @@ impl Client {
     fn callback(
         managed: &dyn super::lightroom::ManagedIo,
         request: CallbackRequest,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<CallbackValue> {
-        let cancel = AtomicBool::new(false);
         match request {
             CallbackRequest::Admit => {
                 managed.admit()?;
@@ -946,10 +946,10 @@ impl Client {
                 Ok(CallbackValue::Admitted)
             }
             CallbackRequest::Filesystem { request } => Ok(CallbackValue::Filesystem(
-                managed.filesystem(request, &cancel)?,
+                managed.filesystem(request, cancel.as_ref())?,
             )),
             CallbackRequest::SourceOpen { authority } => Ok(CallbackValue::Source(
-                managed.source_open(authority, Arc::new(cancel))?,
+                managed.source_open(authority, cancel.clone())?,
             )),
             CallbackRequest::SourceSqlOpen {
                 seal,
@@ -959,7 +959,7 @@ impl Client {
                 seal,
                 limits,
                 protected,
-                Arc::new(cancel),
+                cancel.clone(),
             )?)),
             CallbackRequest::SourceSchema { source } => {
                 Ok(CallbackValue::Schema(managed.source_schema(&source)?))
@@ -990,11 +990,12 @@ impl Client {
         sequence: crate::application::U64,
         request: CallbackRequest,
         managed: Option<&Arc<dyn super::lightroom::ManagedIo>>,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<()> {
         let fatal = matches!(&request, CallbackRequest::Admit | CallbackRequest::Commit);
         let result = managed
             .context("unmanaged Workbench requested a supervisor callback")
-            .and_then(|managed| Self::callback(managed.as_ref(), request))
+            .and_then(|managed| Self::callback(managed.as_ref(), request, cancel))
             .map_err(|error| {
                 if fatal {
                     Failure::fatal(error)
@@ -1061,10 +1062,10 @@ impl Client {
         if let Some(child) = slot.as_mut() {
             // Do not wait here: Source owners must be checked-drained first.
             // An already exited child is reconciled by the same shutdown path.
-            if let Err(error) = child.kill() {
-                if error.kind() != std::io::ErrorKind::InvalidInput {
-                    return Err(error).context("interrupt Workbench child");
-                }
+            if let Err(error) = child.kill()
+                && error.kind() != std::io::ErrorKind::InvalidInput
+            {
+                return Err(error).context("interrupt Workbench child");
             }
         }
         Ok(())
@@ -1111,7 +1112,13 @@ impl Client {
                     .context("Workbench reply lost; child remains owned for checked drain")?;
                 match outcome {
                     Outcome::Callback { sequence, request } => {
-                        Self::reply_callback(transport, sequence, request, self.managed.as_ref())?;
+                        Self::reply_callback(
+                            transport,
+                            sequence,
+                            request,
+                            self.managed.as_ref(),
+                            &self.interrupted,
+                        )?;
                     }
                     Outcome::Reply {
                         sequence: actual,
@@ -1188,9 +1195,13 @@ impl Client {
                 let outcome: Outcome = read_packet(&mut transport.output)?
                     .context("Workbench drain acknowledgement lost")?;
                 match outcome {
-                    Outcome::Callback { sequence, request } => {
-                        Self::reply_callback(transport, sequence, request, self.managed.as_ref())?
-                    }
+                    Outcome::Callback { sequence, request } => Self::reply_callback(
+                        transport,
+                        sequence,
+                        request,
+                        self.managed.as_ref(),
+                        &self.interrupted,
+                    )?,
                     Outcome::Drained {
                         sequence: actual,
                         ref instance,
