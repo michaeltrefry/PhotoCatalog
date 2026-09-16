@@ -692,7 +692,8 @@ mod tests {
 
     fn fixture() -> Result<(tempfile::TempDir, CaptureSource, String)> {
         let root = tempfile::tempdir()?;
-        let path = root.path().join(wire::MEMBER);
+        let canonical_root = root.path().canonicalize()?;
+        let path = canonical_root.join(wire::MEMBER);
         let db = Connection::open(&path)?;
         db.execute_batch(
             "CREATE TABLE sample(id INTEGER PRIMARY KEY, value BLOB NOT NULL);\
@@ -719,7 +720,7 @@ mod tests {
             operation: "operation".into(),
             capture_generation: "capture".into(),
             expires_unix_ms: U64(u64::try_from(expires)?),
-            capture_root: NativePath::from_path(root.path()),
+            capture_root: NativePath::from_path(&canonical_root),
             member: wire::MEMBER.into(),
             manifest_blake3: "1".repeat(64),
             revision_id: "2".repeat(64),

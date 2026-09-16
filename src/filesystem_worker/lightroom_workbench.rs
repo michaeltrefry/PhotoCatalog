@@ -1486,7 +1486,7 @@ mod tests {
     fn seal_rejects_staged_database_change_before_publication() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut owner = Owner::default();
-        let database = staged(&mut owner, &temp.path().join("sealed"))?;
+        let database = staged(&mut owner, &temp.path().canonicalize()?.join("sealed"))?;
         hashed(&mut owner, &database)?;
         let db = rusqlite::Connection::open(database.to_path()?)?;
         db.execute("INSERT INTO evidence VALUES ('changed')", [])?;
@@ -1501,7 +1501,13 @@ mod tests {
             },
         );
         assert!(result.is_err());
-        assert!(!temp.path().join("sealed/input-seal.json").exists());
+        assert!(
+            !temp
+                .path()
+                .canonicalize()?
+                .join("sealed/input-seal.json")
+                .exists()
+        );
         Ok(())
     }
 
@@ -1509,7 +1515,7 @@ mod tests {
     fn seal_status_recovers_lost_successful_publication_reply() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut owner = Owner::default();
-        let database = staged(&mut owner, &temp.path().join("sealed"))?;
+        let database = staged(&mut owner, &temp.path().canonicalize()?.join("sealed"))?;
         hashed(&mut owner, &database)?;
         call(
             &mut owner,
@@ -1537,14 +1543,19 @@ mod tests {
                 ..
             }
         ));
-        assert!(temp.path().join("sealed/input-seal.json").is_file());
+        assert!(
+            temp.path()
+                .canonicalize()?
+                .join("sealed/input-seal.json")
+                .is_file()
+        );
         Ok(())
     }
 
     #[test]
     fn seal_begin_failure_after_first_document_retains_status_retry_and_abort() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let output = temp.path().join("retained-partial-seal");
+        let output = temp.path().canonicalize()?.join("retained-partial-seal");
         let approval = br#"{"approval":true}"#;
         let review = br#"{"review":true}"#;
         let begin = LightroomWorkbenchIo::SealBegin {
@@ -1611,8 +1622,8 @@ mod tests {
     #[test]
     fn seal_begin_retry_rejects_replacement_directory_without_mutating_it() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let output = temp.path().join("replace-target");
-        let retained = temp.path().join("retained-original");
+        let output = temp.path().canonicalize()?.join("replace-target");
+        let retained = temp.path().canonicalize()?.join("retained-original");
         let approval = br#"{"approval":true}"#;
         let review = br#"{"review":true}"#;
         let begin = LightroomWorkbenchIo::SealBegin {
@@ -1676,7 +1687,7 @@ mod tests {
     #[test]
     fn malformed_seal_request_has_no_filesystem_effect() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let output = temp.path().join("must-not-exist");
+        let output = temp.path().canonicalize()?.join("must-not-exist");
         let mut owner = Owner::default();
         let request = LightroomWorkbenchIo::SealBegin {
             operation: OPERATION.into(),
