@@ -331,7 +331,7 @@ fn run_process_inner(
             .take()
             .context("managed backup output")?;
         write_frame(input.as_mut().unwrap(), &startup)?;
-        let (tx, rx) = mpsc::sync_channel(4);
+        let (tx, rx) = mpsc::sync_channel(OUTPUT_CHANNEL_SLOTS);
         reader = Some(
             std::thread::Builder::new()
                 .name("backup-owner-output".into())
@@ -730,7 +730,7 @@ pub fn worker_main() -> Result<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     let reader_cancel = cancel.clone();
     let nonce = startup.nonce.clone();
-    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    let (reply_tx, reply_rx) = mpsc::sync_channel(CONTROL_CHANNEL_SLOTS);
     let control = std::thread::Builder::new()
         .name("backup-owner-control".into())
         .spawn(move || {

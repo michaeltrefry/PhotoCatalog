@@ -291,6 +291,7 @@ pub struct Owner {
 
 /// Exact F backup-custody roots. File/OS handle internals remain native; the
 /// ledger separately charges every bounded Rust path/string/buffer backing.
+#[cfg(test)]
 pub(crate) fn metadata_layouts() -> [(usize, usize); 4] {
     [
         (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>()),
