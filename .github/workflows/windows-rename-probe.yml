@@ -1,0 +1,19 @@
+name: Windows held rename probe
+on:
+  push:
+    branches: [codex/sc-23612-windows-rename-probe]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build and run standalone Win32 and NT rename comparison
+        shell: pwsh
+        run: |
+          rustc --edition 2024 scripts/windows_rename_probe.rs -o "$env:RUNNER_TEMP/rename-probe.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:RUNNER_TEMP/rename-probe.exe"
+          exit $LASTEXITCODE
