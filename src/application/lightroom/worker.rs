@@ -652,6 +652,15 @@ impl Owner {
             else {
                 anyhow::bail!("seal stage reply kind")
             };
+            let protected = vec![
+                self.root_identity
+                    .clone()
+                    .context("managed inspection identity missing")?,
+            ];
+            ensure!(
+                !protected.contains(&physical),
+                "sealed snapshot aliases the mutable inspection database"
+            );
             let progress = control.processed.clone();
             if let Err(error) = review.backup_managed(
                 review_token,
@@ -690,10 +699,6 @@ impl Owner {
                 vm_steps: self.config.limits.vm_steps.min(1_000_000_000),
                 ..Default::default()
             };
-            let mut protected = vec![physical];
-            if let Some(root) = &self.root_identity {
-                protected.push(root.clone());
-            }
             let source =
                 io.source_sql_open(seal.clone(), limits, protected, control.cancel.clone())?;
             io.source_retire(&source)
