@@ -14,7 +14,7 @@ use std::{
     },
     thread,
 };
-mod backup;
+pub(super) mod backup;
 #[allow(dead_code)] // Additive, unselected until the FS6 managed actor dependency is admitted.
 mod filesystem;
 pub(crate) use filesystem::admit_export_stage_reply;

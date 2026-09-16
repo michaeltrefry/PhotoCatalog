@@ -64,10 +64,10 @@ fn managed_backup_routes_share_pre_effect_public_byte_boundary() {
         },
     ];
     for request in requests {
-        assert_eq!(
+        assert!(matches!(
             validate_public_request(&request, 0).unwrap_err().code,
             ErrorCode::ResourceLimit
-        );
+        ));
     }
 }
 

@@ -15,7 +15,7 @@ use std::sync::mpsc;
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-pub(super) enum AdmissionRequest {
+pub(in crate::application) enum AdmissionRequest {
     Create { catalog: String },
     Close { catalog: String, epoch: u64 },
 }
@@ -39,7 +39,7 @@ impl AdmissionRequest {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-pub(super) enum Admission {
+pub(in crate::application) enum Admission {
     Create {
         source: NativePath,
         expected_source: PhysicalObjectId,
@@ -69,7 +69,7 @@ impl Admission {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
-pub(super) enum AdmissionReply {
+pub(in crate::application) enum AdmissionReply {
     Ok(Admission),
     Error(BridgeError),
 }
@@ -88,21 +88,24 @@ impl AdmissionReply {
     pub fn validate(&self) -> anyhow::Result<()> {
         match self {
             Self::Ok(admission) => admission.validate(),
-            Self::Error(error) => anyhow::ensure!(
-                error.message.len() <= super::wire::ERROR_BYTES,
-                "backup admission error length"
-            ),
+            Self::Error(error) => {
+                anyhow::ensure!(
+                    error.message.len() <= super::wire::ERROR_BYTES,
+                    "backup admission error length"
+                );
+                Ok(())
+            }
         }
     }
 }
 
-pub(super) struct Pending {
+pub(in crate::application) struct Pending {
     pub receiver: mpsc::Receiver<AdmissionReply>,
     pub cancel: Cancellation,
 }
 
 impl Bridge {
-    pub(super) fn backup_admission(
+    pub(in crate::application) fn backup_admission(
         &self,
         request: AdmissionRequest,
     ) -> Result<Pending, BridgeError> {
@@ -144,7 +147,7 @@ impl Bridge {
 }
 
 impl Actor {
-    pub(super) fn backup_admission(
+    pub(in crate::application) fn backup_admission(
         &mut self,
         request: AdmissionRequest,
     ) -> Result<Admission, BridgeError> {
