@@ -52,6 +52,9 @@ impl Allocations {
 struct Starting {
     filesystem: Arc<filesystem::Parent>,
     metadata: preview_metadata_admission::ProcessReservation,
+    // Keep the split alive until either Coordinator owns it or checked startup
+    // cleanup disarms the aggregate reservation.
+    _migration: migration::Funding,
     dependencies: Option<Arc<super::super::lightroom_managed::Owner>>,
     generation: Option<Arc<super::super::lightroom_managed::Generation>>,
 }
@@ -71,6 +74,7 @@ impl Starting {
 /// Keep this error to retry checked cleanup when the environment recovers.
 pub struct StartupFailure {
     message: String,
+    cause: anyhow::Error,
     retained: Mutex<Option<Starting>>,
 }
 impl std::fmt::Debug for StartupFailure {
@@ -88,6 +92,9 @@ impl std::fmt::Display for StartupFailure {
 impl std::error::Error for StartupFailure {}
 impl StartupFailure {
     pub fn try_shutdown(&self) -> anyhow::Result<()> {
+        if let Some(nested) = self.cause.downcast_ref::<super::RetainedStartup>() {
+            nested.try_shutdown()?;
+        }
         let mut retained = self.retained.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(starting) = retained.as_ref() {
             starting.drain()?;
@@ -146,6 +153,7 @@ pub(super) fn spawn(config: Config, pools: Allocations) -> anyhow::Result<Deskto
     let mut starting = Starting {
         filesystem: parent.clone(),
         metadata: metadata.clone(),
+        _migration: migration.clone(),
         dependencies: None,
         generation: None,
     };
@@ -188,6 +196,7 @@ pub(super) fn spawn(config: Config, pools: Allocations) -> anyhow::Result<Deskto
             Ok(()) => Err(error),
             Err(cleanup) => Err(anyhow::Error::new(StartupFailure {
                 message: format!("{error:#}; cleanup: {cleanup:#}"),
+                cause: error,
                 retained: Mutex::new(Some(starting)),
             })),
         },

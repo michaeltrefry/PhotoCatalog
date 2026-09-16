@@ -144,6 +144,7 @@ pub(super) struct Coordinator {
     #[cfg(test)]
     faults: Arc<Mutex<Faults>>,
 }
+#[derive(Clone)]
 pub(super) struct Funding {
     metadata: Arc<MetadataAdmission>,
     source: ByteBudget,
