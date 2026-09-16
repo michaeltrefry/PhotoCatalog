@@ -121,6 +121,7 @@ enum CallbackRequest {
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
     },
     SourceSqlOpen {
+        #[serde(with = "callback_seal_wire")]
         seal: crate::lightroom::migration_source::InputSeal,
         limits: crate::lightroom::migration_source::ReadLimits,
         protected: Vec<crate::lightroom_migration_worker::identity::FileKey>,
@@ -140,6 +141,134 @@ enum CallbackRequest {
     SourceRetire {
         source: String,
     },
+}
+
+// CallbackRequest is internally tagged, so Serde buffers its fields through
+// Content while decoding. Content has no u128 representation. Keep InputSeal's
+// public/on-disk numeric grammar and use canonical decimal strings only for the
+// two timestamp positions on this private, build-bound callback wire.
+mod callback_seal_wire {
+    use crate::{
+        lightroom::{
+            migration_source::{InputSeal, SelectedCapture, SelectionApproval, SupplementPin},
+            source::Revision,
+        },
+        storage_volume::NativePath,
+        xmp_packets::{SourceRevision, Status},
+    };
+    use serde::{
+        Deserialize, Deserializer, Serialize, Serializer,
+        de::{SeqAccess, Visitor},
+        ser::SerializeSeq,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "Revision")]
+    struct RevisionDef {
+        object: String,
+        bytes: u64,
+        #[serde(
+            with = "crate::filesystem_worker::wire::capture_manifest_wire::option_u128_decimal"
+        )]
+        modified_ns: Option<u128>,
+        changed: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "SourceRevision")]
+    struct SourceRevisionDef {
+        length: u64,
+        blake3: String,
+        #[serde(
+            with = "crate::filesystem_worker::wire::capture_manifest_wire::option_u128_decimal"
+        )]
+        modified_unix_ns: Option<u128>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "SupplementPin")]
+    struct SupplementPinDef {
+        revision: String,
+        source_id: String,
+        origin: String,
+        #[serde(with = "SourceRevisionDef")]
+        source_revision: SourceRevision,
+        historical_status: Status,
+        proof_blake3: String,
+    }
+
+    #[derive(Serialize)]
+    struct SupplementRef<'a>(#[serde(with = "SupplementPinDef")] &'a SupplementPin);
+
+    struct SupplementOwned(SupplementPin);
+    impl<'de> Deserialize<'de> for SupplementOwned {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            SupplementPinDef::deserialize(deserializer).map(Self)
+        }
+    }
+
+    mod supplements {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            values: &[SupplementPin],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+            for value in values {
+                sequence.serialize_element(&SupplementRef(value))?;
+            }
+            sequence.end()
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<SupplementPin>, D::Error> {
+            struct SupplementVisitor;
+            impl<'de> Visitor<'de> for SupplementVisitor {
+                type Value = Vec<SupplementPin>;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a selected supplement sequence")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                    while let Some(SupplementOwned(value)) = sequence.next_element()? {
+                        values.push(value);
+                    }
+                    Ok(values)
+                }
+            }
+            deserializer.deserialize_seq(SupplementVisitor)
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "InputSeal")]
+    struct InputSealDef {
+        protocol: u32,
+        database: NativePath,
+        #[serde(with = "RevisionDef")]
+        identity: Revision,
+        blake3: String,
+        approval: SelectionApproval,
+        selected: Vec<SelectedCapture>,
+        excluded_revisions: Vec<String>,
+        #[serde(default, with = "supplements")]
+        supplements: Vec<SupplementPin>,
+    }
+
+    pub fn serialize<S: Serializer>(value: &InputSeal, serializer: S) -> Result<S::Ok, S::Error> {
+        InputSealDef::serialize(value, serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<InputSeal, D::Error> {
+        InputSealDef::deserialize(deserializer)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1735,6 +1864,54 @@ mod tests {
                 Err(failure) => anyhow::bail!("callback {expected} failed: {}", failure.detail),
             };
             assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_sql_callback_preserves_full_timestamp_authority() -> Result<()> {
+        for modified_ns in [1_789_566_682_669_866_761_u128, u128::MAX] {
+            let mut seal: crate::lightroom::migration_source::InputSeal = serde_json::from_str(
+                &format!(
+                    r#"[1,{{"encoding":"UnixBytes","units":[47,116,109,112]}},["object",1,{modified_ns},"changed"],"",["","",""],[],[]]"#
+                ),
+            )?;
+            seal.supplements
+                .push(crate::lightroom::migration_source::SupplementPin {
+                    revision: "revision".into(),
+                    source_id: "source".into(),
+                    origin: "embedded".into(),
+                    source_revision: crate::xmp_packets::SourceRevision {
+                        length: 1,
+                        blake3: "digest".into(),
+                        modified_unix_ns: Some(u128::MAX),
+                    },
+                    historical_status: crate::xmp_packets::Status::Complete,
+                    proof_blake3: "proof".into(),
+                });
+            let request = CallbackRequest::SourceSqlOpen {
+                seal,
+                limits: crate::lightroom::migration_source::ReadLimits::default(),
+                protected: vec![],
+            };
+            let outcome = Outcome::Callback {
+                sequence: crate::application::U64(1),
+                request,
+            };
+            let bytes = encode(&outcome).context("encode source SQL callback outcome")?;
+            let decoded: Outcome = decode(&bytes).context("decode source SQL callback outcome")?;
+            let Outcome::Callback {
+                request: CallbackRequest::SourceSqlOpen { seal, .. },
+                ..
+            } = decoded
+            else {
+                anyhow::bail!("source SQL callback kind changed")
+            };
+            assert_eq!(seal.identity.modified_ns, Some(modified_ns));
+            assert_eq!(
+                seal.supplements[0].source_revision.modified_unix_ns,
+                Some(u128::MAX)
+            );
         }
         Ok(())
     }

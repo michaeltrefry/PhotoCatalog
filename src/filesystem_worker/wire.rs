@@ -904,7 +904,7 @@ impl LightroomWorkbenchIo {
 // directly, without a second retained manifest graph. Each wire decimal is at
 // most 39 bytes plus JSON quotes; it remains inside the existing message/parse
 // allowance, and the buffered string is consumed into the final u128.
-mod capture_manifest_wire {
+pub(crate) mod capture_manifest_wire {
     use crate::{
         lightroom::{Issue, capture, source::Revision, wal::WalReport},
         storage_volume::NativePath,
@@ -915,7 +915,7 @@ mod capture_manifest_wire {
         ser::SerializeSeq,
     };
 
-    mod option_u128_decimal {
+    pub(crate) mod option_u128_decimal {
         use serde::{Deserialize, Deserializer, Serialize, Serializer};
         use std::borrow::Cow;
 

@@ -38,6 +38,16 @@ pub(super) fn owner_layout() -> usize {
 fn encode(value: &impl Serialize, limit: usize) -> Result<String> {
     Ok(String::from_utf8(core::bounded_json(value, limit)?)?)
 }
+
+#[derive(Serialize)]
+struct SealResponse<'a> {
+    seal: &'a core::migration_source::InputSeal,
+    approval_json: &'a str,
+    approval: &'a selection::ApprovalDocument,
+    directory: &'a NativePath,
+    seal_path: &'a NativePath,
+    approval_path: &'a NativePath,
+}
 fn count(value: U64, maximum: usize) -> Result<usize> {
     let n = usize::try_from(value.0)?;
     ensure!((1..=maximum).contains(&n), "workbench row/chunk admission");
@@ -1482,10 +1492,19 @@ impl Owner {
                         },
                     )?
                 };
-                // The immutable approval bytes remain exact strings; no integer
-                // or NativePath reserialization changes approval authority.
+                // The immutable approval bytes remain exact strings; serialize
+                // the typed response directly so full-width seal timestamps do
+                // not pass through serde_json::Value's narrower number graph.
+                let approval_json = String::from_utf8(result.approval_bytes)?;
                 encode(
-                    &serde_json::json!({"seal":result.seal,"approval_json":String::from_utf8(result.approval_bytes)?,"approval":result.approval,"directory":result.directory,"seal_path":result.seal_path,"approval_path":result.approval_path}),
+                    &SealResponse {
+                        seal: &result.seal,
+                        approval_json: &approval_json,
+                        approval: &result.approval,
+                        directory: &result.directory,
+                        seal_path: &result.seal_path,
+                        approval_path: &result.approval_path,
+                    },
                     limit,
                 )
             }
@@ -1732,4 +1751,54 @@ fn sequence_page(rows: Vec<serde_json::Value>, maximum: usize) -> Result<String>
         &serde_json::json!({"next":next,"exhausted":rows.is_empty(),"rows":rows}),
         maximum,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seal_response_preserves_full_width_timestamp_without_a_value_graph() -> Result<()> {
+        let seal: core::migration_source::InputSeal = serde_json::from_str(&format!(
+            r#"[1,{{"encoding":"UnixBytes","units":[47,115,101,97,108]}},["object",1,{},"changed"],"",["document","selected_migration_test","roster"],[],[]]"#,
+            u128::MAX
+        ))?;
+        assert!(serde_json::to_value(&seal).is_err());
+        let destination = NativePath::from_path(std::path::Path::new("/destination"));
+        let approval = selection::ApprovalDocument {
+            protocol: 1,
+            review_token: "review".into(),
+            scope: selection::ApprovalScope::SelectedMigrationTest,
+            destination: destination.clone(),
+            policy: crate::catalog_migration::importer::Policy {
+                import_source: "fixture".into(),
+                overlap: crate::catalog_migration::importer::OverlapPolicy::RequireDecision,
+                keyword_overlap:
+                    crate::catalog_migration::importer::KeywordOverlap::RequireDecision,
+                artifacts: vec![],
+                supplements: vec![],
+            },
+            supplements: vec![],
+            authorization: "fixture".into(),
+        };
+        let encoded = encode(
+            &SealResponse {
+                seal: &seal,
+                approval_json: "{}",
+                approval: &approval,
+                directory: &destination,
+                seal_path: &destination,
+                approval_path: &destination,
+            },
+            core::MANIFEST_BYTES,
+        )?;
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            seal: core::migration_source::InputSeal,
+        }
+        let decoded: Decoded = serde_json::from_str(&encoded)?;
+        assert_eq!(decoded.seal.identity.modified_ns, Some(u128::MAX));
+        assert!(encoded.contains(&u128::MAX.to_string()));
+        Ok(())
+    }
 }
