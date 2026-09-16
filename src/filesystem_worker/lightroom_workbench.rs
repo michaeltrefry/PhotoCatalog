@@ -94,6 +94,14 @@ struct Seal {
     published_blake3: Option<String>,
     state: LightroomWorkbenchSealState,
 }
+
+pub(super) fn retained_seal_metadata_layout() -> (usize, usize) {
+    // `requested`, canonical directory, database, seal, approval and review.
+    // The fixed Seal layout includes the retained directory File handle and
+    // both upload owners; path vector backing is accounted separately by C's
+    // checked cross-process metadata reservation.
+    (std::mem::size_of::<Seal>(), 6)
+}
 #[derive(Default)]
 pub(super) struct Owner {
     root: Option<Root>,

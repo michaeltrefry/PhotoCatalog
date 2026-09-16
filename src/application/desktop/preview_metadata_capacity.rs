@@ -2040,6 +2040,20 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         1,
         LEASE_ID_BYTES,
     )?;
+    let (workbench_seal_fixed, workbench_seal_paths) =
+        crate::filesystem_worker::lightroom_workbench_retained_seal_layout();
+    a.push(
+        "filesystem.workbench_retained_seal",
+        Phase::Retained,
+        1,
+        c.add(&[
+            u64::try_from(workbench_seal_fixed)?,
+            c.mul(
+                u64::try_from(workbench_seal_paths)?,
+                c.vec(2, PATH_UNITS as u64)?,
+            )?,
+        ])?,
+    )?;
     a.push(
         "fixed.proxy_packet_type_roots",
         Phase::Active,
@@ -2160,6 +2174,21 @@ mod tests {
         assert_eq!(
             active_roots.each,
             Checked.add(&[registry, Checked.vec(2, PATH_UNITS as u64)?])?
+        );
+        let workbench_seal = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "filesystem.workbench_retained_seal")
+            .unwrap();
+        let (fixed, paths) = crate::filesystem_worker::lightroom_workbench_retained_seal_layout();
+        assert_eq!(paths, 6);
+        assert_eq!(workbench_seal.phase, Phase::Retained);
+        assert_eq!(
+            workbench_seal.each,
+            Checked.add(&[
+                u64::try_from(fixed)?,
+                Checked.mul(u64::try_from(paths)?, Checked.vec(2, PATH_UNITS as u64)?,)?,
+            ])?
         );
         let export_caller = default_report
             .contributions
