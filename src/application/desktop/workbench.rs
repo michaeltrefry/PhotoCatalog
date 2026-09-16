@@ -79,6 +79,8 @@ pub(super) struct Dispatcher {
     generation: Arc<lightroom_managed::Generation>,
     worker: Mutex<Option<JoinHandle<()>>>,
     shutdown: Mutex<()>,
+    #[cfg(test)]
+    fail_next_shutdown: std::sync::atomic::AtomicBool,
 }
 impl Dispatcher {
     /// The caller retains the generation if creating the dispatcher fails.
@@ -103,7 +105,17 @@ impl Dispatcher {
             generation: generation.clone(),
             worker: Mutex::new(Some(worker)),
             shutdown: Mutex::new(()),
+            #[cfg(test)]
+            fail_next_shutdown: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Leave the exact dispatcher, worker and generation untouched so startup
+    /// failure tests can prove that the retained owner is retryable.
+    #[cfg(test)]
+    pub(super) fn fail_next_shutdown_for_test(&self) {
+        self.fail_next_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(super) fn submit(&self, request: lightroom_bridge::Request) -> Result<Pending> {
@@ -200,6 +212,16 @@ impl Dispatcher {
 
     pub(super) fn shutdown_checked(&self) -> Result<()> {
         let _attempt = self.shutdown.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        if self
+            .fail_next_shutdown
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(error(
+                ErrorCode::Native,
+                "injected retained Workbench dispatcher shutdown",
+            ));
+        }
         self.signal_shutdown();
         let joined = self
             .worker
