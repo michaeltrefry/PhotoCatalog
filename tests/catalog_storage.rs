@@ -369,6 +369,20 @@ fn offline_browsing_known_volume_reconnect_and_unregistered_distinction() -> Res
         complete: true,
         issues: vec![],
     };
+    let online = cat.storage_status(&asset.id, &snapshot)?;
+    ensure!(online.state == "online_unverified");
+    ensure!(
+        online.detail
+            == "Original found. This availability check has not verified its current contents."
+    );
+    let temporarily_missing = new.join("temporarily-missing.jpg");
+    fs::rename(&path, &temporarily_missing)?;
+    let missing = cat.storage_status(&asset.id, &snapshot)?;
+    ensure!(missing.state == "missing");
+    ensure!(
+        missing.detail == "Volume found. The original is missing from its recorded location."
+    );
+    fs::rename(temporarily_missing, &path)?;
     ensure!(
         cat.reconnect_storage_asset(&path, &observation, "wrong", &snapshot)
             .is_err()

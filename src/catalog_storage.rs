@@ -651,7 +651,7 @@ impl Catalog {
                 MountMatch::Unique(mount) => {
                     result.state = "online_unverified".into();
                     result.detail =
-                        "Volume found; content verification required before reconnect".into();
+                        "Volume found. The current path has not been verified.".into();
                     if let Some(relative) = b.relative {
                         match storage_volume::candidate_path(&mount, &relative) {
                             Ok(p) => {
@@ -659,12 +659,22 @@ impl Catalog {
                                 let observation =
                                     crate::catalog_session::storage::Observer(self.session.clone())
                                         .locate(&p, &AtomicBool::new(false))?;
-                                result.state = match observation.state {
-                                    LocationState::Available => "online_unverified",
-                                    LocationState::MissingPath => "missing",
-                                    _ => "unavailable",
-                                }
-                                .into();
+                                let (state, detail) = match observation.state {
+                                    LocationState::Available => (
+                                        "online_unverified",
+                                        "Original found. This availability check has not verified its current contents.",
+                                    ),
+                                    LocationState::MissingPath => (
+                                        "missing",
+                                        "Volume found. The original is missing from its recorded location.",
+                                    ),
+                                    _ => (
+                                        "unavailable",
+                                        "Volume found. The original could not be accessed.",
+                                    ),
+                                };
+                                result.state = state.into();
+                                result.detail = detail.into();
                             }
                             Err(e) => {
                                 result.state = "unavailable".into();
