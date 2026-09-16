@@ -1,7 +1,7 @@
 //! Decoded pixels retain their memory reservation until the final consumer drops
 //! them. Evicting an LRU entry alone cannot make externally held pixels free.
 use super::{Codec, PreparedRgb, decode, encoded_dimensions};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -102,6 +102,20 @@ impl ByteReservation {
     }
     pub(crate) fn same_pool(&self, budget: &ByteBudget) -> bool {
         self.budget.same_pool(budget)
+    }
+    pub(crate) fn merge_transferred(&mut self, mut other: ByteReservation) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.budget.0, &other.budget.0),
+            "transferred reservations belong to different pools"
+        );
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .context("transferred reservation overflow")?;
+        // The aggregate charge never changed, so consuming the transferred
+        // token must not adjust the shared pool's used count.
+        other.bytes = 0;
+        Ok(())
     }
     pub(crate) fn grow_exact(&mut self, bytes: u64) -> std::result::Result<(), ByteLimit> {
         let mut state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -369,8 +383,9 @@ mod tests {
         assert!(child.same_pool(&pool));
         assert!(parent.split_exact(64).is_err());
         assert_eq!(parent.bytes(), 63);
-        drop(child);
-        assert_eq!(pool.used(), 63);
+        parent.merge_transferred(child)?;
+        assert_eq!(parent.bytes(), 100);
+        assert_eq!(pool.used(), 100);
         drop(parent);
         assert_eq!(pool.used(), 0);
         Ok(())

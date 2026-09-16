@@ -1,8 +1,11 @@
 use super::*;
-use crate::{application::Request, storage_volume::NativePath};
+use crate::{
+    application::{Config, Request},
+    storage_volume::NativePath,
+};
 #[cfg(unix)]
 use crate::{
-    application::{Config, Limits, Reply, Response},
+    application::{Limits, Reply, Response},
     lightroom_migration_worker::input,
 };
 
@@ -34,8 +37,80 @@ fn snap(response: api::Response) -> Result<api::Snapshot> {
 }
 fn pure(pool: &ByteBudget) -> Result<(Arc<Shared>, Coordinator)> {
     let shared = super::super::tests::shared(1024 * 1024);
-    let coordinator = Coordinator::new(&shared, std::env::current_exe()?, Some(pool.clone()));
+    let config = Config {
+        worker_executable: std::env::current_exe()?,
+        cache_root: None,
+        original_roots: vec![],
+        preview_policy: Default::default(),
+        preview_limits: Default::default(),
+        limits: shared.limits.clone(),
+        import_checkpoint: None,
+    };
+    let metadata_pool = ByteBudget::new(config.requested_preview_metadata_bytes()?)?;
+    let reservation = super::super::preview_metadata_admission::ProcessReservation::reserve(
+        &config,
+        &metadata_pool,
+    )?;
+    let metadata = reservation.split_migration(&config)?;
+    let result = ByteBudget::new(pool.snapshot().0)?;
+    let funding = Funding::from_subgrant(&config, metadata, pool.clone(), result)?;
+    let coordinator = Coordinator::new(&shared, config.worker_executable, Some(funding));
     Ok((shared, coordinator))
+}
+#[test]
+fn migration_funding_transfers_metadata_and_separates_source_and_result() -> Result<()> {
+    let shared = super::super::tests::shared(1024 * 1024);
+    let config = Config {
+        worker_executable: std::env::current_exe()?,
+        cache_root: None,
+        original_roots: vec![],
+        preview_policy: Default::default(),
+        preview_limits: Default::default(),
+        limits: shared.limits.clone(),
+        import_checkpoint: None,
+    };
+    let required = config.requested_preview_metadata_bytes()?;
+    let metadata_pool = ByteBudget::new(required)?;
+    let reservation = super::super::preview_metadata_admission::ProcessReservation::reserve(
+        &config,
+        &metadata_pool,
+    )?;
+    let source = ByteBudget::new(41)?;
+    let result = ByteBudget::new(43)?;
+    let funding = Funding::from_subgrant(
+        &config,
+        reservation.split_migration(&config)?,
+        source.clone(),
+        result.clone(),
+    )?;
+    assert_eq!(metadata_pool.used(), required);
+    assert_eq!(source.used(), 0);
+    assert_eq!(result.used(), 0);
+    drop(funding);
+    assert_eq!(metadata_pool.used(), required);
+
+    assert!(
+        Funding::from_subgrant(
+            &config,
+            reservation.split_migration(&config)?,
+            metadata_pool.clone(),
+            result,
+        )
+        .is_err()
+    );
+    let same = ByteBudget::new(47)?;
+    assert!(
+        Funding::from_subgrant(
+            &config,
+            reservation.split_migration(&config)?,
+            same.clone(),
+            same,
+        )
+        .is_err()
+    );
+    drop(reservation);
+    assert_eq!(metadata_pool.used(), 0);
+    Ok(())
 }
 fn upload(
     coordinator: &Coordinator,
@@ -150,7 +225,7 @@ fn lm_facade_exact_independent_raw_uploads_preserve_bytes_and_refuse_reorder() -
     Ok(())
 }
 #[test]
-fn lm_facade_same_pool_required_minus_one_retries_without_authority_or_storage_leak() -> Result<()>
+fn lm_facade_source_pool_required_minus_one_retries_without_authority_or_storage_leak() -> Result<()>
 {
     let temp = tempfile::tempdir()?;
     let documents = vec![(api::InputRole::SupplementRequests, "[]".into())];
@@ -333,7 +408,24 @@ fn lm_facade_begin_replay_and_small_reply_refusal_keep_guard_and_admission_exact
     assert_eq!(pool.used(), 0);
     let mut shared = super::super::tests::shared(1024 * 1024);
     Arc::get_mut(&mut shared).unwrap().limits.reply_bytes = 1;
-    let coordinator = Coordinator::new(&shared, std::env::current_exe()?, Some(pool.clone()));
+    let config = Config {
+        worker_executable: std::env::current_exe()?,
+        cache_root: None,
+        original_roots: vec![],
+        preview_policy: Default::default(),
+        preview_limits: Default::default(),
+        limits: shared.limits.clone(),
+        import_checkpoint: None,
+    };
+    let metadata_pool = ByteBudget::new(config.requested_preview_metadata_bytes()?)?;
+    let reservation = super::super::preview_metadata_admission::ProcessReservation::reserve(
+        &config,
+        &metadata_pool,
+    )?;
+    let metadata = reservation.split_migration(&config)?;
+    let result = ByteBudget::new(pool.snapshot().0)?;
+    let funding = Funding::from_subgrant(&config, metadata, pool.clone(), result)?;
+    let coordinator = Coordinator::new(&shared, config.worker_executable, Some(funding));
     let baseline = pool.used();
     assert!(matches!(
         coordinator
@@ -352,7 +444,7 @@ fn lm_facade_begin_replay_and_small_reply_refusal_keep_guard_and_admission_exact
 }
 
 #[test]
-fn lm_facade_bookkeeping_refusal_precedes_owned_graph_and_retries_same_pool() -> Result<()> {
+fn lm_facade_prefunded_bookkeeping_is_retained_once_per_operation() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let pool = ByteBudget::new(1024 * 1024 * 1024)?;
     let (shared, coordinator) = pure(&pool)?;
@@ -360,24 +452,23 @@ fn lm_facade_bookkeeping_refusal_precedes_owned_graph_and_retries_same_pool() ->
     let documents = vec![(api::InputRole::SupplementRequests, "[]".into())];
     let name = "bookkeeping-order";
     let bytes = coordinator.bookkeeping_bytes(name, shared.limits.reply_bytes)?;
-    let (limit, used) = pool.snapshot();
-    let competitor = pool.reserve_exact(limit - used - (bytes - 1))?;
-    let held = pool.used();
+    let metadata = &coordinator.funding.as_ref().unwrap().metadata;
+    assert!(bytes <= metadata.bytes);
+    let baseline = Arc::strong_count(metadata);
     let begin = || api::Request::Begin {
         operation: name.into(),
         header: header(&destination, api::Operation::PrepareSupplements, &documents),
     };
-    let failure = coordinator.request(begin()).unwrap_err();
-    assert!(matches!(failure.code, ErrorCode::ResourceLimit));
-    assert_eq!(coordinator.faults.lock().unwrap().graphs_built, 0);
-    assert!(coordinator.slot.lock().unwrap().is_none());
-    assert_eq!(pool.used(), held);
-    assert!(shared.state.lock().unwrap().pending.is_empty());
-    drop(competitor);
     let guard = snap(coordinator.request(begin())?)?.guard;
+    assert_eq!(Arc::strong_count(metadata), baseline + 1);
     assert_eq!(coordinator.faults.lock().unwrap().graphs_built, 1);
+    let replay = snap(coordinator.request(begin())?)?.guard;
+    assert_eq!(replay, guard);
+    assert_eq!(Arc::strong_count(metadata), baseline + 1);
+    assert!(shared.state.lock().unwrap().pending.is_empty());
     coordinator.request(api::Request::Discard { guard })?;
-    assert_eq!(pool.used(), used);
+    assert_eq!(Arc::strong_count(metadata), baseline);
+    assert_eq!(pool.used(), 0);
     Ok(())
 }
 
@@ -752,7 +843,9 @@ mod actual {
     }
     struct Fixture {
         desktop: super::super::super::DesktopBridge,
+        metadata_pool: ByteBudget,
         pool: ByteBudget,
+        result_pool: ByteBudget,
         pids: PathBuf,
         receipts: PathBuf,
         fpid: u32,
@@ -795,8 +888,9 @@ mod actual {
                 limits: Limits::default(),
                 import_checkpoint: None,
             };
-            // This metadata pool is shared by C/F admission and migration G
-            // operation/result owners. Native preview work has a separate pool.
+            // C/F metadata, migration Source and migration result owners have
+            // separately identified allowances. The metadata process charge is
+            // transferred once; operation pools preserve the requested scope.
             use crate::lightroom_migration_worker::memory::{core, layout::add};
             let operation_allowance = add(
                 add(4 * 1024 * 1024 * 1024, core::worker_repair_execution()?)?,
@@ -810,19 +904,23 @@ mod actual {
                 crate::catalog_migration::file_metadata::tests::Test::managed_preprojection()?
                     .managed_preprojection_allowance_bytes()?,
             )?;
-            let allowance = config
-                .requested_preview_metadata_bytes()?
-                .checked_add(operation_allowance as u64)
-                .context("managed fixture pool overflow")?;
-            let pool = ByteBudget::new(allowance)?;
+            let metadata_allowance = config.requested_preview_metadata_bytes()?;
+            let metadata_pool = ByteBudget::new(metadata_allowance)?;
+            let pool = ByteBudget::new(operation_allowance as u64)?;
+            let result_pool = ByteBudget::new(operation_allowance as u64)?;
             // Future export G receives this same native pool; never fold it into
             // the requested-storage allowance above.
             let native = ByteBudget::new(config.preview_limits.working_bytes)?;
             println!(
-                "LM_FACADE_POOL configured={allowance} requested_operation={operation_allowance}"
+                "LM_FACADE_POOLS metadata={metadata_allowance} source={operation_allowance} result={operation_allowance}"
             );
             let desktop = super::super::super::DesktopBridge::spawn_with_filesystem(
-                config, filesystem, &pool, &native,
+                config,
+                filesystem,
+                &metadata_pool,
+                &native,
+                &pool,
+                &result_pool,
             )?;
             ensure!(
                 desktop.status().phase == super::super::super::TransportPhase::Ready,
@@ -831,13 +929,21 @@ mod actual {
             );
             Ok(Self {
                 desktop,
+                metadata_pool,
                 pool,
+                result_pool,
                 pids,
                 receipts,
                 fpid,
                 pause,
                 _temp: temp,
             })
+        }
+        fn operation_used(&self) -> u64 {
+            self.pool
+                .used()
+                .checked_add(self.result_pool.used())
+                .expect("fixture operation allowances fit u64")
         }
         fn public(&self, request: api::Request) -> Result<api::Response> {
             match self
@@ -1068,9 +1174,13 @@ mod actual {
             );
             drop(state);
             self.check_reaped()?;
+            let metadata_pool = self.metadata_pool.clone();
             let pool = self.pool.clone();
+            let result_pool = self.result_pool.clone();
             drop(self.desktop);
+            assert_eq!(metadata_pool.used(), 0);
             assert_eq!(pool.used(), 0);
+            assert_eq!(result_pool.used(), 0);
             Ok(())
         }
     }
@@ -1323,7 +1433,7 @@ mod actual {
             );
             thread::sleep(Duration::from_millis(5));
         };
-        let held = fixture.pool.used();
+        let held = fixture.operation_used();
         assert!(held > 0);
         assert!(
             fixture
@@ -1354,7 +1464,7 @@ mod actual {
                 .code,
             ErrorCode::Busy
         ));
-        assert!(fixture.pool.used() >= held);
+        assert!(fixture.operation_used() >= held);
         {
             let mut faults = fixture.desktop.0.migration.faults.lock().unwrap();
             assert_eq!(faults.lost, 2);
@@ -1374,7 +1484,7 @@ mod actual {
             thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(status.phase, api::Phase::Complete, "{status:?}");
-        assert!(fixture.pool.used() < held);
+        assert!(fixture.operation_used() < held);
         fixture.public(api::Request::Discard { guard })?;
         fixture.close(catalog)?;
         fixture.finish()
@@ -1759,7 +1869,7 @@ mod actual {
             );
             thread::sleep(Duration::from_millis(5));
         }
-        let held = fixture.pool.used();
+        let held = fixture.operation_used();
         assert!(!fixture.desktop.0.migration.drained());
         assert!(
             fixture
@@ -1768,7 +1878,7 @@ mod actual {
                 })
                 .is_err()
         );
-        assert_eq!(fixture.pool.used(), held);
+        assert_eq!(fixture.operation_used(), held);
         fixture.public(api::Request::RetryDrain {
             guard: guard.clone(),
         })?;
@@ -1783,7 +1893,7 @@ mod actual {
             ensure!(Instant::now() < deadline, "checked wait retry deadline");
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(fixture.pool.used() < held);
+        assert!(fixture.operation_used() < held);
         assert!(!destination.exists());
         fixture.public(api::Request::Discard { guard })?;
         fixture.finish()
@@ -1882,7 +1992,7 @@ mod actual {
     }
     #[test]
     #[ignore = "requires exact freshly built PHOTOCATALOG_TEST_EXECUTABLE"]
-    fn lm_facade_actual_same_pool_required_minus_one_drains_then_retries() -> Result<()> {
+    fn lm_facade_actual_source_pool_required_minus_one_drains_then_retries() -> Result<()> {
         let fixture = Fixture::new()?;
         let supplement = crate::catalog_migration::supplements::tests::Fixture::new()?;
         let destination = fixture._temp.path().canonicalize()?.join("target");
@@ -1971,7 +2081,7 @@ mod actual {
     }
     fn acquisition_fault(writer: bool, fault: AcquisitionFault, shutdown: bool) -> Result<()> {
         let fixture = Fixture::new()?;
-        let baseline = fixture.pool.used();
+        let baseline = fixture.operation_used();
         let cpid = fixture.desktop.0.pid;
         let supplement = crate::catalog_migration::supplements::tests::Fixture::new()?;
         let destination = fixture._temp.path().canonicalize()?.join("target");
@@ -2186,7 +2296,7 @@ mod actual {
                 })
                 .is_err()
         );
-        let retained = fixture.pool.used();
+        let retained = fixture.operation_used();
         assert!(retained > baseline);
         let pids = fs::read_to_string(&fixture.pids)?;
         assert_eq!(
@@ -2262,7 +2372,7 @@ mod actual {
             fixture.desktop.0.migration.drained(),
             "G JoinHandle consumed"
         );
-        assert!(fixture.pool.used() < retained);
+        assert!(fixture.operation_used() < retained);
         let receipts = fs::read_to_string(&fixture.receipts)?;
         assert_eq!(
             receipts.matches("target-installed").count(),
@@ -2366,7 +2476,7 @@ mod actual {
     }
     fn early_admission(case: EarlyAdmission) -> Result<()> {
         let fixture = Fixture::new()?;
-        let baseline = fixture.pool.used();
+        let baseline = fixture.operation_used();
         let cpid = fixture.desktop.0.pid;
         let supplement = crate::catalog_migration::supplements::tests::Fixture::new()?;
         let destination = fixture._temp.path().canonicalize()?.join("target");
@@ -2484,7 +2594,7 @@ mod actual {
                 "typed cancellation: {primary:?}"
             );
         }
-        let held = fixture.pool.used();
+        let held = fixture.operation_used();
         assert!(held > baseline);
         assert!(!fixture.desktop.0.migration.drained());
         assert!(
@@ -2494,7 +2604,7 @@ mod actual {
                 })
                 .is_err()
         );
-        assert_eq!(fixture.pool.used(), held);
+        assert_eq!(fixture.operation_used(), held);
         assert!(
             !destination.exists(),
             "no C writer or Bootstrap on refused admission"
@@ -2528,7 +2638,7 @@ mod actual {
             fixture.desktop.0.migration.drained(),
             "checked local waiter and G join"
         );
-        assert!(fixture.pool.used() < held && fixture.pool.used() > baseline);
+        assert!(fixture.operation_used() < held && fixture.operation_used() > baseline);
         let pids = fs::read_to_string(&fixture.pids)?;
         assert_eq!(pids.lines().count(), if target { 1 } else { 2 });
         assert!(!pids.contains("source-reader"));
@@ -2560,7 +2670,7 @@ mod actual {
         );
         fixture.public(api::Request::Discard { guard })?;
         assert_eq!(
-            fixture.pool.used(),
+            fixture.operation_used(),
             baseline,
             "operation and independent failure discarded"
         );

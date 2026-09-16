@@ -855,7 +855,17 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.parse(SAVED_DESCRIPTOR_BYTES, 2, actor_partial)?,
     )?;
 
-    // Private migration uses the same process reservation/shared ByteBudget.
+    // G receives this exact portion of the aggregate process reservation once.
+    // Each operation retains a clone of the transferred token; Source and
+    // result payloads use separate caller-funded pools.
+    a.push(
+        "retained.migration_coordinator_metadata_subgrant",
+        Phase::Retained,
+        1,
+        super::migration::metadata_requirement(config)?,
+    )?;
+
+    // Private migration relay storage remains in the process reservation.
     // One authority request and sixteen recovery requests have independent
     // bounded custody in G/C. Include both encodings, both incoming parsers,
     // queues, complete pins and snapshots; CHUNK only bounds individual frames.
@@ -2606,6 +2616,26 @@ mod tests {
             limits: Default::default(),
             import_checkpoint: None,
         }
+    }
+
+    #[test]
+    fn migration_metadata_subgrant_is_named_and_fully_aggregated() -> Result<()> {
+        let config = config();
+        let report = report(&config)?;
+        let migration = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.migration_coordinator_metadata_subgrant")
+            .context("migration metadata subgrant contribution")?;
+        assert_eq!(migration.phase, Phase::Retained);
+        assert_eq!(migration.count, 1);
+        assert_eq!(
+            migration.each,
+            super::super::migration::metadata_requirement(&config)?
+        );
+        assert_eq!(migration.total, migration.each);
+        assert!(report.requested >= migration.total);
+        Ok(())
     }
 
     #[test]

@@ -28,12 +28,17 @@ impl std::error::Error for MetadataAllowanceExceeded {}
 struct State {
     held: Option<ByteReservation>,
     workbench_granted: bool,
+    migration_granted: bool,
     awaiting_wait: bool,
 }
 #[derive(Default)]
 struct Owned(Mutex<State>);
 #[derive(Clone, Default)]
 pub(super) struct ProcessReservation(Option<Arc<Owned>>);
+pub(super) struct ProcessSubgrant {
+    held: Option<ByteReservation>,
+    owner: Arc<Owned>,
+}
 pub(super) fn owned_layout() -> (usize, usize) {
     (std::mem::size_of::<Owned>(), std::mem::align_of::<Owned>())
 }
@@ -46,6 +51,7 @@ impl ProcessReservation {
         Ok(Self(Some(Arc::new(Owned(Mutex::new(State {
             held: Some(held),
             workbench_granted: false,
+            migration_granted: false,
             awaiting_wait: false,
         }))))))
     }
@@ -85,6 +91,30 @@ impl ProcessReservation {
         state.workbench_granted = true;
         Ok(grant)
     }
+    pub(super) fn split_migration(&self, config: &Config) -> Result<ProcessSubgrant> {
+        let required = super::migration::metadata_requirement(config)?;
+        let owner = self
+            .0
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("managed migration requires process metadata"))?;
+        let mut state = owner.0.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            !state.migration_granted,
+            "migration metadata already granted"
+        );
+        let held = state
+            .held
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("process metadata reservation is unavailable"))?
+            .split_exact(required)
+            .map_err(anyhow::Error::new)?;
+        state.migration_granted = true;
+        drop(state);
+        Ok(ProcessSubgrant {
+            held: Some(held),
+            owner: owner.clone(),
+        })
+    }
     /// Caller proves either OS spawn returned no child, or Child::wait succeeded
     /// and every transport thread has been joined. EOF and drain replies alone
     /// must never call this method. Disarming permits final-owner drop to release
@@ -97,6 +127,41 @@ impl ProcessReservation {
                 .unwrap_or_else(|e| e.into_inner())
                 .awaiting_wait = false;
         }
+    }
+}
+impl ProcessSubgrant {
+    pub(super) fn bytes(&self) -> u64 {
+        self.held.as_ref().map_or(0, ByteReservation::bytes)
+    }
+    pub(super) fn same_pool(&self, budget: &ByteBudget) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(|held| held.same_pool(budget))
+    }
+}
+impl Drop for ProcessSubgrant {
+    fn drop(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        let mut state = self
+            .owner
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.awaiting_wait {
+            // No owner can prove the child and every descendant are gone. Keep
+            // this transferred part charged just like the aggregate remainder.
+            std::mem::forget(held);
+            return;
+        }
+        state
+            .held
+            .as_mut()
+            .expect("process metadata parent remains owned by its subgrant")
+            .merge_transferred(held)
+            .expect("migration subgrant originated in the process pool");
+        state.migration_granted = false;
     }
 }
 impl Drop for Owned {
@@ -189,6 +254,39 @@ mod tests {
         assert_eq!(pool.used(), 0);
         Ok(())
     }
+    #[test]
+    fn migration_subgrant_transfers_once_and_rejoins_before_spawn() -> Result<()> {
+        let config = config();
+        let required = config.requested_preview_metadata_bytes()?;
+        let migration = super::super::migration::metadata_requirement(&config)?;
+        let pool = ByteBudget::new(required)?;
+        let reservation = ProcessReservation::reserve(&config, &pool)?;
+        let grant = reservation.split_migration(&config)?;
+        assert_eq!(grant.bytes(), migration);
+        assert_eq!(pool.used(), required);
+        assert!(reservation.split_migration(&config).is_err());
+        drop(grant);
+        assert_eq!(pool.used(), required);
+        let replay = reservation.split_migration(&config)?;
+        assert_eq!(replay.bytes(), migration);
+        drop(replay);
+        drop(reservation);
+        assert_eq!(pool.used(), 0);
+        Ok(())
+    }
+    #[test]
+    fn dropped_armed_migration_subgrant_keeps_full_process_charge() -> Result<()> {
+        let config = config();
+        let required = config.requested_preview_metadata_bytes()?;
+        let pool = ByteBudget::new(required)?;
+        let reservation = ProcessReservation::reserve(&config, &pool)?;
+        let grant = reservation.split_migration(&config)?;
+        reservation.arm();
+        drop(grant);
+        drop(reservation);
+        assert_eq!(pool.used(), required);
+        Ok(())
+    }
     #[cfg(unix)]
     #[test]
     fn actual_no_child_spawn_error_releases_charge() -> Result<()> {
@@ -220,14 +318,23 @@ mod tests {
         let required = config.requested_preview_metadata_bytes()?;
         let pool = ByteBudget::new(required)?;
         let native = ByteBudget::new(config.preview_limits.working_bytes)?;
+        let migration_source = ByteBudget::new(1)?;
+        let migration_result = ByteBudget::new(1)?;
         let caller = pool.try_reserve(1).unwrap();
         let client = Arc::new(crate::filesystem_worker::client::Client::spawn(
             &config.worker_executable,
             vec![],
         )?);
-        let denied = DesktopBridge::spawn_with_filesystem(config.clone(), client, &pool, &native)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("undersized startup unexpectedly succeeded"))?;
+        let denied = DesktopBridge::spawn_with_filesystem(
+            config.clone(),
+            client,
+            &pool,
+            &native,
+            &migration_source,
+            &migration_result,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("undersized startup unexpectedly succeeded"))?;
         let retained = denied
             .downcast_ref::<filesystem::Unstarted>()
             .ok_or_else(|| anyhow::anyhow!("F startup owner was not retained"))?;
@@ -247,7 +354,13 @@ mod tests {
             retained.retire()?;
             return Err(error);
         }
-        let bridge = DesktopBridge::spawn_inner(config.clone(), Some(parent.clone()), Some(&pool))?;
+        let bridge = DesktopBridge::spawn_inner(
+            config.clone(),
+            Some(parent.clone()),
+            Some(&pool),
+            Some(&migration_source),
+            Some(&migration_result),
+        )?;
         anyhow::ensure!(pool.used() == required, "successful retry not charged");
         bridge.try_shutdown()?;
         parent.finish_after_dependents(false)?;
@@ -263,7 +376,14 @@ mod tests {
             &config.worker_executable,
             vec![],
         )?);
-        let second = DesktopBridge::spawn_with_filesystem(config, client, &pool, &native)?;
+        let second = DesktopBridge::spawn_with_filesystem(
+            config,
+            client,
+            &pool,
+            &native,
+            &migration_source,
+            &migration_result,
+        )?;
         anyhow::ensure!(pool.used() == required, "new C startup was not charged");
         second.try_shutdown()?;
         drop(second);

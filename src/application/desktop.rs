@@ -573,22 +573,32 @@ impl Drop for Handle {
 pub struct DesktopBridge(Arc<Handle>);
 impl DesktopBridge {
     pub fn spawn(config: Config) -> anyhow::Result<Self> {
-        Self::spawn_inner(config, None, None)
+        Self::spawn_inner(config, None, None, None, None)
     }
-    /// Unselected paired transport. Metadata and native work use distinct
-    /// caller-owned pools; G keeps this exact native pool for every native owner.
-    /// Managed actor use remains blocked on FS6.
+    /// Unselected paired transport. Process metadata, native work, migration
+    /// Source payloads and retained migration results use distinct caller-owned
+    /// pools. G keeps each exact identity for the lifetime it funds.
     #[allow(dead_code)]
     pub(crate) fn spawn_with_filesystem(
         config: Config,
         client: Arc<crate::filesystem_worker::client::Client>,
         metadata: &crate::preview::ByteBudget,
         native: &crate::preview::ByteBudget,
+        migration_source: &crate::preview::ByteBudget,
+        migration_result: &crate::preview::ByteBudget,
     ) -> anyhow::Result<Self> {
         config.validate()?;
         anyhow::ensure!(
             !metadata.same_pool(native),
             "managed metadata and native allowances must use distinct pools"
+        );
+        anyhow::ensure!(
+            !migration_source.same_pool(metadata)
+                && !migration_source.same_pool(native)
+                && !migration_result.same_pool(metadata)
+                && !migration_result.same_pool(native)
+                && !migration_source.same_pool(migration_result),
+            "managed metadata, native, migration Source and migration result allowances must use distinct pools"
         );
         anyhow::ensure!(
             native.snapshot().0 == config.preview_limits.working_bytes,
@@ -606,27 +616,47 @@ impl DesktopBridge {
                 config.preview_limits.workers,
                 native,
             )?;
-            Self::spawn_inner(config, Some(parent), Some(metadata))
+            Self::spawn_inner(
+                config,
+                Some(parent),
+                Some(metadata),
+                Some(migration_source),
+                Some(migration_result),
+            )
         }
     }
     fn spawn_inner(
         config: Config,
         filesystem: Option<Arc<filesystem::Parent>>,
         metadata_budget: Option<&crate::preview::ByteBudget>,
+        migration_source: Option<&crate::preview::ByteBudget>,
+        migration_result: Option<&crate::preview::ByteBudget>,
     ) -> anyhow::Result<Self> {
-        let metadata = (|| {
+        let (metadata, migration) = (|| {
             config.validate()?;
             anyhow::ensure!(
-                filesystem.is_some() == metadata_budget.is_some(),
-                "managed catalog requires an explicit preview metadata allowance"
+                filesystem.is_some() == metadata_budget.is_some()
+                    && filesystem.is_some() == migration_source.is_some()
+                    && filesystem.is_some() == migration_result.is_some(),
+                "managed catalog requires explicit metadata, migration Source and migration result allowances"
             );
-            match metadata_budget {
-                Some(budget) => {
-                    let reservation =
-                        preview_metadata_admission::ProcessReservation::reserve(&config, budget)?;
-                    Ok(reservation)
+            match (metadata_budget, migration_source, migration_result) {
+                (Some(metadata_budget), Some(source), Some(result)) => {
+                    let reservation = preview_metadata_admission::ProcessReservation::reserve(
+                        &config,
+                        metadata_budget,
+                    )?;
+                    let grant = reservation.split_migration(&config)?;
+                    let migration = migration::Funding::from_subgrant(
+                        &config,
+                        grant,
+                        source.clone(),
+                        result.clone(),
+                    )?;
+                    Ok((reservation, Some(migration)))
                 }
-                None => Ok(Default::default()),
+                (None, None, None) => Ok((Default::default(), None)),
+                _ => unreachable!("allowance presence checked above"),
             }
         })()
         .map_err(|e: anyhow::Error| match &filesystem {
@@ -639,7 +669,7 @@ impl DesktopBridge {
             }
             None => e,
         })?;
-        Self::spawn_reserved(config, filesystem, metadata_budget, metadata, None)
+        Self::spawn_reserved(config, filesystem, metadata, migration, None)
     }
 
     /// Production supplies an already funded generation; the compatibility
@@ -647,8 +677,8 @@ impl DesktopBridge {
     fn spawn_reserved(
         config: Config,
         filesystem: Option<Arc<filesystem::Parent>>,
-        migration_budget: Option<&crate::preview::ByteBudget>,
         metadata: preview_metadata_admission::ProcessReservation,
+        migration_funding: Option<migration::Funding>,
         workbench: Option<workbench::Dispatcher>,
     ) -> anyhow::Result<Self> {
         let paired = filesystem.is_some();
@@ -742,11 +772,8 @@ impl DesktopBridge {
             }
         };
         let pid = owner.pid();
-        let migration = migration::Coordinator::new(
-            &shared,
-            config.worker_executable,
-            migration_budget.cloned(),
-        );
+        let migration =
+            migration::Coordinator::new(&shared, config.worker_executable, migration_funding);
         let result = Self(Arc::new(Handle {
             migration,
             local,

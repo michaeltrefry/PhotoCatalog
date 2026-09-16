@@ -232,11 +232,18 @@ impl Running {
         }));
         config.validate()?;
         let metadata = crate::preview::ByteBudget::new(config.requested_preview_metadata_bytes()?)?;
+        let migration_source = crate::preview::ByteBudget::new(1)?;
+        let migration_result = crate::preview::ByteBudget::new(1)?;
         // All pre-C fallibility passed while guarded. Once called, spawn_inner
         // owns C creation and its Unstarted error retains F when required.
         before_catalog.parent.take();
-        let bridge = match DesktopBridge::spawn_inner(config, Some(parent.clone()), Some(&metadata))
-        {
+        let bridge = match DesktopBridge::spawn_inner(
+            config,
+            Some(parent.clone()),
+            Some(&metadata),
+            Some(&migration_source),
+            Some(&migration_result),
+        ) {
             Ok(bridge) => bridge,
             Err(error) => {
                 if let Some(unstarted) = error.downcast_ref::<super::Unstarted>()
