@@ -490,102 +490,71 @@ mod exact_mount_tests {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use std::ffi::{CString, c_void};
+    use std::ffi::CString;
     use std::mem::MaybeUninit;
     use std::os::unix::ffi::OsStrExt;
     const MAX_MOUNTS: usize = 4096;
-    type Cf = *const c_void;
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        static kCFURLVolumeUUIDStringKey: Cf;
-        fn CFURLCreateFromFileSystemRepresentation(
-            allocator: Cf,
-            bytes: *const u8,
-            len: isize,
-            directory: u8,
-        ) -> Cf;
-        fn CFURLCopyResourcePropertyForKey(url: Cf, key: Cf, value: *mut Cf, error: *mut Cf) -> u8;
-        fn CFStringGetCString(value: Cf, buffer: *mut i8, size: isize, encoding: u32) -> u8;
-        fn CFGetTypeID(value: Cf) -> usize;
-        fn CFStringGetTypeID() -> usize;
-        fn CFRelease(value: Cf);
+
+    #[repr(C)]
+    struct VolumeUuidAttribute {
+        length: u32,
+        uuid: [u8; 16],
     }
-    // Foundation supplies NSURL resource-property support on macOS.
-    #[link(name = "Foundation", kind = "framework")]
-    unsafe extern "C" {}
-    struct OwnedCf(Cf);
-    impl Drop for OwnedCf {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { CFRelease(self.0) };
-            }
+    fn decode_volume_uuid(value: &VolumeUuidAttribute) -> io::Result<Option<PersistentVolumeId>> {
+        if value.length as usize != std::mem::size_of::<VolumeUuidAttribute>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected volume UUID attribute length",
+            ));
         }
+        let value = uuid::Uuid::from_bytes(value.uuid);
+        if value.is_nil() {
+            return Ok(None);
+        }
+        PersistentVolumeId::new(IdentityScheme::MacVolumeUuid, &value.to_string()).map(Some)
+    }
+    fn unsupported_volume_uuid_error(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ENOTSUP)
+        )
     }
     fn volume_uuid(path: &Path) -> io::Result<Option<PersistentVolumeId>> {
-        let bytes = path.as_os_str().as_bytes();
-        let url = OwnedCf(unsafe {
-            CFURLCreateFromFileSystemRepresentation(
-                std::ptr::null(),
-                bytes.as_ptr(),
-                bytes.len() as isize,
-                1,
-            )
-        });
-        if url.0.is_null() {
-            return Err(io::Error::other("CFURL filesystem URL creation failed"));
-        }
-        let mut value = std::ptr::null();
-        let mut error = std::ptr::null();
-        let success = unsafe {
-            CFURLCopyResourcePropertyForKey(
-                url.0,
-                kCFURLVolumeUUIDStringKey,
-                &mut value,
-                &mut error,
-            )
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let mut attributes = libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: 0,
+            volattr: libc::ATTR_VOL_UUID,
+            dirattr: 0,
+            fileattr: 0,
+            forkattr: 0,
         };
-        let value = OwnedCf(value);
-        let _error = OwnedCf(error);
-        if success == 0 {
-            return Err(io::Error::other(
-                "CFURL persistent-volume-UUID query failed",
-            ));
-        }
-        if value.0.is_null() {
-            return Ok(None);
-        }
-        if unsafe { CFGetTypeID(value.0) != CFStringGetTypeID() } {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "volume UUID property is not a string",
-            ));
-        }
-        let mut buffer = [0i8; 257];
+        let mut value = VolumeUuidAttribute {
+            length: 0,
+            uuid: [0; 16],
+        };
         if unsafe {
-            CFStringGetCString(
-                value.0,
-                buffer.as_mut_ptr(),
-                buffer.len() as isize,
-                0x0800_0100,
+            libc::getattrlist(
+                path.as_ptr(),
+                (&mut attributes as *mut libc::attrlist).cast(),
+                (&mut value as *mut VolumeUuidAttribute).cast(),
+                std::mem::size_of::<VolumeUuidAttribute>(),
+                0,
             )
-        } == 0
+        } != 0
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "volume UUID string exceeds bound or UTF-8 conversion failed",
-            ));
+            let error = io::Error::last_os_error();
+            // The caller supplies a mount root from statfs/getfsstat. With the
+            // fixed attrlist above, EINVAL or ENOTSUP means that filesystem does
+            // not provide ATTR_VOL_UUID (for example devfs or auto_home).
+            if unsupported_volume_uuid_error(&error) {
+                return Ok(None);
+            }
+            return Err(error);
         }
-        let end = buffer
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unterminated UUID"))?;
-        let bytes: Vec<_> = buffer[..end].iter().map(|b| *b as u8).collect();
-        let value = std::str::from_utf8(&bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 volume UUID"))?;
-        if value.is_empty() {
-            return Ok(None);
-        }
-        PersistentVolumeId::new(IdentityScheme::MacVolumeUuid, value).map(Some)
+        decode_volume_uuid(&value)
     }
     fn c_bytes(bytes: &[i8]) -> io::Result<Vec<u8>> {
         let end = bytes.iter().position(|b| *b == 0).ok_or_else(|| {
@@ -720,6 +689,84 @@ mod platform {
             return Err(io::Error::other("mount changed during volume observation"));
         }
         Ok((mount, relative))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn volume_uuid_attribute_requires_exact_non_nil_value() {
+            assert_eq!(std::mem::size_of::<VolumeUuidAttribute>(), 20);
+            let mut value = VolumeUuidAttribute {
+                length: std::mem::size_of::<VolumeUuidAttribute>() as u32,
+                uuid: [0; 16],
+            };
+            assert!(decode_volume_uuid(&value).unwrap().is_none());
+            value.length -= 1;
+            assert!(decode_volume_uuid(&value).is_err());
+            value.length += 1;
+            value.uuid = *uuid::Uuid::parse_str("A88E634C-47BA-440F-831A-6E631274439B")
+                .unwrap()
+                .as_bytes();
+            assert_eq!(
+                decode_volume_uuid(&value).unwrap().unwrap().value,
+                "a88e634c-47ba-440f-831a-6e631274439b"
+            );
+            assert!(unsupported_volume_uuid_error(
+                &io::Error::from_raw_os_error(libc::EINVAL)
+            ));
+            assert!(unsupported_volume_uuid_error(
+                &io::Error::from_raw_os_error(libc::ENOTSUP)
+            ));
+            assert!(!unsupported_volume_uuid_error(
+                &io::Error::from_raw_os_error(libc::EACCES)
+            ));
+        }
+
+        #[test]
+        #[ignore = "requires a split APFS System/Data boot volume and Data-backed HOME"]
+        fn physical_system_and_data_identities_preserve_data_relative_mapping() {
+            let system = volume_uuid(Path::new("/")).unwrap().unwrap();
+            let data = volume_uuid(Path::new("/System/Volumes/Data"))
+                .unwrap()
+                .unwrap();
+            let users = volume_uuid(Path::new("/Users")).unwrap().unwrap();
+            assert_ne!(system, data);
+            assert_eq!(users, data);
+            assert!(volume_uuid(Path::new("/dev")).unwrap().is_none());
+
+            let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is required"));
+            assert_eq!(volume_uuid(&home).unwrap().unwrap(), data);
+            let temp = tempfile::Builder::new()
+                .prefix("photocatalog-volume-")
+                .tempdir_in(home)
+                .unwrap();
+            let file = temp.path().join("original.bin");
+            fs::write(&file, b"physical volume mapping").unwrap();
+            let observed = super::super::locate(&file);
+            assert_eq!(observed.state, LocationState::Available);
+            let identity = observed
+                .volume
+                .as_ref()
+                .unwrap()
+                .persistent_identity
+                .clone()
+                .unwrap();
+            assert_eq!(identity, data);
+            let snapshot = mounted_volumes().unwrap();
+            let MountMatch::Unique(mount) =
+                match_mounts(&LogicalVolume::new(Some(identity)), &snapshot)
+            else {
+                panic!("physical Data UUID must identify one mounted volume: {snapshot:?}");
+            };
+            let candidate =
+                candidate_path(&mount, observed.relative_in_volume.as_ref().unwrap()).unwrap();
+            assert!(same_file(
+                &fs::metadata(&file).unwrap(),
+                &fs::metadata(candidate).unwrap()
+            ));
+        }
     }
 }
 

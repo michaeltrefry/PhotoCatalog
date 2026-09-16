@@ -350,18 +350,16 @@ fn offline_browsing_known_volume_reconnect_and_unregistered_distinction() -> Res
     ensure!(cat.render_identity(&asset.id)? == before);
     let new = temp.path().join("new mount");
     fs::rename(&old, &new)?;
-    ensure!(
-        cat.storage_status(
-            &asset.id,
-            &MountSnapshot {
-                mounts: vec![],
-                complete: true,
-                issues: vec![]
-            }
-        )?
-        .state
-            == "offline"
-    );
+    let offline = cat.storage_status(
+        &asset.id,
+        &MountSnapshot {
+            mounts: vec![],
+            complete: true,
+            issues: vec![],
+        },
+    )?;
+    ensure!(offline.state == "offline");
+    ensure!(offline.detail == "Known volume is not mounted");
     ensure!(!cat.preview(&asset.id)?.is_empty());
     let path = new.join("one.jpg");
     let observation = observed(&path, &new, Path::new("one.jpg"));
@@ -383,6 +381,9 @@ fn offline_browsing_known_volume_reconnect_and_unregistered_distinction() -> Res
         complete: true,
         issues: vec![],
     };
+    let ambiguous = cat.storage_status(&asset.id, &duplicate)?;
+    ensure!(ambiguous.state == "ambiguous");
+    ensure!(ambiguous.detail.contains("same persistent identity"));
     ensure!(
         cat.reconnect_storage_asset(&path, &observation, &fingerprint, &duplicate)
             .is_err()
@@ -392,6 +393,9 @@ fn offline_browsing_known_volume_reconnect_and_unregistered_distinction() -> Res
         complete: false,
         issues: vec![],
     };
+    let indeterminate = cat.storage_status(&asset.id, &incomplete)?;
+    ensure!(indeterminate.state == "indeterminate");
+    ensure!(indeterminate.detail.contains("snapshot is incomplete"));
     ensure!(
         cat.reconnect_storage_asset(&path, &observation, &fingerprint, &incomplete)
             .is_err()

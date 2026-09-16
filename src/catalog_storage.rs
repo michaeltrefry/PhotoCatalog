@@ -673,10 +673,28 @@ impl Catalog {
                         }
                     }
                 }
-                MountMatch::Offline => result.state = "offline".into(),
-                MountMatch::Ambiguous(_) => result.state = "ambiguous".into(),
-                MountMatch::Indeterminate => result.state = "indeterminate".into(),
-                MountMatch::IdentityUnavailable => result.state = "identity_unavailable".into(),
+                MountMatch::Offline => {
+                    result.state = "offline".into();
+                    result.detail = "Known volume is not mounted".into();
+                }
+                MountMatch::Ambiguous(_) => {
+                    result.state = "ambiguous".into();
+                    result.detail =
+                        "Multiple mounted volumes report the same persistent identity; explicit relink required"
+                            .into();
+                }
+                MountMatch::Indeterminate => {
+                    result.state = "indeterminate".into();
+                    result.detail =
+                        "Mount snapshot is incomplete; volume availability cannot be determined"
+                            .into();
+                }
+                MountMatch::IdentityUnavailable => {
+                    result.state = "identity_unavailable".into();
+                    result.detail =
+                        "No persistent volume identity is available; explicit relink required"
+                            .into();
+                }
             }
         }
         Ok(result)
