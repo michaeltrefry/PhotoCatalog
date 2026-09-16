@@ -397,6 +397,16 @@ fn observed_full_event_queue_cannot_delay_revoking_both_sources() -> Result<()> 
             blake3: blake3::hash(b"").to_hex().to_string(),
         },
     )?;
+    // COUNT includes CaptureSql. Started + Started + Accepted exactly fills
+    // the queue, so a fourth valid event is required to observe backpressure.
+    send(
+        &broker,
+        Command::Reserve {
+            token: token.clone(),
+            sequence: U64(1),
+            bytes: U64(1),
+        },
+    )?;
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         let state = broker.shared.state.lock().unwrap();
@@ -493,6 +503,16 @@ fn live_transport_errors_bypass_observed_full_events_before_any_dequeue() -> Res
                 build: crate::lightroom_migration_worker::worker::build_identity().into(),
                 bytes: U64(0),
                 blake3: blake3::hash(b"").to_hex().to_string(),
+            },
+        )?;
+        // COUNT includes CaptureSql. Started + Started + Accepted exactly fills
+        // the queue, so a fourth valid event is required to observe backpressure.
+        send(
+            &broker,
+            Command::Reserve {
+                token: token.clone(),
+                sequence: U64(1),
+                bytes: U64(1),
             },
         )?;
         let until = Instant::now() + Duration::from_secs(10);

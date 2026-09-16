@@ -635,6 +635,7 @@ impl Workbench {
         let (sender, receiver) = mpsc::sync_channel(1);
         let state = shared.clone();
         let stop = closing.clone();
+        let managed_generation = managed.is_some();
         let join = thread::Builder::new()
             .name("lightroom-workbench".into())
             .spawn(move || -> Result<()> {
@@ -646,21 +647,27 @@ impl Workbench {
                 s.status.closed = true;
                 s.status.capture_pid = None;
                 s.status.review_token = None;
-                let result = match outcome {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "inspection worker panicked; retained artifacts require explicit review"
-                    )),
+                let (result, panicked) = match outcome {
+                    Ok(Ok(())) => (Ok(()), false),
+                    Ok(Err(error)) => (Err(error), false),
+                    Err(_) => (
+                        Err(anyhow::anyhow!(
+                            "inspection worker panicked; retained artifacts require explicit review"
+                        )),
+                        true,
+                    ),
                 };
                 if let Err(error) = &result {
-                    s.fatal = true;
+                    // Unmanaged inspection failures are terminal status values
+                    // with no external custody to retain. Managed generations
+                    // and panics must still poison checked shutdown.
+                    s.fatal |= managed_generation || panicked;
                     s.status.error = Some(format!("{error:#}").chars().take(4096).collect());
                     s.status.phase = Phase::Failed;
                 } else {
                     s.status.phase = Phase::Closed;
                 }
-                result
+                if s.fatal { result } else { Ok(()) }
             })?;
         Ok(Self {
             control: WorkbenchControl {

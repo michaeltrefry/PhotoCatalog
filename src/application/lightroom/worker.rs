@@ -319,6 +319,10 @@ pub(super) fn run(
         let fatal = owner.poisoned || managed_failure.is_some();
         if fatal {
             owner.poisoned = true;
+            shared
+                .lock()
+                .unwrap_or_else(|value| value.into_inner())
+                .fatal = true;
             closing.store(true, Ordering::Release);
         }
         let review = owner.review.as_ref().map(|r| r.summary().token.clone());
@@ -329,6 +333,10 @@ pub(super) fn run(
     }
     let close = owner.close();
     if let Err(error) = close {
+        shared
+            .lock()
+            .unwrap_or_else(|value| value.into_inner())
+            .fatal = true;
         if owner.managed.is_some() {
             // A failed SQLite/F close retains the exact Owner in this process.
             // The outer supervisor observes Failed during shutdown and
