@@ -279,7 +279,7 @@ pub struct SelectionReview {
 }
 
 pub(crate) struct ManagedReviewOpenError {
-    pub(crate) plan: Option<Plan>,
+    pub(crate) plan: Option<Box<Plan>>,
     pub(crate) error: anyhow::Error,
 }
 
@@ -531,9 +531,9 @@ fn preadmit(db: &Connection, limits: SelectionLimits) -> Result<()> {
 }
 
 impl SelectionReview {
-    pub(crate) fn close_checked(mut self) -> std::result::Result<(), (Self, anyhow::Error)> {
+    pub(crate) fn close_checked(mut self) -> std::result::Result<(), (Box<Self>, anyhow::Error)> {
         if let Err(error) = self.close_managed_destination() {
-            return Err((self, error));
+            return Err((Box::new(self), error));
         }
         let Self {
             plan,
@@ -548,8 +548,8 @@ impl SelectionReview {
         match plan.close_checked() {
             Ok(()) => Ok(()),
             Err((plan, error)) => Err((
-                Self {
-                    plan,
+                Box::new(Self {
+                    plan: *plan,
                     guard,
                     managed_identity,
                     managed_destination,
@@ -557,7 +557,7 @@ impl SelectionReview {
                     companion_objects,
                     summary,
                     evidence,
-                },
+                }),
                 error,
             )),
         }
@@ -833,7 +833,7 @@ impl SelectionReview {
                 evidence,
             }),
             Err(error) => Err(ManagedReviewOpenError {
-                plan: Some(plan),
+                plan: Some(Box::new(plan)),
                 error,
             }),
         }

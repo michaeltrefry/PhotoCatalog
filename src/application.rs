@@ -1305,9 +1305,10 @@ impl Actor {
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .signal_shutdown();
-                            let result = self.close();
+                            let result = self
+                                .close()
+                                .and_then(|()| self.lightroom.shutdown().map_err(native));
                             if result.is_ok() {
-                                self.lightroom.shutdown();
                                 self.shared.queue.lock().unwrap().stopping = true;
                             }
                             let _ = tx.send(result);
@@ -1396,7 +1397,9 @@ impl Actor {
             // in the loop instead, permitting an explicit Close/shutdown retry.
             self.retain_open();
         }
-        self.lightroom.shutdown();
+        if self.lightroom.shutdown().is_err() {
+            self.lightroom.retain_failed_shutdown();
+        }
     }
     fn close(&mut self) -> std::result::Result<(), BridgeError> {
         if self.migration.held() {
@@ -2690,7 +2693,17 @@ impl Actor {
         })
     }
     fn maintain(&mut self) {
-        self.lightroom.maintain();
+        if let Err(error) = self.lightroom.maintain() {
+            if let Some(open) = self.open.as_mut() {
+                open.closing = true;
+            }
+            let mut queue = self.shared.queue.lock().unwrap();
+            queue.status.phase = Phase::Closing;
+            queue.status.message = Some(format!(
+                "Workbench owner requires checked shutdown: {error:#}"
+            ));
+            return;
+        }
         let Some(o) = self.open.as_mut() else { return };
         if o.catalog
             .session

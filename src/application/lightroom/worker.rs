@@ -46,7 +46,7 @@ fn error_text(error: &anyhow::Error) -> String {
 fn retain_failed_managed_open(
     shared: &Arc<Mutex<Shared>>,
     error: anyhow::Error,
-    _plan: Option<Plan>,
+    _plan: Option<Box<Plan>>,
 ) -> ! {
     let mut state = shared.lock().unwrap_or_else(|value| value.into_inner());
     state.fatal = true;
@@ -161,7 +161,7 @@ pub(super) fn run(
             plan.set_execution(Some(control.clone()));
             let version = match plan.data_version() {
                 Ok(version) => version,
-                Err(error) => retain_failed_managed_open(&shared, error, Some(plan)),
+                Err(error) => retain_failed_managed_open(&shared, error, Some(Box::new(plan))),
             };
             (root, None, Some(physical), plan, version)
         } else {
@@ -1006,19 +1006,19 @@ impl Owner {
     }
     fn close(&mut self) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(review) = self.review.take() {
-            if let Err((review, error)) = review.close_checked() {
-                self.review = Some(review);
-                self.poisoned = true;
-                failures.push(format!("selection review close: {error:#}"));
-            }
+        if let Some(review) = self.review.take()
+            && let Err((review, error)) = review.close_checked()
+        {
+            self.review = Some(*review);
+            self.poisoned = true;
+            failures.push(format!("selection review close: {error:#}"));
         }
-        if let Some(plan) = self.plan.take() {
-            if let Err((plan, error)) = plan.close_checked() {
-                self.plan = Some(plan);
-                self.poisoned = true;
-                failures.push(format!("inspection plan close: {error:#}"));
-            }
+        if let Some(plan) = self.plan.take()
+            && let Err((plan, error)) = plan.close_checked()
+        {
+            self.plan = Some(*plan);
+            self.poisoned = true;
+            failures.push(format!("inspection plan close: {error:#}"));
         }
         if failures.is_empty()
             && !self.poisoned
@@ -1056,7 +1056,7 @@ impl Owner {
                 match Plan::open_managed(&self.root.to_path()?, identity) {
                     Ok(plan) => plan,
                     Err(failure) => {
-                        self.plan = failure.plan;
+                        self.plan = failure.plan.map(|plan| *plan);
                         self.poisoned = true;
                         return Err(failure.error)
                             .context("managed inspection writer admission failed");
@@ -1265,7 +1265,7 @@ impl Owner {
                 if let Some(plan) = self.plan.take()
                     && let Err((plan, error)) = plan.close_checked()
                 {
-                    self.plan = Some(plan);
+                    self.plan = Some(*plan);
                     self.poisoned = true;
                     return Err(error).context("inspection plan close before review");
                 }
@@ -1282,7 +1282,7 @@ impl Owner {
                     ) {
                         Ok(review) => review,
                         Err(failure) => {
-                            self.plan = failure.plan;
+                            self.plan = failure.plan.map(|plan| *plan);
                             self.poisoned = true;
                             return Err(failure.error)
                                 .context("managed selection reader admission failed");
@@ -1373,12 +1373,12 @@ impl Owner {
                 )
             }
             Action::ReleaseReview => {
-                if let Some(review) = self.review.take() {
-                    if let Err((review, error)) = review.close_checked() {
-                        self.review = Some(review);
-                        self.poisoned = true;
-                        return Err(error).context("selection review close");
-                    }
+                if let Some(review) = self.review.take()
+                    && let Err((review, error)) = review.close_checked()
+                {
+                    self.review = Some(*review);
+                    self.poisoned = true;
+                    return Err(error).context("selection review close");
                 }
                 self.verify_root(control)?;
                 self.plan(control)?;

@@ -40,12 +40,12 @@ fn closed_status_waits_for_join_and_process_lease_release() {
         next.request(request(lw::OpenMode::OpenExisting), &executable, ENVELOPE)
             .is_err()
     );
-    coordinator.maintain();
+    coordinator.maintain().unwrap();
     assert!(control.lock().unwrap().status().unwrap().closed);
     // Keep the first coordinator alive to exercise cross-Bridge reopening.
     next.request(request(lw::OpenMode::OpenExisting), &executable, ENVELOPE)
         .unwrap();
-    next.shutdown();
+    next.shutdown().unwrap();
 }
 fn config() -> app::Config {
     app::Config {

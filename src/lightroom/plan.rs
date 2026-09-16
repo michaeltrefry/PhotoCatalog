@@ -244,7 +244,7 @@ pub struct Plan {
     execution: Option<Box<super::control::Control>>,
 }
 pub(crate) struct ManagedPlanOpenError {
-    pub(crate) plan: Option<Plan>,
+    pub(crate) plan: Option<Box<Plan>>,
     pub(crate) error: anyhow::Error,
 }
 impl ManagedPlanOpenError {
@@ -559,7 +559,7 @@ impl Plan {
         match admitted {
             Ok(()) => Ok(plan),
             Err(error) => Err(ManagedPlanOpenError {
-                plan: Some(plan),
+                plan: Some(Box::new(plan)),
                 error,
             }),
         }
@@ -601,12 +601,12 @@ impl Plan {
         match admitted {
             Ok(()) => Ok(plan),
             Err(error) => Err(ManagedPlanOpenError {
-                plan: Some(plan),
+                plan: Some(Box::new(plan)),
                 error,
             }),
         }
     }
-    pub(crate) fn close_checked(self) -> std::result::Result<(), (Self, anyhow::Error)> {
+    pub(crate) fn close_checked(self) -> std::result::Result<(), (Box<Self>, anyhow::Error)> {
         let Self {
             db,
             root,
@@ -615,11 +615,11 @@ impl Plan {
         match db.close() {
             Ok(()) => Ok(()),
             Err((db, error)) => Err((
-                Self {
+                Box::new(Self {
                     db,
                     root,
                     execution,
-                },
+                }),
                 error.into(),
             )),
         }
@@ -3204,7 +3204,7 @@ mod bounded_plan_tests {
             unsafe { rusqlite::ffi::sqlite3_finalize(statement) },
             rusqlite::ffi::SQLITE_OK
         );
-        assert!(plan.close_checked().is_ok());
+        assert!((*plan).close_checked().is_ok());
     }
 
     #[test]
@@ -3224,7 +3224,7 @@ mod bounded_plan_tests {
         };
         assert!(failure.error.to_string().contains("identity"));
         assert!(failure.plan.is_some());
-        assert!(failure.plan.unwrap().close_checked().is_ok());
+        assert!((*failure.plan.unwrap()).close_checked().is_ok());
     }
 
     #[test]

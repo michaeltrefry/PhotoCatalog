@@ -409,6 +409,15 @@ impl Coordinator {
             .drained = true;
         Ok(())
     }
+
+    /// A terminal application actor has no caller left that can retry checked
+    /// shutdown. Keep every remaining child and dependency owner alive rather
+    /// than allowing field destruction to counterfeit a successful reap.
+    pub(crate) fn retain_failed_shutdown(&mut self) {
+        std::mem::forget(self.owner.take());
+        std::mem::forget(self.lease.take());
+        std::mem::forget(self.managed.take());
+    }
     pub(crate) fn request(
         &mut self,
         request: Request,

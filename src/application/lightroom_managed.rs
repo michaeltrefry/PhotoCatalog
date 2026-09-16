@@ -240,19 +240,19 @@ impl Publish for SourceRouter {
 
 enum Reader {
     Capture {
-        owner: CaptureSqlReader,
+        owner: Box<CaptureSqlReader>,
         cancel: Arc<AtomicBool>,
     },
     Sql {
-        owner: SqlReader,
+        owner: Box<SqlReader>,
         cancel: Arc<AtomicBool>,
     },
 }
 impl Reader {
     fn retire(self) -> Result<()> {
         match self {
-            Self::Capture { owner, .. } => owner.retire(),
-            Self::Sql { owner, .. } => owner.retire(),
+            Self::Capture { owner, .. } => (*owner).retire(),
+            Self::Sql { owner, .. } => (*owner).retire(),
         }
     }
 }
@@ -811,7 +811,13 @@ impl ManagedIo for Owner {
                     .readers
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .insert(reader.clone(), Reader::Capture { owner, cancel });
+                    .insert(
+                        reader.clone(),
+                        Reader::Capture {
+                            owner: Box::new(owner),
+                            cancel,
+                        },
+                    );
                 ensure!(replaced.is_none(), "Source generation collision");
                 Ok(reader)
             }
@@ -848,7 +854,13 @@ impl ManagedIo for Owner {
                     .readers
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .insert(reader.clone(), Reader::Sql { owner, cancel });
+                    .insert(
+                        reader.clone(),
+                        Reader::Sql {
+                            owner: Box::new(owner),
+                            cancel,
+                        },
+                    );
                 ensure!(replaced.is_none(), "Source generation collision");
                 Ok(reader)
             }
