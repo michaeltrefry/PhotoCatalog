@@ -548,7 +548,13 @@ impl Handle {
             Ok(())
         };
         if filesystem.is_ok() {
-            self.shared.state.lock().unwrap().filesystem_verified = true;
+            let mut state = self.shared.state.lock().unwrap();
+            state.filesystem_verified = true;
+            if state.child_finished && state.local_verified {
+                state.phase = TransportPhase::Closed;
+                state.drain_error = None;
+            }
+            self.shared.wake.notify_all();
         }
         // Process::drain retains an abnormal-exit diagnostic even after checked
         // wait/join. Safe retirement does not turn that catalog outcome into a
