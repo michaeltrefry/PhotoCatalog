@@ -29,6 +29,7 @@ pub fn build_identity() -> String {
             include_str!("lightroom/worker.rs"),
             include_str!("lightroom_bridge.rs"),
             include_str!("lightroom_bridge/wire.rs"),
+            include_str!("lightroom_managed.rs"),
             include_str!("lightroom_process.rs"),
             include_str!("../lightroom/plan.rs"),
             include_str!("../lightroom/plan/desktop.rs"),
@@ -102,6 +103,7 @@ enum Work {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 enum CallbackRequest {
+    Admit,
     Filesystem {
         request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
     },
@@ -134,6 +136,7 @@ enum CallbackRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 enum CallbackValue {
+    Admitted,
     Filesystem(crate::filesystem_worker::wire::LightroomWorkbenchIoReply),
     Source(String),
     Schema(crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects),
@@ -146,11 +149,19 @@ enum CallbackValue {
 #[serde(deny_unknown_fields)]
 pub struct Failure {
     pub detail: String,
+    pub fatal: bool,
 }
 impl Failure {
     fn new(error: impl std::fmt::Display) -> Self {
         Self {
             detail: format!("{error:#}").chars().take(ERROR_BYTES).collect(),
+            fatal: false,
+        }
+    }
+    fn fatal(error: impl std::fmt::Display) -> Self {
+        Self {
+            detail: format!("{error:#}").chars().take(ERROR_BYTES).collect(),
+            fatal: true,
         }
     }
     fn validate(&self) -> Result<()> {
@@ -409,6 +420,13 @@ impl CallbackProxy {
     }
 }
 impl super::lightroom::ManagedIo for CallbackProxy {
+    fn admit(&self) -> Result<()> {
+        match self.call(CallbackRequest::Admit, &AtomicBool::new(false))? {
+            CallbackValue::Admitted => Ok(()),
+            _ => anyhow::bail!("Workbench admission callback result kind"),
+        }
+    }
+
     fn filesystem(
         &self,
         request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
@@ -553,10 +571,16 @@ pub fn worker_main() -> Result<()> {
                     sequence.0 > 0 && request_digest(&request)? == expected,
                     "Workbench request binding mismatch"
                 );
-                coordinator.maintain();
+                coordinator.maintain()?;
                 let result = coordinator
                     .request(request, &executable, ENVELOPE_BYTES)
-                    .map_err(Failure::new);
+                    .map_err(|error| {
+                        if coordinator.fatal() {
+                            Failure::fatal(error)
+                        } else {
+                            Failure::new(error)
+                        }
+                    });
                 if let Err(error) = &result {
                     error.validate()?;
                 }
@@ -571,8 +595,8 @@ pub fn worker_main() -> Result<()> {
             }
             Work::Shutdown { sequence } => {
                 ensure!(sequence.0 > 0, "Workbench shutdown sequence");
+                coordinator.shutdown()?;
                 callback.close();
-                coordinator.shutdown();
                 write_packet(
                     &mut *output.lock().unwrap_or_else(|e| e.into_inner()),
                     &Outcome::Drained {
@@ -612,12 +636,15 @@ struct Owner {
     child: Option<Child>,
     transport: Option<Transport>,
     drained: bool,
+    poisoned: Option<String>,
 }
 impl Owner {
     fn revoke(&mut self) -> Result<()> {
         drop(self.transport.take());
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
+            if child.try_wait()?.is_none() {
+                child.kill().context("revoke Workbench child")?;
+            }
             child.wait()?;
             self.child.take();
         }
@@ -627,11 +654,25 @@ impl Owner {
 }
 
 struct StartingChild(Option<Child>);
+impl StartingChild {
+    fn reap(&mut self) -> Result<()> {
+        if let Some(child) = self.0.as_mut() {
+            if child.try_wait()?.is_none() {
+                child.kill().context("revoke starting Workbench child")?;
+            }
+            child.wait().context("reap starting Workbench child")?;
+            self.0.take();
+        }
+        Ok(())
+    }
+}
 impl Drop for StartingChild {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        while self.0.is_some() {
+            let _ = self.reap();
+            if self.0.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
     }
 }
@@ -669,23 +710,37 @@ impl Client {
             .stderr(Stdio::null())
             .spawn()?;
         let mut starting = StartingChild(Some(child));
-        let child = starting
-            .0
-            .as_mut()
-            .context("Workbench startup child missing")?;
-        let mut input = child.stdin.take().context("Workbench stdin missing")?;
-        let mut output = child.stdout.take().context("Workbench stdout missing")?;
-        write_packet(&mut input, &startup)?;
-        let ready: Outcome = read_packet(&mut output)?.context("Workbench Ready missing")?;
-        ensure!(
-            matches!(
-                ready,
-                Outcome::Ready { ref instance, ref build }
-                    if instance == &startup.instance && build == &startup.build
-            ),
-            "Workbench Ready binding mismatch"
-        );
-        let child = starting.0.take().context("Workbench startup owner lost")?;
+        let bootstrap = (|| -> Result<(Child, ChildStdin, ChildStdout)> {
+            let child = starting
+                .0
+                .as_mut()
+                .context("Workbench startup child missing")?;
+            let mut input = child.stdin.take().context("Workbench stdin missing")?;
+            let mut output = child.stdout.take().context("Workbench stdout missing")?;
+            write_packet(&mut input, &startup)?;
+            let ready: Outcome = read_packet(&mut output)?.context("Workbench Ready missing")?;
+            ensure!(
+                matches!(
+                    ready,
+                    Outcome::Ready { ref instance, ref build }
+                        if instance == &startup.instance && build == &startup.build
+                ),
+                "Workbench Ready binding mismatch"
+            );
+            let child = starting.0.take().context("Workbench startup owner lost")?;
+            Ok((child, input, output))
+        })();
+        let (child, input, output) = match bootstrap {
+            Ok(ready) => ready,
+            Err(primary) => match starting.reap() {
+                Ok(()) => return Err(primary),
+                Err(cleanup) => {
+                    return Err(primary.context(format!(
+                        "Workbench startup checked reap also failed: {cleanup:#}"
+                    )));
+                }
+            },
+        };
         Ok(Self {
             instance: startup.instance,
             managed,
@@ -697,6 +752,7 @@ impl Client {
                     sequence: 0,
                 }),
                 drained: false,
+                poisoned: None,
             }),
         })
     }
@@ -707,6 +763,10 @@ impl Client {
     ) -> Result<CallbackValue> {
         let cancel = AtomicBool::new(false);
         match request {
+            CallbackRequest::Admit => {
+                managed.admit()?;
+                Ok(CallbackValue::Admitted)
+            }
             CallbackRequest::Filesystem { request } => Ok(CallbackValue::Filesystem(
                 managed.filesystem(request, &cancel)?,
             )),
@@ -753,10 +813,17 @@ impl Client {
         request: CallbackRequest,
         managed: Option<&Arc<dyn super::lightroom::ManagedIo>>,
     ) -> Result<()> {
+        let fatal = matches!(&request, CallbackRequest::Admit);
         let result = managed
             .context("unmanaged Workbench requested a supervisor callback")
             .and_then(|managed| Self::callback(managed.as_ref(), request))
-            .map_err(Failure::new);
+            .map_err(|error| {
+                if fatal {
+                    Failure::fatal(error)
+                } else {
+                    Failure::new(error)
+                }
+            });
         if let Err(error) = &result {
             error.validate()?;
         }
@@ -784,48 +851,74 @@ impl Client {
     }
 
     pub fn call(&self, request: Request) -> Result<Response> {
+        if let Some(managed) = &self.managed {
+            managed.admit()?;
+        }
         let digest = request_digest(&request)?;
         let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
         ensure!(!owner.drained, "Workbench process is drained");
-        let transport = owner
-            .transport
-            .as_mut()
-            .context("Workbench transport is retained after failure")?;
-        transport.sequence = transport
-            .sequence
-            .checked_add(1)
-            .context("Workbench sequence exhausted")?;
-        let sequence = crate::application::U64(transport.sequence);
-        write_packet(
-            &mut transport.input,
-            &Work::Request {
-                sequence,
-                request_digest: digest.clone(),
-                request,
-            },
-        )?;
-        let result = loop {
-            let outcome: Outcome = read_packet(&mut transport.output)?
-                .context("Workbench reply lost; child remains owned for checked drain")?;
-            match outcome {
-                Outcome::Callback { sequence, request } => {
-                    Self::reply_callback(transport, sequence, request, self.managed.as_ref())?;
+        ensure!(
+            owner.poisoned.is_none(),
+            "Workbench process is poisoned: {}",
+            owner.poisoned.as_deref().unwrap_or_default()
+        );
+        let transport_result = (|| -> Result<std::result::Result<Response, Failure>> {
+            let transport = owner
+                .transport
+                .as_mut()
+                .context("Workbench transport is retained after failure")?;
+            transport.sequence = transport
+                .sequence
+                .checked_add(1)
+                .context("Workbench sequence exhausted")?;
+            let sequence = crate::application::U64(transport.sequence);
+            write_packet(
+                &mut transport.input,
+                &Work::Request {
+                    sequence,
+                    request_digest: digest.clone(),
+                    request,
+                },
+            )?;
+            let result = loop {
+                let outcome: Outcome = read_packet(&mut transport.output)?
+                    .context("Workbench reply lost; child remains owned for checked drain")?;
+                match outcome {
+                    Outcome::Callback { sequence, request } => {
+                        Self::reply_callback(transport, sequence, request, self.managed.as_ref())?;
+                    }
+                    Outcome::Reply {
+                        sequence: actual,
+                        request_digest: actual_digest,
+                        result,
+                    } => {
+                        ensure!(
+                            actual == sequence && actual_digest == digest,
+                            "Workbench reply binding mismatch"
+                        );
+                        break result;
+                    }
+                    _ => anyhow::bail!("unexpected Workbench outcome"),
                 }
-                Outcome::Reply {
-                    sequence: actual,
-                    request_digest: actual_digest,
-                    result,
-                } => {
-                    ensure!(
-                        actual == sequence && actual_digest == digest,
-                        "Workbench reply binding mismatch"
-                    );
-                    break result;
-                }
-                _ => anyhow::bail!("unexpected Workbench outcome"),
+            };
+            Ok(result)
+        })();
+        let result = match transport_result {
+            Ok(result) => result,
+            Err(error) => {
+                owner.poisoned = Some(format!("{error:#}"));
+                return Err(error);
             }
         };
-        result.map_err(|failure| anyhow::anyhow!(failure.detail))
+        match result {
+            Ok(response) => Ok(response),
+            Err(failure) => {
+                if failure.fatal {
+                    owner.poisoned = Some(failure.detail.clone());
+                }
+                Err(anyhow::anyhow!(failure.detail))
+            }
+        }
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -883,15 +976,15 @@ impl Client {
         match result {
             Ok(()) => Ok(()),
             Err(primary) => {
-                let revoke = owner.revoke();
                 let dependents = self.managed.as_ref().map(|managed| managed.drain());
-                match (revoke, dependents) {
-                    (Ok(()), None | Some(Ok(()))) => Err(primary),
-                    (Err(cleanup), None | Some(Ok(()))) => Err(primary
+                let revoke = owner.revoke();
+                match (dependents, revoke) {
+                    (None | Some(Ok(())), Ok(())) => Err(primary),
+                    (None | Some(Ok(())), Err(cleanup)) => Err(primary
                         .context(format!("Workbench checked revoke also failed: {cleanup:#}"))),
-                    (Ok(()), Some(Err(cleanup))) => Err(primary
+                    (Some(Err(cleanup)), Ok(())) => Err(primary
                         .context(format!("Workbench dependent drain also failed: {cleanup:#}"))),
-                    (Err(revoke), Some(Err(dependents))) => Err(primary.context(format!(
+                    (Some(Err(dependents)), Err(revoke)) => Err(primary.context(format!(
                         "Workbench revoke failed: {revoke:#}; dependent drain failed: {dependents:#}"
                     ))),
                 }
@@ -912,17 +1005,11 @@ impl Drop for Client {
     fn drop(&mut self) {
         if self.shutdown().is_err() {
             let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
-            if owner.revoke().is_err()
-                && let Some(mut child) = owner.child.take()
-            {
-                // Preserve ownership after Client drop; this reaper is the last
-                // resort when a synchronous checked wait itself failed.
-                let _ = std::thread::Builder::new()
-                    .name("workbench-reaper".into())
-                    .spawn(move || {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    });
+            while owner.child.is_some() {
+                let _ = owner.revoke();
+                if owner.child.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
             }
         }
     }

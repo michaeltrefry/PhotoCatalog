@@ -243,6 +243,18 @@ pub struct Plan {
     root: PathBuf,
     execution: Option<Box<super::control::Control>>,
 }
+pub(crate) struct ManagedPlanOpenError {
+    pub(crate) plan: Option<Plan>,
+    pub(crate) error: anyhow::Error,
+}
+impl ManagedPlanOpenError {
+    fn before_open(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            plan: None,
+            error: error.into(),
+        }
+    }
+}
 pub(crate) fn identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -516,60 +528,101 @@ impl Plan {
     pub(crate) fn create_managed(
         root: &Path,
         expected: &crate::lightroom_migration_worker::identity::FileKey,
-    ) -> Result<Self> {
-        let root = fs::canonicalize(root)?;
+    ) -> std::result::Result<Self, ManagedPlanOpenError> {
+        let root = fs::canonicalize(root).map_err(ManagedPlanOpenError::before_open)?;
         let path = root.join("inspection.sqlite3");
-        ensure!(
-            fs::symlink_metadata(&path)?.len() == 0,
-            "managed inspection database must be empty"
-        );
+        let metadata = fs::symlink_metadata(&path).map_err(ManagedPlanOpenError::before_open)?;
+        if metadata.len() != 0 {
+            return Err(ManagedPlanOpenError::before_open(anyhow::anyhow!(
+                "managed inspection database must be empty"
+            )));
+        }
         let db = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
-            .context("managed inspection create identity")?;
-        crate::configure_catalog_connection(&db)?;
-        initialize_plan(&db)?;
-        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
-            .context("managed inspection initialized identity")?;
-        Ok(Self {
+        )
+        .map_err(ManagedPlanOpenError::before_open)?;
+        let plan = Self {
             db,
             root,
             execution: None,
-        })
+        };
+        let admitted = (|| -> Result<()> {
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection create identity")?;
+            crate::configure_catalog_connection(&plan.db)?;
+            initialize_plan(&plan.db)?;
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection initialized identity")?;
+            Ok(())
+        })();
+        match admitted {
+            Ok(()) => Ok(plan),
+            Err(error) => Err(ManagedPlanOpenError {
+                plan: Some(plan),
+                error,
+            }),
+        }
     }
     pub(crate) fn open_managed(
         root: &Path,
         expected: &crate::lightroom_migration_worker::identity::FileKey,
-    ) -> Result<Self> {
-        let root = fs::canonicalize(root)?;
+    ) -> std::result::Result<Self, ManagedPlanOpenError> {
+        let root = fs::canonicalize(root).map_err(ManagedPlanOpenError::before_open)?;
         let path = root.join("inspection.sqlite3");
         let db = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
-            .context("managed inspection open identity")?;
-        let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(
-            app == 0x50434c49,
-            "not a supported Lightroom inspection plan"
-        );
-        require_current_plan(version)?;
-        validate_paging_indexes(&db)?;
-        crate::configure_catalog_connection(&db)?;
-        crate::catalog_storage::verify_database_identity(&db, &physical(expected))
-            .context("managed inspection configured identity")?;
-        Ok(Self {
+        )
+        .map_err(ManagedPlanOpenError::before_open)?;
+        let plan = Self {
             db,
             root,
             execution: None,
-        })
+        };
+        let admitted = (|| -> Result<()> {
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection open identity")?;
+            let app: i64 = plan
+                .db
+                .query_row("PRAGMA application_id", [], |r| r.get(0))?;
+            let version: i64 = plan.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            ensure!(
+                app == 0x50434c49,
+                "not a supported Lightroom inspection plan"
+            );
+            require_current_plan(version)?;
+            validate_paging_indexes(&plan.db)?;
+            crate::configure_catalog_connection(&plan.db)?;
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection configured identity")?;
+            Ok(())
+        })();
+        match admitted {
+            Ok(()) => Ok(plan),
+            Err(error) => Err(ManagedPlanOpenError {
+                plan: Some(plan),
+                error,
+            }),
+        }
     }
-    pub(crate) fn close_checked(self) -> Result<()> {
-        self.db.close().map_err(|(_, e)| e.into())
+    pub(crate) fn close_checked(self) -> std::result::Result<(), (Self, anyhow::Error)> {
+        let Self {
+            db,
+            root,
+            execution,
+        } = self;
+        match db.close() {
+            Ok(()) => Ok(()),
+            Err((db, error)) => Err((
+                Self {
+                    db,
+                    root,
+                    execution,
+                },
+                error.into(),
+            )),
+        }
     }
     pub(crate) fn verify_managed_identity(
         &self,
@@ -3128,6 +3181,32 @@ fn bounded_values(
 #[cfg(test)]
 mod bounded_plan_tests {
     use super::*;
+    #[test]
+    fn checked_close_returns_the_exact_busy_plan_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = Plan::create(&temp.path().join("plan")).unwrap();
+        let mut statement = std::ptr::null_mut();
+        let sql = b"SELECT 1\0";
+        let prepared = unsafe {
+            rusqlite::ffi::sqlite3_prepare_v2(
+                plan.db.handle(),
+                sql.as_ptr().cast(),
+                -1,
+                &mut statement,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(prepared, rusqlite::ffi::SQLITE_OK);
+        assert!(!statement.is_null());
+
+        let (plan, _) = plan.close_checked().unwrap_err();
+        assert_eq!(
+            unsafe { rusqlite::ffi::sqlite3_finalize(statement) },
+            rusqlite::ffi::SQLITE_OK
+        );
+        assert!(plan.close_checked().is_ok());
+    }
+
     #[test]
     fn global_id_conflict_query_uses_global_indexes_instead_of_nested_revision_scans() {
         use rusqlite::StatementStatus;

@@ -9,6 +9,8 @@ pub mod exports;
 mod hydration;
 pub mod lightroom;
 pub mod lightroom_bridge;
+#[allow(dead_code)]
+pub(crate) mod lightroom_managed;
 pub mod lightroom_migration;
 pub mod lightroom_process;
 pub mod metadata;

@@ -21,6 +21,10 @@ use std::{
 mod worker;
 
 pub(crate) trait ManagedIo: Send + Sync + 'static {
+    /// Fail closed before a new public Workbench request is admitted. This is
+    /// separate from callback validation so F loss can stop W even while no F
+    /// callback is currently in flight.
+    fn admit(&self) -> Result<()>;
     fn filesystem(
         &self,
         request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
@@ -358,6 +362,7 @@ struct Shared {
     status: Status,
     control: Control,
     result: Option<Arc<Cached>>,
+    fatal: bool,
 }
 enum Message {
     Action {
@@ -383,7 +388,7 @@ pub struct WorkbenchControl {
 }
 pub struct Workbench {
     control: WorkbenchControl,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle<Result<()>>>,
 }
 impl std::ops::Deref for Workbench {
     type Target = WorkbenchControl;
@@ -554,6 +559,7 @@ impl Workbench {
             },
             control,
             result: None,
+            fatal: false,
         }));
         let closing = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -561,7 +567,7 @@ impl Workbench {
         let stop = closing.clone();
         let join = thread::Builder::new()
             .name("lightroom-workbench".into())
-            .spawn(move || {
+            .spawn(move || -> Result<()> {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     before();
                     worker::run(config, receiver, state.clone(), stop, managed)
@@ -570,19 +576,21 @@ impl Workbench {
                 s.status.closed = true;
                 s.status.capture_pid = None;
                 s.status.review_token = None;
-                if !matches!(outcome, Ok(Ok(()))) {
-                    s.status.error = Some(match outcome {
-                        Ok(Err(error)) => format!("{error:#}").chars().take(4096).collect(),
-                        Err(_) => {
-                            "inspection worker panicked; retained artifacts require explicit review"
-                                .into()
-                        }
-                        Ok(Ok(())) => unreachable!(),
-                    });
+                let result = match outcome {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "inspection worker panicked; retained artifacts require explicit review"
+                    )),
+                };
+                if let Err(error) = &result {
+                    s.fatal = true;
+                    s.status.error = Some(format!("{error:#}").chars().take(4096).collect());
                     s.status.phase = Phase::Failed;
                 } else {
                     s.status.phase = Phase::Closed;
                 }
+                result
             })?;
         Ok(Self {
             control: WorkbenchControl {
@@ -598,6 +606,13 @@ impl Workbench {
     }
 }
 impl WorkbenchControl {
+    pub(crate) fn fatal(&self) -> bool {
+        self.shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .fatal
+    }
+
     pub fn status(&self) -> Status {
         let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = s.status.clone();
@@ -648,6 +663,7 @@ impl WorkbenchControl {
             !self.closing.load(Ordering::Acquire) && !s.status.closed,
             "workbench is closing or closed"
         );
+        ensure!(!s.fatal, "workbench generation is poisoned");
         ensure!(
             s.status.initialized,
             "workbench is not initialized; open explicitly after failure"
@@ -845,7 +861,7 @@ impl Workbench {
         }
         if let Some(join) = self.join.take() {
             join.join()
-                .map_err(|_| anyhow::anyhow!("workbench owner failed during drain"))?;
+                .map_err(|_| anyhow::anyhow!("workbench owner failed during drain"))??;
         }
         Ok(true)
     }

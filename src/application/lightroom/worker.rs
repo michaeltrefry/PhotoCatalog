@@ -28,6 +28,7 @@ struct Owner {
     generation: String,
     root: NativePath,
     root_identity: Option<FileKey>,
+    poisoned: bool,
     version: i64,
     config: Config,
 }
@@ -41,6 +42,20 @@ fn count(value: U64, maximum: usize) -> Result<usize> {
 }
 fn error_text(error: &anyhow::Error) -> String {
     format!("{error:#}").chars().take(4096).collect()
+}
+fn retain_failed_managed_open(
+    shared: &Arc<Mutex<Shared>>,
+    error: anyhow::Error,
+    _plan: Option<Plan>,
+) -> ! {
+    let mut state = shared.lock().unwrap_or_else(|value| value.into_inner());
+    state.fatal = true;
+    state.status.error = Some(error_text(&error));
+    state.status.phase = Phase::Failed;
+    drop(state);
+    loop {
+        thread::park_timeout(Duration::from_secs(60));
+    }
 }
 fn finish(
     shared: &Arc<Mutex<Shared>>,
@@ -105,7 +120,7 @@ pub(super) fn run(
     };
     let opened = (|| -> Result<Owner> {
         control.check()?;
-        let (root, pin, root_identity, plan) = if let Some(io) = &managed {
+        let (root, pin, root_identity, plan, version) = if let Some(io) = &managed {
             let opening_workbench = shared
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -124,46 +139,31 @@ pub(super) fn run(
             let LightroomWorkbenchIoReply::Root { root, physical, .. } = reply else {
                 anyhow::bail!("Workbench root reply kind")
             };
-            let setup = (|| -> Result<Plan> {
-                let local = native(&root, config.limits.native_path_units)?;
-                let mut plan = if matches!(config.mode, OpenMode::Create) {
-                    Plan::create_managed(&local, &physical)?
-                } else {
-                    Plan::open_managed(&local, &physical)?
-                };
-                plan.set_execution(Some(control.clone()));
-                Ok(plan)
-            })();
-            let plan = match setup {
-                Ok(plan) => plan,
-                Err(primary) => {
-                    let release = LightroomWorkbenchIo::RootRelease {
-                        operation: initial.clone(),
-                        workbench: opening_workbench,
-                        generation: initial_generation.clone(),
-                    };
-                    return match io.filesystem(release.clone(), &AtomicBool::new(false)) {
-                        Ok(reply) => match reply.validate_for(&release) {
-                            Ok(())
-                                if matches!(reply, LightroomWorkbenchIoReply::Released { .. }) =>
-                            {
-                                Err(primary)
-                            }
-                            Ok(()) => {
-                                Err(primary
-                                    .context("managed root startup cleanup reply kind differs"))
-                            }
-                            Err(cleanup) => Err(primary.context(format!(
-                                "managed root startup cleanup receipt invalid: {cleanup:#}"
-                            ))),
-                        },
-                        Err(cleanup) => Err(primary.context(format!(
-                            "managed root startup cleanup also failed: {cleanup:#}"
-                        ))),
-                    };
-                }
+            let local = match native(&root, config.limits.native_path_units) {
+                Ok(local) => local,
+                Err(error) => retain_failed_managed_open(&shared, error, None),
             };
-            (root, None, Some(physical), plan)
+            let opened = if matches!(config.mode, OpenMode::Create) {
+                Plan::create_managed(&local, &physical)
+            } else {
+                Plan::open_managed(&local, &physical)
+            };
+            let mut plan = match opened {
+                Ok(plan) => plan,
+                Err(failure) => retain_failed_managed_open(
+                    &shared,
+                    failure.error.context(
+                        "managed inspection admission failed; F root authority remains retained",
+                    ),
+                    failure.plan,
+                ),
+            };
+            plan.set_execution(Some(control.clone()));
+            let version = match plan.data_version() {
+                Ok(version) => version,
+                Err(error) => retain_failed_managed_open(&shared, error, Some(plan)),
+            };
+            (root, None, Some(physical), plan, version)
         } else {
             let root = native(&config.root, config.limits.native_path_units)?;
             if matches!(config.mode, OpenMode::Create) {
@@ -172,9 +172,15 @@ pub(super) fn run(
             control.check()?;
             let pin = InspectionPin::open(&root)?;
             let plan = pin.open_plan(control.clone())?;
-            (NativePath::from_path(pin.root()), Some(pin), None, plan)
+            let version = plan.data_version()?;
+            (
+                NativePath::from_path(pin.root()),
+                Some(pin),
+                None,
+                plan,
+                version,
+            )
         };
-        let version = plan.data_version()?;
         let workbench = shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -191,6 +197,7 @@ pub(super) fn run(
             generation: initial_generation.clone(),
             root,
             root_identity,
+            poisoned: false,
             version,
             config,
         })
@@ -285,10 +292,43 @@ pub(super) fn run(
                 Err(query) => owner.query(query, &control, &operation),
             }
         })();
+        let fatal = owner.poisoned
+            || result.is_err()
+                && owner
+                    .managed
+                    .as_ref()
+                    .is_some_and(|managed| managed.admit().is_err());
+        if fatal {
+            owner.poisoned = true;
+            closing.store(true, Ordering::Release);
+        }
         let review = owner.review.as_ref().map(|r| r.summary().token.clone());
         finish(&shared, &operation, &generation, result, review, &closing);
+        if fatal {
+            break;
+        }
     }
-    owner.close()
+    let close = owner.close();
+    if let Err(error) = close {
+        if owner.managed.is_some() {
+            // A failed SQLite/F close retains the exact Owner in this process.
+            // The outer supervisor observes Failed during shutdown and
+            // checked-reaps W; no Drained frame can be emitted first.
+            let mut state = shared.lock().unwrap_or_else(|value| value.into_inner());
+            state.fatal = true;
+            state.status.error = Some(error_text(&error));
+            state.status.phase = Phase::Failed;
+            drop(state);
+            loop {
+                thread::park_timeout(Duration::from_secs(60));
+            }
+        }
+        return Err(error);
+    }
+    if owner.poisoned {
+        anyhow::bail!("managed Workbench generation is poisoned")
+    }
+    Ok(())
     // Owner drops Plan/Review first, then identity pin. Any capture subprocess
     // has already dropped/reaped inside action before this point.
 }
@@ -512,13 +552,16 @@ impl Owner {
                 anyhow::bail!("seal stage reply kind")
             };
             let progress = control.processed.clone();
-            review.backup_managed(
+            if let Err(error) = review.backup_managed(
                 review_token,
                 &database,
                 &physical,
                 control.cancel.clone(),
                 move |value| progress.store(value.completed, Ordering::Release),
-            )?;
+            ) {
+                self.poisoned = true;
+                return Err(error).context("managed destination backup failed");
+            }
             let request = LightroomWorkbenchIo::SealSyncHash {
                 operation: operation.into(),
                 workbench: self.workbench.clone(),
@@ -688,8 +731,18 @@ impl Owner {
             Ok(schema)
         })();
         let retired = io.source_retire(&source);
-        let schema = source_result?;
-        retired.context("CaptureSql did not drain")?;
+        let schema = match (source_result, retired) {
+            (Ok(schema), Ok(())) => schema,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(retire)) => {
+                return Err(retire).context("CaptureSql did not drain");
+            }
+            (Err(primary), Err(retire)) => {
+                return Err(
+                    primary.context(format!("CaptureSql checked drain also failed: {retire:#}"))
+                );
+            }
+        };
         // This is the final fallible filesystem observation before the short
         // plan transaction. The evidence lease remains retained through commit.
         self.evidence_current(operation, &capture_generation, control)?;
@@ -798,8 +851,18 @@ impl Owner {
             Ok(retained)
         })();
         let retired = io.source_retire(&source);
-        let retained = source_result?;
-        retired.context("CaptureSql did not drain")?;
+        let retained = match (source_result, retired) {
+            (Ok(retained), Ok(())) => retained,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(retire)) => {
+                return Err(retire).context("CaptureSql did not drain");
+            }
+            (Err(primary), Err(retire)) => {
+                return Err(
+                    primary.context(format!("CaptureSql checked drain also failed: {retire:#}"))
+                );
+            }
+        };
         self.evidence_current(operation, &capture_generation, control)?;
         self.verify_root(control)?;
         let stage = self.plan(control)?.finish_managed_resume(revision)?;
@@ -943,17 +1006,24 @@ impl Owner {
     }
     fn close(&mut self) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(review) = self.review.take()
-            && let Err(error) = review.close_checked()
-        {
-            failures.push(format!("selection review close: {error:#}"));
+        if let Some(review) = self.review.take() {
+            if let Err((review, error)) = review.close_checked() {
+                self.review = Some(review);
+                self.poisoned = true;
+                failures.push(format!("selection review close: {error:#}"));
+            }
         }
-        if let Some(plan) = self.plan.take()
-            && let Err(error) = plan.close_checked()
-        {
-            failures.push(format!("inspection plan close: {error:#}"));
+        if let Some(plan) = self.plan.take() {
+            if let Err((plan, error)) = plan.close_checked() {
+                self.plan = Some(plan);
+                self.poisoned = true;
+                failures.push(format!("inspection plan close: {error:#}"));
+            }
         }
-        if let Some(io) = &self.managed {
+        if failures.is_empty()
+            && !self.poisoned
+            && let Some(io) = &self.managed
+        {
             let request = LightroomWorkbenchIo::RootRelease {
                 operation: self.root_operation.clone(),
                 workbench: self.workbench.clone(),
@@ -981,8 +1051,17 @@ impl Owner {
             "ReleaseReview required before opening inspection writer"
         );
         if self.plan.is_none() {
-            let mut plan = if let Some(identity) = &self.root_identity {
-                Plan::open_managed(&self.root.to_path()?, identity)?
+            let managed_identity = self.root_identity.clone();
+            let mut plan = if let Some(identity) = &managed_identity {
+                match Plan::open_managed(&self.root.to_path()?, identity) {
+                    Ok(plan) => plan,
+                    Err(failure) => {
+                        self.plan = failure.plan;
+                        self.poisoned = true;
+                        return Err(failure.error)
+                            .context("managed inspection writer admission failed");
+                    }
+                }
             } else {
                 self.pin
                     .as_ref()
@@ -1183,19 +1262,32 @@ impl Owner {
                     requested == self.root.to_path()?.join("inspection.sqlite3"),
                     "selection inspection differs from pinned workbench"
                 );
-                if let Some(plan) = self.plan.take() {
-                    plan.close_checked()?;
+                if let Some(plan) = self.plan.take()
+                    && let Err((plan, error)) = plan.close_checked()
+                {
+                    self.plan = Some(plan);
+                    self.poisoned = true;
+                    return Err(error).context("inspection plan close before review");
                 }
                 self.verify_root(control)?;
                 let progress = control.processed.clone();
-                let review = if let Some(identity) = &self.root_identity {
-                    selection::SelectionReview::open_managed(
+                let managed_identity = self.root_identity.clone();
+                let review = if let Some(identity) = &managed_identity {
+                    match selection::SelectionReview::open_managed(
                         request,
                         limits,
                         control.cancel.clone(),
                         identity,
                         move |p| progress.store(p.completed, Ordering::Release),
-                    )?
+                    ) {
+                        Ok(review) => review,
+                        Err(failure) => {
+                            self.plan = failure.plan;
+                            self.poisoned = true;
+                            return Err(failure.error)
+                                .context("managed selection reader admission failed");
+                        }
+                    }
                 } else {
                     let review = selection::SelectionReview::open(
                         request,
@@ -1282,7 +1374,11 @@ impl Owner {
             }
             Action::ReleaseReview => {
                 if let Some(review) = self.review.take() {
-                    review.close_checked()?;
+                    if let Err((review, error)) = review.close_checked() {
+                        self.review = Some(review);
+                        self.poisoned = true;
+                        return Err(error).context("selection review close");
+                    }
                 }
                 self.verify_root(control)?;
                 self.plan(control)?;

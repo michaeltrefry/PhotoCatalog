@@ -345,6 +345,12 @@ pub(crate) struct Coordinator {
     managed: Option<Arc<dyn lw::ManagedIo>>,
 }
 impl Coordinator {
+    pub(crate) fn fatal(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.control().fatal())
+    }
+
     pub(crate) fn new(control: Arc<Mutex<Control>>) -> Self {
         Self {
             owner: None,
@@ -364,9 +370,9 @@ impl Coordinator {
             managed: Some(managed),
         }
     }
-    pub(crate) fn maintain(&mut self) {
+    pub(crate) fn maintain(&mut self) -> Result<()> {
         if let Some(w) = &mut self.owner {
-            let joined = w.poll_closed().unwrap_or(true);
+            let joined = w.poll_closed()?;
             if joined {
                 self.owner = None;
                 self.lease = None;
@@ -376,18 +382,32 @@ impl Coordinator {
                     .drained = true;
             }
         }
+        Ok(())
     }
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) -> Result<()> {
         self.control
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .signal_shutdown();
-        drop(self.owner.take());
+        if let Some(owner) = &mut self.owner {
+            owner.request_close();
+            while !owner.poll_closed()? {
+                let status = owner.control().status();
+                ensure!(
+                    !owner.control().fatal(),
+                    "managed Workbench close failed: {}",
+                    status.error.as_deref().unwrap_or("retained close failure")
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        self.owner = None;
         self.lease = None;
         self.control
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drained = true;
+        Ok(())
     }
     pub(crate) fn request(
         &mut self,
@@ -415,7 +435,7 @@ impl Coordinator {
                 "inspection transport requires at least 48KiB envelopes"
             );
             identity(&attempt)?;
-            self.maintain();
+            self.maintain()?;
             ensure!(
                 self.owner.is_none(),
                 "close and drain the current inspection workbench before opening another"
@@ -718,7 +738,7 @@ fn typed_action(a: Action) -> Result<lw::Action> {
 
 impl Drop for Coordinator {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 

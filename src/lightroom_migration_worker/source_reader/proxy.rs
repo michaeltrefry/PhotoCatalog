@@ -535,6 +535,9 @@ impl SqlReader {
     pub(crate) fn health(&self) -> Health {
         self.session.borrow().health.clone()
     }
+    pub(crate) fn retire(mut self) -> Result<()> {
+        self.session.get_mut().retire()
+    }
     fn query(&self, query: Query) -> Result<Value> {
         self.session.borrow_mut().query(Read::Sql(query))
     }
@@ -703,6 +706,9 @@ impl CaptureSqlReader {
     }
     pub(crate) fn health(&self) -> Health {
         self.session.borrow().health.clone()
+    }
+    pub(crate) fn retire(mut self) -> Result<()> {
+        self.session.get_mut().retire()
     }
     fn query(&self, query: super::capture_wire::Query) -> Result<Value> {
         self.session.borrow_mut().query(Read::CaptureSql(query))

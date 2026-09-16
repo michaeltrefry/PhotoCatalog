@@ -28,7 +28,7 @@ impl Kind {
         }
     }
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "relay", deny_unknown_fields)]
 pub enum Command {
     Start {
