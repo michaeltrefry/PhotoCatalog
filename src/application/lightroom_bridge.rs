@@ -17,6 +17,7 @@ impl Drop for OwnerLease {
 const ENVELOPE: usize = 128 * 1024;
 // JSON may escape a single source byte to six bytes. Leave envelope headroom.
 const CHUNK: usize = (ENVELOPE - 16 * 1024) / 6;
+pub(super) const INPUT_OWNED_OVERHEAD: usize = 256;
 fn identity(s: &str) -> Result<()> {
     ensure!(
         !s.is_empty() && s.len() <= 128,
@@ -693,9 +694,12 @@ impl Coordinator {
                     .checked_add(std::mem::size_of::<String>() * 2)
                     .context("input allocation overflow")?;
                 ensure!(
-                    u.owned
-                        .checked_add(charge)
-                        .is_some_and(|n| n <= u.total.saturating_mul(3).saturating_add(256)),
+                    u.owned.checked_add(charge).is_some_and(|n| {
+                        n <= u
+                            .total
+                            .saturating_mul(3)
+                            .saturating_add(INPUT_OWNED_OVERHEAD)
+                    }),
                     "input owned allocation budget"
                 );
                 let u = c.upload.as_mut().unwrap();

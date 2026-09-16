@@ -418,6 +418,15 @@ pub(super) fn metadata_layouts() -> MetadataLayouts {
         worker_owner: worker::owner_layout(),
     }
 }
+
+pub(super) fn channel_metadata_layouts() -> Result<(usize, usize)> {
+    use crate::lightroom_migration_worker::memory::channels;
+    use std::alloc::Layout;
+    Ok((
+        channels::bounded(1, Layout::new::<Message>())?,
+        std::mem::size_of::<mpsc::Receiver<Message>>(),
+    ))
+}
 enum Message {
     Action {
         operation: String,

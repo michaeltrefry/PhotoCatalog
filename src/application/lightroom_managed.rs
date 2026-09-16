@@ -421,7 +421,7 @@ impl Custody {
 /// shared allocation pool if construction fails, so startup can be retried or
 /// explicitly drained without losing an active owner.
 pub(crate) struct Owner {
-    _metadata: super::lightroom_capacity::Admission,
+    metadata: super::lightroom_capacity::Admission,
     filesystem: Arc<FilesystemClient>,
     router: Arc<SourceRouter>,
     relay: Arc<RelayClient>,
@@ -540,7 +540,7 @@ impl Owner {
         let budget = MemoryBudget::from_shared(source_payloads);
         let (router, relay) = SourceRouter::start(source_executable, guard.clone(), budget)?;
         let owner = Arc::new(Self {
-            _metadata: metadata,
+            metadata,
             filesystem: filesystem.clone(),
             router,
             relay,
@@ -874,7 +874,9 @@ impl Owner {
 
     pub(crate) fn drain_checked(&self) -> Result<()> {
         self.drain_sources()?;
-        self.drain_filesystem()
+        self.drain_filesystem()?;
+        self.metadata.checked_drained();
+        Ok(())
     }
 }
 
@@ -1130,8 +1132,7 @@ impl ManagedIo for Owner {
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        let _ = self.drain_sources();
-        let _ = self.drain_filesystem();
+        let _ = self.drain_checked();
     }
 }
 
@@ -1170,7 +1171,9 @@ pub(crate) mod tests {
             let allocation = super::super::lightroom_capacity::Allocation::from_subgrant(
                 requirement,
                 reservation,
-                crate::preview::ByteBudget::new(1024 * 1024 * 1024)?,
+                crate::preview::ByteBudget::new(
+                    super::super::lightroom_capacity::source_requirement()?,
+                )?,
             )?;
             let temp = std::fs::canonicalize(temp)?;
             let filesystem = Arc::new(crate::filesystem_worker::client::migration_fixture(&temp)?);

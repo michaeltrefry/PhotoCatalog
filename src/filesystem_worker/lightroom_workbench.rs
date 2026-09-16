@@ -108,6 +108,12 @@ pub(crate) struct RetainedMetadataLayouts {
     pub seal_paths: usize,
 }
 
+pub(crate) struct EvidenceConstructionLayouts {
+    pub raw_vector: usize,
+    pub roster_tree: usize,
+    pub roster_strings: usize,
+}
+
 pub(super) fn retained_metadata_layouts() -> RetainedMetadataLayouts {
     RetainedMetadataLayouts {
         owner: std::mem::size_of::<Owner>(),
@@ -122,6 +128,20 @@ pub(super) fn retained_metadata_layouts() -> RetainedMetadataLayouts {
         // `requested`, canonical directory, database, seal, approval and review.
         seal_paths: 6,
     }
+}
+
+pub(super) fn evidence_construction_layouts(
+    artifacts: usize,
+    manifest_bytes: usize,
+) -> Result<EvidenceConstructionLayouts> {
+    use crate::lightroom_migration_worker::memory::layout::{tree, vector};
+    Ok(EvidenceConstructionLayouts {
+        raw_vector: vector::<Source>(artifacts)?,
+        roster_tree: tree::<String, ()>(artifacts)?,
+        // Every roster key clones one manifest-owned `stored` string. Their
+        // aggregate bytes cannot exceed the admitted manifest document.
+        roster_strings: manifest_bytes,
+    })
 }
 #[derive(Default)]
 pub(super) struct Owner {

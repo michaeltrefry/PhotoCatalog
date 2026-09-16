@@ -60,15 +60,35 @@ struct OperationMemory {
 
 impl OperationMemory {
     fn required(&self, transient: usize, graph: usize, opening: [usize; COUNT]) -> Result<usize> {
-        use crate::lightroom_migration_worker::memory::layout::{add, mul};
-        let sources = Kind::ALL.into_iter().try_fold(0usize, |sum, kind| {
-            add(
-                sum,
-                add(opening[kind.index()], self.producer[kind.index()])?,
-            )
-        })?;
-        add(sources, add(add(transient, mul(3, graph)?)?, self.core)?)
+        operation_required(opening, self.producer, transient, graph, self.core)
     }
+}
+
+fn operation_required(
+    opening: [usize; COUNT],
+    producer: [usize; COUNT],
+    transient: usize,
+    graph: usize,
+    core: usize,
+) -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::layout::{add, mul};
+    let sources = Kind::ALL.into_iter().try_fold(0usize, |sum, kind| {
+        add(sum, add(opening[kind.index()], producer[kind.index()])?)
+    })?;
+    add(sources, add(add(transient, mul(3, graph)?)?, core)?)
+}
+
+pub(crate) fn managed_allocation_requirement(
+    opening: [usize; COUNT],
+    producer: [usize; COUNT],
+    transient: usize,
+    graph: usize,
+    core: usize,
+) -> Result<usize> {
+    crate::lightroom_migration_worker::memory::layout::add(
+        Client::allocation_backing()?,
+        operation_required(opening, producer, transient, graph, core)?,
+    )
 }
 
 pub(crate) struct Client {

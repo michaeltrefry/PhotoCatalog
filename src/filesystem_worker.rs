@@ -60,6 +60,12 @@ pub(crate) fn lightroom_workbench_retained_metadata_layouts()
 -> lightroom_workbench::RetainedMetadataLayouts {
     lightroom_workbench::retained_metadata_layouts()
 }
+pub(crate) fn lightroom_workbench_evidence_construction_layouts(
+    artifacts: usize,
+    manifest_bytes: usize,
+) -> Result<lightroom_workbench::EvidenceConstructionLayouts> {
+    lightroom_workbench::evidence_construction_layouts(artifacts, manifest_bytes)
+}
 pub(crate) fn handler_layout() -> (usize, usize) {
     (
         std::mem::size_of::<FilesystemHandler>(),

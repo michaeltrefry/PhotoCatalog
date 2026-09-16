@@ -7,13 +7,20 @@
 use super::{Config, lightroom_process};
 use crate::preview::{ByteBudget, ByteReservation};
 use anyhow::{Context, Result, ensure};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const FAILURE_BYTES: u64 = 4 * super::lightroom_managed::FAILURE_CHARS as u64;
 const IDENTITY_BYTES: u64 = 128;
 const DIGEST_BYTES: u64 = 64;
 const ROSTER_LIMIT: u64 = crate::lightroom::selection::APPROVAL_ROSTER_LIMIT as u64;
-pub(crate) const SOURCE_PAYLOAD_POOL_CONTRACT: &str =
-    "distinct growable Source payload pool; charged by MemoryBudget reservations";
+pub(crate) const SOURCE_PAYLOAD_POOL_CONTRACT: &str = "distinct atomically retained Source high-water grant; nested reservations use its exact private counter";
+
+pub(crate) fn source_requirement() -> Result<u64> {
+    u64::try_from(
+        crate::lightroom_migration_worker::source_reader::managed_workbench_requirement()?,
+    )
+    .context("Workbench Source requirement exceeds u64")
+}
 
 // The integrated dispatcher supplies actual compiler layouts; no parallel
 // layout mirror can drift from its retained owner or queue entries.
@@ -164,6 +171,7 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
     ensure!(queue > 0 && controls > 0, "Workbench dispatcher slot bound");
 
     let w = super::lightroom::metadata_layouts();
+    let (w_channel, w_receiver) = super::lightroom::channel_metadata_layouts()?;
     let bridge = super::lightroom_bridge::metadata_layouts();
     let managed = super::lightroom_managed::metadata_layouts();
     let f = crate::filesystem_worker::lightroom_workbench_retained_metadata_layouts();
@@ -185,9 +193,19 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
     let original = crate::filesystem_worker::wire::LIGHTROOM_ORIGINAL_BYTES;
     let callback = lightroom_process::CALLBACK_BYTES as u64;
     let artifacts = c.add(&[manifest, 1])? / 2;
+    let evidence_construction =
+        crate::filesystem_worker::lightroom_workbench_evidence_construction_layouts(
+            usize::try_from(artifacts)?,
+            usize::try_from(manifest)?,
+        )?;
     let envelope = lightroom_process::ENVELOPE_BYTES as u64;
     let [dispatcher_layout, shared_layout, entry_layout] = dispatcher_layouts();
     let source = c.add(&[f.source as u64, path, c.mul(2, c.string(IDENTITY_BYTES)?)?])?;
+    let source_budget = crate::preview::budget_state_layout();
+    let source_budget = crate::lightroom_migration_worker::memory::channels::arc(
+        std::alloc::Layout::from_size_align(source_budget.0, source_budget.1)
+            .context("Source budget state layout")?,
+    )? as u64;
 
     a.push(
         "g.dispatcher.fixed_owner_and_shared_layouts",
@@ -200,6 +218,12 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         Phase::Retained,
         "base",
         c.mul(slots, c.add(&[entry_layout.0 as u64, c.json(envelope)?])?)?,
+    );
+    a.push(
+        "g.source_parent_and_private_budget_counters",
+        Phase::Retained,
+        "base",
+        c.mul(2, source_budget)?,
     );
     a.push(
         "g.owner_generation_router_reader_custody",
@@ -235,6 +259,8 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
             w.control as u64,
             w.workbench as u64,
             w.worker_owner as u64,
+            w_channel as u64,
+            w_receiver as u64,
             bridge.control as u64,
             bridge.coordinator as u64,
             sql_control as u64,
@@ -251,6 +277,7 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         c.add(&[
             bridge.upload as u64,
             c.mul(3, manifest)?,
+            super::lightroom_bridge::INPUT_OWNED_OVERHEAD as u64,
             c.json(manifest)?,
             c.mul(8, c.string(IDENTITY_BYTES)?)?,
         ])?,
@@ -302,10 +329,13 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
             c.mul(2, source)?,
             c.mul(16, c.string(IDENTITY_BYTES)?)?,
             c.mul(4, c.string(DIGEST_BYTES)?)?,
+            evidence_construction.raw_vector as u64,
             c.mul(
                 artifacts,
                 c.add(&[
-                    source,
+                    // The inline Source roots are in raw_vector. Each Source
+                    // separately owns its path and two identity strings.
+                    c.add(&[path, c.mul(2, c.string(IDENTITY_BYTES)?)?])?,
                     c.string(DIGEST_BYTES)?,
                     std::mem::size_of::<crate::lightroom_migration_worker::identity::FileKey>()
                         as u64,
@@ -336,6 +366,15 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
             c.mul(f.seal_paths as u64, path)?,
             c.mul(10, c.string(IDENTITY_BYTES)?)?,
             c.mul(5, c.string(DIGEST_BYTES)?)?,
+        ])?,
+    );
+    a.push(
+        "transient.f_evidence_roster_construction",
+        Phase::Active,
+        "filesystem",
+        c.add(&[
+            evidence_construction.roster_tree as u64,
+            evidence_construction.roster_strings as u64,
         ])?,
     );
     a.push(
@@ -407,7 +446,27 @@ impl Requirement {
 }
 
 pub(crate) struct Admission {
-    _held: ByteReservation,
+    held: Option<(ByteReservation, ByteReservation)>,
+    checked_drained: AtomicBool,
+}
+
+impl Admission {
+    pub(crate) fn checked_drained(&self) {
+        self.checked_drained.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if !self.checked_drained.load(Ordering::Acquire)
+            && let Some(held) = self.held.take()
+        {
+            // Uncertain W/S/F reconciliation can retain every represented
+            // graph. Keep both physical grants charged so replacement
+            // admission fails closed.
+            std::mem::forget(held);
+        }
+    }
 }
 
 pub(crate) struct Allocation {
@@ -429,9 +488,20 @@ impl Allocation {
             !reservation.same_pool(&source_payloads),
             "Workbench metadata and Source payload pools must be distinct"
         );
+        let source_required = source_requirement()?;
+        let source_held = source_payloads
+            .reserve_exact(source_required)
+            .map_err(anyhow::Error::new)
+            .context("Workbench Source high-water admission")?;
         Ok(Self {
-            metadata: Admission { _held: reservation },
-            source_payloads,
+            metadata: Admission {
+                held: Some((reservation, source_held)),
+                checked_drained: AtomicBool::new(false),
+            },
+            // Dynamic Source reservations use a private counter exactly equal
+            // to the retained parent grant, so later phases cannot race another
+            // user of the shared caller pool.
+            source_payloads: ByteBudget::new(source_required)?,
         })
     }
 
@@ -463,6 +533,7 @@ mod tests {
         for name in [
             "g.dispatcher.fixed_owner_and_shared_layouts",
             "g.dispatcher.queued_and_active_typed_requests",
+            "g.source_parent_and_private_budget_counters",
             "g.owner_generation_router_reader_custody",
             "w.control_status_worker_and_bridge",
             "w.upload_single_staged_input",
@@ -472,6 +543,7 @@ mod tests {
             "f.evidence_manifest_source_roster",
             "f.original_candidate_and_encoded_result",
             "f.seal_paths_uploads_and_digests",
+            "transient.f_evidence_roster_construction",
             "transient.request_decode_and_typed_action",
             "transient.result_build_encode_and_page",
             "transient.selection_documents_and_rosters",
@@ -536,13 +608,20 @@ mod tests {
     #[test]
     fn subgrant_is_exact_once_and_source_pool_is_separate() -> Result<()> {
         let requirement = Requirement::from_config(&config(), 16)?;
+        let source_required = source_requirement()?;
         let metadata = ByteBudget::new(requirement.bytes())?;
-        let source = ByteBudget::new(1024 * 1024)?;
+        let source = ByteBudget::new(source_required)?;
         let mut process = metadata.reserve_exact(requirement.bytes())?;
         let grant = process.split_exact(requirement.bytes())?;
         assert_eq!(metadata.used(), requirement.bytes());
-        let _allocation = Allocation::from_subgrant(requirement, grant, source)?;
+        let allocation = Allocation::from_subgrant(requirement, grant, source.clone())?;
         assert_eq!(metadata.used(), requirement.bytes());
+        assert_eq!(source.used(), source_required);
+        let (admission, _) = allocation.into_parts();
+        admission.checked_drained();
+        drop(admission);
+        assert_eq!(metadata.used(), 0);
+        assert_eq!(source.used(), 0);
 
         let metadata = ByteBudget::new(requirement.bytes())?;
         let same = metadata.reserve_exact(requirement.bytes())?;
@@ -550,6 +629,27 @@ mod tests {
         let short = ByteBudget::new(requirement.bytes() - 1)?;
         let short = short.reserve_exact(requirement.bytes() - 1)?;
         assert!(Allocation::from_subgrant(requirement, short, ByteBudget::new(1)?).is_err());
+
+        let metadata = ByteBudget::new(requirement.bytes())?;
+        let grant = metadata.reserve_exact(requirement.bytes())?;
+        let source = ByteBudget::new(source_required - 1)?;
+        assert!(Allocation::from_subgrant(requirement, grant, source).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unverified_drain_retains_both_physical_grants() -> Result<()> {
+        let requirement = Requirement::from_config(&config(), 16)?;
+        let source_required = source_requirement()?;
+        let metadata = ByteBudget::new(requirement.bytes())?;
+        let source = ByteBudget::new(source_required)?;
+        let grant = metadata.reserve_exact(requirement.bytes())?;
+        let allocation = Allocation::from_subgrant(requirement, grant, source.clone())?;
+        drop(allocation);
+        assert_eq!(metadata.used(), requirement.bytes());
+        assert_eq!(source.used(), source_required);
+        assert!(metadata.reserve_exact(1).is_err());
+        assert!(source.reserve_exact(1).is_err());
         Ok(())
     }
 }
