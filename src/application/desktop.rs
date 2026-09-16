@@ -302,8 +302,42 @@ impl Shared {
         Ok(())
     }
 }
+enum LocalOwner {
+    Legacy(Bridge),
+    #[allow(dead_code)] // Selected after the managed startup funding is wired.
+    Managed(workbench::Dispatcher),
+}
+impl LocalOwner {
+    fn signal_shutdown(&self) {
+        match self {
+            Self::Legacy(bridge) => bridge
+                .0
+                .shared
+                .lightroom
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .signal_shutdown(),
+            Self::Managed(dispatcher) => dispatcher.signal_shutdown(),
+        }
+    }
+    fn try_shutdown(&self) -> Result<()> {
+        match self {
+            Self::Legacy(bridge) => bridge.try_shutdown(),
+            Self::Managed(dispatcher) => dispatcher.shutdown_checked(),
+        }
+    }
+    fn legacy(&self) -> Result<&Bridge> {
+        match self {
+            Self::Legacy(bridge) => Ok(bridge),
+            Self::Managed(_) => Err(error(
+                ErrorCode::InvalidRequest,
+                "request requires the managed Workbench route",
+            )),
+        }
+    }
+}
 struct Handle {
-    local: Bridge,
+    local: LocalOwner,
     shared: Arc<Shared>,
     process: Mutex<process::Owner>,
     pid: u32,
@@ -409,13 +443,7 @@ impl Handle {
         // Signal both independent owners before either potentially blocking join.
         self.migration.signal_shutdown();
         self.shared.stop();
-        self.local
-            .0
-            .shared
-            .lightroom
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .signal_shutdown();
+        self.local.signal_shutdown();
         let result = self.process.lock().unwrap().drain();
         let migration_drained = self.migration.drained();
         let backup_result = self.shared.backup.as_ref().map_or(Ok(()), |backup| {
@@ -429,6 +457,10 @@ impl Handle {
         let backup_drained = backup_result.is_ok();
         let control_result = self.join_control_tasks();
         let control_drained = control_result.is_ok();
+        let local = self.shared.drain_local(|| {
+            let drained = self.local.try_shutdown();
+            control_result.and(drained)
+        });
         let (retired, managed_retired, exit) = {
             let s = self.shared.state.lock().unwrap();
             let managed = managed_catalog_retired(
@@ -449,7 +481,7 @@ impl Handle {
             )
         };
         let filesystem = if let Some(f) = &self.shared.filesystem {
-            if retired {
+            if retired && local.is_ok() {
                 f.finish_after_dependents(exit != Some(0))
                     .map_err(|e| error(ErrorCode::Native, e.to_string()))
             } else {
@@ -464,9 +496,6 @@ impl Handle {
         if filesystem.is_ok() {
             self.shared.state.lock().unwrap().filesystem_verified = true;
         }
-        let local = self
-            .shared
-            .drain_local(|| control_result.and_then(|_| self.local.try_shutdown()));
         // Process::drain retains an abnormal-exit diagnostic even after checked
         // wait/join. Safe retirement does not turn that catalog outcome into a
         // known success: Shared.message and the migration failure remain intact.
@@ -557,6 +586,18 @@ impl DesktopBridge {
             }
             None => e,
         })?;
+        Self::spawn_reserved(config, filesystem, metadata_budget, metadata, None)
+    }
+
+    /// Production supplies an already funded generation; the compatibility
+    /// transport fixtures construct their legacy local owner here instead.
+    fn spawn_reserved(
+        config: Config,
+        filesystem: Option<Arc<filesystem::Parent>>,
+        migration_budget: Option<&crate::preview::ByteBudget>,
+        metadata: preview_metadata_admission::ProcessReservation,
+        workbench: Option<workbench::Dispatcher>,
+    ) -> anyhow::Result<Self> {
         let paired = filesystem.is_some();
         let backup = if paired {
             Some(Arc::new(Mutex::new(
@@ -618,12 +659,16 @@ impl DesktopBridge {
             #[cfg(test)]
             fixture: Mutex::new(None),
         });
-        let local = Bridge::spawn(config.clone())
-            .map_err(|e| filesystem::before_child_failure(&shared.filesystem, e))?;
+        let local = match workbench {
+            Some(dispatcher) => LocalOwner::Managed(dispatcher),
+            None => Bridge::spawn(config.clone())
+                .map(LocalOwner::Legacy)
+                .map_err(|e| filesystem::before_child_failure(&shared.filesystem, e))?,
+        };
         let owner = match process::Owner::spawn(&config.worker_executable, shared.clone(), hello) {
             Ok(owner) => owner,
             Err(e) => {
-                local.shutdown();
+                let _ = local.try_shutdown();
                 if let Some(f) = &shared.filesystem
                     && f.finish_after_dependents(true).is_err()
                 {
@@ -639,7 +684,7 @@ impl DesktopBridge {
         let migration = migration::Coordinator::new(
             &shared,
             config.worker_executable,
-            metadata_budget.cloned(),
+            migration_budget.cloned(),
         );
         let result = Self(Arc::new(Handle {
             migration,
@@ -707,6 +752,11 @@ impl DesktopBridge {
     }
     pub fn submit(&self, request: Request) -> Result<Pending> {
         validate_public_request(&request, self.0.shared.limits.request_bytes)?;
+        if let LocalOwner::Managed(dispatcher) = &self.0.local
+            && let Request::Lightroom { request } = request
+        {
+            return dispatcher.submit(*request);
+        }
         if let Request::Lightroom { request } = &request
             && let super::lightroom_bridge::Request::Action { guard, action } = request.as_ref()
             && let super::lightroom_bridge::Action::ApprovalDocuments {
@@ -720,7 +770,7 @@ impl DesktopBridge {
                     "approval documents require the managed filesystem owner",
                 )
             })?;
-            let local = self.0.local.clone();
+            let local = self.0.local.legacy()?.clone();
             let guard = guard.clone();
             let input = input.clone();
             let review_token = review_token.clone();
@@ -889,7 +939,7 @@ impl DesktopBridge {
     }
     fn submit_catalog(&self, request: Request) -> Result<Pending> {
         if local_route(&request) {
-            return self.0.local.submit(request);
+            return self.0.local.legacy()?.submit(request);
         }
         let control = control_route(&request);
         let retiring = if let Request::Close { catalog } = &request {
