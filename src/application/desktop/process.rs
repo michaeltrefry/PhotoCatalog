@@ -1119,8 +1119,7 @@ fn checked_message(kind: Kind, id: u64, value: &impl serde::Serialize, limit: us
         Kind::MigrationReply,
         "migration replies use their bounded identity-preserving encoder"
     );
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    if bytes.len() <= limit {
+    if let Ok(bytes) = crate::lightroom::bounded_json(value, limit) {
         Message::new(kind, id, bytes)
     } else {
         let e = error(ErrorCode::ResourceLimit, "desktop reply byte limit");

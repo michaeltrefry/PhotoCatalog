@@ -944,9 +944,9 @@ impl DesktopBridge {
         let reply = Reply::Ok {
             value: super::Response::Backup(snapshot),
         };
-        match serde_json::to_vec(&reply) {
-            Ok(bytes) if bytes.len() <= shared.limits.reply_bytes => reply,
-            _ => failure(ErrorCode::ResourceLimit, "response byte limit"),
+        match crate::lightroom::bounded_json(&reply, shared.limits.reply_bytes) {
+            Ok(_) => reply,
+            Err(_) => failure(ErrorCode::ResourceLimit, "response byte limit"),
         }
     }
     fn start_managed_backup(
