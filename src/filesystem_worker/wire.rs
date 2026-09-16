@@ -500,6 +500,14 @@ pub enum LightroomWorkbenchIo {
         generation: String,
         capture_generation: String,
     },
+    EvidenceManifestPage {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+        offset: U64,
+        limit: U64,
+    },
     EvidenceRelease {
         operation: String,
         workbench: String,
@@ -653,6 +661,12 @@ impl LightroomWorkbenchIo {
                 generation,
                 ..
             }
+            | Self::EvidenceManifestPage {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
             | Self::EvidenceRelease {
                 operation,
                 workbench,
@@ -774,6 +788,18 @@ impl LightroomWorkbenchIo {
                 ensure!(protected.len() <= 4096, "protected roster");
                 limits.validate()?;
             }
+            Self::EvidenceManifestPage {
+                capture_generation,
+                offset,
+                limit,
+                ..
+            } => ensure!(
+                !capture_generation.is_empty()
+                    && capture_generation.len() <= 128
+                    && offset.0 < crate::lightroom::MANIFEST_BYTES as u64
+                    && (1..=CHUNK_BYTES as u64).contains(&limit.0),
+                "capture manifest page"
+            ),
             Self::OriginalBegin {
                 candidate,
                 maximum_result_bytes,
@@ -1173,7 +1199,16 @@ pub enum LightroomWorkbenchIoReply {
         #[serde(with = "capture_manifest_wire")]
         manifest: crate::lightroom::capture::Manifest,
         manifest_blake3: String,
+        manifest_bytes: U64,
         authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    },
+    EvidenceManifestChunk {
+        operation: String,
+        capture_generation: String,
+        offset: U64,
+        total_bytes: U64,
+        next: Option<U64>,
+        bytes: Vec<u8>,
     },
     OriginalReady {
         operation: String,
@@ -1277,6 +1312,7 @@ impl LightroomWorkbenchIoReply {
                 operation,
                 capture_generation,
                 manifest_blake3,
+                manifest_bytes,
                 authority,
                 ..
             } => {
@@ -1284,8 +1320,35 @@ impl LightroomWorkbenchIoReply {
                     !capture_generation.is_empty() && capture_generation.len() <= 128,
                     "capture evidence generation"
                 );
-                ensure!(manifest_blake3.len() == 64, "capture manifest digest");
+                ensure!(
+                    manifest_blake3.len() == 64
+                        && (1..=crate::lightroom::MANIFEST_BYTES as u64)
+                            .contains(&manifest_bytes.0),
+                    "capture manifest identity"
+                );
                 authority.validate()?;
+                operation
+            }
+            Self::EvidenceManifestChunk {
+                operation,
+                capture_generation,
+                offset,
+                total_bytes,
+                next,
+                bytes,
+            } => {
+                let end = offset.0.checked_add(bytes.len() as u64);
+                ensure!(
+                    !capture_generation.is_empty()
+                        && capture_generation.len() <= 128
+                        && offset.0 < total_bytes.0
+                        && total_bytes.0 <= crate::lightroom::MANIFEST_BYTES as u64
+                        && !bytes.is_empty()
+                        && bytes.len() <= CHUNK_BYTES
+                        && end.is_some_and(|end| end <= total_bytes.0)
+                        && *next == end.and_then(|end| (end < total_bytes.0).then_some(U64(end))),
+                    "capture manifest chunk"
+                );
                 operation
             }
             Self::OriginalReady {
@@ -1385,6 +1448,28 @@ impl LightroomWorkbenchIoReply {
         };
         ensure!(actual == requested, "Workbench F reply operation differs");
         match (request, self) {
+            (
+                LightroomWorkbenchIo::EvidenceManifestPage {
+                    capture_generation,
+                    offset,
+                    limit,
+                    ..
+                },
+                LightroomWorkbenchIoReply::EvidenceManifestChunk {
+                    capture_generation: actual,
+                    offset: actual_offset,
+                    bytes,
+                    ..
+                },
+            ) => ensure!(
+                capture_generation == actual
+                    && offset == actual_offset
+                    && bytes.len() as u64 <= limit.0,
+                "capture manifest chunk binding differs"
+            ),
+            (LightroomWorkbenchIo::EvidenceManifestPage { .. }, _) => {
+                anyhow::bail!("capture manifest page reply kind differs")
+            }
             (
                 LightroomWorkbenchIo::OriginalBegin { candidate, .. },
                 LightroomWorkbenchIoReply::OriginalReady { token, .. },
@@ -2130,6 +2215,50 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_manifest_page_reply_is_bound_to_requested_progress() {
+        let request = LightroomWorkbenchIo::EvidenceManifestPage {
+            operation: "operation".into(),
+            workbench: "workbench".into(),
+            generation: "generation".into(),
+            capture_generation: "capture".into(),
+            offset: U64(7),
+            limit: U64(4),
+        };
+        request.validate().unwrap();
+        let reply = LightroomWorkbenchIoReply::EvidenceManifestChunk {
+            operation: "operation".into(),
+            capture_generation: "capture".into(),
+            offset: U64(7),
+            total_bytes: U64(12),
+            next: Some(U64(11)),
+            bytes: vec![1, 2, 3, 4],
+        };
+        reply.validate_for(&request).unwrap();
+
+        let mut oversized = reply.clone();
+        let LightroomWorkbenchIoReply::EvidenceManifestChunk {
+            bytes,
+            next,
+            total_bytes,
+            ..
+        } = &mut oversized
+        else {
+            unreachable!()
+        };
+        bytes.push(5);
+        *next = None;
+        *total_bytes = U64(12);
+        assert!(oversized.validate_for(&request).is_err());
+
+        let mut stalled = reply;
+        let LightroomWorkbenchIoReply::EvidenceManifestChunk { bytes, .. } = &mut stalled else {
+            unreachable!()
+        };
+        bytes.clear();
+        assert!(stalled.validate_for(&request).is_err());
+    }
 
     #[test]
     fn lightroom_capture_manifest_wire_preserves_numeric_disk_grammar_and_full_u128() -> Result<()>

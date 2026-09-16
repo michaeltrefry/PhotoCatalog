@@ -466,7 +466,7 @@ fn capture(source: &Path, output: &Path, report: &mut Manifest) -> Result<()> {
     report.state = "captured".into();
     Ok(())
 }
-pub fn read_manifest(directory: &Path) -> Result<Manifest> {
+pub(crate) fn read_manifest_exact(directory: &Path) -> Result<(Manifest, String)> {
     let mut bytes = vec![];
     File::open(directory.join("manifest.json"))?
         .take(super::MANIFEST_BYTES as u64 + 1)
@@ -477,7 +477,10 @@ pub fn read_manifest(directory: &Path) -> Result<Manifest> {
     );
     let report: Manifest = serde_json::from_slice(&bytes)?;
     ensure!(report.protocol == PROTOCOL, "unknown capture protocol");
-    Ok(report)
+    Ok((report, String::from_utf8(bytes)?))
+}
+pub fn read_manifest(directory: &Path) -> Result<Manifest> {
+    Ok(read_manifest_exact(directory)?.0)
 }
 
 #[cfg(test)]

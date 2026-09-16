@@ -379,6 +379,8 @@ impl Owner {
         String,
         NativePath,
         core::capture::Manifest,
+        String,
+        U64,
         crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
     )> {
         let io = self
@@ -406,6 +408,8 @@ impl Owner {
             capture_generation: actual,
             directory,
             manifest,
+            manifest_blake3,
+            manifest_bytes,
             authority,
             ..
         } = reply
@@ -416,7 +420,85 @@ impl Owner {
             actual == capture_generation,
             "capture evidence generation differs"
         );
-        Ok((capture_generation, directory, manifest, authority))
+        Ok((
+            capture_generation,
+            directory,
+            manifest,
+            manifest_blake3,
+            manifest_bytes,
+            authority,
+        ))
+    }
+    fn evidence_manifest(
+        &self,
+        operation: &str,
+        capture_generation: &str,
+        manifest_blake3: &str,
+        manifest_bytes: U64,
+        authority_manifest_blake3: &str,
+        control: &Control,
+    ) -> Result<String> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed filesystem owner absent")?;
+        let collected = (|| -> Result<String> {
+            let total = usize::try_from(manifest_bytes.0)?;
+            let mut bytes = Vec::with_capacity(total);
+            let mut hasher = blake3::Hasher::new();
+            while bytes.len() < total {
+                control.check()?;
+                let offset = bytes.len();
+                let request = LightroomWorkbenchIo::EvidenceManifestPage {
+                    operation: operation.into(),
+                    workbench: self.workbench.clone(),
+                    generation: self.generation.clone(),
+                    capture_generation: capture_generation.into(),
+                    offset: U64(offset as u64),
+                    limit: U64(
+                        crate::filesystem_worker::wire::CHUNK_BYTES.min(total - offset) as u64,
+                    ),
+                };
+                let reply = io.filesystem(request.clone(), &control.cancel)?;
+                reply.validate_for(&request)?;
+                let LightroomWorkbenchIoReply::EvidenceManifestChunk {
+                    offset: actual,
+                    total_bytes,
+                    next,
+                    bytes: fragment,
+                    ..
+                } = reply
+                else {
+                    anyhow::bail!("capture manifest page reply kind")
+                };
+                ensure!(
+                    actual.0 == offset as u64 && total_bytes == manifest_bytes,
+                    "capture manifest page identity changed"
+                );
+                let end = offset
+                    .checked_add(fragment.len())
+                    .context("capture manifest page overflow")?;
+                ensure!(
+                    !fragment.is_empty()
+                        && end <= total
+                        && next == (end < total).then_some(U64(end as u64)),
+                    "capture manifest page did not advance"
+                );
+                hasher.update(&fragment);
+                bytes.extend_from_slice(&fragment);
+            }
+            ensure!(
+                bytes.len() == total
+                    && hasher.finalize().to_hex().as_str() == manifest_blake3
+                    && manifest_blake3 == authority_manifest_blake3,
+                "capture manifest paged digest differs"
+            );
+            Ok(String::from_utf8(bytes)?)
+        })();
+        // A failed or canceled page keeps F's evidence lease retained for the
+        // generation's existing checked reconciliation path. The partial Vec
+        // drops here and no inspection-plan transaction has started.
+        collected
     }
     fn evidence_current(
         &self,
@@ -722,8 +804,16 @@ impl Owner {
             .as_ref()
             .context("managed owner absent")?
             .clone();
-        let (capture_generation, directory, manifest, authority) =
+        let (capture_generation, directory, manifest, manifest_blake3, manifest_bytes, authority) =
             self.begin_evidence(operation, directory, control)?;
+        let manifest_json = self.evidence_manifest(
+            operation,
+            &capture_generation,
+            &manifest_blake3,
+            manifest_bytes,
+            &authority.manifest_blake3,
+            control,
+        )?;
         let binding = authority.binding_blake3.clone();
         let source = io.source_open(authority, control.cancel.clone())?;
         let source_result = (|| -> Result<capture_wire::SchemaObjects> {
@@ -757,9 +847,13 @@ impl Owner {
         // plan transaction. The evidence lease remains retained through commit.
         self.evidence_current(operation, &capture_generation, control)?;
         self.verify_root(control)?;
-        let revision =
-            self.plan(control)?
-                .add_capture_managed(&directory, &manifest, &schema, || io.commit())?;
+        let revision = self.plan(control)?.add_capture_managed(
+            &directory,
+            &manifest,
+            &manifest_json,
+            &schema,
+            || io.commit(),
+        )?;
         self.release_evidence(operation, &capture_generation)?;
         Ok(revision)
     }
@@ -776,7 +870,7 @@ impl Owner {
             .context("managed owner absent")?
             .clone();
         let directory = self.plan(control)?.managed_capture(revision)?.0;
-        let (capture_generation, _, manifest, authority) =
+        let (capture_generation, _, manifest, _, _, authority) =
             self.begin_evidence(operation, directory, control)?;
         ensure!(
             manifest.revision_id.as_deref() == Some(revision),
@@ -1424,7 +1518,7 @@ impl Owner {
         match query {
             Query::CaptureManifest { directory } => {
                 if self.managed.is_some() {
-                    let (capture_generation, _, manifest, _) =
+                    let (capture_generation, _, manifest, _, _, _) =
                         self.begin_evidence(operation, directory, control)?;
                     self.release_evidence(operation, &capture_generation)?;
                     encode(&manifest, maximum)

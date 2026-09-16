@@ -2,7 +2,7 @@
 //! byte evidence; typed row retention and projections are derivative and versioned.
 use super::{
     Issue, Limits, PROTOCOL,
-    capture::{Manifest, read_manifest},
+    capture::{Manifest, read_manifest_exact},
     digest, json_digest, path_value,
     source::Source,
 };
@@ -643,7 +643,7 @@ impl Plan {
             !directory.starts_with(&self.root) && !self.root.starts_with(&directory),
             "capture evidence and mutable inspection plan must be separate"
         );
-        let manifest = read_manifest(&directory)?;
+        let (manifest, manifest_json) = read_manifest_exact(&directory)?;
         ensure!(
             manifest.state == "captured"
                 && manifest.sqlite_consistency == "consistent_default_sqlite",
@@ -689,16 +689,16 @@ impl Plan {
                 "raw artifact digest mismatch"
             );
         }
-        if self
+        if let Some(stored) = self
             .db
             .query_row(
-                "SELECT 1 FROM captures WHERE revision=?",
+                "SELECT manifest FROM captures WHERE revision=?",
                 [&revision],
-                |r| r.get::<_, i64>(0),
+                |r| r.get::<_, String>(0),
             )
             .optional()?
-            .is_some()
         {
+            ensure!(stored == manifest_json, "existing capture evidence differs");
             return Ok(revision);
         }
         let source = snapshot(&directory.join("logical.sqlite3"), &manifest.request.limits)?;
@@ -721,7 +721,7 @@ impl Plan {
                 revision,
                 lineage,
                 path_value(&directory)?,
-                serde_json::to_string(&manifest)?,
+                manifest_json,
                 "pending",
                 version,
                 provider
@@ -956,6 +956,7 @@ impl Plan {
         &mut self,
         directory: &NativePath,
         manifest: &Manifest,
+        manifest_json: &str,
         schema: &crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects,
         commit_authority: impl FnOnce() -> Result<()>,
     ) -> Result<String> {
@@ -976,6 +977,10 @@ impl Plan {
             schema.authority_binding.len() == 64 && schema.schema_roster_blake3.len() == 64,
             "managed schema binding"
         );
+        ensure!(
+            !manifest_json.is_empty() && manifest_json.len() <= super::MANIFEST_BYTES,
+            "managed capture manifest byte limit"
+        );
         if let Some((stored, roster)) = self
             .db
             .query_row(
@@ -986,8 +991,7 @@ impl Plan {
             .optional()?
         {
             ensure!(
-                stored == serde_json::to_string(manifest)?
-                    && roster.as_deref() == Some(&schema.schema_roster_blake3),
+                stored == manifest_json && roster.as_deref() == Some(&schema.schema_roster_blake3),
                 "existing capture evidence differs"
             );
             return Ok(revision);
@@ -996,7 +1000,7 @@ impl Plan {
         let provider = schema.variables.get("Adobe_storeProviderID").cloned();
         let lineage = uuid::Uuid::new_v4().to_string();
         let transaction = self.db.transaction()?;
-        transaction.execute("INSERT INTO captures(revision,lineage,path,manifest,stage,schema_version,provider,schema_roster) VALUES(?,?,?,?,?,?,?,?)",params![revision,lineage,serde_json::to_string(directory)?,serde_json::to_string(manifest)?,"pending",version,provider,schema.schema_roster_blake3])?;
+        transaction.execute("INSERT INTO captures(revision,lineage,path,manifest,stage,schema_version,provider,schema_roster) VALUES(?,?,?,?,?,?,?,?)",params![revision,lineage,serde_json::to_string(directory)?,manifest_json,"pending",version,provider,schema.schema_roster_blake3])?;
         for object in &schema.objects {
             let kind = match object.kind {
                 ObjectKind::Table => "table",
@@ -3247,6 +3251,136 @@ fn bounded_values(
 #[cfg(test)]
 mod bounded_plan_tests {
     use super::*;
+    fn exact_manifest_fixture(root: &Path) -> Manifest {
+        let artifact = super::super::capture::Artifact {
+            source: NativePath::from_path(&root.join("source.lrcat")),
+            role: "main".into(),
+            relative: NativePath::from_path(Path::new("source.lrcat")),
+            stored: "raw/000000-source.lrcat".into(),
+            revision: super::super::source::Revision {
+                object: "fixture-object".into(),
+                bytes: 1,
+                modified_ns: Some(1),
+                changed: "fixture-changed".into(),
+            },
+            blake3: "a".repeat(64),
+        };
+        let artifacts = vec![artifact];
+        let revision = json_digest(&artifacts).unwrap();
+        Manifest {
+            protocol: PROTOCOL,
+            request: super::super::capture::Request {
+                source: NativePath::from_path(&root.join("source.lrcat")),
+                output: NativePath::from_path(&root.join("capture")),
+                include_auxiliary: false,
+                closed_application_evidence: Some("fixture is closed".into()),
+                limits: Limits::default(),
+            },
+            state: "captured".into(),
+            raw_byte_retention: "complete".into(),
+            sqlite_consistency: "consistent_default_sqlite".into(),
+            application_consistency: "closed".into(),
+            cooperative_lock_protocol: "fixture".into(),
+            artifacts,
+            companion_inventory: vec![],
+            absent_companions: vec![],
+            issues: vec![],
+            wal: None,
+            logical_blake3: Some("b".repeat(64)),
+            logical_revision: None,
+            revision_id: Some(revision),
+        }
+    }
+
+    #[test]
+    fn managed_capture_retains_exact_manifest_bytes_and_rejects_whitespace_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = Plan::create(&temp.path().join("plan")).unwrap();
+        let manifest = exact_manifest_fixture(temp.path());
+        let exact = serde_json::to_string_pretty(&manifest).unwrap();
+        let schema =
+            crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects {
+                authority_binding: "c".repeat(64),
+                schema_roster_blake3: "d".repeat(64),
+                objects: vec![],
+                tables: vec![],
+                variables: BTreeMap::new(),
+            };
+        let directory = NativePath::from_path(&temp.path().join("capture"));
+        let revision = plan
+            .add_capture_managed(&directory, &manifest, &exact, &schema, || Ok(()))
+            .unwrap();
+        let stored: String = plan
+            .db
+            .query_row(
+                "SELECT manifest FROM captures WHERE revision=?",
+                [&revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, exact);
+        assert_eq!(
+            plan.add_capture_managed(&directory, &manifest, &exact, &schema, || Ok(()))
+                .unwrap(),
+            revision
+        );
+        let drift = format!("\n{exact}\n");
+        let error = plan
+            .add_capture_managed(&directory, &manifest, &drift, &schema, || Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("existing capture evidence"));
+    }
+
+    #[test]
+    fn direct_capture_repeat_requires_the_same_exact_manifest_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let capture = root.join("capture");
+        let raw_dir = capture.join("raw");
+        fs::create_dir_all(&raw_dir).unwrap();
+        let raw_path = raw_dir.join("000000-source.lrcat");
+        fs::write(&raw_path, b"captured source bytes").unwrap();
+        let mut raw = Source::open(&raw_path, 1024).unwrap();
+        let raw_revision = raw.before.clone();
+        let raw_blake3 = raw.copy_and_hash(None).unwrap();
+        drop(raw);
+
+        let logical_path = capture.join("logical.sqlite3");
+        drop(Connection::open(&logical_path).unwrap());
+        let mut logical = Source::open(&logical_path, 1024 * 1024).unwrap();
+        let logical_revision = logical.before.clone();
+        let logical_blake3 = logical.copy_and_hash(None).unwrap();
+        drop(logical);
+
+        let mut manifest = exact_manifest_fixture(&capture);
+        manifest.request.output = NativePath::from_path(&capture);
+        manifest.artifacts[0].stored = "raw/000000-source.lrcat".into();
+        manifest.artifacts[0].revision = raw_revision;
+        manifest.artifacts[0].blake3 = raw_blake3;
+        manifest.logical_revision = Some(logical_revision);
+        manifest.logical_blake3 = Some(logical_blake3);
+        manifest.revision_id = Some(json_digest(&manifest.artifacts).unwrap());
+        let exact = serde_json::to_string_pretty(&manifest).unwrap();
+        fs::write(capture.join("manifest.json"), &exact).unwrap();
+
+        let mut plan = Plan::create(&root.join("plan")).unwrap();
+        let revision = plan.add_capture(&capture).unwrap();
+        let stored: String = plan
+            .db
+            .query_row(
+                "SELECT manifest FROM captures WHERE revision=?",
+                [&revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, exact);
+        assert_eq!(plan.add_capture(&capture).unwrap(), revision);
+
+        fs::write(capture.join("manifest.json"), format!("\n{exact}\n")).unwrap();
+        let error = plan.add_capture(&capture).unwrap_err();
+        assert!(error.to_string().contains("existing capture evidence"));
+    }
+
     #[test]
     fn checked_close_returns_the_exact_busy_plan_owner() {
         let temp = tempfile::tempdir().unwrap();

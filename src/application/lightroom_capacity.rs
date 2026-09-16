@@ -507,6 +507,15 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         c.add(&[c.vec(1, callback)?, c.json(callback)?, c.vec(1, page)?])?,
     );
     a.push(
+        "transient.w_exact_manifest_assembly",
+        Phase::Active,
+        "callback",
+        // Exact source bytes are accumulated while the typed Evidence reply
+        // remains live. String::from_utf8 reuses this single Vec allocation;
+        // no second semantic manifest graph is constructed.
+        c.vec(1, manifest)?,
+    );
+    a.push(
         "transient.seal_documents_and_preparation",
         Phase::Active,
         "seal",
@@ -649,6 +658,7 @@ mod tests {
             "transient.result_build_encode_and_page",
             "transient.selection_documents_and_rosters",
             "transient.source_callback_frame_and_typed_payload",
+            "transient.w_exact_manifest_assembly",
             "transient.seal_documents_and_preparation",
         ] {
             assert!(

@@ -17,7 +17,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -929,6 +929,28 @@ impl Owner {
                 value.verify(cancel)?;
                 Ok(value.reply())
             }
+            LightroomWorkbenchIo::EvidenceManifestPage {
+                operation,
+                workbench,
+                generation,
+                capture_generation,
+                offset,
+                limit,
+            } => {
+                let value = self
+                    .evidence
+                    .as_mut()
+                    .context("no capture evidence retained")?;
+                same(
+                    (&value.operation, &value.workbench, &value.generation),
+                    (&operation, &workbench, &generation),
+                )?;
+                ensure!(
+                    value.capture_generation == capture_generation,
+                    "capture evidence generation differs"
+                );
+                value.manifest_page(offset.0, limit.0, cancel)
+            }
             LightroomWorkbenchIo::EvidenceRelease {
                 operation,
                 workbench,
@@ -1431,8 +1453,39 @@ impl Evidence {
             directory: self.directory.clone(),
             manifest: self.manifest.clone(),
             manifest_blake3: self.manifest_blake3.clone(),
+            manifest_bytes: U64(self.manifest_source.before.bytes),
             authority: self.authority.clone(),
         }
+    }
+    fn manifest_page(
+        &mut self,
+        offset: u64,
+        limit: u64,
+        cancel: &AtomicBool,
+    ) -> Result<LightroomWorkbenchIoReply> {
+        canceled(cancel)?;
+        self.manifest_source.verify()?;
+        let total = self.manifest_source.before.bytes;
+        ensure!(offset < total, "capture manifest page offset");
+        let end = offset
+            .checked_add(limit)
+            .context("capture manifest page overflow")?
+            .min(total);
+        let length = usize::try_from(end - offset)?;
+        ensure!(length > 0, "capture manifest page is empty");
+        let mut bytes = vec![0; length];
+        self.manifest_source.file.seek(SeekFrom::Start(offset))?;
+        self.manifest_source.file.read_exact(&mut bytes)?;
+        canceled(cancel)?;
+        self.manifest_source.verify()?;
+        Ok(LightroomWorkbenchIoReply::EvidenceManifestChunk {
+            operation: self.operation.clone(),
+            capture_generation: self.capture_generation.clone(),
+            offset: U64(offset),
+            total_bytes: U64(total),
+            next: (end < total).then_some(U64(end)),
+            bytes,
+        })
     }
 }
 
