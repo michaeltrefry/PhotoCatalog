@@ -308,6 +308,32 @@ pub(crate) fn report(config: &Config, control_slots: usize) -> Result<Report> {
         ])?,
     );
     a.push(
+        "g.capability_pending_sessions_and_receipts",
+        Phase::Retained,
+        "base",
+        c.add(&[
+            managed.capability_custody as u64,
+            // The fixed custody root contains the pending request and both
+            // retained session request roots inline. Their independently owned
+            // NativePath/String backings remain live together until checked F
+            // reconciliation.
+            c.mul(3, path)?,
+            c.mul(3, c.string(IDENTITY_BYTES)?)?,
+            c.mul(4, c.string(DIGEST_BYTES)?)?,
+            // F caps prepared receipts at 4,096. G retains the exact same
+            // bounded roster plus one cloned cleanup key while a discard call
+            // is in flight; no hash/tree allocator or unbounded set is used.
+            c.vec(
+                managed.receipt as u64,
+                super::lightroom_managed::CAPABILITY_RECEIPTS as u64,
+            )?,
+            c.mul(
+                super::lightroom_managed::CAPABILITY_RECEIPTS as u64 + 1,
+                c.string(IDENTITY_BYTES)?,
+            )?,
+        ])?,
+    );
+    a.push(
         "w.control_status_worker_and_bridge",
         Phase::Retained,
         "base",
@@ -600,6 +626,7 @@ mod tests {
             "transient.managed_document_callback_roots",
             "g.source_parent_and_private_budget_counters",
             "g.owner_generation_router_reader_custody",
+            "g.capability_pending_sessions_and_receipts",
             "w.control_status_worker_and_bridge",
             "w.upload_single_staged_input",
             "w.cached_result_and_review",
@@ -667,6 +694,37 @@ mod tests {
             default_report.retained + default_report.active
         );
         assert!(SOURCE_PAYLOAD_POOL_CONTRACT.starts_with("distinct"));
+        Ok(())
+    }
+
+    #[test]
+    fn capability_ledger_funds_fixed_roots_and_bounded_receipt_roster() -> Result<()> {
+        let report = report(&config(), 16)?;
+        let actual = report
+            .contributions
+            .iter()
+            .find(|value| value.name == "g.capability_pending_sessions_and_receipts")
+            .context("capability custody contribution")?;
+        let c = Checked;
+        let managed = super::super::lightroom_managed::metadata_layouts();
+        let limits = super::super::lightroom::Limits::metadata_maximum();
+        let path = c.native_path(limits.native_path_units as u64)?;
+        let expected = c.add(&[
+            managed.capability_custody as u64,
+            c.mul(3, path)?,
+            c.mul(3, c.string(IDENTITY_BYTES)?)?,
+            c.mul(4, c.string(DIGEST_BYTES)?)?,
+            c.vec(
+                managed.receipt as u64,
+                super::super::lightroom_managed::CAPABILITY_RECEIPTS as u64,
+            )?,
+            c.mul(
+                super::super::lightroom_managed::CAPABILITY_RECEIPTS as u64 + 1,
+                c.string(IDENTITY_BYTES)?,
+            )?,
+        ])?;
+        assert_eq!(actual.phase, Phase::Retained);
+        assert_eq!(actual.bytes, expected);
         Ok(())
     }
 

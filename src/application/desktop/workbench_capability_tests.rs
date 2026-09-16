@@ -18,7 +18,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{
     path::Path,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -469,5 +469,216 @@ fn managed_dispatcher_preserves_sealed_artifact_and_approval_capabilities() -> R
         generation.pid().is_none(),
         "managed Workbench process was not checked-reaped"
     );
+    Ok(())
+}
+
+fn cancel_after_capability_effect(
+    fixture: &lightroom_managed::tests::ManagedFixture,
+    request: bridge::Request,
+    target: lightroom_managed::tests::CapabilityAck,
+) -> Result<()> {
+    let config = config();
+    let generation = Arc::new(lightroom_managed::Generation::start_fixture(
+        &fixture.owner,
+        &config.worker_executable,
+    )?);
+    let dispatcher = Dispatcher::start(&generation, config.limits)?;
+    let probe = lightroom_managed::tests::CapabilityAckProbe::new(target);
+    fixture.owner.install_capability_ack_probe(probe.clone());
+    let pending = dispatcher.submit(request)?;
+    probe.wait_reached(Duration::from_secs(20))?;
+    pending.cancel();
+    probe.release();
+    ensure!(
+        matches!(pending.recv(), Reply::Error { .. }),
+        "canceled capability unexpectedly returned a reply"
+    );
+    dispatcher.shutdown_checked()?;
+    ensure!(generation.pid().is_none(), "canceled W was not reaped");
+    ensure!(
+        fixture.owner.capability_custody_empty(),
+        "capability custody remained after checked W/F drain"
+    );
+    Ok(())
+}
+
+#[test]
+fn canceled_sealed_begin_reconciles_lost_ack_before_f_release() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let directory = std::fs::canonicalize(temp.path())?;
+    let fixture = lightroom_managed::tests::ManagedFixture::start(&directory)?;
+    let sealed = directory.join("sealed-cancel");
+    std::fs::create_dir(&sealed)?;
+    std::fs::write(sealed.join("approval.json"), b"{\"approved\":true}")?;
+    cancel_after_capability_effect(
+        &fixture,
+        bridge::Request::SealedDocument {
+            request: LightroomSealedRead::Begin {
+                session: uuid::Uuid::new_v4().to_string(),
+                directory: NativePath::from_path(&sealed),
+                document: LightroomSealedDocument::Approval,
+            },
+        },
+        lightroom_managed::tests::CapabilityAck::SealedBegin,
+    )?;
+
+    let replacement = uuid::Uuid::new_v4().to_string();
+    let cancel = AtomicBool::new(false);
+    ensure!(
+        fixture
+            .filesystem
+            .lightroom_sealed_read(
+                &LightroomSealedRead::Begin {
+                    session: replacement.clone(),
+                    directory: NativePath::from_path(&sealed),
+                    document: LightroomSealedDocument::Approval,
+                },
+                &cancel,
+            )?
+            .is_some(),
+        "replacement sealed session was not admitted"
+    );
+    fixture.filesystem.lightroom_sealed_read(
+        &LightroomSealedRead::Discard {
+            session: replacement,
+        },
+        &cancel,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn canceled_artifact_begin_reconciles_lost_ack_before_f_release() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let directory = std::fs::canonicalize(temp.path())?;
+    let fixture = lightroom_managed::tests::ManagedFixture::start(&directory)?;
+    let capture = directory.join("capture-begin-cancel");
+    let (revision, manifest, _) = write_capture(&capture)?;
+    cancel_after_capability_effect(
+        &fixture,
+        bridge::Request::ArtifactPreparation {
+            request: LightroomArtifactPreparation::Begin {
+                session: uuid::Uuid::new_v4().to_string(),
+                directory: NativePath::from_path(&capture),
+                capture_revision: revision.clone(),
+                manifest_blake3: manifest.clone(),
+                maximum_bytes: U64(1024 * 1024),
+                open_deadline_ms: U64(10_000),
+            },
+        },
+        lightroom_managed::tests::CapabilityAck::ArtifactBegin,
+    )?;
+
+    let replacement = uuid::Uuid::new_v4().to_string();
+    let cancel = AtomicBool::new(false);
+    ensure!(
+        fixture
+            .filesystem
+            .lightroom_artifact_preparation(
+                &LightroomArtifactPreparation::Begin {
+                    session: replacement.clone(),
+                    directory: NativePath::from_path(&capture),
+                    capture_revision: revision,
+                    manifest_blake3: manifest,
+                    maximum_bytes: U64(1024 * 1024),
+                    open_deadline_ms: U64(10_000),
+                },
+                &cancel,
+            )?
+            .is_some(),
+        "replacement artifact session was not admitted"
+    );
+    fixture.filesystem.lightroom_artifact_preparation(
+        &LightroomArtifactPreparation::Discard {
+            session: replacement,
+        },
+        &cancel,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn canceled_artifact_member_retires_the_unacknowledged_receipt() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let directory = std::fs::canonicalize(temp.path())?;
+    let fixture = lightroom_managed::tests::ManagedFixture::start(&directory)?;
+    let config = config();
+    let generation = Arc::new(lightroom_managed::Generation::start_fixture(
+        &fixture.owner,
+        &config.worker_executable,
+    )?);
+    let dispatcher = Dispatcher::start(&generation, config.limits)?;
+    let capture = directory.join("capture-member-cancel");
+    let (revision, manifest, _) = write_capture(&capture)?;
+    let session = uuid::Uuid::new_v4().to_string();
+    ensure!(matches!(
+        call(
+            &dispatcher,
+            bridge::Request::ArtifactPreparation {
+                request: LightroomArtifactPreparation::Begin {
+                    session: session.clone(),
+                    directory: NativePath::from_path(&capture),
+                    capture_revision: revision.clone(),
+                    manifest_blake3: manifest.clone(),
+                    maximum_bytes: U64(1024 * 1024),
+                    open_deadline_ms: U64(10_000),
+                },
+            },
+        )?,
+        bridge::Response::ArtifactPreparation(Some(
+            LightroomArtifactPreparationReply::Begun { .. }
+        ))
+    ));
+    let probe = lightroom_managed::tests::CapabilityAckProbe::new(
+        lightroom_managed::tests::CapabilityAck::ArtifactMember,
+    );
+    fixture.owner.install_capability_ack_probe(probe.clone());
+    let pending = dispatcher.submit(bridge::Request::ArtifactPreparation {
+        request: LightroomArtifactPreparation::Member {
+            session,
+            member_index: U64(0),
+        },
+    })?;
+    probe.wait_reached(Duration::from_secs(20))?;
+    let lost_receipt = probe.receipt();
+    pending.cancel();
+    probe.release();
+    let lost_receipt = lost_receipt.context("artifact member probe omitted the created receipt")?;
+    ensure!(matches!(pending.recv(), Reply::Error { .. }));
+    dispatcher.shutdown_checked()?;
+    ensure!(generation.pid().is_none(), "canceled W was not reaped");
+    ensure!(fixture.owner.capability_custody_empty());
+
+    let cancel = AtomicBool::new(false);
+    ensure!(
+        fixture
+            .filesystem
+            .lightroom_artifact_preparation(
+                &LightroomArtifactPreparation::Resolve {
+                    receipt: lost_receipt,
+                },
+                &cancel,
+            )
+            .is_err(),
+        "unacknowledged artifact receipt remained in F"
+    );
+    let replacement = uuid::Uuid::new_v4().to_string();
+    fixture.filesystem.lightroom_artifact_preparation(
+        &LightroomArtifactPreparation::Begin {
+            session: replacement.clone(),
+            directory: NativePath::from_path(&capture),
+            capture_revision: revision,
+            manifest_blake3: manifest,
+            maximum_bytes: U64(1024 * 1024),
+            open_deadline_ms: U64(10_000),
+        },
+        &cancel,
+    )?;
+    fixture.filesystem.lightroom_artifact_preparation(
+        &LightroomArtifactPreparation::Discard {
+            session: replacement,
+        },
+        &cancel,
+    )?;
     Ok(())
 }

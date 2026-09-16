@@ -9,8 +9,11 @@ use crate::{
     filesystem_worker::{
         client::Client as FilesystemClient,
         wire::{
-            LightroomWorkbenchIo, LightroomWorkbenchIoReply, LightroomWorkbenchSealState,
-            Phase as FilesystemPhase,
+            LightroomArtifactPreparation, LightroomArtifactPreparationReply,
+            LightroomSealedDocumentPage, LightroomSealedRead, LightroomWorkbenchIo,
+            LightroomWorkbenchIoReply, LightroomWorkbenchSealState,
+            Operation as FilesystemOperation, Phase as FilesystemPhase,
+            Response as FilesystemResponse,
         },
     },
     lightroom::{
@@ -41,6 +44,7 @@ use std::{
 };
 
 pub(crate) const FAILURE_CHARS: usize = 4096;
+pub(super) const CAPABILITY_RECEIPTS: usize = 4_096;
 
 fn bounded_failure(value: impl std::fmt::Display) -> String {
     value.to_string().chars().take(FAILURE_CHARS).collect()
@@ -67,6 +71,8 @@ pub(super) struct MetadataLayouts {
     pub custody: usize,
     pub identity: usize,
     pub resource: usize,
+    pub capability_custody: usize,
+    pub receipt: usize,
 }
 
 pub(super) fn metadata_layouts() -> MetadataLayouts {
@@ -83,6 +89,8 @@ pub(super) fn metadata_layouts() -> MetadataLayouts {
         custody: std::mem::size_of::<Custody>(),
         identity: std::mem::size_of::<FIdentity>(),
         resource: std::mem::size_of::<FResource>(),
+        capability_custody: std::mem::size_of::<CapabilityCustody>(),
+        receipt: std::mem::size_of::<String>(),
     }
 }
 
@@ -417,6 +425,107 @@ impl Custody {
     }
 }
 
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)] // One bounded inline pending slot is capacity-accounted.
+enum CapabilityPending {
+    Sealed(LightroomSealedRead),
+    Artifact(LightroomArtifactPreparation),
+}
+
+enum CapabilityOutcome<T> {
+    Reply(T),
+    Rejected(anyhow::Error),
+    Unknown(anyhow::Error),
+}
+
+#[derive(Default)]
+struct CapabilityCustody {
+    // Set before the request can reach F. It remains set until an exact,
+    // validated response (including an authoritative rejection) is observed.
+    pending: Option<CapabilityPending>,
+    sealed: Option<LightroomSealedRead>,
+    artifact: Option<LightroomArtifactPreparation>,
+    receipts: Vec<String>,
+}
+
+impl CapabilityCustody {
+    fn before(&mut self, request: CapabilityPending) -> Result<()> {
+        ensure!(
+            self.pending.is_none(),
+            "previous filesystem capability outcome remains unresolved"
+        );
+        self.pending = Some(request);
+        Ok(())
+    }
+
+    fn reject(&mut self) {
+        self.pending = None;
+    }
+
+    fn after_sealed(
+        &mut self,
+        request: &LightroomSealedRead,
+        reply: &Option<LightroomSealedDocumentPage>,
+    ) -> Result<()> {
+        match (request, reply) {
+            (LightroomSealedRead::Begin { .. }, Some(reply)) => {
+                reply.validate_for(request)?;
+                self.sealed = Some(request.clone());
+            }
+            (LightroomSealedRead::Page { .. }, Some(reply)) => {
+                reply.validate_for(request)?;
+            }
+            (LightroomSealedRead::Discard { .. }, None) => self.sealed = None,
+            _ => anyhow::bail!("sealed document response is absent or differs"),
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    fn after_artifact(
+        &mut self,
+        request: &LightroomArtifactPreparation,
+        reply: &Option<LightroomArtifactPreparationReply>,
+    ) -> Result<()> {
+        match (request, reply) {
+            (LightroomArtifactPreparation::Begin { .. }, Some(reply)) => {
+                reply.validate_for(request)?;
+                self.artifact = Some(request.clone());
+            }
+            (
+                LightroomArtifactPreparation::Member { .. },
+                Some(reply @ LightroomArtifactPreparationReply::Prepared { receipt, .. }),
+            ) => {
+                reply.validate_for(request)?;
+                if !self.receipts.contains(receipt) {
+                    ensure!(
+                        self.receipts.len() < CAPABILITY_RECEIPTS,
+                        "managed artifact receipt capacity"
+                    );
+                    self.receipts.push(receipt.clone());
+                }
+            }
+            (LightroomArtifactPreparation::Resolve { .. }, Some(reply)) => {
+                reply.validate_for(request)?;
+            }
+            (LightroomArtifactPreparation::DiscardReceipt { receipt }, None) => {
+                self.receipts.retain(|value| value != receipt);
+            }
+            (LightroomArtifactPreparation::Discard { .. }, None) => self.artifact = None,
+            _ => anyhow::bail!("artifact preparation response is absent or differs"),
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    fn empty(&self) -> bool {
+        self.pending.is_none()
+            && self.sealed.is_none()
+            && self.artifact.is_none()
+            && self.receipts.is_empty()
+    }
+}
+
 /// Unselected managed construction path. The caller retains its F Arc and the
 /// shared allocation pool if construction fails, so startup can be retried or
 /// explicitly drained without losing an active owner.
@@ -429,6 +538,7 @@ pub(crate) struct Owner {
     reader: Mutex<Option<RetainedReader>>,
     next_reader: AtomicU64,
     custody: Mutex<Custody>,
+    capability_custody: Mutex<CapabilityCustody>,
     failed: AtomicBool,
     root_release_allowed: AtomicBool,
     workbench_started: AtomicBool,
@@ -440,6 +550,8 @@ pub(crate) struct Owner {
     filesystem_drained: AtomicBool,
     #[cfg(test)]
     fail_next_commit: AtomicBool,
+    #[cfg(test)]
+    capability_ack_probe: Mutex<Option<Arc<tests::CapabilityAckProbe>>>,
 }
 
 /// One concrete G generation. Construction borrows the dependency owner, so a
@@ -549,6 +661,7 @@ impl Owner {
             reader: Mutex::new(None),
             next_reader: AtomicU64::new(1),
             custody: Mutex::new(Custody::default()),
+            capability_custody: Mutex::new(CapabilityCustody::default()),
             failed: AtomicBool::new(false),
             root_release_allowed: AtomicBool::new(true),
             workbench_started: AtomicBool::new(false),
@@ -560,6 +673,8 @@ impl Owner {
             filesystem_drained: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_commit: AtomicBool::new(false),
+            #[cfg(test)]
+            capability_ack_probe: Mutex::new(None),
         });
         let weak = Arc::downgrade(&owner);
         let monitor = thread::Builder::new()
@@ -629,6 +744,41 @@ impl Owner {
         self.fail_next_commit.store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_capability_ack_probe(&self, probe: Arc<tests::CapabilityAckProbe>) {
+        *self
+            .capability_ack_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(probe);
+    }
+
+    #[cfg(test)]
+    fn pause_capability_ack(&self, event: Option<tests::CapabilityAck>, receipt: Option<&str>) {
+        let Some(event) = event else { return };
+        let probe = {
+            let mut slot = self
+                .capability_ack_probe
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if slot.as_ref().is_some_and(|probe| probe.target == event) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(probe) = probe {
+            probe.pause(receipt);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capability_custody_empty(&self) -> bool {
+        self.capability_custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .empty()
+    }
+
     fn revoke_generation(&self) {
         self.fail_sources();
     }
@@ -660,6 +810,215 @@ impl Owner {
         Ok(format!("{kind}-{sequence}"))
     }
 
+    fn call_sealed_capability(
+        &self,
+        request: &LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> CapabilityOutcome<Option<LightroomSealedDocumentPage>> {
+        match self.filesystem.execute(
+            FilesystemOperation::LightroomSealedRead(request.clone()),
+            cancel,
+        ) {
+            Ok(FilesystemResponse::LightroomSealedDocument(value)) => {
+                CapabilityOutcome::Reply(value)
+            }
+            Ok(_) => CapabilityOutcome::Unknown(anyhow::anyhow!(
+                "filesystem sealed-document response kind"
+            )),
+            Err(error) if self.filesystem.status().phase == FilesystemPhase::Ready => {
+                CapabilityOutcome::Rejected(error)
+            }
+            Err(error) => CapabilityOutcome::Unknown(error),
+        }
+    }
+
+    fn call_artifact_capability(
+        &self,
+        request: &LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> CapabilityOutcome<Option<LightroomArtifactPreparationReply>> {
+        match self.filesystem.execute(
+            FilesystemOperation::LightroomArtifactPreparation(request.clone()),
+            cancel,
+        ) {
+            Ok(FilesystemResponse::LightroomArtifactPreparation(value)) => {
+                CapabilityOutcome::Reply(value)
+            }
+            Ok(_) => CapabilityOutcome::Unknown(anyhow::anyhow!(
+                "filesystem artifact-preparation response kind"
+            )),
+            Err(error) if self.filesystem.status().phase == FilesystemPhase::Ready => {
+                CapabilityOutcome::Rejected(error)
+            }
+            Err(error) => CapabilityOutcome::Unknown(error),
+        }
+    }
+
+    fn sealed_capability(
+        &self,
+        request: LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<LightroomSealedDocumentPage>> {
+        request.validate()?;
+        self.capability_custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .before(CapabilityPending::Sealed(request.clone()))?;
+        match self.call_sealed_capability(&request, cancel) {
+            CapabilityOutcome::Reply(reply) => {
+                if let Err(error) = self
+                    .capability_custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .after_sealed(&request, &reply)
+                {
+                    self.fail_sources();
+                    return Err(error.context("record sealed-document custody"));
+                }
+                #[cfg(test)]
+                self.pause_capability_ack(tests::CapabilityAck::for_sealed(&request), None);
+                Ok(reply)
+            }
+            CapabilityOutcome::Rejected(error) => {
+                self.capability_custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .reject();
+                Err(error)
+            }
+            CapabilityOutcome::Unknown(error) => {
+                self.fail_sources();
+                Err(error.context("sealed-document outcome unknown and retained"))
+            }
+        }
+    }
+
+    fn artifact_capability(
+        &self,
+        request: LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<LightroomArtifactPreparationReply>> {
+        request.validate()?;
+        self.capability_custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .before(CapabilityPending::Artifact(request.clone()))?;
+        match self.call_artifact_capability(&request, cancel) {
+            CapabilityOutcome::Reply(reply) => {
+                if let Err(error) = self
+                    .capability_custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .after_artifact(&request, &reply)
+                {
+                    self.fail_sources();
+                    return Err(error.context("record artifact-preparation custody"));
+                }
+                #[cfg(test)]
+                self.pause_capability_ack(
+                    tests::CapabilityAck::for_artifact(&request),
+                    match &reply {
+                        Some(LightroomArtifactPreparationReply::Prepared { receipt, .. }) => {
+                            Some(receipt.as_str())
+                        }
+                        _ => None,
+                    },
+                );
+                Ok(reply)
+            }
+            CapabilityOutcome::Rejected(error) => {
+                self.capability_custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .reject();
+                Err(error)
+            }
+            CapabilityOutcome::Unknown(error) => {
+                self.fail_sources();
+                Err(error.context("artifact-preparation outcome unknown and retained"))
+            }
+        }
+    }
+
+    fn reconcile_pending_capability(&self, cancel: &AtomicBool) -> Result<()> {
+        let pending = self
+            .capability_custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .clone();
+        match pending {
+            None => Ok(()),
+            Some(CapabilityPending::Sealed(request)) => {
+                let CapabilityOutcome::Reply(reply) = self.call_sealed_capability(&request, cancel)
+                else {
+                    anyhow::bail!("pending sealed-document outcome could not be reconciled")
+                };
+                self.capability_custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .after_sealed(&request, &reply)
+                    .context("reconcile pending sealed-document custody")
+            }
+            Some(CapabilityPending::Artifact(request)) => {
+                let CapabilityOutcome::Reply(reply) =
+                    self.call_artifact_capability(&request, cancel)
+                else {
+                    anyhow::bail!("pending artifact-preparation outcome could not be reconciled")
+                };
+                self.capability_custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .after_artifact(&request, &reply)
+                    .context("reconcile pending artifact-preparation custody")
+            }
+        }
+    }
+
+    fn cleanup_capabilities(&self, cancel: &AtomicBool) -> Result<()> {
+        self.reconcile_pending_capability(cancel)?;
+        loop {
+            let receipt = self
+                .capability_custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .receipts
+                .last()
+                .cloned();
+            let Some(receipt) = receipt else { break };
+            self.artifact_capability(
+                LightroomArtifactPreparation::DiscardReceipt { receipt },
+                cancel,
+            )?;
+        }
+        let artifact = self
+            .capability_custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .artifact
+            .clone();
+        if let Some(LightroomArtifactPreparation::Begin { session, .. }) = artifact {
+            self.artifact_capability(LightroomArtifactPreparation::Discard { session }, cancel)?;
+        }
+        let sealed = self
+            .capability_custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sealed
+            .clone();
+        if let Some(LightroomSealedRead::Begin { session, .. }) = sealed {
+            self.sealed_capability(LightroomSealedRead::Discard { session }, cancel)?;
+        }
+        ensure!(
+            self.capability_custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .empty(),
+            "filesystem capability custody remains retained"
+        );
+        Ok(())
+    }
+
     fn cleanup_filesystem(&self) -> Result<()> {
         let custody = self
             .custody
@@ -668,6 +1027,11 @@ impl Owner {
             .clone();
         let cancel = AtomicBool::new(false);
         let mut failures = Vec::new();
+        if let Err(error) = self.cleanup_capabilities(&cancel) {
+            failures.push(bounded_failure(format!(
+                "F capability reconciliation retained: {error:#}"
+            )));
+        }
         macro_rules! call {
             ($request:expr) => {
                 if let Err(error) = self.cleanup_call($request, &cancel) {
@@ -746,7 +1110,13 @@ impl Owner {
                 .custody
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            custody.capture.is_none()
+            let capabilities_drained = self
+                .capability_custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .empty();
+            capabilities_drained
+                && custody.capture.is_none()
                 && custody.evidence.is_none()
                 && custody.original.is_none()
                 && custody.seal.is_none()
@@ -934,19 +1304,18 @@ impl ManagedIo for Owner {
 
     fn sealed_document(
         &self,
-        request: crate::filesystem_worker::wire::LightroomSealedRead,
+        request: LightroomSealedRead,
         cancel: &AtomicBool,
-    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
-        self.filesystem.lightroom_sealed_read(&request, cancel)
+    ) -> Result<Option<LightroomSealedDocumentPage>> {
+        self.sealed_capability(request, cancel)
     }
 
     fn artifact_preparation(
         &self,
-        request: crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        request: LightroomArtifactPreparation,
         cancel: &AtomicBool,
-    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>> {
-        self.filesystem
-            .lightroom_artifact_preparation(&request, cancel)
+    ) -> Result<Option<LightroomArtifactPreparationReply>> {
+        self.artifact_capability(request, cancel)
     }
 
     fn source_open(
@@ -1142,11 +1511,100 @@ pub(crate) mod tests {
     use super::*;
     use crate::storage_volume::NativePath;
     use std::{
-        sync::MutexGuard,
+        sync::{Condvar, MutexGuard},
         time::{Duration, Instant},
     };
 
     static PROCESS_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum CapabilityAck {
+        SealedBegin,
+        ArtifactBegin,
+        ArtifactMember,
+    }
+
+    impl CapabilityAck {
+        pub(super) fn for_sealed(request: &LightroomSealedRead) -> Option<Self> {
+            matches!(request, LightroomSealedRead::Begin { .. }).then_some(Self::SealedBegin)
+        }
+
+        pub(super) fn for_artifact(request: &LightroomArtifactPreparation) -> Option<Self> {
+            match request {
+                LightroomArtifactPreparation::Begin { .. } => Some(Self::ArtifactBegin),
+                LightroomArtifactPreparation::Member { .. } => Some(Self::ArtifactMember),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CapabilityAckState {
+        reached: bool,
+        released: bool,
+        receipt: Option<String>,
+    }
+
+    pub(crate) struct CapabilityAckProbe {
+        pub(super) target: CapabilityAck,
+        state: Mutex<CapabilityAckState>,
+        wake: Condvar,
+    }
+
+    impl CapabilityAckProbe {
+        pub(crate) fn new(target: CapabilityAck) -> Arc<Self> {
+            Arc::new(Self {
+                target,
+                state: Mutex::new(CapabilityAckState::default()),
+                wake: Condvar::new(),
+            })
+        }
+
+        pub(super) fn pause(&self, receipt: Option<&str>) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.receipt = receipt.map(str::to_owned);
+            state.reached = true;
+            self.wake.notify_all();
+            while !state.released {
+                state = self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+
+        pub(crate) fn wait_reached(&self, timeout: Duration) -> Result<()> {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let (state, _) = self
+                .wake
+                .wait_timeout_while(state, timeout, |state| !state.reached)
+                .unwrap_or_else(|error| error.into_inner());
+            ensure!(state.reached, "capability acknowledgement probe timed out");
+            Ok(())
+        }
+
+        pub(crate) fn release(&self) {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .released = true;
+            self.wake.notify_all();
+        }
+
+        pub(crate) fn receipt(&self) -> Option<String> {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .receipt
+                .clone()
+        }
+    }
+
+    impl Drop for CapabilityAckProbe {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     pub(crate) struct ManagedFixture {
         pub(crate) filesystem: Arc<FilesystemClient>,
