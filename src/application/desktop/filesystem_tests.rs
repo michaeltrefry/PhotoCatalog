@@ -319,10 +319,15 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
     let original = request.clone();
     let last_relay = Arc::new(Mutex::new(String::from("no relay call")));
     let observed_relay = last_relay.clone();
+    let completed_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed_calls = completed_calls.clone();
     *relay.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
         use filesystem::Call;
         *observed_relay.lock().unwrap() =
             format!("{:?}, after={after}", std::mem::discriminant(call));
+        if after {
+            observed_calls.fetch_add(1, Ordering::Release);
+        }
         match call {
             Call::Prepare(_) if after => {
                 if lost_prepare {
@@ -437,8 +442,21 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
         shared: shared.clone(),
     };
     eprintln!("actual relay fixture G owns C={cpid} F={fpid}");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // This fixture streams multi-envelope cache objects through a debug build.
+    // Slow hosted runners must still make progress; one aggregate 30s deadline
+    // could expire while valid relay calls continued completing (CI companion
+    // case completed in 29.8s). Keep the original stall bound, and additionally
+    // cap the complete admission/cache/SQL/drain sequence at two minutes.
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(120);
+    let mut progress_at = started;
+    let mut progress = completed_calls.load(Ordering::Acquire);
     loop {
+        let completed = completed_calls.load(Ordering::Acquire);
+        if completed != progress {
+            progress = completed;
+            progress_at = Instant::now();
+        }
         if lost_confirm && shared.state.lock().unwrap().child_finished {
             break;
         }
@@ -446,10 +464,12 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
             result.map_err(anyhow::Error::msg)?;
             break;
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || progress_at.elapsed() >= Duration::from_secs(30) {
             let state = shared.state.lock().unwrap();
             anyhow::bail!(
-                "actual paired fixture timed out: last_relay={}; C phase={:?}, ready={}, stopping={}, reaped={}, finished={}, exit={:?}, message={:?}, drain_error={:?}; F={:?}",
+                "actual paired fixture timed out after {:?}, idle {:?}, completed_calls={progress}: last_relay={}; C phase={:?}, ready={}, stopping={}, reaped={}, finished={}, exit={:?}, message={:?}, drain_error={:?}; F={:?}",
+                started.elapsed(),
+                progress_at.elapsed(),
                 last_relay.lock().unwrap(),
                 state.phase,
                 state.ready,
