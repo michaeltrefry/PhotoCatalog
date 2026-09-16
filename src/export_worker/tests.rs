@@ -1152,8 +1152,7 @@ fn held_directory_rename_uses_delete_capable_handles_and_refuses_replacement() -
     let source_handle = discard_directory(&source)?;
     let source_identity = lease_identity(&source_handle)?;
 
-    // A one-code-unit name exercises the FILE_RENAME_INFO fixed header size;
-    // passing only offsetof(FileName) plus this payload is invalid on Windows.
+    // Exercise both ends of the accepted UTF-16 name length.
     rename_directory_held(&source_handle, &parent, std::ffi::OsStr::new("m"))?;
     assert!(!source.try_exists()?);
     assert_eq!(
@@ -1200,6 +1199,50 @@ fn held_directory_rename_uses_delete_capable_handles_and_refuses_replacement() -
         lease_identity(&discard_directory(&collision_target)?)?,
         collision_target_identity
     );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn held_directory_rename_follows_moved_root_and_preserves_replacement() -> Result<()> {
+    for collision in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let root = base.join("root");
+        let moved = base.join("moved");
+        fs::create_dir(&root)?;
+        fs::create_dir(root.join("source"))?;
+        fs::write(root.join("source/marker"), b"original")?;
+        if collision {
+            fs::create_dir(root.join("target"))?;
+            fs::write(root.join("target/marker"), b"existing")?;
+        }
+        let parent = discard_directory(&root)?;
+        // Windows can reject moving an ancestor with a descendant already
+        // open. Move while holding the parent, then acquire the exact source.
+        fs::rename(&root, &moved)?;
+        fs::create_dir(&root)?;
+        fs::create_dir(root.join("source"))?;
+        fs::write(root.join("source/marker"), b"replacement")?;
+        let source = discard_directory(&moved.join("source"))?;
+        let identity = lease_identity(&source)?;
+        let result = rename_directory_held(&source, &parent, std::ffi::OsStr::new("target"));
+        if collision {
+            assert!(result.is_err());
+            assert_eq!(fs::read(moved.join("source/marker"))?, b"original");
+            assert_eq!(fs::read(moved.join("target/marker"))?, b"existing");
+        } else {
+            result?;
+            assert!(!moved.join("source").try_exists()?);
+            assert_eq!(fs::read(moved.join("target/marker"))?, b"original");
+            assert_eq!(
+                lease_identity(&discard_directory(&moved.join("target"))?)?,
+                identity
+            );
+        }
+        assert_eq!(fs::read(root.join("source/marker"))?, b"replacement");
+        assert!(!root.join("target").try_exists()?);
+    }
     Ok(())
 }
 
