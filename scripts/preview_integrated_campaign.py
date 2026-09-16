@@ -43,17 +43,15 @@ def ancestry_evidence(source):
         raise ValueError("original migration must remain explicitly 4-to-5")
     if proof.get("native_receipt_sha256")!=entries["native"]["sha256"] or native.get("protocol")!=1 or native.get("complete") is not True or native.get("mode")!="migrate_fixture" or native.get("count")!=10000000 or native.get("engine_version")!="3.51.1":
         raise ValueError("native migration identity mismatch")
-    main=source["files"][""]["sha256"]
+    final_main=source["files"][""]["sha256"]
     current_entries=source.get("schema13_migration", {})
     if source.get("schema_version") == CURRENT_SCHEMA:
         if set(current_entries) != {"proof", "native"}:
             raise ValueError("separate current-schema migration proof required")
         current_payloads,current=read_ancestry(current_entries)
-        main=current["proof"].get("owned_copy_before_sha256")
-    if proof.get("owned_copy_after_sha256")!=main or proof.get("owned_copy_before_sha256")==main:
-        # A real schema6 hop, validated below, is the only permitted intermediate.
-        if not source.get("schema6_migration"):
-            raise ValueError("donor is not the pristine migrated main")
+    schema5_main=proof.get("owned_copy_after_sha256")
+    if proof.get("owned_copy_before_sha256")==schema5_main:
+        raise ValueError("schema4-to-5 physical migration identity changed")
     logical=native.get("logical_before")
     if not isinstance(logical,str) or len(logical)!=64 or any(c not in "0123456789abcdef" for c in logical) or any(row.get(field)!=logical for row in (proof,native) for field in ("logical_before","logical_after")):
         raise ValueError("migration logical identity changed")
@@ -66,12 +64,12 @@ def ancestry_evidence(source):
         raise ValueError("migration index or observer failed")
     if "verification" in parsed:
         verified=parsed["verification"]
-        if verified.get("kind")!="schema5_verification" or verified.get("schema_before")!=5 or verified.get("schema_after")!=5 or any(verified.get(f)!=main for f in ("owned_copy_before_sha256","owned_copy_after_sha256")) or any(verified.get(f)!=logical for f in ("logical_before","logical_after")) or any(verified.get(f)!=tables for f in ("table_counts_before","table_counts_after")) or verified.get("index_sql")!=INDEX_SQL:
+        if verified.get("kind")!="schema5_verification" or verified.get("schema_before")!=5 or verified.get("schema_after")!=5 or any(verified.get(f)!=schema5_main for f in ("owned_copy_before_sha256","owned_copy_after_sha256")) or any(verified.get(f)!=logical for f in ("logical_before","logical_after")) or any(verified.get(f)!=tables for f in ("table_counts_before","table_counts_after")) or verified.get("index_sql")!=INDEX_SQL:
             raise ValueError("later verification cannot replace original migration ancestry")
     if source.get("schema_version") == CURRENT_SCHEMA:
         source_schema=5
         expected_before=tables
-        before_hash=proof["owned_copy_after_sha256"]
+        before_hash=schema5_main
         schema6_entries=source.get("schema6_migration")
         if schema6_entries:
             if set(schema6_entries)!={"proof","native"}:
@@ -83,9 +81,13 @@ def ancestry_evidence(source):
             validate_migration_receipt(newer,10000000,5,6)
             if newer.get("engine_version")!="3.51.1" or older.get("observer",{}).get("exit_code")!=0 or older.get("observer",{}).get("error") is not None:
                 raise ValueError("schema6 migration execution differs")
+            if older.get("kind")!="schema5_to_6_migration":
+                raise ValueError("schema6 migration kind differs")
             for field in proof_fields(6):
                 if older.get(field)!=newer.get(field):
                     raise ValueError("schema6 proof/native identity differs")
+            if newer.get("logical_before")!=logical:
+                raise ValueError("schema6 migration predecessor logical identity differs")
             if older.get("owned_copy_before_sha256")!=before_hash or older.get("owned_copy_after_sha256")==before_hash:
                 raise ValueError("schema6 migration physical lineage differs")
             before_hash=older["owned_copy_after_sha256"]
@@ -98,15 +100,20 @@ def ancestry_evidence(source):
         validate_migration_receipt(current_native,10000000,source_schema,CURRENT_SCHEMA)
         if current_native.get("engine_version")!="3.51.1" or current_proof.get("observer",{}).get("exit_code")!=0 or current_proof.get("observer",{}).get("error") is not None:
             raise ValueError("current migration execution differs")
+        if current_proof.get("kind")!=f"schema{source_schema}_to_13_migration":
+            raise ValueError("current migration kind differs")
         for field in proof_fields(CURRENT_SCHEMA):
             if current_proof.get(field)!=current_native.get(field):
                 raise ValueError("current proof/native identity differs")
         if current_native.get("table_counts_before")!=expected_before:
             raise ValueError("current migration predecessor tables differ")
-        if current_proof.get("owned_copy_before_sha256")!=before_hash or current_proof.get("owned_copy_after_sha256")!=source["files"][""]["sha256"] or current_proof.get("owned_copy_after_sha256")==before_hash:
+        current_logical=current_native.get("logical_before")
+        if (source_schema==5 and current_logical!=logical) or (source_schema==6 and current_logical==logical):
+            raise ValueError("current migration predecessor logical identity differs")
+        if current_proof.get("owned_copy_before_sha256")!=before_hash or current_proof.get("owned_copy_after_sha256")!=final_main or current_proof.get("owned_copy_after_sha256")==before_hash:
             raise ValueError("current migration physical lineage differs")
         payloads.update({"schema13_"+key:value for key,value in current_payloads.items()})
-    elif proof.get("owned_copy_after_sha256")!=source["files"][""]["sha256"]:
+    elif schema5_main!=final_main:
         raise ValueError("donor is not the pristine migrated main")
     return payloads
 

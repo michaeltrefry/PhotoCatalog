@@ -29,7 +29,11 @@ proof exists, it preserves those exact proof/native bytes and physical boundary,
 then records a separate 6-to-13 migration. It never inserts a synthetic 5-to-6
 hop. Reuse admits evidenced schema 4, 5, 6, and 13 fixtures; intermediate schema
 7–12 manifests are not claimed by this campaign contract. Existing frozen
-4-to-5 and 5-to-6 proof bytes keep their original interpretation.
+4-to-5 and 5-to-6 proof bytes keep their original interpretation. Direct
+5-to-13 logical identity must equal the retained schema-5 identity. A genuine
+5-to-6 receipt keeps that schema-5 pre-existing identity, while its later
+6-to-13 receipt must use a different logical digest because the exact 13-table
+schema-6 roster is then part of the pre-existing table-name hash.
 
 This experiment is separate from S2 backend selection. SQLite remains the selected
 backend; no alternative backend/profile or threshold search is performed here.

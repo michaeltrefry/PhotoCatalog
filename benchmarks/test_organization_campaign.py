@@ -180,6 +180,16 @@ class CampaignTests(unittest.TestCase):
             self.assertNotEqual(ancestor['schema4_main_sha256'],result['main_sha256'])
             self.assertEqual(campaign.source_state(main),before)
             with self.assertRaises(FileExistsError):campaign.preserve_schema5_ancestry(args,args.reuse_prepared,fixture)
+            wrong_root=pathlib.Path(directory)/"wrong-logical";wrong_root.mkdir();args.root=wrong_root
+            wrong_copied=campaign.copied_fixture(args,args.reuse_prepared,fixture)
+            wrong={**native,"logical_before":"f"*64,"logical_after":"f"*64}
+            def wrong_child(binary,catalog,output,argv,timeout):
+                campaign.save(output,wrong)
+                target=catalog/"catalog.sqlite3";contents=bytearray(target.read_bytes())
+                contents[60:64]=(13).to_bytes(4,"big");target.write_bytes(contents)
+                return {"exit_code":0,"error":None}
+            with mock.patch.object(campaign,"run_child",side_effect=wrong_child),self.assertRaisesRegex(AssertionError,"schema5 content differs"):
+                campaign.migrate_reused_fixture(args,wrong_copied)
 
     def test_schema4_reuse_migrates_directly_to_thirteen_with_physical_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -212,13 +222,17 @@ class CampaignTests(unittest.TestCase):
             fixture.update(schema=6,main_sha256=campaign.sha(main),source_main_sha256="b"*64)
             native.update(protocol=2,catalog_schema=6,schema_before=5,schema_after=6,identity_scope="pre_existing_tables",added_tables=campaign.schema6_initial_rows(native["table_counts_before"]),alias_initial_state=campaign.schema6_alias_state(native["table_counts_before"]))
             native_path=args.reuse_prepared.parent/"schema6-native.json";campaign.save(native_path,native)
-            proof={**native,"native_receipt":str(native_path),"native_receipt_sha256":campaign.sha(native_path),"owned_copy_before_sha256":"b"*64,"owned_copy_after_sha256":fixture["main_sha256"],"observer":{"exit_code":0,"error":None}}
+            proof={**native,"kind":"schema5_to_6_migration","native_receipt":str(native_path),"native_receipt_sha256":campaign.sha(native_path),"owned_copy_before_sha256":"b"*64,"owned_copy_after_sha256":fixture["main_sha256"],"observer":{"exit_code":0,"error":None}}
             proof_path=args.reuse_prepared.parent/"schema6-proof.json";campaign.save(proof_path,proof)
             fixture["migration_proof"]=str(proof_path)
             retained=campaign.preserve_bound_migration(args,args.reuse_prepared,fixture,6)
             self.assertEqual(pathlib.Path(retained["proof"]).read_bytes(),proof_path.read_bytes())
             self.assertEqual(pathlib.Path(retained["native"]).read_bytes(),native_path.read_bytes())
             self.assertEqual(retained["predecessor_manifest_sha256"],campaign.sha(args.reuse_prepared))
+            proof["kind"]="schema6_verification";proof_path.write_text(json.dumps(proof))
+            with self.assertRaisesRegex(AssertionError,"kind differs"):
+                campaign.preserve_bound_migration(args,args.reuse_prepared,fixture,6)
+            proof["kind"]="schema5_to_6_migration"
             proof["owned_copy_after_sha256"]="f"*64;proof_path.write_text(json.dumps(proof))
             with self.assertRaises(AssertionError):
                 campaign.preserve_bound_migration(args,args.reuse_prepared,fixture,6)
@@ -242,7 +256,7 @@ class CampaignTests(unittest.TestCase):
                           added_tables=campaign.schema6_initial_rows(native["table_counts_before"]),
                           alias_initial_state=campaign.schema6_alias_state(native["table_counts_before"]))
             schema6_native=args.reuse_prepared.parent/"schema6-native.json";campaign.save(schema6_native,native)
-            schema6_proof={**native,"native_receipt":str(schema6_native),"native_receipt_sha256":campaign.sha(schema6_native),
+            schema6_proof={**native,"kind":"schema5_to_6_migration","native_receipt":str(schema6_native),"native_receipt_sha256":campaign.sha(schema6_native),
                            "owned_copy_before_sha256":schema5_hash,"owned_copy_after_sha256":schema6_hash,
                            "observer":{"exit_code":0,"error":None}}
             schema6_proof_path=args.reuse_prepared.parent/"schema6-proof.json";campaign.save(schema6_proof_path,schema6_proof)
@@ -250,7 +264,8 @@ class CampaignTests(unittest.TestCase):
                            migration_proof=str(schema6_proof_path),
                            prior_migration={"proof":str(old_proof_path),"proof_sha256":campaign.sha(old_proof_path),
                                             "native":str(old_native_path),"native_sha256":campaign.sha(old_native_path),
-                                            "schema5_main_sha256":schema5_hash})
+                                            "schema5_main_sha256":schema5_hash,"logical_identity":"a"*64,
+                                            "table_counts":native["table_counts_before"]})
             copied=campaign.copied_fixture(args,args.reuse_prepared,fixture)
             retained=copied["prior_schema6_migration"]
             self.assertEqual(pathlib.Path(retained["proof"]).read_bytes(),schema6_proof_path.read_bytes())
@@ -258,6 +273,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(copied["prior_migration"],fixture["prior_migration"])
             before_tables=sorted(native["table_counts_before"]+native["added_tables"])
             current={**native,"catalog_schema":13,"schema_before":6,"schema_after":13,
+                     "logical_before":"b"*64,"logical_after":"b"*64,
                      "table_counts_before":before_tables,"table_counts_after":before_tables,
                      "added_tables":campaign.expected_added_rows(before_tables,6),
                      "alias_initial_state":campaign.schema6_alias_state(before_tables),
@@ -274,6 +290,35 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(proof["kind"],"schema6_to_13_migration")
             self.assertEqual(proof["owned_copy_before_sha256"],schema6_hash)
             self.assertEqual(result["prior_schema6_migration"],retained)
+            equal_root=pathlib.Path(directory)/"equal-logical";equal_root.mkdir();args.root=equal_root
+            equal_copied=campaign.copied_fixture(args,args.reuse_prepared,fixture)
+            equal={**current,"logical_before":"a"*64,"logical_after":"a"*64}
+            def equal_child(binary,catalog,output,argv,timeout):
+                campaign.save(output,equal)
+                target=catalog/"catalog.sqlite3";contents=bytearray(target.read_bytes())
+                contents[60:64]=(13).to_bytes(4,"big");target.write_bytes(contents)
+                return {"exit_code":0,"error":None}
+            with mock.patch.object(campaign,"run_child",side_effect=equal_child),self.assertRaisesRegex(AssertionError,"omitted added table names"):
+                campaign.migrate_reused_fixture(args,equal_copied)
+
+    def test_preserved_current_proof_rejects_unapproved_source_and_wrong_kind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);preserved=root/"preserved";preserved.mkdir()
+            destination=root/"destination";destination.mkdir()
+            manifest=preserved/"manifest.json";manifest.write_text("{}")
+            native_path=preserved/"native.json";native_path.write_text("{}")
+            proof_path=preserved/"proof.json"
+            fixture={"count":1000,"main_sha256":"b"*64,"source_main_sha256":"a"*64,"migration_proof":str(proof_path)}
+            proof={"schema_before":7,"schema_after":13,"kind":"schema7_to_13_migration",
+                   "owned_copy_before_sha256":"a"*64,"owned_copy_after_sha256":"b"*64,
+                   "native_receipt":str(native_path),"native_receipt_sha256":campaign.sha(native_path)}
+            proof_path.write_text(json.dumps(proof))
+            args=SimpleNamespace(root=destination)
+            with self.assertRaisesRegex(AssertionError,"unsupported campaign"):
+                campaign.preserve_bound_migration(args,manifest,fixture,13)
+            proof.update(schema_before=5,kind="schema6_to_13_migration");proof_path.write_text(json.dumps(proof))
+            with self.assertRaisesRegex(AssertionError,"kind differs"):
+                campaign.preserve_bound_migration(args,manifest,fixture,13)
 
     def test_fresh_schema13_reuse_requires_current_prepare_and_verifies_without_byte_change(self):
         with tempfile.TemporaryDirectory() as directory:

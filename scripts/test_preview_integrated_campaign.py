@@ -90,7 +90,7 @@ class CopyContract(unittest.TestCase):
                      "alias_initial_state":{"unbound":9999997,"dirty":3},"image_initial_state":image_initial_rows(tables),
                      "original_columns_preserved":True}
             current_native=write("new-native.json",current)
-            upgraded={**current,"native_receipt_sha256":current_native["sha256"],"owned_copy_before_sha256":"c"*64,"owned_copy_after_sha256":"d"*64,"observer":{"exit_code":0,"error":None}}
+            upgraded={**current,"kind":"schema5_to_13_migration","native_receipt_sha256":current_native["sha256"],"owned_copy_before_sha256":"c"*64,"owned_copy_after_sha256":"d"*64,"observer":{"exit_code":0,"error":None}}
             current_proof=write("new-proof.json",upgraded)
             source={"schema_version":CURRENT_SCHEMA,"files":{"":{"sha256":"d"*64}},
                     "migration_ancestry":{"proof":old_proof,"native":old_native},
@@ -114,6 +114,13 @@ class CopyContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"bytes changed"):
                 ancestry_evidence(source)
             current_native_path.write_bytes(current_native_bytes)
+            paired=copy.deepcopy(source)
+            paired_native=write("paired-logical-native.json",{**current,"logical_before":"f"*64,"logical_after":"f"*64})
+            paired_proof=write("paired-logical-proof.json",{**upgraded,"logical_before":"f"*64,"logical_after":"f"*64,
+                                                             "native_receipt_sha256":paired_native["sha256"]})
+            paired["schema13_migration"]={"proof":paired_proof,"native":paired_native}
+            with self.assertRaisesRegex(ValueError,"predecessor logical"):
+                ancestry_evidence(paired)
 
     def test_current_schema_accepts_only_a_truthful_five_six_thirteen_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,34 +134,62 @@ class CopyContract(unittest.TestCase):
             legacy_native=write("legacy-native.json",legacy)
             legacy_proof=write("legacy-proof.json",{**legacy,"native_receipt_sha256":legacy_native["sha256"],
                 "owned_copy_before_sha256":"b"*64,"owned_copy_after_sha256":"c"*64,"observer":{"exit_code":0,"error":None}})
+            verification=write("schema5-verification.json",{"kind":"schema5_verification","schema_before":5,"schema_after":5,
+                "logical_before":"a"*64,"logical_after":"a"*64,"table_counts_before":tables,"table_counts_after":tables,
+                "owned_copy_before_sha256":"c"*64,"owned_copy_after_sha256":"c"*64,"index_sql":INDEX_SQL})
             six={**legacy,"protocol":2,"catalog_schema":6,"schema_before":5,"schema_after":6,
                  "identity_scope":"pre_existing_tables","added_tables":schema6_initial_rows(tables),
                  "alias_initial_state":{"unbound":9999997,"dirty":3}}
             six_native=write("six-native.json",six)
-            six_proof=write("six-proof.json",{**six,"native_receipt_sha256":six_native["sha256"],
+            six_proof=write("six-proof.json",{**six,"kind":"schema5_to_6_migration","native_receipt_sha256":six_native["sha256"],
                 "owned_copy_before_sha256":"c"*64,"owned_copy_after_sha256":"d"*64,"observer":{"exit_code":0,"error":None}})
             six_tables=sorted(tables+six["added_tables"])
             thirteen={**six,"catalog_schema":CURRENT_SCHEMA,"schema_before":6,"schema_after":CURRENT_SCHEMA,
+                      "logical_before":"b"*64,"logical_after":"b"*64,
                       "table_counts_before":six_tables,"table_counts_after":six_tables,
                       "added_tables":expected_added_rows(six_tables,6),
                       "image_initial_state":image_initial_rows(six_tables),"original_columns_preserved":True}
             thirteen_native=write("thirteen-native.json",thirteen)
-            thirteen_proof=write("thirteen-proof.json",{**thirteen,"native_receipt_sha256":thirteen_native["sha256"],
+            thirteen_proof=write("thirteen-proof.json",{**thirteen,"kind":"schema6_to_13_migration","native_receipt_sha256":thirteen_native["sha256"],
                 "owned_copy_before_sha256":"d"*64,"owned_copy_after_sha256":"e"*64,"observer":{"exit_code":0,"error":None}})
             source={"schema_version":CURRENT_SCHEMA,"files":{"":{"sha256":"e"*64}},
-                    "migration_ancestry":{"proof":legacy_proof,"native":legacy_native},
+                    "migration_ancestry":{"proof":legacy_proof,"native":legacy_native,"verification":verification},
                     "schema6_migration":{"proof":six_proof,"native":six_native},
                     "schema13_migration":{"proof":thirteen_proof,"native":thirteen_native}}
             result=ancestry_evidence(source)
-            self.assertEqual(set(result),{"proof","native","schema6_proof","schema6_native","schema13_proof","schema13_native"})
-            for section,field,value in (("schema6_migration","owned_copy_before_sha256","f"*64),
+            self.assertEqual(set(result),{"proof","native","verification","schema6_proof","schema6_native","schema13_proof","schema13_native"})
+            for section,field,value in (("migration_ancestry","owned_copy_after_sha256","f"*64),
+                                        ("schema6_migration","owned_copy_before_sha256","f"*64),
+                                        ("schema6_migration","owned_copy_after_sha256","f"*64),
                                         ("schema13_migration","owned_copy_before_sha256","c"*64),
-                                        ("schema13_migration","table_counts_before",tables)):
+                                        ("schema13_migration","owned_copy_after_sha256","f"*64)):
                 bad=copy.deepcopy(source)
                 original=json.loads(Path(bad[section]["proof"]["path"]).read_text())
                 bad[section]["proof"]=write("bad-"+section+"-proof.json",{**original,field:value})
                 with self.subTest(section=section,field=field),self.assertRaises(ValueError):
                     ancestry_evidence(bad)
+            bad=copy.deepcopy(source)
+            bad_verification=json.loads(Path(verification["path"]).read_text())
+            bad["migration_ancestry"]["verification"]=write("bad-verification.json",{
+                **bad_verification,"owned_copy_before_sha256":"f"*64,"owned_copy_after_sha256":"f"*64})
+            with self.assertRaisesRegex(ValueError,"later verification"):
+                ancestry_evidence(bad)
+            bad=copy.deepcopy(source)
+            bad_native=write("bad-current-logical-native.json",{**thirteen,"logical_before":"a"*64,"logical_after":"a"*64})
+            bad_proof=write("bad-current-logical-proof.json",{**json.loads(Path(thirteen_proof["path"]).read_text()),
+                "logical_before":"a"*64,"logical_after":"a"*64,"native_receipt_sha256":bad_native["sha256"]})
+            bad["schema13_migration"]={"proof":bad_proof,"native":bad_native}
+            with self.assertRaisesRegex(ValueError,"predecessor logical"):
+                ancestry_evidence(bad)
+            bad=copy.deepcopy(source)
+            bad_native=write("bad-current-tables-native.json",{**thirteen,"table_counts_before":tables,"table_counts_after":tables,
+                "added_tables":expected_added_rows(tables,6)})
+            bad_proof=write("bad-current-tables-proof.json",{**json.loads(Path(thirteen_proof["path"]).read_text()),
+                "table_counts_before":tables,"table_counts_after":tables,"added_tables":expected_added_rows(tables,6),
+                "native_receipt_sha256":bad_native["sha256"]})
+            bad["schema13_migration"]={"proof":bad_proof,"native":bad_native}
+            with self.assertRaises(ValueError):
+                ancestry_evidence(bad)
 
 
 if __name__=="__main__":

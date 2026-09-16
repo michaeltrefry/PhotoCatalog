@@ -28,7 +28,9 @@ original `proof`/`native` pairs (native protocol 1, 4-to-5) and optional separat
 labeled 5-to-5 `verification`. `schema13_migration` contains distinct
 `proof`/`native` pairs (native protocol 2, either direct 5-to-13 or 6-to-13,
 catalog_schema=13). `schema6_migration` is present only when genuine retained
-5-to-6 proof/native bytes exist; it is never synthesized to create ancestry.
+5-to-6 proof/native bytes exist; it is never synthesized to create ancestry. An
+optional 5-to-5 verification remains bound to the immutable schema-5 output,
+including when a later schema-6 hop exists.
 
 The current proof binds the actual predecessor main to the schema-13 donor hash,
 requires successful native/observer results, and compares every pre-existing
@@ -38,7 +40,10 @@ typed table/row identity with that predecessor. `identity_scope` must be
 frozen initial alias, image/shared-state, mapping-epoch, collection-zero,
 repair/review, and receipt counts. `alias_initial_state`, `image_initial_state`,
 and `original_columns_preserved` are independently checked. No whole-schema hash
-equivalence is claimed. The lens/capture index remains exact. Copy original
+equivalence is claimed. Direct 5-to-13 logical identity equals the retained
+schema-5 identity. For 6-to-13, the logical digest differs from schema 5 because
+the exact expanded schema-6 table-name roster is pre-existing, while internal
+before/after identity remains equal. The lens/capture index remains exact. Copy original
 4-to-5 bytes as `proof`/`native`, optional genuine 5-to-6 bytes as
 `schema6_proof`/`schema6_native`, and current bytes as
 `schema13_proof`/`schema13_native`; never rewrite historical paths or migrate the

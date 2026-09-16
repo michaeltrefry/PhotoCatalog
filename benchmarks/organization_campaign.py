@@ -452,6 +452,11 @@ def preserve_bound_migration(args, old_manifest_path, fixture, target_schema):
     assert hashlib.sha256(native_bytes).hexdigest() == proof["native_receipt_sha256"]
     if target_schema == 6:
         assert proof["schema_before"] == 5, "schema6 ancestry must remain explicitly 5-to-6"
+        expected_kind="schema5_to_6_migration"
+    else:
+        assert target_schema == CURRENT_SCHEMA and proof["schema_before"] in (4,5,6,CURRENT_SCHEMA), "unsupported campaign migration lineage"
+        expected_kind="schema13_verification" if proof["schema_before"]==CURRENT_SCHEMA else f"schema{proof['schema_before']}_to_13_migration"
+    assert proof.get("kind") == expected_kind, "migration proof kind differs from its schema boundary"
     validate_migration_receipt(native, fixture["count"], proof["schema_before"], target_schema)
     assert proof["owned_copy_after_sha256"] == fixture["main_sha256"] and proof["schema_after"] == target_schema
     assert proof["owned_copy_before_sha256"] == fixture["source_main_sha256"]
@@ -492,6 +497,8 @@ def copied_fixture(args, old_manifest_path, fixture):
     if source_schema == 6:
         assert isinstance(ancestry, dict) and predecessor is not None, "schema6 fixture requires explicit 4-to-5 and 5-to-6 ancestry"
         assert ancestry["schema5_main_sha256"] == predecessor["owned_copy_before_sha256"], "schema5-to-6 physical continuity differs"
+        assert ancestry["logical_identity"] == predecessor["logical_identity"], "schema5-to-6 predecessor logical identity differs"
+        assert ancestry["table_counts"] == predecessor["table_counts"], "schema5-to-6 predecessor tables differ"
         for name in ("proof", "native"):
             path=pathlib.Path(ancestry[name])
             assert path.resolve().is_relative_to(old_manifest_path.parent.resolve())
@@ -564,6 +571,7 @@ def migrate_reused_fixture(args, fixture):
         assert before == ancestor["owned_copy_after_sha256"], "predecessor-to-13 physical continuity missing"
         expected_tables = sorted(ancestor["table_counts"] + ancestor["added_tables"])
         assert native["table_counts_before"] == expected_tables, "predecessor table identity differs"
+        assert native["logical_before"] != fixture["prior_migration"]["logical_identity"], "schema6 logical identity omitted added table names"
     if native["schema_before"] == CURRENT_SCHEMA:
         assert before == after, "current-schema verification changed physical bytes"
     proof = {field:native[field] for field in proof_fields(CURRENT_SCHEMA)}
