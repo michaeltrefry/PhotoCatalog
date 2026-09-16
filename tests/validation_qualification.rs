@@ -9,7 +9,8 @@ use photocatalog::{
     application::{
         Config, ImportPhase, Limits, Phase, Reply, Request, Response, U64,
         desktop::{DesktopBridge, TransportPhase},
-        lightroom_bridge as wb, lightroom_migration as migration, metadata, organization,
+        lightroom as app_lightroom, lightroom_bridge as wb, lightroom_migration as migration,
+        metadata, organization,
     },
     catalog_migration::importer::{KeywordOverlap, OverlapPolicy},
     filesystem_worker::wire::{
@@ -267,11 +268,11 @@ fn wait_ready(bridge: &DesktopBridge) -> Result<String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let status = app_status(bridge)?;
-        if status.phase == Phase::Ready {
+        if matches!(status.phase, Phase::Ready) {
             return status.catalog.context("ready catalog token absent");
         }
         ensure!(
-            status.phase != Phase::Failed,
+            !matches!(status.phase, Phase::Failed),
             "catalog failed: {:?}",
             status.message
         );
@@ -348,10 +349,10 @@ fn wb_wait(bridge: &DesktopBridge) -> Result<wb::Status> {
         let status = wb_status(bridge)?;
         if matches!(
             status.phase,
-            lightroom::plan::desktop::Phase::Complete
-                | lightroom::plan::desktop::Phase::Failed
-                | lightroom::plan::desktop::Phase::Canceled
-                | lightroom::plan::desktop::Phase::Closed
+            app_lightroom::Phase::Complete
+                | app_lightroom::Phase::Failed
+                | app_lightroom::Phase::Canceled
+                | app_lightroom::Phase::Closed
         ) {
             return Ok(status);
         }
@@ -363,7 +364,7 @@ fn wb_wait(bridge: &DesktopBridge) -> Result<wb::Status> {
 fn wb_result(bridge: &DesktopBridge) -> Result<(wb::Status, String)> {
     let status = wb_wait(bridge)?;
     ensure!(
-        status.phase == lightroom::plan::desktop::Phase::Complete,
+        matches!(status.phase, app_lightroom::Phase::Complete),
         "Workbench failed: {:?}",
         status.error
     );
@@ -929,16 +930,16 @@ impl Harness {
             wb::Request::Open {
                 attempt: uuid::Uuid::new_v4().to_string(),
                 root: NativePath::from_path(&inspection),
-                mode: lightroom::plan::desktop::OpenMode::Create,
+                mode: app_lightroom::OpenMode::Create,
                 capture_staging: NativePath::from_path(&self.output),
-                limits: lightroom::plan::desktop::Limits::default().into(),
+                limits: app_lightroom::Limits::default().into(),
             },
         )?
         else {
             bail!("Workbench open response")
         };
         ensure!(
-            wb_wait(&self.bridge)?.phase == lightroom::plan::desktop::Phase::Complete,
+            matches!(wb_wait(&self.bridge)?.phase, app_lightroom::Phase::Complete),
             "Workbench open failed"
         );
         let catalogs = self.working.join("inputs/lightroom-catalogs");
@@ -1022,20 +1023,20 @@ impl Harness {
             let selected = family
                 .members
                 .iter()
-                .find(|member| selected_revisions.contains(&member.revision))
+                .find(|member| selected_revisions.contains(&member.revision_id))
                 .context("fixture family has no selected current catalog")?;
             wb_action(
                 &self.bridge,
                 wb::Action::Choose {
                     family: family.id.clone(),
-                    revision: selected.revision.clone(),
+                    revision: selected.revision_id.clone(),
                     expected_evidence: family.evidence_digest.clone(),
                     reason: "exact itinerary selection".into(),
                 },
             )?;
             decisions.push(FamilyDecision::Select {
                 family: family.id.clone(),
-                revision: selected.revision.clone(),
+                revision: selected.revision_id.clone(),
                 expected_evidence_digest: family.evidence_digest.clone(),
             });
         }
@@ -1063,7 +1064,7 @@ impl Harness {
             &self.bridge,
             wb::Query::SelectionPage {
                 review_token: review_token.clone(),
-                collection: lightroom::plan::desktop::ReviewCollection::Captures,
+                collection: app_lightroom::ReviewCollection::Captures,
                 after: U64(0),
                 limit: U64(16),
             },
