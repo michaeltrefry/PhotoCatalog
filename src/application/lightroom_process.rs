@@ -1024,10 +1024,10 @@ impl Client {
     }
 
     pub fn call(&self, request: Request) -> Result<Response> {
-        if let Some(managed) = &self.managed {
-            if let Err(error) = managed.admit() {
-                return Err(self.terminal_failure(error, "admission"));
-            }
+        if let Some(managed) = &self.managed
+            && let Err(error) = managed.admit()
+        {
+            return Err(self.terminal_failure(error, "admission"));
         }
         let digest = request_digest(&request)?;
         let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
