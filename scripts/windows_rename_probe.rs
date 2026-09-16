@@ -39,6 +39,8 @@ unsafe extern "system" {
     fn RtlNtStatusToDosError(status: i32) -> u32;
 }
 fn held(path: &Path) -> io::Result<File> {
+    // Omit FILE_FLAG_OVERLAPPED so NtSetInformationFile completes
+    // synchronously before its stack-backed IO_STATUS_BLOCK is released.
     OpenOptions::new()
         .read(true)
         .access_mode(0x80000000 | 0x10000 | 0x20)
@@ -61,7 +63,7 @@ fn rename(source: &File, parent: &File, name: &OsStr, native: bool) -> io::Resul
     assert!(mem::size_of::<usize>() == 8 && bytes as usize <= mem::size_of_val(&info));
     if native {
         let mut status = IoStatus {
-            status: 0,
+            status: usize::MAX,
             information: 0,
         };
         let code = unsafe {
@@ -73,13 +75,24 @@ fn rename(source: &File, parent: &File, name: &OsStr, native: bool) -> io::Resul
                 10,
             )
         };
+        let completion = status.status as i32;
         println!(
-            "NtSetInformationFile status=0x{:08x} iosb=0x{:x} information={}",
-            code as u32, status.status, status.information
+            "NtSetInformationFile returned=0x{:08x} completion=0x{:08x} information={}",
+            code as u32, completion as u32, status.information
         );
+        if code == 0x103 {
+            return Err(io::Error::other(
+                "NtSetInformationFile unexpectedly returned STATUS_PENDING for a synchronous handle",
+            ));
+        }
         if code != 0 {
             return Err(io::Error::from_raw_os_error(
                 unsafe { RtlNtStatusToDosError(code) } as i32,
+            ));
+        }
+        if completion != 0 {
+            return Err(io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(completion) } as i32,
             ));
         }
     } else {
@@ -115,14 +128,21 @@ fn scenario(
         fs::write(parent_path.join(name).join("target-marker"), b"retained")?;
     }
     let parent = held(&parent_path)?;
-    let source = held(&source_path)?;
-    let final_parent = if move_parent {
+    let (final_parent, replacement_parent) = if move_parent {
         let moved = base.join(format!("{tag}-moved"));
+        // Windows rejects moving this ancestor after a descendant handle is
+        // open, even when the handles share delete access. Move the held root
+        // first, replace its old pathname, then acquire the exact source under
+        // the moved root. Both handles are live at the tested rename call.
         fs::rename(&parent_path, &moved)?;
-        moved
+        fs::create_dir(&parent_path)?;
+        fs::create_dir(parent_path.join("source"))?;
+        fs::write(parent_path.join("source/substitute-marker"), b"replacement")?;
+        (moved, Some(parent_path))
     } else {
-        parent_path
+        (parent_path, None)
     };
+    let source = held(&final_parent.join("source"))?;
     let result = rename(&source, &parent, OsStr::new(name), native);
     println!(
         "case={tag} native={native} parent_moved={move_parent} collision={collision} result={result:?}"
@@ -145,6 +165,13 @@ fn scenario(
             b"original"
         );
     }
+    if let Some(replacement) = replacement_parent {
+        assert_eq!(
+            fs::read(replacement.join("source/substitute-marker"))?,
+            b"replacement"
+        );
+        assert!(!replacement.join(name).exists());
+    }
     Ok(())
 }
 fn main() -> io::Result<()> {
@@ -162,6 +189,12 @@ fn main() -> io::Result<()> {
         ("nt-short", "q".to_owned(), false, false),
         ("nt-max", "x".repeat(128), false, false),
         ("nt-moved-parent", "r".to_owned(), true, false),
+        (
+            "nt-moved-parent-collision",
+            "existing".to_owned(),
+            true,
+            true,
+        ),
         ("nt-collision", "existing".to_owned(), false, true),
     ];
     let mut failed = false;
