@@ -1275,9 +1275,12 @@ impl Client {
         }
         let graceful = (|| -> Result<()> {
             ensure!(
-                owner.poisoned.is_none()
-                    && !self.interrupted.load(std::sync::atomic::Ordering::Acquire),
-                "poisoned or interrupted Workbench requires checked revoke"
+                owner.poisoned.is_none(),
+                "poisoned Workbench requires checked revoke"
+            );
+            ensure!(
+                !self.interrupted.load(std::sync::atomic::Ordering::Acquire),
+                "interrupted Workbench requires checked revoke"
             );
             if self
                 .child
