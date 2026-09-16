@@ -175,7 +175,7 @@ mod tests {
         let required = config.requested_preview_metadata_bytes()?;
         let workbench = crate::application::lightroom_capacity::Requirement::from_config(
             &config,
-            super::CONTROL_SLOTS,
+            super::super::CONTROL_SLOTS,
         )?;
         let pool = ByteBudget::new(required)?;
         let reservation = ProcessReservation::reserve(&config, &pool)?;

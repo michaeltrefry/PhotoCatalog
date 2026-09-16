@@ -369,6 +369,7 @@ impl Client {
     /// Wait for the identity-checked startup acknowledgement before admitting
     /// another managed owner. A timeout leaves this exact client available for
     /// checked cleanup; it never substitutes a new filesystem generation.
+    #[allow(dead_code)] // Also used by the managed public factory after activation.
     pub(crate) fn wait_ready(&self, timeout: Duration) -> Result<()> {
         let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let (state, _) = self

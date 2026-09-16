@@ -2496,7 +2496,7 @@ mod tests {
             .find(|entry| entry.name == "workbench.metadata_generation_subgrant")
             .unwrap();
         let workbench =
-            crate::application::lightroom_capacity::report(&default, super::CONTROL_SLOTS)?;
+            crate::application::lightroom_capacity::report(&default, super::super::CONTROL_SLOTS)?;
         assert_eq!(workbench_generation.phase, Phase::Retained);
         assert_eq!(workbench_generation.each, workbench.required);
         assert_eq!(workbench.required, workbench.retained + workbench.active);

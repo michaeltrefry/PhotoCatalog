@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn complete_report_names_every_owner_and_preserves_configured_queue() -> Result<()> {
         let config = config();
-        let report = report(&config, 16)?;
+        let default_report = report(&config, 16)?;
         for name in [
             "g.dispatcher.fixed_owner_and_shared_layouts",
             "g.dispatcher.queued_and_active_typed_requests",
@@ -479,13 +479,16 @@ mod tests {
             "transient.seal_documents_and_preparation",
         ] {
             assert!(
-                report.contributions.iter().any(|value| value.name == name),
+                default_report
+                    .contributions
+                    .iter()
+                    .any(|value| value.name == name),
                 "missing {name}"
             );
         }
         assert_eq!(
-            report.retained,
-            report
+            default_report.retained,
+            default_report
                 .contributions
                 .iter()
                 .filter(|value| value.phase == Phase::Retained)
@@ -493,8 +496,8 @@ mod tests {
                 .sum()
         );
         assert_eq!(
-            report.active,
-            report
+            default_report.active,
+            default_report
                 .contributions
                 .iter()
                 .filter(|value| value.phase == Phase::Active)
@@ -506,10 +509,10 @@ mod tests {
                 .into_iter()
                 .all(|(size, align)| size > 0 && align.is_power_of_two())
         );
-        let queued = report
+        let queued = default_report
             .contributions
             .iter()
-            .find(|value| value.name.starts_with("g.dispatcher"))
+            .find(|value| value.name == "g.dispatcher.queued_and_active_typed_requests")
             .unwrap()
             .bytes;
         let mut wider = config.clone();
@@ -518,11 +521,14 @@ mod tests {
         let wider_queued = wider
             .contributions
             .iter()
-            .find(|value| value.name.starts_with("g.dispatcher"))
+            .find(|value| value.name == "g.dispatcher.queued_and_active_typed_requests")
             .unwrap()
             .bytes;
         assert!(wider_queued > queued);
-        assert_eq!(report.required, report.retained + report.active);
+        assert_eq!(
+            report.required,
+            default_report.retained + default_report.active
+        );
         assert!(SOURCE_PAYLOAD_POOL_CONTRACT.starts_with("distinct"));
         Ok(())
     }
