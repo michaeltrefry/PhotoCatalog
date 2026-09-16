@@ -507,6 +507,16 @@ struct BackupProcessProbe {
     wake: std::sync::Condvar,
 }
 #[cfg(unix)]
+struct BackupProbePause(Arc<BackupProcessProbe>);
+#[cfg(unix)]
+impl Drop for BackupProbePause {
+    fn drop(&mut self) {
+        // Release the injected pause before Running's checked cleanup, even
+        // when an assertion or fallible setup returns early.
+        self.0.release();
+    }
+}
+#[cfg(unix)]
 impl BackupProcessProbe {
     fn observe(&self, event: crate::catalog_backup::managed::ProcessEvent) {
         let mut state = self.state.lock().unwrap();
@@ -521,8 +531,9 @@ impl BackupProcessProbe {
             }
         }
     }
-    fn pause(&self) {
+    fn pause(self: &Arc<Self>) -> BackupProbePause {
         self.state.lock().unwrap().1 = true;
+        BackupProbePause(self.clone())
     }
     fn spawned(&self) -> Result<(u32, u32)> {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -604,7 +615,7 @@ fn actual_g_owns_backup_siblings_and_close_waits_for_checked_drain() -> Result<(
     let (mut running, token) =
         Running::start(temporary.clone(), &executable, &root, &originals, false)?;
     let probe = Arc::new(BackupProcessProbe::default());
-    probe.pause();
+    let _pause = probe.pause();
     let observer = probe.clone();
     running
         .bridge
@@ -734,7 +745,7 @@ fn actual_c_death_cancels_and_reaps_g_owned_backup_siblings() -> Result<()> {
     let (mut running, token) =
         Running::start(temporary.clone(), &executable, &root, &originals, false)?;
     let probe = Arc::new(BackupProcessProbe::default());
-    probe.pause();
+    let _pause = probe.pause();
     let observer = probe.clone();
     running
         .bridge
@@ -791,7 +802,7 @@ fn actual_public_backup_cancel_reaps_both_g_children_before_terminal_status() ->
     let (running, token) =
         Running::start(temporary.clone(), &executable, &root, &originals, false)?;
     let probe = Arc::new(BackupProcessProbe::default());
-    probe.pause();
+    let _pause = probe.pause();
     let observer = probe.clone();
     running
         .bridge
