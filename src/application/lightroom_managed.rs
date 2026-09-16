@@ -170,10 +170,6 @@ impl SourceRouter {
     }
 
     fn check(&self) -> Result<()> {
-        ensure!(
-            !self.stopping.load(Ordering::Acquire),
-            "Workbench Source owner is draining"
-        );
         if let Some(failure) = self
             .failure
             .lock()
@@ -182,6 +178,10 @@ impl SourceRouter {
         {
             anyhow::bail!("Workbench Source owner failed: {failure}");
         }
+        ensure!(
+            !self.stopping.load(Ordering::Acquire),
+            "Workbench Source owner is draining"
+        );
         Ok(())
     }
 
@@ -684,8 +684,11 @@ impl Owner {
                     if owner.monitor_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    if owner.filesystem.status().phase != FilesystemPhase::Ready {
-                        owner.fail_sources();
+                    let status = owner.filesystem.status();
+                    if status.phase != FilesystemPhase::Ready {
+                        owner.fail_sources(format!(
+                            "filesystem monitor observed non-ready owner: {status:?}"
+                        ));
                         break;
                     }
                     drop(owner);
@@ -715,24 +718,24 @@ impl Owner {
     }
 
     fn check_source(&self) -> Result<()> {
+        self.router.check()?;
         ensure!(
             !self.failed.load(Ordering::Acquire),
             "managed Workbench owner failed"
         );
-        self.router.check()
+        Ok(())
     }
 
-    fn fail_sources(&self) {
-        self.failed.store(true, Ordering::Release);
+    fn fail_sources(&self, detail: impl std::fmt::Display) {
         self.root_release_allowed.store(false, Ordering::Release);
-        self.relay.revoke();
-        self.router.fail("managed Workbench owner failed");
+        self.router.fail(detail.to_string());
+        self.failed.store(true, Ordering::Release);
     }
 
     fn commit(&self) -> Result<()> {
         #[cfg(test)]
         if self.fail_next_commit.swap(false, Ordering::AcqRel) {
-            self.fail_sources();
+            self.fail_sources("injected F loss at managed commit gate");
             anyhow::bail!("injected F loss at managed commit gate");
         }
         self.admit()
@@ -780,7 +783,7 @@ impl Owner {
     }
 
     fn revoke_generation(&self) {
-        self.fail_sources();
+        self.fail_sources("Workbench generation revoked after fatal failure");
     }
 
     fn workbench_reaped(&self) {
@@ -794,7 +797,9 @@ impl Owner {
     pub(crate) fn admit(&self) -> Result<()> {
         let status = self.filesystem.status();
         if status.phase != FilesystemPhase::Ready {
-            self.fail_sources();
+            self.fail_sources(format!(
+                "filesystem owner is not ready for Workbench admission: {status:?}"
+            ));
             anyhow::bail!("filesystem owner is not ready for Workbench admission: {status:?}")
         }
         self.check_source()
@@ -872,7 +877,7 @@ impl Owner {
                     .unwrap_or_else(|error| error.into_inner())
                     .after_sealed(&request, &reply)
                 {
-                    self.fail_sources();
+                    self.fail_sources(format!("record sealed-document custody: {error:#}"));
                     return Err(error.context("record sealed-document custody"));
                 }
                 #[cfg(test)]
@@ -887,7 +892,9 @@ impl Owner {
                 Err(error)
             }
             CapabilityOutcome::Unknown(error) => {
-                self.fail_sources();
+                self.fail_sources(format!(
+                    "sealed-document outcome unknown and retained: {error:#}"
+                ));
                 Err(error.context("sealed-document outcome unknown and retained"))
             }
         }
@@ -911,7 +918,7 @@ impl Owner {
                     .unwrap_or_else(|error| error.into_inner())
                     .after_artifact(&request, &reply)
                 {
-                    self.fail_sources();
+                    self.fail_sources(format!("record artifact-preparation custody: {error:#}"));
                     return Err(error.context("record artifact-preparation custody"));
                 }
                 #[cfg(test)]
@@ -934,7 +941,9 @@ impl Owner {
                 Err(error)
             }
             CapabilityOutcome::Unknown(error) => {
-                self.fail_sources();
+                self.fail_sources(format!(
+                    "artifact-preparation outcome unknown and retained: {error:#}"
+                ));
                 Err(error.context("artifact-preparation outcome unknown and retained"))
             }
         }
@@ -1295,7 +1304,7 @@ impl ManagedIo for Owner {
             }
             Err(error) => {
                 if !cancel.load(Ordering::Acquire) {
-                    self.fail_sources();
+                    self.fail_sources(format!("Workbench filesystem callback failed: {error:#}"));
                 }
                 Err(error)
             }
@@ -1353,7 +1362,7 @@ impl ManagedIo for Owner {
             }
             Err(error) => {
                 if !cancel.load(Ordering::Acquire) {
-                    self.fail_sources();
+                    self.fail_sources(format!("CaptureSql source open failed: {error:#}"));
                 }
                 Err(error)
             }
@@ -1399,7 +1408,7 @@ impl ManagedIo for Owner {
             }
             Err(error) => {
                 if !cancel.load(Ordering::Acquire) {
-                    self.fail_sources();
+                    self.fail_sources(format!("SQL13 source open failed: {error:#}"));
                 }
                 Err(error)
             }
@@ -1420,9 +1429,9 @@ impl ManagedIo for Owner {
             anyhow::bail!("CaptureSql source generation differs")
         };
         ensure!(id == source, "CaptureSql source generation differs");
-        owner.schema_objects().inspect_err(|_| {
+        owner.schema_objects().inspect_err(|error| {
             if !cancel.load(Ordering::Acquire) {
-                self.fail_sources();
+                self.fail_sources(format!("CaptureSql schema read failed: {error:#}"));
             }
         })
     }
@@ -1447,11 +1456,13 @@ impl ManagedIo for Owner {
             anyhow::bail!("CaptureSql source generation differs")
         };
         ensure!(id == source, "CaptureSql source generation differs");
-        owner.table_rows(handle, cursor, limit).inspect_err(|_| {
-            if !cancel.load(Ordering::Acquire) {
-                self.fail_sources();
-            }
-        })
+        owner
+            .table_rows(handle, cursor, limit)
+            .inspect_err(|error| {
+                if !cancel.load(Ordering::Acquire) {
+                    self.fail_sources(format!("CaptureSql table read failed: {error:#}"));
+                }
+            })
     }
 
     fn source_current(&self, source: &str) -> Result<Current> {
@@ -1468,9 +1479,9 @@ impl ManagedIo for Owner {
             anyhow::bail!("CaptureSql source generation differs")
         };
         ensure!(id == source, "CaptureSql source generation differs");
-        owner.current().inspect_err(|_| {
+        owner.current().inspect_err(|error| {
             if !cancel.load(Ordering::Acquire) {
-                self.fail_sources();
+                self.fail_sources(format!("CaptureSql current read failed: {error:#}"));
             }
         })
     }
@@ -1488,7 +1499,10 @@ impl ManagedIo for Owner {
             .take()
             .context("Source generation is not retained")?;
         drop(retained);
-        reader.reader.retire().inspect_err(|_| self.fail_sources())
+        reader
+            .reader
+            .retire()
+            .inspect_err(|error| self.fail_sources(format!("Source retire failed: {error:#}")))
     }
 
     fn drain_sources(&self) -> Result<()> {
@@ -1864,7 +1878,11 @@ pub(crate) mod tests {
         fixture.owner.inject_f_loss_at_next_commit();
         let failure = fixture.owner.commit().unwrap_err();
         assert!(failure.to_string().contains("injected F loss"));
-        assert!(fixture.owner.admit().is_err());
+        let readmission = fixture.owner.admit().unwrap_err();
+        assert!(
+            format!("{readmission:#}").contains("injected F loss at managed commit gate"),
+            "first owner failure was replaced: {readmission:#}"
+        );
         fixture.drain()?;
         Ok(())
     }
