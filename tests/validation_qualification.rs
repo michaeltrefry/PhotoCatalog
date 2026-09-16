@@ -1081,6 +1081,17 @@ impl Harness {
                 paths_exhausted,
                 "inspection paths exceed qualification bound"
             );
+            let reported_paths = report
+                .counts
+                .iter()
+                .filter(|(name, _)| name.starts_with("paths_"))
+                .map(|(_, count)| *count)
+                .sum::<i64>();
+            ensure!(
+                reported_paths > 0 && paths.len() as i64 == reported_paths,
+                "inspection path roster differs for {name}: paged {}, reported {reported_paths}",
+                paths.len()
+            );
             self.record(
                 &format!("inspection-{name}.json"),
                 &json!({"row_stage": row_stage, "original_pages": original_pages, "paths": paths, "report": &report}),
