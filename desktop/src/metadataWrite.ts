@@ -1,5 +1,6 @@
 /** Proposed metadata_write v1. Source/design only. Outer command: {command:'metadata_write',args:{catalog,request}}.
- * Rust uses tagged enums with deny_unknown_fields. All authority integers serialize as canonical decimal strings.
+ * Rust uses tagged enums with deny_unknown_fields. Request authority integers use canonical decimal strings;
+ * retained sidecar-plan owner snapshots preserve the core catalog's JSON numbers.
  * Canonical UUID attempts are caller-generated; tokens and cursors are opaque server-generated values.
  */
 export type Decimal = string;
@@ -21,9 +22,12 @@ export type Input = { token:string; generation:Decimal; bytes:Decimal; expected_
 export type Review = { token:string; digest:string; identity:ImageIdentity; base_model:Decimal|null; input_blake3:string; edits:Decimal; changed_fields:Decimal; packet:Ref; issues:Text };
 export type ReviewField = { field:string; before:Text|null; after:Text|null; removed:boolean; semantic_changed:boolean };
 export type FileRevision = { bytes:Decimal; digest:string; modified_ns:Decimal; identity:[Decimal,Decimal] };
-export type SidecarReceipt = { state:'Published'|'Restored'|'Conflict'|'Recoverable'; destination:NativePath; recovery_directory:NativePath; captured_original:NativePath|null; detail:Text; exact:Ref };
-export type SidecarPlan = { operation:string; version:Decimal; owner:{kind:'image'; identity:ImageIdentity}|{kind:'legacy_asset'; asset_id:string; revision:Decimal}; base_model:Decimal; destination:NativePath; expected:FileRevision|null; existing:Ref|null; max_existing_bytes:Decimal|null; alias_limits:{directories:Decimal;candidates:Decimal}|null; payload_bytes:Decimal; payload_digest:string; authority_blake3:string; current:boolean; receipt:SidecarReceipt|null };
-export type RecoveryEntry = { directory:NativePath; kind:'known'|'unknown'|'preparing'|'invalid'; operation:string|null; plan_digest:string|null; detail:Text };
+export type SidecarOwner =
+ | { kind:'image'; identity:{ image_id:string; key:VariantKey; metadata_revision:number; pixel_generation:number; shared_source_epoch:number; physical_generation:number } }
+ | { kind:'legacy_asset'; asset_id:string; revision:number };
+export type SidecarReceipt = { version:number; state:'Published'|'Restored'|'Conflict'|'Recoverable'; destination:NativePath; recovery_directory:NativePath; captured_original:NativePath|null; detail:string };
+export type SidecarPlan = { row:Decimal; operation:string; version:Decimal; owner:SidecarOwner; revision:Decimal; base_model:Decimal; destination:NativePath; expected:FileRevision|null; existing:Ref|null; max_existing_bytes:Decimal|null; alias_limits:{directories:Decimal;candidates:Decimal}|null; payload_bytes:Decimal; payload_digest:string; authority_blake3:string; current:boolean; receipt:SidecarReceipt|null };
+export type RecoveryEntry = { directory:NativePath; name:NativePath; kind:'known'|'unknown'|'preparing'|'invalid'; operation:string|null; plan_digest:string|null; detail:string };
 export type Change = { revision:Decimal; observation_id:Decimal; model_ids:Decimal[]; changed:boolean };
 export type EvidenceReceipt = { destination:NativePath; bytes:Decimal; blake3:string|null; state:'complete'|'partial'; detail:Text };
 export type Result =
@@ -37,8 +41,7 @@ export type Result =
  | { kind:'discovery'; value:{token:string; directory:NativePath} }
  | { kind:'paths'; value:{projected:Decimal; pending:Decimal; unbound:Decimal} }
  | { kind:'evidence'; value:EvidenceReceipt };
-export type Error = { code:'invalid_input'|'stale'|'busy'|'resource_limit'|'canceled'|'unavailable'|'conflict'|'internal'; message:string; detail:Ref|null };
-export type Operation = { id:string; attempt:string; request_digest:string; epoch:Decimal; kind:Action['kind']; phase:'running'|'complete'|'failed'|'canceled'; stage:'admitting'|'reading'|'preparing'|'waiting_writer'|'committing'|'hashing'|'capturing'|'publishing'|'restoring'|'draining'; cancel_requested:boolean; progress:Decimal; result:Result|null; error:Error|null };
+export type Operation = { id:string; attempt:string; request_digest:string; epoch:Decimal; kind:Action['kind']; phase:'running'|'complete'|'failed'|'canceled'; stage:'admitting'|'reading'|'preparing'|'waiting_writer'|'committing'|'hashing'|'capturing'|'publishing'|'restoring'|'draining'; cancel_requested:boolean; progress:Decimal; result:Result|null; error:string|null };
 export type Status = { catalog:string; epoch:Decimal; operation:Operation|null; write_hold:boolean; closing:boolean; input:Input|null; review:Review|null };
 export type DurableReceipt = { attempt:string; request_digest:string; kind:'edit'|'resolve'|'sidecar_plan'|'sidecar_apply'|'sidecar_recover'|'sidecar_restore'; identity:ImageIdentity|null; legacy_asset:string|null; result:Result; created_at:string };
 /** Every action is independently observable by exact attempt before its invoke reply. No long direct mutation reply owns the App gate. */
@@ -98,3 +101,4 @@ export async function metadataWrite<K extends keyof Data>(catalog:string, reques
   return response.value as Data[K];
 }
 export const metadataWriteTerminal=(operation:Operation)=>['complete','failed','canceled'].includes(operation.phase);
+export const metadataWriteOperationError=(operation:Operation)=>operation.error??'Metadata operation failed.';
