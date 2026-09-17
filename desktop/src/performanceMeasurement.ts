@@ -233,6 +233,7 @@ export class PerformanceRecorder {
       timerHandle: undefined as unknown as ReturnType<typeof setTimeout>,
     };
     this.activeScroll = active;
+    console.timeStamp?.(`LensWorks:S12:${this.runId}:scroll:start`);
     const tick: FrameRequestCallback = timestamp => {
       if (this.activeScroll !== active) return;
       active.frameHandle = null;
@@ -264,6 +265,7 @@ export class PerformanceRecorder {
     const target = finalTarget === undefined ? this.findScrollTarget() : finalTarget;
     const sameTarget = target === active.target && active.target.isConnected;
     const ended = this.clock.now();
+    console.timeStamp?.(`LensWorks:S12:${this.runId}:scroll:end:${reason}`);
     const startedUs = Math.max(0, Math.round(active.started * 1000));
     const endedUs = Math.max(0, Math.round(ended * 1000));
     const firstFrameUs = active.frames[0]?.[0];
