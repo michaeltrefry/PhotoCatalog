@@ -149,7 +149,12 @@ def evaluate(receipt, rows, declaration):
         if durable is not None:
             event(durable)
             require(row['start_event'] < durable and (end is None or durable < end), 'Reversed durable event')
-        require((durable is not None) == (samples[ordinal].get('durable_us') is not None), 'Durable event/timing mismatch')
+        if samples[ordinal].get('import_id') is not None:
+            require((durable is not None) == (samples[ordinal].get('durable_us') is not None), 'Durable event/timing mismatch')
+        else:
+            # Idle setup can precede import-profile activation. Its existing
+            # latency is retained, but no import event may be invented for it.
+            require(durable is None, 'Durable event on non-import sample')
         sample_events[ordinal] = row
     require(set(sample_events) == set(samples), 'Missing sample causal event')
     require([r['ordinal'] for r in alignment['sample_events']] == list(samples)

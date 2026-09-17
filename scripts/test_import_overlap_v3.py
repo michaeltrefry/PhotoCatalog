@@ -64,6 +64,29 @@ def fixture():
     return receipt, rows, declaration
 
 
+def idle_warmup_fixture(kind='edit', explicit_null=True):
+    receipt, rows, declaration = fixture()
+    alignment = receipt['clock_alignment']
+    for anchor in alignment['anchors']:
+        anchor['send_event'] += 2
+        anchor['receive_event'] += 2
+    for row in alignment['sample_events']:
+        row['ordinal'] += 1
+        for key in ('start_event', 'durable_event', 'end_event'): row[key] += 2
+    for row in alignment['import_evidence']['timeline']:
+        row['request_event'] += 2
+        row['event'] += 2
+    for sample in receipt['samples']: sample['ordinal'] += 1
+    warmup = {'ordinal': 1, 'kind': kind, 'during_import': False, 'outcome': 'complete',
+              'durable_us': 250000, 'presentation_us': 300000}
+    if explicit_null: warmup['import_id'] = None
+    receipt['samples'].insert(0, warmup)
+    alignment['sample_events'].insert(0, {'ordinal': 1, 'start_event': 1, 'end_event': 2})
+    declaration.update(setup_cutoff_ordinal=1, input_ordinals=list(range(2, 102)))
+    rows[0]['declaration_sha256'] = observer.declaration_digest(declaration)
+    return receipt, rows, declaration
+
+
 class EvaluatorTests(unittest.TestCase):
     def test_exact100_boundary_and_budget(self):
         result = evaluate(*fixture())
@@ -71,6 +94,35 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(result['cohort'], list(range(1, 101)))
         self.assertEqual(result['durable_p95_ms'], 100)
         self.assertTrue(result['native_progress_event_pairs'])
+
+    def test_idle_warmup_then_100_import_inputs_keeps_exact_cohort(self):
+        for kind in ('cull', 'edit'):
+            for explicit_null in (True, False):
+                values = idle_warmup_fixture(kind, explicit_null)
+                result = evaluate(*values)
+                self.assertEqual(result['verdict'], 'TIMING_PASS_REQUIRES_IMPORT_RECONCILIATION')
+                self.assertEqual(result['cohort'], list(range(2, 102)))
+                self.assertEqual(result['durable_p95_ms'], 100)
+                self.assertEqual(values[0]['samples'][0]['durable_us'], 250000)
+                self.assertNotIn('durable_event', values[0]['clock_alignment']['sample_events'][0])
+
+    def test_missing_import_cohort_durable_event_still_rejects_after_idle_warmup(self):
+        values = idle_warmup_fixture()
+        values[0]['clock_alignment']['sample_events'][1].pop('durable_event')
+        with self.assertRaisesRegex(ValueError, 'Durable event/timing mismatch'): evaluate(*values)
+
+    def test_nonimport_setup_cannot_carry_fabricated_durable_event(self):
+        values = idle_warmup_fixture()
+        # Make a unique, ordered event inside the setup sample so rejection
+        # specifically checks import binding, not duplicate/reversed events.
+        for anchor in values[0]['clock_alignment']['anchors']:
+            anchor['send_event'] += 1; anchor['receive_event'] += 1
+        for row in values[0]['clock_alignment']['import_evidence']['timeline']:
+            row['request_event'] += 1; row['event'] += 1
+        for row in values[0]['clock_alignment']['sample_events'][1:]:
+            for key in ('start_event', 'durable_event', 'end_event'): row[key] += 1
+        values[0]['clock_alignment']['sample_events'][0].update(durable_event=2, end_event=3)
+        with self.assertRaisesRegex(ValueError, 'Durable event on non-import sample'): evaluate(*values)
 
     def test_all_latencies_retained_no_favorable_selection(self):
         values = fixture()
