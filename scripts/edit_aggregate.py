@@ -277,13 +277,25 @@ def cleanup_evidence(root, service_campaign_root, record, request, verification,
     if done.get('complete') is not True or done.get('error') is not None or done['start_sha256'] != edit_verify.digest(start_path, 'sha256', MAX_REPORT):
         raise ValueError('cleanup is incomplete or its plan changed')
     start = edit_verify.read_json(start_path, MAX_REPORT)
-    if start.get('version') != 2 or done.get('version') != 2 or start['case_id'] != case_id:
+    if start.get('version') != 3 or done.get('version') != 3 or start['case_id'] != case_id:
         raise ValueError('cleanup belongs to another case')
     for field, evidence in (('verifier_receipt_sha256', record['verification_path']),
                             ('probe_supervisor_sha256', record['probe_supervisor_path']),
                             ('verify_supervisor_sha256', record['verify_supervisor_path'])):
         if start[field] != edit_verify.digest(evidence, 'sha256', MAX_REPORT):
             raise ValueError('cleanup used different success/ownership evidence')
+    for field,evidence in (('probe_supervisor_start_sha256',Path(record['probe_supervisor_path']).parent/'start.json'),
+                           ('verify_supervisor_start_sha256',Path(record['verify_supervisor_path']).parent/'start.json')):
+        if start[field]!=edit_verify.digest(evidence,'sha256',MAX_REPORT):
+            raise ValueError('cleanup used different storage admission evidence')
+    cleanup_storage=start.get('storage')
+    if (not isinstance(cleanup_storage,dict) or set(cleanup_storage)!= {'artifact','service'}
+        or cleanup_storage['artifact']['root']!=str(root)
+        or cleanup_storage['service']['root']!=str(service_campaign_root)
+        or any(edit_verify.read_json(Path(record[key]).parent/'start.json',MAX_REPORT)
+               .get('limits',{}).get('storage')!=cleanup_storage
+               for key in ('probe_supervisor_path','verify_supervisor_path'))):
+        raise ValueError('cleanup storage evidence differs')
     by_iteration = {value['iteration']: value for value in values}
     retained = by_iteration[request['warmups']]
     destination = bound_path(root, retained['path'])
@@ -524,6 +536,8 @@ def aggregate(root, binding):
             action = actions[action_id]
             limits = {name: action[name] for name in ('deadline_seconds', 'process_rss_bytes', 'group_rss_bytes')}
             limits['storage'] = {name:dict(root=storage[name]['path'],**identities[name],
+                parent=storage[name]['parent'],parent_device=storage[name]['parent_device'],
+                parent_inode=storage[name]['parent_inode'],
                 reserve_bytes=binding['volumes'][name]['free_reserve_bytes']+
                     binding['volumes'][name]['post_campaign_bytes']) for name in ('artifact','service')}
             # The builder freezes argv after selecting isolated launcher paths.

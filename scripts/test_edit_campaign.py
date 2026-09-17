@@ -153,7 +153,7 @@ class ActualChildSupervisorContracts(unittest.TestCase):
         disk_roots=dict(artifact=root) if disk_roots is None else {
             name:Path(path).resolve() for name,path in disk_roots.items()}
         reserves={name:0 for name in disk_roots} if reserves is None else reserves
-        storage={name:dict(root=str(path),**campaign.storage_identity(path),reserve_bytes=reserves[name])
+        storage={name:campaign.storage_descriptor(path,reserves[name])
                  for name,path in disk_roots.items()}
         start=time.monotonic()
         try:
@@ -204,9 +204,15 @@ class ActualChildSupervisorContracts(unittest.TestCase):
 
     def test_live_storage_identity_change_stops_and_reaps(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary)
+            root=Path(temporary).resolve()
             identity=campaign.storage_identity(root)
-            observed=[identity,dict(identity,inode=identity['inode']+1)]
+            original=campaign.storage_identity;calls=0
+            def observed(path):
+                nonlocal calls
+                if Path(path)==root:
+                    calls+=1
+                    if calls>=3:return dict(identity,inode=identity['inode']+1)
+                return original(path)
             result,_=self.invoke(root,'import time; time.sleep(30)',expect_failure=True,
                 patches=(patch.object(campaign,'storage_identity',side_effect=observed),))
             self.assertIn('filesystem identity changed',result['error'])
@@ -559,7 +565,7 @@ class ActualOuterTrackingContracts(unittest.TestCase):
                         campaign.invoke([sys.executable,'-c','pass'],folder,
                             dict(deadline_seconds=86400,process_rss_bytes=256*campaign.MIB,
                                  group_rss_bytes=512*campaign.MIB,
-                                 storage=dict(artifact=dict(root=str(root),**campaign.storage_identity(root),reserve_bytes=0))),dict(artifact=root))
+                                 storage=dict(artifact=campaign.storage_descriptor(root,0))),dict(artifact=root))
                 result=json.loads((folder/'result.json').read_text())
                 self.assertFalse(result['complete'])
                 self.assertIn('deadline exceeded',result['error'])

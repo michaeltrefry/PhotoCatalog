@@ -31,7 +31,7 @@ def run(probe, executable, output, platform):
     output = output.resolve(strict=True)
     pins = {'probe': package.sha256(probe), 'executable': package.sha256(executable)}
     # Reuse the repository's reviewed process-tree owner and bounded captures.
-    from edit_campaign import invoke,storage_identity
+    from edit_campaign import invoke,storage_descriptor
     inherited, previous_cwd = dict(os.environ), Path.cwd()
     with tempfile.TemporaryDirectory(prefix='photocatalog-installed-cwd-') as cwd:
         try:
@@ -41,8 +41,7 @@ def run(probe, executable, output, platform):
             owned = invoke([str(probe), '--worker-executable', str(executable)], output/'invoke',
                 {'deadline_seconds': 120, 'process_rss_bytes': 1024**3,
                  'group_rss_bytes': 2*1024**3,
-                 'storage': {'artifact': {'root': str(output), **storage_identity(output),
-                                          'reserve_bytes': 64*1024**2}}}, {'artifact': output})
+                 'storage': {'artifact': storage_descriptor(output,64*1024**2)}}, {'artifact': output})
         finally:
             # Windows cannot remove a process's current directory. Restore it
             # before TemporaryDirectory cleanup, including failed child runs.

@@ -87,8 +87,10 @@ class AggregateContracts(unittest.TestCase):
     def supervisor_fixture(self, root):
         folder = root/'action'; folder.mkdir()
         limits = dict(deadline_seconds=10, process_rss_bytes=100, group_rss_bytes=200,
-                      storage=dict(artifact=dict(root=str(root),device=1,inode=10,reserve_bytes=50),
-                                   service=dict(root='/service',device=2,inode=20,reserve_bytes=75)))
+                      storage=dict(artifact=dict(root=str(root),device=1,inode=10,
+                                       parent=str(root.parent),parent_device=1,parent_inode=9,reserve_bytes=50),
+                                   service=dict(root='/service',device=2,inode=20,
+                                       parent='/',parent_device=2,parent_inode=19,reserve_bytes=75)))
         command = ['/fixed/probe', '--request', '/fixed/request']
         def write(name, value): (folder/name).write_text(json.dumps(value)+'\n')
         write('start.json', dict(command=command, limits=limits, started={'monotonic_ns': 100}))
@@ -213,7 +215,8 @@ class AggregateContracts(unittest.TestCase):
             r = dict(phase='export', warmups=2, encoded_extent=1024, output=str(output),service_root=str(service))
             record = dict(id='case', cleanup_path=str(root/'case-cleanup.json'),
                 verification_path=str(root/'verification.json'),
-                probe_supervisor_path=str(root/'probe.json'), verify_supervisor_path=str(root/'verify.json'))
+                probe_supervisor_path=str(root/'probe/result.json'),
+                verify_supervisor_path=str(root/'verify/result.json'))
             rows, encoded, files, directories = [], [], [], [str(service/'catalog')]
             for iteration in range(22):
                 data = ('encoded '+str(iteration)).encode()
@@ -227,17 +230,28 @@ class AggregateContracts(unittest.TestCase):
                 if iteration == 2: Path(path).write_bytes(data)
                 else: files.append(dict(path=path, bytes=len(data), sha256=sha))
             proof = {'result': {'encoded': encoded}}
-            for name, value in (('verification.json', proof), ('probe.json', {}), ('verify.json', {})):
-                (root/name).write_text(json.dumps(value))
+            (root/'verification.json').write_text(json.dumps(proof))
+            storage={name:dict(root=str(path),**aggregate.storage_identity(path),parent=str(path.parent),
+                               parent_device=path.parent.stat().st_dev,parent_inode=path.parent.stat().st_ino,
+                               reserve_bytes=0)
+                     for name,path in (('artifact',root),('service',service_campaign))}
+            for name in ('probe','verify'):
+                folder=root/name;folder.mkdir()
+                (folder/'result.json').write_text('{}')
+                (folder/'start.json').write_text(json.dumps({'limits':{'storage':storage}}))
             retained = dict(path=rows[2]['path'], sha256=encoded[2]['sha256'], blake3=rows[2]['blake3'])
-            start = dict(version=2,case_id='case', retained=retained, delete_files=files, delete_directories=directories)
+            start = dict(version=3,case_id='case', retained=retained, storage=storage,
+                         delete_files=files, delete_directories=directories)
             for key, value in (('verifier_receipt_sha256', 'verification.json'),
-                               ('probe_supervisor_sha256', 'probe.json'), ('verify_supervisor_sha256', 'verify.json')):
+                               ('probe_supervisor_sha256', 'probe/result.json'),
+                               ('verify_supervisor_sha256', 'verify/result.json'),
+                               ('probe_supervisor_start_sha256', 'probe/start.json'),
+                               ('verify_supervisor_start_sha256', 'verify/start.json')):
                 start[key] = hashlib.sha256((root/value).read_bytes()).hexdigest()
             def retain_receipts(plan):
                 data = json.dumps(plan).encode()
                 (root/'case-cleanup-start.json').write_bytes(data)
-                done = dict(version=2,complete=True, error=None, retained=retained, start_sha256=hashlib.sha256(data).hexdigest(),
+                done = dict(version=3,complete=True, error=None, retained=retained, start_sha256=hashlib.sha256(data).hexdigest(),
                             deleted_paths=[f['path'] for f in plan['delete_files']]+plan['delete_directories'])
                 (root/'case-cleanup.json').write_text(json.dumps(done))
             retain_receipts(start)

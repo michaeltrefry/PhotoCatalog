@@ -34,6 +34,13 @@ def storage_identity(path):
     if not stat.S_ISDIR(value.st_mode):
         raise ValueError('ordinary storage directory required')
     return dict(device=value.st_dev,inode=value.st_ino)
+
+
+def storage_descriptor(path,reserve_bytes):
+    path=Path(path)
+    return dict(root=str(path),**storage_identity(path),parent=str(path.parent),
+                **{('parent_'+key):value for key,value in storage_identity(path.parent).items()},
+                reserve_bytes=reserve_bytes)
 MAX_TELEMETRY=32*MIB
 MAX_ACTIVE=4
 MAX_SEEN=256
@@ -391,15 +398,20 @@ def invoke(command, folder, limits, disk_roots, *, supervision=None):
         raise ValueError('positive finite at-most-24-hour owner deadline required')
     storage=limits.get('storage')
     if (not isinstance(disk_roots,dict) or not disk_roots or set(disk_roots)!=set(storage or {})
-        or any(not isinstance(value,dict) or set(value)!= {'root','device','inode','reserve_bytes'}
+        or any(not isinstance(value,dict) or set(value)!= {
+                   'root','device','inode','parent','parent_device','parent_inode','reserve_bytes'}
                or type(value['device']) is not int or type(value['inode']) is not int
+               or type(value['parent_device']) is not int or type(value['parent_inode']) is not int
                or type(value['reserve_bytes']) is not int
                or value['reserve_bytes']<0 for value in (storage or {}).values())):
         raise ValueError('exact named storage roots/reserves required')
     disk_roots={name:Path(path) for name,path in disk_roots.items()}
     if any(not disk_roots[name].is_absolute() or disk_roots[name].resolve(strict=True)!=disk_roots[name]
            or str(disk_roots[name])!=value['root']
+           or str(disk_roots[name].parent)!=value['parent']
            or storage_identity(disk_roots[name])!={key:value[key] for key in ('device','inode')}
+           or storage_identity(disk_roots[name].parent)!={
+               key.removeprefix('parent_'):value[key] for key in ('parent_device','parent_inode')}
            for name,value in storage.items()):
         raise ValueError('named storage root identity changed')
     folder=Path(folder)
@@ -448,6 +460,8 @@ def invoke(command, folder, limits, disk_roots, *, supervision=None):
                 total=sum(p['rss'] for p in records)
                 peak=max(peak,total)
                 if any(storage_identity(disk_roots[name])!={key:value[key] for key in ('device','inode')}
+                       or storage_identity(disk_roots[name].parent)!={
+                           key.removeprefix('parent_'):value[key] for key in ('parent_device','parent_inode')}
                        for name,value in storage.items()):
                     raise RuntimeError('live filesystem identity changed')
                 free={name:psutil.disk_usage(os.fspath(path)).free for name,path in disk_roots.items()}
@@ -631,8 +645,8 @@ def execute(binding,root):
                     raise ValueError('unknown action')
                 limits=dict(deadline_seconds=action['deadline_seconds'],
                             process_rss_bytes=action['process_rss_bytes'],group_rss_bytes=action['group_rss_bytes'],
-                            storage={name:dict(root=str(roots[name]),**identities[name],
-                                reserve_bytes=binding['volumes'][name]['free_reserve_bytes']+
+                            storage={name:storage_descriptor(roots[name],
+                                binding['volumes'][name]['free_reserve_bytes']+
                                     binding['volumes'][name]['post_campaign_bytes']) for name in roots})
                 if command!=action['command']:
                     raise ValueError('actual command differs from frozen argv')

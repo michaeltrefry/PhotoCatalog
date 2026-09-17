@@ -127,8 +127,8 @@ def prepare(manifest_descriptor,build,root):
                     raise ValueError('preparation storage identity changed')
                 limits=dict(deadline_seconds=600,process_rss_bytes=qualification.GIB,
                             group_rss_bytes=qualification.GIB,
-                            storage=dict(artifact=dict(root=str(root),**artifact_identity,
-                                reserve_bytes=artifact['free_reserve_bytes'])))
+                            storage=dict(artifact=edit_campaign.storage_descriptor(
+                                root,artifact['free_reserve_bytes'])))
                 supervisor=root/('generate-'+fixture)
                 edit_campaign.invoke(command,supervisor,limits,dict(artifact=root))
                 require_host_evidence(host)
