@@ -6,16 +6,17 @@ export type ExportEditAdmission = {
   operation: Operation | null;
 };
 
-// A rendering or foreground-yielding Run owns SQL for native ticks. SaveRecipe still
-// meets the actor's authoritative pre-mutation Busy check, and EditQueue keeps
-// the user's latest recipe while retrying that typed refusal. Unknown export
-// state, admission, recovery, cancellation and terminal drain stay held. Yield
-// also covers an explicit pause; its SQL custody uses the same Busy boundary.
+// Run stage labels describe progress, not SQL custody: publication checkpoints
+// can persist into the next tick. Keep inputs stable throughout an ordinary Run.
+// SaveRecipe still meets the actor's pre-mutation Busy guard; EditQueue retains
+// the latest recipe and reports an error if its finite retry budget expires.
+// Unknown state, admission, other operation kinds, cancellation and drain stay held.
 export function exportHoldsRecipeEdits({ ready, admitting, operation }: ExportEditAdmission) {
   if (!ready || admitting || !operation?.write_hold) return !ready || admitting;
   return !(operation.kind === 'run'
     && operation.phase === 'running'
-    && (operation.stage === 'rendering' || operation.stage === 'yielding'));
+    && operation.stage !== 'draining'
+    && operation.stage !== 'finished');
 }
 
 export type RecipeControlHolds = {

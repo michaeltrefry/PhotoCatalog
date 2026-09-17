@@ -9,10 +9,33 @@ const operation = (values: Partial<Operation>): Operation => ({
 });
 
 describe('recipe edit admission during export', () => {
-  it('keeps recipe inputs enabled as a Run yields to foreground previews', () => {
-    expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({}) })).toBe(false);
+  it('keeps inputs stable across the entire ordinary Run lifecycle', () => {
+    const stages: Record<Operation['stage'], boolean> = {
+      opening: false, planning: false, hashing: false, alias: false,
+      waiting_for_previews: false, rendering: false, accepting: false,
+      intent_committed: false, captured: false, capture_verified: false,
+      linked: false, finalizing: false, installed_verified: false,
+      recovering: false, restoring: false, yielding: false,
+      draining: true, finished: true,
+    };
+    for (const [stage, held] of Object.entries(stages)) {
+      expect(exportHoldsRecipeEdits({ ready: true, admitting: false,
+        operation: operation({ stage: stage as Operation['stage'] }) }), stage).toBe(held);
+    }
     expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ write_hold: false }) })).toBe(false);
-    expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ stage: 'yielding' }) })).toBe(false);
+  });
+
+  it('does not interpret progress labels as authority for other phases or operations', () => {
+    const phases: Operation['phase'][] = ['waiting_for_previews', 'paused', 'cancel_requested', 'complete', 'canceled', 'failed'];
+    for (const phase of phases) {
+      expect(exportHoldsRecipeEdits({ ready: true, admitting: false,
+        operation: operation({ phase }) }), phase).toBe(true);
+    }
+    const kinds: Operation['kind'][] = ['profile', 'paths', 'destinations', 'append', 'recover', 'retry_seal', 'restore', 'cancel'];
+    for (const kind of kinds) {
+      expect(exportHoldsRecipeEdits({ ready: true, admitting: false,
+        operation: operation({ kind }) }), kind).toBe(true);
+    }
   });
 
   it('retains unknown, admission, recovery, cancellation and drain holds', () => {
