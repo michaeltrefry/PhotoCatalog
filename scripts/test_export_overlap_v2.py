@@ -56,6 +56,52 @@ def raw_proof(observer):
 
 
 class EvaluationTests(unittest.TestCase):
+    def systemerror_fixture(self, detail='zombie'):
+        values = fixture(); observations = values[1]; summary = observations[-1]
+        closed = observations[-2]; closed_ns = 201002
+        closed.update(closed_reason='proc_cmdline_system_error', monotonic_ns=closed_ns)
+        summary['segments'][0].update(closed_reason=closed['closed_reason'], closed_observed_monotonic_ns=closed_ns)
+        error = LifecycleTests.cmdline_error()
+        original = {'kind': 'process_query_failure', 'pid': 43, 'birth_unix_s': 123, 'operation': 'cmdline',
+                    'error': 'SystemError: ' + str(error), 'exception_chain': observer_module.exception_evidence(error), 'has_direct_cause': True,
+                    'failure_monotonic_ns': closed_ns, 'failure_wall_ns': closed_ns + 999,
+                    'monotonic_ns': closed_ns}
+        probe = {'state': 'gone', 'detail': detail, 'before_monotonic_ns': 201010, 'after_monotonic_ns': 201020,
+                 'within_budget': True, 'observed_status': 'zombie', 'observed_birth_unix_s': None, 'exception_chain': []}
+        if detail == 'pid_reused':
+            probe.update(observed_status='running', observed_birth_unix_s=124)
+        elif detail == 'absent_or_zombie':
+            probe.update(observed_status=None, exception_chain=[{'type': 'NoSuchProcess', 'message': 'gone', 'errno': None}])
+        gap = {**copy.deepcopy(original), 'kind': 'observation_gap', 'reason': closed['closed_reason'],
+               'monotonic_ns': 201030, 'lifecycle': 'gone', 'lifecycle_detail': detail,
+               'recheck_deadline_monotonic_ns': 202000, 'recheck_budget_ns': 250000000,
+               'recheck_max_probes': 11, 'lifecycle_probes': [probe]}
+        observations[-1:-1] = [original, gap]
+        summary['observation_gaps'] = 1
+        return values
+
+    def test_systemerror_gap_requires_exact_original_cause_bound_probes_and_exit(self):
+        for detail in ('zombie', 'pid_reused', 'absent_or_zombie'):
+            values = self.systemerror_fixture(detail)
+            self.assertEqual(evaluate(*values)['verdict'], 'TIMING_PASS_REQUIRES_EXPORT_RECONCILIATION')
+        mutations = [lambda rows: rows.pop(-3),
+                     lambda rows: rows.insert(-1, copy.deepcopy(rows[-3])),
+                     lambda rows: rows[-2].update(operation='cwd'),
+                     lambda rows: rows[-2].update(has_direct_cause=False),
+                     lambda rows: rows[-2].update(failure_monotonic_ns=201003),
+                     lambda rows: rows[-2]['exception_chain'][1].update(errno=1),
+                     lambda rows: rows[-2]['exception_chain'][0].update(message='other SystemError'),
+                     lambda rows: rows[-2]['lifecycle_probes'][0].update(within_budget=False),
+                     lambda rows: rows[-2]['lifecycle_probes'][0].update(after_monotonic_ns=202001),
+                     lambda rows: rows[-2]['lifecycle_probes'][0].update(state='unknown'),
+                     lambda rows: rows[-2]['lifecycle_probes'][0].update(integrity_error=True),
+                     lambda rows: rows[-2]['lifecycle_probes'][0].update(observed_status='running'),
+                     lambda rows: rows[-2].update(recheck_deadline_monotonic_ns=251201003)]
+        for mutate in mutations:
+            values = self.systemerror_fixture(); mutate(values[1])
+            with self.assertRaisesRegex(ValueError, 'closure cause|Unreconciled'):
+                evaluate(*values)
+
     def test_raw_summary_bijection_and_aggregate_mutations_reject(self):
         a = fixture(); extra = copy.deepcopy(a[1][1]); extra['segment'] = 99
         a[1].insert(-1, extra)
@@ -213,7 +259,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(lifecycle(42, 12)[0], 'unknown')
         with self.assertRaises(psutil.AccessDenied): same_birth(42, 12)
 
-    def run_observer(self, failure, operation='cmdline', gone=False, root_error=False):
+    def run_observer(self, failure, operation='cmdline', gone=False, root_error=False, fail_at=3, probe_error=None, sleep_error=None, final_root_error=None, late_probe=False, final_exe_error=None):
         with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
             base = Path(temporary); exe = base / 'installed'; exe.write_bytes(b'fixture')
             workers = base / 'export-workers'; workers.mkdir(); stage = workers / 'photo-worker-test'; stage.mkdir()
@@ -226,7 +272,7 @@ class LifecycleTests(unittest.TestCase):
             def operation_call():
                 nonlocal calls, ended
                 calls += 1
-                if calls == 3:
+                if calls == fail_at:
                     ended = True
                     raise failure
                 return [str(exe), observer_module.ROLE] if operation == 'cmdline' else str(stage)
@@ -237,36 +283,113 @@ class LifecycleTests(unittest.TestCase):
                 nonlocal post_denial_reads
                 if ended:
                     post_denial_reads += 1
+                    if probe_error is not None:
+                        raise probe_error
                 return psutil.STATUS_ZOMBIE if ended and (gone is True or gone == 'later' and post_denial_reads >= 2) else 'running'
             child.status.side_effect = status
             child.is_running.return_value = True
             root.children.side_effect = [list([child]), list([child]), failure] if root_error else None
             root.children.return_value = [child]
+            if final_root_error is not None:
+                root.status.side_effect = ['running'] * 4 + [final_root_error]
             args = ['observer', '--pid', '41', '--exe', str(exe), '--exe-sha256', hashlib.sha256(b'fixture').hexdigest(),
                     '--export-workers', str(workers), '--job', 'job', '--output', str(output), '--seconds', '.05']
+            ticks = iter(range(1_000_000_000, 2_000_000_000, 1000))
+            def monotonic_ns():
+                return next(ticks) + (250_000_001 if late_probe and post_denial_reads else 0)
             bindings = {
                 'sys.argv': args, 'sys.platform': 'darwin',
                 'psutil.Process': lambda pid: root if pid == 41 else child,
                 'time.monotonic': Mock(side_effect=[0, 0, .01, .02, .03, .06]),
-                'time.monotonic_ns': Mock(side_effect=iter(range(1_000_000_000, 2_000_000_000, 1000))),
+                'time.monotonic_ns': Mock(side_effect=monotonic_ns),
                 'time.sleep': Mock(), 'time.get_clock_info': Mock(return_value=Mock(implementation='mach_absolute_time()')),
                 'read_stage': Mock(return_value={'job': 'job', 'sequence': 1, 'attempt': 'attempt', 'authority': 'authority',
                     'active_lock': str(stage / 'active.lock'), 'active_lock_device_inode': [1, 2]}),
                 'lock_contended': Mock(return_value=True),
                 'child_holds_lock': Mock(return_value={'exact_path_open': True, 'elapsed_ns': 1}),
             }
+            if final_exe_error is not None:
+                bindings['sha256_path'] = Mock(side_effect=[hashlib.sha256(b'fixture').hexdigest(), final_exe_error])
+            if sleep_error is not None:
+                bindings['time.sleep'] = Mock(side_effect=[None, sleep_error])
             for name, value in bindings.items(): stack.enter_context(patch('observe_export_native_v2.' + name, value))
             real_recheck = observer_module.recheck_denied_lifecycle
             def recheck(*args):
                 current = [json.loads(line) for line in output.read_text().splitlines()]
-                self.assertEqual(current[-1]['kind'], 'segment_closed')
-                self.assertEqual(current[-1]['closed_reason'], 'denied_access')
-                self.assertEqual(current[-1]['monotonic_ns'], args[2])
+                if isinstance(failure, SystemError):
+                    self.assertEqual(current[-1]['kind'], 'process_query_failure')
+                    self.assertEqual(current[-1]['failure_monotonic_ns'], args[2])
+                    if fail_at > 1:
+                        self.assertEqual(current[-2]['kind'], 'segment_closed')
+                        self.assertEqual(current[-2]['monotonic_ns'], args[2])
+                else:
+                    self.assertEqual(current[-1]['kind'], 'segment_closed')
+                    self.assertEqual(current[-1]['closed_reason'], 'denied_access')
+                    self.assertEqual(current[-1]['monotonic_ns'], args[2])
                 return real_recheck(*args)
             with patch.object(observer_module, 'recheck_denied_lifecycle', side_effect=recheck):
                 code = observer_module.main()
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             return code, rows
+
+    @staticmethod
+    def cmdline_error(known=True):
+        error = SystemError('<built-in function proc_cmdline> returned a result with an exception set')
+        if known:
+            error.__cause__ = PermissionError(13, 'force permission denied (originated from sysctl(KERN_PROCARGS2) -> errno 0)')
+        return error
+
+    def test_main_known_cmdline_systemerror_gap_only_with_fresh_exit_and_known_worker(self):
+        for gone in (True, 'later'):
+            code, rows = self.run_observer(self.cmdline_error(), gone=gone)
+            self.assertEqual(code, 0)
+            self.assertEqual(rows[-1]['fatal_errors'], 0)
+            self.assertEqual(rows[-1]['observation_gaps'], 1)
+            self.assertEqual(rows[-1]['segments'][0]['positive_observations'], 2)
+            gap = next(row for row in rows if row['kind'] == 'observation_gap')
+            self.assertEqual(gap['reason'], 'proc_cmdline_system_error')
+            self.assertEqual([part['type'] for part in gap['exception_chain']], ['SystemError', 'PermissionError'])
+            self.assertEqual(gap['exception_chain'][1]['errno'], 13)
+            closed = next(row for row in rows if row['kind'] == 'segment_closed')
+            self.assertEqual(gap['failure_monotonic_ns'], closed['monotonic_ns'])
+            self.assertLessEqual(closed['monotonic_ns'], gap['lifecycle_probes'][0]['before_monotonic_ns'])
+
+    def test_main_systemerror_unknown_live_unbound_or_wrong_operation_is_fatal(self):
+        wrong_cause = self.cmdline_error(); wrong_cause.__cause__ = PermissionError(1, 'other denial')
+        context_only = self.cmdline_error(False); context_only.__context__ = self.cmdline_error().__cause__
+        for error, options in [(wrong_cause, {'gone': True}), (context_only, {'gone': True}),
+                               (self.cmdline_error(False), {'gone': True}),
+                               (self.cmdline_error(), {}),
+                               (self.cmdline_error(), {'gone': True, 'fail_at': 1}),
+                               (self.cmdline_error(), {'gone': True, 'operation': 'cwd'}),
+                               (self.cmdline_error(), {'probe_error': self.cmdline_error(False)}),
+                               (self.cmdline_error(), {'gone': True, 'late_probe': True})]:
+            code, rows = self.run_observer(error, **options)
+            self.assertEqual(code, 2)
+            self.assertEqual(rows[-1]['kind'], 'summary')
+            self.assertEqual(rows[-1]['fatal_errors'], 1)
+            self.assertEqual(rows[-1]['observation_gaps'], 0)
+            failure = next(row for row in rows if row['kind'] == 'error')
+            self.assertEqual(failure['exception_chain'][0]['type'], 'SystemError')
+            if options.get('probe_error'):
+                self.assertEqual(failure['lifecycle'], 'unknown')
+                self.assertEqual(len(failure['lifecycle_probes']), 1)
+                self.assertTrue(failure['lifecycle_probes'][0]['integrity_error'])
+
+    def test_main_generic_child_enumeration_loop_and_final_validation_errors_finish_receipt(self):
+        for options in ({}, {'root_error': True}, {'sleep_error': LookupError('interval failure')},
+                        {'fail_at': 10, 'final_root_error': SystemError('final lifecycle failure')},
+                        {'fail_at': 10, 'final_exe_error': LookupError('final executable failure')}):
+            code, rows = self.run_observer(LookupError('unexpected observation failure'), **options)
+            self.assertEqual(code, 2)
+            self.assertEqual(rows[-1]['kind'], 'summary')
+            self.assertEqual(rows[-1]['fatal_errors'], 1)
+            self.assertEqual(sum(row['kind'] == 'segment_closed' for row in rows), len(rows[-1]['segments']))
+            for segment in rows[-1]['segments']:
+                self.assertIn('closed_reason', segment)
+            failure = next(row for row in rows if row['kind'] == 'error')
+            evidence = failure.get('exception_chain') or failure['lifecycle_observation']['exception_chain']
+            self.assertIn(evidence[0]['type'], ('LookupError', 'SystemError'))
 
     def test_main_denied_exit_closes_without_reopening(self):
         code, rows = self.run_observer(psutil.AccessDenied(42), gone=True)

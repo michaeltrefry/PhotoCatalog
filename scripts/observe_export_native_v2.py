@@ -45,6 +45,17 @@ def exception_evidence(error: BaseException) -> list[dict[str, Any]]:
     return chain
 
 
+def known_cmdline_permission_race(error: SystemError) -> bool:
+    # psutil 7.2.2 proc_utils.c:93-97 sets EACCES but returns success.
+    # Require its exact direct cause; arbitrary SystemError is integrity failure.
+    cause = error.__cause__
+    return (
+        str(error) == "<built-in function proc_cmdline> returned a result with an exception set"
+        and type(cause) is PermissionError and cause.errno == errno.EACCES
+        and str(cause) == "[Errno 13] force permission denied (originated from sysctl(KERN_PROCARGS2) -> errno 0)"
+    )
+
+
 def lifecycle_observation(pid: int, birth: float | None) -> dict[str, Any]:
     observed: dict[str, Any] = {"observed_status": None, "observed_birth_unix_s": None, "exception_chain": []}
     operation = "process"
@@ -62,9 +73,11 @@ def lifecycle_observation(pid: int, birth: float | None) -> dict[str, Any]:
     except (psutil.NoSuchProcess, psutil.ZombieProcess) as error:
         return {**observed, "state": "gone", "detail": "absent_or_zombie", "operation": operation,
                 "exception_chain": exception_evidence(error)}
-    except (psutil.AccessDenied, OSError) as error:
+    except Exception as error:
+        # A psutil extension or observer failure is not affirmative exit evidence.
         return {**observed, "state": "unknown", "detail": f"{type(error).__name__}: {error}",
-                "operation": operation, "exception_chain": exception_evidence(error)}
+                "operation": operation, "exception_chain": exception_evidence(error),
+                "integrity_error": not isinstance(error, (psutil.AccessDenied, OSError))}
 
 
 def lifecycle(pid: int, birth: float | None) -> tuple[str, str]:
@@ -97,7 +110,7 @@ def recheck_denied_lifecycle(pid: int, birth: float | None, denial_ns: int,
         if not within:
             state, detail = "unknown", "lifecycle_read_exceeded_recheck_deadline"
             break
-        if state == "gone":
+        if state == "gone" or value.get("integrity_error"):
             break
         remaining = deadline - time.monotonic_ns()
         if remaining <= 0:
@@ -406,222 +419,269 @@ def main() -> int:
             current_segment[key] = len(segments) - 1
             return len(segments) - 1
 
-        while time.monotonic() < deadline:
-            root_state, root_detail = lifecycle(args.pid, root_birth)
-            if root_state != "live":
-                fatal_errors += 1
-                emit({"kind": "error", "operation": "root_lifecycle", "pid": args.pid,
-                      "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
-                      "error": root_detail, "lifecycle": root_state})
-                break
-            loop_started = time.monotonic_ns()
-            wall_ns = time.time_ns()
-            try:
-                children = root.children(recursive=True)
-            except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied, OSError) as error:
-                fatal_errors += 1
-                emit({"kind": "error", "operation": "root_children", "pid": args.pid,
-                      "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
-                      "error": f"{type(error).__name__}: {error}"})
-                break
-            seen: set[tuple[int, float]] = set()
-            for listed_child in children:
-                key: tuple[int, float] | None = None
-                operation = "child_identity"
+        operation = "observer_loop"
+        try:
+            while time.monotonic() < deadline:
+                operation = "root_lifecycle"
+                root_observation = lifecycle_observation(args.pid, root_birth)
+                root_state, root_detail = root_observation["state"], root_observation["detail"]
+                if root_state != "live":
+                    fatal_errors += 1
+                    emit({"kind": "error", "operation": "root_lifecycle", "pid": args.pid,
+                          "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+                          "error": root_detail, "lifecycle": root_state,
+                          "lifecycle_observation": root_observation})
+                    break
+                loop_started = time.monotonic_ns()
+                wall_ns = time.time_ns()
+                operation = "root_children"
                 try:
-                    child = psutil.Process(listed_child.pid)
-                    birth = child.create_time()
-                    key = (child.pid, birth)
-                    if key in retired:
-                        continue
-                    operation = "cmdline"
-                    cmdline = child.cmdline()
-                    if cmdline[1:] != [ROLE]:
-                        continue
-                    seen.add(key)
-                    operation = "executable"
-                    child_exe = Path(child.exe()).resolve(strict=True)
-                    if child_exe != executable:
-                        raise RuntimeError("worker executable path differs from bound executable")
-                    operation = "cwd"
-                    cwd = Path(child.cwd()).resolve(strict=True)
-                    operation = "ancestry"
-                    chain = ancestry(child, args.pid, root_birth)
-                    if key not in admitted:
-                        admission_before_wall = time.time_ns()
-                        admission_before_mono = time.monotonic_ns()
-                        operation = "stage_admission"
-                        stage = read_stage(cwd, workers, args.job)
-                        initial_contended = lock_contended(
-                            Path(stage["active_lock"]), tuple(stage["active_lock_device_inode"])
-                        )
-                        operation = "lsof"
-                        lsof = child_holds_lock(child.pid, Path(stage["active_lock"]))
-                        birth_current = same_birth(child.pid, birth)
-                        final_contended = lock_contended(
-                            Path(stage["active_lock"]), tuple(stage["active_lock_device_inode"])
-                        )
-                        admission_after_wall = time.time_ns()
-                        admission_after_mono = time.monotonic_ns()
-                        if (
-                            not initial_contended or not final_contended or not birth_current
-                            or not lsof["exact_path_open"] or lsof["elapsed_ns"] > 1_100_000_000
-                        ):
-                            emit({"kind": "candidate_rejected", "pid": child.pid,
-                                  "birth_unix_s": birth,
+                    children = root.children(recursive=True)
+                except Exception as error:
+                    fatal_errors += 1
+                    emit({"kind": "error", "operation": "root_children", "pid": args.pid,
+                          "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+                          "error": f"{type(error).__name__}: {error}",
+                          "exception_chain": exception_evidence(error)})
+                    break
+                seen: set[tuple[int, float]] = set()
+                for listed_child in children:
+                    key: tuple[int, float] | None = None
+                    operation = "child_identity"
+                    try:
+                        child = psutil.Process(listed_child.pid)
+                        birth = child.create_time()
+                        key = (child.pid, birth)
+                        if key in retired:
+                            continue
+                        operation = "cmdline"
+                        cmdline = child.cmdline()
+                        if cmdline[1:] != [ROLE]:
+                            continue
+                        seen.add(key)
+                        operation = "executable"
+                        child_exe = Path(child.exe()).resolve(strict=True)
+                        if child_exe != executable:
+                            raise RuntimeError("worker executable path differs from bound executable")
+                        operation = "cwd"
+                        cwd = Path(child.cwd()).resolve(strict=True)
+                        operation = "ancestry"
+                        chain = ancestry(child, args.pid, root_birth)
+                        if key not in admitted:
+                            admission_before_wall = time.time_ns()
+                            admission_before_mono = time.monotonic_ns()
+                            operation = "stage_admission"
+                            stage = read_stage(cwd, workers, args.job)
+                            initial_contended = lock_contended(
+                                Path(stage["active_lock"]), tuple(stage["active_lock_device_inode"])
+                            )
+                            operation = "lsof"
+                            lsof = child_holds_lock(child.pid, Path(stage["active_lock"]))
+                            birth_current = same_birth(child.pid, birth)
+                            final_contended = lock_contended(
+                                Path(stage["active_lock"]), tuple(stage["active_lock_device_inode"])
+                            )
+                            admission_after_wall = time.time_ns()
+                            admission_after_mono = time.monotonic_ns()
+                            if (
+                                not initial_contended or not final_contended or not birth_current
+                                or not lsof["exact_path_open"] or lsof["elapsed_ns"] > 1_100_000_000
+                            ):
+                                emit({"kind": "candidate_rejected", "pid": child.pid,
+                                      "birth_unix_s": birth,
+                                      "positive_before_wall_ns": admission_before_wall,
+                                      "positive_before_monotonic_ns": admission_before_mono,
+                                      "positive_after_wall_ns": admission_after_wall,
+                                      "positive_after_monotonic_ns": admission_after_mono,
+                                      "initial_contended": initial_contended,
+                                      "final_contended": final_contended,
+                                      "birth_current_after_lsof": birth_current, "lsof": lsof})
+                                continue
+                            stage["ancestry_child_to_root"] = chain
+                            stage["lsof_admission"] = lsof
+                            admitted[key] = stage
+                            segment_index = start_segment(
+                                key, stage, admission_before_wall, admission_before_mono,
+                                admission_after_wall, admission_after_mono, True,
+                            )
+                            positive_observations += 1
+                            emit({"kind": "stage_admitted", "pid": child.pid,
+                                  "birth_unix_s": birth, "segment": segment_index + 1,
                                   "positive_before_wall_ns": admission_before_wall,
                                   "positive_before_monotonic_ns": admission_before_mono,
                                   "positive_after_wall_ns": admission_after_wall,
-                                  "positive_after_monotonic_ns": admission_after_mono,
-                                  "initial_contended": initial_contended,
-                                  "final_contended": final_contended,
-                                  "birth_current_after_lsof": birth_current, "lsof": lsof})
+                                  "positive_after_monotonic_ns": admission_after_mono, **stage})
                             continue
-                        stage["ancestry_child_to_root"] = chain
-                        stage["lsof_admission"] = lsof
-                        admitted[key] = stage
-                        segment_index = start_segment(
-                            key, stage, admission_before_wall, admission_before_mono,
-                            admission_after_wall, admission_after_mono, True,
-                        )
-                        positive_observations += 1
-                        emit({"kind": "stage_admitted", "pid": child.pid,
-                              "birth_unix_s": birth, "segment": segment_index + 1,
-                              "positive_before_wall_ns": admission_before_wall,
-                              "positive_before_monotonic_ns": admission_before_mono,
-                              "positive_after_wall_ns": admission_after_wall,
-                              "positive_after_monotonic_ns": admission_after_mono, **stage})
-                        continue
-                    stage = admitted[key]
-                    operation = "active_probe"
-                    probe_before_wall = time.time_ns()
-                    probe_before_mono = time.monotonic_ns()
-                    if not same_birth(child.pid, birth):
-                        observation_gaps += 1
-                        close_segment(key, "pid_birth_not_current", probe_before_wall, probe_before_mono)
-                        emit({"kind": "observation_gap", "pid": child.pid,
-                              "birth_unix_s": birth, "reason": "pid_birth_not_current",
-                              "wall_ns": probe_before_wall, "monotonic_ns": probe_before_mono})
-                        continue
-                    contended = lock_contended(
-                        Path(stage["active_lock"]), tuple(stage["active_lock_device_inode"])
-                    )
-                    if not contended:
-                        observation_gaps += 1
-                        close_segment(key, "active_lock_not_contended", probe_before_wall, probe_before_mono)
-                        emit({"kind": "observation_gap", "pid": child.pid,
-                              "birth_unix_s": birth, "reason": "active_lock_not_contended",
-                              "wall_ns": probe_before_wall, "monotonic_ns": probe_before_mono})
-                        continue
-                    lsof_confirmed = False
-                    segment_index = current_segment.get(key)
-                    last_lsof = segments[segment_index]["last_lsof_monotonic_ns"] if segment_index is not None else 0
-                    if probe_before_mono - last_lsof >= 2_000_000_000:
-                        operation = "lsof"
-                        lsof = child_holds_lock(child.pid, Path(stage["active_lock"]))
+                        stage = admitted[key]
+                        operation = "active_probe"
+                        probe_before_wall = time.time_ns()
+                        probe_before_mono = time.monotonic_ns()
                         if not same_birth(child.pid, birth):
                             observation_gaps += 1
-                            close_segment(key, "pid_birth_changed_after_lsof", time.time_ns(), time.monotonic_ns())
+                            close_segment(key, "pid_birth_not_current", probe_before_wall, probe_before_mono)
                             emit({"kind": "observation_gap", "pid": child.pid,
-                                  "birth_unix_s": birth, "reason": "pid_birth_changed_after_lsof",
-                                  "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
-                                      "lsof": lsof})
+                                  "birth_unix_s": birth, "reason": "pid_birth_not_current",
+                                  "wall_ns": probe_before_wall, "monotonic_ns": probe_before_mono})
                             continue
-                        if not lsof["exact_path_open"] or lsof["elapsed_ns"] > 1_100_000_000:
-                            raise RuntimeError("live worker active.lock lsof admission failed")
-                        if not lock_contended(
+                        contended = lock_contended(
                             Path(stage["active_lock"]), tuple(stage["active_lock_device_inode"])
-                        ):
-                            observation_gaps += 1
-                            close_segment(key, "active_lock_changed_after_lsof", time.time_ns(), time.monotonic_ns())
-                            emit({"kind": "observation_gap", "pid": child.pid,
-                                  "birth_unix_s": birth, "reason": "active_lock_changed_after_lsof",
-                                  "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
-                                  "lsof": lsof})
-                            continue
-                        lsof_confirmed = True
-                    elif not same_birth(child.pid, birth):
-                        observation_gaps += 1
-                        close_segment(key, "pid_birth_changed_after_probe", time.time_ns(), time.monotonic_ns())
-                        emit({"kind": "observation_gap", "pid": child.pid,
-                              "birth_unix_s": birth, "reason": "pid_birth_changed_after_probe",
-                              "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()})
-                        continue
-                    probe_after_wall = time.time_ns()
-                    probe_after_mono = time.monotonic_ns()
-                    segment_index = current_segment.get(key)
-                    if segment_index is None:
-                        segment_index = start_segment(
-                            key, stage, probe_before_wall, probe_before_mono,
-                            probe_after_wall, probe_after_mono, lsof_confirmed,
                         )
-                    else:
-                        segment = segments[segment_index]
-                        segment["last_positive_before_wall_ns"] = probe_before_wall
-                        segment["last_positive_before_monotonic_ns"] = probe_before_mono
-                        segment["last_positive_after_wall_ns"] = probe_after_wall
-                        segment["last_positive_after_monotonic_ns"] = probe_after_mono
-                        segment["positive_observations"] += 1
-                        if lsof_confirmed:
-                            segment["lsof_confirmations"] += 1
-                            segment["last_lsof_monotonic_ns"] = probe_after_mono
-                    positive_observations += 1
-                    emit({"kind": "active", "pid": child.pid, "birth_unix_s": birth,
-                          "segment": segment_index + 1,
-                          "positive_before_wall_ns": probe_before_wall,
-                          "positive_before_monotonic_ns": probe_before_mono,
-                          "positive_after_wall_ns": probe_after_wall,
-                          "positive_after_monotonic_ns": probe_after_mono,
-                          "lsof_rechecked": lsof_confirmed,
-                          "job": stage["job"], "sequence": stage["sequence"],
-                          "attempt": stage["attempt"], "authority": stage["authority"],
-                          "active_lock_device_inode": stage["active_lock_device_inode"]})
-                except (psutil.NoSuchProcess, psutil.ZombieProcess, FileNotFoundError) as error:
-                    observation_gaps += 1
-                    now_wall, now_mono = time.time_ns(), time.monotonic_ns()
-                    if key is not None:
-                        close_segment(key, "lifecycle_race", now_wall, now_mono)
-                    emit({"kind": "observation_gap", "pid": listed_child.pid,
-                          "wall_ns": now_wall, "monotonic_ns": now_mono,
-                          "operation": operation, "reason": f"{type(error).__name__}: {error}"})
-                except psutil.AccessDenied as error:
-                    # Retire at the first denial, before inspection or any wait.
-                    denial_mono, denial_wall = time.monotonic_ns(), time.time_ns()
-                    if key is not None:
-                        close_segment(key, "denied_access", denial_wall, denial_mono)
-                    evidence = recheck_denied_lifecycle(listed_child.pid, key[1] if key else None,
-                                                        denial_mono, deadline_ns)
-                    if evidence["lifecycle"] == "gone":
+                        if not contended:
+                            observation_gaps += 1
+                            close_segment(key, "active_lock_not_contended", probe_before_wall, probe_before_mono)
+                            emit({"kind": "observation_gap", "pid": child.pid,
+                                  "birth_unix_s": birth, "reason": "active_lock_not_contended",
+                                  "wall_ns": probe_before_wall, "monotonic_ns": probe_before_mono})
+                            continue
+                        lsof_confirmed = False
+                        segment_index = current_segment.get(key)
+                        last_lsof = segments[segment_index]["last_lsof_monotonic_ns"] if segment_index is not None else 0
+                        if probe_before_mono - last_lsof >= 2_000_000_000:
+                            operation = "lsof"
+                            lsof = child_holds_lock(child.pid, Path(stage["active_lock"]))
+                            if not same_birth(child.pid, birth):
+                                observation_gaps += 1
+                                close_segment(key, "pid_birth_changed_after_lsof", time.time_ns(), time.monotonic_ns())
+                                emit({"kind": "observation_gap", "pid": child.pid,
+                                      "birth_unix_s": birth, "reason": "pid_birth_changed_after_lsof",
+                                      "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+                                          "lsof": lsof})
+                                continue
+                            if not lsof["exact_path_open"] or lsof["elapsed_ns"] > 1_100_000_000:
+                                raise RuntimeError("live worker active.lock lsof admission failed")
+                            if not lock_contended(
+                                Path(stage["active_lock"]), tuple(stage["active_lock_device_inode"])
+                            ):
+                                observation_gaps += 1
+                                close_segment(key, "active_lock_changed_after_lsof", time.time_ns(), time.monotonic_ns())
+                                emit({"kind": "observation_gap", "pid": child.pid,
+                                      "birth_unix_s": birth, "reason": "active_lock_changed_after_lsof",
+                                      "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+                                      "lsof": lsof})
+                                continue
+                            lsof_confirmed = True
+                        elif not same_birth(child.pid, birth):
+                            observation_gaps += 1
+                            close_segment(key, "pid_birth_changed_after_probe", time.time_ns(), time.monotonic_ns())
+                            emit({"kind": "observation_gap", "pid": child.pid,
+                                  "birth_unix_s": birth, "reason": "pid_birth_changed_after_probe",
+                                  "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()})
+                            continue
+                        probe_after_wall = time.time_ns()
+                        probe_after_mono = time.monotonic_ns()
+                        segment_index = current_segment.get(key)
+                        if segment_index is None:
+                            segment_index = start_segment(
+                                key, stage, probe_before_wall, probe_before_mono,
+                                probe_after_wall, probe_after_mono, lsof_confirmed,
+                            )
+                        else:
+                            segment = segments[segment_index]
+                            segment["last_positive_before_wall_ns"] = probe_before_wall
+                            segment["last_positive_before_monotonic_ns"] = probe_before_mono
+                            segment["last_positive_after_wall_ns"] = probe_after_wall
+                            segment["last_positive_after_monotonic_ns"] = probe_after_mono
+                            segment["positive_observations"] += 1
+                            if lsof_confirmed:
+                                segment["lsof_confirmations"] += 1
+                                segment["last_lsof_monotonic_ns"] = probe_after_mono
+                        positive_observations += 1
+                        emit({"kind": "active", "pid": child.pid, "birth_unix_s": birth,
+                              "segment": segment_index + 1,
+                              "positive_before_wall_ns": probe_before_wall,
+                              "positive_before_monotonic_ns": probe_before_mono,
+                              "positive_after_wall_ns": probe_after_wall,
+                              "positive_after_monotonic_ns": probe_after_mono,
+                              "lsof_rechecked": lsof_confirmed,
+                              "job": stage["job"], "sequence": stage["sequence"],
+                              "attempt": stage["attempt"], "authority": stage["authority"],
+                              "active_lock_device_inode": stage["active_lock_device_inode"]})
+                    except (psutil.NoSuchProcess, psutil.ZombieProcess, FileNotFoundError) as error:
                         observation_gaps += 1
-                    else:
+                        now_wall, now_mono = time.time_ns(), time.monotonic_ns()
+                        if key is not None:
+                            close_segment(key, "lifecycle_race", now_wall, now_mono)
+                        emit({"kind": "observation_gap", "pid": listed_child.pid,
+                              "wall_ns": now_wall, "monotonic_ns": now_mono,
+                              "operation": operation, "reason": f"{type(error).__name__}: {error}"})
+                    except psutil.AccessDenied as error:
+                        # Retire at the first denial, before inspection or any wait.
+                        denial_mono, denial_wall = time.monotonic_ns(), time.time_ns()
+                        if key is not None:
+                            close_segment(key, "denied_access", denial_wall, denial_mono)
+                        evidence = recheck_denied_lifecycle(listed_child.pid, key[1] if key else None,
+                                                            denial_mono, deadline_ns)
+                        if evidence["lifecycle"] == "gone":
+                            observation_gaps += 1
+                        else:
+                            fatal_errors += 1
+                        emit({"kind": "observation_gap" if evidence["lifecycle"] == "gone" else "error",
+                              "pid": listed_child.pid, "birth_unix_s": key[1] if key else None,
+                              "operation": operation, "error": f"{type(error).__name__}: {error}",
+                              "denial_monotonic_ns": denial_mono, "denial_wall_ns": denial_wall,
+                              "exception_chain": exception_evidence(error), **evidence,
+                              "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()})
+                    except SystemError as error:
+                        failure_mono, failure_wall = time.monotonic_ns(), time.time_ns()
+                        known_race = (operation == "cmdline" and key in admitted
+                                      and known_cmdline_permission_race(error))
+                        reason = "proc_cmdline_system_error" if known_race else "fatal_observation_error"
+                        if key is not None:
+                            close_segment(key, reason, failure_wall, failure_mono)
+                        original = {"pid": listed_child.pid, "birth_unix_s": key[1] if key else None,
+                                    "operation": operation, "error": f"{type(error).__name__}: {error}",
+                                    "failure_wall_ns": failure_wall, "failure_monotonic_ns": failure_mono,
+                                    "exception_chain": exception_evidence(error),
+                                    "has_direct_cause": error.__cause__ is not None}
+                        # Flush original failure before any additional process read.
+                        emit({"kind": "process_query_failure", **original,
+                              "wall_ns": failure_wall, "monotonic_ns": failure_mono})
+                        evidence = recheck_denied_lifecycle(
+                            listed_child.pid, key[1] if key else None, failure_mono, deadline_ns)
+                        confirmed_gap = known_race and evidence["lifecycle"] == "gone"
+                        if confirmed_gap:
+                            observation_gaps += 1
+                        else:
+                            fatal_errors += 1
+                        emit({"kind": "observation_gap" if confirmed_gap else "error", **original,
+                              "reason": reason, **evidence,
+                              "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()})
+                    except Exception as error:
                         fatal_errors += 1
-                    emit({"kind": "observation_gap" if evidence["lifecycle"] == "gone" else "error",
-                          "pid": listed_child.pid, "birth_unix_s": key[1] if key else None,
-                          "operation": operation, "error": f"{type(error).__name__}: {error}",
-                          "denial_monotonic_ns": denial_mono, "denial_wall_ns": denial_wall,
-                          "exception_chain": exception_evidence(error), **evidence,
-                          "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()})
-                except (OSError, ValueError, RuntimeError, json.JSONDecodeError,
-                        subprocess.TimeoutExpired) as error:
-                    fatal_errors += 1
+                        now_wall, now_mono = time.time_ns(), time.monotonic_ns()
+                        if key is not None:
+                            close_segment(key, "fatal_observation_error", now_wall, now_mono)
+                        emit({"kind": "error", "pid": listed_child.pid,
+                              "birth_unix_s": key[1] if key else None,
+                              "failure_wall_ns": now_wall, "failure_monotonic_ns": now_mono,
+                              "wall_ns": now_wall, "monotonic_ns": now_mono,
+                              "operation": operation, "error": f"{type(error).__name__}: {error}",
+                              "exception_chain": exception_evidence(error)})
+                operation = "segment_bookkeeping"
+                for key in present_previous - seen:
                     now_wall, now_mono = time.time_ns(), time.monotonic_ns()
-                    if key is not None:
-                        close_segment(key, "fatal_observation_error", now_wall, now_mono)
-                    emit({"kind": "error", "pid": listed_child.pid,
-                          "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
-                          "operation": operation, "error": f"{type(error).__name__}: {error}"})
-            for key in present_previous - seen:
-                now_wall, now_mono = time.time_ns(), time.monotonic_ns()
-                close_segment(key, "child_not_seen", now_wall, now_mono)
-                if key in admitted:
-                    stage = admitted[key]
-                    emit({"kind": "stage_not_seen", "pid": key[0], "birth_unix_s": key[1],
-                          "wall_ns": now_wall, "monotonic_ns": now_mono,
-                          "job": stage["job"], "sequence": stage["sequence"],
-                          "attempt": stage["attempt"], "authority": stage["authority"]})
-            present_previous = seen
-            elapsed = (time.monotonic_ns() - loop_started) / 1e9
-            time.sleep(max(0.0, args.interval - elapsed))
+                    close_segment(key, "child_not_seen", now_wall, now_mono)
+                    if key in admitted:
+                        stage = admitted[key]
+                        emit({"kind": "stage_not_seen", "pid": key[0], "birth_unix_s": key[1],
+                              "wall_ns": now_wall, "monotonic_ns": now_mono,
+                              "job": stage["job"], "sequence": stage["sequence"],
+                              "attempt": stage["attempt"], "authority": stage["authority"]})
+                present_previous = seen
+                elapsed = (time.monotonic_ns() - loop_started) / 1e9
+                operation = "observation_interval"
+                time.sleep(max(0.0, args.interval - elapsed))
+        except Exception as error:
+            # Keep a complete failure receipt for errors outside child handlers.
+            # Output-device failure itself cannot be repaired by writing more JSON.
+            fatal_errors += 1
+            now_wall, now_mono = time.time_ns(), time.monotonic_ns()
+            for key in list(current_segment):
+                close_segment(key, "fatal_observer_error", now_wall, now_mono)
+            emit({"kind": "error", "operation": operation,
+                  "wall_ns": now_wall, "monotonic_ns": now_mono,
+                  "error": f"{type(error).__name__}: {error}",
+                  "exception_chain": exception_evidence(error)})
         measurement_end_wall = time.time_ns()
         measurement_end_mono = time.monotonic_ns()
         for key in list(current_segment):
@@ -639,6 +699,10 @@ def main() -> int:
             executable_final_hash = None
             executable_final_identity = None
             executable_final_error = f"{type(error).__name__}: {error}"
+            fatal_errors += 1
+            emit({"kind": "error", "operation": "final_executable_validation",
+                  "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+                  "error": executable_final_error, "exception_chain": exception_evidence(error)})
         executable_unchanged = (
             executable_final_error is None
             and executable_final_hash == observed_hash
@@ -649,6 +713,14 @@ def main() -> int:
             and segment["last_positive_before_monotonic_ns"] >= segment["first_positive_after_monotonic_ns"]
             for segment in segments
         )
+        final_root_observation = lifecycle_observation(args.pid, root_birth)
+        root_same_birth = final_root_observation["state"] == "live"
+        if not root_same_birth:
+            fatal_errors += 1
+            emit({"kind": "error", "operation": "final_root_lifecycle", "pid": args.pid,
+                  "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+                  "error": final_root_observation["detail"],
+                  "lifecycle_observation": final_root_observation})
         emit({
             "kind": "summary",
             "protocol": 2, "clock": CLOCK,
@@ -659,7 +731,8 @@ def main() -> int:
             "max_clock_offset_drift_ns": max_clock_offset_drift_ns,
             "clock_observations": clock_observations,
             "clock_offset_within_5ms": max_clock_offset_drift_ns <= 5_000_000,
-            "root_same_birth": lifecycle(args.pid, root_birth)[0] == "live",
+            "root_same_birth": root_same_birth,
+            "final_root_lifecycle": final_root_observation,
             "admitted_stages": len(admitted),
             "positive_observations": positive_observations,
             "usable_segments": usable_segments,
@@ -671,7 +744,7 @@ def main() -> int:
             "executable_unchanged": executable_unchanged,
             "segments": segments,
         })
-    return 0 if usable_segments and fatal_errors == 0 and executable_unchanged and lifecycle(args.pid, root_birth)[0] == "live" else 2
+    return 0 if usable_segments and fatal_errors == 0 and executable_unchanged and root_same_birth else 2
 
 
 if __name__ == "__main__":

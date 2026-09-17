@@ -64,6 +64,12 @@ def evaluate(receipt, observations, declaration):
     raw_positive = [row for row in observations if row["kind"] in ("stage_admitted", "active")]
     raw_closes = [row for row in observations if row["kind"] == "segment_closed"]
     raw_gaps = [row for row in observations if row["kind"] == "observation_gap"]
+    query_failures = [row for row in observations if row["kind"] == "process_query_failure"]
+    query_gaps = [row for row in raw_gaps if row.get("reason") == "proc_cmdline_system_error"]
+    require(len(query_failures) == len(query_gaps) and all(
+        sum(all(failure.get(name) == gap.get(name) for name in
+                ("pid", "birth_unix_s", "failure_monotonic_ns", "error", "exception_chain"))
+            for gap in query_gaps) == 1 for failure in query_failures), "Unreconciled process query failure")
     summary_ids = [segment["segment"] for segment in summary["segments"]]
     require(summary_ids == list(range(1, len(summary_ids) + 1)), "Summary segment IDs are not consecutive")
     require({row["segment"] for row in raw_positive} == set(summary_ids), "Raw/summary positive segment bijection mismatch")
@@ -104,6 +110,50 @@ def evaluate(receipt, observations, declaration):
                     return False
                 if reason == "denied_access":
                     return row.get("lifecycle") == "gone" and row.get("error", "").startswith("AccessDenied:")
+                if reason == "proc_cmdline_system_error":
+                    chain = row.get("exception_chain", [])
+                    probes = row.get("lifecycle_probes", [])
+                    deadline = row.get("recheck_deadline_monotonic_ns", 0)
+                    signature = "<built-in function proc_cmdline> returned a result with an exception set"
+                    cause = "[Errno 13] force permission denied (originated from sysctl(KERN_PROCARGS2) -> errno 0)"
+                    if not (row.get("reason") == reason and row.get("operation") == "cmdline"
+                            and row.get("lifecycle") == "gone" and row.get("failure_monotonic_ns") == closed_ns
+                            and row.get("has_direct_cause") is True
+                            and row.get("error") == "SystemError: " + signature
+                            and len(chain) >= 2 and chain[0].get("type") == "SystemError"
+                            and chain[0].get("message") == signature
+                            and chain[1] == {"type": "PermissionError", "message": cause, "errno": 13}
+                            and row.get("recheck_budget_ns") == 250_000_000
+                            and row.get("recheck_max_probes") == 11
+                            and closed_ns < deadline <= closed_ns + 250_000_000
+                            and 1 <= len(probes) <= 11):
+                        return False
+                    prior = closed_ns
+                    for probe in probes:
+                        if not (probe.get("within_budget") is True and not probe.get("integrity_error")
+                                and probe.get("state") in ("live", "unknown", "gone")
+                                and prior <= probe.get("before_monotonic_ns", -1)
+                                <= probe.get("after_monotonic_ns", -1) <= deadline):
+                            return False
+                        prior = probe["after_monotonic_ns"]
+                    if any(probe.get("state") == "gone" for probe in probes[:-1]):
+                        return False
+                    final = probes[-1]
+                    affirmative = (final.get("state") == "gone" and (
+                        final.get("detail") == "zombie" and final.get("observed_status") == "zombie"
+                        or final.get("detail") == "pid_reused" and isinstance(final.get("observed_birth_unix_s"), (int, float))
+                           and final["observed_birth_unix_s"] != key[1]
+                        or final.get("detail") == "absent_or_zombie" and bool(final.get("exception_chain"))
+                           and final["exception_chain"][0].get("type") in ("NoSuchProcess", "ZombieProcess")
+                    ))
+                    originals = [r for r in observations[observations.index(closed) + 1:observations.index(row)]
+                                 if r["kind"] == "process_query_failure" and r.get("pid") == key[0]
+                                 and r.get("birth_unix_s") == key[1]]
+                    return (affirmative and row.get("lifecycle_detail") == final.get("detail")
+                            and prior <= row["monotonic_ns"] and len(originals) == 1
+                            and all(originals[0].get(name) == row.get(name) for name in
+                                    ("operation", "error", "exception_chain", "has_direct_cause", "failure_monotonic_ns", "failure_wall_ns"))
+                            and originals[0]["monotonic_ns"] == closed_ns)
                 if reason == "lifecycle_race":
                     return row.get("reason", "").startswith(("NoSuchProcess:", "ZombieProcess:", "FileNotFoundError:"))
                 return reason in ("pid_birth_not_current", "active_lock_not_contended", "pid_birth_changed_after_lsof",
