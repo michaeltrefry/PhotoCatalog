@@ -24,6 +24,7 @@ fn ready_interactive(
             viewport: "prepared-route".into(),
             generation: U64(generation),
             foreground: true,
+            diagnostics: false,
         },
     )?
     else {

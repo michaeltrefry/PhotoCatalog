@@ -1086,6 +1086,8 @@ struct Ticket {
     interactive: bool,
     foreground: bool,
     hydration: bool,
+    diagnostic_started: Option<Instant>,
+    original_started: Option<Instant>,
     touched: Instant,
     cancel: Cancellation,
 }
@@ -1186,6 +1188,20 @@ fn identity_equal(
     b: &crate::catalog_edits::EditRenderIdentity,
 ) -> bool {
     serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+}
+
+fn read_diagnostic(done: &preview::ReadCompletion, outcome: &str) -> PreviewReadDiagnostic {
+    PreviewReadDiagnostic {
+        outcome: outcome.into(),
+        queue_ms: done.queue_ms,
+        owner_read_ms: done.owner_read_ms,
+        catalog_identity_ms: done.metrics.catalog_identity_ms,
+        store_read_checksum_ms: done.metrics.store_read_checksum_ms,
+        header_decode_ms: done.metrics.header_decode_ms,
+        total_ms: done.metrics.total_ms,
+        decoded_hits: done.metrics.decoded_hits,
+        decoded_misses: done.metrics.decoded_misses,
+    }
 }
 fn cancel_relink_consumers(open: &mut Open) {
     open.hydration.request_cancel();
@@ -2517,6 +2533,7 @@ impl Actor {
                 viewport,
                 generation,
                 foreground,
+                diagnostics,
             } => {
                 let shared = Arc::clone(&self.shared);
                 let o = self.current(&catalog)?;
@@ -2528,6 +2545,14 @@ impl Actor {
                     PreviewTier::Thumbnail => preview::Tier::Thumbnail,
                     PreviewTier::Large => preview::Tier::Large,
                 };
+                let diagnostic_started = diagnostics.then(Instant::now);
+                let expected_key_digest = diagnostics
+                    .then(|| {
+                        o.service
+                            .variant_key(&identity, tier)
+                            .and_then(|key| key.digest())
+                    })
+                    .and_then(Result::ok);
                 let read = if o.managed.is_some() {
                     Some(core!(o.service.queue_read_variant(
                         &o.catalog,
@@ -2551,6 +2576,14 @@ impl Actor {
                 } else {
                     core!(o.service.cached_variant(&o.catalog, &key, tier, false))
                 };
+                let selected_key_digest = diagnostics
+                    .then(|| {
+                        cached
+                            .as_ref()
+                            .and_then(|view| view.key.as_ref())
+                            .and_then(|key| key.digest().ok())
+                    })
+                    .flatten();
                 if (o.relink.write_hold()
                     || o.exports.write_hold(&shared.exports)
                     || o.metadata_write.write_hold())
@@ -2603,6 +2636,14 @@ impl Actor {
                         Err(e) => (PreviewState::Failed, None, Some(format!("{e:#}"))),
                     }
                 };
+                let route = if read.is_some() {
+                    PreviewRoute::Pending
+                } else if cached.is_some() {
+                    PreviewRoute::MemoryCache
+                } else {
+                    PreviewRoute::OriginalRender
+                };
+                let original_started = (diagnostics && consumer.is_some()).then(Instant::now);
                 let mut queue = shared.queue.lock().unwrap();
                 if queue.viewport.get(&(catalog.clone(), viewport.clone())) != Some(&generation.0) {
                     if let Some(c) = consumer {
@@ -2626,6 +2667,21 @@ impl Actor {
                     generation,
                     state,
                     message,
+                    diagnostic: diagnostics.then(|| PreviewDiagnostic {
+                        route,
+                        expected_key_digest: expected_key_digest.clone(),
+                        selected_key_digest: selected_key_digest.clone(),
+                        current_key_matches_selected: selected_key_digest
+                            .as_ref()
+                            .zip(expected_key_digest.as_ref())
+                            .map(|(selected, expected)| selected == expected),
+                        retained_read: None,
+                        original_render_ms: None,
+                        ready_ms: cached
+                            .is_some()
+                            .then(|| diagnostic_started.unwrap().elapsed().as_secs_f64() * 1000.0),
+                        delivery: None,
+                    }),
                 };
                 o.tickets.insert(
                     id.clone(),
@@ -2638,6 +2694,8 @@ impl Actor {
                         interactive,
                         foreground,
                         hydration: needs_hydration && cached.is_none() && read.is_none(),
+                        diagnostic_started,
+                        original_started,
                         touched: Instant::now(),
                         cancel: cancel.clone(),
                     },
@@ -2969,6 +3027,24 @@ impl Actor {
                 && let Some(done) = o.service.take_read(read)
             {
                 t.read = None;
+                if let Some(diagnostic) = &mut t.dto.diagnostic {
+                    let (outcome, selected) = match &done.outcome {
+                        preview::ReadOutcome::Ready(view) => {
+                            ("ready", view.key.as_ref().and_then(|key| key.digest().ok()))
+                        }
+                        preview::ReadOutcome::Missing => ("missing", None),
+                        preview::ReadOutcome::Stale => ("stale", None),
+                        preview::ReadOutcome::Failed { .. } => ("failed", None),
+                    };
+                    diagnostic.retained_read = Some(read_diagnostic(&done, outcome));
+                    if let Some(selected) = selected {
+                        diagnostic.current_key_matches_selected = diagnostic
+                            .expected_key_digest
+                            .as_ref()
+                            .map(|expected| expected == &selected);
+                        diagnostic.selected_key_digest = Some(selected);
+                    }
+                }
                 let current = o.catalog.edit_render_identity(&t.dto.key);
                 if !current
                     .as_ref()
@@ -2981,6 +3057,12 @@ impl Actor {
                     preview::ReadOutcome::Ready(_) => {
                         t.dto.state = PreviewState::Ready;
                         t.dto.message = None;
+                        if let Some(diagnostic) = &mut t.dto.diagnostic {
+                            diagnostic.route = PreviewRoute::Retained;
+                            diagnostic.ready_ms = t
+                                .diagnostic_started
+                                .map(|started| started.elapsed().as_secs_f64() * 1000.0);
+                        }
                     }
                     preview::ReadOutcome::Stale => t.dto.state = PreviewState::Stale,
                     preview::ReadOutcome::Failed {
@@ -3052,6 +3134,11 @@ impl Actor {
                                 Ok(c) => {
                                     t.consumer = Some(c);
                                     t.dto.state = PreviewState::Queued;
+                                    t.original_started =
+                                        t.dto.diagnostic.as_ref().map(|_| Instant::now());
+                                    if let Some(diagnostic) = &mut t.dto.diagnostic {
+                                        diagnostic.route = PreviewRoute::OriginalRender;
+                                    }
                                 }
                                 Err(e) => {
                                     t.dto.state = PreviewState::Failed;
@@ -3084,6 +3171,17 @@ impl Actor {
                     };
                     t.dto.state = state;
                     t.dto.message = message;
+                    if matches!(t.dto.state, PreviewState::Ready)
+                        && let Some(diagnostic) = &mut t.dto.diagnostic
+                    {
+                        diagnostic.route = PreviewRoute::OriginalRender;
+                        diagnostic.original_render_ms = t
+                            .original_started
+                            .map(|started| started.elapsed().as_secs_f64() * 1000.0);
+                        diagnostic.ready_ms = t
+                            .diagnostic_started
+                            .map(|started| started.elapsed().as_secs_f64() * 1000.0);
+                    }
                 }
             } else if matches!(t.dto.state, PreviewState::CancelRequested)
                 && o.service.native_work_drained()

@@ -2,7 +2,8 @@
 use super::super::DesktopBridge;
 use super::{Call, Parent};
 use crate::application::{
-    Config, Limits, PreviewState, PreviewStatus, PreviewTier, Reply, Request, Response, U64,
+    Config, Limits, PreviewRoute, PreviewState, PreviewStatus, PreviewTier, Reply, Request,
+    Response, U64,
 };
 use crate::catalog_edits::VariantKey;
 use crate::catalog_session::{CatalogFilesystem, RootCapability, native as n};
@@ -292,6 +293,15 @@ impl Running {
         Ok((running, token))
     }
     fn ready(&self, token: &str, key: &VariantKey, generation: u64) -> Result<PreviewStatus> {
+        self.ready_with_diagnostics(token, key, generation, false)
+    }
+    fn ready_with_diagnostics(
+        &self,
+        token: &str,
+        key: &VariantKey,
+        generation: u64,
+        diagnostics: bool,
+    ) -> Result<PreviewStatus> {
         let Response::Preview(mut status) = command(
             &self.bridge,
             Request::Preview {
@@ -302,6 +312,7 @@ impl Running {
                 viewport: "fixture".into(),
                 generation: U64(generation),
                 foreground: true,
+                diagnostics,
             },
         )?
         else {
@@ -1001,13 +1012,56 @@ fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {
     running.finish(token)?;
     let (running, token) = Running::start(temporary.clone(), &executable, &root, &originals, true)?;
     let cold = Instant::now();
-    let status = running.ready(&token, &key, 1)?;
+    let status = running.ready_with_diagnostics(&token, &key, 1, true)?;
+    let diagnostic = status
+        .diagnostic
+        .as_ref()
+        .context("missing retained-read diagnostic")?;
+    ensure!(
+        matches!(diagnostic.route, PreviewRoute::Retained)
+            && diagnostic.current_key_matches_selected == Some(true)
+            && diagnostic.expected_key_digest == diagnostic.selected_key_digest,
+        "cold retained route did not select the current key"
+    );
+    let retained_read = diagnostic
+        .retained_read
+        .as_ref()
+        .context("missing retained read phases")?;
+    ensure!(
+        retained_read.outcome == "ready"
+            && retained_read.decoded_hits + retained_read.decoded_misses == 1
+            && retained_read.total_ms >= retained_read.catalog_identity_ms
+            && retained_read.total_ms >= retained_read.store_read_checksum_ms
+            && retained_read.total_ms >= retained_read.header_decode_ms,
+        "cold retained read phases are inconsistent"
+    );
     let bytes = running.bytes(&token, &status.ticket)?;
     ensure!(
         blake3::hash(bytes.bytes()) == digest,
         "cached encoded bytes changed"
     );
     drop(bytes);
+    let Response::Preview(delivered) = command(
+        &running.bridge,
+        Request::PreviewStatus {
+            catalog: token.clone(),
+            ticket: status.ticket,
+        },
+    )?
+    else {
+        anyhow::bail!("wrong delivered status reply")
+    };
+    let delivery = delivered
+        .diagnostic
+        .and_then(|diagnostic| diagnostic.delivery)
+        .context("missing retained delivery phases")?;
+    ensure!(
+        delivery.retained_read.outcome == "ready"
+            && delivery.retained_read.decoded_hits + delivery.retained_read.decoded_misses == 1
+            && delivery.ready_for_transfer_ms >= delivery.retained_read.queue_ms
+            && delivery.total_ms >= delivery.ready_for_transfer_ms,
+        "cold retained delivery phases are inconsistent"
+    );
     let cold_elapsed = cold.elapsed();
     let initial = running.observed.lock().unwrap().len();
     ensure!(
@@ -1174,6 +1228,7 @@ fn request(
             viewport: "fixture".into(),
             generation: U64(generation),
             foreground: true,
+            diagnostics: false,
         },
     )? {
         Response::Preview(status) => Ok(status),

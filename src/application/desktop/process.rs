@@ -1897,6 +1897,7 @@ mod tests {
                 viewport: "view".into(),
                 generation: crate::application::U64(1),
                 foreground: true,
+                diagnostics: false,
             },
             Request::PreviewStatus {
                 catalog: catalog.clone(),

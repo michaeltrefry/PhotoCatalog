@@ -32,6 +32,26 @@ fn decimal_and_native_path_wire_are_lossless() {
     }
 }
 
+#[test]
+fn preview_diagnostics_are_opt_in_on_the_wire() {
+    let request = Request::Preview {
+        catalog: "catalog".into(),
+        key: VariantKey::master("asset"),
+        tier: PreviewTier::Thumbnail,
+        interactive: false,
+        viewport: "grid".into(),
+        generation: U64(1),
+        foreground: false,
+        diagnostics: true,
+    };
+    let mut wire = serde_json::to_value(request).unwrap();
+    wire["args"].as_object_mut().unwrap().remove("diagnostics");
+    let Request::Preview { diagnostics, .. } = serde_json::from_value(wire).unwrap() else {
+        panic!()
+    };
+    assert!(!diagnostics);
+}
+
 pub(super) fn disconnected() -> Bridge {
     let shared = Arc::new(Shared {
         managed_catalog: false,
@@ -77,6 +97,7 @@ fn preview_request(generation: u64, key: &str) -> Request {
         viewport: "grid".into(),
         generation: U64(generation),
         foreground: false,
+        diagnostics: false,
     }
 }
 #[test]
@@ -654,6 +675,7 @@ fn canceled_hydration_keeps_blocked_reader_owned_without_blocking_foreground() -
         viewport: "selected".into(),
         generation: U64(1),
         foreground: true,
+        diagnostics: false,
     })?
     else {
         anyhow::bail!("preview")

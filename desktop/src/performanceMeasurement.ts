@@ -391,6 +391,7 @@ export function initializeMeasurement() {
 }
 
 export const beginMeasurement = (kind: MeasurementKind, context: MeasurementContext) => recorder?.begin(kind, context);
+export const measurementDiagnosticsEnabled = () => recorder !== null;
 export const measurementDurable = (ordinal: number | undefined) => { if (ordinal !== undefined) recorder?.durable(ordinal); };
 export const measurementPresented = (ordinal: number | undefined, verify: () => boolean) => { if (ordinal !== undefined) recorder?.present(ordinal, verify); };
 export const measurementEnded = (ordinal: number | undefined, outcome: 'backend_error' | 'superseded' | 'canceled') => { if (ordinal !== undefined) recorder?.end(ordinal, outcome); };

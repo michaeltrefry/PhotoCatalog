@@ -56,12 +56,14 @@ struct Entry {
     view: Option<Box<preview::PreviewView>>,
     cancel: Cancellation,
     reply: mpsc::SyncSender<std::result::Result<PreviewBytes, BridgeError>>,
+    enqueued: Option<Instant>,
 }
 struct Active {
     entry: Entry,
     _gate: Gate,
     transfer: Option<Transfer>,
     binary: Option<BinaryGrant>,
+    started: Option<Instant>,
 }
 #[derive(Default)]
 pub(super) struct Queue {
@@ -170,6 +172,7 @@ impl Queue {
                 view: None,
                 cancel,
                 reply: reply.clone(),
+                enqueued: ticket.dto.diagnostic.as_ref().map(|_| Instant::now()),
             })
         })();
         match result {
@@ -234,6 +237,23 @@ impl Queue {
                             .payload(bytes, mime)
                     });
                 if result.is_ok()
+                    && let Some(diagnostic) = ctx
+                        .tickets
+                        .get_mut(&active.entry.id)
+                        .and_then(|ticket| ticket.dto.diagnostic.as_mut())
+                    && let Some(delivery) = &mut diagnostic.delivery
+                {
+                    delivery.transfer_ms = active
+                        .started
+                        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    delivery.total_ms = active
+                        .entry
+                        .enqueued
+                        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                }
+                if result.is_ok()
                     && let Some(ticket) = ctx.tickets.get_mut(&active.entry.id)
                 {
                     ticket.touched = Instant::now();
@@ -257,6 +277,37 @@ impl Queue {
                     return;
                 };
                 entry.read = None;
+                if let Some(diagnostic) = ctx
+                    .tickets
+                    .get_mut(&entry.id)
+                    .and_then(|ticket| ticket.dto.diagnostic.as_mut())
+                {
+                    let (outcome, selected) = match &done.outcome {
+                        preview::ReadOutcome::Ready(view) => {
+                            ("ready", view.key.as_ref().and_then(|key| key.digest().ok()))
+                        }
+                        preview::ReadOutcome::Missing => ("missing", None),
+                        preview::ReadOutcome::Stale => ("stale", None),
+                        preview::ReadOutcome::Failed { .. } => ("failed", None),
+                    };
+                    let read = read_diagnostic(&done, outcome);
+                    if let Some(selected) = selected {
+                        diagnostic.current_key_matches_selected = diagnostic
+                            .expected_key_digest
+                            .as_ref()
+                            .map(|expected| expected == &selected);
+                        diagnostic.selected_key_digest = Some(selected);
+                    }
+                    diagnostic.delivery = Some(PreviewDeliveryDiagnostic {
+                        ready_for_transfer_ms: entry
+                            .enqueued
+                            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                            .unwrap_or(0.0),
+                        retained_read: read,
+                        transfer_ms: 0.0,
+                        total_ms: 0.0,
+                    });
+                }
                 match done.outcome {
                     preview::ReadOutcome::Ready(view) => entry.view = Some(view),
                     outcome => {
@@ -294,6 +345,7 @@ impl Queue {
                 _gate: gate,
                 transfer: None,
                 binary: None,
+                started: None,
             });
         }
         let active = self.active.as_mut().unwrap();
@@ -330,6 +382,7 @@ impl Queue {
                 active.entry.view = None;
                 active.transfer = Some(transfer);
                 active.binary = Some(grant);
+                active.started = active.entry.enqueued.map(|_| Instant::now());
             }
             Err(e) => {
                 let active = self.active.take().unwrap();

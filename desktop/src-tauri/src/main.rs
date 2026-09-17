@@ -116,6 +116,12 @@ fn main() {
                 measurement_run_id.clone(),
                 cache_root,
             ));
+            #[cfg(feature = "measurement-devtools")]
+            if measurement_run_id.is_some()
+                && let Some(window) = app.get_webview_window("main")
+            {
+                window.open_devtools();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -127,6 +133,7 @@ fn main() {
             commands::catalog_preview_release,
             measurement::catalog_measurement_config,
             measurement::catalog_measurement_finish,
+            measurement::catalog_measurement_preview_diagnostic,
             commands::catalog_frontend_ready,
             commands::catalog_quit,
         ])

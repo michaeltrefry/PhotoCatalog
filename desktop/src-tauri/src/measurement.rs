@@ -17,11 +17,14 @@ const MAX_SCROLL_FRAMES: usize = 2_048;
 const SCROLL_DURATION_US: u64 = 5_000_000;
 const MAX_SCROLL_DURATION_US: u64 = 10_000_000;
 const MAX_SCROLL_EDGE_GAP_US: u64 = 100_000;
+const MAX_PREVIEW_DIAGNOSTICS: usize = 128;
+const MAX_PREVIEW_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
 struct Target {
     run_id: String,
     receipt_path: PathBuf,
     finalized: bool,
+    preview_diagnostics: usize,
 }
 
 pub struct State(Mutex<Option<Target>>);
@@ -35,6 +38,7 @@ impl State {
                     .join(format!("{run_id}.json")),
                 run_id,
                 finalized: false,
+                preview_diagnostics: 0,
             }
         })))
     }
@@ -83,6 +87,128 @@ impl State {
             .map_err(|error| format!("Write measurement receipt: {error}"))?;
         target.finalized = true;
         Ok(target.receipt_path.to_string_lossy().into_owned())
+    }
+
+    fn preview_diagnostic(&self, diagnostic: FrontendPreviewDiagnostic) -> Result<bool, String> {
+        diagnostic.validate()?;
+        let mut target = self.0.lock().map_err(|_| "Measurement state unavailable")?;
+        let target = target.as_mut().ok_or("S12 measurement is not enabled")?;
+        if target.preview_diagnostics >= MAX_PREVIEW_DIAGNOSTICS {
+            return Ok(false);
+        }
+        let line = serde_json::to_string(&PreviewDiagnosticLine {
+            run_id: &target.run_id,
+            diagnostic: &diagnostic,
+        })
+        .map_err(|_| "Preview diagnostic is invalid")?;
+        if line.len() > MAX_PREVIEW_DIAGNOSTIC_BYTES {
+            return Err("Preview diagnostic exceeds its byte limit".into());
+        }
+        eprintln!("S12_PREVIEW_DIAGNOSTIC {line}");
+        target.preview_diagnostics += 1;
+        Ok(true)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FrontendPreviewDiagnostic {
+    ticket: String,
+    admission_command_ms: f64,
+    ready_observed_ms: f64,
+    blob_invoke_ms: f64,
+    object_url_ms: f64,
+    polls: u16,
+    native: photocatalog::application::PreviewDiagnostic,
+}
+
+#[derive(Serialize)]
+struct PreviewDiagnosticLine<'a> {
+    run_id: &'a str,
+    diagnostic: &'a FrontendPreviewDiagnostic,
+}
+
+impl FrontendPreviewDiagnostic {
+    fn validate(&self) -> Result<(), String> {
+        uuid::Uuid::parse_str(&self.ticket).map_err(|_| "Invalid preview diagnostic ticket")?;
+        if self.polls > 10_000
+            || [
+                self.admission_command_ms,
+                self.ready_observed_ms,
+                self.blob_invoke_ms,
+                self.object_url_ms,
+            ]
+            .into_iter()
+            .any(|value| !value.is_finite() || !(0.0..=1_800_000.0).contains(&value))
+        {
+            return Err("Preview diagnostic timing is invalid".into());
+        }
+        for digest in [
+            self.native.expected_key_digest.as_deref(),
+            self.native.selected_key_digest.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if digest.len() != 64 || !digest.bytes().all(|value| value.is_ascii_hexdigit()) {
+                return Err("Preview diagnostic digest is invalid".into());
+            }
+        }
+        if let (Some(expected), Some(selected)) = (
+            self.native.expected_key_digest.as_deref(),
+            self.native.selected_key_digest.as_deref(),
+        ) && self.native.current_key_matches_selected != Some(expected == selected)
+        {
+            return Err("Preview diagnostic key comparison is invalid".into());
+        }
+        let mut native_times = Vec::new();
+        if let Some(value) = self.native.original_render_ms {
+            native_times.push(value);
+        }
+        if let Some(value) = self.native.ready_ms {
+            native_times.push(value);
+        }
+        let mut reads = Vec::new();
+        if let Some(read) = &self.native.retained_read {
+            reads.push(read);
+        }
+        if let Some(delivery) = &self.native.delivery {
+            native_times.extend([
+                delivery.ready_for_transfer_ms,
+                delivery.transfer_ms,
+                delivery.total_ms,
+            ]);
+            reads.push(&delivery.retained_read);
+        }
+        for read in reads {
+            if !matches!(
+                read.outcome.as_str(),
+                "ready" | "missing" | "stale" | "failed"
+            ) {
+                return Err("Preview diagnostic read outcome is invalid".into());
+            }
+            native_times.extend([
+                read.queue_ms,
+                read.owner_read_ms,
+                read.catalog_identity_ms,
+                read.store_read_checksum_ms,
+                read.header_decode_ms,
+                read.total_ms,
+            ]);
+            if read.decoded_hits > 1 || read.decoded_misses > 1 {
+                return Err("Preview diagnostic decode count is invalid".into());
+            }
+        }
+        if native_times
+            .into_iter()
+            .any(|value| !value.is_finite() || !(0.0..=1_800_000.0).contains(&value))
+        {
+            return Err("Preview diagnostic native timing is invalid".into());
+        }
+        let bytes = serde_json::to_vec(self).map_err(|_| "Preview diagnostic is invalid")?;
+        if bytes.len() > MAX_PREVIEW_DIAGNOSTIC_BYTES {
+            return Err("Preview diagnostic exceeds its byte limit".into());
+        }
+        Ok(())
     }
 }
 
@@ -278,6 +404,14 @@ pub fn catalog_measurement_finish(
     state.finish(receipt)
 }
 
+#[tauri::command]
+pub fn catalog_measurement_preview_diagnostic(
+    state: tauri::State<'_, State>,
+    diagnostic: FrontendPreviewDiagnostic,
+) -> Result<bool, String> {
+    state.preview_diagnostic(diagnostic)
+}
+
 fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
     if receipt.protocol != 1
         || !matches!(
@@ -454,6 +588,69 @@ fn scrollable_snapshot(value: &ScrollSnapshot) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview_diagnostic() -> FrontendPreviewDiagnostic {
+        let read = photocatalog::application::PreviewReadDiagnostic {
+            outcome: "ready".into(),
+            queue_ms: 1.0,
+            owner_read_ms: 2.0,
+            catalog_identity_ms: 0.1,
+            store_read_checksum_ms: 0.5,
+            header_decode_ms: 1.4,
+            total_ms: 2.0,
+            decoded_hits: 0,
+            decoded_misses: 1,
+        };
+        FrontendPreviewDiagnostic {
+            ticket: "00000000-0000-4000-8000-000000000001".into(),
+            admission_command_ms: 1.0,
+            ready_observed_ms: 3.0,
+            blob_invoke_ms: 2.0,
+            object_url_ms: 0.1,
+            polls: 1,
+            native: photocatalog::application::PreviewDiagnostic {
+                route: photocatalog::application::PreviewRoute::Retained,
+                expected_key_digest: Some("a".repeat(64)),
+                selected_key_digest: Some("a".repeat(64)),
+                current_key_matches_selected: Some(true),
+                retained_read: Some(read.clone()),
+                original_render_ms: None,
+                ready_ms: Some(3.0),
+                delivery: Some(photocatalog::application::PreviewDeliveryDiagnostic {
+                    ready_for_transfer_ms: 1.0,
+                    retained_read: read,
+                    transfer_ms: 1.0,
+                    total_ms: 2.0,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn preview_diagnostic_requires_bounded_consistent_identity_and_timing() {
+        let mut diagnostic = preview_diagnostic();
+        diagnostic.validate().unwrap();
+        assert!(serde_json::to_vec(&diagnostic).unwrap().len() < MAX_PREVIEW_DIAGNOSTIC_BYTES);
+
+        diagnostic.native.current_key_matches_selected = Some(false);
+        assert!(diagnostic.validate().is_err());
+        diagnostic.native.current_key_matches_selected = Some(true);
+        diagnostic
+            .native
+            .retained_read
+            .as_mut()
+            .unwrap()
+            .decoded_misses = 2;
+        assert!(diagnostic.validate().is_err());
+        diagnostic
+            .native
+            .retained_read
+            .as_mut()
+            .unwrap()
+            .decoded_misses = 1;
+        diagnostic.ready_observed_ms = f64::INFINITY;
+        assert!(diagnostic.validate().is_err());
+    }
 
     #[test]
     fn run_identifier_is_explicit_and_path_safe() {
