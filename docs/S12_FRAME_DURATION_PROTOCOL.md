@@ -106,8 +106,11 @@ declared phases in a continuous rAF sequence:
    `animation-frame-fired` interval. Their simple sum must exceed their union,
    proving nested work is not double-counted.
 
-The same recording must preserve an empty-work frame, zero-duration timestamp
-markers, and complete guard frames around the idle, busy, and layout cohorts.
+The same recording must preserve zero-duration timestamp markers and complete
+guard frames around the idle, busy, and layout cohorts. Literal zero-work live
+frames are not required: the continuous rAF control and compositor activity are
+themselves retained work. The evaluator still reports their count, and its
+synthetic tests cover the empty interval-union case.
 Between the callback-10 idle-start marker and callback-120 done marker, it must
 export at least the expected 111 remaining `animation-frame-fired` records.
 This callback check is bounded to the declared phase instead of the entire

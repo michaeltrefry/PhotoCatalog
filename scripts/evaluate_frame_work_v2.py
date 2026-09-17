@@ -334,7 +334,6 @@ def validate_conformance(trace, plan, package_binding, package_sha256, evaluator
     layout_analysis = analyze_frames(parsed, layout_selected, 16.7)
     require(any(row["assigned_task_work_ms"] > 0 for row in layout_analysis["frames"]), "Layout frame assignment lost work")
     empty_frames = [frame for frame in parsed["frames"] if union_length(parsed["tasks"] + parsed["gc"], frame) == 0]
-    require(bool(empty_frames), "Conformance lacks an empty-work frame")
     phase_callbacks = sum(event == "animation-frame-fired" and intersect((start, end), (times["idle_start"], times["done"])) is not None
                           for event, start, end in parsed["task_rows"])
     expected_phase_callbacks = plan["callbacks"]["total"] - plan["callbacks"]["idle"][0] + 1

@@ -56,6 +56,7 @@ class IntervalTests(unittest.TestCase):
         values = [(0.0, 5.0), (1.0, 2.0), (4.0, 7.0), (8.0, 9.0)]
         self.assertAlmostEqual(union_length(values), 8.0)
         self.assertAlmostEqual(union_length(values, (1.5, 8.5)), 6.0)
+        self.assertEqual(union_length([]), 0.0)
 
     def test_gap_work_is_assigned_to_both_adjacent_frames_and_reported(self):
         value = trace([
@@ -268,6 +269,14 @@ class EvaluationTests(unittest.TestCase):
                 row["startTime"], row["endTime"] = 6.2, 6.5
         with self.assertRaisesRegex(ValueError, "declared rAF"):
             validate_conformance(changed, plan, PACKAGE, PACKAGE_SHA, EVALUATOR_SHA)
+
+    def test_conformance_allows_continuous_raf_with_no_literal_empty_frame(self):
+        conformance, plan = conformance_fixture()
+        for row in list(conformance["recording"]["records"]):
+            if row["type"] == "timeline-record-type-rendering-frame":
+                conformance["recording"]["records"].append(layout("composite", row["startTime"], row["startTime"] + .00001))
+        result = validate_conformance(conformance, plan, PACKAGE, PACKAGE_SHA, EVALUATOR_SHA)
+        self.assertEqual(result["empty_work_frames"], 0)
 
     def test_measured_duration_is_fixed_to_five_seconds(self):
         values = list(self.fixture())
