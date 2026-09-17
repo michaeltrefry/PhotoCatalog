@@ -83,6 +83,7 @@ class StorageGuard:
         self.parent=Path(descriptor['parent'])
         self.handles=[]
         self.fd=None
+        self.close_handle=None
 
     def identity(self,path,prefix=''):
         value=path.lstat()
@@ -106,44 +107,63 @@ class StorageGuard:
 
     def __enter__(self):
         self.check()
-        if os.name=='nt':
-            import ctypes
-            from ctypes import wintypes
-            kernel=ctypes.WinDLL('kernel32',use_last_error=True)
-            create=kernel.CreateFileW
-            create.argtypes=(wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,wintypes.LPVOID,
-                             wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE)
-            create.restype=wintypes.HANDLE
-            # Omitting FILE_SHARE_DELETE freezes both path bindings until CloseHandle.
-            try:
+        try:
+            if os.name=='nt':
+                import ctypes
+                from ctypes import wintypes
+                kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+                create=kernel.CreateFileW
+                create.argtypes=(wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,wintypes.LPVOID,
+                                 wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE)
+                create.restype=wintypes.HANDLE
+                close=kernel.CloseHandle
+                close.argtypes=(wintypes.HANDLE,)
+                close.restype=wintypes.BOOL
+                self.close_handle=close
+                # Omitting FILE_SHARE_DELETE freezes both path bindings until CloseHandle.
                 for path in (self.parent,self.path):
                     handle=create(str(path),0x80,0x1|0x2,None,3,0x02000000|0x00200000,None)
                     if handle==wintypes.HANDLE(-1).value:
                         raise OSError(ctypes.get_last_error(),'cannot retain cleanup directory')
                     self.handles.append(handle)
-            except BaseException:
-                for handle in reversed(self.handles):kernel.CloseHandle(handle)
-                self.handles=[]
-                raise
-        else:
-            flags=os.O_RDONLY|getattr(os,'O_DIRECTORY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_CLOEXEC',0)
-            parent_fd=os.open(self.parent,flags)
-            try:self.fd=os.open(self.path,flags)
-            except BaseException:
-                os.close(parent_fd);raise
-            self.handles.append(parent_fd)
-        self.check()
+            else:
+                flags=os.O_RDONLY|getattr(os,'O_DIRECTORY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_CLOEXEC',0)
+                self.handles.append(os.open(self.parent,flags))
+                self.fd=os.open(self.path,flags)
+            self.check()
+        except BaseException as failure:
+            try:self.release()
+            except BaseException as close_failure:
+                raise RuntimeError('storage admission failed and retained handle release failed: '
+                                   +type(close_failure).__name__+': '+str(close_failure)) from failure
+            raise
         return self
 
-    def __exit__(self,*_):
+    def release(self):
+        handles=self.handles;descriptor=self.fd;close=self.close_handle
+        self.handles=[];self.fd=None;self.close_handle=None
+        errors=[]
         if os.name=='nt':
             import ctypes
-            kernel=ctypes.WinDLL('kernel32',use_last_error=True)
-            for handle in reversed(self.handles):kernel.CloseHandle(handle)
+            if close is None and handles:
+                errors.append('missing configured CloseHandle')
+            else:
+                for handle in reversed(handles):
+                    if not close(handle):
+                        errors.append('CloseHandle failed '+str(getattr(ctypes,'get_last_error',lambda:0)()))
         else:
-            if self.fd is not None:os.close(self.fd)
-            for handle in reversed(self.handles):os.close(handle)
-        self.handles=[];self.fd=None
+            for handle in ([descriptor] if descriptor is not None else [])+list(reversed(handles)):
+                try:os.close(handle)
+                except OSError as exc:errors.append(type(exc).__name__+': '+str(exc))
+        if errors:raise OSError('; '.join(errors))
+
+    def __exit__(self,kind,error,_):
+        try:self.release()
+        except BaseException as close_failure:
+            if error is not None:
+                raise RuntimeError('cleanup failed and retained handle release failed: '
+                                   +type(close_failure).__name__+': '+str(close_failure)) from error
+            raise
 
     def remove(self,path,directory=False):
         path=Path(path)

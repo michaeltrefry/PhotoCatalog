@@ -21,6 +21,41 @@ def descriptor(path):
 
 
 class DisposableCleanupAdmission(unittest.TestCase):
+    @unittest.skipIf(os.name=='nt','POSIX descriptor lifecycle regression')
+    def test_post_open_identity_failure_closes_every_retained_descriptor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary).resolve()/'root';root.mkdir()
+            guard=cleanup.StorageGuard('artifact',descriptor(root))
+            opened=[];real_open=os.open
+            def tracked_open(*args,**kwargs):
+                value=real_open(*args,**kwargs);opened.append(value);return value
+            with patch.object(cleanup.os,'open',side_effect=tracked_open), \
+                 patch.object(guard,'check',side_effect=(None,ValueError('changed after open'))):
+                with self.assertRaisesRegex(ValueError,'changed after open'):guard.__enter__()
+            self.assertEqual(len(opened),2)
+            self.assertEqual((guard.fd,guard.handles),(None,[]))
+            for descriptor_number in opened:
+                with self.assertRaises(OSError):os.fstat(descriptor_number)
+
+    def test_windows_close_handle_keeps_pointer_width_and_closes_reverse_order(self):
+        import ctypes
+        from ctypes import wintypes
+        class Function:
+            def __init__(self,values):self.values=iter(values);self.calls=[];self.argtypes=None;self.restype=None
+            def __call__(self,*args):self.calls.append(args);return next(self.values)
+        first,second=0x1_0000_0001,0x2_0000_0002
+        create=Function((first,second));close=Function((True,True))
+        kernel=type('Kernel',(),dict(CreateFileW=create,CloseHandle=close))()
+        guard=cleanup.StorageGuard('artifact',dict(root='C:/artifact',parent='C:/',device=1,inode=2,
+            parent_device=1,parent_inode=1,reserve_bytes=0))
+        with patch.object(cleanup.os,'name','nt'), \
+             patch.object(ctypes,'WinDLL',return_value=kernel,create=True), \
+             patch.object(guard,'check'):
+            with guard:pass
+        self.assertEqual(close.argtypes,(wintypes.HANDLE,))
+        self.assertIs(close.restype,wintypes.BOOL)
+        self.assertEqual(close.calls,[(second,),(first,)])
+
     def export_fixture(self,base):
         from blake3 import blake3
         base=Path(base).resolve();root=base/'artifacts';service_root=base/'services'
