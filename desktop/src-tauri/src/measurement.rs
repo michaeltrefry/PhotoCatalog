@@ -9,10 +9,14 @@ use std::{
 };
 
 const MAX_SAMPLES: usize = 512;
-const MAX_RECEIPT_BYTES: usize = 128 * 1024;
+const MAX_RECEIPT_BYTES: usize = 208 * 1024;
 const MAX_DURATION_US: u64 = 30 * 60 * 1_000_000;
 const MAX_STARTED_US: u64 = 24 * 60 * 60 * 1_000_000;
 const MAX_THUMBNAIL_EVENTS: u32 = 1_000_000;
+const MAX_SCROLL_FRAMES: usize = 2_048;
+const SCROLL_DURATION_US: u64 = 5_000_000;
+const MAX_SCROLL_DURATION_US: u64 = 10_000_000;
+const MAX_SCROLL_EDGE_GAP_US: u64 = 100_000;
 
 struct Target {
     run_id: String,
@@ -168,6 +172,55 @@ pub struct Receipt {
     overflowed: u32,
     thumbnail_diagnostics: ThumbnailDiagnostics,
     samples: Vec<Sample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scroll_capture: Option<ScrollCapture>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollOutcome {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollReason {
+    DurationElapsed,
+    ManualStop,
+    Finalized,
+    Unmounted,
+    TargetChanged,
+    FrameLimit,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollFrameModel {
+    RequestAnimationFrameTimestampScrollPosition,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ScrollSnapshot {
+    identity: u32,
+    scroll_top_px: u32,
+    scroll_left_px: u32,
+    viewport_width_px: u32,
+    viewport_height_px: u32,
+    scroll_width_px: u32,
+    scroll_height_px: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ScrollCapture {
+    frame_model: ScrollFrameModel,
+    outcome: ScrollOutcome,
+    reason: ScrollReason,
+    started_us: u64,
+    ended_us: u64,
+    target_initial: ScrollSnapshot,
+    target_final: Option<ScrollSnapshot>,
+    frames: Vec<(u64, u32, u32)>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -340,7 +393,62 @@ fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
             return Err("Measurement sample fields are invalid".into());
         }
     }
+    if let Some(capture) = &receipt.scroll_capture {
+        let duration = capture
+            .ended_us
+            .checked_sub(capture.started_us)
+            .ok_or("Scroll capture bounds are invalid")?;
+        if capture.started_us > MAX_STARTED_US
+            || duration > MAX_DURATION_US
+            || capture.frames.len() > MAX_SCROLL_FRAMES
+            || !valid_scroll_snapshot(&capture.target_initial)
+            || !scrollable_snapshot(&capture.target_initial)
+            || capture
+                .target_final
+                .as_ref()
+                .is_some_and(|value| !valid_scroll_snapshot(value))
+            || capture.frames.windows(2).any(|pair| pair[0].0 > pair[1].0)
+            || capture.frames.iter().any(|(timestamp, _, _)| {
+                *timestamp < capture.started_us.saturating_sub(MAX_SCROLL_EDGE_GAP_US)
+                    || *timestamp > capture.ended_us
+            })
+        {
+            return Err("Scroll capture fields are invalid".into());
+        }
+        let valid_outcome = match capture.outcome {
+            ScrollOutcome::Complete => {
+                matches!(capture.reason, ScrollReason::DurationElapsed)
+                    && duration >= SCROLL_DURATION_US
+                    && duration <= MAX_SCROLL_DURATION_US
+                    && capture.frames.len() >= 2
+                    && capture.frames[0].0.abs_diff(capture.started_us) <= MAX_SCROLL_EDGE_GAP_US
+                    && capture.ended_us - capture.frames.last().unwrap().0 <= MAX_SCROLL_EDGE_GAP_US
+                    && capture.target_final.as_ref().is_some_and(|final_target| {
+                        final_target.identity == capture.target_initial.identity
+                    })
+            }
+            ScrollOutcome::Incomplete => true,
+        };
+        if !valid_outcome {
+            return Err("Scroll capture outcome is invalid".into());
+        }
+    }
     Ok(())
+}
+
+fn valid_scroll_snapshot(value: &ScrollSnapshot) -> bool {
+    value.identity > 0
+        && value.viewport_width_px > 0
+        && value.viewport_height_px > 0
+        && value.scroll_width_px >= value.viewport_width_px
+        && value.scroll_height_px >= value.viewport_height_px
+        && value.scroll_left_px <= value.scroll_width_px
+        && value.scroll_top_px <= value.scroll_height_px
+}
+
+fn scrollable_snapshot(value: &ScrollSnapshot) -> bool {
+    value.scroll_width_px > value.viewport_width_px
+        || value.scroll_height_px > value.viewport_height_px
 }
 
 #[cfg(test)]
@@ -388,6 +496,7 @@ mod tests {
                 page_rows: None,
                 visible_count: None,
             }],
+            scroll_capture: None,
         };
         validate(&receipt, "run").unwrap();
         receipt.samples[0].presentation_us = Some(3_999);
@@ -461,9 +570,94 @@ mod tests {
                     visible_count: Some(100),
                 })
                 .collect(),
+            scroll_capture: Some(ScrollCapture {
+                frame_model: ScrollFrameModel::RequestAnimationFrameTimestampScrollPosition,
+                outcome: ScrollOutcome::Complete,
+                reason: ScrollReason::DurationElapsed,
+                started_us: MAX_STARTED_US,
+                ended_us: MAX_STARTED_US + SCROLL_DURATION_US,
+                target_initial: ScrollSnapshot {
+                    identity: 1,
+                    scroll_top_px: 0,
+                    scroll_left_px: 0,
+                    viewport_width_px: u32::MAX - 1,
+                    viewport_height_px: u32::MAX - 1,
+                    scroll_width_px: u32::MAX,
+                    scroll_height_px: u32::MAX,
+                },
+                target_final: Some(ScrollSnapshot {
+                    identity: 1,
+                    scroll_top_px: u32::MAX,
+                    scroll_left_px: u32::MAX,
+                    viewport_width_px: u32::MAX - 1,
+                    viewport_height_px: u32::MAX - 1,
+                    scroll_width_px: u32::MAX,
+                    scroll_height_px: u32::MAX,
+                }),
+                frames: (0..MAX_SCROLL_FRAMES)
+                    .map(|offset| {
+                        (
+                            MAX_STARTED_US
+                                + (offset as u64 * SCROLL_DURATION_US / MAX_SCROLL_FRAMES as u64),
+                            u32::MAX,
+                            u32::MAX,
+                        )
+                    })
+                    .collect(),
+            }),
         };
         validate(&receipt, &receipt.run_id).unwrap();
         assert!(serde_json::to_vec(&receipt).unwrap().len() <= MAX_RECEIPT_BYTES);
+    }
+
+    #[test]
+    fn scroll_capture_requires_bounded_monotonic_callback_timestamps() {
+        let mut receipt = Receipt {
+            protocol: 1,
+            presentation_model: PresentationModel::TwoAnimationFrames,
+            context_model: ContextModel::LastObservedStatusAtStart,
+            run_id: "scroll".into(),
+            time_origin_ms: 42.0,
+            overflowed: 0,
+            thumbnail_diagnostics: ThumbnailDiagnostics::default(),
+            samples: Vec::new(),
+            scroll_capture: Some(ScrollCapture {
+                frame_model: ScrollFrameModel::RequestAnimationFrameTimestampScrollPosition,
+                outcome: ScrollOutcome::Complete,
+                reason: ScrollReason::DurationElapsed,
+                started_us: 1_000,
+                ended_us: 5_001_000,
+                target_initial: ScrollSnapshot {
+                    identity: 1,
+                    scroll_top_px: 0,
+                    scroll_left_px: 0,
+                    viewport_width_px: 800,
+                    viewport_height_px: 600,
+                    scroll_width_px: 800,
+                    scroll_height_px: 2400,
+                },
+                target_final: Some(ScrollSnapshot {
+                    identity: 1,
+                    scroll_top_px: 1800,
+                    scroll_left_px: 0,
+                    viewport_width_px: 800,
+                    viewport_height_px: 600,
+                    scroll_width_px: 800,
+                    scroll_height_px: 2400,
+                }),
+                frames: vec![(999, 0, 0), (5_000_000, 1800, 0)],
+            }),
+        };
+        validate(&receipt, "scroll").unwrap();
+        receipt.scroll_capture.as_mut().unwrap().frames = vec![(5_000_000, 0, 0), (1_010, 0, 0)];
+        assert!(validate(&receipt, "scroll").is_err());
+        receipt.scroll_capture.as_mut().unwrap().frames = vec![(1_010, 0, 0), (5_001_001, 0, 0)];
+        assert!(validate(&receipt, "scroll").is_err());
+        let capture = receipt.scroll_capture.as_mut().unwrap();
+        capture.outcome = ScrollOutcome::Incomplete;
+        capture.ended_us = 12_001_000;
+        capture.frames = vec![(1_010, 0, 0), (12_000_000, 0, 0)];
+        validate(&receipt, "scroll").unwrap();
     }
 
     #[test]
@@ -482,6 +676,7 @@ mod tests {
             overflowed: 0,
             thumbnail_diagnostics: ThumbnailDiagnostics::default(),
             samples: Vec::new(),
+            scroll_capture: None,
         };
         let path = PathBuf::from(state.finish(receipt).unwrap());
         let stored: Receipt = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -496,6 +691,7 @@ mod tests {
                 overflowed: 0,
                 thumbnail_diagnostics: ThumbnailDiagnostics::default(),
                 samples: Vec::new(),
+                scroll_capture: None,
             })
             .unwrap();
         assert_eq!(PathBuf::from(exact_retry), path);
@@ -510,6 +706,7 @@ mod tests {
                     overflowed: 0,
                     thumbnail_diagnostics: ThumbnailDiagnostics::default(),
                     samples: Vec::new(),
+                    scroll_capture: None,
                 })
                 .is_err()
         );

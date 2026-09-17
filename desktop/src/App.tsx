@@ -33,7 +33,7 @@ import { CompatibilityStatus } from './components/CompatibilityStatus';
 import { Viewport } from './components/Viewport';
 import { EditQueue, type EditSnapshot } from './state/editQueue';
 import { ActionGate } from './state/actionGate';
-import { beginMeasurement, finalizeMeasurement, initializeMeasurement, measurementDurable, measurementEnded, measurementPresented, measurementSearchResponse, subscribeMeasurement, type MeasurementStatus } from './performanceMeasurement';
+import { beginMeasurement, finalizeMeasurement, initializeMeasurement, measurementDurable, measurementEnded, measurementPresented, measurementSearchResponse, startScrollMeasurement, stopScrollMeasurement, subscribeMeasurement, type MeasurementStatus } from './performanceMeasurement';
 
 const initialStatus: CatalogStatus = { phase: 'closed', catalog: null, jobs_held: false, pending_commands: 0, active_previews: 0, cancel_requested: false, message: null };
 const LightroomMigrationPanel=lazy(()=>import('./components/LightroomMigrationPanel').then(module=>({default:module.LightroomMigrationPanel})));
@@ -85,7 +85,7 @@ export function App() {
   const [history, setHistory] = useState<HistoryEntry[] | null>(null);
   const gate = useRef(new ActionGate());
   const [transitioning, setTransitioning] = useState(false);
-  const [measurement, setMeasurement] = useState<MeasurementStatus>({ enabled: false, samples: 0, finalizing: false, finalized: false, receiptPath: null, error: null });
+  const [measurement, setMeasurement] = useState<MeasurementStatus>({ enabled: false, samples: 0, scrollState: 'idle', scrollFrames: 0, finalizing: false, finalized: false, receiptPath: null, error: null });
   const perform = useCallback(async (action: () => Promise<void>) => {
     await gate.current.run(async () => {
       setTransitioning(true);
@@ -355,7 +355,7 @@ export function App() {
       {desktopAvailable && <button className="quiet" onClick={() => setShowLightroomMigration(true)}>Migrate Lightroom…</button>}
       {catalog && <button className="quiet" onClick={() => void close()} disabled={!!busy || transitioning}>Close catalog</button>}
       </header>
-      {measurement.enabled && <div className="measurement-banner" role="status"><span>S12 measurement · {measurement.samples} samples</span><button disabled={measurement.finalizing || measurement.finalized} onClick={() => void finalizeMeasurement()}>{measurement.finalized ? 'Receipt finalized' : measurement.finalizing ? 'Finalizing receipt…' : 'Finalize measurement receipt'}</button>{measurement.receiptPath && <span>{measurement.receiptPath}</span>}{measurement.error && <span>{measurement.error}</span>}</div>}
+      {measurement.enabled && <div className="measurement-banner" role="status"><span>S12 measurement · {measurement.samples} samples · scroll {measurement.scrollState}{measurement.scrollState !== 'idle' ? ` (${measurement.scrollFrames} frames)` : ''}</span><button disabled={measurement.finalizing || measurement.finalized || (measurement.scrollState !== 'idle' && measurement.scrollState !== 'capturing')} onClick={() => measurement.scrollState === 'capturing' ? stopScrollMeasurement() : startScrollMeasurement()}>{measurement.scrollState === 'capturing' ? 'Stop scroll capture' : 'Capture 5s scroll cadence'}</button><button disabled={measurement.finalizing || measurement.finalized} onClick={() => void finalizeMeasurement()}>{measurement.finalized ? 'Receipt finalized' : measurement.finalizing ? 'Finalizing receipt…' : 'Finalize measurement receipt'}</button>{measurement.receiptPath && <span>{measurement.receiptPath}</span>}{measurement.error && <span>{measurement.error}</span>}</div>}
     {catalog && <button disabled={transitioning} onClick={() => setShowPreviewSettings(true)}>Preview storage…</button>}
     {desktopAvailable && <LightroomActivity controller={inspection} onOpen={() => setShowLightroom(true)} />}
     {desktopAvailable && <LightroomMigrationActivity controller={migration} onOpen={() => setShowLightroomMigration(true)} />}

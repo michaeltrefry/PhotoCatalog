@@ -29,6 +29,28 @@ export type MeasurementReceipt = {
   readonly overflowed: number;
   readonly thumbnail_diagnostics: ThumbnailDiagnostics;
   readonly samples: readonly MeasurementSample[];
+  readonly scroll_capture?: ScrollCapture;
+};
+
+export type ScrollSnapshot = {
+  identity: number;
+  scroll_top_px: number;
+  scroll_left_px: number;
+  viewport_width_px: number;
+  viewport_height_px: number;
+  scroll_width_px: number;
+  scroll_height_px: number;
+};
+
+export type ScrollCapture = {
+  frame_model: 'request_animation_frame_timestamp_scroll_position';
+  outcome: 'complete' | 'incomplete';
+  reason: 'duration_elapsed' | 'manual_stop' | 'finalized' | 'unmounted' | 'target_changed' | 'frame_limit';
+  started_us: number;
+  ended_us: number;
+  target_initial: ScrollSnapshot;
+  target_final: ScrollSnapshot | null;
+  frames: readonly (readonly [timestamp_us: number, scroll_top_px: number, scroll_left_px: number])[];
 };
 
 export type ThumbnailDiagnostics = {
@@ -63,9 +85,19 @@ type Active = {
 
 type Clock = { now: () => number; timeOrigin: number };
 type Frame = (callback: FrameRequestCallback) => number;
+type CancelFrame = (handle: number) => void;
+type Timer = (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
+type CancelTimer = (handle: ReturnType<typeof setTimeout>) => void;
+type ScrollTarget = () => HTMLElement | null;
 
 const elapsedUs = (started: number, ended: number) => Math.max(0, Math.round((ended - started) * 1000));
 const MAX_STARTED_US = 24 * 60 * 60 * 1_000_000;
+const SCROLL_DURATION_MS = 5_000;
+const MAX_SCROLL_FRAMES = 2_048;
+const MAX_SCROLL_PX = 0xffff_ffff;
+const MAX_SCROLL_EDGE_GAP_US = 100_000;
+
+const boundedPixel = (value: number) => Math.min(MAX_SCROLL_PX, Math.max(0, Math.round(Number.isFinite(value) ? value : 0)));
 
 export class PerformanceRecorder {
   private nextOrdinal = 0;
@@ -73,6 +105,17 @@ export class PerformanceRecorder {
   private frozen: MeasurementReceipt | null = null;
   private readonly active = new Map<number, Active>();
   private readonly samples: MeasurementSample[] = [];
+  private scrollCapture: ScrollCapture | undefined;
+  private activeScroll: {
+    target: HTMLElement;
+    started: number;
+    initial: ScrollSnapshot;
+    frames: [number, number, number][];
+    frameHandle: number | null;
+    timerHandle: ReturnType<typeof setTimeout>;
+  } | null = null;
+  private nextSurfaceIdentity = 0;
+  private readonly surfaceIdentities = new WeakMap<HTMLElement, number>();
   private readonly thumbnailDiagnostics: ThumbnailDiagnostics = {
     attempts: 0, decode_completed: 0, decode_failed: 0, source_changed: 0,
     disconnected: 0, incomplete: 0, zero_size: 0, nonvisible: 0,
@@ -82,6 +125,10 @@ export class PerformanceRecorder {
   readonly maxSamples: number;
   private readonly clock: Clock;
   private readonly frame: Frame;
+  private readonly cancelFrame: CancelFrame;
+  private readonly timer: Timer;
+  private readonly cancelTimer: CancelTimer;
+  private readonly findScrollTarget: ScrollTarget;
   private readonly changed: () => void;
 
   constructor(
@@ -90,15 +137,79 @@ export class PerformanceRecorder {
     clock: Clock = performance,
     frame: Frame = requestAnimationFrame,
     changed: () => void = () => {},
+    cancelFrame: CancelFrame = handle => cancelAnimationFrame(handle),
+    timer: Timer = (callback, milliseconds) => setTimeout(callback, milliseconds),
+    cancelTimer: CancelTimer = handle => clearTimeout(handle),
+    findScrollTarget: ScrollTarget = () => document.querySelector<HTMLElement>('.photo-grid'),
   ) {
     this.runId = runId;
     this.maxSamples = maxSamples;
     this.clock = clock;
     this.frame = frame.bind(globalThis);
+    this.cancelFrame = cancelFrame.bind(globalThis);
+    this.timer = timer.bind(globalThis);
+    this.cancelTimer = cancelTimer.bind(globalThis);
+    this.findScrollTarget = findScrollTarget;
     this.changed = changed;
   }
 
   get count() { return this.samples.length; }
+  get scrollState(): 'idle' | 'capturing' | 'complete' | 'incomplete' {
+    return this.activeScroll ? 'capturing' : this.scrollCapture?.outcome ?? 'idle';
+  }
+  get scrollFrames() { return this.activeScroll?.frames.length ?? this.scrollCapture?.frames.length ?? 0; }
+
+  startScroll(target: HTMLElement): boolean {
+    if (this.frozen || this.activeScroll || this.scrollCapture || !target.isConnected) return false;
+    if (target.scrollHeight <= target.clientHeight && target.scrollWidth <= target.clientWidth) return false;
+    const started = this.clock.now();
+    const active = {
+      target, started, initial: this.scrollSnapshot(target), frames: [] as [number, number, number][], frameHandle: null as number | null,
+      timerHandle: undefined as unknown as ReturnType<typeof setTimeout>,
+    };
+    this.activeScroll = active;
+    const tick: FrameRequestCallback = timestamp => {
+      if (this.activeScroll !== active) return;
+      active.frameHandle = null;
+      active.frames.push([Math.round(timestamp * 1000), boundedPixel(active.target.scrollTop), boundedPixel(active.target.scrollLeft)]);
+      const current = this.findScrollTarget();
+      if (!active.target.isConnected || !current) { this.stopScroll('unmounted'); return; }
+      if (current !== active.target) { this.stopScroll('target_changed', current); return; }
+      if (active.frames.length >= MAX_SCROLL_FRAMES) { this.stopScroll('frame_limit'); return; }
+      active.frameHandle = this.frame(tick);
+    };
+    active.frameHandle = this.frame(tick);
+    active.timerHandle = this.timer(() => this.stopScroll('duration_elapsed'), SCROLL_DURATION_MS);
+    this.notify();
+    return true;
+  }
+
+  stopScroll(reason: ScrollCapture['reason'] = 'manual_stop', finalTarget?: HTMLElement | null): boolean {
+    const active = this.activeScroll;
+    if (!active) return false;
+    this.activeScroll = null;
+    this.cancelTimer(active.timerHandle);
+    if (active.frameHandle !== null) this.cancelFrame(active.frameHandle);
+    const target = finalTarget === undefined ? this.findScrollTarget() : finalTarget;
+    const sameTarget = target === active.target && active.target.isConnected;
+    const ended = this.clock.now();
+    const startedUs = Math.max(0, Math.round(active.started * 1000));
+    const endedUs = Math.max(0, Math.round(ended * 1000));
+    const firstFrameUs = active.frames[0]?.[0];
+    const lastFrameUs = active.frames.at(-1)?.[0];
+    this.scrollCapture = Object.freeze({
+      frame_model: 'request_animation_frame_timestamp_scroll_position',
+      outcome: reason === 'duration_elapsed' && sameTarget && ended - active.started >= SCROLL_DURATION_MS && ended - active.started <= 10_000 && firstFrameUs !== undefined && lastFrameUs !== undefined && Math.abs(firstFrameUs - startedUs) <= MAX_SCROLL_EDGE_GAP_US && lastFrameUs <= endedUs && endedUs - lastFrameUs <= MAX_SCROLL_EDGE_GAP_US ? 'complete' : 'incomplete',
+      reason,
+      started_us: startedUs,
+      ended_us: endedUs,
+      target_initial: active.initial,
+      target_final: target ? this.scrollSnapshot(target) : null,
+      frames: Object.freeze(active.frames.map(frame => Object.freeze(frame))),
+    });
+    this.notify();
+    return true;
+  }
 
   begin(kind: MeasurementKind, context: MeasurementContext): number | undefined {
     if (this.frozen) return undefined;
@@ -172,6 +283,7 @@ export class PerformanceRecorder {
 
   receipt(): MeasurementReceipt {
     if (this.frozen) return this.frozen;
+    this.stopScroll('finalized');
     for (const active of [...this.active.values()]) {
       if (active.kind === 'browse' && active.expected) {
         this.thumbnailDiagnostic('pending_expected', [...active.expected].filter(id => !active.presented?.has(id)).length);
@@ -179,7 +291,7 @@ export class PerformanceRecorder {
       this.finish(active, 'incomplete', null);
     }
     const samples = Object.freeze(this.samples.map(sample => Object.freeze({ ...sample })));
-    this.frozen = Object.freeze({ protocol: 1, presentation_model: 'two_animation_frames', context_model: 'last_observed_status_at_start', run_id: this.runId, time_origin_ms: this.clock.timeOrigin, overflowed: this.overflowed, thumbnail_diagnostics: Object.freeze({ ...this.thumbnailDiagnostics }), samples });
+    this.frozen = Object.freeze({ protocol: 1, presentation_model: 'two_animation_frames', context_model: 'last_observed_status_at_start', run_id: this.runId, time_origin_ms: this.clock.timeOrigin, overflowed: this.overflowed, thumbnail_diagnostics: Object.freeze({ ...this.thumbnailDiagnostics }), samples, ...(this.scrollCapture ? { scroll_capture: this.scrollCapture } : {}) });
     return this.frozen;
   }
 
@@ -187,6 +299,19 @@ export class PerformanceRecorder {
   // establish compositor delivery or physical scanout; those need native trace evidence.
   private afterTwoFrames(action: () => void) { this.frame(() => { this.frame(() => action()); }); }
   private notify() { try { this.changed(); } catch { /* Measurement status cannot affect product work. */ } }
+  private surfaceIdentity(target: HTMLElement) {
+    let identity = this.surfaceIdentities.get(target);
+    if (identity === undefined) { identity = ++this.nextSurfaceIdentity; this.surfaceIdentities.set(target, identity); }
+    return identity;
+  }
+  private scrollSnapshot(target: HTMLElement): ScrollSnapshot {
+    return Object.freeze({
+      identity: this.surfaceIdentity(target),
+      scroll_top_px: boundedPixel(target.scrollTop), scroll_left_px: boundedPixel(target.scrollLeft),
+      viewport_width_px: boundedPixel(target.clientWidth), viewport_height_px: boundedPixel(target.clientHeight),
+      scroll_width_px: boundedPixel(target.scrollWidth), scroll_height_px: boundedPixel(target.scrollHeight),
+    });
+  }
   private thumbnailDiagnostic(kind: keyof ThumbnailDiagnostics, count = 1) {
     if (this.frozen) return;
     this.thumbnailDiagnostics[kind] = Math.min(0xffffffff, this.thumbnailDiagnostics[kind] + count);
@@ -219,7 +344,7 @@ export class PerformanceRecorder {
 }
 
 type Config = { enabled: boolean; run_id: string | null; max_samples: number };
-export type MeasurementStatus = { enabled: boolean; samples: number; finalizing: boolean; finalized: boolean; receiptPath: string | null; error: string | null };
+export type MeasurementStatus = { enabled: boolean; samples: number; scrollState: 'idle' | 'capturing' | 'complete' | 'incomplete'; scrollFrames: number; finalizing: boolean; finalized: boolean; receiptPath: string | null; error: string | null };
 
 export class ReceiptFinalizer {
   private snapshot: MeasurementReceipt | null = null;
@@ -247,7 +372,7 @@ export class ReceiptFinalizer {
 let recorder: PerformanceRecorder | null = null;
 let finalizer: ReceiptFinalizer | null = null;
 let initialization: Promise<void> | null = null;
-let status: MeasurementStatus = { enabled: false, samples: 0, finalizing: false, finalized: false, receiptPath: null, error: null };
+let status: MeasurementStatus = { enabled: false, samples: 0, scrollState: 'idle', scrollFrames: 0, finalizing: false, finalized: false, receiptPath: null, error: null };
 const listeners = new Set<(value: MeasurementStatus) => void>();
 const publish = (next: Partial<MeasurementStatus>) => { status = { ...status, ...next }; listeners.forEach(listener => listener(status)); };
 
@@ -258,7 +383,7 @@ export function subscribeMeasurement(listener: (value: MeasurementStatus) => voi
 export function initializeMeasurement() {
   initialization ??= invoke<Config>('catalog_measurement_config').then(config => {
     if (!config.enabled || !config.run_id) return;
-    recorder = new PerformanceRecorder(config.run_id, Math.min(512, config.max_samples), performance, requestAnimationFrame, () => publish({ samples: recorder?.count ?? 0 }));
+    recorder = new PerformanceRecorder(config.run_id, Math.min(512, config.max_samples), performance, requestAnimationFrame, () => publish({ samples: recorder?.count ?? 0, scrollState: recorder?.scrollState ?? 'idle', scrollFrames: recorder?.scrollFrames ?? 0 }));
     finalizer = new ReceiptFinalizer(recorder, receipt => invoke<string>('catalog_measurement_finish', { receipt }));
     publish({ enabled: true });
   }).catch(error => publish({ error: error instanceof Error ? error.message : String(error) }));
@@ -271,6 +396,16 @@ export const measurementPresented = (ordinal: number | undefined, verify: () => 
 export const measurementEnded = (ordinal: number | undefined, outcome: 'backend_error' | 'superseded' | 'canceled') => { if (ordinal !== undefined) recorder?.end(ordinal, outcome); };
 export const measurementSearchResponse = (ordinal: number | undefined, rows: number) => { if (ordinal !== undefined) recorder?.searchResponse(ordinal, rows); };
 export const measurementVisible = (ordinal: number | undefined, ids: string[]) => { if (ordinal !== undefined) recorder?.visible(ordinal, ids); };
+export function startScrollMeasurement() {
+  const target = document.querySelector<HTMLElement>('.photo-grid');
+  if (!target || !recorder?.startScroll(target)) {
+    publish({ error: 'Scroll capture requires one mounted, scrollable photo grid.' });
+    return false;
+  }
+  publish({ error: null });
+  return true;
+}
+export const stopScrollMeasurement = () => recorder?.stopScroll('manual_stop') ?? false;
 
 export function classifyThumbnailPresentation(image: Pick<HTMLImageElement, 'getAttribute' | 'isConnected' | 'complete' | 'naturalWidth' | 'naturalHeight' | 'getBoundingClientRect'>, expectedSource: string): ThumbnailPresentation {
   if (image.getAttribute('src') !== expectedSource) return 'source_changed';

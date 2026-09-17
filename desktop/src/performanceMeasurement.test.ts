@@ -47,6 +47,114 @@ test('animation frames retain the browser receiver after the scheduler is stored
   ]);
 });
 
+function scrollSurface(overrides: Partial<HTMLElement> = {}) {
+  return {
+    isConnected: true, scrollTop: 0, scrollLeft: 0,
+    clientWidth: 800, clientHeight: 600, scrollWidth: 800, scrollHeight: 2400,
+    ...overrides,
+  } as unknown as HTMLElement;
+}
+
+test('scroll cadence retains the receiver-sensitive native callback timestamp and surface proof', () => {
+  let now = 20, timer: (() => void) | undefined;
+  const frames: FrameRequestCallback[] = [];
+  const target = scrollSurface();
+  function receiverSensitiveFrame(this: typeof globalThis, callback: FrameRequestCallback) {
+    if (this !== globalThis) throw new TypeError('Illegal invocation');
+    frames.push(callback); return frames.length;
+  }
+  const recorder = new PerformanceRecorder(
+    'run', 8, { now: () => now, timeOrigin: 1234 }, receiverSensitiveFrame, () => {}, () => {},
+    callback => { timer = callback; return 1 as unknown as ReturnType<typeof setTimeout>; }, () => {}, () => target,
+  );
+  expect(recorder.startScroll(target)).toBe(true);
+  frames.splice(0).forEach(callback => callback(19.99));
+  target.scrollTop = 500;
+  frames.splice(0).forEach(callback => callback(5019));
+  now = 5020; timer!();
+  expect(recorder.receipt().scroll_capture).toEqual(expect.objectContaining({
+    outcome: 'complete', reason: 'duration_elapsed', started_us: 20_000, ended_us: 5_020_000,
+    target_initial: expect.objectContaining({ identity: 1, scroll_top_px: 0, scroll_height_px: 2400 }),
+    target_final: expect.objectContaining({ identity: 1, scroll_top_px: 500, scroll_height_px: 2400 }),
+    frames: [[19_990, 0, 0], [5_019_000, 500, 0]],
+  }));
+});
+
+test('scroll cadence stops bounded and incomplete when its mounted grid disappears', () => {
+  let now = 0;
+  let connected = true;
+  const frames: FrameRequestCallback[] = [];
+  const target = scrollSurface();
+  Object.defineProperty(target, 'isConnected', { get: () => connected });
+  const recorder = new PerformanceRecorder(
+    'run', 8, { now: () => now, timeOrigin: 1234 }, callback => { frames.push(callback); return frames.length; }, () => {}, () => {},
+    () => 1 as unknown as ReturnType<typeof setTimeout>, () => {}, () => connected ? target : null,
+  );
+  expect(recorder.startScroll(target)).toBe(true);
+  frames.splice(0).forEach(callback => callback(5));
+  connected = false;
+  now = 10;
+  frames.splice(0).forEach(callback => callback(10));
+  expect(recorder.scrollState).toBe('incomplete');
+  expect(recorder.receipt().scroll_capture).toEqual(expect.objectContaining({
+    outcome: 'incomplete', reason: 'unmounted', target_final: null,
+    frames: [[5000, 0, 0], [10_000, 0, 0]],
+  }));
+  expect(recorder.receipt().samples).toEqual([]);
+});
+
+test('finalizing an active scroll capture preserves callbacks and marks it incomplete', () => {
+  const frames: FrameRequestCallback[] = [];
+  const target = scrollSurface();
+  const recorder = new PerformanceRecorder(
+    'run', 8, { now: () => 20, timeOrigin: 1234 }, callback => { frames.push(callback); return frames.length; }, () => {}, () => {},
+    () => 1 as unknown as ReturnType<typeof setTimeout>, () => {}, () => target,
+  );
+  recorder.startScroll(target);
+  frames.splice(0).forEach(callback => callback(20));
+  expect(recorder.receipt().scroll_capture).toEqual(expect.objectContaining({
+    outcome: 'incomplete', reason: 'finalized', frames: [[20_000, 0, 0]],
+  }));
+});
+
+test('scroll cadence stops at its fixed frame bound without scheduling another callback', () => {
+  let now = 0;
+  const frames: FrameRequestCallback[] = [];
+  const target = scrollSurface();
+  const recorder = new PerformanceRecorder(
+    'run', 8, { now: () => now, timeOrigin: 1234 }, callback => { frames.push(callback); return frames.length; }, () => {}, () => {},
+    () => 1 as unknown as ReturnType<typeof setTimeout>, () => {}, () => target,
+  );
+  recorder.startScroll(target);
+  for (let index = 0; index < 2048; index += 1) {
+    now = index;
+    expect(frames).toHaveLength(1);
+    frames.splice(0).forEach(callback => callback(index));
+  }
+  expect(frames).toHaveLength(0);
+  const capture = recorder.receipt().scroll_capture!;
+  expect(capture).toEqual(expect.objectContaining({ outcome: 'incomplete', reason: 'frame_limit' }));
+  expect(capture.frames).toHaveLength(2048);
+});
+
+test('a delayed duration timer is retained as an incomplete observation', () => {
+  let now = 0, timer: (() => void) | undefined;
+  const frames: FrameRequestCallback[] = [];
+  const target = scrollSurface();
+  const recorder = new PerformanceRecorder(
+    'run', 8, { now: () => now, timeOrigin: 1234 }, callback => { frames.push(callback); return frames.length; }, () => {}, () => {},
+    callback => { timer = callback; return 1 as unknown as ReturnType<typeof setTimeout>; }, () => {}, () => target,
+  );
+  recorder.startScroll(target);
+  frames.splice(0).forEach(callback => callback(1));
+  frames.splice(0).forEach(callback => callback(17));
+  now = 12_000; timer!();
+  expect(recorder.receipt().scroll_capture).toEqual(expect.objectContaining({
+    outcome: 'incomplete', reason: 'duration_elapsed', ended_us: 12_000_000,
+    frames: [[1000, 0, 0], [17_000, 0, 0]],
+  }));
+});
+
 test('a post-commit failure cannot revoke a durable cull presentation', () => {
   const h = harness();
   const ordinal = h.recorder.begin('cull', context)!;
