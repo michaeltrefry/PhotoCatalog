@@ -16,14 +16,23 @@ import edit_campaign as campaign
 import edit_correctness_matrix as matrix
 
 
-def binding():
+def binding(artifact='/private/artifacts',service='/private/services'):
     file=dict(path='/private/frozen',sha256='a'*64)
-    value=dict(version=2,pending_execution_gates=[],automatic_retries=0,
+    volume=lambda retained,active,copies,reserve,minimum:dict(
+        retained_bound_bytes=retained,active_bound_bytes=active,copies_bound_bytes=copies,
+        free_reserve_bytes=reserve,minimum_free_bytes=minimum,post_campaign_bytes=0,
+        campaign_admission_bytes=minimum,full_sequence_initial_free_bytes=minimum+copies,
+        output_stop_bytes=retained+active,components={})
+    value=dict(version=3,pending_execution_gates=[],automatic_retries=0,
                 actions=[dict(id='one',kind='probe',deadline_seconds=60,process_rss_bytes=100,group_rss_bytes=200)],
                 **{key:file.copy() for key in ('python','probe','worker','verifier','fixture_generator',
                                               'source_archive','build_reference','protocol')},
-                source_commit='b'*40,minimum_free_bytes=1000,retained_bound_bytes=300,
-                active_bound_bytes=200,copies_bound_bytes=100,free_reserve_bytes=400)
+                source_commit='b'*40,retained_bound_bytes=300,active_bound_bytes=200,copies_bound_bytes=100,
+                volumes=dict(service=volume(100,100,0,400,600),artifact=volume(200,100,100,400,800)),
+                storage_roots=dict(artifact=dict(path=str(artifact),parent=str(Path(artifact).parent),parent_device=1,
+                                                  parent_inode=Path(artifact).parent.stat().st_ino if Path(artifact).parent.exists() else 1),
+                                   service=dict(path=str(service),parent=str(Path(service).parent),parent_device=2,
+                                                 parent_inode=Path(service).parent.stat().st_ino if Path(service).parent.exists() else 2)))
     value['python']['path']=sys.executable
     return value
 
@@ -32,16 +41,37 @@ class BindingContracts(unittest.TestCase):
     def test_campaign_funding_converts_path_before_windows_disk_api(self):
         from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)/'campaign'
+            artifact_parent=Path(folder)/'artifact-parent';service_parent=Path(folder)/'service-parent'
+            artifact_parent.mkdir();service_parent.mkdir()
+            root=artifact_parent/'campaign';service=service_parent/'service'
             def disk_usage(path):
                 self.assertIsInstance(path,str)
-                self.assertEqual(path,str(root))
+                self.assertIn(path,(str(root),str(service)))
                 return SimpleNamespace(free=0)
             with patch.object(campaign,'validate_binding'), \
+                 patch.object(campaign,'storage_identity',side_effect=lambda path:dict(
+                     device=1 if Path(path) in (root,artifact_parent) else 2,
+                     inode=Path(path).stat().st_ino)), \
                  patch.object(campaign.psutil,'disk_usage',side_effect=disk_usage) as usage:
                 with self.assertRaisesRegex(ValueError,'insufficient fully funded'):
-                    campaign.execute(binding(),root)
+                    campaign.execute(binding(root,service),root)
             usage.assert_called_once()
+
+    def test_changed_parent_identity_stops_before_capacity_or_child_admission(self):
+        with tempfile.TemporaryDirectory() as folder:
+            artifact_parent=Path(folder).resolve()/'artifact-parent';service_parent=Path(folder).resolve()/'service-parent'
+            artifact_parent.mkdir();service_parent.mkdir()
+            root=artifact_parent/'campaign';service=service_parent/'service'
+            value=binding(root,service)
+            value['storage_roots']['artifact']['parent_device']=artifact_parent.stat().st_dev
+            value['storage_roots']['service']['parent_device']=service_parent.stat().st_dev+1
+            with patch.object(campaign,'validate_binding'), \
+                 patch.object(campaign.psutil,'disk_usage') as usage, \
+                 self.assertRaisesRegex(ValueError,'storage volume identity changed'):
+                campaign.execute(value,root)
+            usage.assert_not_called()
+            self.assertTrue(root.is_dir())
+            self.assertTrue(service.is_dir())
 
     def check(self,value):
         with patch.object(campaign,'digest',return_value='a'*64), patch.object(campaign.edit_admission,'validate_execution'):
@@ -55,7 +85,7 @@ class BindingContracts(unittest.TestCase):
 
     def test_minimum_funds_entire_peak(self):
         value=binding()
-        value['minimum_free_bytes']=999
+        value['volumes']['artifact']['minimum_free_bytes']=799
         with self.assertRaises(ValueError): self.check(value)
 
     def test_nonfinite_negative_and_oversize_deadlines_rejected(self):
@@ -108,9 +138,10 @@ class ActualChildSupervisorContracts(unittest.TestCase):
             self.assertEqual(result['ownership']['root_returncode'],0)
             self.assertEqual((folder/'stdout.log').read_text().strip(),'worker proof reached')
             self.assertTrue(seen)
-            self.assertTrue(all(path==str(Path(root)) for path in seen))
+            self.assertTrue(all(path==str(Path(root).resolve()) for path in seen))
 
-    def invoke(self,root,code,*,expect_failure,patches=()):
+    def invoke(self,root,code,*,expect_failure,patches=(),disk_roots=None,reserves=None):
+        root=Path(root).resolve()
         spawned=[]
         popen=subprocess.Popen
         def launch(*args,**kwargs):
@@ -119,6 +150,11 @@ class ActualChildSupervisorContracts(unittest.TestCase):
             return child
         from contextlib import ExitStack
         folder=Path(root)/'attempt'
+        disk_roots=dict(artifact=root) if disk_roots is None else {
+            name:Path(path).resolve() for name,path in disk_roots.items()}
+        reserves={name:0 for name in disk_roots} if reserves is None else reserves
+        storage={name:dict(root=str(path),**campaign.storage_identity(path),reserve_bytes=reserves[name])
+                 for name,path in disk_roots.items()}
         start=time.monotonic()
         try:
             with ExitStack() as stack:
@@ -129,11 +165,13 @@ class ActualChildSupervisorContracts(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError,'child failed; retained at'):
                         campaign.invoke([sys.executable,'-c',code],folder,
                             dict(deadline_seconds=10,process_rss_bytes=256*campaign.MIB,
-                                 group_rss_bytes=512*campaign.MIB,free_reserve_bytes=0),root)
+                                 group_rss_bytes=512*campaign.MIB,
+                                 storage=storage),disk_roots)
                 else:
                     campaign.invoke([sys.executable,'-c',code],folder,
                         dict(deadline_seconds=10,process_rss_bytes=256*campaign.MIB,
-                             group_rss_bytes=512*campaign.MIB,free_reserve_bytes=0),root)
+                             group_rss_bytes=512*campaign.MIB,
+                             storage=storage),disk_roots)
             self.assertEqual(len(spawned),1)
             self.assertIsNotNone(spawned[0].returncode,'supervisor did not reap its Popen child')
             self.assertLess(time.monotonic()-start,15,'bounded cleanup exceeded test allowance')
@@ -148,6 +186,31 @@ class ActualChildSupervisorContracts(unittest.TestCase):
                 if child.poll() is None:
                     child.kill()
                 child.wait(timeout=5)
+
+    def test_live_space_exhaustion_on_either_named_volume_stops_and_reaps(self):
+        from types import SimpleNamespace
+        for low in ('artifact','service'):
+            with self.subTest(low=low),tempfile.TemporaryDirectory() as temporary:
+                base=Path(temporary).resolve();root=base/'artifact';service=base/'service';root.mkdir();service.mkdir()
+                roots=dict(artifact=root,service=service)
+                def usage(path):
+                    name=next(name for name,value in roots.items() if str(value)==path)
+                    return SimpleNamespace(free=0 if name==low else 100)
+                result,_=self.invoke(root,'import time; time.sleep(30)',expect_failure=True,
+                    patches=(patch.object(campaign.psutil,'disk_usage',side_effect=usage),),
+                    disk_roots=roots,reserves=dict(artifact=1,service=1))
+                self.assertIn('free-space reserve exhausted',result['error'])
+                self.assertTrue(result['ownership']['root_reaped'])
+
+    def test_live_storage_identity_change_stops_and_reaps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            identity=campaign.storage_identity(root)
+            observed=[identity,dict(identity,inode=identity['inode']+1)]
+            result,_=self.invoke(root,'import time; time.sleep(30)',expect_failure=True,
+                patches=(patch.object(campaign,'storage_identity',side_effect=observed),))
+            self.assertIn('filesystem identity changed',result['error'])
+            self.assertTrue(result['ownership']['root_reaped'])
 
     def test_initial_process_or_identity_inspection_failure_still_reaps_root(self):
         for attribute in ('process','identity'):
@@ -479,6 +542,7 @@ class ActualOuterTrackingContracts(unittest.TestCase):
         original_anchor=campaign.anchor
         for observed in (86401.,86402.):
             with self.subTest(observed=observed),tempfile.TemporaryDirectory() as root:
+                root=Path(root).resolve()
                 late={'value':False}
                 def polled(child):
                     code=original_poll(child)
@@ -487,14 +551,15 @@ class ActualOuterTrackingContracts(unittest.TestCase):
                 def anchored():
                     value=original_anchor();value['monotonic_ns']=1_000_000_000;return value
                 def clock():return observed if late['value'] else 0.
-                folder=Path(root)/'attempt'
+                folder=root/'attempt'
                 with patch.object(campaign.subprocess.Popen,'poll',polled), \
                      patch.object(campaign,'anchor',side_effect=anchored), \
                      patch.object(campaign.time,'monotonic',side_effect=clock):
                     with self.assertRaisesRegex(RuntimeError,'child failed'):
                         campaign.invoke([sys.executable,'-c','pass'],folder,
                             dict(deadline_seconds=86400,process_rss_bytes=256*campaign.MIB,
-                                 group_rss_bytes=512*campaign.MIB,free_reserve_bytes=0),root)
+                                 group_rss_bytes=512*campaign.MIB,
+                                 storage=dict(artifact=dict(root=str(root),**campaign.storage_identity(root),reserve_bytes=0))),dict(artifact=root))
                 result=json.loads((folder/'result.json').read_text())
                 self.assertFalse(result['complete'])
                 self.assertIn('deadline exceeded',result['error'])

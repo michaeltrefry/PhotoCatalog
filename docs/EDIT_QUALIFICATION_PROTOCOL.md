@@ -1,18 +1,25 @@
 # S8 editing and derivative qualification protocol
 
-This document describes the implemented, frozen qualification method. It is an
+This document describes qualification protocol schema **version 3**. It is an
 editorial consolidation of the reviewed protocol, not a new experiment or a
 change to its targets, fixtures, samples or tolerances. Measurements and acceptance
 decisions are recorded in [the results report](EDIT_QUALIFICATION_RESULTS.md). A completed probe or successful individual
 verifier does not by itself award performance, memory or whole-story acceptance.
 
-The bound helper source is `2ed0e5cbceb857e542562ad4d01b8e75eeff8eff`; the native
+Version 3 bindings require request schema version 2 and separate, physically
+distinct service and artifact filesystems. Historical version-2 bindings and
+their version-1 single-root requests are rejected rather than silently
+reinterpreted; the old `--campaign-root` CLI is not accepted. Every execution
+still requires a fresh immutable binding to the exact source, helper package,
+runtime and native executables.
+
+The retained historical version-2 helper source is `2ed0e5cbceb857e542562ad4d01b8e75eeff8eff`; its native
 release was built from `a6498079a01e98c703d56a6559e8fc80b1dcc5da`. Their complete Git
 delta contains only the supervisor Python, its tests and the execution ledger.
 The private build/source-association receipts retain that distinction, together
 with both source archives and exact app, probe, SDK and dependency identities.
 Historical failed tests and corrective smoke runs remain in private receipts;
-this consolidation neither deletes them nor replaces their verdicts.
+this version neither deletes them nor upgrades their verdicts to version 3.
 
 ## Fixed acceptance targets and reporting
 
@@ -36,8 +43,11 @@ Do not pool cameras or configurations to conceal a miss. Correctness/refusal and
 64/100 MP support cases receive no ≤32 MP timing award.
 
 These are headless component and durable-operation measurements. Desktop frame
-delivery remains S12. Sources are ordinary copies on the private local SSD/APFS
-volume; this is not RAID throughput evidence. Fresh children and disabling the
+delivery remains S12. Sources are ordinary copies on the bound external
+artifact/source filesystem; catalogs, preview manifests and preview caches remain
+on the bound local service SSD. The receipt must name the actual storage topology;
+fixture copies on an external volume are not proof that the user's complete real
+original corpus was exercised. Fresh children and disabling the
 prepared cache do not flush filesystem caches or establish cold-storage latency.
 
 ## Sources, operations and complete registry
@@ -279,13 +289,44 @@ and reaps known children, and stops further admission on uncertainty. Abrupt hos
 failure still requires explicit ownership reconciliation.
 
 Disk funding comes from `edit_disk_budget.py::budget()` over the complete matrix,
-not an expected compression ratio: retained content/namespaces/evidence plus the
-largest active export, source copies, explicit allocation overhead and 16 GiB free
-reserve. The bound minimum is 403,726,925,824 bytes; the separately funded aggregate
-artifact adds 67,174,400 bytes, giving 403,794,100,224 bytes initial outer admission.
-Live free-space checks remain mandatory. The accounting `output_stop_bytes` field
-is not a separate filesystem quota; encoded extent/admission and live reserve are
-the active safeguards. External disk consumption can still cause an honest failure.
+not an expected compression ratio. The registry-derived ledgers reconcile exactly
+to the unchanged aggregate retained, active and copy bounds. The local service
+ledger funds 91,163,197,440 retained bytes, 570,425,344 active bytes (the maximum
+512 MiB encoded worker stage plus 32 MiB staging overhead), and an independent
+16 GiB reserve; its rounded minimum is 109,521,666,048 bytes (102 GiB). The external
+artifact/source ledger funds 262,246,667,664 retained bytes, 11,274,289,152 active
+bytes, 20,954,742,784 source-copy bytes, and its own 16 GiB reserve; its rounded
+minimum is 312,458,870,784 bytes (291 GiB). The separately funded aggregate artifact
+adds 67,174,400 bytes on the external volume, making external campaign admission
+312,526,045,184 bytes. Because preparation writes up to 20,954,742,784 bytes of
+source copies before campaign admission is rechecked, full-sequence external
+preparation requires 333,480,787,968 initially; this preserves the independently
+required campaign floor after those preparation bytes are consumed. Combined service plus external
+campaign admission is 422,047,711,232 bytes across the two volumes. Preparation
+and campaign each recheck their applicable free-space admission; live child
+supervision samples both writable volumes and fails when either reserve is
+exhausted. During campaign actions the external live floor is the 16 GiB reserve
+plus the aggregate evidence allowance, so a completed campaign cannot consume
+the bytes reserved for its final audit. The two `output_stop_bytes`
+values sum to the former aggregate 365,254,579,600 bytes and are accounting fields,
+not filesystem quotas. External disk consumption can still cause an honest failure.
+
+Each request binds an external `output` and a local `service_root`. The catalog,
+preview manifest, thumbnail store, large-preview store and catalog-rooted export
+worker staging are confined to `service_root`. Requests, samples, receipts, raw and
+encoded artifacts, export destinations and their recovery seals, verifier evidence,
+supervisor logs, prepared source copies and generated fixtures are confined to the
+artifact/source filesystem. Roots must be absolute, create-new, non-overlapping,
+non-symlink direct children of their frozen campaign parents, and backed by distinct
+physical filesystems. Failed or partial roots remain for explicit reconciliation.
+The builder freezes each physical parent device and inode before either child root
+exists. Execution rechecks those parent identities after create-new admission,
+then every 100 ms child sample rechecks the created root device and inode as well
+as the named-volume free-space reserve. Aggregate verification rechecks both
+parent and surviving root identities against the retained supervisor records.
+The native probe independently resolves both roots through the cross-platform
+volume mapper before catalog or SQL work and refuses a shared or unavailable
+physical volume identity; it does not trust the coordinator's device comparison.
 
 Funding covers 23 simultaneous encoded extents during export batches of 22. Only after all 22
 individual outputs, durable receipts and process retirement pass may cleanup

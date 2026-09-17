@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import stat
 import edit_disk_budget
 import edit_fixtures
 import edit_memory
@@ -141,7 +142,11 @@ def supervisor(root, folder, reference, command, limits, expected_pid=None):
                 total += rss
             if type(value['total_rss']) is not int or value['total_rss'] != total or total > limits['group_rss_bytes']:
                 raise ValueError('sampled group RSS does not reconcile')
-            if type(value['free_bytes']) is not int or value['free_bytes'] < limits['free_reserve_bytes']:
+            free=value.get('free_bytes_by_volume')
+            storage=limits.get('storage')
+            if (not isinstance(free,dict) or set(free)!=set(storage or {})
+                or any(type(free[name]) is not int or free[name]<descriptor['reserve_bytes']
+                       for name,descriptor in (storage or {}).items())):
                 raise ValueError('sampled disk reserve exhausted')
             actual_peak = max(actual_peak, total)
     if observed != count or actual_peak != peak or not observed_root:
@@ -258,7 +263,7 @@ def background_source(root, binding, cohort):
     return value
 
 
-def cleanup_evidence(root, record, request, verification, values):
+def cleanup_evidence(root, service_campaign_root, record, request, verification, values):
     if request['phase'] != 'export':
         if record.get('cleanup_path') is not None:
             raise ValueError('cleanup is not admitted for this phase')
@@ -272,7 +277,7 @@ def cleanup_evidence(root, record, request, verification, values):
     if done.get('complete') is not True or done.get('error') is not None or done['start_sha256'] != edit_verify.digest(start_path, 'sha256', MAX_REPORT):
         raise ValueError('cleanup is incomplete or its plan changed')
     start = edit_verify.read_json(start_path, MAX_REPORT)
-    if start['case_id'] != case_id:
+    if start.get('version') != 2 or done.get('version') != 2 or start['case_id'] != case_id:
         raise ValueError('cleanup belongs to another case')
     for field, evidence in (('verifier_receipt_sha256', record['verification_path']),
                             ('probe_supervisor_sha256', record['probe_supervisor_path']),
@@ -292,7 +297,10 @@ def cleanup_evidence(root, record, request, verification, values):
         if edit_verify.digest(destination, algorithm, request['encoded_extent']) != expected_retained[algorithm]:
             raise ValueError('retained measured output changed')
     output = Path(request['output'])
-    removable_roots = {output/'catalog'}
+    service=Path(request['service_root'])
+    if service!=Path(service_campaign_root)/(case_id+'-service'):
+        raise ValueError('cleanup service namespace differs')
+    removable_roots = {service/'catalog'}
     for value in values:
         directory = Path(value['items'][0]['receipt']['recovery_directory'])
         if directory.parent != output or not directory.name.startswith('.photocatalog-photo-export-'):
@@ -342,7 +350,7 @@ def case_result(request, receipt, verification, attempts, values):
         raise ValueError('independent verifier lacks required phase coverage')
     if receipt.get('probe_complete') is not True or receipt.get('qualification_complete') is not False or receipt.get('error') is not None:
         raise ValueError('probe incomplete or overclaiming')
-    for field in ('phase', 'fixture_id', 'operation', 'source_sha256', 'source_blake3'):
+    for field in ('phase', 'fixture_id', 'operation', 'source_sha256', 'source_blake3', 'output', 'service_root'):
         if not same(receipt[field], request[field]):
             raise ValueError('probe request identity differs')
     edit_verify.sample_coverage(request, attempts, values)
@@ -383,19 +391,60 @@ def by_identity_as_json(values):
     return [[list(key), value] for key, value in sorted(values.items())]
 
 
+def storage_identity(path):
+    value=Path(path).lstat()
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError('ordinary storage directory required')
+    return dict(device=value.st_dev,inode=value.st_ino)
+
+
 def aggregate(root, binding):
-    root = Path(root).resolve(strict=True)
+    root = Path(root)
+    if root.is_symlink():
+        raise ValueError('artifact root must not be a symlink')
+    root = root.resolve(strict=True)
+    storage=binding['storage_roots']
+    if (not isinstance(storage,dict) or set(storage)!= {'artifact','service'}
+        or any(not isinstance(value,dict)
+               or set(value)!= {'path','parent','parent_device','parent_inode'}
+               or type(value['parent_device']) is not int or type(value['parent_inode']) is not int
+               for value in storage.values())):
+        raise ValueError('exact split storage descriptors required')
+    if root!=Path(storage['artifact']['path']):
+        raise ValueError('aggregate root differs from frozen artifact root')
+    service_path=Path(storage['service']['path'])
+    if service_path.is_symlink():
+        raise ValueError('service root must not be a symlink')
+    service_root=service_path.resolve(strict=True)
+    identities={name:storage_identity(path) for name,path in (
+        ('artifact',root),('service',service_root))}
+    for name,path in (('artifact',root),('service',service_root)):
+        parent=path.parent.lstat()
+        if (Path(storage[name]['parent'])!=path.parent
+            or identities[name]['device']!=storage[name]['parent_device']
+            or parent.st_dev!=storage[name]['parent_device']
+            or parent.st_ino!=storage[name]['parent_inode']):
+            raise ValueError(name+' storage identity changed')
+    if identities['artifact']['device']==identities['service']['device']:
+        raise ValueError('split storage identity changed')
     manifest_path = Path(binding['manifest']['path'])
     if edit_verify.digest(manifest_path, 'sha256', MIB) != binding['manifest']['sha256']:
         raise ValueError('source cohort manifest changed')
     manifest = edit_verify.read_json(manifest_path, MIB)
+    funding=edit_disk_budget.budget(manifest)
+    if (binding.get('version')!=3 or not same(binding.get('funding'),funding)
+        or not same(binding.get('volumes'),funding['volumes'])
+        or any(binding.get(name)!=funding[name] for name in (
+            'retained_bound_bytes','active_bound_bytes','copies_bound_bytes'))):
+        raise ValueError('split storage funding differs from complete registry')
     normal_limits = edit_qualification.plan(manifest)['normal_limits']
     if not same(binding['normal_limits'], normal_limits):
         raise ValueError('normal resource configuration differs from prospective plan')
     preparation_root = Path(binding['preparation_root'])
     if (not preparation_root.is_absolute() or preparation_root.is_symlink()
             or preparation_root.resolve(strict=True) != preparation_root
-            or preparation_root.parent != root.parent or preparation_root == root):
+            or preparation_root.parent != root.parent or preparation_root == root
+            or os.stat(preparation_root).st_dev!=os.stat(root).st_dev):
         raise ValueError('explicit separate owned preparation sibling required')
     prepared = preparation(preparation_root, binding)
     cohort = {item['id']: item for item in manifest['inputs']}
@@ -417,6 +466,16 @@ def aggregate(root, binding):
         if request_path != output/'request.json':
             raise ValueError('case request namespace differs')
         request = edit_verify.read_json(request_path)
+        expected_service=service_root/(case_id+'-service')
+        if Path(request.get('service_root',''))!=expected_service or record.get('service_root')!=str(expected_service):
+            raise ValueError('case service namespace differs')
+        uses_service=request['phase'] in {
+            'warm_service','first_raw','export','export_correctness','overlap_import','overlap_export'}
+        if (uses_service and (not expected_service.is_dir() or expected_service.is_symlink()
+                             or os.stat(expected_service).st_dev!=storage['service']['parent_device'])):
+            raise ValueError('required service namespace identity differs')
+        if not uses_service and (expected_service.exists() or expected_service.is_symlink()):
+            raise ValueError('non-service case created a service namespace')
         if not same(request, record['request']) or not same(request, actions[case_id]['request']):
             raise ValueError('executed request differs from frozen request')
         case_semantics(case, request, normal_limits)
@@ -464,11 +523,13 @@ def aggregate(root, binding):
         for action_id, ref_key in ((case_id, 'probe_supervisor_path'), ('verify-'+case_id, 'verify_supervisor_path')):
             action = actions[action_id]
             limits = {name: action[name] for name in ('deadline_seconds', 'process_rss_bytes', 'group_rss_bytes')}
-            limits['free_reserve_bytes'] = binding['free_reserve_bytes']
+            limits['storage'] = {name:dict(root=storage[name]['path'],**identities[name],
+                reserve_bytes=binding['volumes'][name]['free_reserve_bytes']+
+                    binding['volumes'][name]['post_campaign_bytes']) for name in ('artifact','service')}
             # The builder freezes argv after selecting isolated launcher paths.
             supervisors.append(supervisor(root, root/action_id, record[ref_key], action['command'], limits,
                                           receipt['probe_pid'] if action_id == case_id else None))
-        cleanup = cleanup_evidence(root, record, request, verification, values)
+        cleanup = cleanup_evidence(root, service_root, record, request, verification, values)
         if cleanup is not None:
             cleanups.append(cleanup)
         if request['phase'] == 'correctness' and request['operation'] in ('all-0', 'all-1'):

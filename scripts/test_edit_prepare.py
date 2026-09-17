@@ -18,7 +18,8 @@ class SourceCopyAdmission(unittest.TestCase):
                 self.assertEqual(path,str(root))
                 return disk_usage(path)
             with patch.object(preparation.psutil,'disk_usage',side_effect=windows_disk_usage) as usage:
-                result=preparation.source_copy(source,root/'copy',1024,sha,0,time.monotonic()+30)
+                result=preparation.source_copy(source,root/'copy',1024,sha,0,time.monotonic()+30,
+                                               root,preparation.edit_campaign.storage_identity(root))
             usage.assert_called_once()
             self.assertEqual((root/'copy').read_bytes(),source.read_bytes())
             self.assertEqual(result['sha256'],sha)
@@ -27,16 +28,30 @@ class SourceCopyAdmission(unittest.TestCase):
     def test_small_limit_refuses_before_creating_output(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder).resolve();source=root/'original';source.write_bytes(b'123456789')
-            with self.assertRaises(ValueError):preparation.source_copy(source,root/'copy',2,'a'*64,0,time.monotonic()+30)
+            with self.assertRaises(ValueError):preparation.source_copy(source,root/'copy',2,'a'*64,0,time.monotonic()+30,
+                                                                      root,preparation.edit_campaign.storage_identity(root))
             self.assertFalse((root/'copy').exists())
             self.assertEqual(source.read_bytes(),b'123456789')
 
     def test_wrong_expected_bytes_preserve_failed_copy_and_source(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder).resolve();source=root/'original';source.write_bytes(b'original')
-            with self.assertRaises(ValueError):preparation.source_copy(source,root/'copy',1024,'a'*64,0,time.monotonic()+30)
+            with self.assertRaises(ValueError):preparation.source_copy(source,root/'copy',1024,'a'*64,0,time.monotonic()+30,
+                                                                      root,preparation.edit_campaign.storage_identity(root))
             self.assertEqual(source.read_bytes(),b'original')
             self.assertEqual((root/'copy').read_bytes(),b'original')
+
+    def test_live_root_replacement_preserves_partial_copy_and_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder).resolve();source=root/'original';source.write_bytes(b'x'*(128*1024))
+            identity=preparation.edit_campaign.storage_identity(root)
+            changed=dict(identity,inode=identity['inode']+1)
+            with patch.object(preparation.edit_campaign,'storage_identity',side_effect=[identity,identity,changed]), \
+                 self.assertRaisesRegex(ValueError,'storage identity changed'):
+                preparation.source_copy(source,root/'copy',256*1024,hashlib.sha256(source.read_bytes()).hexdigest(),
+                                        0,time.monotonic()+30,root,identity)
+            self.assertEqual(source.read_bytes(),b'x'*(128*1024))
+            self.assertEqual((root/'copy').stat().st_size,64*1024)
 
 
 class PreparationHostFailures(unittest.TestCase):
@@ -111,6 +126,15 @@ class PreparationHostFailures(unittest.TestCase):
 
 
 class PreparedPlanOwnerAdmission(unittest.TestCase):
+    def test_single_filesystem_campaign_roots_are_explicitly_rejected(self):
+        import edit_build_plan as plans
+        roots=[dict(path='/owned/campaign',parent='/owned',parent_device=1,parent_inode=10),
+               dict(path='/owned/services',parent='/owned',parent_device=1,parent_inode=10)]
+        preparation=dict(root='/owned/prepared')
+        with patch.object(plans,'storage_root',side_effect=roots), \
+             self.assertRaisesRegex(ValueError,'disjoint physical filesystems'):
+            plans.build_plan(preparation,{},dict(inputs=[]),'/owned/campaign','/owned/services')
+
     def test_old_or_changed_preparation_caps_cannot_be_relabelled_in_new_plan(self):
         import copy
         import edit_qualification as q
@@ -122,7 +146,10 @@ class PreparedPlanOwnerAdmission(unittest.TestCase):
         for owner in (None,dict(disk.preparation_owner(),deadline_seconds=3901)):
             value=copy.deepcopy(prepared)
             if owner is not None:value['preparation_owner']=owner
-            with self.assertRaisesRegex(ValueError,'exact bounded owner/host contract'):
-                plans.build_plan(value,{},manifest,Path('/owned/campaign'))
+            roots=[dict(path='/owned/campaign',parent='/owned',parent_device=1,parent_inode=10),
+                   dict(path='/services/campaign',parent='/services',parent_device=2,parent_inode=20)]
+            with patch.object(plans,'storage_root',side_effect=roots), \
+                 self.assertRaisesRegex(ValueError,'exact bounded owner/host contract'):
+                plans.build_plan(value,{},manifest,Path('/owned/campaign'),Path('/services/campaign'))
 
 if __name__=='__main__':unittest.main()

@@ -36,9 +36,10 @@ class AggregateContracts(unittest.TestCase):
     def case(self):
         r = request()
         r['source_blake3'] = 'b'*64
+        r.update(output='/private/artifacts/case-output',service_root='/private/services/case-service')
         values = samples(r)
         attempts = [dict(recipe_index=v['recipe_index'], iteration=v['iteration']) for v in values]
-        receipt = {k: r[k] for k in ('phase', 'fixture_id', 'operation', 'source_sha256', 'source_blake3')}
+        receipt = {k: r[k] for k in ('phase', 'fixture_id', 'operation', 'source_sha256', 'source_blake3', 'output', 'service_root')}
         receipt.update(probe_complete=True, qualification_complete=False, error=None)
         verifier = dict(complete=True, error=None, result=dict(verified=True, whole_story_qualified=False,
             sample_count=len(values), coverage=sorted(aggregate.required_coverage(r))))
@@ -85,12 +86,15 @@ class AggregateContracts(unittest.TestCase):
 
     def supervisor_fixture(self, root):
         folder = root/'action'; folder.mkdir()
-        limits = dict(deadline_seconds=10, process_rss_bytes=100, group_rss_bytes=200, free_reserve_bytes=50)
+        limits = dict(deadline_seconds=10, process_rss_bytes=100, group_rss_bytes=200,
+                      storage=dict(artifact=dict(root=str(root),device=1,inode=10,reserve_bytes=50),
+                                   service=dict(root='/service',device=2,inode=20,reserve_bytes=75)))
         command = ['/fixed/probe', '--request', '/fixed/request']
         def write(name, value): (folder/name).write_text(json.dumps(value)+'\n')
         write('start.json', dict(command=command, limits=limits, started={'monotonic_ns': 100}))
         write('spawn.json', dict(pid=123, create_time=100.25))
-        telemetry = dict(at={'monotonic_ns': 150}, processes=[dict(pid=123, create_time=100.25, rss=80, status='running')], total_rss=80, free_bytes=100)
+        telemetry = dict(at={'monotonic_ns': 150}, processes=[dict(pid=123, create_time=100.25, rss=80, status='running')],
+                         total_rss=80, free_bytes_by_volume=dict(artifact=100,service=100))
         write('processes.jsonl', telemetry)
         result = dict(complete=True, error=None, samples=1, sampled_peak_group_rss=80,
                       finished={'monotonic_ns': 200}, captures={},
@@ -122,6 +126,24 @@ class AggregateContracts(unittest.TestCase):
             (folder/'result.json').write_text(json.dumps(result))
             (folder/'stdout.log').write_bytes(b'unbound output')
             with self.assertRaises(ValueError): aggregate.supervisor(root, folder, str(folder/'result.json'), command, limits)
+
+    def test_supervisor_requires_each_named_volume_reserve(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            folder, result, command, limits = self.supervisor_fixture(root)
+            for volume in ('artifact', 'service'):
+                with self.subTest(volume=volume):
+                    row = dict(at={'monotonic_ns': 150},
+                               processes=[dict(pid=123, create_time=100.25, rss=80, status='running')],
+                               total_rss=80,
+                               free_bytes_by_volume=dict(artifact=100, service=100))
+                    row['free_bytes_by_volume'][volume] = limits['storage'][volume]['reserve_bytes']-1
+                    data = (json.dumps(row)+'\n').encode()
+                    (folder/'processes.jsonl').write_bytes(data)
+                    result['processes.jsonl'] = dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+                    (folder/'result.json').write_text(json.dumps(result))
+                    with self.assertRaisesRegex(ValueError, 'disk reserve exhausted'):
+                        aggregate.supervisor(root, folder, str(folder/'result.json'), command, limits, 123)
 
     def test_owned_artifact_symlink_and_path_escape_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -162,7 +184,8 @@ class AggregateContracts(unittest.TestCase):
             folder, original, command, limits = self.supervisor_fixture(root)
             for change in ('empty', 'foreign', 'old', 'late'):
                 result = copy.deepcopy(original)
-                row = dict(at={'monotonic_ns': 150}, processes=[dict(pid=123, create_time=100.25, rss=80, status='running')], total_rss=80, free_bytes=100)
+                row = dict(at={'monotonic_ns': 150}, processes=[dict(pid=123, create_time=100.25, rss=80, status='running')],
+                           total_rss=80, free_bytes_by_volume=dict(artifact=100,service=100))
                 if change == 'empty':
                     row.update(processes=[], total_rss=0); result['sampled_peak_group_rss'] = 0
                 elif change == 'foreign': row['processes'][0]['create_time'] = 100.5
@@ -185,11 +208,13 @@ class AggregateContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             output = root/'case-output'; output.mkdir()
-            r = dict(phase='export', warmups=2, encoded_extent=1024, output=str(output))
+            service_campaign=root/'services';service_campaign.mkdir()
+            service=service_campaign/'case-service';service.mkdir()
+            r = dict(phase='export', warmups=2, encoded_extent=1024, output=str(output),service_root=str(service))
             record = dict(id='case', cleanup_path=str(root/'case-cleanup.json'),
                 verification_path=str(root/'verification.json'),
                 probe_supervisor_path=str(root/'probe.json'), verify_supervisor_path=str(root/'verify.json'))
-            rows, encoded, files, directories = [], [], [], [str(output/'catalog')]
+            rows, encoded, files, directories = [], [], [], [str(service/'catalog')]
             for iteration in range(22):
                 data = ('encoded '+str(iteration)).encode()
                 path = str(output/f'export-{iteration}.image')
@@ -205,27 +230,27 @@ class AggregateContracts(unittest.TestCase):
             for name, value in (('verification.json', proof), ('probe.json', {}), ('verify.json', {})):
                 (root/name).write_text(json.dumps(value))
             retained = dict(path=rows[2]['path'], sha256=encoded[2]['sha256'], blake3=rows[2]['blake3'])
-            start = dict(case_id='case', retained=retained, delete_files=files, delete_directories=directories)
+            start = dict(version=2,case_id='case', retained=retained, delete_files=files, delete_directories=directories)
             for key, value in (('verifier_receipt_sha256', 'verification.json'),
                                ('probe_supervisor_sha256', 'probe.json'), ('verify_supervisor_sha256', 'verify.json')):
                 start[key] = hashlib.sha256((root/value).read_bytes()).hexdigest()
             def retain_receipts(plan):
                 data = json.dumps(plan).encode()
                 (root/'case-cleanup-start.json').write_bytes(data)
-                done = dict(complete=True, error=None, retained=retained, start_sha256=hashlib.sha256(data).hexdigest(),
+                done = dict(version=2,complete=True, error=None, retained=retained, start_sha256=hashlib.sha256(data).hexdigest(),
                             deleted_paths=[f['path'] for f in plan['delete_files']]+plan['delete_directories'])
                 (root/'case-cleanup.json').write_text(json.dumps(done))
             retain_receipts(start)
-            result = aggregate.cleanup_evidence(root, record, r, proof, rows)
+            result = aggregate.cleanup_evidence(root, service_campaign, record, r, proof, rows)
             self.assertEqual(result['deleted_files'], 21)
             for mutate in (lambda p: p['delete_directories'].pop(),
                            lambda p: p['delete_files'][0].update(sha256='f'*64),
                            lambda p: p['delete_files'].append({'path': str(root/'unrelated'), 'sha256': 'a'*64})):
                 changed = copy.deepcopy(start); mutate(changed); retain_receipts(changed)
-                with self.assertRaises(ValueError): aggregate.cleanup_evidence(root, record, r, proof, rows)
+                with self.assertRaises(ValueError): aggregate.cleanup_evidence(root, service_campaign, record, r, proof, rows)
             retain_receipts(start)
             Path(retained['path']).write_bytes(b'changed retained output')
-            with self.assertRaises(ValueError): aggregate.cleanup_evidence(root, record, r, proof, rows)
+            with self.assertRaises(ValueError): aggregate.cleanup_evidence(root, service_campaign, record, r, proof, rows)
 
 
 if __name__ == '__main__':

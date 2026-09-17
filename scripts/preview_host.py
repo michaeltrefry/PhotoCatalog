@@ -36,7 +36,7 @@ def storage(path):
     return result
 
 
-def host_identity(output, sources):
+def host_identity(output, sources, output_roots=None):
     cpu = {"status": "unavailable", "model": None}
     if platform.system() == "Darwin":
         try:
@@ -45,10 +45,12 @@ def host_identity(output, sources):
             cpu = {"status": "available", "model": value.stdout.strip()}
         except (OSError, subprocess.SubprocessError) as error:
             cpu["reason"] = type(error).__name__
+    roots={"output":output} if output_roots is None else output_roots
     return {"system": platform.system(), "release": platform.release(),
             "machine": platform.machine(), "cpu": cpu, "cpus": psutil.cpu_count(),
             "ram_bytes": psutil.virtual_memory().total, "psutil_version": psutil.__version__,
             "output_storage": storage(output),
+            "output_storages": {name:storage(path) for name,path in roots.items()},
             "input_storage": [storage(p) for p in sorted({str(Path(p).resolve().parent) for p in sources})],
             "telemetry": {"path": "host.jsonl", "receipt": "host-receipt.json",
                           "interval_seconds": 1, "observer_sha256": sha(OBSERVER),

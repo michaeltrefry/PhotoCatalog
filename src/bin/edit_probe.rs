@@ -47,6 +47,19 @@ enum Phase {
     OverlapImport,
     OverlapExport,
 }
+impl Phase {
+    fn uses_service(self) -> bool {
+        matches!(
+            self,
+            Self::FirstRaw
+                | Self::WarmService
+                | Self::Export
+                | Self::ExportCorrectness
+                | Self::OverlapImport
+                | Self::OverlapExport
+        )
+    }
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -64,6 +77,7 @@ struct Request {
     outputs: Vec<OutputSpec>,
     worker: PathBuf,
     output: PathBuf,
+    service_root: PathBuf,
     decode: DecodeLimits,
     render: RenderLimits,
     encoded_extent: u64,
@@ -320,7 +334,7 @@ fn pixels(request: &Request, samples: &mut File) -> Result<()> {
     Ok(())
 }
 fn service(request: &Request) -> Result<(Catalog, PreviewService, VariantKey)> {
-    let root = &request.output;
+    let root = &request.service_root;
     let mut previews = PreviewService::open(
         preview::StoreConfig {
             manifest_root: root.join("preview-manifest"),
@@ -715,7 +729,7 @@ fn overlap(request: &Request, samples: &mut File) -> Result<()> {
     let (mut catalog, mut previews, master) = service(request)?;
     let foreground = catalog.create_edit_variant(&master, 0, "foreground qualification")?;
     let _ = previews.take_worker_metrics(); // Drop the untimed setup producer.
-    let catalog_root = request.output.join("catalog");
+    let catalog_root = request.service_root.join("catalog");
     let state = Mutex::new(OverlapState::default());
     let stop = AtomicBool::new(false);
     let background_start = stamp();
@@ -1073,14 +1087,90 @@ fn refusal(request: &Request, samples: &mut File) -> Result<()> {
         json!({"kind":"observation","iteration":0,"warmup":false,"expected_refusal":observed}),
     )
 }
+fn validate_split_storage(output: &Path, service: &Path) -> Result<()> {
+    let service_parent = service.parent().context("service root parent")?;
+    let service_name = service.file_name().context("service root name")?;
+    #[cfg(unix)]
+    ensure!(
+        output.canonicalize()? == output,
+        "artifact root must use its physical path"
+    );
+    #[cfg(unix)]
+    ensure!(
+        service_parent.canonicalize()?.join(service_name) == service,
+        "service root must use its physical parent path"
+    );
+    #[cfg(windows)]
+    {
+        // Windows canonicalize returns a verbatim spelling even for the same
+        // ordinary path. Resolve both existing directories for admission, then
+        // use volume and object metadata below rather than comparing spellings.
+        output.canonicalize()?;
+        service_parent.canonicalize()?;
+        ensure!(!service_name.is_empty(), "service root name");
+    }
+    let output_metadata = fs::symlink_metadata(output)?;
+    let service_metadata = fs::symlink_metadata(service_parent)?;
+    ensure!(
+        output_metadata.is_dir()
+            && !output_metadata.file_type().is_symlink()
+            && service_metadata.is_dir()
+            && !service_metadata.file_type().is_symlink(),
+        "ordinary split storage directories required"
+    );
+    let output_location = photocatalog::storage_volume::locate(output);
+    let service_location = photocatalog::storage_volume::locate(service_parent);
+    ensure!(
+        matches!(
+            output_location.state,
+            photocatalog::storage_volume::LocationState::Available
+        ) && matches!(
+            service_location.state,
+            photocatalog::storage_volume::LocationState::Available
+        ),
+        "split storage volume identity unavailable"
+    );
+    let output_volume = output_location.volume.context("artifact volume identity")?;
+    let service_volume = service_location.volume.context("service volume identity")?;
+    let distinct = match (
+        &output_volume.persistent_identity,
+        &service_volume.persistent_identity,
+    ) {
+        (Some(output), Some(service)) => output != service,
+        _ => match (&output_volume.device_number, &service_volume.device_number) {
+            (Some(output), Some(service)) => output != service,
+            _ => false,
+        },
+    };
+    ensure!(
+        distinct,
+        "service and artifact roots require distinct physical filesystems"
+    );
+    Ok(())
+}
 fn run(request: &Request, samples: &mut File) -> Result<()> {
     ensure!(
-        request.version == 1
+        request.version == 2
             && request.source.is_absolute()
             && request.output.is_absolute()
+            && request.service_root.is_absolute()
             && request.worker.is_absolute(),
         "probe request version/paths"
     );
+    ensure!(
+        request.output != request.service_root
+            && !request.output.starts_with(&request.service_root)
+            && !request.service_root.starts_with(&request.output),
+        "service and artifact roots must be disjoint"
+    );
+    ensure!(
+        !request.service_root.try_exists()?,
+        "service root must be create-new"
+    );
+    validate_split_storage(&request.output, &request.service_root)?;
+    if request.phase.uses_service() {
+        fs::create_dir(&request.service_root)?;
+    }
     ensure!(
         !request.recipes.is_empty() && request.recipes.len() <= 32 && request.outputs.len() <= 32,
         "matrix bound"
@@ -1177,16 +1267,59 @@ fn main() -> Result<()> {
     samples.sync_all()?;
     exclusive(
         &request.output.join("receipt.json"),
-        &json!({"version":1,"probe_pid":std::process::id(),"started":started,"finished":stamp(),
+        &json!({"version":2,"probe_pid":std::process::id(),"started":started,"finished":stamp(),
         "probe_complete":result.is_ok(),"qualification_complete":false,
         "independent_oracles":"pending separate verifier","error":result.as_ref().err().map(|e|format!("{e:#}")),
         "source":request.source,"source_sha256":request.source_sha256,"source_blake3":request.source_blake3,
+        "output":request.output,"service_root":request.service_root,
         "phase":request.phase,"fixture_id":request.fixture_id,"operation":request.operation,
         "rss":rss(),"renderer":edit::renderer_identity(),
         "export_renderer":photocatalog::photo_render::output_renderer_identity(),
         "probe_source_blake3":blake3::hash(include_bytes!("edit_probe.rs")).to_hex().to_string()}),
     )?;
     result
+}
+
+#[cfg(test)]
+mod split_storage_tests {
+    use super::{Phase, validate_split_storage};
+
+    #[test]
+    fn only_catalog_preview_and_export_phases_create_service_namespaces() {
+        for phase in [
+            Phase::FirstRaw,
+            Phase::WarmService,
+            Phase::Export,
+            Phase::ExportCorrectness,
+            Phase::OverlapImport,
+            Phase::OverlapExport,
+        ] {
+            assert!(phase.uses_service(), "{phase:?}");
+        }
+        for phase in [
+            Phase::Correctness,
+            Phase::Kernel,
+            Phase::Full,
+            Phase::Support100mp,
+            Phase::LargeCancellation,
+            Phase::Refusal,
+            Phase::ProxyReference,
+        ] {
+            assert!(!phase.uses_service(), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn native_boundary_rejects_single_filesystem_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().canonicalize().unwrap();
+        let service = output.parent().unwrap().join("unused-service-root");
+        let error = validate_split_storage(&output, &service).unwrap_err();
+        assert!(
+            error.to_string().contains("distinct physical filesystems"),
+            "{error:#}"
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

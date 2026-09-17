@@ -184,12 +184,18 @@ def overlap_proof(value,receipt,process_samples):
 
 
 def verify_case(root):
-    root=Path(root)
+    root=Path(root).resolve(strict=True)
     request=read_json(root/'request.json')
+    service=Path(request.get('service_root',''))
+    service_phases={'warm_service','first_raw','export','export_correctness','overlap_import','overlap_export'}
+    if (request.get('version')!=2 or Path(request.get('output',''))!=root or not service.is_absolute()
+        or root==service or root in service.parents or service in root.parents
+        or (request['phase'] in service_phases) != service.is_dir() or service.is_symlink()):
+        raise ValueError('split request storage identity differs')
     receipt=read_json(root/'receipt.json')
     if not receipt.get('probe_complete') or receipt.get('qualification_complete') is not False:
         raise ValueError('incomplete or overclaiming probe receipt')
-    for field in ('phase','fixture_id','operation','source_sha256','source_blake3'):
+    for field in ('phase','fixture_id','operation','source_sha256','source_blake3','output','service_root'):
         if receipt[field]!=request[field]:
             raise ValueError('request/receipt identity mismatch: '+field)
     if digest(request['source'],'sha256',request['decode']['max_encoded_bytes'])!=request['source_sha256']:

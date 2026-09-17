@@ -59,12 +59,16 @@ def retired(path):
         raise ValueError('cleanup requires complete successful process retirement')
 
 
-def cleanup_export(root,record):
+def cleanup_export(root,service_campaign_root,record):
     root=Path(root).resolve(strict=True)
+    service_campaign_root=Path(service_campaign_root).resolve(strict=True)
     output=owned(root,record['probe_output'])
     case_id=record['id']
     if output!=root/(case_id+'-output'):raise ValueError('cleanup case namespace differs')
     request=read_json(output/'request.json')
+    service=owned(service_campaign_root,request['service_root'])
+    if service!=service_campaign_root/(case_id+'-service'):
+        raise ValueError('cleanup service namespace differs')
     if request['phase']!='export' or (request['warmups'],request['repetitions'])!=(2,20):
         raise ValueError('cleanup is restricted to complete22-export timing fixtures')
     verification=owned(root,record['verification_path'])
@@ -80,7 +84,7 @@ def cleanup_export(root,record):
     attempts,values=observations(output);sample_coverage(request,attempts,values)
     encodings={item['path']:item for item in proof['encoded']}
     if len(encodings)!=22 or len(proof['encoded'])!=22:raise ValueError('all22 independent encoded readbacks required')
-    roots=[owned(output,output/'catalog')]
+    roots=[]
     destinations=[];retained=None
     for value in values:
         path=owned(output,value['path'])
@@ -109,7 +113,15 @@ def cleanup_export(root,record):
         raise ValueError('cleanup root/retained coverage differs')
     delete_files,delete_directories=tree(output,[*roots,*destinations],request['encoded_extent'],
                                        46*request['encoded_extent']+128*1024*1024)
-    before=dict(version=1,case_id=case_id,retained=retained,
+    service_files,service_directories=tree(service,[owned(service,service/'catalog')],
+                                           request['encoded_extent'],128*1024*1024)
+    delete_files.extend(service_files);delete_directories.extend(service_directories)
+    if len(delete_files)+len(delete_directories)>MAX_ENTRIES:
+        raise ValueError('combined cleanup entry bound')
+    def owner(path):
+        path=Path(path)
+        return service if path==service or service in path.parents else output
+    before=dict(version=2,case_id=case_id,retained=retained,
         verifier_receipt_sha256=digest(verification,'sha256',16*1024*1024),
         probe_supervisor_sha256=digest(probe_supervisor,'sha256',1024*1024),
         verify_supervisor_sha256=digest(verify_supervisor,'sha256',1024*1024),
@@ -119,7 +131,7 @@ def cleanup_export(root,record):
     deleted=[];error=None
     try:
         for item in delete_files:
-            path=owned(output,item['path'])
+            path=owned(owner(item['path']),item['path'])
             current=stamp(path)
             if any(current[key]!=item[key] for key in ('bytes','device','inode','mtime_ns')):
                 raise ValueError('cleanup target identity changed after admission')
@@ -129,14 +141,14 @@ def cleanup_export(root,record):
                 raise ValueError('cleanup target bytes changed after admission')
             path.unlink();deleted.append(str(path))
         for name in delete_directories:
-            path=owned(output,name)
+            path=owned(owner(name),name)
             path.rmdir();deleted.append(str(path))
         if digest(retained['path'],'sha256',request['encoded_extent'])!=retained['sha256']:
             raise ValueError('retained first measured export changed')
         if digest(retained['path'],'blake3',request['encoded_extent'])!=retained['blake3']:
             raise ValueError('retained first measured BLAKE3 changed')
     except Exception as exc:error=f'{type(exc).__name__}: {exc}'
-    result=dict(version=1,case_id=case_id,complete=error is None,error=error,
+    result=dict(version=2,case_id=case_id,complete=error is None,error=error,
         start_sha256=digest(start,'sha256',16*1024*1024),deleted_paths=deleted,retained=retained)
     exclusive(record['cleanup_path'],result)
     if error:raise RuntimeError('partial cleanup retained; no retry: '+error)
