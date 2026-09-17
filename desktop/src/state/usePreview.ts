@@ -40,11 +40,12 @@ export function usePreview(catalog: string, key: VariantKey, viewport: string, l
           const objectUrlMs = diagnostics ? performance.now() - objectUrlStarted : 0;
           setValue({ url, loading: false });
           if (diagnostics) {
+            const deliveredTicket = ticket;
             void command({ command: 'preview_status', args: { catalog, ticket } }, 'preview', abort.signal)
               .then((finalState: PreviewStatus) => {
                 if (abort.signal.aborted || generation.current !== current || !finalState.diagnostic) return;
                 return logPreviewDiagnostic({
-                  ticket,
+                  ticket: deliveredTicket,
                   admission_command_ms: admissionCommandMs,
                   ready_observed_ms: readyObservedMs,
                   blob_invoke_ms: blobInvokeMs,
