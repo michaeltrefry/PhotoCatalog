@@ -32,6 +32,7 @@ import { RecipeControls } from './components/RecipeControls';
 import { CompatibilityStatus } from './components/CompatibilityStatus';
 import { Viewport } from './components/Viewport';
 import { EditQueue, type EditSnapshot } from './state/editQueue';
+import { recipeControlsHeld } from './state/editAdmission';
 import { ActionGate } from './state/actionGate';
 import { beginMeasurement, finalizeMeasurement, initializeMeasurement, measurementDurable, measurementEnded, measurementPresented, measurementSearchResponse, setMeasurementExportActive, startScrollMeasurement, stopScrollMeasurement, subscribeMeasurement, type MeasurementStatus } from './performanceMeasurement';
 
@@ -108,6 +109,14 @@ export function App() {
   const copyRefreshed = useRef('');
   const migrationWriteHold = !!(catalog && migration.snapshot?.catalog === catalog && !terminalMigration(migration.snapshot) && !['uploading', 'ready'].includes(migration.snapshot.phase));
   const storageWriteHold = storage.writeHeld || outputs.writeHeld || exportDirectHeld || migrationWriteHold;
+  const recipeControlsWriteHeld = recipeControlsHeld({
+    transitioning,
+    storage: storage.writeHeld,
+    directExport: exportDirectHeld,
+    migration: migrationWriteHold,
+    copy: copyEditingHeld,
+    export: outputs.recipeWriteHeld,
+  });
   const importActive = !!importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase);
   const importActiveRef = useRef(importActive); importActiveRef.current = importActive;
   // Receipt context is the last observed status at input start. The sample's
@@ -392,7 +401,7 @@ export function App() {
           <Section title="Selected photo"><div className="selected-filename">{selected.filename}</div><CompatibilityStatus image={selected} selectedKey={editor.variant.key} />{editor.variant.label && <p className="hint">{editor.variant.label}</p>}<div className="rating-buttons" aria-label="Rating">{[0, 1, 2, 3, 4, 5].map(value => <button key={value} disabled={storageWriteHold} aria-label={`${value} stars`} aria-pressed={selected.rating === String(value)} onClick={() => void cull({ operation: 'rating', value }, false)}>{value === 0 ? '—' : '★'}</button>)}</div>
           <div className="button-group"><button disabled={storageWriteHold} aria-pressed={selected.flag === 'pick'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'pick' ? 'unflagged' : 'pick' }, false)}>Pick</button><button disabled={storageWriteHold} aria-pressed={selected.flag === 'reject'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'reject' ? 'unflagged' : 'reject' }, false)}>Reject</button></div>
           {selected.conflicts.length > 0 && <p className="hint">Conflicting metadata: {selected.conflicts.join(', ')}</p>}{selected.metadata_pending && <p className="hint">Metadata indexing is pending.</p>}<button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowMetadata(true); })}>Metadata & XMP…</button></Section>
-          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={transitioning || storageWriteHold || copyEditingHeld} recipe={editor.recipe} onChange={value => { if (!gate.current.locked && !storageWriteHold && !copyEditingHeld) queueRef.current?.change(value, beginMeasurement('edit', measurementContext())); }} />
+          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={recipeControlsWriteHeld} recipe={editor.recipe} onChange={value => { if (!gate.current.locked && !recipeControlsWriteHeld) queueRef.current?.change(value, beginMeasurement('edit', measurementContext())); }} />
           <div className="edit-actions"><button disabled={transitioning || storageWriteHold || copyEditingHeld || !editor.variant.can_undo} onClick={() => void undo(false)}>Undo</button><button disabled={transitioning || storageWriteHold || copyEditingHeld || !editor.variant.can_redo} onClick={() => void undo(true)}>Redo</button><button disabled={storageWriteHold || copyEditingHeld} onClick={() => setCopyName('Copy')}>Create variant…</button><button onClick={() => void inspectHistory()}>Edit history</button></div></>}
           {mode !== 'develop' && <Section title="Editing"><p className="hint">Changes apply to the selected photo or variant and leave the original untouched.</p><button onClick={() => setMode('develop')}>Open Develop</button></Section>}
         </> : <div className="empty-state"><p>Select a photo to inspect its metadata and edits.</p></div>}</aside>}

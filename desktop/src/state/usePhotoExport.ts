@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { errorText } from '../bridge';
 import { photoExport, terminal, type Operation, type OperationKind, type Request } from '../photoExport';
+import { exportHoldsRecipeEdits } from './editAdmission';
 
 export type ExportAction = Extract<Request, { command: Exclude<OperationKind, 'cancel'> }>;
 type Scope = { catalog: string | null; alive: boolean };
@@ -114,5 +115,5 @@ export function usePhotoExport(catalog: string | null) {
     // result without destroying this catalog's admission or completion ticket.
     readEpoch.current += 1; statusKnown.current = false; setReady(false); setError('Rechecking export status…');
   };
-  return { operation, ready, busy: !ready || admitting || !!operation && (!terminal(operation) || operation.write_hold), writeHeld: !ready || admitting || !!operation?.write_hold, error, admit: (request: ExportAction) => admit(request), cancelJob: (job: string) => admit({ command: 'cancel', args: { job, operation: null } }), cancel: () => stop(false), yield: () => stop(true), retry };
+  return { operation, ready, busy: !ready || admitting || !!operation && (!terminal(operation) || operation.write_hold), writeHeld: !ready || admitting || !!operation?.write_hold, recipeWriteHeld: exportHoldsRecipeEdits({ ready, admitting, operation }), error, admit: (request: ExportAction) => admit(request), cancelJob: (job: string) => admit({ command: 'cancel', args: { job, operation: null } }), cancel: () => stop(false), yield: () => stop(true), retry };
 }
