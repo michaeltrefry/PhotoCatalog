@@ -313,7 +313,7 @@ fn actual_prepared_reuse_and_source_or_cache_change_fall_back_to_original() -> R
     let running = cold.running.as_ref().unwrap();
     let begin = Instant::now();
     for (index, variant) in variants.iter().enumerate() {
-        ready_interactive(running, &token, variant, 10 + index as u64)?;
+        ready_interactive(running, &token, variant, 10 + index as u64, false)?;
     }
     let elapsed = begin.elapsed();
     {
