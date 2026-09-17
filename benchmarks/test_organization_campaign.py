@@ -58,11 +58,91 @@ class CampaignTests(unittest.TestCase):
         rows=[]
         for i in range(501,701):
             rows.append(dict(sequence=i,asset_id=f"fixture-{i:012}",state="ready",metadata_revision=0,folder=2+i%5,filename=f"file{i:012}.jpg",capture=f"2024-01-{i%28+1:02}T12:00:00",camera_make="fixture",camera=f"camera{i%3}",lens=f"lens{i%4}",format="JPEG" if i%2==0 else "DNG",rating=i%6,flag=["reject","pick","unflagged"][i%3],label="red" if i%2==0 else "blue",conflicts=["gps_latitude"] if i%97==0 else [],provenance={"synthetic_fixture":1}))
-        anchor=dict(version=1,epoch=0,high_water=1000,sequence=500,key=dict(kind="integer",value=500))
-        sample=dict(iteration=0,anchor=anchor,elapsed_ms=20.0,error=None,rows=rows,oracle_sequences=list(range(501,701)),chunks=[dict(scanned=200,returned=200,sorts=0,vm_steps=4000,elapsed_ms=19.0,exhausted=False,has_more=True,cursor=dict(sequence=700),text_work=dict(candidate_rows_read=200,indexed_rows=0,indexed_bytes=0,batches=0,vm_steps=0,sorts=0,admission_limited=False))])
+        query_hash="a"*64
+        anchor=dict(version=2,query_hash=query_hash,epoch=0,high_water=1000,sequence=500,key=dict(kind="integer",value=500))
+        cursor=dict(version=2,query_hash=query_hash,epoch=0,high_water=1000,sequence=700,key=dict(kind="integer",value=700))
+        sample=dict(iteration=0,anchor=anchor,elapsed_ms=20.0,error=None,rows=rows,oracle_sequences=list(range(501,701)),chunks=[dict(scanned=200,returned=200,sorts=0,vm_steps=4000,elapsed_ms=19.0,exhausted=False,has_more=True,cursor=cursor,text_work=dict(candidate_rows_read=200,indexed_rows=0,indexed_bytes=0,batches=0,vm_steps=0,sorts=0,admission_limited=False))])
         receipt=dict(protocol=2,catalog_schema=campaign.CURRENT_SCHEMA,complete=True,mode="query",count=1000,case="browse",repetitions=1,warmups=0,start=0,errors=[],plans=["SEARCH"],settings=dict(diagnostic_shared_helper_connection=campaign.SETTINGS),engine_version="3.51.1",text_limits=campaign.TEXT_LIMITS,open_ms=2.0,samples=[sample],warmup_samples=[])
         observer=dict(exit_code=0,error=None,rss_samples=1,rss_peak_bytes=1024,elapsed_ms=50)
         return receipt,observer
+    def test_native_cursor_v2_shape_and_malformed_values(self):
+        # Compact copy of the native 1M text diagnostic's first continuation.
+        actual={"epoch":0,"high_water":1_000_000,
+                "key":{"kind":"integer","value":501_000},
+                "query_hash":"0bafb59ef6d6444c14fc963dc6a3c6884870292f91af5f339d7ebe62a244fc63",
+                "sequence":501_000,"version":2}
+        self.assertIs(campaign.validate_cursor(actual),actual)
+        mutations=[
+            lambda c:c.update(version=1),
+            lambda c:c.update(query_hash="g"*64),
+            lambda c:c.update(epoch=True),
+            lambda c:c.update(high_water=500_000),
+            lambda c:c.update(sequence=True),
+            lambda c:c["key"].update(value=True),
+            lambda c:c.update(extra="unbound"),
+            lambda c:c["key"].update(kind="number"),
+        ]
+        for change in mutations:
+            malformed=copy.deepcopy(actual);change(malformed)
+            with self.assertRaises(AssertionError):campaign.validate_cursor(malformed)
+
+    def test_receipt_rejects_cursor_v1_or_unbound_continuation(self):
+        valid,observer=self.receipt()
+        for change in [
+            lambda r:r["samples"][0]["anchor"].update(version=1),
+            lambda r:r["samples"][0]["chunks"][0]["cursor"].update(version=1),
+            lambda r:r["samples"][0]["chunks"][0]["cursor"].update(query_hash="b"*64),
+            lambda r:r["samples"][0]["chunks"][0]["cursor"].update(high_water=999),
+            lambda r:r["samples"][0]["chunks"][0]["cursor"]["key"].update(value=699),
+            lambda r:r["samples"][0]["chunks"][0].update(exhausted=True,has_more=False),
+        ]:
+            receipt=copy.deepcopy(valid);change(receipt)
+            with self.assertRaises(AssertionError):
+                campaign.validate_receipt(receipt,observer,"browse",1000,1,0,0)
+
+    def test_transition_pages_bind_snapshot_cursor_v2(self):
+        def rows(first):
+            return [dict(sequence=i,asset_id=f"fixture-{i:012}",state="ready",metadata_revision=0,
+                         folder=2+i%5,filename=f"file{i:012}.jpg",capture=f"2024-01-{i%28+1:02}T12:00:00",
+                         camera_make="fixture",camera=f"camera{i%3}",lens=f"lens{i%4}",
+                         format="JPEG" if i%2==0 else "DNG",rating=i%6,
+                         flag=["reject","pick","unflagged"][i%3],label="red" if i%2==0 else "blue",
+                         conflicts=["gps_latitude"] if i%97==0 else [],provenance={"synthetic_fixture":1})
+                    for i in range(first,first+200)]
+        digest="c"*64
+        data=dict(protocol=2,catalog_schema=campaign.CURRENT_SCHEMA,mode="transitions",complete=True,
+                  errors=[],count=400,repetitions=2,engine_version="3.51.1",
+                  settings=dict(diagnostic_shared_helper_connection=campaign.SETTINGS),
+                  source_hashes_before=["d"*64,"e"*64],source_hashes_after=["d"*64,"e"*64],
+                  writes=[],snapshot_browse=[],source_updates=[],reopened=[])
+        for i in range(2):
+            timing=dict(iteration=i,elapsed_ms=1.0,begin_ms=float(i),end_ms=float(i)+.5)
+            operation={"operation":"rating","value":i%6} if i%2==0 else {"operation":"label","value":f"saved{i}"}
+            data["writes"].append({**timing,"asset_id":f"fixture-{401+i%100:012}","operation":operation,
+                                   "revision_before":i//100,"revision_after":i//100+1,"pixel_generation":0})
+            data["source_updates"].append({**timing,"asset_id":f"fixture-{501+i%100:012}",
+                                            "selected_label":f"import{i}","revision_before":i//100,
+                                            "revision_after":i//100+1,"models":["fixture"]})
+            sequence=(i+1)*200
+            cursor=dict(version=2,query_hash=digest,epoch=7,high_water=600,sequence=sequence,
+                        key={"kind":"integer","value":sequence})
+            page=dict(rows=rows(i*200+1),scanned=200,has_more=True,exhausted=False,page_complete=True,
+                      next=cursor,vm_steps=1000,sorts=0,elapsed_ms=.5,
+                      text_work=dict(candidate_rows_read=200,indexed_rows=0,indexed_bytes=0,
+                                     batches=0,vm_steps=0,sorts=0,admission_limited=False))
+            data["snapshot_browse"].append({**timing,"page":page})
+            data["reopened"].append(dict(asset_id=f"fixture-{401+i%100:012}",revision=1,
+                                          field="rating" if i%2==0 else "label",
+                                          value=str(i%6) if i%2==0 else f"saved{i}",correct=True))
+        observer=dict(exit_code=0,error=None,rss_samples=1,rss_peak_bytes=1024)
+        self.assertEqual(campaign.validate_transitions(data,observer,400,2)["snapshot_browse"]["n"],2)
+        for change in [
+            lambda d:d["snapshot_browse"][0]["page"]["next"].update(version=1),
+            lambda d:d["snapshot_browse"][1]["page"]["next"].update(query_hash="f"*64),
+            lambda d:d["snapshot_browse"][0]["page"].update(next=None),
+        ]:
+            malformed=copy.deepcopy(data);change(malformed)
+            with self.assertRaises(AssertionError):campaign.validate_transitions(malformed,observer,400,2)
     def test_closed_gates_reject_false_pages_settings_missing_memory_and_errors(self):
         valid,observer=self.receipt()
         self.assertEqual(campaign.validate_receipt(valid,observer,"browse",1000,1,0,0)["n"],1)

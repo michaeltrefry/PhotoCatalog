@@ -31,6 +31,7 @@ from schema_campaign_contract import (  # noqa: E402
 PROTOCOL = NATIVE_PROTOCOL  # Synthetic fixture row marker stays 1.
 FIXTURE_PROTOCOL = 1
 DRIVER_PROTOCOL = 6
+CURSOR_VERSION = 2
 
 
 # Kept as a public alias for frozen tests and external receipt tooling.
@@ -159,6 +160,49 @@ def row_valid(row):
             and row["provenance"] == {"synthetic_fixture": FIXTURE_PROTOCOL})
 
 
+def validate_cursor(cursor, *, query_hash=None, epoch=None, high_water=None,
+                    sequence=None, key=None, key_kind=None):
+    """Validate the complete serialized production cursor-v2 contract."""
+    assert type(cursor) is dict
+    assert set(cursor) == {"version", "query_hash", "epoch", "high_water", "sequence", "key"}
+    assert type(cursor["version"]) is int and cursor["version"] == CURSOR_VERSION
+    digest = cursor["query_hash"]
+    assert isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+    assert type(cursor["epoch"]) is int and cursor["epoch"] >= 0
+    assert type(cursor["high_water"]) is int and cursor["high_water"] > 0
+    assert type(cursor["sequence"]) is int and 0 < cursor["sequence"] <= cursor["high_water"]
+    cursor_key = cursor["key"]
+    assert type(cursor_key) is dict and set(cursor_key) == {"kind", "value"}
+    assert cursor_key["kind"] in ("integer", "text")
+    if cursor_key["kind"] == "integer":
+        assert type(cursor_key["value"]) is int
+    else:
+        assert isinstance(cursor_key["value"], str)
+    if query_hash is not None:
+        assert digest == query_hash
+    if epoch is not None:
+        assert cursor["epoch"] == epoch
+    if high_water is not None:
+        assert cursor["high_water"] == high_water
+    if sequence is not None:
+        assert cursor["sequence"] == sequence
+    if key is not None:
+        assert cursor_key == key
+    if key_kind is not None:
+        assert cursor_key["kind"] == key_kind
+    return cursor
+
+
+def fixture_cursor_key(case, sequence):
+    if case in ("capture-rating", "text-capture", "date-camera"):
+        return {"kind": "text", "value": f"2024-01-{sequence % 28 + 1:02}T12:00:00"}
+    if case == "rating-sort":
+        return {"kind": "integer", "value": sequence % 6}
+    if case == "filename-reverse":
+        return {"kind": "text", "value": f"file{sequence:012}.jpg"}
+    return {"kind": "integer", "value": sequence}
+
+
 
 def expected_sequences(case, count, anchor):
     predicate = {
@@ -248,8 +292,7 @@ def validate_receipt(receipt, observer, case, count, repetitions, warmups, start
         assert sample["error"] is None and finite(sample["elapsed_ms"])
         rows, expected, chunks = sample["rows"], sample["oracle_sequences"], sample["chunks"]
         anchor = sample["anchor"]
-        assert anchor["version"] == 1 and anchor["epoch"] == 0 and anchor["high_water"] == count
-        assert anchor["sequence"] == count // 2 + count * 45 * (sample["iteration"] % 10) // 1000
+        expected_sequence = count // 2 + count * 45 * (sample["iteration"] % 10) // 1000
         if case in ("capture-rating", "text-capture", "date-camera"):
             day = ([14, 18] if case == "date-camera" else [15, 26])[sample["iteration"] % 2]
             expected_key = {"kind": "text", "value": f"2024-01-{day:02}T12:00:00"}
@@ -259,7 +302,7 @@ def validate_receipt(receipt, observer, case, count, repetitions, warmups, start
             expected_key = {"kind": "text", "value": f"file{anchor['sequence']:012}.jpg"}
         else:
             expected_key = {"kind": "integer", "value": anchor["sequence"]}
-        assert anchor["key"] == expected_key
+        validate_cursor(anchor, epoch=0, high_water=count, sequence=expected_sequence, key=expected_key)
         assert chunks and [r["sequence"] for r in rows] == expected == expected_sequences(case, count, anchor)
         assert len(expected) == len(set(expected))
         assert all(row_valid(row) for row in rows)
@@ -277,8 +320,15 @@ def validate_receipt(receipt, observer, case, count, repetitions, warmups, start
             validate_text_work(chunk, case in LOCAL_TEXT_CASES)
             if case == "filename-reverse":
                 assert chunk["text_work"]["indexed_rows"] == chunk["scanned"]
-            if not chunk["exhausted"]:
-                assert chunk["cursor"] is not None and chunk["has_more"] is True
+            assert type(chunk["exhausted"]) is bool and type(chunk["has_more"]) is bool
+            assert chunk["has_more"] is (not chunk["exhausted"])
+            if chunk["exhausted"]:
+                assert chunk["cursor"] is None
+            else:
+                cursor = validate_cursor(chunk["cursor"], query_hash=anchor["query_hash"],
+                                         epoch=anchor["epoch"], high_water=anchor["high_water"],
+                                         key_kind=expected_key["kind"])
+                assert cursor["key"] == fixture_cursor_key(case, cursor["sequence"])
     return distribution([s["elapsed_ms"] for s in receipt["samples"]])
 
 
@@ -304,6 +354,14 @@ def validate_transitions(data, observer, count, repetitions):
         validate_text_work(page, False)
         assert [row["sequence"] for row in page["rows"]]==list(range(i*200+1,(i+1)*200+1))
         assert all(row_valid(row) for row in page["rows"])
+        assert page["exhausted"] is False and page["has_more"] is True
+        expected_sequence=(i+1)*200
+        cursor=validate_cursor(page["next"], high_water=count+200, sequence=expected_sequence,
+                               key={"kind":"integer","value":expected_sequence})
+        if i == 0:
+            snapshot_query_hash, snapshot_epoch = cursor["query_hash"], cursor["epoch"]
+        else:
+            assert cursor["query_hash"] == snapshot_query_hash and cursor["epoch"] == snapshot_epoch
     assert len(data["reopened"])==min(repetitions,100)
     for item,i in zip(data["reopened"],range(max(0,repetitions-100),repetitions)):
         assert item["correct"] is True and item["asset_id"]==f"fixture-{count+1+i%100:012}" and item["revision"]==i//100+1
