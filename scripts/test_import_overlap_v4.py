@@ -89,6 +89,31 @@ def idle_warmup_fixture(kind='edit', explicit_null=True):
     return receipt, rows, declaration
 
 
+def three_setup_fixture():
+    receipt, rows, declaration = idle_warmup_fixture()
+    alignment = receipt['clock_alignment']
+    for anchor in alignment['anchors']:
+        anchor['send_event'] += 4
+        if anchor['receive_event'] is not None: anchor['receive_event'] += 4
+    for status in alignment['import_evidence']['timeline']:
+        status['request_event'] += 4; status['event'] += 4
+    for event in alignment['sample_events'][1:]:
+        for key in ('start_event', 'durable_event', 'end_event'):
+            if key in event: event[key] += 4
+        event['ordinal'] += 2
+    for sample in receipt['samples'][1:]: sample['ordinal'] += 2
+    browse, cohort = receipt['samples'][0], receipt['samples'][1:]
+    setup = [{**browse, 'ordinal': ordinal, 'kind': 'cull'} for ordinal in (2, 3)]
+    receipt['samples'] = [*setup, browse, *cohort]
+    alignment['sample_events'][1:1] = [
+        {'ordinal': 2, 'start_event': 3, 'end_event': 4},
+        {'ordinal': 3, 'start_event': 5, 'end_event': 6},
+    ]
+    declaration.update(setup_cutoff_ordinal=3, input_ordinals=list(range(4, 104)))
+    rows[0]['declaration_sha256'] = observer.declaration_digest(declaration)
+    return receipt, rows, declaration
+
+
 class EvaluatorTests(unittest.TestCase):
     def test_exact100_boundary_and_budget(self):
         result = evaluate(*fixture())
@@ -170,6 +195,24 @@ class EvaluatorTests(unittest.TestCase):
                        lambda v: v[0]['samples'][0].update(kind='cull')):
             values = fixture(); mutate(values)
             with self.assertRaises(ValueError): evaluate(*values)
+
+    def test_sample_completion_order_does_not_define_input_order(self):
+        values = three_setup_fixture()
+        self.assertEqual([sample['ordinal'] for sample in values[0]['samples'][:3]], [2, 3, 1])
+        self.assertEqual(evaluate(*values)['verdict'], 'TIMING_PASS_REQUIRES_IMPORT_RECONCILIATION')
+
+        values = fixture()
+        values[0]['samples'].reverse()
+        self.assertEqual(evaluate(*values)['verdict'], 'TIMING_PASS_REQUIRES_IMPORT_RECONCILIATION')
+
+    def test_sample_ordinal_bijection_rejects_duplicate_gap_and_extra(self):
+        for mutate in (
+            lambda samples: samples[0].update(ordinal=2),
+            lambda samples: samples.append({**samples[-1], 'ordinal': 101}),
+        ):
+            values = fixture(); mutate(values[0]['samples'])
+            with self.assertRaisesRegex(ValueError, 'Missing setup/duplicate/extra'):
+                evaluate(*values)
 
     def test_input_failure_is_not_hidden_by_durable_latency(self):
         values = fixture(); values[0]['samples'][49]['outcome'] = 'failed'

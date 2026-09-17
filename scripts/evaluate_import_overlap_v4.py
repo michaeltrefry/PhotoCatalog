@@ -103,7 +103,8 @@ def evaluate(receipt, rows, declaration):
     require(type(cutoff) is int and 0 <= cutoff <= 412 and isinstance(expected, list) and all(type(i) is int for i in expected) and expected == list(range(cutoff + 1, cutoff + 101)), 'Exactly 100 contiguous predeclared inputs required')
     require(declaration['input_kind'] in ('cull', 'edit') and declaration['input_action'] == ('rating' if declaration['input_kind'] == 'cull' else 'edit'), 'Rating or edit cohort required')
     values = receipt['samples']
-    require(len(values) <= 512 and all(type(s['ordinal']) is int for s in values) and [s['ordinal'] for s in values] == list(range(1, len(values) + 1))
+    ordinals = [s['ordinal'] for s in values]
+    require(len(values) <= 512 and all(type(ordinal) is int for ordinal in ordinals) and sorted(ordinals) == list(range(1, len(values) + 1))
             and cutoff <= len(values) <= cutoff + 100, 'Missing setup/duplicate/extra/undeclared samples')
     samples = {s['ordinal']: s for s in values}
     require(all(s['kind'] == declaration['input_kind'] for i, s in samples.items() if i > cutoff), 'Wrong input kind')
@@ -156,7 +157,7 @@ def evaluate(receipt, rows, declaration):
         # durable event is optional. Present events still validate above.
         sample_events[ordinal] = row
     require(set(sample_events) == set(samples), 'Missing sample causal event')
-    require([r['ordinal'] for r in alignment['sample_events']] == list(samples)
+    require([r['ordinal'] for r in alignment['sample_events']] == sorted(samples)
             and all(a['start_event'] < b['start_event'] for a, b in zip(alignment['sample_events'], alignment['sample_events'][1:])), 'Sample causal start order')
     evidence = alignment['import_evidence']
     require(evidence['overflowed'] == 0 and len(evidence['bindings']) == 1 and len(evidence['timeline']) <= 1202, 'Import evidence overflow/unbound campaign')
