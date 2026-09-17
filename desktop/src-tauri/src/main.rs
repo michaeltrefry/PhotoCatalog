@@ -2,6 +2,7 @@
 
 mod commands;
 mod measurement;
+mod measurement_clock;
 
 use photocatalog::{application, preview};
 use std::sync::atomic::Ordering;
@@ -11,6 +12,13 @@ fn main() {
     // The installed executable is also the isolated worker. Never initialize a
     // webview, dialogs or catalog owner in a worker process.
     match std::env::args_os().nth(1).as_deref() {
+        Some(arg) if arg == "--s12-clock-diagnostic" => {
+            if let Err(error) = measurement_clock::diagnostic() {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+            return;
+        }
         Some(arg) if arg == "--lightroom-migration-worker" => {
             if let Err(error) = photocatalog::lightroom_migration_worker::worker_main() {
                 eprintln!("{error:#}");
@@ -133,6 +141,7 @@ fn main() {
             commands::catalog_preview_bytes,
             commands::catalog_preview_release,
             measurement::catalog_measurement_config,
+            measurement::catalog_measurement_clock_anchor,
             measurement::catalog_measurement_finish,
             measurement::catalog_measurement_preview_diagnostic,
             commands::catalog_frontend_ready,

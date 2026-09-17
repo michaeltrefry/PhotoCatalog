@@ -9,7 +9,7 @@ use std::{
 };
 
 const MAX_SAMPLES: usize = 512;
-const MAX_RECEIPT_BYTES: usize = 208 * 1024;
+const MAX_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DURATION_US: u64 = 30 * 60 * 1_000_000;
 const MAX_STARTED_US: u64 = 24 * 60 * 60 * 1_000_000;
 const MAX_THUMBNAIL_EVENTS: u32 = 1_000_000;
@@ -26,6 +26,8 @@ struct Target {
     receipt_path: PathBuf,
     finalized: bool,
     preview_diagnostics: usize,
+    clock_session: String,
+    clock_anchors: Vec<crate::measurement_clock::NativeAnchor>,
 }
 
 pub struct State(Mutex<Option<Target>>);
@@ -40,6 +42,8 @@ impl State {
                 run_id,
                 finalized: false,
                 preview_diagnostics: 0,
+                clock_session: uuid::Uuid::new_v4().to_string(),
+                clock_anchors: Vec::new(),
             }
         })))
     }
@@ -57,6 +61,16 @@ impl State {
         let mut target = self.0.lock().map_err(|_| "Measurement state unavailable")?;
         let target = target.as_mut().ok_or("S12 measurement is not enabled")?;
         validate(&receipt, &target.run_id)?;
+        if let Some(alignment) = &receipt.clock_alignment {
+            alignment.validate(
+                &receipt
+                    .samples
+                    .iter()
+                    .map(|sample| sample.ordinal)
+                    .collect(),
+                Some(&target.clock_anchors),
+            )?;
+        }
         let bytes = serde_json::to_vec(&receipt).map_err(|_| "Measurement receipt is invalid")?;
         if bytes.len() > MAX_RECEIPT_BYTES {
             return Err("Measurement receipt exceeds its byte limit".into());
@@ -311,6 +325,8 @@ pub struct Sample {
 #[derive(Deserialize, Serialize)]
 pub struct Receipt {
     protocol: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clock_alignment: Option<crate::measurement_clock::Alignment>,
     presentation_model: PresentationModel,
     context_model: ContextModel,
     run_id: String,
@@ -412,6 +428,29 @@ fn parse_run_id(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<
 }
 
 #[tauri::command]
+pub fn catalog_measurement_clock_anchor(
+    state: tauri::State<'_, State>,
+    run_id: String,
+    anchor_id: u32,
+) -> Result<crate::measurement_clock::NativeAnchor, String> {
+    let mut state = state
+        .0
+        .lock()
+        .map_err(|_| "Measurement state unavailable")?;
+    let target = state.as_mut().ok_or("S12 measurement is not enabled")?;
+    if target.finalized
+        || target.run_id != run_id
+        || target.clock_anchors.len() >= crate::measurement_clock::MAX_ANCHORS
+        || anchor_id as usize != target.clock_anchors.len() + 1
+    {
+        return Err("Clock anchor request is invalid".into());
+    }
+    let anchor = crate::measurement_clock::anchor(&run_id, anchor_id, &target.clock_session)?;
+    target.clock_anchors.push(anchor.clone());
+    Ok(anchor)
+}
+
+#[tauri::command]
 pub fn catalog_measurement_config(state: tauri::State<'_, State>) -> Result<Config, String> {
     state.config()
 }
@@ -433,7 +472,8 @@ pub fn catalog_measurement_preview_diagnostic(
 }
 
 fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
-    if receipt.protocol != 1
+    if !matches!(receipt.protocol, 1 | 2)
+        || (receipt.protocol == 2) != receipt.clock_alignment.is_some()
         || !matches!(
             receipt.presentation_model,
             PresentationModel::TwoAnimationFrames
@@ -546,6 +586,9 @@ fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
         if !valid {
             return Err("Measurement sample fields are invalid".into());
         }
+    }
+    if let Some(alignment) = &receipt.clock_alignment {
+        alignment.validate(&ordinals, None)?;
     }
     if let Some(capture) = &receipt.scroll_capture {
         let duration = capture
@@ -700,6 +743,7 @@ mod tests {
     fn receipt_requires_kind_specific_bounded_fields() {
         let mut receipt = Receipt {
             protocol: 1,
+            clock_alignment: None,
             presentation_model: PresentationModel::TwoAnimationFrames,
             context_model: ContextModel::LastObservedStatusAtStart,
             run_id: "run".into(),
@@ -758,8 +802,9 @@ mod tests {
 
     #[test]
     fn maximum_receipt_fits_the_persisted_byte_bound() {
-        let receipt = Receipt {
+        let mut receipt = Receipt {
             protocol: 1,
+            clock_alignment: None,
             presentation_model: PresentationModel::TwoAnimationFrames,
             context_model: ContextModel::LastObservedStatusAtStart,
             run_id: "x".repeat(64),
@@ -833,12 +878,31 @@ mod tests {
         };
         validate(&receipt, &receipt.run_id).unwrap();
         assert!(serde_json::to_vec(&receipt).unwrap().len() <= MAX_RECEIPT_BYTES);
+        let count = crate::measurement_clock::MAX_ANCHORS;
+        receipt.protocol = 2;
+        receipt.clock_alignment = Some(serde_json::from_value(serde_json::json!({
+            "model": "causal_native_brackets_v1", "interval_ms": 100, "duration_ms": 300000,
+            "stop_reason": "anchor_limit",
+            "anchors": (0..count).map(|index| serde_json::json!({
+                "anchor_id": index + 1, "send_event": index * 2 + 1, "receive_event": index * 2 + 2,
+                "error": null, "native": { "anchor_id": index + 1, "run_id": receipt.run_id,
+                    "session_id": "ffffffff-ffff-ffff-ffff-ffffffffffff", "native_pid": u32::MAX,
+                    "clock": crate::measurement_clock::CLOCK, "monotonic_ns": u64::MAX.to_string() }
+            })).collect::<Vec<_>>(),
+            "sample_events": (0..MAX_SAMPLES).map(|index| serde_json::json!({
+                "ordinal": index + 1, "start_event": count * 2 + index * 2 + 1,
+                "end_event": count * 2 + index * 2 + 2
+            })).collect::<Vec<_>>()
+        })).unwrap());
+        validate(&receipt, &receipt.run_id).unwrap();
+        assert!(serde_json::to_vec(&receipt).unwrap().len() <= MAX_RECEIPT_BYTES);
     }
 
     #[test]
     fn scroll_capture_requires_bounded_monotonic_callback_timestamps() {
         let mut receipt = Receipt {
             protocol: 1,
+            clock_alignment: None,
             presentation_model: PresentationModel::TwoAnimationFrames,
             context_model: ContextModel::LastObservedStatusAtStart,
             run_id: "scroll".into(),
@@ -887,13 +951,19 @@ mod tests {
 
     #[test]
     fn finalize_retries_exactly_without_replacing_an_existing_receipt() {
+        fn pending_alignment() -> crate::measurement_clock::Alignment {
+            serde_json::from_value(serde_json::json!({"model":"causal_native_brackets_v1", "interval_ms":100,
+                "duration_ms":300000, "stop_reason":"finalized", "sample_events":[],
+                "anchors":[{"anchor_id":1,"send_event":1,"receive_event":null,"native":null,"error":"incomplete"}]})).unwrap()
+        }
         let cache_root = std::env::temp_dir().join(format!(
             "photocatalog-s12-measurement-{}",
             uuid::Uuid::new_v4()
         ));
         let state = State::new(Some("persist-once".into()), cache_root.clone());
         let receipt = Receipt {
-            protocol: 1,
+            protocol: 2,
+            clock_alignment: Some(pending_alignment()),
             presentation_model: PresentationModel::TwoAnimationFrames,
             context_model: ContextModel::LastObservedStatusAtStart,
             run_id: "persist-once".into(),
@@ -906,9 +976,26 @@ mod tests {
         let path = PathBuf::from(state.finish(receipt).unwrap());
         let stored: Receipt = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         validate(&stored, "persist-once").unwrap();
+        // A command can have been issued even though its frontend reply missed the frozen receipt.
+        state
+            .0
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .clock_anchors
+            .push(crate::measurement_clock::NativeAnchor {
+                run_id: "persist-once".into(),
+                anchor_id: 1,
+                session_id: uuid::Uuid::new_v4().to_string(),
+                native_pid: 1,
+                clock: crate::measurement_clock::CLOCK.into(),
+                monotonic_ns: "123".into(),
+            });
         let exact_retry = state
             .finish(Receipt {
-                protocol: 1,
+                protocol: 2,
+                clock_alignment: Some(pending_alignment()),
                 presentation_model: PresentationModel::TwoAnimationFrames,
                 context_model: ContextModel::LastObservedStatusAtStart,
                 run_id: "persist-once".into(),
@@ -923,7 +1010,8 @@ mod tests {
         assert!(
             state
                 .finish(Receipt {
-                    protocol: 1,
+                    protocol: 2,
+                    clock_alignment: Some(pending_alignment()),
                     presentation_model: PresentationModel::TwoAnimationFrames,
                     context_model: ContextModel::LastObservedStatusAtStart,
                     run_id: "persist-once".into(),

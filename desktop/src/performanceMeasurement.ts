@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { MeasurementClock, type ClockAlignment, type NativeAnchor } from './measurementClock';
 
 export type MeasurementKind = 'cull' | 'edit' | 'browse';
 export type MeasurementOutcome = 'complete' | 'backend_error' | 'presentation_mismatch' | 'superseded' | 'canceled' | 'incomplete';
@@ -21,7 +22,8 @@ export type MeasurementSample = {
 };
 
 export type MeasurementReceipt = {
-  readonly protocol: 1;
+  readonly protocol: 1 | 2;
+  readonly clock_alignment?: ClockAlignment;
   readonly presentation_model: 'two_animation_frames';
   readonly context_model: 'last_observed_status_at_start';
   readonly run_id: string;
@@ -101,6 +103,11 @@ const boundedPixel = (value: number) => Math.min(MAX_SCROLL_PX, Math.max(0, Math
 
 export class PerformanceRecorder {
   private nextOrdinal = 0;
+  private alignment: MeasurementClock | null = null;
+  enableClockAlignment(request: (id: number) => Promise<NativeAnchor>) {
+    if (!this.alignment && this.nextOrdinal === 0 && !this.frozen) this.alignment = new MeasurementClock(request, this.runId);
+  }
+  startExportClock() { if (!this.frozen) this.alignment?.start(); }
   private overflowed = 0;
   private frozen: MeasurementReceipt | null = null;
   private readonly active = new Map<number, Active>();
@@ -223,6 +230,8 @@ export class PerformanceRecorder {
     const started = this.clock.now(), startedUs = Math.max(0, Math.round(started * 1000));
     if (startedUs > MAX_STARTED_US) { this.overflowed += 1; this.notify(); return undefined; }
     const ordinal = ++this.nextOrdinal;
+    this.alignment?.begin(ordinal);
+    if (context.duringExport) this.startExportClock();
     this.active.set(ordinal, { kind, ordinal, started, startedUs, duringImport: context.duringImport, duringExport: context.duringExport, durableUs: null, searchResponseUs: null, pageRows: null });
     return ordinal;
   }
@@ -297,7 +306,7 @@ export class PerformanceRecorder {
       this.finish(active, 'incomplete', null);
     }
     const samples = Object.freeze(this.samples.map(sample => Object.freeze({ ...sample })));
-    this.frozen = Object.freeze({ protocol: 1, presentation_model: 'two_animation_frames', context_model: 'last_observed_status_at_start', run_id: this.runId, time_origin_ms: this.clock.timeOrigin, overflowed: this.overflowed, thumbnail_diagnostics: Object.freeze({ ...this.thumbnailDiagnostics }), samples, ...(this.scrollCapture ? { scroll_capture: this.scrollCapture } : {}) });
+    this.frozen = Object.freeze({ protocol: this.alignment ? 2 : 1, ...(this.alignment ? { clock_alignment: this.alignment.receipt() } : {}), presentation_model: 'two_animation_frames', context_model: 'last_observed_status_at_start', run_id: this.runId, time_origin_ms: this.clock.timeOrigin, overflowed: this.overflowed, thumbnail_diagnostics: Object.freeze({ ...this.thumbnailDiagnostics }), samples, ...(this.scrollCapture ? { scroll_capture: this.scrollCapture } : {}) });
     return this.frozen;
   }
 
@@ -334,6 +343,7 @@ export class PerformanceRecorder {
       first_thumbnail_us: elapsedUs(active.started, first), visible_complete_us: elapsedUs(active.started, complete),
       page_rows: active.pageRows, visible_count: active.expected.size,
     });
+    this.alignment?.end(active.ordinal);
     this.active.delete(active.ordinal); this.notify();
   }
 
@@ -345,6 +355,7 @@ export class PerformanceRecorder {
       search_response_us: active.searchResponseUs, first_thumbnail_us: null, visible_complete_us: null,
       page_rows: active.pageRows, visible_count: active.expected?.size ?? null,
     });
+    this.alignment?.end(active.ordinal);
     this.active.delete(active.ordinal); this.notify();
   }
 }
@@ -376,6 +387,11 @@ export class ReceiptFinalizer {
 }
 
 let recorder: PerformanceRecorder | null = null;
+let exportActive = false;
+export function setMeasurementExportActive(active: boolean) {
+  exportActive = active;
+  if (active) recorder?.startExportClock();
+}
 let finalizer: ReceiptFinalizer | null = null;
 let initialization: Promise<void> | null = null;
 let status: MeasurementStatus = { enabled: false, samples: 0, scrollState: 'idle', scrollFrames: 0, finalizing: false, finalized: false, receiptPath: null, error: null };
@@ -390,6 +406,8 @@ export function initializeMeasurement() {
   initialization ??= invoke<Config>('catalog_measurement_config').then(config => {
     if (!config.enabled || !config.run_id) return;
     recorder = new PerformanceRecorder(config.run_id, Math.min(512, config.max_samples), performance, requestAnimationFrame, () => publish({ samples: recorder?.count ?? 0, scrollState: recorder?.scrollState ?? 'idle', scrollFrames: recorder?.scrollFrames ?? 0 }));
+    recorder.enableClockAlignment(anchorId => invoke<NativeAnchor>('catalog_measurement_clock_anchor', { runId: config.run_id, anchorId }));
+    if (exportActive) recorder.startExportClock();
     finalizer = new ReceiptFinalizer(recorder, receipt => invoke<string>('catalog_measurement_finish', { receipt }));
     publish({ enabled: true });
   }).catch(error => publish({ error: error instanceof Error ? error.message : String(error) }));

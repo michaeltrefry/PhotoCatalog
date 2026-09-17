@@ -33,7 +33,7 @@ import { CompatibilityStatus } from './components/CompatibilityStatus';
 import { Viewport } from './components/Viewport';
 import { EditQueue, type EditSnapshot } from './state/editQueue';
 import { ActionGate } from './state/actionGate';
-import { beginMeasurement, finalizeMeasurement, initializeMeasurement, measurementDurable, measurementEnded, measurementPresented, measurementSearchResponse, startScrollMeasurement, stopScrollMeasurement, subscribeMeasurement, type MeasurementStatus } from './performanceMeasurement';
+import { beginMeasurement, finalizeMeasurement, initializeMeasurement, measurementDurable, measurementEnded, measurementPresented, measurementSearchResponse, setMeasurementExportActive, startScrollMeasurement, stopScrollMeasurement, subscribeMeasurement, type MeasurementStatus } from './performanceMeasurement';
 
 const initialStatus: CatalogStatus = { phase: 'closed', catalog: null, jobs_held: false, pending_commands: 0, active_previews: 0, cancel_requested: false, message: null };
 const LightroomMigrationPanel=lazy(()=>import('./components/LightroomMigrationPanel').then(module=>({default:module.LightroomMigrationPanel})));
@@ -116,6 +116,7 @@ export function App() {
     && ['running', 'waiting_for_previews', 'cancel_requested'].includes(outputs.operation.phase)
     && !['draining', 'yielding', 'finished'].includes(outputs.operation.stage);
   const exportActiveRef = useRef(exportActive); exportActiveRef.current = exportActive;
+  useEffect(() => { setMeasurementExportActive(exportActive); }, [exportActive]);
   const measurementContext = () => ({ duringImport: importActiveRef.current, duringExport: exportActiveRef.current });
   const exportBlocked = exportDirectHeld || outputs.writeHeld || migrationWriteHold || status.phase !== 'ready' || status.jobs_held || storage.writeHeld || copies.busy || copyRefreshing?.catalog === catalog;
   const exportBlockedRef = useRef(exportBlocked); exportBlockedRef.current = exportBlocked;
