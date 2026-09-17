@@ -1,5 +1,7 @@
 use photocatalog::{
-    application::{Cancellation, PreviewBytes, Reply, Request, desktop::DesktopBridge},
+    application::{
+        BridgeError, Cancellation, ErrorCode, PreviewBytes, Reply, Request, desktop::DesktopBridge,
+    },
     storage_volume::NativePath,
 };
 use serde::{Deserialize, Serialize};
@@ -59,7 +61,12 @@ pub async fn catalog_command(
             value.cancellation.is_some() || value.started.elapsed() < Duration::from_secs(60)
         });
         if operations.len() >= 128 && !operations.contains_key(&operation) {
-            return Err("Too many active catalog operations".into());
+            return Ok(Reply::Error {
+                error: BridgeError {
+                    code: ErrorCode::Busy,
+                    message: "Too many active catalog operations".into(),
+                },
+            });
         }
         if operations
             .get(&operation)
@@ -67,10 +74,12 @@ pub async fn catalog_command(
         {
             return Err("Operation identifier is already active".into());
         }
-        let pending = state
-            .bridge
-            .submit(request)
-            .map_err(|error| error.message)?;
+        let pending = match state.bridge.submit(request) {
+            Ok(pending) => pending,
+            // Preserve native error codes so background readers can distinguish
+            // admission backpressure from other failures.
+            Err(error) => return Ok(Reply::Error { error }),
+        };
         let canceled = operations
             .get(&operation)
             .is_some_and(|value| value.canceled);

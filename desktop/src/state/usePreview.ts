@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
-import { command, errorText, imageKey, logPreviewDiagnostic, previewBlob, type PreviewStatus, type VariantKey } from '../bridge';
+import { CatalogError, command, errorText, imageKey, isBusyError, logPreviewDiagnostic, previewBlob, type PreviewStatus, type VariantKey } from '../bridge';
 import { measurementDiagnosticsEnabled } from '../performanceMeasurement';
+import { PreviewCleanupCapacityError, PreviewCleanupCoordinator, type PreviewCleanupLease } from '../previewCleanup';
 
 // Virtualized cells unmount and remount; their consumer generation must not reset.
 let nextGeneration = 0n;
+const cleanup = new PreviewCleanupCoordinator(
+  async (catalog, viewport, generation) => {
+    await command({ command: 'release_viewport', args: { catalog, viewport, generation } }, 'status');
+  },
+  error => isBusyError(error) ? 'busy' : error instanceof CatalogError && ['closed', 'stale_session'].includes(error.code) ? 'retired' : 'failure',
+);
 
 export function usePreview(catalog: string, key: VariantKey, viewport: string, large: boolean, revision: string, interactive = false, attempt = 0) {
   const [value, setValue] = useState<{ url?: string; message?: string; loading: boolean }>({ loading: true });
@@ -13,6 +20,7 @@ export function usePreview(catalog: string, key: VariantKey, viewport: string, l
     const current = ++nextGeneration;
     generation.current = current;
     const abort = new AbortController();
+    let lease: PreviewCleanupLease | undefined;
     let ticket: string | undefined;
     let url: string | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -21,8 +29,6 @@ export function usePreview(catalog: string, key: VariantKey, viewport: string, l
     let admissionCommandMs = 0;
     let polls = 0;
     setValue({ loading: true });
-    const release = () => { void command({ command: 'release_viewport', args: { catalog, viewport, generation: String(current) } }, 'status').catch(() => {}); };
-    const cancel = (id: string) => { void command({ command: 'cancel_preview', args: { catalog, ticket: id } }, 'preview').catch(() => {}); };
     const poll = async () => {
       if (abort.signal.aborted || !ticket) return;
       try {
@@ -63,12 +69,35 @@ export function usePreview(catalog: string, key: VariantKey, viewport: string, l
         } else setValue({ loading: false, message: state.message ?? state.state.replaceAll('_', ' ') });
       } catch (e) { if (!abort.signal.aborted) setValue({ loading: false, message: errorText(e) }); }
     };
-    void command({ command: 'preview', args: { catalog, key, viewport, generation: String(current), tier: large ? 'large' : 'thumbnail', interactive, foreground: large, diagnostics } }, 'preview', abort.signal)
-      .then(state => { admissionCommandMs = diagnostics ? performance.now() - diagnosticStarted : 0; ticket = state.ticket; if (abort.signal.aborted) cancel(ticket); else void poll(); })
-      .catch(e => { if (!abort.signal.aborted) setValue({ loading: false, message: errorText(e) }); })
-      // Native dispatch may admit Preview after the first cleanup release.
-      .finally(() => { if (abort.signal.aborted) release(); });
-    return () => { abort.abort(); clearTimeout(timer); release(); if (ticket) cancel(ticket); if (url) URL.revokeObjectURL(url); };
+    const admit = () => {
+      if (abort.signal.aborted) return;
+      const reserved = cleanup.reserve(catalog, viewport, String(current));
+      lease = reserved;
+      void reserved.ready.then(async ready => {
+        if (!ready || !reserved.begin()) return;
+        let admitted = false;
+        try {
+          const state = await command({ command: 'preview', args: { catalog, key, viewport, generation: String(current), tier: large ? 'large' : 'thumbnail', interactive, foreground: large, diagnostics } }, 'preview', abort.signal);
+          admitted = true; admissionCommandMs = diagnostics ? performance.now() - diagnosticStarted : 0; ticket = state.ticket;
+          if (!abort.signal.aborted) void poll();
+        } catch (e) {
+          if (!abort.signal.aborted) setValue({ loading: false, message: errorText(e) });
+        } finally {
+          reserved.settled();
+          // ReleaseViewport is authoritative: it removes pending work and
+          // ticket ownership; the actor then cancels the obsolete consumer.
+          if (!admitted || abort.signal.aborted) reserved.release();
+        }
+      }).catch(e => {
+        if (abort.signal.aborted) return;
+        if (e instanceof PreviewCleanupCapacityError) {
+          setValue({ loading: true, message: e.message });
+          timer = setTimeout(admit, 100);
+        } else setValue({ loading: false, message: errorText(e) });
+      });
+    };
+    admit();
+    return () => { abort.abort(); clearTimeout(timer); lease?.release(); if (url) URL.revokeObjectURL(url); };
     // key is represented by its stable identity; each render's object is not a new consumer.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [catalog, identity, viewport, large, revision, interactive, attempt]);

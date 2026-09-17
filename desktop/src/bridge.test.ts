@@ -3,7 +3,7 @@ import { beforeEach, expect, test, vi } from 'vitest';
 const harness = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: harness.invoke, isTauri: () => true }));
 
-import { command } from './bridge';
+import { CatalogError, command, isBusyError } from './bridge';
 
 type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void };
 function deferred<T>(): Deferred<T> {
@@ -94,4 +94,16 @@ test('ordinary fulfilled command sends no cancellation cleanup IPC', async () =>
   harness.invoke.mockResolvedValue(reply);
   await expect(command({ command: 'status' }, 'status', new AbortController().signal)).resolves.toEqual({ phase: 'ready' });
   expect(harness.invoke.mock.calls.map(([name]) => name)).toEqual(['catalog_command']);
+});
+
+test('typed admission pressure remains an error for callers and can be recognized by background polls', async () => {
+  harness.invoke.mockResolvedValue({ status: 'error', error: { code: 'busy', message: 'desktop admission queue full' } });
+  let observed: unknown;
+  try { await command({ command: 'status' }, 'status'); }
+  catch (error) { observed = error; }
+  expect(observed).toBeInstanceOf(CatalogError);
+  expect(isBusyError(observed)).toBe(true);
+  expect(isBusyError(new CatalogError('closed', 'owner stopped'))).toBe(false);
+  expect(isBusyError(new Error('desktop admission queue full'))).toBe(false);
+  expect(isBusyError('desktop admission queue full')).toBe(false);
 });

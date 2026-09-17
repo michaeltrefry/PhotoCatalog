@@ -2,7 +2,7 @@ import { PreviewSettingsPanel } from './components/PreviewSettingsPanel';
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { command, chooseFolder, desktopAvailable, errorText, imageKey, type BackupStatus, type CatalogStatus, type CullOperation, type Data, type Folder, type GridImage, type HistoryEntry, type ImportStatus, type Variant } from './bridge';
+import { command, chooseFolder, desktopAvailable, errorText, imageKey, isBusyError, type BackupStatus, type CatalogStatus, type CullOperation, type Data, type Folder, type GridImage, type HistoryEntry, type ImportStatus, type Variant } from './bridge';
 import { Dialog, ErrorNotice, Section } from './components/Controls';
 import { FolderTree } from './components/FolderTree';
 import { CatalogActivity } from './components/CatalogActivity';
@@ -183,7 +183,7 @@ export function App() {
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       try { const next = await command({ command: 'status' }, 'status'); if (!stopped) setStatus(next); }
-      catch (e) { if (!stopped) setError(errorText(e)); }
+      catch (e) { if (!stopped && !isBusyError(e)) setError(errorText(e)); }
       if (!stopped) timer = setTimeout(() => { void poll(); }, 500);
     };
     void poll(); return () => { stopped = true; clearTimeout(timer); };

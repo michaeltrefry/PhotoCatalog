@@ -98,6 +98,7 @@ export class CatalogError extends Error {
 }
 
 export const desktopAvailable = isTauri();
+export const isBusyError = (error: unknown): boolean => error instanceof CatalogError && error.code === 'busy';
 export const imageKey = (key: VariantKey) => JSON.stringify([key.asset_id, key.variant_id]);
 
 export async function command<K extends keyof Data>(request: Request, kind: K, signal?: AbortSignal): Promise<Data[K]> {

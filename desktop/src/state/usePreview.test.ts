@@ -5,7 +5,13 @@ vi.mock('react', () => ({
   useRef: () => ({ current: 0n }),
   useState: () => [{ loading: true }, harness.setValue],
 }));
-vi.mock('../bridge', () => ({ command: harness.command, errorText: String, imageKey: JSON.stringify, previewBlob: harness.previewBlob, logPreviewDiagnostic: harness.logPreviewDiagnostic }));
+vi.mock('../bridge', () => {
+  class CatalogError extends Error {
+    readonly code: string;
+    constructor(code: string, message: string) { super(message); this.code = code; }
+  }
+  return { CatalogError, command: harness.command, errorText: String, imageKey: JSON.stringify, isBusyError: (error: unknown) => error instanceof CatalogError && error.code === 'busy', previewBlob: harness.previewBlob, logPreviewDiagnostic: harness.logPreviewDiagnostic };
+});
 vi.mock('../performanceMeasurement', () => ({ measurementDiagnosticsEnabled: () => harness.diagnostics }));
 import { usePreview } from './usePreview';
 
@@ -17,15 +23,16 @@ for (const outcome of ['success', 'failure'] as const) {
     harness.command.mockImplementation(request => request.command === 'preview' ? pending : Promise.resolve({}));
     usePreview('catalog', { asset_id: 'asset', variant_id: 'master' }, 'tile', false, '1');
     const cleanup = harness.effects[0]();
+    await Promise.resolve(); await Promise.resolve();
     const [request, , signal] = harness.command.mock.calls[0];
     cleanup();
     expect(signal.aborted).toBe(true);
     const releases = () => harness.command.mock.calls.filter(([value]) => value.command === 'release_viewport');
-    expect(releases()).toHaveLength(1);
+    expect(releases()).toHaveLength(0);
     if (outcome === 'success') finish({ ticket: 'late-ticket' }); else fail(new Error('Canceled before admission'));
     // Drain the then/catch/finally chain used by the actual hook.
-    await pending.catch(() => {}); await Promise.resolve(); await Promise.resolve();
-    expect(releases()).toHaveLength(2);
+    await pending.catch(() => {}); for (let index = 0; index < 6; index += 1) await Promise.resolve();
+    expect(releases()).toHaveLength(1);
     for (const [release] of releases()) expect(release.args).toEqual({ catalog: 'catalog', viewport: 'tile', generation: request.args.generation });
     expect(harness.command.mock.calls.some(([value]) => value.command === 'preview_status')).toBe(false);
   });
@@ -49,12 +56,13 @@ test('opt-in remount emits one bounded phase record after delivery readback', as
   harness.logPreviewDiagnostic.mockResolvedValue(true);
   const create = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:diagnostic');
   usePreview('catalog', ready.key, 'tile', false, '1');
-  harness.effects[0]();
+  const cleanup = harness.effects[0]();
   for (let index = 0; index < 12; index += 1) await Promise.resolve();
   expect(harness.command.mock.calls[0][0].args.diagnostics).toBe(true);
   expect(harness.previewBlob).toHaveBeenCalledWith('catalog', ready.ticket);
   expect(harness.logPreviewDiagnostic).toHaveBeenCalledTimes(1);
   expect(harness.logPreviewDiagnostic.mock.calls[0][0]).toMatchObject({ ticket: ready.ticket, polls: 1, native });
+  cleanup(); for (let index = 0; index < 4; index += 1) await Promise.resolve();
   create.mockRestore();
 });
 
@@ -73,11 +81,12 @@ test('ordinary successful delivery performs no diagnostic readback or log', asyn
   harness.previewBlob.mockResolvedValue(new Blob([new Uint8Array([1])]));
   const create = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:ordinary');
   usePreview('catalog', { asset_id: 'asset', variant_id: 'master' }, 'tile', false, '1');
-  harness.effects[0]();
+  const cleanup = harness.effects[0]();
   for (let index = 0; index < 12; index += 1) await Promise.resolve();
   expect(harness.command.mock.calls[0][0].args.diagnostics).toBe(false);
   expect(harness.command.mock.calls.filter(([value]) => value.command === 'preview_status')).toHaveLength(1);
   expect(harness.logPreviewDiagnostic).not.toHaveBeenCalled();
+  cleanup(); for (let index = 0; index < 4; index += 1) await Promise.resolve();
   create.mockRestore();
 });
 
