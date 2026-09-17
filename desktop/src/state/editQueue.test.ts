@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { EDIT_COALESCE_MS, EditQueue } from './editQueue';
+import { EDIT_BUSY_RETRY_BASE_MS, EDIT_BUSY_RETRY_LIMIT, EDIT_BUSY_RETRY_MAX_MS, EDIT_COALESCE_MS, EditQueue } from './editQueue';
 import type { Variant } from '../bridge';
 
 const variant: Variant = {
@@ -7,6 +7,12 @@ const variant: Variant = {
   recipe: { version: '1', settings: { crop: null, straighten_degrees: 0, exposure_ev: 0, white_balance: { mode: 'as_shot' }, contrast: 0, highlights: 0, shadows: 0, saturation: 0, vibrance: 0, sharpening: { amount: 0, radius_px: 1 }, noise_reduction: { luminance: 0, chroma: 0 } } },
 };
 const exposure = (value: number) => ({ ...variant.recipe, settings: { ...variant.recipe.settings, exposure_ev: value } });
+class RejectedBeforeMutation extends Error {}
+const retryable = (error: unknown) => error instanceof RejectedBeforeMutation;
+const fullRetryDelay = () => Array.from(
+  { length: EDIT_BUSY_RETRY_LIMIT },
+  (_, index) => Math.min(EDIT_BUSY_RETRY_BASE_MS * 2 ** index, EDIT_BUSY_RETRY_MAX_MS),
+).reduce((sum, value) => sum + value, 0);
 afterEach(() => vi.useRealTimers());
 
 test('a slider move during an in-flight save uses its returned exact revision', async () => {
@@ -83,4 +89,77 @@ test('measurement failure cannot change a successful edit', async () => {
   await expect(queue.flush()).resolves.toBeUndefined();
   expect(queue.value.state).toBe('saved');
   expect(queue.value.variant.revision).toBe('9007199254740994');
+});
+
+test('a pre-mutation hold waits in the same measured write and then becomes durable', async () => {
+  vi.useFakeTimers();
+  const events: { ordinal: number; outcome: string; revision?: string }[] = [];
+  let attempts = 0;
+  const save = vi.fn(async (base: Variant, recipe: Variant['recipe']) => {
+    attempts += 1;
+    if (attempts <= 2) throw new RejectedBeforeMutation('export write hold');
+    return { ...base, revision: '9007199254740994', recipe };
+  });
+  const queue = new EditQueue(variant, save, event => events.push(event), retryable);
+  queue.change(exposure(5), 40);
+  const flushed = queue.flush();
+  await vi.advanceTimersByTimeAsync(EDIT_BUSY_RETRY_BASE_MS);
+  expect(events).toEqual([]);
+  expect(queue.value.state).toBe('saving');
+  await vi.advanceTimersByTimeAsync(EDIT_BUSY_RETRY_BASE_MS * 2);
+  await flushed;
+  expect(save).toHaveBeenCalledTimes(3);
+  expect(events).toEqual([{ ordinal: 40, outcome: 'durable', revision: '9007199254740994' }]);
+  expect(queue.value.state).toBe('saved');
+});
+
+test('a newer slider recipe supersedes the held recipe without starting a parallel write', async () => {
+  vi.useFakeTimers();
+  const events: { ordinal: number; outcome: string; revision?: string }[] = [];
+  const writes: number[] = [];
+  const save = vi.fn(async (base: Variant, recipe: Variant['recipe']) => {
+    writes.push(recipe.settings.exposure_ev);
+    if (writes.length === 1) throw new RejectedBeforeMutation('export write hold');
+    return { ...base, revision: '9007199254740994', recipe };
+  });
+  const queue = new EditQueue(variant, save, event => events.push(event), retryable);
+  queue.change(exposure(1), 41);
+  const firstFlush = queue.flush();
+  const sameFlush = queue.flush();
+  await vi.advanceTimersByTimeAsync(0);
+  queue.change(exposure(2), 42);
+  await vi.advanceTimersByTimeAsync(EDIT_BUSY_RETRY_BASE_MS);
+  await Promise.all([firstFlush, sameFlush]);
+  expect(writes).toEqual([1, 2]);
+  expect(events).toEqual([
+    { ordinal: 41, outcome: 'superseded' },
+    { ordinal: 42, outcome: 'durable', revision: '9007199254740994' },
+  ]);
+  expect(queue.value.recipe.settings.exposure_ev).toBe(2);
+});
+
+test('a persistent pre-mutation hold has a finite retry budget and reports one terminal failure', async () => {
+  vi.useFakeTimers();
+  const events: { ordinal: number; outcome: string }[] = [];
+  const save = vi.fn().mockRejectedValue(new RejectedBeforeMutation('export write hold remained active'));
+  const queue = new EditQueue(variant, save, event => events.push(event), retryable);
+  queue.change(exposure(6), 43);
+  const rejected = expect(queue.flush()).rejects.toThrow('export write hold remained active');
+  await vi.advanceTimersByTimeAsync(fullRetryDelay());
+  await rejected;
+  expect(save).toHaveBeenCalledTimes(EDIT_BUSY_RETRY_LIMIT + 1);
+  expect(events).toEqual([{ ordinal: 43, outcome: 'backend_error' }]);
+  expect(queue.value.state).toBe('error');
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test('an ambiguous transport error mentioning busy is never retried', async () => {
+  vi.useFakeTimers();
+  const save = vi.fn().mockRejectedValue(new Error('transport failed while export was busy'));
+  const queue = new EditQueue(variant, save, undefined, retryable);
+  queue.change(exposure(7));
+  await expect(queue.flush()).rejects.toThrow('transport failed while export was busy');
+  expect(save).toHaveBeenCalledTimes(1);
+  expect(queue.value.state).toBe('error');
+  expect(vi.getTimerCount()).toBe(0);
 });

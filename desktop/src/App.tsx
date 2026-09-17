@@ -202,7 +202,7 @@ export function App() {
         measurementDurable(event.ordinal);
         measurementPresented(event.ordinal, () => queueRef.current === next && next.value.variant.revision === event.revision && document.querySelector('.edit-status')?.textContent === 'Changes saved');
       } else measurementEnded(event.ordinal, event.outcome === 'superseded' ? 'superseded' : 'backend_error');
-    });
+    }, isBusyError);
     queueRef.current = next; setQueue(next);
   }, [catalog]);
   const select = useCallback(async (row: GridImage) => {
