@@ -199,6 +199,17 @@ def invoke(command, root, name, timeout):
     return child
 
 
+def validate_overlay(receipt):
+    overlay = receipt.get("overlay", {})
+    if (receipt.get("complete") is not True
+            or overlay.get("schema_version") != CURRENT_SCHEMA
+            or overlay.get("rows") != 10000
+            or overlay.get("catalog_count") != 10000000
+            or overlay.get("connection_total_changes_delta") != 40000
+            or overlay.get("queued_storage_refreshes") != 10000):
+        raise ValueError("overlay proof incomplete")
+
+
 def prepare(args):
     args.output.mkdir(parents=False, exist_ok=False)
     receipt = {"version":PROTOCOL,"catalog_schema":CURRENT_SCHEMA,"complete":False,"started":anchor(),"source_catalog":str(args.source_catalog),
@@ -274,8 +285,7 @@ def prepare(args):
     try:
         final["child"] = invoke([str(args.binary),"overlay","--bundle",str(args.output),"--dataset",str(args.dataset)],args.output,"overlay",3600)
         overlay = read_json(args.output/"overlay-receipt.json",1024*1024)
-        if overlay.get("complete") is not True or overlay.get("overlay",{}).get("connection_total_changes_delta") != 20000:
-            raise ValueError("overlay proof incomplete")
+        validate_overlay(overlay)
         final["overlay_sha256"] = digest(args.output/"overlay-receipt.json")
         final["complete"] = True
     except BaseException as exc:
