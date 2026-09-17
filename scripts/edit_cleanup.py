@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from edit_verify import digest,read_json,observations,sample_coverage,owned
+from edit_verify import digest,read_json,observations,sample_coverage,owned,native_path
 
 MAX_ENTRIES=4096
 STORAGE_FIELDS={'root','device','inode','parent','parent_device','parent_inode','reserve_bytes'}
@@ -237,12 +237,14 @@ def cleanup_export(root,service_campaign_root,record):
         if value['job']['state']!='complete' or value['job']['completed']!=1 or len(value['items'])!=1:
             raise ValueError('export is not durably complete')
         item=value['items'][0];receipt=item['receipt']
-        if item['state']!='published' or receipt['state']!='Published' or receipt['destination']!=str(path) or receipt['captured_original'] is not None:
+        if (item['state']!='published' or receipt['state']!='Published'
+            or native_path(receipt['destination'])!=path or receipt['captured_original'] is not None):
             raise ValueError('cleanup requires new-destination publication, no captured original')
-        recovery=owned(output,receipt['recovery_directory'])
+        recovery=owned(output,native_path(receipt['recovery_directory']))
         seal=read_json(recovery/'photo-seal.json')
         if (recovery.parent!=output or recovery.name!='.photocatalog-photo-export-'+seal['snapshot']['operation']
-            or seal['snapshot']['destination']!=str(path) or seal['authority_digest']!=item['authority']
+            or native_path(seal['snapshot']['destination'])!=path
+            or seal['authority_digest']!=item['authority']
             or seal['payload']['digest']!=value['blake3']):
             raise ValueError('recovery directory lacks exact published authority')
         roots.append(recovery)

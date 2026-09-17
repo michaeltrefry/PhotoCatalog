@@ -20,6 +20,7 @@ import edit_memory
 
 MAX_JSON=256*1024
 MAX_SAMPLES=16*1024*1024
+MAX_PATH_UNITS=32*1024
 PIXEL_PHASES={'correctness','kernel','full','support100mp','proxy_reference'}
 
 
@@ -50,6 +51,24 @@ def read_json(path, limit=MAX_JSON):
     if len(data)>limit:
         raise ValueError('JSON grew')
     return strict_json(data)
+
+
+def native_path(value):
+    if not isinstance(value,dict) or set(value)!= {'encoding','units'}:
+        raise ValueError('native path shape differs')
+    units=value['units']
+    if not isinstance(units,list) or not 1<=len(units)<=MAX_PATH_UNITS:
+        raise ValueError('native path unit bound')
+    if value['encoding']=='UnixBytes' and os.name=='posix':
+        if any(type(unit) is not int or not 0<=unit<=255 for unit in units) or 0 in units:
+            raise ValueError('invalid Unix native path units')
+        return Path(os.fsdecode(bytes(units)))
+    if value['encoding']=='WindowsWide' and os.name=='nt':
+        if any(type(unit) is not int or not 0<=unit<=65535 for unit in units) or 0 in units:
+            raise ValueError('invalid Windows native path units')
+        import struct
+        return Path(struct.pack('<'+'H'*len(units),*units).decode('utf-16-le','surrogatepass'))
+    raise ValueError('foreign native path encoding')
 
 
 def digest(path, algorithm, limit):

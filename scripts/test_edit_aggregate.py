@@ -13,6 +13,14 @@ from test_edit_qualification import manifest
 from test_edit_statistics import request, samples
 
 
+def native_path(path):
+    import os
+    if os.name=='nt':
+        raw=str(path).encode('utf-16-le');units=[int.from_bytes(raw[i:i+2],'little') for i in range(0,len(raw),2)]
+        return dict(encoding='WindowsWide',units=units)
+    return dict(encoding='UnixBytes',units=list(os.fsencode(path)))
+
+
 class AggregateContracts(unittest.TestCase):
     def test_semantic_numbers_cannot_turn_boolean_into_configuration(self):
         self.assertTrue(aggregate.same({'kelvin': 4300}, {'kelvin': 4300.0}))
@@ -224,7 +232,7 @@ class AggregateContracts(unittest.TestCase):
                 sha = hashlib.sha256(data).hexdigest()
                 recovery = str(output/f'.photocatalog-photo-export-operation-{iteration}')
                 rows.append(dict(iteration=iteration, path=path, blake3=blake3(data).hexdigest(),
-                                 items=[dict(receipt={'recovery_directory': recovery})]))
+                                 items=[dict(receipt={'recovery_directory': native_path(recovery)})]))
                 encoded.append(dict(path=path, sha256=sha))
                 directories.append(recovery)
                 if iteration == 2: Path(path).write_bytes(data)

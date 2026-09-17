@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 import edit_cleanup as cleanup
 import edit_aggregate
+import edit_verify
 
 
 def write_json(path,value):
@@ -20,7 +21,33 @@ def descriptor(path):
                 parent_device=parent.st_dev,parent_inode=parent.st_ino,reserve_bytes=0)
 
 
+def native_path(path):
+    if os.name=='nt':
+        raw=str(path).encode('utf-16-le');units=[int.from_bytes(raw[i:i+2],'little') for i in range(0,len(raw),2)]
+        return dict(encoding='WindowsWide',units=units)
+    return dict(encoding='UnixBytes',units=list(os.fsencode(path)))
+
+
 class DisposableCleanupAdmission(unittest.TestCase):
+    def test_native_receipt_path_is_exact_bounded_and_platform_specific(self):
+        path=Path(tempfile.gettempdir())/'native-path'
+        self.assertEqual(cleanup.native_path(native_path(path)),path)
+        foreign=dict(encoding='WindowsWide' if os.name!='nt' else 'UnixBytes',units=[65])
+        for value in ({},foreign,dict(encoding=native_path(path)['encoding'],units=[]),
+                      dict(encoding=native_path(path)['encoding'],units=[True]),
+                      dict(encoding=native_path(path)['encoding'],units=[65536]),
+                      dict(encoding=native_path(path)['encoding'],units=[0]),
+                      dict(encoding=native_path(path)['encoding'],units=[1]*(32*1024+1))):
+            with self.assertRaises(ValueError):cleanup.native_path(value)
+
+    def test_windows_native_receipt_path_preserves_utf16_surrogates(self):
+        units=[ord('C'),ord(':'),ord('\\'),0xd83d,0xde00,0xd800,ord('x')]
+        expected=bytes().join(unit.to_bytes(2,'little') for unit in units).decode(
+            'utf-16-le','surrogatepass')
+        with patch.object(edit_verify.os,'name','nt'), \
+             patch.object(edit_verify,'Path',side_effect=lambda value:value):
+            self.assertEqual(cleanup.native_path(dict(encoding='WindowsWide',units=units)),expected)
+
     @unittest.skipIf(os.name=='nt','POSIX descriptor lifecycle regression')
     def test_post_open_identity_failure_closes_every_retained_descriptor(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -76,9 +103,10 @@ class DisposableCleanupAdmission(unittest.TestCase):
             value=dict(kind='observation',recipe_index=0,iteration=iteration,path=str(destination),
                        blake3=blake3(data).hexdigest(),job=dict(state='complete',completed=1),
                        items=[dict(state='published',authority=authority,receipt=dict(
-                           state='Published',destination=str(destination),captured_original=None,
-                           recovery_directory=str(recovery)))])
-            write_json(recovery/'photo-seal.json',dict(snapshot=dict(operation=operation,destination=str(destination)),
+                           state='Published',destination=native_path(destination),captured_original=None,
+                           recovery_directory=native_path(recovery)))])
+            write_json(recovery/'photo-seal.json',dict(snapshot=dict(
+                       operation=operation,destination=native_path(destination)),
                        authority_digest=authority,payload=dict(digest=value['blake3'])))
             values.append(value)
             encoded.append(dict(path=str(destination),sha256=hashlib.sha256(data).hexdigest()))

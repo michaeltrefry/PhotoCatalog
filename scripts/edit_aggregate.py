@@ -314,7 +314,7 @@ def cleanup_evidence(root, service_campaign_root, record, request, verification,
         raise ValueError('cleanup service namespace differs')
     removable_roots = {service/'catalog'}
     for value in values:
-        directory = Path(value['items'][0]['receipt']['recovery_directory'])
+        directory = edit_verify.native_path(value['items'][0]['receipt']['recovery_directory'])
         if directory.parent != output or not directory.name.startswith('.photocatalog-photo-export-'):
             raise ValueError('cleanup recovery root differs from authoritative item')
         removable_roots.add(directory)
