@@ -127,6 +127,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::catalog_command,
             commands::catalog_cancel_operation,
+            commands::catalog_settle_cancellation,
             commands::catalog_choose_folder,
             commands::catalog_choose_location,
             commands::catalog_preview_bytes,

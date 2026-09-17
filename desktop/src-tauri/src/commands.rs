@@ -116,6 +116,13 @@ pub fn catalog_cancel_operation(
         .operations
         .lock()
         .map_err(|_| "Operation state unavailable")?;
+    cancel_operation(&mut operations, operation)
+}
+
+fn cancel_operation(
+    operations: &mut HashMap<String, Operation>,
+    operation: String,
+) -> Result<(), String> {
     operations.retain(|_, value| {
         value.cancellation.is_some() || value.started.elapsed() < Duration::from_secs(60)
     });
@@ -136,6 +143,35 @@ pub fn catalog_cancel_operation(
         );
     } else {
         return Err("Too many active catalog operations".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn catalog_settle_cancellation(
+    state: tauri::State<'_, State>,
+    operation: String,
+) -> Result<(), String> {
+    valid_operation(&operation)?;
+    let mut operations = state
+        .operations
+        .lock()
+        .map_err(|_| "Operation state unavailable")?;
+    settle_cancellation(&mut operations, &operation)
+}
+
+fn settle_cancellation(
+    operations: &mut HashMap<String, Operation>,
+    operation: &str,
+) -> Result<(), String> {
+    // The frontend sends this only after both the command reply and its cancel
+    // invocation settle. A cancel that crossed the command's reply can otherwise
+    // leave a pre-admission tombstone occupying capacity for sixty seconds.
+    if let Some(value) = operations.get(operation) {
+        if value.cancellation.is_some() || !value.canceled {
+            return Err("Operation is still active".into());
+        }
+        operations.remove(operation);
     }
     Ok(())
 }
@@ -381,6 +417,64 @@ pub async fn catalog_quit(
     state.quitting.store(true, Ordering::Release);
     app.exit(0);
     Ok(())
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn late_cancellation_settlement_releases_capacity_without_waiting_for_expiry() {
+        let mut operations = HashMap::new();
+        for _ in 0..256 {
+            let operation = uuid::Uuid::new_v4().to_string();
+            // Native completion has removed the command, but cancellation can
+            // cross its reply on the way back to the frontend.
+            cancel_operation(&mut operations, operation.clone()).unwrap();
+            assert!(operations[&operation].cancellation.is_none());
+            settle_cancellation(&mut operations, &operation).unwrap();
+            settle_cancellation(&mut operations, &operation).unwrap();
+            assert!(operations.is_empty());
+        }
+    }
+
+    #[test]
+    fn settlement_cannot_retire_an_active_operation_or_signal_another_one() {
+        let mut operations = HashMap::new();
+        let active = Cancellation::default();
+        operations.insert(
+            "active".into(),
+            Operation {
+                started: Instant::now(),
+                cancellation: Some(active.clone()),
+                canceled: false,
+            },
+        );
+        cancel_operation(&mut operations, "late".into()).unwrap();
+        assert!(settle_cancellation(&mut operations, "active").is_err());
+        settle_cancellation(&mut operations, "late").unwrap();
+        assert_eq!(operations.len(), 1);
+        assert!(!active.is_canceled());
+        cancel_operation(&mut operations, "active".into()).unwrap();
+        assert!(active.is_canceled());
+        assert!(settle_cancellation(&mut operations, "active").is_err());
+        assert_eq!(operations.len(), 1);
+    }
+
+    #[test]
+    fn unacknowledged_early_cancellations_keep_the_existing_capacity_and_expiry() {
+        let mut operations = HashMap::new();
+        for i in 0..128 {
+            cancel_operation(&mut operations, i.to_string()).unwrap();
+        }
+        assert!(operations["0"].canceled);
+        assert!(operations["0"].cancellation.is_none());
+        assert!(cancel_operation(&mut operations, "overflow".into()).is_err());
+        operations.get_mut("0").unwrap().started = Instant::now() - Duration::from_secs(61);
+        cancel_operation(&mut operations, "replacement".into()).unwrap();
+        assert_eq!(operations.len(), 128);
+        assert!(!operations.contains_key("0"));
+    }
 }
 
 #[cfg(test)]

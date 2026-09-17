@@ -104,15 +104,24 @@ export async function command<K extends keyof Data>(request: Request, kind: K, s
   if (!desktopAvailable) throw new CatalogError('desktop_required', 'Open the LensWorks desktop app to access your catalog.');
   if (signal?.aborted) throw new DOMException('Canceled', 'AbortError');
   const operation = crypto.randomUUID();
-  const cancel = () => { void invoke('catalog_cancel_operation', { operation }).catch(() => {}); };
+  let cancellation: Promise<void> | undefined;
+  let requestReturned = false;
+  const cancel = () => { cancellation ??= invoke<void>('catalog_cancel_operation', { operation }).catch(() => {}); };
   signal?.addEventListener('abort', cancel, { once: true });
   try {
     const reply = await invoke<Reply>('catalog_command', { operation, request });
+    requestReturned = true;
     if (signal?.aborted) throw new DOMException('Canceled', 'AbortError');
     if (reply.status === 'error') throw new CatalogError(reply.error.code, reply.error.message);
     if (reply.value.kind !== kind) throw new CatalogError('protocol', `Unexpected ${reply.value.kind} response to ${request.command}.`);
     return reply.value.data as Data[K];
-  } finally { signal?.removeEventListener('abort', cancel); }
+  } finally {
+    signal?.removeEventListener('abort', cancel);
+    if (cancellation) {
+      await cancellation;
+      if (requestReturned) await invoke<void>('catalog_settle_cancellation', { operation }).catch(() => {});
+    }
+  }
 }
 
 export async function chooseFolder(createCatalog = false): Promise<{ path: NativePath; display: string } | null> {
