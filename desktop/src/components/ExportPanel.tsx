@@ -13,7 +13,34 @@ export type ExportGate = <T>(action: () => Promise<T>) => Promise<T>;
 type Frozen = { target: TargetKey; metadata: Metadata; filename: string; label: string };
 type Review = { token: string; total: string; targets: Frozen[]; output: Output; budgets: Budgets };
 type Token = { kind: 'profile'; profile: ProfileAdmission } | { kind: 'destinations'; token: string };
+export type ImportedPathPreparation = { phase: 'required' | 'pending' | 'complete' | 'unbound'; diagnostic?: string };
+const pendingPathProjection = 'export alias index has pending path projections; run bounded reconciliation first';
 const tokenId = (v: Token) => v.kind === 'profile' ? v.profile.token : v.token;
+
+export const requiresImportedPathPreparation = (message: string) => message.includes(pendingPathProjection);
+
+export function ImportedPathPreparationControls({ state, progress, rows, uncertain, locked, busy, confirm, prepare, setRows }: {
+  state: ImportedPathPreparation | null; progress: string; uncertain: boolean; locked: boolean; busy: boolean;
+  rows: string; confirm: (() => void) | null; prepare: () => void; setRows: (value: string) => void;
+}) {
+  const message = state?.phase === 'required'
+    ? 'Imported photo locations need preparation before this reviewed output can be added to the saved job.'
+    : state?.phase === 'pending'
+      ? 'More imported photo locations need preparation. Prepare another bounded step.'
+      : state?.phase === 'unbound'
+        ? 'Some imported photos do not have a current location. Close Export, use Locate originals, then return and prepare locations again.'
+        : state?.phase === 'complete'
+          ? 'Imported photo locations are prepared. Retry Append this reviewed output explicitly; LensWorks will not retry it automatically.'
+          : 'Imported photos require one-time location preparation before their first output is appended.';
+  const needsConfirmation = !!state && uncertain;
+  return <details open={!!state}><summary>Imported photo locations {state ? '— action required' : '— prepare before first append'}</summary>
+    {state?.phase === 'required' ? <ErrorNotice message={message} /> : <p role={state ? 'status' : undefined}>{message}</p>}
+    {state?.diagnostic && <details><summary>Technical error details</summary><p>{state.diagnostic}</p></details>}
+    {needsConfirmation && <><p>First confirm the saved job state. This checks what was stored and does not replay the rejected append.</p><button disabled={busy || !confirm} onClick={confirm ?? undefined}>Confirm saved job state</button></>}
+    {!needsConfirmation && !['complete', 'unbound'].includes(state?.phase ?? '') && <><label>Paths per step<input value={rows} onChange={event => setRows(event.target.value)} /></label><button disabled={locked} onClick={prepare}>Prepare one path step</button></>}
+    {progress && <p role="status">{progress}</p>}
+  </details>;
+}
 
 export function ExportPanel({ catalog, open, rows, controller, gate: appGate, blocked, onDirectPending, onClose }: {
   catalog: string; open: boolean; rows: GridImage[]; controller: Controller; gate: ExportGate; blocked: boolean; onDirectPending: (pending: boolean) => void; onClose: () => void;
@@ -29,7 +56,7 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
   const [directPending, setDirectPending] = useState(false);
   const pendingCallback = useRef(onDirectPending); pendingCallback.current = onDirectPending;
   const [uncertain, setUncertain] = useState(false), [recoverAck, setRecoverAck] = useState(false), [recovery, setRecovery] = useState<string | null>(null);
-  const [recoveredKey, setRecoveredKey] = useState<string | null>(null);
+  const [recoveredKey, setRecoveredKey] = useState<string | null>(null), [pathPreparation, setPathPreparation] = useState<ImportedPathPreparation | null>(null);
   const pendingRecovery = useRef<string | null>(null);
   const [recoverDirs, setRecoverDirs] = useState('256'), [pathRows, setPathRows] = useState('256'), [paths, setPaths] = useState(''), [runItems, setRunItems] = useState('100'), [runSeconds, setRunSeconds] = useState('300');
   const [pageLimit, setPageLimit] = useState('20');
@@ -47,7 +74,7 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
     if (pendingReview.current?.draftKey !== draftKey) pendingReview.current = null;
   }, [draftKey]);
   useEffect(() => { owner.current.alive = true; return () => { owner.current.alive = false; activeAbort.current?.abort(); reading.current?.abort(); }; }, []);
-  useEffect(() => { if (!open) { activeAbort.current?.abort(); reading.current?.abort(); } }, [open]);
+  useEffect(() => { if (!open) { activeAbort.current?.abort(); reading.current?.abort(); setPathPreparation(null); setPaths(''); } }, [open]);
   useEffect(() => {
     const abort = new AbortController();
     void photoExport(catalog, { command: 'options' }, 'options', abort.signal).then(value => { if (!abort.signal.aborted) { setOptions(value); setBudget(v => v ?? value.budgets); setLimits(v => v ?? executionDraft(value.execution)); setPageLimit(BigInt(value.page_rows) < 20n ? value.page_rows : '20'); } }).catch(e => { if (!abort.signal.aborted) setError(errorText(e)); });
@@ -87,7 +114,7 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
     const abort = new AbortController(); activeAbort.current = abort;
     active.current = true; const generation = ++owner.current.generation; setBusy(label); setError('');
     void waitForExport(Promise.resolve().then(() => action(generation)), abort.signal).catch(e => {
-      if (currentView(generation)) { setError(errorText(e)); if (writes) { setUncertain(true); setShowJobs(true); } }
+      if (currentView(generation)) { const message = errorText(e); setError(message); if (requiresImportedPathPreparation(message)) setPathPreparation({ phase: 'required', diagnostic: message }); if (writes) { setUncertain(true); setShowJobs(true); } }
     }).finally(() => { if (activeAbort.current === abort) { active.current = false; reading.current = null; if (owner.current.alive) setBusy(''); } });
   };
   // Job/Jobs reads have higher actor priority than these writes. They cannot
@@ -165,7 +192,14 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
     if (!target) throw new Error('Destination does not match this frozen target review.');
     const result = await operation({ command: 'append', args: { job: job.id, expected_total: job.total, target: { ...target.target, destination: destination.destination, overwrite: overwrite.has(imageKey(target.target.key)), metadata: target.metadata }, output: review.output, budgets: review.budgets } }, generation);
     if (result.result?.kind !== 'appended') throw new Error('Append result missing. Refresh the saved job before retrying.');
-    check(generation); setJob(result.result.value.job); setAppended(v => new Set(v).add(imageKey(target.target.key))); setEpoch(v => v + 1);
+    check(generation); setJob(result.result.value.job); setPathPreparation(null); setAppended(v => new Set(v).add(imageKey(target.target.key))); setEpoch(v => v + 1);
+  }, true);
+  const prepareImportedPaths = () => attempt('Preparing imported paths', async generation => {
+    const result = await operation({ command: 'paths', args: { limit: decimal(pathRows, 'Paths per step', '1', '512') } }, generation);
+    if (result.result?.kind !== 'paths') throw new Error('Imported path preparation result missing. Inspect operation status.');
+    check(generation); const value = result.result.value;
+    setPaths(`${value.projected} projected; ${value.pending ? 'more steps pending' : 'projection complete'}; ${value.unbound} unbound.`);
+    setPathPreparation(current => ({ phase: BigInt(value.unbound) > 0n ? 'unbound' : value.pending ? 'pending' : 'complete', diagnostic: current?.diagnostic }));
   }, true);
   const authorityAction = (kind: 'retry_seal' | 'restore', item: Item) => attempt(kind === 'restore' ? 'Restoring saved publication' : 'Retrying saved seal', async generation => {
     if (!job) return;
@@ -176,7 +210,7 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
   if (!open) return null;
   return <Dialog title="Export photos" onClose={onClose}><div className="metadata-panel export-panel">
     <p>Create JPEG, PNG or TIFF outputs from frozen saved edits. Original source photos are never export destinations. Saved jobs remain available after closing this panel or catalog.</p>
-    {error && <ErrorNotice message={error} />}{controller.error && <ErrorNotice message={controller.error} />}
+    {error && error !== pathPreparation?.diagnostic && <ErrorNotice message={error} />}{controller.error && controller.error !== pathPreparation?.diagnostic && <ErrorNotice message={controller.error} />}
     {!options && <button onClick={() => setOptionEpoch(v => v + 1)}>Retry export options</button>}{!controller.ready && <button onClick={controller.retry}>Retry export status</button>}
     {busy && <p role="status">{busy}… <button onClick={() => { activeAbort.current?.abort(); reading.current?.abort(); }}>{reading.current ? 'Cancel target preparation' : 'Stop waiting'}</button></p>}
     {directPending && <p role="alert">A saved-job write has no acknowledgement yet. Inspection does not settle it. Catalog writes remain held until its acknowledgement arrives, or you close and reopen the catalog. Stop waiting only releases this dialog; it does not prove cancellation.</p>}
@@ -199,6 +233,7 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
         {['building', 'queued'].includes(job.state) && <button disabled={locked} onClick={() => attempt('Canceling inactive saved job', async generation => { const admitted: ExportAdmission = await gate(async () => { check(generation); return controller.cancelJob(job.id); }); await waitForExport(admitted.completion, activeAbort.current!.signal); check(generation); await readJob(job.id, generation); }, true)}>Cancel remaining saved items</button>}
       </>}
     </section>
+    <ImportedPathPreparationControls state={pathPreparation} progress={paths} rows={pathRows} uncertain={uncertain} locked={locked} busy={!!busy} confirm={job ? () => attempt('Confirming saved job state', generation => readJob(job.id, generation)) : null} prepare={prepareImportedPaths} setRows={setPathRows} />
     {job?.state === 'building' && <section><h3>Prepare targets from the library page</h3><p>Close this panel to browse another page; the saved job stays available. A frozen review holds at most 100 logical images with exact edit and metadata revisions.</p>
       <fieldset disabled={locked || !!review}><legend>Targets</legend><button onClick={() => setChosen(new Set(rows.slice(0, 100).map(row => imageKey(row.key))))}>Select this page</button><button onClick={() => setChosen(new Set())}>Clear selection</button>{rows.slice(0, 100).map(row => <label className="checkbox" key={imageKey(row.key)}><input type="checkbox" checked={chosen.has(imageKey(row.key))} onChange={e => setChosen(v => { const next = new Set(v); if (e.target.checked) next.add(imageKey(row.key)); else next.delete(imageKey(row.key)); return next; })} />{row.filename} · {row.key.variant_id}</label>)}
         <label>Metadata in outputs<select value={metadataMode} onChange={e => { setMetadataMode(e.target.value as typeof metadataMode); setFrozen([]); setAvailableReview(null); }}><option value="omit">Omit metadata</option><option value="resolved">Use resolved metadata at the captured revision</option></select></label>{metadataMode === 'resolved' && <label>Optional retained base-model ID<input value={baseModel} onChange={e => { setBaseModel(e.target.value); setFrozen([]); setAvailableReview(null); }} placeholder="Default resolved base" inputMode="numeric" /></label>}
@@ -210,7 +245,6 @@ export function ExportPanel({ catalog, open, rows, controller, gate: appGate, bl
       {adoptableReview && !review && <button disabled={locked} onClick={() => { if (adoptableReview.draftKey !== draftKeyRef.current) return; setReview(adoptableReview); setAvailableReview(null); setOverwrite(new Set()); setAppended(new Set()); }}>Use completed naming review ({adoptableReview.total} targets)</button>}
       {review && <section><h4>Frozen destination review · {review.total} targets</h4><p>Each append freezes the reviewed output settings. Existing destinations require explicit authorization; collisions and changed identities reject. To change settings, release this naming review below.</p><ExportPage key={review.token} catalog={catalog} kind="destinations" owner={review.token} limit={pageLimit}>{row => <><strong>{row.name.filename} · {row.name.variant_label}</strong>{row.destination && <ExportPath path={row.destination} />}{row.error && <ErrorNotice message={row.error} />}<label className="checkbox"><input disabled={locked || appended.has(imageKey(row.target.key))} type="checkbox" checked={overwrite.has(imageKey(row.target.key))} onChange={e => setOverwrite(v => { const next = new Set(v); if (e.target.checked) next.add(imageKey(row.target.key)); else next.delete(imageKey(row.target.key)); return next; })} />Authorize replacement of this destination if it already exists, preserving its captured original</label><button disabled={locked || uncertain || !!row.error || !row.destination || appended.has(imageKey(row.target.key))} onClick={() => appendDestination(row)}>{appended.has(imageKey(row.target.key)) ? 'Appended to saved job' : 'Append this reviewed output'}</button></>}</ExportPage></section>}
     </section>}
-    <details><summary>Imported path preparation</summary><p>Project bounded imported original paths when append reports unprepared paths. Unbound originals still require Locate originals; they are never skipped automatically.</p><label>Paths per step<input value={pathRows} onChange={e => setPathRows(e.target.value)} /></label><button disabled={locked} onClick={() => attempt('Preparing imported paths', async generation => { const result = await operation({ command: 'paths', args: { limit: decimal(pathRows, 'Paths per step', '1', '512') } }, generation); if (result.result?.kind === 'paths') { check(generation); const v = result.result.value; setPaths(`${v.projected} projected; ${v.pending ? 'more steps pending' : 'projection complete'}; ${v.unbound} unbound.`); } }, true)}>Prepare one path step</button><p role="status">{paths}</p></details>
     {!!tokens.length && <section><h3>Session profiles and naming reviews</h3><p>Tokens remain available until explicitly released or the catalog closes. Saved plans own their bytes independently.</p>{tokens.map(token => <article key={tokenId(token)}>{token.kind === 'profile' ? <><p>{token.profile.name} · {token.profile.bytes} bytes · {token.profile.blake3}</p><button disabled={locked || !!review} onClick={() => setSettings(v => ({ ...v, profile: 'icc', icc: token.profile }))}>Use this ICC profile</button></> : <p>Naming review {token.token}</p>}<button disabled={!!busy} onClick={() => attempt('Releasing session token', generation => release(token, generation))}>Release {token.kind === 'profile' ? 'ICC profile' : 'naming review'}</button></article>)}</section>}
     <details open={showJobs} onToggle={e => setShowJobs(e.currentTarget.open)}><summary>Saved export jobs</summary>{showJobs && <ExportPage key={`jobs:${epoch}`} catalog={catalog} kind="jobs" limit={pageLimit}>{row => <><strong>Job {row.sequence}: {row.state}</strong><p>{row.completed} of {row.total} processed</p><button disabled={!!busy} onClick={() => attempt('Inspecting saved job', generation => readJob(row.id, generation))}>Inspect job {row.sequence}</button></>}</ExportPage>}</details>
     {job && <section><h3>Saved item outcomes</h3><ExportPage key={`${job.id}:${epoch}`} catalog={catalog} kind="items" owner={job.id} limit={pageLimit}>{row => <><strong>{row.name.filename} · {row.name.variant_label}</strong><p>Item {row.sequence}: {row.state}</p><ExportPath path={row.destination} />{row.error && <ErrorNotice message={row.error} />}{row.receipt && <p>{row.receipt.state}: {row.receipt.detail}</p>}<button onClick={() => setInspect(row)}>Review plan and recovery for item {row.sequence}</button></>}</ExportPage>{inspect && <ExportPlan key={`${job.id}:${inspect.sequence}:${epoch}`} catalog={catalog} job={job.id} item={inspect} locked={locked || uncertain} act={authorityAction} />}</section>}
