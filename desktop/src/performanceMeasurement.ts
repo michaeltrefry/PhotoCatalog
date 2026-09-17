@@ -328,6 +328,11 @@ export class PerformanceRecorder {
     active.pageRows = pageRows;
   }
 
+  needsVisibleRoster(ordinal: number) {
+    const active = this.active.get(ordinal);
+    return active?.kind === 'browse' && !active.expected;
+  }
+
   visible(ordinal: number, tileIds: string[]) {
     const active = this.active.get(ordinal);
     if (!active || active.kind !== 'browse' || active.expected) return;
@@ -492,6 +497,7 @@ export const measurementDurable = (ordinal: number | undefined) => { if (ordinal
 export const measurementPresented = (ordinal: number | undefined, verify: () => boolean) => { if (ordinal !== undefined) recorder?.present(ordinal, verify); };
 export const measurementEnded = (ordinal: number | undefined, outcome: 'backend_error' | 'superseded' | 'canceled') => { if (ordinal !== undefined) recorder?.end(ordinal, outcome); };
 export const measurementSearchResponse = (ordinal: number | undefined, rows: number) => { if (ordinal !== undefined) recorder?.searchResponse(ordinal, rows); };
+export const measurementNeedsVisibleRoster = (ordinal: number | undefined) => ordinal !== undefined && recorder?.needsVisibleRoster(ordinal) === true;
 export const measurementVisible = (ordinal: number | undefined, ids: string[]) => { if (ordinal !== undefined) recorder?.visible(ordinal, ids); };
 export function startScrollMeasurement() {
   const target = document.querySelector<HTMLElement>('.photo-grid');

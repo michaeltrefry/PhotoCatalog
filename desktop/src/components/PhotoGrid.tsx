@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { imageKey, type GridImage, type Variant } from '../bridge';
 import { createKeyboardFocusRequest, focusLeavesGrid } from '../photoGridNavigation';
-import { measurementThumbnail, measurementVisible } from '../performanceMeasurement';
+import { measurementNeedsVisibleRoster, measurementThumbnail, measurementVisible } from '../performanceMeasurement';
 import { usePreview } from '../state/usePreview';
 
 export function PhotoTile({ catalog, row, selected, onSelect, onDevelop, compact = false, editRevision = '', measurementOrdinal }: {
@@ -51,7 +51,7 @@ export function PhotoGrid({ catalog, rows, selected, onSelect, onDevelop, size =
     return()=>cancelAnimationFrame(frame);
   },[selected,visibleRows]);
   useEffect(() => {
-    if (measurementOrdinal === undefined) return;
+    if (!measurementNeedsVisibleRoster(measurementOrdinal)) return;
     const frame = requestAnimationFrame(() => {
       const region = parent.current, bounds = region?.getBoundingClientRect();
       if (!region || !bounds) return;

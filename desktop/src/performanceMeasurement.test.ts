@@ -262,6 +262,18 @@ test('browse completes only after the frozen visible roster is decoded and prese
   expect(h.recorder.receipt().thumbnail_diagnostics).toEqual(expect.objectContaining({ attempts: 2, accepted: 2, roster_tiles: 2 }));
 });
 
+test('browse visibility geometry is needed only until its roster is frozen', () => {
+  const h = harness();
+  const browse = h.recorder.begin('browse', context)!;
+  const edit = h.recorder.begin('edit', context)!;
+  expect(h.recorder.needsVisibleRoster(browse)).toBe(true);
+  expect(h.recorder.needsVisibleRoster(edit)).toBe(false);
+  h.recorder.visible(browse, []);
+  expect(h.recorder.needsVisibleRoster(browse)).toBe(true);
+  h.recorder.visible(browse, ['first', 'second']);
+  expect(h.recorder.needsVisibleRoster(browse)).toBe(false);
+});
+
 test('thumbnail diagnostics distinguish every presentation rejection without completing the roster', () => {
   const h = harness();
   const ordinal = h.recorder.begin('browse', context)!;
