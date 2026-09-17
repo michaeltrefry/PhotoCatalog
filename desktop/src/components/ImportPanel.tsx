@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { chooseSource, command, displayPath, errorText, type ImportStatus, type NativePath } from '../bridge';
+import { beginMeasurementImportStatus, discardMeasurementImportStatus, setMeasurementImportStatus } from '../performanceMeasurement';
 import { Dialog, ErrorNotice } from './Controls';
 
 const active = (status: ImportStatus | null) => status && ['discovering', 'draining', 'cancel_requested'].includes(status.phase);
@@ -12,13 +13,29 @@ export function ImportPanel({ catalog, jobsHeld, open, onProgress, onComplete, o
   const previous = useRef<string | null>(null);
   const complete = useRef(onComplete); complete.current = onComplete;
   const progress = useRef(onProgress); progress.current = onProgress;
+  const current = useRef<ImportStatus | null>(null);
+  const observed = (next: ImportStatus | null, event?: number) => {
+    setMeasurementImportStatus(next, event); current.current = next; setStatus(next); progress.current(next);
+  };
+  const requestStatus = async (action: () => Promise<ImportStatus | null>, knownActive: boolean, signal: AbortSignal) => {
+    const event = knownActive ? beginMeasurementImportStatus() : undefined;
+    try {
+      const next = await action();
+      if (signal.aborted) { discardMeasurementImportStatus(event); return next; }
+      observed(next, event); return next;
+    }
+    catch (failure) { discardMeasurementImportStatus(event); throw failure; }
+  };
   useEffect(() => {
     const abort = new AbortController(); let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       try {
-        const next = await command({ command: 'import_status', args: { catalog } }, 'import', abort.signal);
+        const next = await requestStatus(
+          () => command({ command: 'import_status', args: { catalog } }, 'import', abort.signal),
+          !!active(current.current),
+          abort.signal,
+        );
         if (abort.signal.aborted) return;
-        setStatus(next); progress.current(next);
         const terminal = next && !active(next) ? `${next.id}:${next.phase}` : null;
         if (terminal && terminal !== previous.current) complete.current();
         previous.current = terminal;
@@ -34,7 +51,7 @@ export function ImportPanel({ catalog, jobsHeld, open, onProgress, onComplete, o
   };
   const start = async (resume: boolean) => {
     if (!source || jobsHeld) return;
-    await run(async () => { setStatus(await command({ command: resume ? 'import_resume' : 'import_start', args: { catalog, source: source.path } }, 'import')); });
+    await run(async () => { observed(await command({ command: resume ? 'import_resume' : 'import_start', args: { catalog, source: source.path } }, 'import')); });
   };
   if (!open) return null;
   return <Dialog title="Add photographs" onClose={onClose}>
@@ -49,7 +66,7 @@ export function ImportPanel({ catalog, jobsHeld, open, onProgress, onComplete, o
       <dl className="import-counts"><dt>Imported</dt><dd>{status.imported}</dd><dt>Unchanged</dt><dd>{status.unchanged}</dd><dt>Failed</dt><dd>{status.failed}</dd><dt>Skipped</dt><dd>{status.skipped}</dd><dt>Metadata updated</dt><dd>{status.metadata_updated}</dd><dt>Metadata warnings</dt><dd>{status.metadata_warnings}</dd><dt>Awaiting resources</dt><dd>{status.awaiting_resources}</dd></dl>
       {status.error_source && <p className="source-path">{displayPath(status.error_source)}</p>}
       {status.error && <ErrorNotice message={status.error} />}
-      {active(status) && <button disabled={busy || status.phase === 'cancel_requested'} onClick={() => void run(async () => { setStatus(await command({ command: 'import_cancel', args: { catalog, import: status.id } }, 'import')); })}>Cancel import</button>}
+      {active(status) && <button disabled={busy || status.phase === 'cancel_requested'} onClick={() => void run(async () => { observed(await command({ command: 'import_cancel', args: { catalog, import: status.id } }, 'import')); })}>Cancel import</button>}
     </section>}
     <p className="hint">Closing this panel keeps the import running. Close the catalog to stop its background work safely.</p>
   </Dialog>;

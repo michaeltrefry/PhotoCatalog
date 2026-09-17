@@ -62,12 +62,27 @@ impl State {
         let target = target.as_mut().ok_or("S12 measurement is not enabled")?;
         validate(&receipt, &target.run_id)?;
         if let Some(alignment) = &receipt.clock_alignment {
+            let durable: HashSet<_> = receipt
+                .samples
+                .iter()
+                .filter_map(|sample| sample.durable_us.map(|_| sample.ordinal))
+                .collect();
+            let import_durable: HashSet<_> = receipt
+                .samples
+                .iter()
+                .filter_map(|sample| {
+                    (sample.durable_us.is_some() && sample.import_id.is_some())
+                        .then_some(sample.ordinal)
+                })
+                .collect();
             alignment.validate(
                 &receipt
                     .samples
                     .iter()
                     .map(|sample| sample.ordinal)
                     .collect(),
+                &durable,
+                &import_durable,
                 Some(&target.clock_anchors),
             )?;
         }
@@ -304,6 +319,8 @@ pub struct Sample {
     ordinal: u32,
     started_us: u64,
     during_import: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_id: Option<String>,
     during_export: bool,
     outcome: Outcome,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -511,6 +528,10 @@ fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
             || sample.ordinal as usize > MAX_SAMPLES
             || sample.started_us > MAX_STARTED_US
             || !ordinals.insert(sample.ordinal)
+            || sample
+                .import_id
+                .as_ref()
+                .is_some_and(|value| !sample.during_import || uuid::Uuid::parse_str(value).is_err())
         {
             return Err("Measurement receipt ordinals are invalid".into());
         }
@@ -588,7 +609,45 @@ fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
         }
     }
     if let Some(alignment) = &receipt.clock_alignment {
-        alignment.validate(&ordinals, None)?;
+        let durable = receipt
+            .samples
+            .iter()
+            .filter_map(|sample| sample.durable_us.map(|_| sample.ordinal))
+            .collect();
+        let import_durable = receipt
+            .samples
+            .iter()
+            .filter_map(|sample| {
+                (sample.durable_us.is_some() && sample.import_id.is_some())
+                    .then_some(sample.ordinal)
+            })
+            .collect();
+        alignment.validate(&ordinals, &durable, &import_durable, None)?;
+        if let Some(ids) = alignment.import_ids()
+            && receipt.samples.iter().any(|sample| {
+                sample.during_import
+                    != sample
+                        .import_id
+                        .as_deref()
+                        .is_some_and(|id| ids.contains(id))
+            })
+        {
+            return Err("Measurement import identity is invalid".into());
+        }
+        if alignment.import_ids().is_none()
+            && receipt
+                .samples
+                .iter()
+                .any(|sample| sample.import_id.is_some())
+        {
+            return Err("Measurement import identity is invalid".into());
+        }
+    } else if receipt
+        .samples
+        .iter()
+        .any(|sample| sample.import_id.is_some())
+    {
+        return Err("Measurement import identity is invalid".into());
     }
     if let Some(capture) = &receipt.scroll_capture {
         let duration = capture
@@ -755,6 +814,7 @@ mod tests {
                 ordinal: 1,
                 started_us: 2_000,
                 during_import: true,
+                import_id: None,
                 during_export: true,
                 outcome: Outcome::Complete,
                 durable_us: Some(4_000),
@@ -782,6 +842,7 @@ mod tests {
             ordinal: 1,
             started_us: 2_000,
             during_import: false,
+            import_id: None,
             during_export: false,
             outcome: Outcome::Complete,
             durable_us: None,
@@ -829,6 +890,7 @@ mod tests {
                     ordinal: ordinal as u32,
                     started_us: MAX_STARTED_US,
                     during_import: true,
+                    import_id: None,
                     during_export: true,
                     outcome: Outcome::Complete,
                     durable_us: None,
@@ -947,6 +1009,158 @@ mod tests {
         capture.ended_us = 12_001_000;
         capture.frames = vec![(1_010, 0, 0), (12_000_000, 0, 0)];
         validate(&receipt, "scroll").unwrap();
+    }
+
+    fn import_receipt() -> Receipt {
+        let id = "00000000-0000-4000-8000-000000000001";
+        Receipt {
+            protocol: 2,
+            clock_alignment: Some(serde_json::from_value(serde_json::json!({
+                "model":"causal_native_brackets_v1", "profile":"import_v1", "interval_ms":200,
+                "duration_ms":600000, "stop_reason":"finalized",
+                "anchors":[{"anchor_id":1,"send_event":1,"receive_event":2,"native":{
+                    "run_id":"import-run","anchor_id":1,"session_id":"ffffffff-ffff-ffff-ffff-ffffffffffff",
+                    "native_pid":42,"clock":crate::measurement_clock::CLOCK,"monotonic_ns":"123"
+                },"error":null}],
+                "sample_events":[{"ordinal":1,"start_event":5,"durable_event":6,"end_event":7}],
+                "import_evidence":{"bindings":[{"key":1,"id":id,"source_blake3":"a".repeat(64)}],
+                    "timeline":[
+                        {"request_event":3,"event":4,"binding":1,"phase":"discovering","imported":"0","unchanged":"0","failed":"0","skipped":"0","metadata_updated":"0","metadata_warnings":"0","awaiting_resources":"0","pending_previews":0},
+                        {"request_event":8,"event":9,"binding":1,"phase":"complete","imported":"1","unchanged":"0","failed":"0","skipped":"0","metadata_updated":"1","metadata_warnings":"0","awaiting_resources":"0","pending_previews":0}
+                    ],"overflowed":0}
+            })).unwrap()),
+            presentation_model: PresentationModel::TwoAnimationFrames,
+            context_model: ContextModel::LastObservedStatusAtStart,
+            run_id: "import-run".into(),
+            time_origin_ms: 42.0,
+            overflowed: 0,
+            thumbnail_diagnostics: ThumbnailDiagnostics::default(),
+            samples: vec![Sample {
+                kind: Kind::Cull,
+                ordinal: 1,
+                started_us: 1,
+                during_import: true,
+                import_id: Some(id.into()),
+                during_export: false,
+                outcome: Outcome::Complete,
+                durable_us: Some(2),
+                presentation_us: Some(3),
+                search_response_us: None,
+                first_thumbnail_us: None,
+                visible_complete_us: None,
+                page_rows: None,
+                visible_count: None,
+            }],
+            scroll_capture: None,
+        }
+    }
+
+    #[test]
+    fn import_receipt_requires_bound_identity() {
+        let mut receipt = import_receipt();
+        validate(&receipt, "import-run").unwrap();
+        receipt.samples[0].import_id = Some("00000000-0000-4000-8000-000000000002".into());
+        assert!(validate(&receipt, "import-run").is_err());
+        receipt = import_receipt();
+        receipt.clock_alignment = None;
+        assert!(validate(&receipt, "import-run").is_err());
+    }
+
+    #[test]
+    fn import_receipt_accepts_a_durable_idle_warmup_without_a_causal_event() {
+        let mut receipt = import_receipt();
+        let mut alignment = serde_json::to_value(receipt.clock_alignment.take().unwrap()).unwrap();
+        alignment["sample_events"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"ordinal":2,"start_event":10,"end_event":11}));
+        receipt.clock_alignment = Some(serde_json::from_value(alignment.clone()).unwrap());
+        receipt.samples.push(Sample {
+            kind: Kind::Edit,
+            ordinal: 2,
+            started_us: 1,
+            during_import: false,
+            import_id: None,
+            during_export: false,
+            outcome: Outcome::Complete,
+            durable_us: Some(2),
+            presentation_us: Some(3),
+            search_response_us: None,
+            first_thumbnail_us: None,
+            visible_complete_us: None,
+            page_rows: None,
+            visible_count: None,
+        });
+        validate(&receipt, "import-run").unwrap();
+        alignment["sample_events"][1]["durable_event"] = serde_json::json!(12);
+        alignment["sample_events"][1]["end_event"] = serde_json::json!(13);
+        receipt.clock_alignment = Some(serde_json::from_value(alignment).unwrap());
+        validate(&receipt, "import-run").unwrap();
+        receipt.samples[1].durable_us = None;
+        receipt.samples[1].presentation_us = None;
+        receipt.samples[1].outcome = Outcome::BackendError;
+        assert!(validate(&receipt, "import-run").is_err());
+    }
+
+    #[test]
+    fn maximum_import_receipt_fits_the_persisted_bound() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let anchors = crate::measurement_clock::MAX_ANCHORS;
+        let timeline_start = anchors * 2 + 1;
+        let samples_start = timeline_start + crate::measurement_clock::MAX_IMPORT_TIMELINE * 2;
+        let mut receipt = Receipt {
+            protocol: 2,
+            clock_alignment: Some(serde_json::from_value(serde_json::json!({
+                "model":"causal_native_brackets_v1", "profile":"import_v1", "interval_ms":200,
+                "duration_ms":600000, "stop_reason":"anchor_limit",
+                "anchors":(0..anchors).map(|index| serde_json::json!({
+                    "anchor_id":index+1,"send_event":index*2+1,"receive_event":index*2+2,"error":null,
+                    "native":{"run_id":"max-import","anchor_id":index+1,"session_id":"ffffffff-ffff-ffff-ffff-ffffffffffff",
+                        "native_pid":u32::MAX,"clock":crate::measurement_clock::CLOCK,"monotonic_ns":u64::MAX.to_string()}
+                })).collect::<Vec<_>>(),
+                "sample_events":(0..MAX_SAMPLES).map(|index| serde_json::json!({
+                    "ordinal":index+1,"start_event":samples_start+index*3,"durable_event":samples_start+index*3+1,"end_event":samples_start+index*3+2
+                })).collect::<Vec<_>>(),
+                "import_evidence":{"bindings":(1..=crate::measurement_clock::MAX_IMPORT_BINDINGS).map(|key| serde_json::json!({
+                    "key":key,"id":format!("00000000-0000-4000-8000-{key:012}"),"source_blake3":format!("{key:x}").repeat(64)
+                })).collect::<Vec<_>>(),
+                    "timeline":(0..crate::measurement_clock::MAX_IMPORT_TIMELINE).map(|index| serde_json::json!({
+                        "request_event":timeline_start+index*2,"event":timeline_start+index*2+1,
+                        "binding":if index<crate::measurement_clock::MAX_IMPORT_BINDINGS{index+1}else{1},
+                        "phase":if index+1==crate::measurement_clock::MAX_IMPORT_TIMELINE{"complete"}else{"discovering"},
+                        "imported":u64::MAX.to_string(),"unchanged":u64::MAX.to_string(),"failed":u64::MAX.to_string(),"skipped":u64::MAX.to_string(),
+                        "metadata_updated":u64::MAX.to_string(),"metadata_warnings":u64::MAX.to_string(),"awaiting_resources":u64::MAX.to_string(),"pending_previews":u32::MAX
+                    })).collect::<Vec<_>>(),"overflowed":u32::MAX}
+            })).unwrap()),
+            presentation_model: PresentationModel::TwoAnimationFrames,
+            context_model: ContextModel::LastObservedStatusAtStart,
+            run_id: "max-import".into(),
+            time_origin_ms: 42.0,
+            overflowed: 0,
+            thumbnail_diagnostics: ThumbnailDiagnostics::default(),
+            samples: (1..=MAX_SAMPLES as u32).map(|ordinal| Sample {
+                kind: Kind::Edit, ordinal, started_us: MAX_STARTED_US, during_import: true,
+                import_id: Some(id.into()), during_export: false, outcome: Outcome::Complete,
+                durable_us: Some(MAX_DURATION_US), presentation_us: Some(MAX_DURATION_US),
+                search_response_us: None, first_thumbnail_us: None, visible_complete_us: None,
+                page_rows: None, visible_count: None,
+            }).collect(),
+            scroll_capture: None,
+        };
+        validate(&receipt, "max-import").unwrap();
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        assert!(
+            bytes.len() <= MAX_RECEIPT_BYTES,
+            "maximum import receipt is {} bytes",
+            bytes.len()
+        );
+        let mut alignment = serde_json::to_value(receipt.clock_alignment.take().unwrap()).unwrap();
+        alignment["import_evidence"]["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"key":2,"id":id,"source_blake3":"e".repeat(64)}));
+        receipt.clock_alignment = Some(serde_json::from_value(alignment).unwrap());
+        assert!(validate(&receipt, "max-import").is_err());
     }
 
     #[test]

@@ -1,15 +1,19 @@
 import { invoke } from '@tauri-apps/api/core';
-import { MeasurementClock, type ClockAlignment, type NativeAnchor } from './measurementClock';
+import { MAX_IMPORT_BINDINGS, MeasurementClock, type ClockAlignment, type NativeAnchor } from './measurementClock';
+import { blake3 } from '@noble/hashes/blake3.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+import type { ImportStatus, NativePath } from './bridge';
 
 export type MeasurementKind = 'cull' | 'edit' | 'browse';
 export type MeasurementOutcome = 'complete' | 'backend_error' | 'presentation_mismatch' | 'superseded' | 'canceled' | 'incomplete';
-export type MeasurementContext = { duringImport: boolean; duringExport: boolean };
+export type MeasurementContext = { duringImport: boolean; duringExport: boolean; importId?: string | null };
 
 export type MeasurementSample = {
   kind: MeasurementKind;
   ordinal: number;
   started_us: number;
   during_import: boolean;
+  import_id?: string;
   during_export: boolean;
   outcome: MeasurementOutcome;
   durable_us: number | null;
@@ -77,6 +81,7 @@ type Active = {
   started: number;
   startedUs: number;
   duringImport: boolean;
+  importId: string | null;
   duringExport: boolean;
   durableUs: number | null;
   searchResponseUs: number | null;
@@ -94,10 +99,23 @@ type ScrollTarget = () => HTMLElement | null;
 
 const elapsedUs = (started: number, ended: number) => Math.max(0, Math.round((ended - started) * 1000));
 const MAX_STARTED_US = 24 * 60 * 60 * 1_000_000;
+const MAX_SOURCE_UNITS = 32_768;
 const SCROLL_DURATION_MS = 5_000;
 const MAX_SCROLL_FRAMES = 2_048;
 const MAX_SCROLL_PX = 0xffff_ffff;
 const MAX_SCROLL_EDGE_GAP_US = 100_000;
+
+const activeImport = (status: ImportStatus) => ['discovering', 'draining', 'cancel_requested'].includes(status.phase);
+function sourceBinding(source: NativePath) {
+  if (source.encoding !== 'UnixBytes' && source.encoding !== 'WindowsWide') throw new Error('Import source encoding is invalid');
+  const maximum = source.encoding === 'UnixBytes' ? 0xff : 0xffff;
+  if (!Array.isArray(source.units) || source.units.length < 1 || source.units.length > MAX_SOURCE_UNITS
+    || source.units.some(value => !Number.isInteger(value) || value <= 0 || value > maximum)) {
+    throw new Error('Import source binding is invalid');
+  }
+  const canonical = JSON.stringify([source.encoding, source.units]);
+  return { canonical, digest: bytesToHex(blake3(new TextEncoder().encode(canonical))) };
+}
 
 const boundedPixel = (value: number) => Math.min(MAX_SCROLL_PX, Math.max(0, Math.round(Number.isFinite(value) ? value : 0)));
 
@@ -108,10 +126,50 @@ export class PerformanceRecorder {
     if (!this.alignment && this.nextOrdinal === 0 && !this.frozen) this.alignment = new MeasurementClock(request, this.runId);
   }
   startExportClock() { if (!this.frozen) this.alignment?.start(); }
+  beginImportStatusRequest() { return this.frozen ? undefined : this.alignment?.beginImportRequest(); }
+  discardImportStatusRequest(event: number | undefined) { this.alignment?.discardImportRequest(event); }
+  observeImportStatus(event: number, status: ImportStatus) {
+    if (this.frozen) return false;
+    const known = this.trackedImportIds.has(status.id);
+    const overflowProbe = activeImport(status) && !known
+      && this.trackedImportIds.size >= MAX_IMPORT_BINDINGS && !this.importBindingOverflowObserved;
+    if (activeImport(status) && !known && this.trackedImportIds.size < MAX_IMPORT_BINDINGS) {
+      this.trackedImportIds.add(status.id);
+    }
+    if (!this.trackedImportIds.has(status.id) && !overflowProbe) {
+      this.discardImportStatusRequest(event);
+      return false;
+    }
+    try {
+      const current = sourceBinding(status.source);
+      const prior = this.importSources.get(status.id);
+      const source = prior?.canonical === current.canonical ? prior : current;
+      if (!prior && this.importSources.size < MAX_IMPORT_BINDINGS) this.importSources.set(status.id, current);
+      const observed = this.alignment?.observeImport(event, status.id, source.digest, {
+        phase: status.phase,
+        imported: status.imported,
+        unchanged: status.unchanged,
+        failed: status.failed,
+        skipped: status.skipped,
+        metadata_updated: status.metadata_updated,
+        metadata_warnings: status.metadata_warnings,
+        awaiting_resources: status.awaiting_resources,
+        pending_previews: status.pending_previews,
+      }) ?? false;
+      if (overflowProbe) this.importBindingOverflowObserved = true;
+      return observed;
+    } catch {
+      this.discardImportStatusRequest(event);
+      return false;
+    }
+  }
   private overflowed = 0;
   private frozen: MeasurementReceipt | null = null;
   private readonly active = new Map<number, Active>();
   private readonly samples: MeasurementSample[] = [];
+  private readonly trackedImportIds = new Set<string>();
+  private readonly importSources = new Map<string, { canonical: string; digest: string }>();
+  private importBindingOverflowObserved = false;
   private scrollCapture: ScrollCapture | undefined;
   private activeScroll: {
     target: HTMLElement;
@@ -232,13 +290,16 @@ export class PerformanceRecorder {
     const ordinal = ++this.nextOrdinal;
     this.alignment?.begin(ordinal);
     if (context.duringExport) this.startExportClock();
-    this.active.set(ordinal, { kind, ordinal, started, startedUs, duringImport: context.duringImport, duringExport: context.duringExport, durableUs: null, searchResponseUs: null, pageRows: null });
+    this.active.set(ordinal, { kind, ordinal, started, startedUs, duringImport: context.duringImport, importId: context.importId ?? null, duringExport: context.duringExport, durableUs: null, searchResponseUs: null, pageRows: null });
     return ordinal;
   }
 
   durable(ordinal: number) {
     const active = this.active.get(ordinal);
-    if (active && active.kind !== 'browse' && active.durableUs === null) active.durableUs = elapsedUs(active.started, this.clock.now());
+    if (active && active.kind !== 'browse' && active.durableUs === null) {
+      active.durableUs = elapsedUs(active.started, this.clock.now());
+      this.alignment?.durable(ordinal, active.importId !== null);
+    }
   }
 
   present(ordinal: number, verify: () => boolean) {
@@ -337,7 +398,8 @@ export class PerformanceRecorder {
     const times = [...active.expected].map(id => active.presented!.get(id)!);
     const first = Math.min(...times), complete = Math.max(...times);
     this.samples.push({
-      kind: 'browse', ordinal: active.ordinal, started_us: active.startedUs, during_import: active.duringImport, outcome: 'complete',
+      kind: 'browse', ordinal: active.ordinal, started_us: active.startedUs, during_import: active.duringImport,
+      ...(active.importId ? { import_id: active.importId } : {}), outcome: 'complete',
       during_export: active.duringExport,
       durable_us: null, presentation_us: null, search_response_us: active.searchResponseUs,
       first_thumbnail_us: elapsedUs(active.started, first), visible_complete_us: elapsedUs(active.started, complete),
@@ -349,7 +411,8 @@ export class PerformanceRecorder {
 
   private finish(active: Active, outcome: MeasurementOutcome, presentationUs: number | null) {
     this.samples.push({
-      kind: active.kind, ordinal: active.ordinal, started_us: active.startedUs, during_import: active.duringImport, outcome,
+      kind: active.kind, ordinal: active.ordinal, started_us: active.startedUs, during_import: active.duringImport,
+      ...(active.importId ? { import_id: active.importId } : {}), outcome,
       during_export: active.duringExport,
       durable_us: active.durableUs, presentation_us: presentationUs,
       search_response_us: active.searchResponseUs, first_thumbnail_us: null, visible_complete_us: null,
@@ -391,6 +454,13 @@ let exportActive = false;
 export function setMeasurementExportActive(active: boolean) {
   exportActive = active;
   if (active) recorder?.startExportClock();
+}
+export const beginMeasurementImportStatus = () => recorder?.beginImportStatusRequest();
+export const discardMeasurementImportStatus = (event: number | undefined) => recorder?.discardImportStatusRequest(event);
+export function setMeasurementImportStatus(status: ImportStatus | null, event: number | undefined) {
+  if (event === undefined) return;
+  if (status) recorder?.observeImportStatus(event, status);
+  else recorder?.discardImportStatusRequest(event);
 }
 let finalizer: ReceiptFinalizer | null = null;
 let initialization: Promise<void> | null = null;

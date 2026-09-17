@@ -119,6 +119,7 @@ export function App() {
   });
   const importActive = !!importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase);
   const importActiveRef = useRef(importActive); importActiveRef.current = importActive;
+  const importIdRef = useRef<string | null>(importActive ? importStatus.id : null); importIdRef.current = importActive ? importStatus.id : null;
   // Receipt context is the last observed status at input start. The sample's
   // timestamp lets qualification correlate it with job and native trace intervals.
   const exportActive = outputs.ready && outputs.operation?.kind === 'run'
@@ -126,7 +127,7 @@ export function App() {
     && !['draining', 'yielding', 'finished'].includes(outputs.operation.stage);
   const exportActiveRef = useRef(exportActive); exportActiveRef.current = exportActive;
   useEffect(() => { setMeasurementExportActive(exportActive); }, [exportActive]);
-  const measurementContext = () => ({ duringImport: importActiveRef.current, duringExport: exportActiveRef.current });
+  const measurementContext = () => ({ duringImport: importActiveRef.current, importId: importIdRef.current, duringExport: exportActiveRef.current });
   const exportBlocked = exportDirectHeld || outputs.writeHeld || migrationWriteHold || status.phase !== 'ready' || status.jobs_held || storage.writeHeld || copies.busy || copyRefreshing?.catalog === catalog;
   const exportBlockedRef = useRef(exportBlocked); exportBlockedRef.current = exportBlocked;
   const exportGate: ExportGate = async action => {
@@ -365,7 +366,7 @@ export function App() {
       {desktopAvailable && <button className="quiet" onClick={() => setShowLightroomMigration(true)}>Migrate Lightroom…</button>}
       {catalog && <button className="quiet" onClick={() => void close()} disabled={!!busy || transitioning}>Close catalog</button>}
       </header>
-      {measurement.enabled && <div className="measurement-banner" role="status"><span>S12 measurement · {measurement.samples} samples · scroll {measurement.scrollState}{measurement.scrollState !== 'idle' ? ` (${measurement.scrollFrames} frames)` : ''}</span><button disabled={measurement.finalizing || measurement.finalized || (measurement.scrollState !== 'idle' && measurement.scrollState !== 'capturing')} onClick={() => measurement.scrollState === 'capturing' ? stopScrollMeasurement() : startScrollMeasurement()}>{measurement.scrollState === 'capturing' ? 'Stop scroll capture' : 'Capture 5s scroll cadence'}</button><button disabled={measurement.finalizing || measurement.finalized} onClick={() => void finalizeMeasurement()}>{measurement.finalized ? 'Receipt finalized' : measurement.finalizing ? 'Finalizing receipt…' : 'Finalize measurement receipt'}</button>{measurement.receiptPath && <span>{measurement.receiptPath}</span>}{measurement.error && <span>{measurement.error}</span>}</div>}
+      {measurement.enabled && <div className="measurement-banner" role="status"><span>S12 measurement · {measurement.samples} samples · scroll {measurement.scrollState}{measurement.scrollState !== 'idle' ? ` (${measurement.scrollFrames} frames)` : ''}</span><span>Current import UUID: {importStatus?.id ?? 'none observed'}{importStatus ? ` · ${importStatus.phase}` : ''}</span><button disabled={measurement.finalizing || measurement.finalized || (measurement.scrollState !== 'idle' && measurement.scrollState !== 'capturing')} onClick={() => measurement.scrollState === 'capturing' ? stopScrollMeasurement() : startScrollMeasurement()}>{measurement.scrollState === 'capturing' ? 'Stop scroll capture' : 'Capture 5s scroll cadence'}</button><button disabled={measurement.finalizing || measurement.finalized} onClick={() => void finalizeMeasurement()}>{measurement.finalized ? 'Receipt finalized' : measurement.finalizing ? 'Finalizing receipt…' : 'Finalize measurement receipt'}</button>{measurement.receiptPath && <span>{measurement.receiptPath}</span>}{measurement.error && <span>{measurement.error}</span>}</div>}
     {catalog && <button disabled={transitioning} onClick={() => setShowPreviewSettings(true)}>Preview storage…</button>}
     {desktopAvailable && <LightroomActivity controller={inspection} onOpen={() => setShowLightroom(true)} />}
     {desktopAvailable && <LightroomMigrationActivity controller={migration} onOpen={() => setShowLightroomMigration(true)} />}

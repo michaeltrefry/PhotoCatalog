@@ -1,5 +1,6 @@
 import { expect, test, vi } from 'vitest';
 import { classifyThumbnailPresentation, PerformanceRecorder, ReceiptFinalizer } from './performanceMeasurement';
+import type { ImportStatus } from './bridge';
 
 const context = { duringImport: false, duringExport: false };
 
@@ -24,6 +25,65 @@ test('durable cull and presentation opportunity use the same input ordinal', () 
   expect(h.recorder.receipt().samples).toEqual([expect.objectContaining({
     kind: 'cull', ordinal, started_us: 2000, during_import: true, during_export: true, outcome: 'complete', durable_us: 4000, presentation_us: 16000,
   })]);
+});
+
+const importStatus = (phase: ImportStatus['phase'], imported = '0'): ImportStatus => ({
+  id: '00000000-0000-4000-8000-000000000001',
+  source: { encoding: 'UnixBytes', units: [47, 115, 111, 117, 114, 99, 101] },
+  phase, imported, unchanged: '0', failed: '0', skipped: '0', metadata_updated: imported,
+  metadata_warnings: '0', awaiting_resources: '0', pending_previews: 0, error: null, error_source: null,
+});
+
+test('fulfilled import status starts the import profile and binds terminal progress once per source', () => {
+  const h = harness();
+  h.recorder.enableClockAlignment(() => new Promise(() => {}));
+  const warmup = h.recorder.begin('edit', context)!;
+  h.advance(1); h.recorder.durable(warmup); h.recorder.present(warmup, () => true); h.frame(); h.frame();
+  expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, importStatus('complete'))).toBe(false);
+  expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, importStatus('discovering'))).toBe(true);
+  const ordinal = h.recorder.begin('cull', { duringImport: true, importId: importStatus('discovering').id, duringExport: false })!;
+  h.advance(3); h.recorder.durable(ordinal); h.recorder.present(ordinal, () => true); h.frame(); h.frame();
+  expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, importStatus('complete', '1'))).toBe(true);
+  const receipt = h.recorder.receipt();
+  expect(receipt.samples[0]).toMatchObject({ durable_us: 1000 });
+  expect(receipt.samples[0]).not.toHaveProperty('import_id');
+  expect(receipt.samples[1]).toMatchObject({ import_id: importStatus('complete').id, durable_us: 3000 });
+  expect(receipt.clock_alignment).toMatchObject({
+    profile: 'import_v1',
+    sample_events: [
+      { ordinal: warmup },
+      { ordinal, durable_event: expect.any(Number) },
+    ],
+    import_evidence: {
+      bindings: [{ key: 1, id: importStatus('complete').id, source_blake3: 'ea86888b76029916e2b607c2f2d661c840f9707799dd41a113da27f8ca282ce1' }],
+      timeline: [expect.objectContaining({ binding: 1, phase: 'discovering', imported: '0' }), expect.objectContaining({ binding: 1, phase: 'complete', imported: '1' })],
+      overflowed: 0,
+    },
+  });
+  expect(receipt.clock_alignment?.sample_events[0]).not.toHaveProperty('durable_event');
+});
+
+test('more than four import identities overflow once without retaining later jobs', () => {
+  const h = harness();
+  h.recorder.enableClockAlignment(() => new Promise(() => {}));
+  const statusFor = (index: number, phase: ImportStatus['phase'] = 'discovering') => ({
+    ...importStatus(phase), id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+  });
+  for (let index = 1; index <= 4; index += 1) {
+    expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, statusFor(index))).toBe(true);
+  }
+  expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, {
+    ...statusFor(5), source: { encoding: 'UnixBytes', units: [] },
+  })).toBe(false);
+  expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, statusFor(5))).toBe(false);
+  expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, statusFor(5, 'complete'))).toBe(false);
+  expect(h.recorder.observeImportStatus(h.recorder.beginImportStatusRequest()!, statusFor(6))).toBe(false);
+  expect(h.recorder.receipt().clock_alignment?.import_evidence).toMatchObject({
+    bindings: expect.arrayContaining([expect.objectContaining({ id: statusFor(4).id })]),
+    overflowed: 1,
+  });
+  expect(h.recorder.receipt().clock_alignment?.import_evidence?.bindings).toHaveLength(4);
+  expect(h.recorder.receipt().clock_alignment?.import_evidence?.timeline).toHaveLength(4);
 });
 
 test('animation frames retain the browser receiver after the scheduler is stored', () => {
