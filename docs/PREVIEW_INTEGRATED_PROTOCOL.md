@@ -76,13 +76,16 @@ and cache publication are untimed setup; no original image rendering occurs.
 
 The SQL overlay changes only `assets.fingerprint`, `render_generation`, and
 `preview_hash`. IDs, sequence, metadata text, native location bytes, display path,
-state, error, and every organization/metadata/storage table remain in place.
-Inside one IMMEDIATE transaction the probe compares all ten asset columns for
-all first-10k rows before/after, permits exactly those three changes, checks the
+state, error, and unrelated organization/metadata values remain in place.
+The current image and storage triggers also advance each asset's `physical_generation`,
+advance `storage_epoch.revision`, and queue an `image_storage_events` refresh.
+Inside one IMMEDIATE transaction the probe compares the asset columns for
+all first-10k rows before/after, permits only those direct and trigger changes, checks the
 same schema and AUTOINCREMENT state, rechecks 10M count, and requires exactly
-20,000 connection total changes: 10,000 asset updates plus 10,000
-`storage_asset_change` updates of `storage_epoch.revision`. The epoch must advance
-exactly 10,000. Existing organization triggers watch other columns and do not
+40,000 connection total changes: 10,000 direct asset updates plus 10,000 each
+of physical-generation updates, storage-epoch updates, and queued refreshes.
+The epoch must advance exactly 10,000; each queued refresh must retain the expected
+zero cursor and image high-water mark. Existing organization triggers watch other columns and do not
 fire. These bounded checks and known unchanged trigger SQL replace a redundant
 scan of all organization tables; they are not an organization-fidelity audit.
 Unexpected extra DML, changed columns, keys, count, or schema roll back the overlay.

@@ -2,7 +2,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from preview_integrated_campaign import raw_copy, source_state, checked_binding, ancestry_evidence, INDEX_SQL
+from preview_integrated_campaign import raw_copy, source_state, checked_binding, ancestry_evidence, validate_overlay, INDEX_SQL
 from schema_campaign_contract import (
     CURRENT_SCHEMA, expected_added_rows, image_initial_rows, schema6_initial_rows,
 )
@@ -12,6 +12,25 @@ import copy
 
 
 class CopyContract(unittest.TestCase):
+    def test_overlay_requires_current_schema_storage_trigger_effects(self):
+        valid = {"complete": True, "overlay": {
+            "schema_version": CURRENT_SCHEMA, "rows": 10000,
+            "catalog_count": 10000000, "connection_total_changes_delta": 40000,
+            "queued_storage_refreshes": 10000,
+        }}
+        validate_overlay(valid)
+        for field, value in (("schema_version", 6), ("rows", 9999),
+                             ("catalog_count", 10000),
+                             ("connection_total_changes_delta", 20000),
+                             ("connection_total_changes_delta", 40001),
+                             ("queued_storage_refreshes", 0)):
+            bad = copy.deepcopy(valid)
+            bad["overlay"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                validate_overlay(bad)
+        with self.assertRaises(ValueError):
+            validate_overlay({**valid, "complete": False})
+
     def test_all_companions_and_absence_are_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
