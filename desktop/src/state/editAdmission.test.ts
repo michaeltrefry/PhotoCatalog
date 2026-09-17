@@ -9,18 +9,21 @@ const operation = (values: Partial<Operation>): Operation => ({
 });
 
 describe('recipe edit admission during export', () => {
-  it('queues through only the sampled transient rendering Run hold', () => {
+  it('keeps recipe inputs enabled as a Run yields to foreground previews', () => {
     expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({}) })).toBe(false);
     expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ write_hold: false }) })).toBe(false);
+    expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ stage: 'yielding' }) })).toBe(false);
   });
 
-  it('retains unknown, admission, recovery, cancellation, drain and yield holds', () => {
+  it('retains unknown, admission, recovery, cancellation and drain holds', () => {
     expect(exportHoldsRecipeEdits({ ready: false, admitting: false, operation: null })).toBe(true);
     expect(exportHoldsRecipeEdits({ ready: true, admitting: true, operation: operation({}) })).toBe(true);
     expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ kind: 'recover', stage: 'recovering' }) })).toBe(true);
     expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ phase: 'cancel_requested' }) })).toBe(true);
     expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ stage: 'draining' }) })).toBe(true);
-    expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ stage: 'yielding' }) })).toBe(true);
+    expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ stage: 'yielding', phase: 'cancel_requested' }) })).toBe(true);
+    expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ stage: 'yielding', kind: 'recover' }) })).toBe(true);
+    expect(exportHoldsRecipeEdits({ ready: true, admitting: false, operation: operation({ stage: 'waiting_for_previews', phase: 'waiting_for_previews' }) })).toBe(true);
   });
 
   it('does not let the Run exception override any independent hard hold', () => {
