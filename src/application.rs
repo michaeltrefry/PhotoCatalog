@@ -2548,9 +2548,12 @@ impl Actor {
                 let diagnostic_started = diagnostics.then(Instant::now);
                 let expected_key_digest = diagnostics
                     .then(|| {
-                        o.service
-                            .variant_key(&identity, tier)
-                            .and_then(|key| key.digest())
+                        let key = if interactive {
+                            o.service.interactive_key(&identity, tier)
+                        } else {
+                            o.service.variant_key(&identity, tier)
+                        }?;
+                        key.digest()
                     })
                     .and_then(Result::ok);
                 let read = if o.managed.is_some() {

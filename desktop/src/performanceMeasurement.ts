@@ -179,7 +179,13 @@ export class PerformanceRecorder {
       active.frameHandle = this.frame(tick);
     };
     active.frameHandle = this.frame(tick);
-    active.timerHandle = this.timer(() => this.stopScroll('duration_elapsed'), SCROLL_DURATION_MS);
+    active.timerHandle = this.timer(() => {
+      if (this.activeScroll !== active) return;
+      const current = this.findScrollTarget();
+      if (!active.target.isConnected || !current) this.stopScroll('unmounted', current);
+      else if (current !== active.target) this.stopScroll('target_changed', current);
+      else this.stopScroll('duration_elapsed', current);
+    }, SCROLL_DURATION_MS);
     this.notify();
     return true;
   }

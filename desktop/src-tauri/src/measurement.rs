@@ -19,6 +19,7 @@ const MAX_SCROLL_DURATION_US: u64 = 10_000_000;
 const MAX_SCROLL_EDGE_GAP_US: u64 = 100_000;
 const MAX_PREVIEW_DIAGNOSTICS: usize = 128;
 const MAX_PREVIEW_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const TIMING_TOLERANCE_MS: f64 = 0.001;
 
 struct Target {
     run_id: String,
@@ -153,12 +154,21 @@ impl FrontendPreviewDiagnostic {
                 return Err("Preview diagnostic digest is invalid".into());
             }
         }
-        if let (Some(expected), Some(selected)) = (
-            self.native.expected_key_digest.as_deref(),
-            self.native.selected_key_digest.as_deref(),
-        ) && self.native.current_key_matches_selected != Some(expected == selected)
-        {
+        let expected = self.native.expected_key_digest.as_deref();
+        let selected = self.native.selected_key_digest.as_deref();
+        if match (expected, selected) {
+            (Some(expected), Some(selected)) => {
+                self.native.current_key_matches_selected != Some(expected == selected)
+            }
+            _ => self.native.current_key_matches_selected.is_some(),
+        } {
             return Err("Preview diagnostic key comparison is invalid".into());
+        }
+        if let Some(delivery) = &self.native.delivery
+            && (delivery.total_ms + TIMING_TOLERANCE_MS < delivery.ready_for_transfer_ms
+                || delivery.total_ms + TIMING_TOLERANCE_MS < delivery.transfer_ms)
+        {
+            return Err("Preview diagnostic delivery timing is inconsistent".into());
         }
         let mut native_times = Vec::new();
         if let Some(value) = self.native.original_render_ms {
@@ -196,6 +206,16 @@ impl FrontendPreviewDiagnostic {
             ]);
             if read.decoded_hits > 1 || read.decoded_misses > 1 {
                 return Err("Preview diagnostic decode count is invalid".into());
+            }
+            if [
+                read.catalog_identity_ms,
+                read.store_read_checksum_ms,
+                read.header_decode_ms,
+            ]
+            .into_iter()
+            .any(|phase| read.total_ms + TIMING_TOLERANCE_MS < phase)
+            {
+                return Err("Preview diagnostic read timing is inconsistent".into());
             }
         }
         if native_times
@@ -635,6 +655,15 @@ mod tests {
         diagnostic.native.current_key_matches_selected = Some(false);
         assert!(diagnostic.validate().is_err());
         diagnostic.native.current_key_matches_selected = Some(true);
+        diagnostic.native.selected_key_digest = None;
+        assert!(diagnostic.validate().is_err());
+        diagnostic.native.selected_key_digest = Some("a".repeat(64));
+        diagnostic.native.delivery.as_mut().unwrap().total_ms = 0.5;
+        assert!(diagnostic.validate().is_err());
+        diagnostic.native.delivery.as_mut().unwrap().total_ms = 2.0;
+        diagnostic.native.retained_read.as_mut().unwrap().total_ms = 0.05;
+        assert!(diagnostic.validate().is_err());
+        diagnostic.native.retained_read.as_mut().unwrap().total_ms = 2.0;
         diagnostic
             .native
             .retained_read

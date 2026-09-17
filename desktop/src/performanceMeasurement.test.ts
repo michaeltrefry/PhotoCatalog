@@ -103,6 +103,24 @@ test('scroll cadence stops bounded and incomplete when its mounted grid disappea
   expect(recorder.receipt().samples).toEqual([]);
 });
 
+test('duration timer retains an unmount reason when no later animation frame arrives', () => {
+  let now = 0, timer: (() => void) | undefined;
+  let connected = true;
+  const target = scrollSurface();
+  Object.defineProperty(target, 'isConnected', { get: () => connected });
+  const recorder = new PerformanceRecorder(
+    'run', 8, { now: () => now, timeOrigin: 1234 }, () => 1, () => {}, () => {},
+    callback => { timer = callback; return 1 as unknown as ReturnType<typeof setTimeout>; }, () => {}, () => connected ? target : null,
+  );
+  expect(recorder.startScroll(target)).toBe(true);
+  connected = false;
+  now = 5_000;
+  timer!();
+  expect(recorder.receipt().scroll_capture).toEqual(expect.objectContaining({
+    outcome: 'incomplete', reason: 'unmounted', target_final: null, frames: [],
+  }));
+});
+
 test('finalizing an active scroll capture preserves callbacks and marks it incomplete', () => {
   const frames: FrameRequestCallback[] = [];
   const target = scrollSurface();
