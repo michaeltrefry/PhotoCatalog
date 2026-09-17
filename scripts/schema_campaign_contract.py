@@ -91,6 +91,19 @@ def image_initial_rows(tables):
     return initial_rows_for(tables, SCHEMA7_TABLES)
 
 
+def validate_image_initial_state(value, tables):
+    """Validate the exact schema-7 table/count mapping independent of JSON order."""
+    expected = dict(image_initial_rows(tables))
+    if (not isinstance(value, list) or len(value) != len(expected)
+            or any(not isinstance(row, list) or len(row) != 2
+                   or not isinstance(row[0], str) or type(row[1]) is not int
+                   or row[1] < 0 for row in value)):
+        raise ValueError("migration image initialization differs")
+    actual = dict(value)
+    if len(actual) != len(value) or set(actual) != set(expected) or actual != expected:
+        raise ValueError("migration image initialization differs")
+
+
 def expected_added_rows(tables, source_schema, target_schema=CURRENT_SCHEMA):
     if type(source_schema) is not int or not 4 <= source_schema <= target_schema <= CURRENT_SCHEMA:
         raise ValueError("unsupported migration schema range")
@@ -148,8 +161,7 @@ def validate_migration_receipt(native, count, source_schema, target_schema):
     if native.get("index_sql") != INDEX_SQL:
         raise ValueError("migration index differs")
     if target_schema >= 7:
-        if native.get("image_initial_state") != image_initial_rows(tables):
-            raise ValueError("migration image initialization differs")
+        validate_image_initial_state(native.get("image_initial_state"), tables)
         if native.get("original_columns_preserved") is not True:
             raise ValueError("migration original columns were not preserved")
     return tables
