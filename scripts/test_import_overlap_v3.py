@@ -111,18 +111,23 @@ class EvaluatorTests(unittest.TestCase):
         values[0]['clock_alignment']['sample_events'][1].pop('durable_event')
         with self.assertRaisesRegex(ValueError, 'Durable event/timing mismatch'): evaluate(*values)
 
-    def test_nonimport_setup_cannot_carry_fabricated_durable_event(self):
+    def test_nonimport_setup_recorded_optional_event_requires_latency(self):
         values = idle_warmup_fixture()
-        # Make a unique, ordered event inside the setup sample so rejection
-        # specifically checks import binding, not duplicate/reversed events.
+        # The clock has already started, but setup context is non-import.
+        # Preserve its legitimately recorded event; the cohort stays unchanged.
         for anchor in values[0]['clock_alignment']['anchors']:
             anchor['send_event'] += 1; anchor['receive_event'] += 1
         for row in values[0]['clock_alignment']['import_evidence']['timeline']:
             row['request_event'] += 1; row['event'] += 1
         for row in values[0]['clock_alignment']['sample_events'][1:]:
             for key in ('start_event', 'durable_event', 'end_event'): row[key] += 1
-        values[0]['clock_alignment']['sample_events'][0].update(durable_event=2, end_event=3)
-        with self.assertRaisesRegex(ValueError, 'Durable event on non-import sample'): evaluate(*values)
+        values[0]['clock_alignment']['anchors'][0].update(send_event=1, receive_event=2)
+        values[0]['clock_alignment']['sample_events'][0].update(start_event=3, durable_event=4, end_event=5)
+        result = evaluate(*values)
+        self.assertEqual(result['verdict'], 'TIMING_PASS_REQUIRES_IMPORT_RECONCILIATION')
+        self.assertEqual(result['cohort'], list(range(2, 102)))
+        values[0]['samples'][0]['durable_us'] = None
+        with self.assertRaisesRegex(ValueError, 'Durable event without latency'): evaluate(*values)
 
     def test_all_latencies_retained_no_favorable_selection(self):
         values = fixture()
