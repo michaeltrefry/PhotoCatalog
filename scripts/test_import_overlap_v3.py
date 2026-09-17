@@ -400,6 +400,89 @@ class ObserverTests(unittest.TestCase):
             root.children.return_value = children[:1]
             with self.assertRaisesRegex(ValueError, 'missing'): observer.unique_role_owners(declaration)
 
+    def test_departed_unbound_child_cmdline_denial_does_not_hide_exact_role_owners(self):
+        declaration = fixture()[2]
+        root = Mock()
+        owners = []
+        for role in observer.ROLES:
+            child = Mock(pid=declaration[f'{role}_pid'])
+            child.create_time.return_value = declaration[f'{role}_birth_unix_s']
+            child.cmdline.return_value = ['/tmp/photo', observer.ROLES[role]]
+            child.ppid.return_value = declaration['root_pid']
+            owners.append(child)
+        helper = Mock(pid=45)
+        helper.create_time.return_value = 13
+        denial = observer.psutil.AccessDenied(45)
+        denial.__cause__ = PermissionError(
+            13, 'force permission denied (originated from sysctl(KERN_PROCARGS2) -> EINVAL)')
+        helper.cmdline.side_effect = denial
+        root.children.return_value = [*owners, helper]
+        with patch.object(observer.psutil, 'Process', side_effect=lambda pid: root if pid == 42 else Mock(
+                is_running=Mock(return_value=True), status=Mock(return_value=observer.psutil.STATUS_ZOMBIE))):
+            self.assertEqual(observer.unique_role_owners(declaration), {
+                role: [{'pid': declaration[f'{role}_pid'],
+                        'birth_unix_s': declaration[f'{role}_birth_unix_s']}]
+                for role in observer.ROLES
+            })
+
+    def test_live_or_uncertain_unbound_child_cmdline_denial_remains_fatal(self):
+        declaration = fixture()[2]
+        for status_error in (None, observer.psutil.AccessDenied(45)):
+            root = Mock()
+            helper = Mock(pid=45)
+            helper.create_time.return_value = 13
+            denial = observer.psutil.AccessDenied(45)
+            helper.cmdline.side_effect = denial
+            root.children.return_value = [helper]
+            fresh = Mock()
+            fresh.is_running.return_value = True
+            if status_error is None:
+                fresh.status.return_value = 'running'
+                fresh.create_time.return_value = 13
+            else:
+                fresh.status.side_effect = status_error
+            with patch.object(observer.psutil, 'Process', side_effect=lambda pid: root if pid == 42 else fresh):
+                with self.assertRaises(observer.psutil.AccessDenied) as raised:
+                    observer.unique_role_owners(declaration)
+                self.assertIs(raised.exception, denial)
+
+    def test_unbound_child_birth_denial_remains_fatal(self):
+        declaration = fixture()[2]
+        root = Mock()
+        helper = Mock(pid=45)
+        denial = observer.psutil.AccessDenied(45)
+        helper.create_time.side_effect = denial
+        root.children.return_value = [helper]
+        with patch.object(observer.psutil, 'Process', return_value=root), \
+             patch.object(observer, 'same_birth') as lifecycle:
+            with self.assertRaises(observer.psutil.AccessDenied) as raised:
+                observer.unique_role_owners(declaration)
+            self.assertIs(raised.exception, denial)
+            lifecycle.assert_not_called()
+
+    def test_declared_owner_cmdline_failure_cannot_be_ignored_as_departed_helper(self):
+        declaration = fixture()[2]
+        root = Mock()
+        desktop = Mock(pid=declaration['desktop_pid'])
+        desktop.create_time.return_value = declaration['desktop_birth_unix_s']
+        desktop.cmdline.side_effect = observer.psutil.AccessDenied(desktop.pid)
+        root.children.return_value = [desktop]
+        with patch.object(observer.psutil, 'Process', return_value=root), \
+             patch.object(observer, 'same_birth') as lifecycle:
+            with self.assertRaises(observer.psutil.AccessDenied):
+                observer.unique_role_owners(declaration)
+            lifecycle.assert_not_called()
+
+    def test_departed_declared_owner_is_still_missing(self):
+        declaration = fixture()[2]
+        root = Mock()
+        desktop = Mock(pid=declaration['desktop_pid'])
+        desktop.create_time.side_effect = observer.psutil.NoSuchProcess(desktop.pid)
+        root.children.return_value = [desktop]
+        with patch.object(observer.psutil, 'Process', return_value=root):
+            with self.assertRaisesRegex(ValueError, 'missing'):
+                observer.unique_role_owners(declaration)
+
     def test_file_identity_rejects_symlink_and_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve() / 'lock'; path.write_text('')

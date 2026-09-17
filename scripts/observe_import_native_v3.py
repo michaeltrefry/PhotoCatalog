@@ -111,13 +111,38 @@ def import_lock_holder(pid, path, identity):
 def unique_role_owners(binding):
     """A fresh one-catalog GUI must have exactly one C and one F owner."""
     found = {role: [] for role in ROLES}
+    bound_pids = {binding[f'{role}_pid'] for role in ROLES}
     for process in psutil.Process(binding['root_pid']).children(recursive=False):
-        command = process.cmdline()
+        try:
+            # Bind the listed process before cmdline: short-lived GUI helpers can
+            # exit between children() and Darwin's KERN_PROCARGS2 query.
+            birth = process.create_time()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            # A declared C/F disappearing is still rejected by the exact owner
+            # comparison below. Other departed direct children are irrelevant.
+            continue
+        try:
+            command = process.cmdline()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except psutil.AccessDenied as error:
+            # Never turn denial for a declared owner, a still-live helper, or an
+            # uncertain lifecycle into exit evidence. Only a fresh birth-aware
+            # read proving this exact unbound child departed may be ignored.
+            if process.pid in bound_pids:
+                raise
+            try:
+                departed = not same_birth(process.pid, birth)
+            except Exception:
+                raise error
+            if departed:
+                continue
+            raise
         for role, flag in ROLES.items():
             if flag in command:
                 require(command == [binding['executable'], flag], 'Ambiguous role command')
                 require(process.ppid() == binding['root_pid'], 'Role owner reparented')
-                found[role].append({'pid': process.pid, 'birth_unix_s': process.create_time()})
+                found[role].append({'pid': process.pid, 'birth_unix_s': birth})
     expected = {role: [{'pid': binding[f'{role}_pid'], 'birth_unix_s': binding[f'{role}_birth_unix_s']}] for role in ROLES}
     require(found == expected, 'Ambiguous/missing GUI catalog-worker owners')
     return found
