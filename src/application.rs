@@ -2670,20 +2670,22 @@ impl Actor {
                     generation,
                     state,
                     message,
-                    diagnostic: diagnostics.then(|| PreviewDiagnostic {
-                        route,
-                        expected_key_digest: expected_key_digest.clone(),
-                        selected_key_digest: selected_key_digest.clone(),
-                        current_key_matches_selected: selected_key_digest
-                            .as_ref()
-                            .zip(expected_key_digest.as_ref())
-                            .map(|(selected, expected)| selected == expected),
-                        retained_read: None,
-                        original_render_ms: None,
-                        ready_ms: cached
-                            .is_some()
-                            .then(|| diagnostic_started.unwrap().elapsed().as_secs_f64() * 1000.0),
-                        delivery: None,
+                    diagnostic: diagnostics.then(|| {
+                        Box::new(PreviewDiagnostic {
+                            route,
+                            expected_key_digest: expected_key_digest.clone(),
+                            selected_key_digest: selected_key_digest.clone(),
+                            current_key_matches_selected: selected_key_digest
+                                .as_ref()
+                                .zip(expected_key_digest.as_ref())
+                                .map(|(selected, expected)| selected == expected),
+                            retained_read: None,
+                            original_render_ms: None,
+                            ready_ms: cached.is_some().then(|| {
+                                diagnostic_started.unwrap().elapsed().as_secs_f64() * 1000.0
+                            }),
+                            delivery: None,
+                        })
                     }),
                 };
                 o.tickets.insert(

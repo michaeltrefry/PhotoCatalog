@@ -377,7 +377,7 @@ pub struct PreviewStatus {
     pub state: PreviewState,
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostic: Option<PreviewDiagnostic>,
+    pub diagnostic: Option<Box<PreviewDiagnostic>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]

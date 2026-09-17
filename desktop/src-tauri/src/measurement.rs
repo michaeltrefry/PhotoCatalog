@@ -572,8 +572,7 @@ fn validate(receipt: &Receipt, expected_run_id: &str) -> Result<(), String> {
         let valid_outcome = match capture.outcome {
             ScrollOutcome::Complete => {
                 matches!(capture.reason, ScrollReason::DurationElapsed)
-                    && duration >= SCROLL_DURATION_US
-                    && duration <= MAX_SCROLL_DURATION_US
+                    && (SCROLL_DURATION_US..=MAX_SCROLL_DURATION_US).contains(&duration)
                     && capture.frames.len() >= 2
                     && capture.frames[0].0.abs_diff(capture.started_us) <= MAX_SCROLL_EDGE_GAP_US
                     && capture.ended_us - capture.frames.last().unwrap().0 <= MAX_SCROLL_EDGE_GAP_US
